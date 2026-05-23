@@ -1,11 +1,78 @@
 ---
+# Pick up YouTrack issues tagged "AI Agent: Queued" and have Claude work them
+# end-to-end per the YouTrack workflow documented in the user's CLAUDE.md.
+#
+# Auth: yt CLI is host-configured. No tokens in YAML.
+#
+# Tune the query and the project repo map below as new projects come online.
+
+name: youtrack
+
 input:
   command: |
     #!/usr/bin/env nu
     yt list --query '#{Pandora-YouTrack CLI} AI Agent: Queued' --json
 
-output:
-  file: youtrack-action.log
+dedup_key: idReadable
 
-prompt:
-  Work the YouTrack issue identified from the query.
+filter: |
+  #!/usr/bin/env nu
+  # Skip any issue that already has the AI Agent field set to anything other
+  # than Queued. Belt-and-suspenders since the query already filters; protects
+  # against races between two cron firings on different hosts.
+  let ai_agent = ($row | get -o "AI Agent" | default "")
+  if $ai_agent != "Queued" {
+      print --stderr $"skipping ($row.idReadable): AI Agent = ($ai_agent)"
+      exit 1
+  }
+
+pre:
+  # Mark the issue in progress so it does not get picked up again on the next
+  # cron firing. set-state targets the State custom field directly.
+  - |
+    #!/usr/bin/env nu
+    ^yt issue set-state $row.idReadable "In Progress"
+
+prompt: |
+  #!/usr/bin/env nu
+  $"You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.
+
+  Issue: ($row.idReadable) - ($row.summary)
+  Current state: ($row.State)
+  Assignee: ($row.Assignee)
+  Working directory: ($workdir) \(empty, clone the relevant project repo here\)
+
+  Steps:
+    1. Inspect the issue with `yt issue inspect ($row.idReadable)` to read the full description.
+    2. Identify which repo the issue belongs to (issue body, project key, or related links).
+    3. From ($workdir), clone the repo and create a feature branch per the Git workflow in CLAUDE.md.
+    4. Make the minimum change required to satisfy the acceptance criteria.
+    5. Commit with a message ending in the YouTrack command trailer `#($row.idReadable) State Done` so the issue auto-transitions on merge.
+    6. Push the branch and open a PR with the issue id in the title and body.
+    7. Stop after the PR is opened. Do not merge.
+
+  If you cannot safely complete the issue \(missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue\), do not change any code. Instead, post a comment on the issue explaining what is blocking you, and revert the State back to To do.
+
+  When you finish, summarize what you did and the PR URL in plain text."
+
+claude:
+  allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
+  permission_mode: acceptEdits
+
+post:
+  # Append the Claude run summary as an issue comment so the human reviewer
+  # has context without digging through logs.
+  - |
+    #!/usr/bin/env nu
+    let lines = ["Claude AI agent run summary:", "", $claude_result.summary, "", $"Cost: $($claude_result.cost) USD"]
+    let body = ($lines | str join "\n")
+    ^yt issue comment $row.idReadable $body
+
+output:
+  file: youtrack.jsonl
+
+limits:
+  max_attempts_per_key: 2
+  max_runs_per_day: 10
+  claude_timeout_seconds: 1200
+  daily_budget_usd: 10.00
