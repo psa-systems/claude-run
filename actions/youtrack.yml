@@ -1,0 +1,11 @@
+---
+input:
+  command: |
+    #!/usr/bin/env nu
+    yt list --query '#{Pandora-YouTrack CLI} AI Agent: Queued' --json
+
+output:
+  file: youtrack-action.log
+
+prompt:
+  Work the YouTrack issue identified from the query.
