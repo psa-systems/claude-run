@@ -1,25 +1,66 @@
 ---
-# Pick up YouTrack issues tagged "AI Agent: Queued" and have Claude work them
-# end-to-end per the YouTrack workflow documented in the user's CLAUDE.md.
+# Pick up YouTrack issues whose AI Agent custom field is Queued. Resolve each
+# issue's repo via the project's VCS integration, clone it into the row's
+# workdir, and have Claude work the issue end-to-end per the YouTrack and Git
+# workflows in CLAUDE.md.
 #
 # Auth: yt CLI is host-configured. No tokens in YAML.
 #
-# Tune the query and the project repo map below as new projects come online.
+# Requires yt 0.3.0+ (project vcs, issue get-field, issue set-field).
+#
+# AI Agent state machine:
+#   Queued       -> picked up by this action
+#   Working      -> claude is running (set in pre step)
+#   Needs Review -> claude finished, PR is open (set in post step)
+#   Failed       -> claude or a step gave up (claude or human sets this)
+#   Done         -> human merged the PR (commit trailer transitions State)
 
 name: youtrack
 
 input:
   command: |
     #!/usr/bin/env nu
-    yt list --query '#{Pandora-YouTrack CLI} AI Agent: Queued' --json
+    let issues_raw = (^yt list --query '#{Pandora-YouTrack CLI} AI Agent: Queued' --json | complete)
+    if $issues_raw.exit_code != 0 {
+        print --stderr $"yt list failed: ($issues_raw.stderr)"
+        exit 1
+    }
+    let issues = ($issues_raw.stdout | from json)
+
+    # Resolve each project's enabled VCS processor once per project key.
+    # Cached so N issues in the same project make one yt project vcs call.
+    let project_keys = ($issues | each { |i| $i.idReadable | split row "-" | first } | uniq)
+    let proj_map = ($project_keys | reduce --fold {} { |key, acc|
+        let r = (^yt project vcs $key --enabled-only --json | complete)
+        if $r.exit_code != 0 {
+            return ($acc | upsert $key null)
+        }
+        let procs = (try { $r.stdout | from json } catch { [] })
+        if ($procs | is-empty) {
+            return ($acc | upsert $key null)
+        }
+        let p = ($procs | first)
+        let host = ($p.serverUrl | str trim --right --char "/")
+        $acc | upsert $key {repo_host: $host, repo_path: $p.path, clone_url: $"($host)/($p.path).git"}
+    })
+
+    # Drop issues whose project has no enabled VCS integration; they cannot be
+    # cloned and would just fail in the pre step.
+    let rows = ($issues | each { |i|
+        let key = ($i.idReadable | split row "-" | first)
+        let repo = ($proj_map | get -o $key)
+        if $repo == null { return null }
+        $i | merge $repo
+    } | compact)
+
+    $rows | to json
 
 dedup_key: idReadable
 
 filter: |
   #!/usr/bin/env nu
-  # Skip any issue that already has the AI Agent field set to anything other
-  # than Queued. Belt-and-suspenders since the query already filters; protects
-  # against races between two cron firings on different hosts.
+  # Belt-and-suspenders: query already filters to Queued, but if a race lets a
+  # Working/Done issue through, skip it.
   let ai_agent = ($row | get -o "AI Agent" | default "")
   if $ai_agent != "Queued" {
       print --stderr $"skipping ($row.idReadable): AI Agent = ($ai_agent)"
@@ -27,46 +68,66 @@ filter: |
   }
 
 pre:
-  # Mark the issue in progress so it does not get picked up again on the next
-  # cron firing. set-state targets the State custom field directly.
+  # Mark the issue Working so concurrent or subsequent runs do not pick it up.
   - |
     #!/usr/bin/env nu
+    ^yt issue set-field $row.idReadable "AI Agent" "Working"
     ^yt issue set-state $row.idReadable "In Progress"
+
+  # Clone the repo into the row's workdir. Host git identity handles auth.
+  - |
+    #!/usr/bin/env nu
+    if ($workdir | path exists) {
+        rm -rf $workdir
+    }
+    mkdir ($workdir | path dirname)
+    ^git clone --depth 50 $row.clone_url $workdir
 
 prompt: |
   #!/usr/bin/env nu
-  $"You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.
-
-  Issue: ($row.idReadable) - ($row.summary)
-  Current state: ($row.State)
-  Assignee: ($row.Assignee)
-  Working directory: ($workdir) \(empty, clone the relevant project repo here\)
-
-  Steps:
-    1. Inspect the issue with `yt issue inspect ($row.idReadable)` to read the full description.
-    2. Identify which repo the issue belongs to (issue body, project key, or related links).
-    3. From ($workdir), clone the repo and create a feature branch per the Git workflow in CLAUDE.md.
-    4. Make the minimum change required to satisfy the acceptance criteria.
-    5. Commit with a message ending in the YouTrack command trailer `#($row.idReadable) State Done` so the issue auto-transitions on merge.
-    6. Push the branch and open a PR with the issue id in the title and body.
-    7. Stop after the PR is opened. Do not merge.
-
-  If you cannot safely complete the issue \(missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue\), do not change any code. Instead, post a comment on the issue explaining what is blocking you, and revert the State back to To do.
-
-  When you finish, summarize what you did and the PR URL in plain text."
+  let lines = [
+      "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.",
+      "",
+      $"Issue: ($row.idReadable): ($row.summary)",
+      $"Repo: ($row.clone_url)",
+      $"Working directory: ($workdir) - the repo is already cloned here, you are inside it.",
+      "",
+      "Steps:",
+      $"1. Run 'yt issue inspect ($row.idReadable)' to read the full description and acceptance criteria.",
+      "2. Create a feature branch off the default branch per the Git workflow in CLAUDE.md.",
+      "3. Make the minimum change required to satisfy the acceptance criteria.",
+      $"4. Commit with a message ending in the YouTrack command trailer '#($row.idReadable) State Done' so the issue auto-transitions when the PR merges.",
+      "5. Push the branch and open a PR with the issue id in both the title and the body.",
+      "6. Stop after the PR is opened. Do not merge.",
+      "",
+      "If you cannot safely complete the issue - missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue - do not change any code. Comment on the issue explaining what is blocking you, then run:",
+      $"    yt issue set-field ($row.idReadable) 'AI Agent' Failed",
+      "so it is not retried.",
+      "",
+      "When you finish, summarize what you did and the PR URL in plain text.",
+  ]
+  $lines | str join "\n"
 
 claude:
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
   permission_mode: acceptEdits
 
 post:
-  # Append the Claude run summary as an issue comment so the human reviewer
-  # has context without digging through logs.
+  # Comment the Claude run summary on the issue.
   - |
     #!/usr/bin/env nu
     let lines = ["Claude AI agent run summary:", "", $claude_result.summary, "", $"Cost: $($claude_result.cost) USD"]
     let body = ($lines | str join "\n")
     ^yt issue comment $row.idReadable $body
+
+  # Flip AI Agent to Needs Review only if it is still Working. Preserves a
+  # Failed value that Claude self-set via the prompt's failure path.
+  - |
+    #!/usr/bin/env nu
+    let r = (^yt issue get-field $row.idReadable "AI Agent" | complete)
+    if $r.exit_code == 0 and ($r.stdout | str trim) == "Working" {
+        ^yt issue set-field $row.idReadable "AI Agent" "Needs Review"
+    }
 
 output:
   file: youtrack.jsonl
