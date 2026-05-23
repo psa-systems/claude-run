@@ -60,16 +60,13 @@ filter: |
 pre:
   - |
     #!/usr/bin/env nu
-    # Clean workdir and clone the PR branch using fj's stored token.
+    # Clone the PR branch using fj's stored token. Runner already created
+    # $workdir as an empty dir. If a previous attempt left state behind, git
+    # clone will fail; attempt counter trips and a human investigates.
     let keys = (open ~/.local/share/forgejo-cli/keys.json)
     let token = ($keys.hosts | get $row.host | get token)
     let url = $"https://oauth2:($token)@($row.host)/($row.repo).git"
-
-    if ($workdir | path exists) {
-        rm -rf $workdir
-    }
-    mkdir ($workdir | path dirname)
-    git clone --branch $row.branch --depth 50 $url $workdir
+    ^git clone --branch $row.branch --depth 50 $url $workdir
 
 claude:
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
@@ -126,7 +123,9 @@ post:
         "push"
     }
 
-    {decision: $decision, files: $files, lines: $lines_changed} | to json | save --force $"($workdir)/.claude-run-post.json"
+    let report_file = $"($workdir)/.claude-run-post.json"
+    if ($report_file | path exists) { rm $report_file }
+    {decision: $decision, files: $files, lines: $lines_changed} | to json | save $report_file
 
   # Step 1: commit and push if decision == push.
   - |
@@ -146,7 +145,8 @@ post:
 
     let msg_lines = [$"fix: Claude auto-fix for PR #($row.pr_number)", "", $claude_result.summary, "", "[skip claude]"]
     let msg_file = $"($workdir)/.claude-run-commit-msg"
-    ($msg_lines | str join "\n") | save --force $msg_file
+    if ($msg_file | path exists) { rm $msg_file }
+    ($msg_lines | str join "\n") | save $msg_file
     ^git commit --file $msg_file
 
     let push_url = $"https://oauth2:($token)@($row.host)/($row.repo).git"

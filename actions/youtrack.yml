@@ -75,12 +75,11 @@ pre:
     ^yt issue set-state $row.idReadable "In Progress"
 
   # Clone the repo into the row's workdir. Host git identity handles auth.
+  # Runner already created $workdir as an empty dir. If a previous attempt
+  # left state behind, git clone will fail; the attempt counter trips after
+  # max_attempts_per_key and a human is expected to investigate $workdir.
   - |
     #!/usr/bin/env nu
-    if ($workdir | path exists) {
-        rm -rf $workdir
-    }
-    mkdir ($workdir | path dirname)
     ^git clone --depth 50 $row.clone_url $workdir
 
 prompt: |
