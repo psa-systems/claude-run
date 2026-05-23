@@ -127,7 +127,8 @@ def lock-acquire [cfg: record, name: string] {
         log warn $cfg $name "removing stale lock file" {stale_pid: $pid}
         rm $lock
     }
-    $"($nu.pid)" | save --force $lock
+    # Stale lock cleared above; if anything else is racing we want save to fail.
+    $"($nu.pid)" | save $lock
     return true
 }
 
@@ -157,7 +158,8 @@ def state-load [cfg: record, name: string] {
 def state-save [cfg: record, name: string, state: record] {
     let f = (state-file $cfg $name)
     dir-ensure ($f | path dirname)
-    $state | to json | save --force $f
+    if ($f | path exists) { rm $f }
+    $state | to json | save $f
 }
 
 def attempts-get [state: record, key: string] {
@@ -255,12 +257,14 @@ def snippet-write [
     mut prelude = ""
     for col in ($bindings | columns) {
         let val_path = $"($snippet_dir)/binding-($col).json"
-        ($bindings | get $col) | to json | save --force $val_path
+        if ($val_path | path exists) { rm $val_path }
+        ($bindings | get $col) | to json | save $val_path
         $prelude = $"($prelude)let ($col) = \(open --raw '($val_path)' | from json\)\n"
     }
     let script = $"($prelude)\n($body)"
     let script_path = $"($snippet_dir)/($phase).nu"
-    $script | save --force $script_path
+    if ($script_path | path exists) { rm $script_path }
+    $script | save $script_path
     $script_path
 }
 
