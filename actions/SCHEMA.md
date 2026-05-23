@@ -17,6 +17,7 @@ usage check. The action YAML supplies everything specific to the job.
 
 ```yaml
 name: <kebab-id>            # required
+workdir_base: /path/to/dir  # optional, overrides $CLAUDE_RUN_WORKDIR_BASE for this action
 input:
   command: |                # required, nu snippet, stdout = JSON array
     #!/usr/bin/env nu
@@ -52,6 +53,17 @@ limits:                     # optional per-action overrides of env defaults
 
 Identifier used for the lock file, state file, log directory, and PAUSED flag.
 Should be kebab-case and unique across all actions on the host.
+
+### `workdir_base` (string, optional)
+
+Per-row working directories are rooted under `<workdir_base>/<name>/<key>`.
+Defaults to `$CLAUDE_RUN_WORKDIR_BASE` (which itself defaults to
+`/tmp/claude-run`). Setting this on the action overrides the env for that
+action only - useful when one action needs more disk than `/tmp` allows
+(e.g., a workspace mounted on a large data volume) or when you want
+per-action isolation on disk for cleanup or quota reasons.
+
+Path is `path expand`-ed, so `~` and env vars work.
 
 ### `input.command` (nu snippet, required)
 
@@ -159,6 +171,7 @@ Per-action overrides for the runner-wide defaults. Any subset of:
 | `CLAUDE_RUN_STATE_DIR`                | `~/.local/share/claude-run`      | State, locks, PAUSED flags, cost ledger.                |
 | `CLAUDE_RUN_LOG_DIR`                  | `$CLAUDE_RUN_STATE_DIR/logs`     | Daily JSONL logs and per-action output files.           |
 | `CLAUDE_RUN_ACTIONS_DIR`              | `./actions`                      | Resolves bare action names to YAML files.               |
+| `CLAUDE_RUN_WORKDIR_BASE`             | `/tmp/claude-run`                | Per-row workdir root. Final path = `<base>/<name>/<key>`. Overridable per action via `workdir_base`. |
 | `CLAUDE_RUN_MAX_RUNS_PER_DAY`         | `20`                             | Hard cap on Claude invocations per action per day.      |
 | `CLAUDE_RUN_MAX_ATTEMPTS_PER_KEY`     | `3`                              | Per-row attempt cap when `dedup_key` is set.            |
 | `CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS`   | `600`                            | `timeout` wrapper around the `claude` CLI call.         |
@@ -217,9 +230,13 @@ Bindings available to snippets:
 | `$workdir`       | -               | yes      | yes   | yes      | yes    |
 | `$claude_result` | -               | -        | -     | -        | yes    |
 
-`$workdir` is `/tmp/claude-run/<name>/<dedup_key-or-row-index>`. The runner
-creates it before the first `pre` step and does not clean it up; actions that
-need a clean dir should remove it in the first `pre` step.
+`$workdir` is `<workdir_base>/<name>/<dedup_key-or-row-index>`, where
+`workdir_base` is the action's `workdir_base` field if set, else
+`$CLAUDE_RUN_WORKDIR_BASE`, else `/tmp/claude-run`. The runner creates it
+before the first `pre` step and does not clean it up; if a prior attempt
+left state behind the next `pre` step (typically `git clone`) is expected
+to fail naturally, which trips the per-key attempt counter so a human can
+investigate.
 
 For `filter` and `pre`/`post`, exit code 0 = continue, non-zero = step
 failure (skip row, count attempt). The snippet's stdout is captured into the

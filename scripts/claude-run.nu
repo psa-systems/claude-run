@@ -65,6 +65,7 @@ def runner-config [] {
         state_dir: $state_dir,
         log_dir: (env-default "CLAUDE_RUN_LOG_DIR" $"($state_dir)/logs" | path expand),
         actions_dir: (env-default "CLAUDE_RUN_ACTIONS_DIR" "./actions" | path expand),
+        workdir_base: (env-default "CLAUDE_RUN_WORKDIR_BASE" "/tmp/claude-run" | path expand),
         max_runs_per_day: (env-default-int "CLAUDE_RUN_MAX_RUNS_PER_DAY" 20),
         max_attempts_per_key: (env-default-int "CLAUDE_RUN_MAX_ATTEMPTS_PER_KEY" 3),
         claude_timeout_seconds: (env-default-int "CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS" 600),
@@ -388,7 +389,8 @@ def row-process [
 
     log info $cfg $name "processing row" {key: $key, attempt: ($attempts + 1)}
 
-    let workdir = $"/tmp/claude-run/($name)/($key)"
+    let workdir_base = ($action.workdir_base? | default $cfg.workdir_base | path expand)
+    let workdir = $"($workdir_base)/($name)/($key)"
     let snippet_dir = $"($cfg.state_dir)/snippets/($name)/($key)"
     let base_bindings = {row: $row, workdir: $workdir}
 
