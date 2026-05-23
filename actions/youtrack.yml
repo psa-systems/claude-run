@@ -1,10 +1,25 @@
 ---
-# Pick up YouTrack issues tagged "AI Agent: Queued" and have Claude work them
-# end-to-end per the YouTrack workflow documented in the user's CLAUDE.md.
+# Pick up YouTrack issues whose AI Agent custom field is Queued and have
+# Claude work them end-to-end per the YouTrack and Git workflows in CLAUDE.md.
 #
 # Auth: yt CLI is host-configured. No tokens in YAML.
 #
-# Tune the query and the project repo map below as new projects come online.
+# AI Agent state machine:
+#   Queued       -> picked up by this action
+#   Working      -> claude is running (set in pre step)
+#   Needs Review -> claude finished, PR is open (set in post step)
+#   Failed       -> claude or a step gave up (claude or human sets this)
+#   Done         -> human merged the PR (commit trailer transitions State)
+#
+# Outstanding YT issues this action will use once they land:
+#   YT-7  yt project show: include VCS integration info (repo URL + path)
+#         -> lets the input snippet derive each issue's repo automatically
+#         -> until then, Claude has to figure out the repo from issue context
+#   YT-8  yt issue get-field: read a single custom field value
+#         -> currently we do not condition the post-step transition on the
+#            current AI Agent value; the flip to "Needs Review" is unconditional
+#   YT-9  yt issue set-field: set an arbitrary custom field value
+#         -> currently we set AI Agent via `yt issue apply --command 'AI Agent X'`
 
 name: youtrack
 
@@ -17,9 +32,8 @@ dedup_key: idReadable
 
 filter: |
   #!/usr/bin/env nu
-  # Skip any issue that already has the AI Agent field set to anything other
-  # than Queued. Belt-and-suspenders since the query already filters; protects
-  # against races between two cron firings on different hosts.
+  # Belt-and-suspenders: query already filters to Queued, but if a race lets a
+  # Working/Done issue through, skip it.
   let ai_agent = ($row | get -o "AI Agent" | default "")
   if $ai_agent != "Queued" {
       print --stderr $"skipping ($row.idReadable): AI Agent = ($ai_agent)"
@@ -27,46 +41,58 @@ filter: |
   }
 
 pre:
-  # Mark the issue in progress so it does not get picked up again on the next
-  # cron firing. set-state targets the State custom field directly.
+  # Mark the issue Working so concurrent or subsequent runs do not pick it up.
+  # Uses `yt issue apply` until YT-9 ships a `set-field` subcommand.
   - |
     #!/usr/bin/env nu
+    ^yt issue apply --command 'AI Agent Working' $row.idReadable
     ^yt issue set-state $row.idReadable "In Progress"
 
 prompt: |
   #!/usr/bin/env nu
-  $"You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.
-
-  Issue: ($row.idReadable) - ($row.summary)
-  Current state: ($row.State)
-  Assignee: ($row.Assignee)
-  Working directory: ($workdir) \(empty, clone the relevant project repo here\)
-
-  Steps:
-    1. Inspect the issue with `yt issue inspect ($row.idReadable)` to read the full description.
-    2. Identify which repo the issue belongs to (issue body, project key, or related links).
-    3. From ($workdir), clone the repo and create a feature branch per the Git workflow in CLAUDE.md.
-    4. Make the minimum change required to satisfy the acceptance criteria.
-    5. Commit with a message ending in the YouTrack command trailer `#($row.idReadable) State Done` so the issue auto-transitions on merge.
-    6. Push the branch and open a PR with the issue id in the title and body.
-    7. Stop after the PR is opened. Do not merge.
-
-  If you cannot safely complete the issue \(missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue\), do not change any code. Instead, post a comment on the issue explaining what is blocking you, and revert the State back to To do.
-
-  When you finish, summarize what you did and the PR URL in plain text."
+  let lines = [
+      "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.",
+      "",
+      $"Issue: ($row.idReadable): ($row.summary)",
+      $"Current state: ($row.State)",
+      $"Working directory: ($workdir) - empty, clone the relevant project repo here.",
+      "",
+      "Steps:",
+      $"1. Run 'yt issue inspect ($row.idReadable)' to read the full description and acceptance criteria.",
+      "2. Identify which repo the issue belongs to. Look at the issue description, links, and the project's VCS settings on YouTrack. If you cannot determine the repo, follow the failure path below.",
+      $"3. Clone the repo into ($workdir) and create a feature branch per the Git workflow in CLAUDE.md.",
+      "4. Make the minimum change required to satisfy the acceptance criteria.",
+      $"5. Commit with a message ending in the YouTrack command trailer '#($row.idReadable) State Done' so the issue auto-transitions when the PR merges.",
+      "6. Push the branch and open a PR with the issue id in both the title and the body.",
+      "7. Stop after the PR is opened. Do not merge.",
+      "",
+      "If you cannot safely complete the issue - missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue - do not change any code. Comment on the issue explaining what is blocking you, then run:",
+      $"    yt issue apply --command 'AI Agent Failed' ($row.idReadable)",
+      "so it is not retried.",
+      "",
+      "When you finish, summarize what you did and the PR URL in plain text.",
+  ]
+  $lines | str join "\n"
 
 claude:
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
   permission_mode: acceptEdits
 
 post:
-  # Append the Claude run summary as an issue comment so the human reviewer
-  # has context without digging through logs.
+  # Comment the Claude summary on the issue.
   - |
     #!/usr/bin/env nu
     let lines = ["Claude AI agent run summary:", "", $claude_result.summary, "", $"Cost: $($claude_result.cost) USD"]
     let body = ($lines | str join "\n")
     ^yt issue comment $row.idReadable $body
+
+  # Flip AI Agent to Needs Review. Unconditional: if Claude self-flagged Failed
+  # via the failure path in the prompt, this overwrites it back to Needs Review
+  # which is acceptable - the comment + PR will tell the human what happened.
+  # Will become a conditional `set-field` once YT-8 + YT-9 land.
+  - |
+    #!/usr/bin/env nu
+    ^yt issue apply --command 'AI Agent Needs Review' $row.idReadable
 
 output:
   file: youtrack.jsonl
