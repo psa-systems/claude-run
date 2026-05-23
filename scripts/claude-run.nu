@@ -506,7 +506,9 @@ def rows-gather [cfg: record, action: record] {
 # MAIN
 # ============================================================================
 
-def main [action_arg: string] {
+def main [
+	action_arg: string			# Action to run from actions/
+] {
     let cfg = (runner-config)
     dir-ensure $cfg.state_dir
     dir-ensure $cfg.log_dir
