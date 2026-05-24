@@ -19,7 +19,13 @@
 #   Needs Review -> claude couldn't proceed, the issue needs human input (post step)
 #                   - attempt counter is NOT incremented (parked, not failed)
 #   Failed       -> claude or a step had a hard failure (post step)
-#   Done         -> PR merged; human or commit trailer transitions State here
+#
+# State (the standard YouTrack field) is independent of AI Agent. The pre step
+# sets State=In Progress. Submitting a PR does NOT move State to Done: the
+# commit links the PR to the issue but carries no State command, so the issue
+# stays In Progress until a human merges the PR and sets State=Done themselves.
+# (State=Done while AI Agent=Code Review would be contradictory - the PR is
+# open, not merged.)
 
 name: youtrack
 
@@ -112,7 +118,7 @@ prompt: |
       $"1. Run 'yt issue inspect ($row.idReadable)' to read the full description and acceptance criteria.",
       "2. Create a feature branch off the default branch per the Git workflow in CLAUDE.md.",
       "3. Make the minimum change required to satisfy the acceptance criteria.",
-      $"4. Commit with a message ending in the YouTrack command trailer '#($row.idReadable) State Done' so the issue auto-transitions when the PR merges.",
+      $"4. Commit with a message that references the issue on its own line as '#($row.idReadable)' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
       "5. Push the branch and open a PR with the issue id in both the title and the body.",
       "6. Set AI Agent to 'Code Review' so the human knows the PR is waiting on them:",
       $"     yt issue set-field ($row.idReadable) 'AI Agent' 'Code Review'",
