@@ -13,14 +13,14 @@ use std::time::Duration;
 
 use askama::Template;
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Form, Path as AxumPath, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use axum::Router;
 use futures_util::stream::Stream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -41,7 +41,14 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
     let st = WebState { api, paths };
     Router::new()
         .route("/", get(dashboard))
+        .route("/actions/new", get(action_new_page))
+        .route("/actions", post(action_create))
         .route("/actions/:name", get(action_detail))
+        .route(
+            "/actions/:name/edit",
+            get(action_edit_page).post(action_edit_save),
+        )
+        .route("/actions/:name/export", get(action_export))
         .route("/runs/:id", get(run_detail))
         .route("/runs/:id/rows/:key/attempt/:attempt", get(row_stream_page))
         .route(
@@ -224,6 +231,195 @@ async fn action_detail(
         runs,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
+// ---- action editor / import / export (CLAUDE-7) ---------------------------
+
+#[derive(Template)]
+#[template(path = "action_editor.html")]
+struct ActionEditorTpl {
+    version: &'static str,
+    heading: String,
+    /// URL the form POSTs to.
+    post_url: String,
+    /// YAML to prefill the textarea (current file, submitted draft, or skeleton).
+    yaml: String,
+    /// Inline validation error, rendered above the editor when set.
+    error: Option<String>,
+    /// Import (create) mode vs editing an existing file.
+    is_new: bool,
+    /// Existing action name; drives the Cancel / Export links.
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ActionForm {
+    yaml: String,
+}
+
+/// Skeleton prefilled into the new-action editor. Validates as-is (name /
+/// input.command / prompt are all non-empty) and ships disabled so an import
+/// never starts running before the author reviews it.
+const NEW_ACTION_TEMPLATE: &str = "name: my-action\n\
+input:\n\
+\x20\x20command: |\n\
+\x20\x20\x20\x20# nu: print a JSON array of rows to stdout\n\
+\x20\x20\x20\x20print '[]'\n\
+prompt: |\n\
+\x20\x20# nu: print the Claude prompt for the current row to stdout\n\
+\x20\x20print \"Describe the task for this row.\"\n\
+enabled: false\n";
+
+/// Resolve an indexed action's on-disk path by exact name. Only names the
+/// daemon has scanned (always under `actions_dir`) resolve, so a hostile
+/// `:name` such as `../../etc/passwd` can never reach the filesystem here.
+async fn indexed_action_path(pool: &SqlitePool, name: &str) -> Result<Option<String>, WebError> {
+    let rows = state::action_index_list(pool).await?;
+    Ok(rows
+        .into_iter()
+        .find(|r| r.name == name)
+        .map(|r| r.file_path))
+}
+
+/// Constrain an action name to a single safe path component for use as a
+/// `<stem>.yml` filename. Rejects empty, `.`/`..`, path separators, and any
+/// character outside `[A-Za-z0-9._-]`.
+fn safe_action_stem(name: &str) -> Option<String> {
+    let n = name.trim();
+    if n.is_empty() || n == "." || n == ".." {
+        return None;
+    }
+    if !n
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(n.to_string())
+}
+
+/// Re-render the editor with an inline error (HTTP 422), preserving the draft.
+fn editor_error(
+    version: &'static str,
+    is_new: bool,
+    name: Option<String>,
+    yaml: String,
+    message: String,
+) -> Result<Response, WebError> {
+    let (heading, post_url) = match &name {
+        Some(n) if !is_new => (format!("Edit {n}"), format!("/actions/{n}/edit")),
+        _ => ("New action".to_string(), "/actions".to_string()),
+    };
+    let tpl = ActionEditorTpl {
+        version,
+        heading,
+        post_url,
+        yaml,
+        error: Some(message),
+        is_new,
+        name,
+    };
+    Ok((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Html(tpl.render().map_err(WebError::from)?),
+    )
+        .into_response())
+}
+
+async fn action_edit_page(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, WebError> {
+    let Some(path) = indexed_action_path(&s.api.pool, &name).await? else {
+        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
+    };
+    let yaml = std::fs::read_to_string(&path).map_err(WebError::from)?;
+    let tpl = ActionEditorTpl {
+        version: s.api.version,
+        heading: format!("Edit {name}"),
+        post_url: format!("/actions/{name}/edit"),
+        yaml,
+        error: None,
+        is_new: false,
+        name: Some(name),
+    };
+    Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
+async fn action_edit_save(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+    Form(form): Form<ActionForm>,
+) -> Result<Response, WebError> {
+    let Some(path) = indexed_action_path(&s.api.pool, &name).await? else {
+        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
+    };
+    // Validate through the same checks the loader/scanner uses. A broken
+    // candidate is rejected inline and the on-disk file is left untouched.
+    if let Err(e) = crate::action::validate_str(&form.yaml, &path) {
+        return editor_error(s.api.version, false, Some(name), form.yaml, e.to_string());
+    }
+    std::fs::write(&path, form.yaml.as_bytes()).map_err(WebError::from)?;
+    // The daemon's 5s directory re-scan picks up the new sha256; no restart.
+    Ok(Redirect::to(&format!("/actions/{name}")).into_response())
+}
+
+async fn action_new_page(State(s): State<WebState>) -> Result<Html<String>, WebError> {
+    let tpl = ActionEditorTpl {
+        version: s.api.version,
+        heading: "New action".into(),
+        post_url: "/actions".into(),
+        yaml: NEW_ACTION_TEMPLATE.into(),
+        error: None,
+        is_new: true,
+        name: None,
+    };
+    Ok(Html(tpl.render().map_err(WebError::from)?))
+}
+
+async fn action_create(
+    State(s): State<WebState>,
+    Form(form): Form<ActionForm>,
+) -> Result<Response, WebError> {
+    let loaded = match crate::action::validate_str(&form.yaml, "<import>") {
+        Ok(l) => l,
+        Err(e) => return editor_error(s.api.version, true, None, form.yaml, e.to_string()),
+    };
+    let Some(stem) = safe_action_stem(&loaded.action.name) else {
+        let msg = format!(
+            "action name `{}` is not a safe filename (allowed: letters, digits, '-', '_', '.')",
+            loaded.action.name
+        );
+        return editor_error(s.api.version, true, None, form.yaml, msg);
+    };
+    let actions_dir = s.paths.actions_dir();
+    let dest = actions_dir.join(format!("{stem}.yml"));
+    if dest.exists() {
+        let msg = format!("`{stem}.yml` already exists; edit it instead of importing a duplicate");
+        return editor_error(s.api.version, true, None, form.yaml, msg);
+    }
+    std::fs::create_dir_all(&actions_dir).map_err(WebError::from)?;
+    std::fs::write(&dest, form.yaml.as_bytes()).map_err(WebError::from)?;
+    Ok(Redirect::to(&format!("/actions/{}", loaded.action.name)).into_response())
+}
+
+async fn action_export(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, WebError> {
+    let Some(path) = indexed_action_path(&s.api.pool, &name).await? else {
+        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
+    };
+    let body = std::fs::read_to_string(&path).map_err(WebError::from)?;
+    let mut resp = Response::new(Body::from(body));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-yaml"),
+    );
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{name}.yml\"")) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+    }
+    Ok(resp)
 }
 
 #[derive(Serialize)]
@@ -478,6 +674,15 @@ impl From<crate::error::Error> for WebError {
 
 impl From<sqlx::Error> for WebError {
     fn from(e: sqlx::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: e.to_string(),
+        }
+    }
+}
+
+impl From<std::io::Error> for WebError {
+    fn from(e: std::io::Error) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: e.to_string(),
