@@ -1,5 +1,7 @@
 ---
 # yaml-embedded-languages: nushell
+# https://github.com/harrydowning/vscode-yaml-embedded-languages
+# https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
 
 # Unattended Claude Code fix for failing CI on Forgejo PRs.
 #
