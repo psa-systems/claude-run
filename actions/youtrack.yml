@@ -17,10 +17,13 @@
 
 name: youtrack
 
+# /home has more space than /tmp
+workdir_base: $"($nu.home-dir | path join workspace)"
+
 input:
   command: |
     #!/usr/bin/env nu
-    let issues_raw = (^yt list --query '#{Pandora-YouTrack CLI} AI Agent: Queued' --json | complete)
+    let issues_raw = (^yt list --query '-Resolved AI Agent: Queued' --json | complete)
     if $issues_raw.exit_code != 0 {
         print --stderr $"yt list failed: ($issues_raw.stderr)"
         exit 1
