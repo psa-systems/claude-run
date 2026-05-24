@@ -1,4 +1,6 @@
 ---
+# yaml-embedded-languages: nushell
+
 # Pick up YouTrack issues whose AI Agent custom field is Queued. Resolve each
 # issue's repo via the project's VCS integration, clone it into the row's
 # workdir, and have Claude work the issue end-to-end per the YouTrack and Git
