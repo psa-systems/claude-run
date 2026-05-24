@@ -22,7 +22,7 @@ use claude_run::{
 #[derive(Parser)]
 #[command(
     name = "claude-run",
-    version,
+    version = claude_run::VERSION,
     about = "YAML-driven Claude Code runner",
     long_about = "Run actions defined in $CONFIG_DIR/actions/*.yml. Each action's input.command \
                   emits a JSON array; one Claude invocation per row. See actions/SCHEMA.md."
