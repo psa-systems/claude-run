@@ -2,10 +2,18 @@
 # Unattended Claude Code fix for failing CI on Forgejo PRs.
 #
 # Ports the original scripts/claude-run.nu (pre-refactor) behavior to the
-# generic runner. Uses the Forgejo REST API for listing/commenting because the
-# fj CLI does not expose JSON output for `pr search` / `pr status`. Auth
-# reuses fj's own credential store (~/.local/share/forgejo-cli/keys.json),
-# so no token lives in YAML or env.
+# generic runner.
+#
+# TODO(MK-12): the input.command bypasses `fj` for listing PRs because
+# `fj pr search` has no --json output. Switch to `fj pr search --json` once
+# that ships.
+# TODO(MK-13): same for CI status. `fj pr status` has no --json output (and a
+# bug with relative-URL parsing). Switch to `fj pr status --json` once that
+# ships.
+#
+# `fj pr comment` is used directly (it supports --body-file). Auth for the
+# remaining REST calls reuses fj's own credential store at
+# ~/.local/share/forgejo-cli/keys.json, so no token lives in YAML or env.
 
 name: forgejo-ci-fix
 
@@ -155,7 +163,7 @@ post:
     let push_url = $"https://oauth2:($token)@($row.host)/($row.repo).git"
     ^git push $push_url $row.branch
 
-  # Step 2: post PR comment summarizing the run.
+  # Step 2: post PR comment summarizing the run via fj.
   - |
     #!/usr/bin/env nu
     let report = (open $"($workdir)/.claude-run-post.json")
@@ -166,12 +174,12 @@ post:
     } else {
         ["**Claude ran but made no changes.**", "", $claude_result.summary]
     }
-    let body = ($lines | str join "\n")
+    let body_file = $"($workdir)/.claude-run-pr-comment.md"
+    if ($body_file | path exists) { rm $body_file }
+    ($lines | str join "\n") | save $body_file
 
-    let keys = (open ~/.local/share/forgejo-cli/keys.json)
-    let token = ($keys.hosts | get $row.host | get token)
-    let url = $"https://($row.host)/api/v1/repos/($row.repo)/issues/($row.pr_number)/comments"
-    http post --content-type "application/json" --headers [Authorization $"token ($token)"] $url {body: $body}
+    cd $workdir
+    ^fj --host $row.host pr comment $row.pr_number --body-file $body_file
 
 output:
   file: forgejo-ci-fix.jsonl
