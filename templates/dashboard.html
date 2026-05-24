@@ -2,12 +2,22 @@
 {% block title %}claude-run dashboard{% endblock %}
 {% block main %}
 
+<div id="poll-region"
+     hx-get="/"
+     hx-trigger="every 5s, refreshNow from:body"
+     hx-select="#poll-region"
+     hx-swap="outerHTML">
+
 {% if let Some(g) = global_pause %}
   <h2>Globally paused</h2>
   <div class="card">
     <span class="badge pause">paused</span>
     Since {{ g.paused_at }}{% if let Some(r) = g.reason %} - {{ r }}{% endif %}.
-    <form hx-post="/api/resume" hx-swap="none" style="display:inline; margin-left: 12px;">
+    <form hx-post="/api/resume"
+          hx-swap="none"
+          hx-disabled-elt="find button"
+          hx-on::after-request="htmx.trigger('body', 'refreshNow')"
+          style="display:inline; margin-left: 12px;">
       <button class="btn">Resume globally</button>
     </form>
   </div>
@@ -52,15 +62,24 @@
         last run: {% if let Some(t) = a.last_run_started %}{{ t }}{% else %}<span class="dim">never</span>{% endif %}
       </div>
       <div class="row-actions">
-        <form hx-post="/api/actions/{{ a.name }}/trigger" hx-swap="none">
+        <form hx-post="/api/actions/{{ a.name }}/trigger"
+              hx-swap="none"
+              hx-disabled-elt="find button"
+              hx-on::after-request="htmx.trigger('body', 'refreshNow')">
           <button class="btn">Trigger now</button>
         </form>
         {% if a.paused.is_some() %}
-          <form hx-post="/api/actions/{{ a.name }}/resume" hx-swap="none">
+          <form hx-post="/api/actions/{{ a.name }}/resume"
+                hx-swap="none"
+                hx-disabled-elt="find button"
+                hx-on::after-request="htmx.trigger('body', 'refreshNow')">
             <button class="btn">Resume</button>
           </form>
         {% else %}
-          <form hx-post="/api/actions/{{ a.name }}/pause" hx-swap="none">
+          <form hx-post="/api/actions/{{ a.name }}/pause"
+                hx-swap="none"
+                hx-disabled-elt="find button"
+                hx-on::after-request="htmx.trigger('body', 'refreshNow')">
             <button class="btn">Pause</button>
           </form>
         {% endif %}
@@ -99,5 +118,7 @@
     </tbody>
   </table>
 {% endif %}
+
+</div><!-- /#poll-region -->
 
 {% endblock %}
