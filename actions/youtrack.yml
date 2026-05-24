@@ -23,8 +23,10 @@
 
 name: youtrack
 
-# /home has more space than /tmp
-workdir_base: $"($nu.home-dir | path join workspace)"
+# /home has more space than /tmp.
+# Plain shell expansion: ~, $VAR, and ${VAR} are honored. The old nu-eval
+# form ($"...") is gone with the Rust port.
+workdir_base: ~/workspace
 
 input:
   command: |
