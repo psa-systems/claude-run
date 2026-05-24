@@ -1,4 +1,6 @@
 ---
+# yaml-embedded-languages: nushell
+
 # Pick up YouTrack issues whose AI Agent custom field is Queued. Resolve each
 # issue's repo via the project's VCS integration, clone it into the row's
 # workdir, and have Claude work the issue end-to-end per the YouTrack and Git
@@ -117,27 +119,37 @@ claude:
   permission_mode: acceptEdits
 
 post:
-  # Comment the Claude run summary on the issue.
+  # Comment the run summary on the issue. Post always runs, even when claude
+  # failed (timeout, error), so branch the header text on $claude_result.ok.
   - |
     #!/usr/bin/env nu
-    let lines = ["Claude AI agent run summary:", "", $claude_result.summary, "", $"Cost: $($claude_result.cost) USD"]
+    let header = if $claude_result.ok {
+        "Claude AI agent run summary:"
+    } else {
+        $"Claude AI agent run FAILED \(($claude_result.error)\):"
+    }
+    let lines = [$header, "", $claude_result.summary, "", $"Cost: $($claude_result.cost) USD"]
     let body = ($lines | str join "\n")
     ^yt issue comment $row.idReadable $body
 
-  # Flip AI Agent to Needs Review only if it is still Working. Preserves a
-  # Failed value that Claude self-set via the prompt's failure path.
+  # Transition AI Agent out of Working so the row is not stuck. Only acts when
+  # the current value is still Working - preserves a value Claude self-set
+  # (Failed via the prompt's failure path, or anything a human has touched).
+  # success -> Needs Review (human reviews the PR claude opened)
+  # failure -> Failed (human investigates the stream log)
   - |
     #!/usr/bin/env nu
     let r = (^yt issue get-field $row.idReadable "AI Agent" | complete)
     if $r.exit_code == 0 and ($r.stdout | str trim) == "Working" {
-        ^yt issue set-field $row.idReadable "AI Agent" "Needs Review"
+        let target = if $claude_result.ok { "Needs Review" } else { "Failed" }
+        ^yt issue set-field $row.idReadable "AI Agent" $target
     }
 
 output:
   file: youtrack.jsonl
 
 limits:
-  max_attempts_per_key: 2
-  max_runs_per_day: 10
-  claude_timeout_seconds: 1200
-  daily_budget_usd: 10.00
+  max_attempts_per_key: 3
+  max_runs_per_day: 20
+  claude_timeout_seconds: 1800
+  daily_budget_usd: 20.00

@@ -104,10 +104,19 @@ prompt: |
   When you are done, summarize what you changed and why in plain text."
 
 post:
-  # Step 0: inspect the diff. Decide push vs no-op vs too-big.
-  # Writes a small JSON report to $workdir/.claude-run-post.json for the next steps.
+  # Step 0: write a decision report for subsequent steps. Post now runs even
+  # when claude failed (timeout, error), so the very first thing is to branch
+  # on $claude_result.ok.
   - |
     #!/usr/bin/env nu
+    let report_file = $"($workdir)/.claude-run-post.json"
+    if ($report_file | path exists) { rm $report_file }
+
+    if not $claude_result.ok {
+        {decision: "claude_failed", files: 0, lines: 0} | to json | save $report_file
+        exit 0
+    }
+
     let max_files = 10
     let max_lines = 300
 
@@ -134,8 +143,6 @@ post:
         "push"
     }
 
-    let report_file = $"($workdir)/.claude-run-post.json"
-    if ($report_file | path exists) { rm $report_file }
     {decision: $decision, files: $files, lines: $lines_changed} | to json | save $report_file
 
   # Step 1: commit and push if decision == push.
@@ -167,7 +174,9 @@ post:
   - |
     #!/usr/bin/env nu
     let report = (open $"($workdir)/.claude-run-post.json")
-    let lines = if $report.decision == "push" {
+    let lines = if $report.decision == "claude_failed" {
+        [$"**Claude run FAILED \(($claude_result.error)\).**", "", "Summary / stream log tail:", $claude_result.summary, "", "No changes were pushed. See the per-attempt stream log on the runner host for full context."]
+    } else if $report.decision == "push" {
         ["**Claude pushed a fix.**", "", $claude_result.summary, "", "CI will re-run on the new commit. Review the diff before merging."]
     } else if $report.decision == "too_big" {
         ["**Claude attempted a fix but the diff is too large for unattended push.**", "", $"Files: ($report.files), Lines: ($report.lines)", "", "Summary:", $claude_result.summary, "", "This needs human review."]

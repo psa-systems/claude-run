@@ -508,14 +508,17 @@ def row-process [
     $state2 = (daily-cost-add $state2 $claude_result.cost)
 
     if not $claude_result.ok {
-        log warn $cfg $name "claude run failed" {key: $key, error: $claude_result.error}
+        log warn $cfg $name "claude run failed (post still runs)" {key: $key, error: $claude_result.error}
         output-record-append $cfg $action {ts: (now-iso), key: $key, attempt: ($attempts + 1), phase: "claude", ok: false, error: $claude_result.error, summary: $claude_result.summary, cost: $claude_result.cost}
-        return (workdir-cleanup $workdir (daily-count-increment (attempt-record $state2 $key)))
+    } else {
+        log info $cfg $name "claude completed" {key: $key, cost: $claude_result.cost}
     }
 
-    log info $cfg $name "claude completed" {key: $key, cost: $claude_result.cost}
-
     # ---- post steps ----
+    # Post runs whenever claude actually ran (success or non-transient failure).
+    # Transient claude errors are handled above with an early return so the row
+    # can be retried cleanly on the next firing. The action's post step is
+    # expected to branch on $claude_result.ok to do success vs failure cleanup.
     let post_bindings = ($base_bindings | merge {claude_result: $claude_result})
     let post_steps = ($action.post? | default [])
     mut post_failed = false
@@ -534,8 +537,8 @@ def row-process [
         ts: (now-iso),
         key: $key,
         attempt: ($attempts + 1),
-        phase: (if $post_failed { "post" } else { "done" }),
-        ok: (not $post_failed),
+        phase: "done",
+        ok: ($claude_result.ok and (not $post_failed)),
         claude_ok: $claude_result.ok,
         claude_cost: $claude_result.cost,
         summary: $claude_result.summary,
