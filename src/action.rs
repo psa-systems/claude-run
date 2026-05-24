@@ -1,7 +1,8 @@
 //! Action YAML loader.
 //!
-//! Schema mirrors `actions/SCHEMA.md`. Snippets stay as opaque strings; the
-//! runner shells out to `nu` to execute them (see `crate::snippet`).
+//! Schema mirrors `actions/SCHEMA.md`. Each script-bearing field holds opaque
+//! code plus an optional interpreter; the runner shells out to that interpreter
+//! (default `nu`) to execute it (see `crate::snippet`).
 
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,58 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+
+/// A script-bearing field (`input.command`, `filter`, each `pre`, `prompt`,
+/// each `post`). Accepted in two forms:
+///
+/// - a plain YAML string (implicit `shell: nu`) for back-compat, or
+/// - a `{run: <code>, shell: <interpreter>}` mapping, following Docker
+///   Compose's `run` / `shell` convention.
+///
+/// `shell` defaults to `nu` when omitted. The interpreter is a bare binary
+/// name resolved on `PATH` (no arguments).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum Script {
+    /// Plain string form: code with the default `nu` interpreter.
+    Plain(String),
+    /// Explicit mapping form: code plus an optional interpreter.
+    Mapping {
+        run: String,
+        #[serde(default)]
+        shell: Option<String>,
+    },
+}
+
+impl Script {
+    /// The code to execute.
+    pub fn code(&self) -> &str {
+        match self {
+            Script::Plain(s) => s,
+            Script::Mapping { run, .. } => run,
+        }
+    }
+
+    /// The declared interpreter, or `None` to use the runner's default (`nu`).
+    pub fn shell(&self) -> Option<&str> {
+        match self {
+            Script::Plain(_) => None,
+            Script::Mapping { shell, .. } => shell.as_deref(),
+        }
+    }
+}
+
+impl From<String> for Script {
+    fn from(s: String) -> Self {
+        Script::Plain(s)
+    }
+}
+
+impl From<&str> for Script {
+    fn from(s: &str) -> Self {
+        Script::Plain(s.to_string())
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -24,18 +77,18 @@ pub struct Action {
     pub dedup_key: Option<String>,
 
     #[serde(default)]
-    pub filter: Option<String>,
+    pub filter: Option<Script>,
 
     #[serde(default)]
-    pub pre: Vec<String>,
+    pub pre: Vec<Script>,
 
-    pub prompt: String,
+    pub prompt: Script,
 
     #[serde(default)]
     pub claude: ClaudeBlock,
 
     #[serde(default)]
-    pub post: Vec<String>,
+    pub post: Vec<Script>,
 
     #[serde(default)]
     pub output: OutputBlock,
@@ -79,6 +132,47 @@ mod tests {
         assert_eq!(render_link("/{repo}/{key}", "PR-42"), "/{repo}/PR-42");
     }
 
+    #[test]
+    fn script_field_accepts_string_and_mapping_forms() {
+        let yaml = r#"
+name: t
+input:
+  command: "echo []"
+filter:
+  run: "exit 0"
+  shell: bash
+pre:
+  - "print pre"
+prompt:
+  run: "print hi"
+post:
+  - run: "echo done"
+    shell: sh
+"#;
+        let action: Action = serde_yaml::from_str(yaml).unwrap();
+
+        // Plain string -> default interpreter (nu).
+        assert_eq!(action.input.command.code(), "echo []");
+        assert_eq!(action.input.command.shell(), None);
+
+        // Mapping with explicit shell.
+        let filter = action.filter.as_ref().unwrap();
+        assert_eq!(filter.code(), "exit 0");
+        assert_eq!(filter.shell(), Some("bash"));
+
+        // List of plain strings.
+        assert_eq!(action.pre[0].code(), "print pre");
+        assert_eq!(action.pre[0].shell(), None);
+
+        // Mapping with omitted shell -> default (nu).
+        assert_eq!(action.prompt.code(), "print hi");
+        assert_eq!(action.prompt.shell(), None);
+
+        // List of mappings.
+        assert_eq!(action.post[0].code(), "echo done");
+        assert_eq!(action.post[0].shell(), Some("sh"));
+    }
+
     const MINIMAL: &str = "name: demo\ninput:\n  command: echo '[]'\nprompt: do the thing\n";
 
     #[test]
@@ -112,7 +206,7 @@ fn default_enabled() -> bool {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputBlock {
-    pub command: String,
+    pub command: Script,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -206,14 +300,14 @@ pub fn validate_str(raw: &str, label: &str) -> Result<LoadedAction> {
             path: label.to_string(),
         });
     }
-    if action.input.command.trim().is_empty() {
+    if action.input.command.code().trim().is_empty() {
         return Err(Error::ActionMissingField {
             name: action.name.clone(),
             field: "input.command".into(),
             path: label.to_string(),
         });
     }
-    if action.prompt.trim().is_empty() {
+    if action.prompt.code().trim().is_empty() {
         return Err(Error::ActionMissingField {
             name: action.name.clone(),
             field: "prompt".into(),

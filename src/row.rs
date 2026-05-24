@@ -110,10 +110,11 @@ pub async fn gather_rows(
         .join(&action.action.name)
         .join("_input");
     let outcome = ctx_snippet.run(
-        &action.action.input.command,
+        action.action.input.command.code(),
         &Bindings::new(),
         &snippet_dir,
         "input",
+        action.action.input.command.shell(),
     )?;
     if !outcome.ok {
         return Err(Error::SnippetFailed {
@@ -156,8 +157,14 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
     bindings.insert("workdir", Value::String(workdir_path.display().to_string()));
 
     // ---- filter ----
-    if let Some(filter) = action.filter.as_deref() {
-        let r = ctx.snippet.run(filter, &bindings, &snippet_dir, "filter")?;
+    if let Some(filter) = action.filter.as_ref() {
+        let r = ctx.snippet.run(
+            filter.code(),
+            &bindings,
+            &snippet_dir,
+            "filter",
+            filter.shell(),
+        )?;
         if !r.ok {
             info!(action = %action.name, key = %key, stderr = %r.stderr, "row filtered out");
             return Ok(ProcessedRow::Filtered { key });
@@ -169,9 +176,13 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
     // ---- pre steps ----
     let mut pre_failed: Option<(usize, i32, String)> = None;
     for (i, step) in action.pre.iter().enumerate() {
-        let r = ctx
-            .snippet
-            .run(step, &bindings, &snippet_dir, &format!("pre-{i}"))?;
+        let r = ctx.snippet.run(
+            step.code(),
+            &bindings,
+            &snippet_dir,
+            &format!("pre-{i}"),
+            step.shell(),
+        )?;
         if !r.ok {
             warn!(action = %action.name, key = %key, step = i, exit_code = r.exit_code, stderr = %r.stderr, "pre step failed (post still runs)");
             pre_failed = Some((i, r.exit_code, r.stderr));
@@ -186,9 +197,13 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
             false,
         )
     } else {
-        let prompt_r = ctx
-            .snippet
-            .run(&action.prompt, &bindings, &snippet_dir, "prompt")?;
+        let prompt_r = ctx.snippet.run(
+            action.prompt.code(),
+            &bindings,
+            &snippet_dir,
+            "prompt",
+            action.prompt.shell(),
+        )?;
         if !prompt_r.ok {
             warn!(action = %action.name, key = %key, exit_code = prompt_r.exit_code, "prompt snippet failed (post still runs)");
             (
@@ -253,9 +268,13 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
 
     let mut post_failed = false;
     for (i, step) in action.post.iter().enumerate() {
-        let r = ctx
-            .snippet
-            .run(step, &post_bindings, &snippet_dir, &format!("post-{i}"))?;
+        let r = ctx.snippet.run(
+            step.code(),
+            &post_bindings,
+            &snippet_dir,
+            &format!("post-{i}"),
+            step.shell(),
+        )?;
         if !r.ok {
             warn!(action = %action.name, key = %key, step = i, exit_code = r.exit_code, stderr = %r.stderr, "post step failed");
             post_failed = true;
