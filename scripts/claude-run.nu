@@ -407,6 +407,16 @@ def row-key [action: record, row: any, idx: int] {
     ($v | into string)
 }
 
+# Remove the per-row workdir at end-of-row. Pass through whatever state value
+# the caller wants to return. Plain `rm -r` (no -f) so permission/read-only
+# issues surface as real errors instead of being silently force-deleted.
+def workdir-cleanup [workdir: string, state: any] {
+    if ($workdir | path exists) {
+        rm -r $workdir
+    }
+    $state
+}
+
 def output-record-append [cfg: record, action: record, record_data: record] {
     let f = ($action.output?.file? | default "")
     if ($f | is-empty) { return }
@@ -466,7 +476,7 @@ def row-process [
         }
     }
     if $step_failed {
-        return (attempt-record $state $key)
+        return (workdir-cleanup $workdir (attempt-record $state $key))
     }
 
     # ---- prompt ----
@@ -474,13 +484,13 @@ def row-process [
     if not $prompt_r.ok {
         log warn $cfg $name "prompt snippet failed" {key: $key, exit_code: $prompt_r.exit_code, stderr: $prompt_r.stderr}
         output-record-append $cfg $action {ts: (now-iso), key: $key, attempt: ($attempts + 1), phase: "prompt", ok: false, stderr: $prompt_r.stderr}
-        return (attempt-record $state $key)
+        return (workdir-cleanup $workdir (attempt-record $state $key))
     }
     let prompt = ($prompt_r.stdout | str trim)
     if ($prompt | is-empty) {
         log warn $cfg $name "prompt snippet produced empty output" {key: $key}
         output-record-append $cfg $action {ts: (now-iso), key: $key, attempt: ($attempts + 1), phase: "prompt", ok: false, stderr: "empty prompt"}
-        return (attempt-record $state $key)
+        return (workdir-cleanup $workdir (attempt-record $state $key))
     }
 
     # ---- claude ----
@@ -492,7 +502,7 @@ def row-process [
     mut state2 = $state
     if $claude_result.transient {
         log info $cfg $name "transient claude error, not counting attempt" {key: $key, error: $claude_result.error}
-        return $state2
+        return (workdir-cleanup $workdir $state2)
     }
 
     $state2 = (daily-cost-add $state2 $claude_result.cost)
@@ -500,7 +510,7 @@ def row-process [
     if not $claude_result.ok {
         log warn $cfg $name "claude run failed" {key: $key, error: $claude_result.error}
         output-record-append $cfg $action {ts: (now-iso), key: $key, attempt: ($attempts + 1), phase: "claude", ok: false, error: $claude_result.error, summary: $claude_result.summary, cost: $claude_result.cost}
-        return (daily-count-increment (attempt-record $state2 $key))
+        return (workdir-cleanup $workdir (daily-count-increment (attempt-record $state2 $key)))
     }
 
     log info $cfg $name "claude completed" {key: $key, cost: $claude_result.cost}
@@ -531,7 +541,7 @@ def row-process [
         summary: $claude_result.summary,
     }
 
-    daily-count-increment (attempt-record $state2 $key)
+    workdir-cleanup $workdir (daily-count-increment (attempt-record $state2 $key))
 }
 
 # ============================================================================
