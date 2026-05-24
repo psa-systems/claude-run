@@ -156,22 +156,38 @@ and outcome (`result`, `is_error`) once claude exits.
 
 ### `post` (list of nu snippets, optional)
 
-Ordered steps executed after Claude returns successfully. Each step has
-`$row`, `$workdir`, `$env`, and `$claude_result` in scope.
+Ordered steps executed after Claude returns. **Post runs whether Claude
+succeeded or failed** (timeout, non-transient error, etc.), so it is the
+right place for end-of-row cleanup that must happen unconditionally. The
+single exception is transient Claude errors (rate limit, auth) - those skip
+post and return early so the row can be retried cleanly on the next firing.
+
+Each step has `$row`, `$workdir`, `$env`, and `$claude_result` in scope.
+The action's post step is expected to branch on `$claude_result.ok` to do
+success vs failure cleanup.
 
 `$claude_result` shape:
 
 ```
 {
-  ok: bool,
-  summary: string,        # claude's final message (from the result event)
-  cost: float,            # total_cost_usd from the result event
-  raw: record,            # the parsed final "result" NDJSON event
+  ok: bool,               # false if claude exited non-zero (timeout, error)
+  summary: string,        # claude's final message on success, error text or
+                          #   stream-log tail on failure
+  cost: float,            # total_cost_usd from the result event (0 if claude
+                          #   never got that far)
+  raw: record,            # the parsed final "result" NDJSON event, or {} on
+                          #   failure before the result event was emitted
+  error: string,          # set on failure, empty on success
+  transient: bool,        # always false at this point - transient is handled
+                          #   before post runs
 }
 ```
 
-Same failure handling as `pre`: a non-zero step logs the failure, counts the
-attempt, and continues to the next row.
+Same step-failure handling as `pre`: if a post step exits non-zero, the
+runner logs the failure, **counts the attempt**, and stops running
+subsequent post steps. The row's overall outcome record (the "done" line in
+the per-action JSONL log) has `ok: false` if either claude or any post step
+failed.
 
 ### `output.file` (string, optional)
 
