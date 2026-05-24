@@ -48,9 +48,15 @@ COPY src ./src
 COPY migrations ./migrations
 COPY templates ./templates
 COPY assets ./assets
+COPY build.rs ./
 
+# Bake build metadata into the binary. build.rs reads these env vars; the
+# workflow passes the real values via --build-arg (CLAUDE-2).
 ARG GIT_SHA=unknown
-RUN echo "GIT_SHA=${GIT_SHA}"
+ARG BUILD_DATE=unknown
+ENV CLAUDE_RUN_GIT_SHA=${GIT_SHA}
+ENV CLAUDE_RUN_BUILD_DATE=${BUILD_DATE}
+RUN echo "CLAUDE_RUN_GIT_SHA=${CLAUDE_RUN_GIT_SHA} CLAUDE_RUN_BUILD_DATE=${CLAUDE_RUN_BUILD_DATE}"
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

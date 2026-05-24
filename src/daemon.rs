@@ -25,7 +25,7 @@ use crate::scheduler::{self, ParsedSchedule};
 use crate::snippet::SnippetRunner;
 use crate::state::{self, ActionIndexRow};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION: &str = crate::VERSION;
 const TICK_SECS: u64 = 5;
 
 pub struct Daemon {
@@ -109,14 +109,20 @@ impl Daemon {
         let scheduler_task = tokio::spawn(scheduler_loop(dispatch.clone(), trigger_tx.clone()));
         let trigger_task = tokio::spawn(trigger_consumer(dispatch.clone(), trigger_rx));
 
-        // Graceful shutdown on SIGINT/SIGTERM.
-        let shutdown = tokio::signal::ctrl_c();
+        // Graceful shutdown on SIGINT (Ctrl-C) or SIGTERM (service managers,
+        // `claude-run stop`). Both fall through to the same cleanup below.
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
         tokio::select! {
             res = server_unix => {
                 warn!(?res, "unix-socket server exited");
             }
-            _ = shutdown => {
-                info!("ctrl-c received, shutting down");
+            _ = sigint.recv() => {
+                info!("SIGINT received, shutting down");
+            }
+            _ = sigterm.recv() => {
+                info!("SIGTERM received, shutting down");
             }
         }
         scheduler_task.abort();
@@ -513,4 +519,67 @@ pub fn daemon_socket_path(paths: &Paths) -> PathBuf {
 
 pub fn daemon_pidfile_path(paths: &Paths) -> PathBuf {
     paths.runtime_dir.join("daemon.pid")
+}
+
+/// Read the PID recorded in the daemon pidfile, if it exists and parses.
+pub fn read_pidfile(paths: &Paths) -> Option<i32> {
+    let contents = std::fs::read_to_string(daemon_pidfile_path(paths)).ok()?;
+    contents.trim().parse::<i32>().ok()
+}
+
+/// True if a process with this PID currently exists, via a `kill(pid, 0)`
+/// probe. `EPERM` (exists but not signalable by us) still counts as alive;
+/// only `ESRCH` means gone.
+pub fn process_alive(pid: i32) -> bool {
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Send SIGTERM to a PID. The daemon handles it gracefully (see `Daemon::run`).
+pub fn send_sigterm(pid: i32) -> std::io::Result<()> {
+    if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Paths;
+
+    fn paths_with_runtime(dir: &std::path::Path) -> Paths {
+        Paths {
+            config_dir: dir.to_path_buf(),
+            data_dir: dir.to_path_buf(),
+            state_dir: dir.to_path_buf(),
+            runtime_dir: dir.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn current_process_is_alive() {
+        assert!(process_alive(std::process::id() as i32));
+    }
+
+    #[test]
+    fn absurd_pid_is_not_alive() {
+        // A PID near the 32-bit max is never allocated on these hosts.
+        assert!(!process_alive(0x7fff_fff0));
+    }
+
+    #[test]
+    fn read_pidfile_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        assert_eq!(read_pidfile(&paths), None);
+        std::fs::write(daemon_pidfile_path(&paths), "12345\n").unwrap();
+        assert_eq!(read_pidfile(&paths), Some(12345));
+        std::fs::write(daemon_pidfile_path(&paths), "not-a-pid").unwrap();
+        assert_eq!(read_pidfile(&paths), None);
+    }
 }
