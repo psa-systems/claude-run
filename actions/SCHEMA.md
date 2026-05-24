@@ -47,6 +47,41 @@ limits:                     # optional per-action overrides of env defaults
   daily_budget_usd: 5.00
 ```
 
+## Script fields: `run` / `shell`
+
+The script-bearing fields (`input.command`, `filter`, each `pre`, `prompt`,
+each `post`) each accept two forms:
+
+- a plain YAML string holding the code (implicit `shell: nu`), or
+- a `{run:, shell:}` mapping, following Docker Compose's `run` / `shell`
+  convention: `run` is the code, `shell` is the interpreter.
+
+`shell` defaults to `nu` when omitted, so existing string-form actions keep
+working unchanged. `shell` is a bare binary name resolved on `PATH` (no
+arguments); e.g. `nu`, `bash`, `sh`.
+
+```yaml
+filter: exit 0                 # string form, runs with nu
+
+prompt:                        # mapping form
+  run: |
+    print $"Work ($row.id)"
+  shell: nu
+
+pre:
+  - run: |                     # this step runs with bash
+      set -euo pipefail
+      echo "$row" | jq -r .id
+    shell: bash
+```
+
+**Bindings across interpreters.** For `nu` (the default), bindings (`$row`,
+`$workdir`, `$claude_result`) are loaded by a generated prelude, exactly as
+before. For any other interpreter the prelude does not apply, so each binding
+is exposed instead as an environment variable of the same name holding the
+compact-JSON value (decode with `jq`): in a `bash` snippet, `$row` is the
+JSON string `{"id":"..."}`.
+
 ## Field reference
 
 ### `name` (string, required)
@@ -303,10 +338,14 @@ $CLAUDE_RUN_STATE_DIR/
 
 ## Snippet execution model
 
-All `input.command`, `filter`, `pre`, `prompt`, and `post` snippets run as
-Nushell code with `nu --commands "$snippet"`.
+`input.command`, `filter`, `pre`, `prompt`, and `post` snippets run with the
+interpreter declared by the field's `shell` (see
+[Script fields: `run` / `shell`](#script-fields-run--shell)), defaulting to
+Nushell. The runner writes the code to a file and executes
+`<interpreter> <file>`.
 
-Bindings available to snippets:
+Bindings available to snippets (the `$`-prefixed nu names below; under a
+non-nu `shell` the same names are environment variables holding compact JSON):
 
 | Binding          | `input.command` | `filter` | `pre` | `prompt` | `post` |
 |------------------|:---------------:|:--------:|:-----:|:--------:|:------:|

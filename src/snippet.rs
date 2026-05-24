@@ -52,36 +52,66 @@ impl SnippetRunner {
         }
     }
 
-    /// Write the snippet (with a binding-loading prelude) to `<snippet_dir>/<phase>.nu`
-    /// and execute it. Bindings are stored in sibling JSON files.
+    /// Write the snippet to `<snippet_dir>/<phase>.<ext>` and execute it with
+    /// the declared interpreter. `shell` is the per-field interpreter from the
+    /// action's `{run:, shell:}` mapping; `None` (or `"nu"`) selects the
+    /// runner's configured nu binary.
+    ///
+    /// For `nu`, bindings are written to sibling JSON files and loaded by a
+    /// generated prelude (`let <name> = (open --raw '<path>' | from json)`).
+    /// For any other interpreter the prelude does not apply, so each binding is
+    /// exposed instead as an environment variable named after the binding,
+    /// holding the compact-JSON value (e.g. `$row`, `$workdir` in a bash
+    /// snippet, decode with `jq`).
     pub fn run(
         &self,
         body: &str,
         bindings: &Bindings,
         snippet_dir: &Path,
         phase: &str,
+        shell: Option<&str>,
     ) -> Result<SnippetOutcome> {
         std::fs::create_dir_all(snippet_dir)?;
 
+        // None or "nu" -> configured nu binary; anything else is the literal
+        // interpreter resolved on PATH.
+        let is_nu = matches!(shell, None | Some("nu"));
+        let interpreter: &str = if is_nu {
+            self.nu_binary.as_str()
+        } else {
+            shell.unwrap()
+        };
+
         let mut prelude = String::new();
+        let mut env_bindings: Vec<(String, String)> = Vec::new();
         for (name, value) in &bindings.values {
-            let val_path = snippet_dir.join(format!("binding-{name}.json"));
             let json = serde_json::to_string(value)?;
-            std::fs::write(&val_path, json)?;
-            // Each binding becomes: let <name> = (open --raw '<path>' | from json)
-            prelude.push_str(&format!(
-                "let {name} = (open --raw '{path}' | from json)\n",
-                name = name,
-                path = val_path.display(),
-            ));
+            if is_nu {
+                let val_path = snippet_dir.join(format!("binding-{name}.json"));
+                std::fs::write(&val_path, &json)?;
+                // Each binding becomes: let <name> = (open --raw '<path>' | from json)
+                prelude.push_str(&format!(
+                    "let {name} = (open --raw '{path}' | from json)\n",
+                    name = name,
+                    path = val_path.display(),
+                ));
+            } else {
+                env_bindings.push((name.clone(), json));
+            }
         }
 
-        let script_path = snippet_dir.join(format!("{phase}.nu"));
-        let script = format!("{prelude}\n{body}");
+        let ext = if is_nu { "nu" } else { "script" };
+        let script_path = snippet_dir.join(format!("{phase}.{ext}"));
+        let script = if is_nu {
+            format!("{prelude}\n{body}")
+        } else {
+            body.to_string()
+        };
         std::fs::write(&script_path, script)?;
 
-        let output = Command::new(&self.nu_binary)
+        let output = Command::new(interpreter)
             .arg(&script_path)
+            .envs(env_bindings)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -115,7 +145,7 @@ mod tests {
         let mut b = Bindings::new();
         b.insert("row", json!({"id": "hello"}));
         let out = runner
-            .run(r#"print $row.id"#, &b, dir.path(), "test")
+            .run(r#"print $row.id"#, &b, dir.path(), "test", None)
             .unwrap();
         assert!(out.ok, "stderr: {}", out.stderr);
         assert!(out.stdout.trim() == "hello", "got {:?}", out.stdout);
@@ -126,9 +156,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let runner = SnippetRunner::new(None);
         let out = runner
-            .run(r#"exit 7"#, &Bindings::new(), dir.path(), "fail")
+            .run(r#"exit 7"#, &Bindings::new(), dir.path(), "fail", None)
             .unwrap();
         assert!(!out.ok);
         assert_eq!(out.exit_code, 7);
+    }
+
+    #[test]
+    fn snippet_dispatches_to_declared_shell() {
+        let dir = tempdir().unwrap();
+        let runner = SnippetRunner::new(None);
+        // Non-nu interpreter: bindings arrive as env vars holding compact JSON.
+        let mut b = Bindings::new();
+        b.insert("row", json!({"id": "hello"}));
+        let out = runner
+            .run(r#"echo "$row""#, &b, dir.path(), "test", Some("bash"))
+            .unwrap();
+        assert!(out.ok, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout.trim(), r#"{"id":"hello"}"#);
     }
 }
