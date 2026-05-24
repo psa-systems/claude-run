@@ -2,6 +2,12 @@
 {% block title %}{{ action.name }} - claude-run{% endblock %}
 {% block main %}
 
+<div id="poll-region"
+     hx-get="/actions/{{ action.name }}"
+     hx-trigger="every 5s, refreshNow from:body"
+     hx-select="#poll-region"
+     hx-swap="outerHTML">
+
 <h2>{{ action.name }}</h2>
 
 <div class="card">
@@ -19,15 +25,24 @@
     {% endif %}
   </dl>
   <div class="row-actions" style="margin-top: 16px;">
-    <form hx-post="/api/actions/{{ action.name }}/trigger" hx-swap="none">
+    <form hx-post="/api/actions/{{ action.name }}/trigger"
+          hx-swap="none"
+          hx-disabled-elt="find button"
+          hx-on::after-request="htmx.trigger('body', 'refreshNow')">
       <button class="btn">Trigger now</button>
     </form>
     {% if paused.is_some() %}
-      <form hx-post="/api/actions/{{ action.name }}/resume" hx-swap="none">
+      <form hx-post="/api/actions/{{ action.name }}/resume"
+            hx-swap="none"
+            hx-disabled-elt="find button"
+            hx-on::after-request="htmx.trigger('body', 'refreshNow')">
         <button class="btn">Resume</button>
       </form>
     {% else %}
-      <form hx-post="/api/actions/{{ action.name }}/pause" hx-swap="none">
+      <form hx-post="/api/actions/{{ action.name }}/pause"
+            hx-swap="none"
+            hx-disabled-elt="find button"
+            hx-on::after-request="htmx.trigger('body', 'refreshNow')">
         <button class="btn">Pause</button>
       </form>
     {% endif %}
@@ -60,5 +75,7 @@
     </tbody>
   </table>
 {% endif %}
+
+</div><!-- /#poll-region -->
 
 {% endblock %}

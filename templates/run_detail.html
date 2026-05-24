@@ -2,6 +2,15 @@
 {% block title %}run #{{ run.id }} - claude-run{% endblock %}
 {% block main %}
 
+{# Run detail polls faster (2s) than the dashboard because a run in progress
+   should feel live. The polling div re-fetches this same URL and swaps just
+   its own subtree via hx-select. #}
+<div id="poll-region"
+     hx-get="/runs/{{ run.id }}"
+     hx-trigger="every 2s, refreshNow from:body"
+     hx-select="#poll-region"
+     hx-swap="outerHTML">
+
 <h2>Run #{{ run.id }} - {{ run.action_name }}</h2>
 
 <div class="card">
@@ -62,5 +71,7 @@
     </tbody>
   </table>
 {% endif %}
+
+</div><!-- /#poll-region -->
 
 {% endblock %}
