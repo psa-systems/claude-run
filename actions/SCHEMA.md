@@ -118,8 +118,12 @@ nu snippet with `$row`, `$workdir`, and `$env` in scope. Steps share the
 runner's working directory unless they `cd` themselves.
 
 If a step exits non-zero, the runner logs the failure, **counts the attempt**,
-and moves on to the next row. (Poison rows eventually hit the attempt cap and
-stop being retried.)
+skips remaining pre steps, skips the prompt + claude invocation, and **still
+runs post steps** so the action can roll back any side effects an earlier
+pre step had (e.g. resetting an external state field that pre step 0 set).
+Post receives a synthesized `$claude_result` with `ok: false`, an `error`
+field naming the failed pre step, and the step's stderr as `summary`.
+Poison rows eventually hit the per-key attempt cap and stop being retried.
 
 ### `prompt` (nu snippet, required)
 
@@ -156,13 +160,20 @@ and outcome (`result`, `is_error`) once claude exits.
 
 ### `post` (list of nu snippets, optional)
 
-Ordered steps executed after Claude returns. **Post runs whether Claude
-succeeded or failed** (timeout, non-transient error, etc.), so it is the
-right place for end-of-row cleanup that must happen unconditionally. The
-single exception is transient Claude errors (rate limit, auth) - those skip
-post and return early so the row can be retried cleanly on the next firing.
+Ordered steps that run after every code path that reached the workdir:
+Claude success, Claude non-transient failure, prompt-snippet failure,
+empty-prompt, and pre-step failure all run post. The single exception is
+transient Claude errors (rate limit, auth) - those skip post and return
+early so the row can be retried cleanly on the next firing.
+
+This makes post the right place for end-of-row cleanup that must happen
+unconditionally - resetting an external state field, posting a status
+comment, releasing a soft lock, etc.
 
 Each step has `$row`, `$workdir`, `$env`, and `$claude_result` in scope.
+On pre/prompt failure `$claude_result` is synthesized (`ok: false`,
+`error` names the failing phase, `summary` carries the step stderr) so
+post sees a uniform shape regardless of which upstream step failed.
 The action's post step is expected to branch on `$claude_result.ok` to do
 success vs failure cleanup.
 
