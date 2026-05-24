@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}{{ heading }} - claude-run{% endblock %}
+{% block main %}
+
+<h2>{{ heading }}</h2>
+
+{% if let Some(e) = error %}
+<div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
+  <strong style="color: var(--bad);">Not saved - validation failed</strong>
+  <pre class="stream" style="max-height: 240px; margin: 8px 0 0;">{{ e }}</pre>
+</div>
+{% endif %}
+
+{% if is_new %}
+<div class="card" style="margin-bottom: 16px;">
+  <span class="dim">Paste an action's YAML below to import it. The file is saved as
+  <code>actions/&lt;name&gt;.yml</code> using the <code>name:</code> field and is rejected if it
+  does not validate or already exists.</span>
+</div>
+{% endif %}
+
+<form method="post" action="{{ post_url }}">
+  <textarea name="yaml" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off"
+            style="width: 100%; min-height: 480px; background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 12px; font-family: var(--mono); font-size: 13px; line-height: 1.45;">{{ yaml }}</textarea>
+  <div class="row-actions" style="margin-top: 12px;">
+    <button class="btn" type="submit">Save</button>
+    {% if let Some(n) = name %}
+      <a class="btn" href="/actions/{{ n }}">Cancel</a>
+      <a class="btn" href="/actions/{{ n }}/export">Export</a>
+    {% else %}
+      <a class="btn" href="/">Cancel</a>
+    {% endif %}
+  </div>
+</form>
+
+{% endblock %}

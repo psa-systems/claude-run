@@ -78,6 +78,31 @@ mod tests {
     fn render_link_leaves_unknown_tokens_alone() {
         assert_eq!(render_link("/{repo}/{key}", "PR-42"), "/{repo}/PR-42");
     }
+
+    const MINIMAL: &str = "name: demo\ninput:\n  command: echo '[]'\nprompt: do the thing\n";
+
+    #[test]
+    fn validate_str_accepts_minimal_action() {
+        let loaded = validate_str(MINIMAL, "<candidate>").expect("valid");
+        assert_eq!(loaded.action.name, "demo");
+        assert_eq!(loaded.yaml_sha256.len(), 64);
+    }
+
+    #[test]
+    fn validate_str_rejects_missing_prompt() {
+        let raw = "name: demo\ninput:\n  command: echo '[]'\nprompt: \"\"\n";
+        let err = validate_str(raw, "<candidate>").unwrap_err();
+        assert!(matches!(err, Error::ActionMissingField { field, .. } if field == "prompt"));
+    }
+
+    #[test]
+    fn validate_str_rejects_unknown_field() {
+        let raw = format!("{MINIMAL}bogus: nope\n");
+        assert!(matches!(
+            validate_str(&raw, "<candidate>").unwrap_err(),
+            Error::Yaml(_)
+        ));
+    }
 }
 
 fn default_enabled() -> bool {
@@ -158,7 +183,19 @@ pub fn resolve_action_path(arg: &str, actions_dir: &Path) -> Option<PathBuf> {
 
 pub fn load_from_path(path: &Path) -> Result<LoadedAction> {
     let raw = std::fs::read_to_string(path)?;
-    let action: Action = serde_yaml::from_str(&raw)?;
+    let mut loaded = validate_str(&raw, &path.display().to_string())?;
+    loaded.path = path.to_path_buf();
+    Ok(loaded)
+}
+
+/// Validate raw YAML as an [`Action`] without touching disk, computing the
+/// same sha256 provenance [`load_from_path`] does. `label` names the candidate
+/// source in error messages (e.g. the would-be file path); the returned
+/// `path` is set to it but callers that persist should overwrite it with the
+/// real destination. Used by the web UI to reject broken YAML before it ever
+/// reaches `actions/<name>.yml`.
+pub fn validate_str(raw: &str, label: &str) -> Result<LoadedAction> {
+    let action: Action = serde_yaml::from_str(raw)?;
 
     // Required-field validation that goes beyond what serde catches with
     // `#[serde(deny_unknown_fields)]` (which already catches typos).
@@ -166,21 +203,21 @@ pub fn load_from_path(path: &Path) -> Result<LoadedAction> {
         return Err(Error::ActionMissingField {
             name: "(unnamed)".into(),
             field: "name".into(),
-            path: path.display().to_string(),
+            path: label.to_string(),
         });
     }
     if action.input.command.trim().is_empty() {
         return Err(Error::ActionMissingField {
             name: action.name.clone(),
             field: "input.command".into(),
-            path: path.display().to_string(),
+            path: label.to_string(),
         });
     }
     if action.prompt.trim().is_empty() {
         return Err(Error::ActionMissingField {
             name: action.name.clone(),
             field: "prompt".into(),
-            path: path.display().to_string(),
+            path: label.to_string(),
         });
     }
 
@@ -190,7 +227,7 @@ pub fn load_from_path(path: &Path) -> Result<LoadedAction> {
 
     Ok(LoadedAction {
         action,
-        path: path.to_path_buf(),
+        path: PathBuf::from(label),
         yaml_sha256,
     })
 }
