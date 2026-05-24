@@ -307,56 +307,86 @@ def snippet-run [
 # CLAUDE INVOCATION
 # ============================================================================
 
+# Invoke claude with streaming NDJSON output. Each event lands in $stream_log
+# as a separate line, so `tail -f` shows progress live from another terminal.
+# After claude exits, parses the final "result" event for cost + summary +
+# is_error. Same return shape as before.
 def claude-invoke [
     prompt: string,
     claude_cfg: record,
     timeout_s: int,
     default_cwd: string,
+    stream_log: string,
 ] {
     let cwd = ($claude_cfg.cwd? | default $default_cwd)
     let allowed_tools = ($claude_cfg.allowed_tools? | default "Read,Edit,Write,Bash,Glob,Grep")
     let permission_mode = ($claude_cfg.permission_mode? | default "acceptEdits")
-    let output_format = ($claude_cfg.output_format? | default "json")
 
+    dir-ensure ($stream_log | path dirname)
+    if ($stream_log | path exists) { rm $stream_log }
     cd $cwd
 
-    let result = (do {
-        ^timeout $timeout_s claude --print --permission-mode $permission_mode --allowed-tools $allowed_tools --output-format $output_format $prompt
-    } | complete)
+    # `null |` upstream gives claude an empty stdin. Without it, nu does not
+    # connect a stdin source for the external command and claude --print waits
+    # several seconds for stdin data before erroring out (it ignores the prompt
+    # arg in that mode).
+    #
+    # `--allowed-tools` is variadic in claude's CLI parser: any positional arg
+    # immediately after it gets swallowed as another tool name. Using
+    # `--allowed-tools=VAL` form prevents that so the trailing $prompt stays a
+    # positional arg. Same for --permission-mode.
+    #
+    # `o+e>| save` merges stdout+stderr into a pipeline and writes the result
+    # to the stream log. (Direct `o+e> $file` is incompatible with `timeout`
+    # in nu 0.112.2 and prevents claude from seeing its prompt arg.)
+    #
+    # `complete` does not work with a redirected pipeline, so we swallow nu's
+    # non-zero-exit error via try/catch and read `$env.LAST_EXIT_CODE` to
+    # recover the exit code.
+    let perm_flag = $"--permission-mode=($permission_mode)"
+    let tools_flag = $"--allowed-tools=($allowed_tools)"
+    try {
+        null | ^timeout $timeout_s claude --print --verbose --output-format stream-json $perm_flag $tools_flag $prompt o+e>| save $stream_log
+    } catch { }
+    let exit_code = $env.LAST_EXIT_CODE
 
-    if $result.exit_code != 0 {
-        let stderr_text = ($result.stderr | default "")
-        let stdout_text = ($result.stdout | default "")
-        let combined = $"($stderr_text)\n($stdout_text)"
-        let is_rate_limit = ($combined | str contains --ignore-case "rate limit") or ($combined | str contains --ignore-case "usage limit")
-        let is_auth = ($combined | str contains --ignore-case "unauthorized") or ($combined | str contains --ignore-case "authentication")
+    # Parse the last non-empty NDJSON line for the final "result" event.
+    let lines = (try { open --raw $stream_log | lines | where ($it | str trim | is-not-empty) } catch { [] })
+    let last_line = if ($lines | is-empty) { "" } else { $lines | last }
+    let final_event = (try { $last_line | from json } catch { {} })
+
+    if $exit_code != 0 {
+        let stream_tail = (try { open --raw $stream_log | str substring 0..2000 } catch { "" })
+        let is_rate_limit = ($stream_tail | str contains --ignore-case "rate limit") or ($stream_tail | str contains --ignore-case "usage limit")
+        let is_auth = ($stream_tail | str contains --ignore-case "unauthorized") or ($stream_tail | str contains --ignore-case "authentication")
         return {
             ok: false,
-            summary: $combined,
-            cost: 0.0,
-            raw: {},
-            error: $"claude exited ($result.exit_code)",
+            summary: $stream_tail,
+            cost: ($final_event | get -o total_cost_usd | default 0.0 | into float),
+            raw: $final_event,
+            error: $"claude exited ($exit_code), see ($stream_log)",
             transient: ($is_rate_limit or $is_auth),
         }
     }
 
-    let parsed = (try { $result.stdout | from json } catch {
+    let event_type = ($final_event | get -o type | default "")
+    if $event_type != "result" {
         return {
             ok: false,
-            summary: ($result.stdout | default ""),
+            summary: (try { open --raw $stream_log } catch { "" }),
             cost: 0.0,
-            raw: {},
-            error: "claude output was not valid JSON",
+            raw: $final_event,
+            error: $"claude stream did not end with a result event, see ($stream_log)",
             transient: false,
         }
-    })
+    }
 
     {
-        ok: (not ($parsed.is_error? | default false)),
-        summary: ($parsed.result? | default ""),
-        cost: ($parsed.total_cost_usd? | default 0.0 | into float),
-        raw: $parsed,
-        error: ($parsed.error? | default ""),
+        ok: (not ($final_event.is_error? | default false)),
+        summary: ($final_event.result? | default ""),
+        cost: ($final_event.total_cost_usd? | default 0.0 | into float),
+        raw: $final_event,
+        error: ($final_event.error? | default ""),
         transient: false,
     }
 }
@@ -455,7 +485,9 @@ def row-process [
 
     # ---- claude ----
     let claude_cfg = ($action.claude? | default {})
-    let claude_result = (claude-invoke $prompt $claude_cfg $limits.claude_timeout_seconds $workdir)
+    let stream_log = $"($cfg.log_dir)/($name)/streams/($key)-attempt-(($attempts) + 1).jsonl"
+    log info $cfg $name "invoking claude (stream log)" {key: $key, stream_log: $stream_log}
+    let claude_result = (claude-invoke $prompt $claude_cfg $limits.claude_timeout_seconds $workdir $stream_log)
 
     mut state2 = $state
     if $claude_result.transient {

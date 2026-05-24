@@ -141,9 +141,18 @@ Tuning for the `claude` CLI call. All keys are optional.
 | `cwd`             | per-row `$workdir`                       | Working directory for the claude process. Plain string.   |
 | `allowed_tools`   | `Read,Edit,Write,Bash,Glob,Grep`         | Passed as `--allowed-tools`.                              |
 | `permission_mode` | `acceptEdits`                            | Passed as `--permission-mode`.                            |
-| `output_format`   | `json`                                   | Passed as `--output-format`. Runner expects JSON for cost accounting. |
 
-The runner always wraps the call in `timeout $claude_timeout_seconds`.
+The runner always passes `--print --verbose --output-format stream-json`. It
+wraps the call in `timeout $claude_timeout_seconds`. Stdout+stderr are
+redirected to a per-row NDJSON stream log:
+
+```
+$CLAUDE_RUN_LOG_DIR/<name>/streams/<key>-attempt-<n>.jsonl
+```
+
+`tail -f` that file from another terminal to watch Claude work in real time.
+The final `result` event on the last line is parsed for cost (`total_cost_usd`)
+and outcome (`result`, `is_error`) once claude exits.
 
 ### `post` (list of nu snippets, optional)
 
@@ -155,9 +164,9 @@ Ordered steps executed after Claude returns successfully. Each step has
 ```
 {
   ok: bool,
-  summary: string,        # claude's final message
-  cost: float,            # total_cost_usd from claude json output
-  raw: record,            # the parsed claude json response
+  summary: string,        # claude's final message (from the result event)
+  cost: float,            # total_cost_usd from the result event
+  raw: record,            # the parsed final "result" NDJSON event
 }
 ```
 
@@ -206,6 +215,7 @@ $CLAUDE_RUN_STATE_DIR/
   state/<name>.json            # {attempts, daily_count, daily_cost_usd}
   logs/<name>/YYYY-MM-DD.log   # JSONL runner log
   logs/<name>/<output.file>    # JSONL per-row outcomes if output.file set
+  logs/<name>/streams/<key>-attempt-<n>.jsonl  # claude stream-json output per attempt
 ```
 
 `state/<name>.json` shape:
