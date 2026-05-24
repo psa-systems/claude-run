@@ -23,7 +23,9 @@ workdir_base: $"($nu.home-dir | path join workspace)"
 input:
   command: |
     #!/usr/bin/env nu
-    let issues_raw = (^yt list --query '-Resolved AI Agent: Queued' --json | complete)
+    # --query=VAL (not --query VAL): the YouTrack query starts with `-Resolved`
+    # which clap would otherwise read as an unknown short flag and bail.
+    let issues_raw = (^yt list --query='-Resolved AI Agent: Queued' --json | complete)
     if $issues_raw.exit_code != 0 {
         print --stderr $"yt list failed: ($issues_raw.stderr)"
         exit 1
