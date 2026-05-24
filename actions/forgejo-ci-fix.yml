@@ -1,4 +1,6 @@
 ---
+# yaml-embedded-languages: nushell
+
 # Unattended Claude Code fix for failing CI on Forgejo PRs.
 #
 # Ports the original scripts/claude-run.nu (pre-refactor) behavior to the
