@@ -579,6 +579,15 @@ def row-process [
         }
     }
 
+    # Per-key attempt count is skipped if the action's post step wrote the
+    # marker at $workdir/.claude-run-skip-attempt. Intended for outcomes that
+    # park the row pending external input ("blocker") rather than failing it:
+    # the row is not broken, so it should not consume one of its max_attempts
+    # slots. Daily Claude-invocation count still increments when claude ran
+    # (the run cost real budget).
+    let skip_marker = $"($workdir)/.claude-run-skip-attempt"
+    let skip_attempt = ($skip_marker | path exists)
+
     output-record-append $cfg $action {
         ts: (now-iso),
         key: $key,
@@ -586,15 +595,17 @@ def row-process [
         phase: "done",
         ok: ($claude_result.ok and (not $post_failed)),
         claude_ran: $claude_ran,
-        claude_ok: $claude_result.ok,
         claude_cost: $claude_result.cost,
+        attempt_counted: (not $skip_attempt),
+        claude_ok: $claude_result.ok,
         summary: $claude_result.summary,
     }
 
-    # Only count toward the per-day Claude-invocation cap when claude actually
-    # ran. Pre/prompt failures still count toward the per-key attempt cap so
-    # poison rows eventually get skipped.
-    let state_with_attempt = (attempt-record $state2 $key)
+    if $skip_attempt {
+        log info $cfg $name "skip-attempt marker present, not counting attempt" {key: $key}
+    }
+
+    let state_with_attempt = if $skip_attempt { $state2 } else { (attempt-record $state2 $key) }
     let final_state = if $claude_ran {
         daily-count-increment $state_with_attempt
     } else {

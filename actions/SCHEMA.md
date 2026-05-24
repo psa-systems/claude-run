@@ -200,6 +200,35 @@ subsequent post steps. The row's overall outcome record (the "done" line in
 the per-action JSONL log) has `ok: false` if either claude or any post step
 failed.
 
+#### Skip-attempt marker (parked / blocker outcomes)
+
+By default every row processed past pre counts toward `max_attempts_per_key`.
+A post step can opt this row out of attempt counting by writing a sentinel
+file:
+
+```nu
+touch $"($workdir)/.claude-run-skip-attempt"
+```
+
+The runner checks for that file after the post loop. If present, the
+per-key attempt counter is **not** incremented. Daily Claude-invocation
+count still increments when claude actually ran (real budget was spent).
+
+Use this for outcomes where the row is **parked pending external input**,
+not failed:
+
+- The work depends on information that has to come from a human.
+- The work depends on another issue that has to land first.
+- The work was deliberately deferred (out of scope, wrong priority).
+
+Do **not** use it for hard failures (timeout, exception, claude can't even
+investigate). Those should consume an attempt slot so poison rows eventually
+stop being retried.
+
+The `done` outcome record gains an `attempt_counted: bool` field reflecting
+the runner's decision, so downstream tooling can see at a glance which rows
+were parked vs failed.
+
 ### `output.file` (string, optional)
 
 If set, the runner appends one JSON line per row to
