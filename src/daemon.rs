@@ -108,12 +108,16 @@ fn pidfile_lock(pidfile: &Path) -> Result<std::fs::File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(pidfile)?;
     fs2::FileExt::try_lock_exclusive(&f).map_err(|e| {
         if e.kind() == std::io::ErrorKind::WouldBlock {
-            anyhow::anyhow!("another claude-run daemon already holds {}", pidfile.display())
-                .into()
+            anyhow::anyhow!(
+                "another claude-run daemon already holds {}",
+                pidfile.display()
+            )
+            .into()
         } else {
             crate::error::Error::Io(e)
         }
@@ -374,7 +378,10 @@ pub async fn run_action_inner(
     Ok(())
 }
 
-async fn scheduler_loop(dispatch: Arc<Dispatcher>, _trigger_tx: mpsc::Sender<String>) -> Result<()> {
+async fn scheduler_loop(
+    dispatch: Arc<Dispatcher>,
+    _trigger_tx: mpsc::Sender<String>,
+) -> Result<()> {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(TICK_SECS));
     loop {
         ticker.tick().await;
@@ -426,9 +433,14 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
         if matches!(parsed, ParsedSchedule::Manual) {
             continue;
         }
-        let last_started: Option<DateTime<Utc>> = state::action_last_run_started(&dispatch.pool, &r.name)
-            .await?
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
+        let last_started: Option<DateTime<Utc>> =
+            state::action_last_run_started(&dispatch.pool, &r.name)
+                .await?
+                .and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc))
+                });
         if scheduler::next_fire_due(&parsed, last_started, now).is_some() {
             info!(action = %r.name, "scheduler firing");
             dispatch.clone().dispatch(r.name.clone(), "scheduler").await;
@@ -437,10 +449,7 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
     Ok(())
 }
 
-async fn trigger_consumer(
-    dispatch: Arc<Dispatcher>,
-    mut rx: mpsc::Receiver<String>,
-) -> Result<()> {
+async fn trigger_consumer(dispatch: Arc<Dispatcher>, mut rx: mpsc::Receiver<String>) -> Result<()> {
     while let Some(name) = rx.recv().await {
         info!(action = %name, "trigger received");
         dispatch.clone().dispatch(name, "trigger").await;

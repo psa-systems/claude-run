@@ -35,7 +35,8 @@ impl Paths {
             state_dir: resolve_dir("CLAUDE_RUN_STATE_DIR", dirs::state_dir(), "claude-run")?,
             runtime_dir: resolve_dir(
                 "CLAUDE_RUN_RUNTIME_DIR",
-                dirs::runtime_dir().or_else(|| Some(std::env::temp_dir().join("claude-run-runtime"))),
+                dirs::runtime_dir()
+                    .or_else(|| Some(std::env::temp_dir().join("claude-run-runtime"))),
                 "claude-run",
             )?,
         })
@@ -66,8 +67,8 @@ fn resolve_dir(env_var: &str, xdg_default: Option<PathBuf>, subdir: &str) -> Res
     if let Ok(raw) = std::env::var(env_var) {
         return Ok(PathBuf::from(expand_path(&raw)));
     }
-    let base = xdg_default
-        .ok_or_else(|| anyhow::anyhow!("could not resolve XDG dir for {}", env_var))?;
+    let base =
+        xdg_default.ok_or_else(|| anyhow::anyhow!("could not resolve XDG dir for {}", env_var))?;
     Ok(base.join(subdir))
 }
 
@@ -121,8 +122,8 @@ impl OnDiskConfig {
             return Ok(Self::default());
         }
         let raw = std::fs::read_to_string(&f)?;
-        let cfg: Self = toml::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("parsing {}: {}", f.display(), e))?;
+        let cfg: Self =
+            toml::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing {}: {}", f.display(), e))?;
         Ok(cfg)
     }
 }

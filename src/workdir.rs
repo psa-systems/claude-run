@@ -17,10 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{expand_path, Paths};
 
-pub fn resolve_workdir_base(
-    action_workdir_base: Option<&str>,
-    paths: &Paths,
-) -> PathBuf {
+pub fn resolve_workdir_base(action_workdir_base: Option<&str>, paths: &Paths) -> PathBuf {
     if let Some(raw) = action_workdir_base {
         return PathBuf::from(expand_path(raw));
     }

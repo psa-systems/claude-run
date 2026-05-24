@@ -22,8 +22,8 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     pub fn new(socket_path: &Path) -> Self {
-        let client = Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build(hyperlocal::UnixConnector);
+        let client =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build(hyperlocal::UnixConnector);
         Self {
             socket_path: socket_path.to_path_buf(),
             client,
@@ -72,9 +72,7 @@ impl DaemonClient {
     }
 }
 
-async fn read_json<T: DeserializeOwned>(
-    resp: hyper::Response<hyper::body::Incoming>,
-) -> Result<T> {
+async fn read_json<T: DeserializeOwned>(resp: hyper::Response<hyper::body::Incoming>) -> Result<T> {
     let status = resp.status();
     let body = resp
         .into_body()

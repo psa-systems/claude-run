@@ -22,7 +22,9 @@ use crate::error::Result;
 #[derive(Debug, Clone)]
 pub enum ParsedSchedule {
     Interval(Duration),
-    Cron(cron::Schedule),
+    // Boxed because cron::Schedule is ~1KB while the other variants are tiny;
+    // clippy::large_enum_variant otherwise.
+    Cron(Box<cron::Schedule>),
     Manual,
 }
 
@@ -53,7 +55,7 @@ pub fn parse_schedule(s: &Schedule) -> Result<ParsedSchedule> {
             };
             let sched = cron::Schedule::from_str(&normalized)
                 .map_err(|e| anyhow::anyhow!("cron spec `{spec}`: {e}"))?;
-            Ok(ParsedSchedule::Cron(sched))
+            Ok(ParsedSchedule::Cron(Box::new(sched)))
         }
     }
 }
@@ -79,10 +81,7 @@ pub fn next_fire_due(
         }
         ParsedSchedule::Cron(sched) => {
             let after = last_run_started.unwrap_or(now - chrono::Duration::seconds(1));
-            sched
-                .after(&after)
-                .next()
-                .filter(|t| *t <= now)
+            sched.after(&after).next().filter(|t| *t <= now)
         }
     }
 }
@@ -116,7 +115,12 @@ mod tests {
     fn manual_never_fires() {
         let s = ParsedSchedule::Manual;
         assert!(next_fire_due(&s, None, ts("2026-01-01T00:00:00Z")).is_none());
-        assert!(next_fire_due(&s, Some(ts("2025-01-01T00:00:00Z")), ts("2030-01-01T00:00:00Z")).is_none());
+        assert!(next_fire_due(
+            &s,
+            Some(ts("2025-01-01T00:00:00Z")),
+            ts("2030-01-01T00:00:00Z")
+        )
+        .is_none());
     }
 
     #[test]
