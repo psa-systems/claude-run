@@ -262,10 +262,14 @@ Bindings available to snippets:
 `$workdir` is `<workdir_base>/<name>/<dedup_key-or-row-index>`, where
 `workdir_base` is the action's `workdir_base` field if set, else
 `$CLAUDE_RUN_WORKDIR_BASE`, else `/tmp/claude-run`. The runner creates it
-before the first `pre` step and does not clean it up; if a prior attempt
-left state behind the next `pre` step (typically `git clone`) is expected
-to fail naturally, which trips the per-key attempt counter so a human can
-investigate.
+before the first `pre` step and **removes it at end of row regardless of
+outcome** (success, claude failure, pre/post step failure, transient error).
+Plain `rm -r` is used, not `rm -rf`, so permission or read-only issues
+surface as real errors instead of being silently force-deleted.
+
+To inspect what happened in a failed run, look at the per-attempt stream log
+(`$CLAUDE_RUN_LOG_DIR/<name>/streams/<key>-attempt-<n>.jsonl`); it survives
+across runs since it lives outside `$workdir`.
 
 For `filter` and `pre`/`post`, exit code 0 = continue, non-zero = step
 failure (skip row, count attempt). The snippet's stdout is captured into the
