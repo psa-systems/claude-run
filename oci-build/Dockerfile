@@ -33,11 +33,21 @@ RUN mkdir -p src/bin \
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release --locked \
-    && rm -rf src target/release/deps/claude_run* target/release/deps/claude-run*
+    && rm -rf src \
+       target/release/deps/libclaude_run* \
+       target/release/deps/claude_run* \
+       target/release/deps/claude-run* \
+       target/release/.fingerprint/claude_run-* \
+       target/release/.fingerprint/claude-run-*
 
-# Real source + migrations + actions (the binary embeds migrations via sqlx::migrate!).
+# Real source + migrations + templates + assets. The binary embeds, all at
+# compile time: migrations via sqlx::migrate!, the web UI's askama templates
+# via #[template(path = ...)], and assets/htmx.min.js via include_bytes!. All
+# resolve from these crate-root directories, so each must be present.
 COPY src ./src
 COPY migrations ./migrations
+COPY templates ./templates
+COPY assets ./assets
 COPY build.rs ./
 
 # Bake build metadata into the binary. build.rs reads these env vars; the
