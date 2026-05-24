@@ -29,6 +29,7 @@ pub mod row;
 pub mod scheduler;
 pub mod snippet;
 pub mod state;
+pub mod web;
 pub mod workdir;
 
 /// Exit codes match the previous nu implementation so existing cron and

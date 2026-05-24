@@ -61,15 +61,42 @@ impl Daemon {
         let snippet = SnippetRunner::new(self.on_disk.daemon.nu_binary.as_deref());
         let claude = ClaudeInvoker::new(self.on_disk.daemon.claude_binary.as_deref());
 
-        let state = AppState {
+        let api_state = Arc::new(AppState {
             pool: pool.clone(),
             trigger_tx: trigger_tx.clone(),
             version: VERSION,
-        };
-        let app = api::router(state);
+        });
 
-        // Tasks: HTTP server on unix socket, scheduler tick, trigger consumer.
-        let server = tokio::spawn(serve_unix(listener, app));
+        // Unix-socket router: bare paths (`/status`, `/actions`, ...). CLI
+        // continues to call these paths; no /api prefix to avoid breaking
+        // existing client code.
+        let unix_app = api::router((*api_state).clone());
+
+        // TCP router: web UI at root, JSON API under `/api/`. Same handlers
+        // as the unix-socket flavor, just nested + sibling-mounted.
+        let api_for_tcp = api::router((*api_state).clone());
+        let web_router = crate::web::router(api_state.clone(), self.paths.clone());
+        let tcp_app = axum::Router::new()
+            .merge(web_router)
+            .nest("/api", api_for_tcp);
+
+        // Tasks: unix-socket server, TCP server, scheduler tick, trigger consumer.
+        let server_unix = tokio::spawn(serve_unix(listener, unix_app));
+
+        let tcp_bind = format!("{}:{}", self.on_disk.web.bind, self.on_disk.web.port);
+        let tcp_listener = match tokio::net::TcpListener::bind(&tcp_bind).await {
+            Ok(l) => {
+                info!(address = %tcp_bind, "web UI listening");
+                Some(l)
+            }
+            Err(e) => {
+                // Don't fail the whole daemon just because the TCP port is
+                // taken - the unix-socket API still works.
+                warn!(address = %tcp_bind, error = %e, "TCP bind failed; web UI disabled this run");
+                None
+            }
+        };
+        let server_tcp = tcp_listener.map(|l| tokio::spawn(serve_tcp(l, tcp_app)));
 
         let dispatch = Arc::new(Dispatcher {
             paths: self.paths.clone(),
@@ -85,7 +112,7 @@ impl Daemon {
         // Graceful shutdown on SIGINT/SIGTERM.
         let shutdown = tokio::signal::ctrl_c();
         tokio::select! {
-            res = server => {
+            res = server_unix => {
                 warn!(?res, "unix-socket server exited");
             }
             _ = shutdown => {
@@ -94,6 +121,9 @@ impl Daemon {
         }
         scheduler_task.abort();
         trigger_task.abort();
+        if let Some(t) = server_tcp {
+            t.abort();
+        }
         // pidfile lock released on drop
         let _ = std::fs::remove_file(&sock_path);
         Ok(())
@@ -125,6 +155,11 @@ fn pidfile_lock(pidfile: &Path) -> Result<std::fs::File> {
     f.set_len(0)?;
     writeln!(f, "{}", std::process::id())?;
     Ok(f)
+}
+
+async fn serve_tcp(listener: tokio::net::TcpListener, app: axum::Router) -> Result<()> {
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 async fn serve_unix(listener: UnixListener, app: axum::Router) -> Result<()> {

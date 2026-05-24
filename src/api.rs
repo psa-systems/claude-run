@@ -29,7 +29,9 @@ use tokio::sync::mpsc;
 
 use crate::state;
 
-/// Shared state injected into every handler.
+/// Shared state injected into every handler. `Clone` is trivial because the
+/// fields are already cheap-clone (`SqlitePool` is `Arc`-shaped, `Sender`
+/// is `Clone`, version is `&'static`).
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
@@ -39,6 +41,9 @@ pub struct AppState {
     pub version: &'static str,
 }
 
+/// JSON API router. Phase 2 mounted it at root over the unix socket;
+/// Phase 3 mounts it under `/api/` over TCP (alongside the web UI). The
+/// unix socket continues to serve it at root for cheaper CLI calls.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/status", get(get_status))

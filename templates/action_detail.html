@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}{{ action.name }} - claude-run{% endblock %}
+{% block main %}
+
+<h2>{{ action.name }}</h2>
+
+<div class="card">
+  <dl class="kv">
+    <dt>File</dt>          <dd>{{ action.file_path }}</dd>
+    <dt>SHA-256</dt>       <dd>{{ action.yaml_sha256 }}</dd>
+    <dt>Enabled</dt>       <dd>{{ action.enabled }}</dd>
+    <dt>Schedule</dt>      <dd>{% if let Some(k) = action.schedule_kind %}{{ k }}{% if let Some(s) = action.schedule_spec %} <strong>{{ s }}</strong>{% endif %}{% else %}<span class="dim">none</span>{% endif %}</dd>
+    <dt>Last seen</dt>     <dd>{{ action.last_seen_at }}</dd>
+    {% if let Some(e) = action.parse_error %}
+      <dt>Parse error</dt> <dd style="color: var(--bad);">{{ e }}</dd>
+    {% endif %}
+    {% if let Some(p) = paused %}
+      <dt>Paused</dt>      <dd><span class="badge pause">paused</span> since {{ p.paused_at }}{% if let Some(r) = p.reason %} - {{ r }}{% endif %}</dd>
+    {% endif %}
+  </dl>
+  <div class="row-actions" style="margin-top: 16px;">
+    <form hx-post="/api/actions/{{ action.name }}/trigger" hx-swap="none">
+      <button class="btn">Trigger now</button>
+    </form>
+    {% if paused.is_some() %}
+      <form hx-post="/api/actions/{{ action.name }}/resume" hx-swap="none">
+        <button class="btn">Resume</button>
+      </form>
+    {% else %}
+      <form hx-post="/api/actions/{{ action.name }}/pause" hx-swap="none">
+        <button class="btn">Pause</button>
+      </form>
+    {% endif %}
+  </div>
+</div>
+
+<h2>Recent runs</h2>
+{% if runs.is_empty() %}
+  <div class="card"><span class="dim">No runs yet for this action.</span></div>
+{% else %}
+  <table>
+    <thead><tr><th>Run</th><th>Started</th><th>Ended</th><th>Triggered</th><th>Rows</th><th>Exit</th></tr></thead>
+    <tbody>
+      {% for r in runs %}
+        <tr>
+          <td class="mono"><a href="/runs/{{ r.id }}">#{{ r.id }}</a></td>
+          <td class="mono dim">{{ r.started_at }}</td>
+          <td class="mono dim">{{ r.ended_at.as_deref().unwrap_or("-") }}</td>
+          <td class="dim">{{ r.triggered_by }}</td>
+          <td class="mono">{{ r.rows_processed }}</td>
+          <td class="mono">
+            {% match r.exit_code %}
+              {% when Some(0) %}<span class="badge ok">0</span>
+              {% when Some(c) %}<span class="badge bad">{{ c }}</span>
+              {% when None %}<span class="badge warn">running</span>
+            {% endmatch %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+{% endblock %}

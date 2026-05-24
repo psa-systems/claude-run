@@ -16,6 +16,8 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
+askama = "0.12"
+async-stream = "0.3"
 axum = { version = "0.7", features = ["macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -23,6 +25,7 @@ cron = "0.12"
 daemonize = "0.5"
 dirs = "5"
 fs2 = "0.4"
+futures-util = "0.3"
 hex = "0.4"
 humantime = "2"
 hyper = { version = "1", features = ["client", "http1"] }
@@ -37,6 +40,7 @@ shellexpand = "3"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "chrono", "migrate"] }
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 toml = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }

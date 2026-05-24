@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}{{ row_key }} - run #{{ run_id }} - claude-run{% endblock %}
+{% block main %}
+
+<h2><a href="/runs/{{ run_id }}">Run #{{ run_id }}</a> - {{ row_key }} (attempt {{ attempt }})</h2>
+
+<div class="card">
+  <div class="meta">
+    Streaming from <code>{{ stream_path }}</code>. New events append at the bottom; the connection closes once the file is fully consumed.
+  </div>
+</div>
+
+<h2>Events</h2>
+<pre class="stream" id="stream"></pre>
+
+<script>
+  // SSE renderer: each "msg" event carries a single JSON NDJSON line.
+  // We classify by `type` so the user can spot the result event at a glance.
+  const out = document.getElementById('stream');
+  const source = new EventSource("/sse/runs/{{ run_id }}/rows/{{ row_key }}/attempt/{{ attempt }}");
+  source.addEventListener('msg', (e) => {
+    let cls = 'ev-system';
+    let text = e.data;
+    try {
+      const j = JSON.parse(e.data);
+      if (j.type === 'assistant') cls = 'ev-assistant';
+      else if (j.type === 'user') cls = 'ev-user';
+      else if (j.type === 'result') {
+        cls = j.is_error ? 'ev-result-err' : 'ev-result-ok';
+      }
+      text = JSON.stringify(j, null, 2);
+    } catch (_) { /* not JSON, render raw */ }
+    const span = document.createElement('span');
+    span.className = cls;
+    span.textContent = text + "\n";
+    out.appendChild(span);
+    out.scrollTop = out.scrollHeight;
+  });
+  source.addEventListener('done', () => source.close());
+  source.addEventListener('error', () => {
+    // EventSource auto-reconnects on transient errors; only close on hard fail.
+    if (source.readyState === EventSource.CLOSED) {
+      const span = document.createElement('span');
+      span.className = 'ev-result-err';
+      span.textContent = "\n[stream closed]\n";
+      out.appendChild(span);
+    }
+  });
+</script>
+
+{% endblock %}
