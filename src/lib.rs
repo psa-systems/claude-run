@@ -16,12 +16,17 @@
 //! runtime contract.
 
 pub mod action;
+pub mod api;
 pub mod claude;
+pub mod client;
 pub mod config;
+pub mod daemon;
 pub mod db;
 pub mod error;
+pub mod lock;
 pub mod migrate;
 pub mod row;
+pub mod scheduler;
 pub mod snippet;
 pub mod state;
 pub mod workdir;
