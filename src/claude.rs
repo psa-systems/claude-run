@@ -132,11 +132,7 @@ impl ClaudeInvoker {
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0),
                 raw: final_event.clone(),
-                error: format!(
-                    "claude exited {}, see {}",
-                    exit_code,
-                    stream_log.display()
-                ),
+                error: format!("claude exited {}, see {}", exit_code, stream_log.display()),
                 transient: classify_transient(exit_code, &final_event),
             });
         }

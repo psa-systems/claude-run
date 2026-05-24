@@ -14,13 +14,12 @@ pub fn now_iso() -> String {
 }
 
 pub async fn attempts_get(pool: &SqlitePool, action: &str, key: &str) -> Result<u32> {
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT count FROM attempt_counters WHERE action_name = ? AND row_key = ?",
-    )
-    .bind(action)
-    .bind(key)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT count FROM attempt_counters WHERE action_name = ? AND row_key = ?")
+            .bind(action)
+            .bind(key)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(|(c,)| c as u32).unwrap_or(0))
 }
 
@@ -45,13 +44,12 @@ pub async fn attempts_increment(pool: &SqlitePool, action: &str, key: &str) -> R
 
 pub async fn daily_count_get(pool: &SqlitePool, action: &str) -> Result<u32> {
     let today = today_local().to_string();
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT run_count FROM daily_ledger WHERE action_name = ? AND date = ?",
-    )
-    .bind(action)
-    .bind(&today)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT run_count FROM daily_ledger WHERE action_name = ? AND date = ?")
+            .bind(action)
+            .bind(&today)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(|(c,)| c as u32).unwrap_or(0))
 }
 
@@ -74,13 +72,12 @@ pub async fn daily_count_increment(pool: &SqlitePool, action: &str) -> Result<()
 
 pub async fn daily_cost_get(pool: &SqlitePool, action: &str) -> Result<f64> {
     let today = today_local().to_string();
-    let row: Option<(f64,)> = sqlx::query_as(
-        "SELECT cost_usd FROM daily_ledger WHERE action_name = ? AND date = ?",
-    )
-    .bind(action)
-    .bind(&today)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(f64,)> =
+        sqlx::query_as("SELECT cost_usd FROM daily_ledger WHERE action_name = ? AND date = ?")
+            .bind(action)
+            .bind(&today)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(|(c,)| c).unwrap_or(0.0))
 }
 
@@ -102,11 +99,7 @@ pub async fn daily_cost_add(pool: &SqlitePool, action: &str, amount: f64) -> Res
     Ok(())
 }
 
-pub async fn run_begin(
-    pool: &SqlitePool,
-    action: &str,
-    triggered_by: &str,
-) -> Result<i64> {
+pub async fn run_begin(pool: &SqlitePool, action: &str, triggered_by: &str) -> Result<i64> {
     let now = now_iso();
     let id = sqlx::query_scalar::<_, i64>(
         r#"
@@ -225,20 +218,15 @@ pub async fn action_pause_status(
     pool: &SqlitePool,
     action: &str,
 ) -> Result<Option<(String, Option<String>)>> {
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT paused_at, reason FROM paused_actions WHERE action_name = ?",
-    )
-    .bind(action)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT paused_at, reason FROM paused_actions WHERE action_name = ?")
+            .bind(action)
+            .fetch_optional(pool)
+            .await?;
     Ok(row)
 }
 
-pub async fn action_pause_set(
-    pool: &SqlitePool,
-    action: &str,
-    reason: Option<&str>,
-) -> Result<()> {
+pub async fn action_pause_set(pool: &SqlitePool, action: &str, reason: Option<&str>) -> Result<()> {
     let now = now_iso();
     sqlx::query(
         r#"
@@ -313,10 +301,7 @@ pub async fn action_index_list(pool: &SqlitePool) -> Result<Vec<ActionIndexRow>>
     Ok(rows)
 }
 
-pub async fn action_last_run_started(
-    pool: &SqlitePool,
-    action: &str,
-) -> Result<Option<String>> {
+pub async fn action_last_run_started(pool: &SqlitePool, action: &str) -> Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT started_at FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 1",
     )

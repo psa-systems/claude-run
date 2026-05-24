@@ -76,16 +76,21 @@ struct ActionStatus {
 }
 
 async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusResponse>, AppError> {
-    let global = state::global_pause_status(&s.pool).await?.map(|(a, r)| PauseInfo {
-        paused_at: a,
-        reason: r,
-    });
+    let global = state::global_pause_status(&s.pool)
+        .await?
+        .map(|(a, r)| PauseInfo {
+            paused_at: a,
+            reason: r,
+        });
     let actions = state::action_index_list(&s.pool).await?;
     let mut out = Vec::with_capacity(actions.len());
     for a in actions {
         let paused = state::action_pause_status(&s.pool, &a.name)
             .await?
-            .map(|(at, r)| PauseInfo { paused_at: at, reason: r });
+            .map(|(at, r)| PauseInfo {
+                paused_at: at,
+                reason: r,
+            });
         let last = state::action_last_run_started(&s.pool, &a.name).await?;
         out.push(ActionStatus {
             name: a.name,
@@ -210,6 +215,10 @@ impl From<crate::error::Error> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        (self.status, Json(serde_json::json!({"error": self.message}))).into_response()
+        (
+            self.status,
+            Json(serde_json::json!({"error": self.message})),
+        )
+            .into_response()
     }
 }

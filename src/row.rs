@@ -99,7 +99,11 @@ pub fn row_key(action: &LoadedAction, row: &Value, idx: usize) -> String {
     }
 }
 
-pub async fn gather_rows(action: &LoadedAction, ctx_snippet: &SnippetRunner, paths: &Paths) -> Result<Vec<Value>> {
+pub async fn gather_rows(
+    action: &LoadedAction,
+    ctx_snippet: &SnippetRunner,
+    paths: &Paths,
+) -> Result<Vec<Value>> {
     let snippet_dir = paths
         .state_dir
         .join("snippets")
@@ -131,11 +135,7 @@ pub async fn gather_rows(action: &LoadedAction, ctx_snippet: &SnippetRunner, pat
 
 /// Process a single row. Returns the per-row outcome record that the runner
 /// will both write to the per-action JSONL and insert into `row_outcomes`.
-pub async fn process_row(
-    ctx: &RowContext<'_>,
-    row: &Value,
-    idx: usize,
-) -> Result<ProcessedRow> {
+pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Result<ProcessedRow> {
     let action = &ctx.action.action;
     let key = row_key(ctx.action, row, idx);
     let attempts = state::attempts_get(ctx.pool, &action.name, &key).await?;
@@ -153,16 +153,11 @@ pub async fn process_row(
 
     let mut bindings = Bindings::new();
     bindings.insert("row", row.clone());
-    bindings.insert(
-        "workdir",
-        Value::String(workdir_path.display().to_string()),
-    );
+    bindings.insert("workdir", Value::String(workdir_path.display().to_string()));
 
     // ---- filter ----
     if let Some(filter) = action.filter.as_deref() {
-        let r = ctx
-            .snippet
-            .run(filter, &bindings, &snippet_dir, "filter")?;
+        let r = ctx.snippet.run(filter, &bindings, &snippet_dir, "filter")?;
         if !r.ok {
             info!(action = %action.name, key = %key, stderr = %r.stderr, "row filtered out");
             return Ok(ProcessedRow::Filtered { key });
@@ -187,10 +182,7 @@ pub async fn process_row(
     // ---- prompt + claude (skipped on pre failure; synthesize claude_result) ----
     let (claude_result, claude_ran) = if let Some((step_idx, exit_code, stderr)) = pre_failed {
         (
-            ClaudeResult::synthesized(
-                format!("pre step {step_idx} exited {exit_code}"),
-                stderr,
-            ),
+            ClaudeResult::synthesized(format!("pre step {step_idx} exited {exit_code}"), stderr),
             false,
         )
     } else {
@@ -281,14 +273,9 @@ pub async fn process_row(
     let ok = claude_result.ok && !post_failed;
     let stream_log_path = if claude_ran {
         Some(
-            ClaudeInvoker::stream_log_path(
-                &ctx.paths.logs_dir(),
-                &action.name,
-                &key,
-                attempts + 1,
-            )
-            .display()
-            .to_string(),
+            ClaudeInvoker::stream_log_path(&ctx.paths.logs_dir(), &action.name, &key, attempts + 1)
+                .display()
+                .to_string(),
         )
     } else {
         None
@@ -363,11 +350,7 @@ impl ProcessedRow {
 
 /// Append a row-outcome record to the action's per-action JSONL log (the
 /// `output.file` field on the action). Best-effort; logs but does not fail.
-pub fn append_output_record(
-    paths: &Paths,
-    action: &LoadedAction,
-    record: &Value,
-) {
+pub fn append_output_record(paths: &Paths, action: &LoadedAction, record: &Value) {
     let Some(rel) = action.action.output.file.as_deref() else {
         return;
     };
@@ -377,7 +360,8 @@ pub fn append_output_record(
         return;
     }
     let path = dir.join(rel);
-    let mut line = serde_json::to_string(record).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
+    let mut line =
+        serde_json::to_string(record).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
     line.push('\n');
     if let Err(e) = std::fs::OpenOptions::new()
         .create(true)
@@ -448,7 +432,9 @@ mod tests {
             action: crate::action::Action {
                 name: "t".into(),
                 workdir_base: None,
-                input: crate::action::InputBlock { command: "x".into() },
+                input: crate::action::InputBlock {
+                    command: "x".into(),
+                },
                 dedup_key,
                 filter: None,
                 pre: vec![],

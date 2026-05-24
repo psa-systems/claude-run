@@ -169,9 +169,11 @@ async fn real_main(cli: Cli) -> claude_run::error::Result<i32> {
         Cmd::Action(c) => action_cmd(c, &paths, &actions_dir).await,
         Cmd::Migrate { from } => {
             let pool = db::open(&paths.state_db()).await?;
-            let legacy = from
-                .map(PathBuf::from)
-                .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/share/claude-run/state"));
+            let legacy = from.map(PathBuf::from).unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap()
+                    .join(".local/share/claude-run/state")
+            });
             let report = migrate::import_legacy_state(&pool, &legacy).await?;
             tracing::info!(
                 actions = report.actions,
@@ -200,7 +202,10 @@ async fn run_action(
         tracing::info!("globally paused");
         return Ok(exit::PAUSED);
     }
-    if state::action_pause_status(&pool, &loaded.action.name).await?.is_some() {
+    if state::action_pause_status(&pool, &loaded.action.name)
+        .await?
+        .is_some()
+    {
         tracing::info!(action = %loaded.action.name, "action paused");
         return Ok(exit::PAUSED);
     }

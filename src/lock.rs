@@ -31,6 +31,7 @@ impl ActionLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(&path)?;
         match file.try_lock_exclusive() {
@@ -59,6 +60,9 @@ mod tests {
         assert!(b.is_none(), "second acquire should fail while first held");
         drop(a);
         let c = ActionLock::try_acquire(dir.path(), "test").unwrap();
-        assert!(c.is_some(), "third acquire should succeed after first dropped");
+        assert!(
+            c.is_some(),
+            "third acquire should succeed after first dropped"
+        );
     }
 }
