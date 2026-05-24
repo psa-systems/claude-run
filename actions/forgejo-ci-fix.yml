@@ -9,6 +9,9 @@
 
 name: forgejo-ci-fix
 
+# /home has more space than /tmp
+workdir_base: $"($nu.home-dir | path join workspace)"
+
 input:
   command: |
     #!/usr/bin/env nu
