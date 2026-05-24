@@ -16,6 +16,8 @@ on:
     paths:
       - "src/**"
       - "migrations/**"
+      - "templates/**"
+      - "assets/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
