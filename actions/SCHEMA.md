@@ -63,7 +63,26 @@ action only - useful when one action needs more disk than `/tmp` allows
 (e.g., a workspace mounted on a large data volume) or when you want
 per-action isolation on disk for cleanup or quota reasons.
 
-Path is `path expand`-ed, so `~` and env vars work.
+**Resolution rules** (apply to both the YAML value and the env value):
+
+- If the value starts with `$`, it is evaluated as a nu expression and the
+  result is used. Lets you do things like:
+
+  ```yaml
+  workdir_base: $nu.home-dir | path join workspace
+  workdir_base: $"($env.HOME)/workspace"
+  workdir_base: $"($env.XDG_DATA_HOME)/claude-run"
+  ```
+
+- Otherwise, the value is treated as a literal path. `path expand` is applied
+  in either case, so `~` and `$env` references that `path expand` understands
+  still work for literal values.
+
+```yaml
+workdir_base: ~/workspace                          # literal, ~ expanded
+workdir_base: /mnt/data/claude-run                 # literal, absolute
+workdir_base: $nu.home-dir | path join workspace   # evaluated
+```
 
 ### `input.command` (nu snippet, required)
 

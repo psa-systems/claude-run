@@ -65,7 +65,7 @@ def runner-config [] {
         state_dir: $state_dir,
         log_dir: (env-default "CLAUDE_RUN_LOG_DIR" $"($state_dir)/logs" | path expand),
         actions_dir: (env-default "CLAUDE_RUN_ACTIONS_DIR" "./actions" | path expand),
-        workdir_base: (env-default "CLAUDE_RUN_WORKDIR_BASE" "/tmp/claude-run" | path expand),
+        workdir_base: (env-default "CLAUDE_RUN_WORKDIR_BASE" "/tmp/claude-run"),
         max_runs_per_day: (env-default-int "CLAUDE_RUN_MAX_RUNS_PER_DAY" 20),
         max_attempts_per_key: (env-default-int "CLAUDE_RUN_MAX_ATTEMPTS_PER_KEY" 3),
         claude_timeout_seconds: (env-default-int "CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS" 600),
@@ -89,6 +89,23 @@ def dir-ensure [p: string] {
     if not ($p | path exists) {
         mkdir $p
     }
+}
+
+# Resolve a path string. Leading `$` means treat the value as a nu expression
+# (e.g. `$nu.home-dir`, `$"($env.HOME)/foo"`, `$nu.home-dir | path join workspace`)
+# and use its evaluated result. Otherwise treat as a literal path. Either way
+# the result is `path expand`-ed so `~` still works.
+def path-resolve [raw: string] {
+    let resolved = if ($raw | str starts-with "$") {
+        let r = (^nu --commands $raw | complete)
+        if $r.exit_code != 0 {
+            error make {msg: $"path expression failed: ($raw) - ($r.stderr)"}
+        }
+        $r.stdout | str trim
+    } else {
+        $raw
+    }
+    $resolved | path expand
 }
 
 # ============================================================================
@@ -389,7 +406,7 @@ def row-process [
 
     log info $cfg $name "processing row" {key: $key, attempt: ($attempts + 1)}
 
-    let workdir_base = ($action.workdir_base? | default $cfg.workdir_base | path expand)
+    let workdir_base = (path-resolve ($action.workdir_base? | default $cfg.workdir_base))
     let workdir = $"($workdir_base)/($name)/($key)"
     let snippet_dir = $"($cfg.state_dir)/snippets/($name)/($key)"
     let base_bindings = {row: $row, workdir: $workdir}
