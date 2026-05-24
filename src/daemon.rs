@@ -25,7 +25,7 @@ use crate::scheduler::{self, ParsedSchedule};
 use crate::snippet::SnippetRunner;
 use crate::state::{self, ActionIndexRow};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION: &str = crate::VERSION;
 const TICK_SECS: u64 = 5;
 
 pub struct Daemon {

@@ -32,6 +32,19 @@ pub mod state;
 pub mod web;
 pub mod workdir;
 
+/// Build-stamped version string: semver + short git hash + build date, baked
+/// at compile time by `build.rs`. Example: `0.1.0 (1b66909c2a3f, 2026-05-24)`.
+/// Single source for `--version`, the `/api/status` `version` field, and the
+/// web footer (CLAUDE-2).
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("CLAUDE_RUN_GIT_SHA"),
+    ", ",
+    env!("CLAUDE_RUN_BUILD_DATE"),
+    ")"
+);
+
 /// Exit codes match the previous nu implementation so existing cron and
 /// systemd units behave the same after the port.
 pub mod exit {
