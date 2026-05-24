@@ -226,12 +226,27 @@ async fn action_detail(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
+#[derive(Serialize)]
+pub struct PlannedRow {
+    pub key: String,
+    pub href: Option<String>,
+    /// One of: "running" (no outcome yet) | "ok" | "fail"
+    pub status: String,
+}
+
 #[derive(Template)]
 #[template(path = "run_detail.html")]
 struct RunDetailTpl {
     version: &'static str,
     run: RunRow,
     outcomes: Vec<OutcomeRow>,
+    /// CLAUDE-1: rows planned at run-start; populated as soon as
+    /// `input.command` returns. Pre-existing rows have NULL `run.row_keys`
+    /// and this stays empty.
+    planned_rows: Vec<PlannedRow>,
+    /// Per-row href builder for the outcomes table. Empty string when the
+    /// action declares no `link_template`.
+    link_template: Option<String>,
 }
 
 async fn run_detail(
@@ -253,10 +268,49 @@ async fn run_detail(
     .bind(id)
     .fetch_all(pool)
     .await?;
+
+    // Look up the action's link_template once and reuse for both planned
+    // rows and the outcomes table.
+    let link_template: Option<String> =
+        sqlx::query_scalar("SELECT link_template FROM actions WHERE name = ?")
+            .bind(&run.action_name)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+
+    let planned_keys = state::run_row_keys(pool, run.id).await.unwrap_or_default();
+    // Build a quick lookup: key -> overall ok flag from row_outcomes (latest
+    // attempt wins, since outcomes are inserted in order).
+    let mut outcome_by_key: std::collections::HashMap<&str, bool> =
+        std::collections::HashMap::new();
+    for o in &outcomes {
+        outcome_by_key.insert(o.row_key.as_str(), o.ok);
+    }
+    let planned_rows: Vec<PlannedRow> = planned_keys
+        .into_iter()
+        .map(|k| {
+            let status = match outcome_by_key.get(k.as_str()) {
+                Some(true) => "ok".to_string(),
+                Some(false) => "fail".to_string(),
+                None => "running".to_string(),
+            };
+            let href = link_template
+                .as_ref()
+                .map(|t| crate::action::render_link(t, &k));
+            PlannedRow {
+                key: k,
+                href,
+                status,
+            }
+        })
+        .collect();
+
     let tpl = RunDetailTpl {
         version: s.api.version,
         run,
         outcomes,
+        planned_rows,
+        link_template,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }

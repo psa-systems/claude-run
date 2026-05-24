@@ -46,8 +46,38 @@ pub struct Action {
     #[serde(default)]
     pub schedule: Option<Schedule>,
 
+    /// Optional URL template for rendering row keys as clickable links in the
+    /// web UI. `{key}` is substituted with the row key. Example:
+    /// `https://example.myjetbrains.com/issue/{key}`.
+    #[serde(default)]
+    pub link_template: Option<String>,
+
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+}
+
+/// Substitute `{key}` in a template string. Other `{...}` tokens pass through
+/// unchanged so templates can include literal braces if they need to.
+pub fn render_link(template: &str, key: &str) -> String {
+    template.replace("{key}", key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_link_substitutes_key() {
+        assert_eq!(
+            render_link("https://example.myjetbrains.com/issue/{key}", "MK-16"),
+            "https://example.myjetbrains.com/issue/MK-16"
+        );
+    }
+
+    #[test]
+    fn render_link_leaves_unknown_tokens_alone() {
+        assert_eq!(render_link("/{repo}/{key}", "PR-42"), "/{repo}/PR-42");
+    }
 }
 
 fn default_enabled() -> bool {
