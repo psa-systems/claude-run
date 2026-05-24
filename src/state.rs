@@ -116,6 +116,33 @@ pub async fn run_begin(pool: &SqlitePool, action: &str, triggered_by: &str) -> R
     Ok(id)
 }
 
+/// CLAUDE-1: record the planned row keys for a run as soon as input.command
+/// has produced them, so the web UI can show what's queued / in-flight
+/// before any outcome record exists. Stored as a JSON array of strings on
+/// the `runs.row_keys` column.
+pub async fn run_set_row_keys(pool: &SqlitePool, run_id: i64, keys: &[String]) -> Result<()> {
+    let payload = serde_json::to_string(keys)?;
+    sqlx::query("UPDATE runs SET row_keys = ? WHERE id = ?")
+        .bind(payload)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn run_row_keys(pool: &SqlitePool, run_id: i64) -> Result<Vec<String>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT row_keys FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?;
+    let json = row.and_then(|(j,)| j);
+    if let Some(j) = json {
+        Ok(serde_json::from_str(&j).unwrap_or_default())
+    } else {
+        Ok(vec![])
+    }
+}
+
 pub async fn run_finish(
     pool: &SqlitePool,
     run_id: i64,
@@ -260,6 +287,8 @@ pub struct ActionIndexRow {
     pub schedule_spec: Option<String>,
     pub last_seen_at: String,
     pub parse_error: Option<String>,
+    /// CLAUDE-1: optional URL template for rendering row keys as links.
+    pub link_template: Option<String>,
 }
 
 pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Result<()> {
@@ -267,8 +296,8 @@ pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Res
         r#"
         INSERT INTO actions (
             name, file_path, yaml_sha256, enabled,
-            schedule_kind, schedule_spec, last_seen_at, parse_error
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            schedule_kind, schedule_spec, last_seen_at, parse_error, link_template
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
             file_path = excluded.file_path,
             yaml_sha256 = excluded.yaml_sha256,
@@ -276,7 +305,8 @@ pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Res
             schedule_kind = excluded.schedule_kind,
             schedule_spec = excluded.schedule_spec,
             last_seen_at = excluded.last_seen_at,
-            parse_error = excluded.parse_error
+            parse_error = excluded.parse_error,
+            link_template = excluded.link_template
         "#,
     )
     .bind(&row.name)
@@ -287,6 +317,7 @@ pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Res
     .bind(&row.schedule_spec)
     .bind(&row.last_seen_at)
     .bind(&row.parse_error)
+    .bind(&row.link_template)
     .execute(pool)
     .await?;
     Ok(())
@@ -294,7 +325,7 @@ pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Res
 
 pub async fn action_index_list(pool: &SqlitePool) -> Result<Vec<ActionIndexRow>> {
     let rows = sqlx::query_as::<_, ActionIndexRow>(
-        "SELECT name, file_path, yaml_sha256, enabled, schedule_kind, schedule_spec, last_seen_at, parse_error FROM actions ORDER BY name",
+        "SELECT name, file_path, yaml_sha256, enabled, schedule_kind, schedule_spec, last_seen_at, parse_error, link_template FROM actions ORDER BY name",
     )
     .fetch_all(pool)
     .await?;

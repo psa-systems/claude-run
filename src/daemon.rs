@@ -215,6 +215,7 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
                     schedule_spec: la.action.schedule.as_ref().and_then(|s| s.spec.clone()),
                     last_seen_at: now.clone(),
                     parse_error: None,
+                    link_template: la.action.link_template.clone(),
                 };
                 state::action_index_upsert(pool, &row).await?;
             }
@@ -233,6 +234,7 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
                     schedule_spec: None,
                     last_seen_at: now.clone(),
                     parse_error: Some(e.to_string()),
+                    link_template: None,
                 };
                 state::action_index_upsert(pool, &row).await?;
             }
@@ -350,6 +352,18 @@ pub async fn run_action_inner(
     info!(action = %loaded.action.name, count = rows.len(), "input rows gathered");
 
     let run_id = state::run_begin(pool, &loaded.action.name, triggered_by).await?;
+
+    // CLAUDE-1: record the planned row keys so the web UI shows what's
+    // queued / in-flight before any outcome record lands.
+    let planned_keys: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| row::row_key(loaded, r, i))
+        .collect();
+    if let Err(e) = state::run_set_row_keys(pool, run_id, &planned_keys).await {
+        warn!(error = %e, "run_set_row_keys failed (non-fatal)");
+    }
+
     let mut processed: u32 = 0;
     let ctx = row::RowContext {
         action: loaded,

@@ -444,6 +444,7 @@ mod tests {
                 output: Default::default(),
                 limits: Default::default(),
                 schedule: None,
+                link_template: None,
                 enabled: true,
             },
             path: std::path::PathBuf::from("/dev/null"),

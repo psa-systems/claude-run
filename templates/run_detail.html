@@ -30,6 +30,40 @@
   </dl>
 </div>
 
+{# CLAUDE-1: planned rows from input.command, populated at run-start. Each
+   key links out via the action's link_template when set. Status is derived
+   from row_outcomes: "running" = no outcome yet, "ok" / "fail" once done. #}
+{% if !planned_rows.is_empty() %}
+  <h2>Rows in this batch</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>Row</th><th>State</th></tr></thead>
+      <tbody>
+        {% for p in planned_rows %}
+          <tr>
+            <td class="mono">
+              {% if let Some(h) = p.href %}
+                <a href="{{ h }}" target="_blank" rel="noopener">{{ p.key }}</a>
+              {% else %}
+                {{ p.key }}
+              {% endif %}
+            </td>
+            <td>
+              {% if p.status == "ok" %}
+                <span class="badge ok">done</span>
+              {% else if p.status == "fail" %}
+                <span class="badge bad">failed</span>
+              {% else %}
+                <span class="badge warn">running</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
 <h2>Row outcomes</h2>
 {% if outcomes.is_empty() %}
   <div class="card"><span class="dim">No rows yet.</span></div>
@@ -43,7 +77,13 @@
     <tbody>
       {% for o in outcomes %}
         <tr>
-          <td class="mono">{{ o.row_key }}</td>
+          <td class="mono">
+            {% if let Some(t) = link_template %}
+              <a href="{{ crate::action::render_link(t, o.row_key.as_str()) }}" target="_blank" rel="noopener">{{ o.row_key }}</a>
+            {% else %}
+              {{ o.row_key }}
+            {% endif %}
+          </td>
           <td class="mono">{{ o.attempt }}</td>
           <td>
             {% if o.ok %}<span class="badge ok">ok</span>

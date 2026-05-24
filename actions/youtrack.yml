@@ -23,6 +23,10 @@
 
 name: youtrack
 
+# Per-action link template (CLAUDE-1). Row keys (idReadable, e.g. MK-16)
+# render as clickable links to the YouTrack issue in the web UI.
+link_template: "https://example.myjetbrains.com/issue/{key}"
+
 # /home has more space than /tmp.
 # Plain shell expansion: ~, $VAR, and ${VAR} are honored. The old nu-eval
 # form ($"...") is gone with the Rust port.
