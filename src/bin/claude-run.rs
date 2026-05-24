@@ -1,8 +1,8 @@
 //! `claude-run` CLI entry point.
 //!
 //! Phase 1 subcommands: `run`, `migrate`.
-//! Phase 2 subcommands: `serve`, `trigger`, `status`, `pause`, `resume`,
-//! `action {list,show}`. CLI commands that mutate runtime state (trigger,
+//! Phase 2 subcommands: `serve`, `stop`, `restart`, `trigger`, `status`,
+//! `pause`, `resume`, `action {list,show}`. CLI commands that mutate runtime state (trigger,
 //! pause, resume) delegate to the daemon when its socket is reachable, else
 //! operate on the DB directly so the binary is useful both standalone and as
 //! a daemon control plane.
@@ -47,6 +47,16 @@ enum Cmd {
     /// Start the daemon. Owns the scheduler and the unix-socket API.
     Serve {
         /// Detach (fork twice, write pidfile, redirect stdio to daemon.log).
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Stop a running daemon (SIGTERM, graceful). Idempotent: a no-op exit 0
+    /// when no daemon is running. Never force-kills; if the daemon does not
+    /// exit within the grace window, reports and exits non-zero.
+    Stop,
+    /// Restart the daemon: stop the running one, then `serve` again.
+    Restart {
+        /// Detach the restarted daemon (mirrors `serve --detach`).
         #[arg(long)]
         detach: bool,
     },
@@ -162,6 +172,8 @@ async fn real_main(cli: Cli) -> claude_run::error::Result<i32> {
     match cli.cmd {
         Cmd::Run { action } => run_action(&action, &actions_dir, &paths, &on_disk).await,
         Cmd::Serve { detach } => serve(detach, paths, on_disk).await,
+        Cmd::Stop => stop(&paths).await,
+        Cmd::Restart { detach } => restart(detach, cli.actions_dir.as_deref(), &paths).await,
         Cmd::Trigger { action } => trigger(&action, &paths).await,
         Cmd::Pause { action, reason } => pause(action, reason, &paths).await,
         Cmd::Resume { action } => resume(action, &paths).await,
@@ -234,6 +246,109 @@ async fn serve(
     let d = daemon::Daemon { paths, on_disk };
     d.run().await?;
     Ok(exit::OK)
+}
+
+/// Grace window the daemon gets to exit after SIGTERM before `stop` gives up.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+enum StopOutcome {
+    NotRunning,
+    Stopped,
+    /// Still alive after the grace window; carries the PID for the message.
+    Timeout(i32),
+}
+
+/// Remove a leftover socket if the daemon exited without cleaning up (e.g. an
+/// older build that was killed before SIGTERM was handled gracefully).
+fn cleanup_stale_socket(paths: &cfg::Paths) {
+    let sock = daemon::daemon_socket_path(paths);
+    if sock.exists() {
+        let _ = std::fs::remove_file(&sock);
+    }
+}
+
+/// Send SIGTERM to the daemon (if any) and poll for it to exit. Never escalates
+/// to SIGKILL - per the repo safety rule, a stuck daemon is left for the
+/// operator to deal with.
+async fn stop_daemon(paths: &cfg::Paths) -> claude_run::error::Result<StopOutcome> {
+    let pid = match daemon::read_pidfile(paths) {
+        Some(p) if daemon::process_alive(p) => p,
+        _ => {
+            cleanup_stale_socket(paths);
+            return Ok(StopOutcome::NotRunning);
+        }
+    };
+
+    daemon::send_sigterm(pid)?;
+    tracing::info!(pid, "sent SIGTERM to daemon");
+
+    let deadline = std::time::Instant::now() + STOP_GRACE;
+    while std::time::Instant::now() < deadline {
+        if !daemon::process_alive(pid) {
+            cleanup_stale_socket(paths);
+            return Ok(StopOutcome::Stopped);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    if daemon::process_alive(pid) {
+        Ok(StopOutcome::Timeout(pid))
+    } else {
+        cleanup_stale_socket(paths);
+        Ok(StopOutcome::Stopped)
+    }
+}
+
+async fn stop(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+    match stop_daemon(paths).await? {
+        StopOutcome::NotRunning => {
+            println!("daemon not running");
+            Ok(exit::OK)
+        }
+        StopOutcome::Stopped => {
+            println!("daemon stopped");
+            Ok(exit::OK)
+        }
+        StopOutcome::Timeout(pid) => {
+            eprintln!(
+                "daemon (pid {pid}) did not exit within {}s; not force-killing - \
+                 stop it manually if it is truly stuck",
+                STOP_GRACE.as_secs()
+            );
+            Ok(exit::UNEXPECTED)
+        }
+    }
+}
+
+async fn restart(
+    detach: bool,
+    actions_dir_arg: Option<&str>,
+    paths: &cfg::Paths,
+) -> claude_run::error::Result<i32> {
+    match stop_daemon(paths).await? {
+        StopOutcome::Timeout(pid) => {
+            eprintln!("daemon (pid {pid}) did not exit within the grace window; not restarting");
+            return Ok(exit::UNEXPECTED);
+        }
+        StopOutcome::NotRunning => tracing::info!("no daemon running; starting fresh"),
+        StopOutcome::Stopped => tracing::info!("daemon stopped; starting again"),
+    }
+
+    // Re-exec `claude-run serve [--detach]`. exec replaces this process image,
+    // so the detach-must-happen-before-the-tokio-runtime ordering enforced in
+    // main() is handled cleanly by the freshly-started child.
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    if let Some(dir) = actions_dir_arg {
+        cmd.arg("--actions-dir").arg(dir);
+    }
+    cmd.arg("serve");
+    if detach {
+        cmd.arg("--detach");
+    }
+    let err = cmd.exec();
+    Err(anyhow::anyhow!("failed to exec `serve` on restart: {err}").into())
 }
 
 async fn trigger(action: &str, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
