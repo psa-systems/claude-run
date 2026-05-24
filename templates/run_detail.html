@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}run #{{ run.id }} - claude-run{% endblock %}
+{% block main %}
+
+<h2>Run #{{ run.id }} - {{ run.action_name }}</h2>
+
+<div class="card">
+  <dl class="kv">
+    <dt>Started</dt>       <dd>{{ run.started_at }}</dd>
+    <dt>Ended</dt>         <dd>{{ run.ended_at.as_deref().unwrap_or("running") }}</dd>
+    <dt>Triggered by</dt>  <dd>{{ run.triggered_by }}</dd>
+    <dt>Rows processed</dt><dd>{{ run.rows_processed }}</dd>
+    <dt>Exit</dt>
+    <dd>
+      {% match run.exit_code %}
+        {% when Some(0) %}<span class="badge ok">0</span>
+        {% when Some(c) %}<span class="badge bad">{{ c }}</span>
+        {% when None %}<span class="badge warn">running</span>
+      {% endmatch %}
+    </dd>
+  </dl>
+</div>
+
+<h2>Row outcomes</h2>
+{% if outcomes.is_empty() %}
+  <div class="card"><span class="dim">No rows yet.</span></div>
+{% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Key</th><th>Attempt</th><th>OK</th><th>Claude</th><th>$</th><th>Counted</th><th>When</th><th>Stream</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for o in outcomes %}
+        <tr>
+          <td class="mono">{{ o.row_key }}</td>
+          <td class="mono">{{ o.attempt }}</td>
+          <td>
+            {% if o.ok %}<span class="badge ok">ok</span>
+            {% else %}<span class="badge bad">fail</span>{% endif %}
+          </td>
+          <td>
+            {% if o.claude_ran %}
+              {% if o.claude_ok %}<span class="badge ok">ran</span>
+              {% else %}<span class="badge bad">err</span>{% endif %}
+            {% else %}<span class="badge neutral">skip</span>{% endif %}
+          </td>
+          <td class="mono">${{ "{:.4}"|format(o.claude_cost_usd) }}</td>
+          <td>
+            {% if o.attempt_counted %}<span class="badge warn">counted</span>
+            {% else %}<span class="badge pause">parked</span>{% endif %}
+          </td>
+          <td class="mono dim">{{ o.ts }}</td>
+          <td>
+            {% if o.claude_ran %}
+              <a href="/runs/{{ run.id }}/rows/{{ o.row_key }}/attempt/{{ o.attempt }}">view stream</a>
+            {% else %}<span class="dim">-</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+{% endblock %}

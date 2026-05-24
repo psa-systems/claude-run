@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}claude-run dashboard{% endblock %}
+{% block main %}
+
+{% if let Some(g) = global_pause %}
+  <h2>Globally paused</h2>
+  <div class="card">
+    <span class="badge pause">paused</span>
+    Since {{ g.paused_at }}{% if let Some(r) = g.reason %} - {{ r }}{% endif %}.
+    <form hx-post="/api/resume" hx-swap="none" style="display:inline; margin-left: 12px;">
+      <button class="btn">Resume globally</button>
+    </form>
+  </div>
+{% endif %}
+
+<h2>Today</h2>
+<div class="grid">
+  <div class="card">
+    <h3>Runs today</h3>
+    <div style="font-size: 28px; font-family: var(--mono);">{{ today_runs }}</div>
+    <div class="meta">across {{ today_actions }} actions</div>
+  </div>
+  <div class="card">
+    <h3>Spend today</h3>
+    <div style="font-size: 28px; font-family: var(--mono);">${{ "{:.4}"|format(today_cost) }}</div>
+    <div class="meta">USD</div>
+  </div>
+</div>
+
+<h2>Actions</h2>
+<div class="grid">
+  {% for a in actions %}
+    <div class="card">
+      <h3><a href="/actions/{{ a.name }}">{{ a.name }}</a></h3>
+      <div class="meta">
+        {% if a.parse_error.is_some() %}
+          <span class="badge bad">parse error</span>
+        {% else if !a.enabled %}
+          <span class="badge neutral">disabled</span>
+        {% else if a.paused.is_some() %}
+          <span class="badge pause">paused</span>
+        {% else %}
+          <span class="badge ok">enabled</span>
+        {% endif %}
+        {% if let Some(k) = a.schedule_kind %}
+          - {{ k }}{% if let Some(s) = a.schedule_spec %} {{ s }}{% endif %}
+        {% else %}
+          - no schedule
+        {% endif %}
+      </div>
+      <div class="meta">
+        last run: {% if let Some(t) = a.last_run_started %}{{ t }}{% else %}<span class="dim">never</span>{% endif %}
+      </div>
+      <div class="row-actions">
+        <form hx-post="/api/actions/{{ a.name }}/trigger" hx-swap="none">
+          <button class="btn">Trigger now</button>
+        </form>
+        {% if a.paused.is_some() %}
+          <form hx-post="/api/actions/{{ a.name }}/resume" hx-swap="none">
+            <button class="btn">Resume</button>
+          </form>
+        {% else %}
+          <form hx-post="/api/actions/{{ a.name }}/pause" hx-swap="none">
+            <button class="btn">Pause</button>
+          </form>
+        {% endif %}
+      </div>
+    </div>
+  {% endfor %}
+  {% if actions.is_empty() %}
+    <div class="card"><span class="dim">No actions indexed yet. Drop YAML files into <code>$CLAUDE_RUN_CONFIG_DIR/actions/</code>.</span></div>
+  {% endif %}
+</div>
+
+<h2>Recent runs</h2>
+{% if recent_runs.is_empty() %}
+  <div class="card"><span class="dim">No runs yet.</span></div>
+{% else %}
+  <table>
+    <thead><tr><th>Run</th><th>Action</th><th>Started</th><th>Ended</th><th>Triggered</th><th>Rows</th><th>Exit</th></tr></thead>
+    <tbody>
+      {% for r in recent_runs %}
+        <tr>
+          <td class="mono"><a href="/runs/{{ r.id }}">#{{ r.id }}</a></td>
+          <td>{{ r.action_name }}</td>
+          <td class="mono dim">{{ r.started_at }}</td>
+          <td class="mono dim">{{ r.ended_at.as_deref().unwrap_or("-") }}</td>
+          <td class="dim">{{ r.triggered_by }}</td>
+          <td class="mono">{{ r.rows_processed }}</td>
+          <td class="mono">
+            {% match r.exit_code %}
+              {% when Some(0) %}<span class="badge ok">0</span>
+              {% when Some(c) %}<span class="badge bad">{{ c }}</span>
+              {% when None %}<span class="badge warn">running</span>
+            {% endmatch %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+{% endblock %}
