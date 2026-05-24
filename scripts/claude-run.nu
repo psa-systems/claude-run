@@ -357,15 +357,33 @@ def claude-invoke [
 
     if $exit_code != 0 {
         let stream_tail = (try { open --raw $stream_log | str substring 0..2000 } catch { "" })
-        let is_rate_limit = ($stream_tail | str contains --ignore-case "rate limit") or ($stream_tail | str contains --ignore-case "usage limit")
-        let is_auth = ($stream_tail | str contains --ignore-case "unauthorized") or ($stream_tail | str contains --ignore-case "authentication")
+        # Transient = "the API itself told us to back off; a retry might
+        # succeed". Only rate-limit signals count. Detection scope:
+        #   - Look only at the final result event's `api_error_status` and
+        #     `error` fields. NOT the whole stream-log tail - the init event
+        #     embeds MCP server statuses like `"status":"needs-auth"` which
+        #     used to false-positive every claude failure as transient.
+        #   - exit 124 (timeout) is wall-clock exhaustion, never transient.
+        #   - auth / config errors are NOT transient - they need a human, and
+        #     marking them transient hides the failure from the attempt counter
+        #     so the row never advances.
+        let api_status = (($final_event | get -o api_error_status | default "" | into string) | str downcase)
+        let event_err = (($final_event | get -o error | default "" | into string) | str downcase)
+        let is_rate_limit = (
+            ($api_status | str contains "rate") or
+            ($api_status | str contains "throttl") or
+            ($api_status | str contains "429") or
+            ($event_err | str contains "rate limit") or
+            ($event_err | str contains "usage limit")
+        )
+        let transient = ($exit_code != 124) and $is_rate_limit
         return {
             ok: false,
             summary: $stream_tail,
             cost: ($final_event | get -o total_cost_usd | default 0.0 | into float),
             raw: $final_event,
             error: $"claude exited ($exit_code), see ($stream_log)",
-            transient: ($is_rate_limit or $is_auth),
+            transient: $transient,
         }
     }
 
