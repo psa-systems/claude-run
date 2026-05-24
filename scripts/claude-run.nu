@@ -463,62 +463,90 @@ def row-process [
     dir-ensure $workdir
 
     # ---- pre steps ----
-    mut step_failed = false
+    # On pre failure we still want post to run (so the action can roll back any
+    # side effects an earlier pre step had, e.g. resetting an external state
+    # field). Capture which step failed and synthesize a $claude_result for
+    # post; that way post sees a uniform shape regardless of upstream failure.
+    mut pre_failed = false
+    mut pre_fail_step = -1
+    mut pre_fail_stderr = ""
+    mut pre_fail_exit = 0
     let pre_steps = ($action.pre? | default [])
     for i in 0..<($pre_steps | length) {
-        if $step_failed { break }
+        if $pre_failed { break }
         let step = ($pre_steps | get $i)
         let r = (snippet-run $step $base_bindings $snippet_dir $"pre-($i)")
         if not $r.ok {
-            log warn $cfg $name "pre step failed" {key: $key, step: $i, exit_code: $r.exit_code, stderr: $r.stderr}
+            log warn $cfg $name "pre step failed (post still runs)" {key: $key, step: $i, exit_code: $r.exit_code, stderr: $r.stderr}
             output-record-append $cfg $action {ts: (now-iso), key: $key, attempt: ($attempts + 1), phase: $"pre-($i)", ok: false, stderr: $r.stderr}
-            $step_failed = true
+            $pre_failed = true
+            $pre_fail_step = $i
+            $pre_fail_stderr = $r.stderr
+            $pre_fail_exit = $r.exit_code
         }
     }
-    if $step_failed {
-        return (workdir-cleanup $workdir (attempt-record $state $key))
+
+    # ---- prompt + claude (skipped on pre failure) ----
+    # claude_ran tracks whether claude was actually invoked. Used at the end
+    # to decide whether to increment the daily Claude-invocation counter and
+    # whether to add cost to the daily ledger.
+    mut claude_ran = false
+    let claude_result = if $pre_failed {
+        {
+            ok: false,
+            summary: $pre_fail_stderr,
+            cost: 0.0,
+            raw: {},
+            error: $"pre step ($pre_fail_step) exited ($pre_fail_exit)",
+            transient: false,
+        }
+    } else {
+        let prompt_r = (snippet-run $action.prompt $base_bindings $snippet_dir "prompt")
+        if not $prompt_r.ok {
+            log warn $cfg $name "prompt snippet failed (post still runs)" {key: $key, exit_code: $prompt_r.exit_code, stderr: $prompt_r.stderr}
+            output-record-append $cfg $action {ts: (now-iso), key: $key, attempt: ($attempts + 1), phase: "prompt", ok: false, stderr: $prompt_r.stderr}
+            {ok: false, summary: $prompt_r.stderr, cost: 0.0, raw: {}, error: $"prompt snippet exited ($prompt_r.exit_code)", transient: false}
+        } else {
+            let prompt = ($prompt_r.stdout | str trim)
+            if ($prompt | is-empty) {
+                log warn $cfg $name "prompt snippet produced empty output (post still runs)" {key: $key}
+                output-record-append $cfg $action {ts: (now-iso), key: $key, attempt: ($attempts + 1), phase: "prompt", ok: false, stderr: "empty prompt"}
+                {ok: false, summary: "prompt snippet produced empty output", cost: 0.0, raw: {}, error: "empty prompt", transient: false}
+            } else {
+                let claude_cfg = ($action.claude? | default {})
+                let stream_log = $"($cfg.log_dir)/($name)/streams/($key)-attempt-(($attempts) + 1).jsonl"
+                log info $cfg $name "invoking claude (stream log)" {key: $key, stream_log: $stream_log}
+                $claude_ran = true
+                let result = (claude-invoke $prompt $claude_cfg $limits.claude_timeout_seconds $workdir $stream_log)
+                if not $result.transient {
+                    if not $result.ok {
+                        log warn $cfg $name "claude run failed (post still runs)" {key: $key, error: $result.error}
+                        output-record-append $cfg $action {ts: (now-iso), key: $key, attempt: ($attempts + 1), phase: "claude", ok: false, error: $result.error, summary: $result.summary, cost: $result.cost}
+                    } else {
+                        log info $cfg $name "claude completed" {key: $key, cost: $result.cost}
+                    }
+                }
+                $result
+            }
+        }
     }
 
-    # ---- prompt ----
-    let prompt_r = (snippet-run $action.prompt $base_bindings $snippet_dir "prompt")
-    if not $prompt_r.ok {
-        log warn $cfg $name "prompt snippet failed" {key: $key, exit_code: $prompt_r.exit_code, stderr: $prompt_r.stderr}
-        output-record-append $cfg $action {ts: (now-iso), key: $key, attempt: ($attempts + 1), phase: "prompt", ok: false, stderr: $prompt_r.stderr}
-        return (workdir-cleanup $workdir (attempt-record $state $key))
-    }
-    let prompt = ($prompt_r.stdout | str trim)
-    if ($prompt | is-empty) {
-        log warn $cfg $name "prompt snippet produced empty output" {key: $key}
-        output-record-append $cfg $action {ts: (now-iso), key: $key, attempt: ($attempts + 1), phase: "prompt", ok: false, stderr: "empty prompt"}
-        return (workdir-cleanup $workdir (attempt-record $state $key))
-    }
-
-    # ---- claude ----
-    let claude_cfg = ($action.claude? | default {})
-    let stream_log = $"($cfg.log_dir)/($name)/streams/($key)-attempt-(($attempts) + 1).jsonl"
-    log info $cfg $name "invoking claude (stream log)" {key: $key, stream_log: $stream_log}
-    let claude_result = (claude-invoke $prompt $claude_cfg $limits.claude_timeout_seconds $workdir $stream_log)
-
+    # Transient claude errors retry cleanly on next firing: no post, no attempt
+    # counted, no daily-count increment, no cost charge.
     mut state2 = $state
     if $claude_result.transient {
         log info $cfg $name "transient claude error, not counting attempt" {key: $key, error: $claude_result.error}
         return (workdir-cleanup $workdir $state2)
     }
 
-    $state2 = (daily-cost-add $state2 $claude_result.cost)
-
-    if not $claude_result.ok {
-        log warn $cfg $name "claude run failed (post still runs)" {key: $key, error: $claude_result.error}
-        output-record-append $cfg $action {ts: (now-iso), key: $key, attempt: ($attempts + 1), phase: "claude", ok: false, error: $claude_result.error, summary: $claude_result.summary, cost: $claude_result.cost}
-    } else {
-        log info $cfg $name "claude completed" {key: $key, cost: $claude_result.cost}
+    if $claude_ran {
+        $state2 = (daily-cost-add $state2 $claude_result.cost)
     }
 
     # ---- post steps ----
-    # Post runs whenever claude actually ran (success or non-transient failure).
-    # Transient claude errors are handled above with an early return so the row
-    # can be retried cleanly on the next firing. The action's post step is
-    # expected to branch on $claude_result.ok to do success vs failure cleanup.
+    # Post runs after every code path that reaches here (pre fail, prompt fail,
+    # prompt empty, claude success, claude non-transient failure). Action
+    # snippets branch on $claude_result.ok to do success vs failure cleanup.
     let post_bindings = ($base_bindings | merge {claude_result: $claude_result})
     let post_steps = ($action.post? | default [])
     mut post_failed = false
@@ -539,12 +567,22 @@ def row-process [
         attempt: ($attempts + 1),
         phase: "done",
         ok: ($claude_result.ok and (not $post_failed)),
+        claude_ran: $claude_ran,
         claude_ok: $claude_result.ok,
         claude_cost: $claude_result.cost,
         summary: $claude_result.summary,
     }
 
-    workdir-cleanup $workdir (daily-count-increment (attempt-record $state2 $key))
+    # Only count toward the per-day Claude-invocation cap when claude actually
+    # ran. Pre/prompt failures still count toward the per-key attempt cap so
+    # poison rows eventually get skipped.
+    let state_with_attempt = (attempt-record $state2 $key)
+    let final_state = if $claude_ran {
+        daily-count-increment $state_with_attempt
+    } else {
+        $state_with_attempt
+    }
+    workdir-cleanup $workdir $final_state
 }
 
 # ============================================================================
