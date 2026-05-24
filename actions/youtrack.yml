@@ -179,4 +179,4 @@ limits:
   max_attempts_per_key: 3
   max_runs_per_day: 20
   claude_timeout_seconds: 3600
-  daily_budget_usd: 20.00
+  daily_budget_usd: 100.00

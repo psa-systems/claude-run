@@ -1,14 +1,22 @@
-//! `claude-run` CLI entry point. Phase 1 supports the two subcommands needed
-//! for parity with the old nu script: `run` and `migrate`. Phase 2 adds
-//! `serve`, `action`, `config`, `pause`, etc.
+//! `claude-run` CLI entry point.
+//!
+//! Phase 1 subcommands: `run`, `migrate`.
+//! Phase 2 subcommands: `serve`, `trigger`, `status`, `pause`, `resume`,
+//! `action {list,show}`. CLI commands that mutate runtime state (trigger,
+//! pause, resume) delegate to the daemon when its socket is reachable, else
+//! operate on the DB directly so the binary is useful both standalone and as
+//! a daemon control plane.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use serde_json::json;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use claude_run::{
-    action, claude as claude_mod, config as cfg, db, exit, migrate, row, snippet, state,
+    action, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db, exit, lock,
+    migrate, snippet, state,
 };
 
 #[derive(Parser)]
@@ -30,30 +38,106 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run an action once. Behaves like the legacy `scripts/claude-run.nu`.
+    /// Run an action once. Holds the per-action lock; conflicts with a
+    /// daemon-driven run.
     Run {
         /// Action name (resolved against the actions dir) or path to a YAML file.
         action: String,
     },
+    /// Start the daemon. Owns the scheduler and the unix-socket API.
+    Serve {
+        /// Detach (fork twice, write pidfile, redirect stdio to daemon.log).
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Ask the daemon to run an action immediately (out of cycle).
+    Trigger { action: String },
+    /// Pause global / per-action scheduling. With no `action`, pauses globally.
+    Pause {
+        action: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Resume global / per-action scheduling.
+    Resume { action: Option<String> },
+    /// Print daemon status as JSON.
+    Status,
+    /// Action management subcommands.
+    #[command(subcommand)]
+    Action(ActionCmd),
     /// Import legacy `~/.local/share/claude-run/state/*.json` files into SQLite.
     Migrate {
-        /// Override the legacy state directory.
         #[arg(long)]
         from: Option<String>,
     },
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+#[derive(Subcommand)]
+enum ActionCmd {
+    /// List actions known to the daemon (or scanned directly if no daemon).
+    List,
+    /// Show one action's metadata.
+    Show { name: String },
+}
+
+fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
-    match real_main(cli).await {
-        Ok(code) => ExitCode::from(code as u8),
-        Err(e) => {
-            tracing::error!(error = %e, "fatal");
-            ExitCode::from(exit::UNEXPECTED as u8)
+
+    // daemonize MUST happen before any tokio runtime exists. forking after
+    // the runtime is constructed produces a child with corrupt scheduler
+    // state. Resolve paths and do the fork in this sync context, then build
+    // the runtime in the child.
+    let maybe_detach = matches!(&cli.cmd, Cmd::Serve { detach: true });
+    if maybe_detach {
+        if let Err(e) = detach_now() {
+            eprintln!("detach failed: {e}");
+            return ExitCode::from(exit::UNEXPECTED as u8);
         }
     }
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("tokio runtime build failed: {e}");
+            return ExitCode::from(exit::UNEXPECTED as u8);
+        }
+    };
+    rt.block_on(async move {
+        match real_main(cli).await {
+            Ok(code) => ExitCode::from(code as u8),
+            Err(e) => {
+                tracing::error!(error = %e, "fatal");
+                ExitCode::from(exit::UNEXPECTED as u8)
+            }
+        }
+    })
+}
+
+fn detach_now() -> claude_run::error::Result<()> {
+    let paths = cfg::Paths::resolve()?;
+    let log = paths.state_dir.join("logs").join("daemon.log");
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)?;
+    let stderr = stdout.try_clone()?;
+    // Don't let daemonize manage the pidfile - it acquires its own exclusive
+    // lock on it, which would race with our explicit `pidfile_lock()` in
+    // `Daemon::run`. The runtime pidfile lock is the single source of truth.
+    daemonize::Daemonize::new()
+        .working_directory("/")
+        .stdout(stdout)
+        .stderr(stderr)
+        .start()
+        .map_err(|e| anyhow::anyhow!("daemonize: {e}"))?;
+    Ok(())
 }
 
 fn init_tracing() {
@@ -71,15 +155,22 @@ async fn real_main(cli: Cli) -> claude_run::error::Result<i32> {
 
     let actions_dir = cli
         .actions_dir
-        .map(std::path::PathBuf::from)
+        .clone()
+        .map(PathBuf::from)
         .unwrap_or_else(|| paths.actions_dir());
 
     match cli.cmd {
         Cmd::Run { action } => run_action(&action, &actions_dir, &paths, &on_disk).await,
+        Cmd::Serve { detach } => serve(detach, paths, on_disk).await,
+        Cmd::Trigger { action } => trigger(&action, &paths).await,
+        Cmd::Pause { action, reason } => pause(action, reason, &paths).await,
+        Cmd::Resume { action } => resume(action, &paths).await,
+        Cmd::Status => status(&paths).await,
+        Cmd::Action(c) => action_cmd(c, &paths, &actions_dir).await,
         Cmd::Migrate { from } => {
             let pool = db::open(&paths.state_db()).await?;
             let legacy = from
-                .map(std::path::PathBuf::from)
+                .map(PathBuf::from)
                 .unwrap_or_else(|| dirs::home_dir().unwrap().join(".local/share/claude-run/state"));
             let report = migrate::import_legacy_state(&pool, &legacy).await?;
             tracing::info!(
@@ -100,105 +191,158 @@ async fn run_action(
     on_disk: &cfg::OnDiskConfig,
 ) -> claude_run::error::Result<i32> {
     let loaded = action::load(arg, actions_dir)?;
-    tracing::info!(
-        action = %loaded.action.name,
-        path = %loaded.path.display(),
-        "starting run"
-    );
+    tracing::info!(action = %loaded.action.name, path = %loaded.path.display(), "starting run");
 
     let pool = db::open(&paths.state_db()).await?;
-    let snippet = snippet::SnippetRunner::new(on_disk.daemon.nu_binary.as_deref());
-    let claude = claude_mod::ClaudeInvoker::new(on_disk.daemon.claude_binary.as_deref());
 
-    let defaults = row::RunnerDefaults::default();
-    let limits = row::effective_limits(&defaults, &loaded);
-
-    // ---- daily cap + budget pre-check (parity with old exit codes) ----
-    let daily = state::daily_count_get(&pool, &loaded.action.name).await?;
-    if daily >= limits.max_runs_per_day {
-        tracing::warn!(count = daily, cap = limits.max_runs_per_day, "daily cap reached");
-        return Ok(exit::DAILY_CAP);
+    // Pause checks (Phase 2 contract)
+    if state::global_pause_status(&pool).await?.is_some() {
+        tracing::info!("globally paused");
+        return Ok(exit::PAUSED);
     }
-    let cost_today = state::daily_cost_get(&pool, &loaded.action.name).await?;
-    if cost_today >= limits.daily_budget_usd {
-        tracing::warn!(cost_usd = cost_today, budget_usd = limits.daily_budget_usd, "daily budget reached");
-        return Ok(exit::OVER_BUDGET);
+    if state::action_pause_status(&pool, &loaded.action.name).await?.is_some() {
+        tracing::info!(action = %loaded.action.name, "action paused");
+        return Ok(exit::PAUSED);
     }
 
-    // ---- gather input rows ----
-    let rows = row::gather_rows(&loaded, &snippet, paths).await?;
-    tracing::info!(count = rows.len(), "input rows gathered");
-
-    // ---- mark run, iterate ----
-    let run_id = state::run_begin(&pool, &loaded.action.name, "cli").await?;
-    let mut processed: u32 = 0;
-    let ctx = row::RowContext {
-        action: &loaded,
-        limits,
-        paths,
-        snippet: &snippet,
-        claude: &claude,
-        pool: &pool,
-        run_id,
+    // Cross-process action lock (Phase 2)
+    let lock_dir = paths.runtime_dir.join("locks");
+    let _lock = match lock::ActionLock::try_acquire(&lock_dir, &loaded.action.name)? {
+        Some(l) => l,
+        None => {
+            tracing::info!(action = %loaded.action.name, "another runner holds the lock");
+            return Ok(exit::LOCKED);
+        }
     };
 
-    for (idx, r) in rows.iter().enumerate() {
-        // Re-check caps mid-loop the way the old runner did.
-        let current = state::daily_count_get(&pool, &loaded.action.name).await?;
-        if current >= limits.max_runs_per_day {
-            tracing::warn!(count = current, "daily cap reached mid-run, stopping");
-            break;
-        }
-        let cost = state::daily_cost_get(&pool, &loaded.action.name).await?;
-        if cost >= limits.daily_budget_usd {
-            tracing::warn!(cost_usd = cost, "daily budget reached mid-run, stopping");
-            break;
-        }
+    let snippet = snippet::SnippetRunner::new(on_disk.daemon.nu_binary.as_deref());
+    let claude = claude_mod::ClaudeInvoker::new(on_disk.daemon.claude_binary.as_deref());
+    daemon::run_action_inner(&loaded, paths, &pool, &snippet, &claude, "cli").await?;
+    Ok(exit::OK)
+}
 
-        let outcome = row::process_row(&ctx, r, idx).await?;
-        if let Some(record) = row::done_record(&outcome) {
-            row::append_output_record(paths, &loaded, &record);
-            if let row::ProcessedRow::Done {
-                key,
-                attempt,
-                ok,
-                claude_ran,
-                claude_ok,
-                claude_cost,
-                attempt_counted,
-                summary,
-                stream_log_path,
-            } = &outcome
-            {
-                state::row_outcome_insert(
-                    &pool,
-                    &state::RowOutcome {
-                        run_id,
-                        action_name: &loaded.action.name,
-                        row_key: key,
-                        attempt: *attempt,
-                        ok: *ok,
-                        claude_ran: *claude_ran,
-                        claude_ok: *claude_ok,
-                        claude_cost_usd: *claude_cost,
-                        attempt_counted: *attempt_counted,
-                        summary: Some(summary.as_str()),
-                        stream_log_path: stream_log_path.as_deref(),
-                    },
-                )
-                .await?;
+async fn serve(
+    _detach: bool, // already actioned in main() before the tokio runtime started
+    paths: cfg::Paths,
+    on_disk: cfg::OnDiskConfig,
+) -> claude_run::error::Result<i32> {
+    let d = daemon::Daemon { paths, on_disk };
+    d.run().await?;
+    Ok(exit::OK)
+}
+
+async fn trigger(action: &str, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+    let sock = daemon::daemon_socket_path(paths);
+    if !DaemonClient::is_reachable(&sock) {
+        return Err(anyhow::anyhow!(
+            "daemon not reachable at {}; start it with `claude-run serve --detach`",
+            sock.display()
+        )
+        .into());
+    }
+    let c = DaemonClient::new(&sock);
+    let v: serde_json::Value = c
+        .post(&format!("/actions/{}/trigger", action), None)
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(exit::OK)
+}
+
+async fn pause(
+    action: Option<String>,
+    reason: Option<String>,
+    paths: &cfg::Paths,
+) -> claude_run::error::Result<i32> {
+    let sock = daemon::daemon_socket_path(paths);
+    let body = reason.as_ref().map(|r| json!({"reason": r}));
+
+    if DaemonClient::is_reachable(&sock) {
+        let c = DaemonClient::new(&sock);
+        let path = match &action {
+            Some(name) => format!("/actions/{}/pause", name),
+            None => "/pause".to_string(),
+        };
+        let v: serde_json::Value = c.post(&path, body.as_ref()).await?;
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        let pool = db::open(&paths.state_db()).await?;
+        match action {
+            Some(name) => state::action_pause_set(&pool, &name, reason.as_deref()).await?,
+            None => state::global_pause_set(&pool, reason.as_deref()).await?,
+        }
+        println!("ok");
+    }
+    Ok(exit::OK)
+}
+
+async fn resume(action: Option<String>, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+    let sock = daemon::daemon_socket_path(paths);
+    if DaemonClient::is_reachable(&sock) {
+        let c = DaemonClient::new(&sock);
+        let path = match &action {
+            Some(name) => format!("/actions/{}/resume", name),
+            None => "/resume".to_string(),
+        };
+        let v: serde_json::Value = c.post(&path, None).await?;
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        let pool = db::open(&paths.state_db()).await?;
+        match action {
+            Some(name) => state::action_pause_clear(&pool, &name).await?,
+            None => state::global_pause_clear(&pool).await?,
+        }
+        println!("ok");
+    }
+    Ok(exit::OK)
+}
+
+async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+    let sock = daemon::daemon_socket_path(paths);
+    if DaemonClient::is_reachable(&sock) {
+        let c = DaemonClient::new(&sock);
+        let v: serde_json::Value = c.get("/status").await?;
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(exit::OK);
+    }
+    let pool = db::open(&paths.state_db()).await?;
+    let global = state::global_pause_status(&pool).await?;
+    let actions = state::action_index_list(&pool).await?;
+    let report = json!({
+        "daemon": "not running",
+        "socket_expected_at": sock.display().to_string(),
+        "global_paused": global.map(|(a, r)| json!({"paused_at": a, "reason": r})),
+        "actions": actions,
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(exit::OK)
+}
+
+async fn action_cmd(
+    cmd: ActionCmd,
+    paths: &cfg::Paths,
+    actions_dir: &std::path::Path,
+) -> claude_run::error::Result<i32> {
+    let pool = db::open(&paths.state_db()).await?;
+    let sock = daemon::daemon_socket_path(paths);
+    if !DaemonClient::is_reachable(&sock) {
+        // Refresh the index ourselves; without a daemon, nobody else does.
+        daemon::scan_actions(&pool, actions_dir).await?;
+    }
+    match cmd {
+        ActionCmd::List => {
+            let rows = state::action_index_list(&pool).await?;
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        }
+        ActionCmd::Show { name } => {
+            let rows = state::action_index_list(&pool).await?;
+            match rows.into_iter().find(|r| r.name == name) {
+                Some(r) => println!("{}", serde_json::to_string_pretty(&r)?),
+                None => {
+                    eprintln!("no action `{name}` in index");
+                    return Ok(exit::CONFIG_ERROR);
+                }
             }
         }
-        processed += 1;
     }
-
-    state::run_finish(&pool, run_id, exit::OK, processed).await?;
-    let final_count = state::daily_count_get(&pool, &loaded.action.name).await?;
-    let final_cost = state::daily_cost_get(&pool, &loaded.action.name).await?;
-    tracing::info!(
-        final_daily_count = final_count,
-        final_daily_cost_usd = final_cost,
-        "run complete"
-    );
     Ok(exit::OK)
 }
