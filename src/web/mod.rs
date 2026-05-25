@@ -426,8 +426,46 @@ async fn action_export(
 pub struct PlannedRow {
     pub key: String,
     pub href: Option<String>,
-    /// One of: "running" (no outcome yet) | "ok" | "fail"
+    /// One of:
+    /// - "ok" / "fail": an outcome record landed.
+    /// - "running": no outcome, run still active, and a stream log exists on
+    ///   disk (claude is writing). Carries `watch_attempt`.
+    /// - "queued": no outcome, run still active, no stream log yet.
+    /// - "skipped": no outcome and the run has ended (planned but never
+    ///   completed). Replaces the stale "running" badge.
     pub status: String,
+    /// Attempt number for the "watch live" link, set only for "running" rows.
+    /// Resolved from the CLAUDE-9 in-flight registry once it lands, else from
+    /// the highest `<key>-attempt-<n>.jsonl` on disk.
+    pub watch_attempt: Option<u32>,
+}
+
+/// Resolve the highest attempt number with a stream log on disk for `key`.
+/// Stream logs are written live by `ClaudeInvoker::invoke` to
+/// `<logs>/<action>/streams/<key>-attempt-<n>.jsonl`, so the presence of one
+/// without a matching `row_outcomes` record means that row is in flight. This
+/// is the on-disk fallback for the CLAUDE-9 per-run in-flight registry.
+fn latest_attempt_on_disk(logs_dir: &std::path::Path, action: &str, key: &str) -> Option<u32> {
+    let dir = logs_dir.join(action).join("streams");
+    let prefix = format!("{key}-attempt-");
+    let mut best: Option<u32> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let fname = entry.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        let Some(rest) = fname.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(num) = rest.strip_suffix(".jsonl") else {
+            continue;
+        };
+        let Ok(n) = num.parse::<u32>() else {
+            continue;
+        };
+        best = Some(best.map_or(n, |b| b.max(n)));
+    }
+    best
 }
 
 #[derive(Template)]
@@ -482,13 +520,25 @@ async fn run_detail(
     for o in &outcomes {
         outcome_by_key.insert(o.row_key.as_str(), o.ok);
     }
+    // A run with a NULL `ended_at` is still active; only then can a row be
+    // genuinely in flight. Once the run ends, a planned row with no outcome
+    // never started (or never finished), so it must not keep the "running"
+    // badge.
+    let run_active = run.ended_at.is_none();
+    let logs_dir = s.paths.logs_dir();
     let planned_rows: Vec<PlannedRow> = planned_keys
         .into_iter()
         .map(|k| {
-            let status = match outcome_by_key.get(k.as_str()) {
-                Some(true) => "ok".to_string(),
-                Some(false) => "fail".to_string(),
-                None => "running".to_string(),
+            let (status, watch_attempt) = match outcome_by_key.get(k.as_str()) {
+                Some(true) => ("ok".to_string(), None),
+                Some(false) => ("fail".to_string(), None),
+                None if run_active => {
+                    match latest_attempt_on_disk(&logs_dir, &run.action_name, &k) {
+                        Some(n) => ("running".to_string(), Some(n)),
+                        None => ("queued".to_string(), None),
+                    }
+                }
+                None => ("skipped".to_string(), None),
             };
             let href = link_template
                 .as_ref()
@@ -497,6 +547,7 @@ async fn run_detail(
                 key: k,
                 href,
                 status,
+                watch_attempt,
             }
         })
         .collect();
@@ -702,5 +753,48 @@ impl From<askama::Error> for WebError {
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
         (self.status, self.message).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::latest_attempt_on_disk;
+
+    fn touch(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+
+    #[test]
+    fn latest_attempt_picks_highest_and_ignores_other_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path();
+        let streams = logs.join("act").join("streams");
+        touch(&streams.join("CLAUDE-9-attempt-1.jsonl"));
+        touch(&streams.join("CLAUDE-9-attempt-2.jsonl"));
+        // A longer key that shares the prefix must not leak in.
+        touch(&streams.join("CLAUDE-90-attempt-5.jsonl"));
+        // Unrelated files are skipped.
+        touch(&streams.join("CLAUDE-9-attempt-bogus.jsonl"));
+        touch(&streams.join("CLAUDE-9.txt"));
+
+        assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-9"), Some(2));
+        assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-90"), Some(5));
+    }
+
+    #[test]
+    fn latest_attempt_none_when_no_stream_dir_or_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path();
+        // No streams dir at all.
+        assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-9"), None);
+        // Dir exists but holds no matching file.
+        touch(
+            &logs
+                .join("act")
+                .join("streams")
+                .join("other-attempt-1.jsonl"),
+        );
+        assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-9"), None);
     }
 }

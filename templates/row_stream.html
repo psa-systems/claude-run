@@ -6,44 +6,121 @@
 
 <div class="card">
   <div class="meta">
-    Streaming from <code>{{ stream_path }}</code>. New events append at the bottom; the connection closes once the file is fully consumed.
+    Streaming from <code>{{ stream_path }}</code>. New events append at the bottom; the connection closes once the row finishes.
+  </div>
+  <div>
+    Last activity: <span id="activity" class="activity">waiting...</span>
+    <label style="float:right; cursor:pointer;">
+      <input type="checkbox" id="raw-toggle"> raw NDJSON
+    </label>
   </div>
 </div>
 
 <h2>Events</h2>
-<pre class="stream" id="stream"></pre>
+<div class="stream" id="stream"></div>
+<pre class="stream" id="raw" style="display:none"></pre>
 
 <script>
-  // SSE renderer: each "msg" event carries a single JSON NDJSON line.
-  // We classify by `type` so the user can spot the result event at a glance.
+  // SSE renderer. Each "msg" event carries one stream-json NDJSON line. We
+  // parse it into a readable line (assistant text, tool name + a short input
+  // summary, the final result) so progress and a stalled agent are obvious
+  // without reading raw JSON. The raw pane keeps the unparsed NDJSON for
+  // debugging, toggled by the checkbox.
   const out = document.getElementById('stream');
+  const raw = document.getElementById('raw');
+  const activity = document.getElementById('activity');
+  const rawToggle = document.getElementById('raw-toggle');
+  let lastEventAt = null;
+  let closed = false;
+
+  rawToggle.addEventListener('change', () => {
+    const showRaw = rawToggle.checked;
+    raw.style.display = showRaw ? '' : 'none';
+    out.style.display = showRaw ? 'none' : '';
+  });
+
+  function append(cls, text) {
+    const div = document.createElement('span');
+    div.className = 'ev ' + cls;
+    div.textContent = text;
+    out.appendChild(div);
+    out.scrollTop = out.scrollHeight;
+  }
+
+  // Pull a short, human-meaningful summary out of a tool_use input object.
+  function summarizeInput(input) {
+    if (!input || typeof input !== 'object') return '';
+    for (const k of ['command', 'file_path', 'path', 'pattern', 'url', 'prompt', 'description']) {
+      if (typeof input[k] === 'string' && input[k].length) {
+        const v = input[k].replace(/\s+/g, ' ').trim();
+        return v.length > 160 ? v.slice(0, 157) + '...' : v;
+      }
+    }
+    const s = JSON.stringify(input);
+    return s.length > 160 ? s.slice(0, 157) + '...' : s;
+  }
+
+  function render(j) {
+    if (j.type === 'assistant' && j.message && Array.isArray(j.message.content)) {
+      for (const block of j.message.content) {
+        if (block.type === 'text' && block.text && block.text.trim()) {
+          append('ev-assistant', block.text.trim());
+        } else if (block.type === 'tool_use') {
+          const summary = summarizeInput(block.input);
+          append('ev-tool', '→ ' + (block.name || 'tool') + (summary ? ': ' + summary : ''));
+        }
+      }
+    } else if (j.type === 'result') {
+      const summary = (typeof j.result === 'string' && j.result) ? j.result : (j.subtype || '(no result text)');
+      const cost = (typeof j.total_cost_usd === 'number') ? ' ($' + j.total_cost_usd.toFixed(4) + ')' : '';
+      append(j.is_error ? 'ev-result-err' : 'ev-result-ok', 'result: ' + summary + cost);
+    } else if (j.type === 'system') {
+      if (j.subtype === 'no-stream-yet') {
+        append('ev-system', 'No stream yet - the agent has not started writing.');
+      } else if (j.subtype === 'init') {
+        append('ev-system', 'session started' + (j.model ? ' (model ' + j.model + ')' : ''));
+      } else if (j.error) {
+        append('ev-system', 'system error: ' + j.error);
+      }
+      // Other system events are noise in the readable view; they stay in raw.
+    }
+    // user / tool_result events are verbose tool output; the readable view
+    // skips them and they remain available in the raw pane.
+  }
+
+  // Tick the "last activity" indicator every second so a stalled agent shows
+  // a growing, eventually-red counter instead of a frozen timestamp.
+  function tick() {
+    if (lastEventAt === null) return;
+    const secs = Math.round((Date.now() - lastEventAt) / 1000);
+    activity.textContent = secs + 's ago' + (closed ? ' (stream closed)' : '');
+    activity.className = 'activity ' + (closed ? '' : (secs > 60 ? 'stale' : 'live'));
+  }
+  setInterval(tick, 1000);
+
   const source = new EventSource("/sse/runs/{{ run_id }}/rows/{{ row_key }}/attempt/{{ attempt }}");
   source.addEventListener('msg', (e) => {
-    let cls = 'ev-system';
-    let text = e.data;
+    lastEventAt = Date.now();
+    raw.textContent += e.data + "\n";
+    raw.scrollTop = raw.scrollHeight;
     try {
-      const j = JSON.parse(e.data);
-      if (j.type === 'assistant') cls = 'ev-assistant';
-      else if (j.type === 'user') cls = 'ev-user';
-      else if (j.type === 'result') {
-        cls = j.is_error ? 'ev-result-err' : 'ev-result-ok';
-      }
-      text = JSON.stringify(j, null, 2);
-    } catch (_) { /* not JSON, render raw */ }
-    const span = document.createElement('span');
-    span.className = cls;
-    span.textContent = text + "\n";
-    out.appendChild(span);
-    out.scrollTop = out.scrollHeight;
+      render(JSON.parse(e.data));
+    } catch (_) {
+      append('ev-system', e.data); // not JSON: show raw line in readable view too
+    }
+    tick();
   });
-  source.addEventListener('done', () => source.close());
+  source.addEventListener('done', () => {
+    closed = true;
+    source.close();
+    tick();
+  });
   source.addEventListener('error', () => {
-    // EventSource auto-reconnects on transient errors; only close on hard fail.
+    // EventSource auto-reconnects on transient errors; only report a hard fail.
     if (source.readyState === EventSource.CLOSED) {
-      const span = document.createElement('span');
-      span.className = 'ev-result-err';
-      span.textContent = "\n[stream closed]\n";
-      out.appendChild(span);
+      closed = true;
+      append('ev-result-err', "\n[stream closed]");
+      tick();
     }
   });
 </script>

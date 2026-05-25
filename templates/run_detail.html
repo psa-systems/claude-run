@@ -30,14 +30,17 @@
   </dl>
 </div>
 
-{# CLAUDE-1: planned rows from input.command, populated at run-start. Each
-   key links out via the action's link_template when set. Status is derived
-   from row_outcomes: "running" = no outcome yet, "ok" / "fail" once done. #}
+{# CLAUDE-1 / CLAUDE-12: planned rows from input.command, populated at
+   run-start. Each key links out via the action's link_template when set.
+   Status is derived from row_outcomes plus the on-disk stream log: "running"
+   = in flight (stream log present, run still active) and carries a watch-live
+   link; "queued" = waiting its turn; "skipped" = the run ended before this
+   row produced an outcome; "ok" / "fail" once an outcome lands. #}
 {% if !planned_rows.is_empty() %}
   <h2>Rows in this batch</h2>
   <div class="card">
     <table>
-      <thead><tr><th>Row</th><th>State</th></tr></thead>
+      <thead><tr><th>Row</th><th>State</th><th>Live</th></tr></thead>
       <tbody>
         {% for p in planned_rows %}
           <tr>
@@ -53,8 +56,19 @@
                 <span class="badge ok">done</span>
               {% else if p.status == "fail" %}
                 <span class="badge bad">failed</span>
-              {% else %}
+              {% else if p.status == "running" %}
                 <span class="badge warn">running</span>
+              {% else if p.status == "queued" %}
+                <span class="badge neutral">queued</span>
+              {% else %}
+                <span class="badge neutral">not started</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if let Some(a) = p.watch_attempt %}
+                <a href="/runs/{{ run.id }}/rows/{{ p.key }}/attempt/{{ a }}">watch live</a>
+              {% else %}
+                <span class="dim">-</span>
               {% endif %}
             </td>
           </tr>
