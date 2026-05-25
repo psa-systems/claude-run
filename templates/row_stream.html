@@ -30,8 +30,16 @@
   const raw = document.getElementById('raw');
   const activity = document.getElementById('activity');
   const rawToggle = document.getElementById('raw-toggle');
-  let lastEventAt = null;
-  let closed = false;
+  const baseUrl = "/sse/runs/{{ run_id }}/rows/{{ row_key }}/attempt/{{ attempt }}";
+
+  let lastEventAt = null;        // wall-clock of the last rendered event
+  let lastId = null;             // last SSE event id, carried into reconnects to resume
+  let finished = false;          // set true ONLY by the 'done' event (row actually complete)
+  let source = null;             // current EventSource (re-created on manual reconnect)
+  let reconnectDelay = 1000;     // backoff, doubles to RECONNECT_MAX
+  let reconnectTimer = null;
+  let statusText = '';           // transient connection status (reconnecting / paused)
+  const RECONNECT_MAX = 5000;
 
   rawToggle.addEventListener('change', () => {
     const showRaw = rawToggle.checked;
@@ -88,41 +96,128 @@
     // skips them and they remain available in the raw pane.
   }
 
-  // Tick the "last activity" indicator every second so a stalled agent shows
-  // a growing, eventually-red counter instead of a frozen timestamp.
+  function setActivity(text, cls) {
+    activity.textContent = text;
+    activity.className = 'activity ' + (cls || '');
+  }
+
+  // Refresh the status line every second. The four states are explicit:
+  //   - finished:        the row is genuinely done ('done' fired).
+  //   - tab hidden:      stream paused, not closed.
+  //   - reconnecting:    connection dropped while in flight, retrying.
+  //   - connected:       healthy; keep-alive comments hold the connection even
+  //                      during a long silent tool call, so the elapsed-since-
+  //                      last-event counter must NOT read as stale.
   function tick() {
-    if (lastEventAt === null) return;
+    if (finished) {
+      const secs = lastEventAt ? Math.round((Date.now() - lastEventAt) / 1000) : 0;
+      setActivity(secs + 's ago (stream closed)', '');
+      return;
+    }
+    if (document.hidden) {
+      setActivity('stream paused - tab inactive', '');
+      return;
+    }
+    if (statusText) {
+      setActivity(statusText, '');
+      return;
+    }
+    if (lastEventAt === null) {
+      setActivity('waiting...', '');
+      return;
+    }
     const secs = Math.round((Date.now() - lastEventAt) / 1000);
-    activity.textContent = secs + 's ago' + (closed ? ' (stream closed)' : '');
-    activity.className = 'activity ' + (closed ? '' : (secs > 60 ? 'stale' : 'live'));
+    setActivity(secs + 's since last event', 'live');
   }
   setInterval(tick, 1000);
 
-  const source = new EventSource("/sse/runs/{{ run_id }}/rows/{{ row_key }}/attempt/{{ attempt }}");
-  source.addEventListener('msg', (e) => {
-    lastEventAt = Date.now();
-    raw.textContent += e.data + "\n";
-    raw.scrollTop = raw.scrollHeight;
-    try {
-      render(JSON.parse(e.data));
-    } catch (_) {
-      append('ev-system', e.data); // not JSON: show raw line in readable view too
-    }
-    tick();
-  });
-  source.addEventListener('done', () => {
-    closed = true;
-    source.close();
-    tick();
-  });
-  source.addEventListener('error', () => {
-    // EventSource auto-reconnects on transient errors; only report a hard fail.
-    if (source.readyState === EventSource.CLOSED) {
-      closed = true;
+  function scheduleReconnect() {
+    if (finished || reconnectTimer) return;
+    const delay = reconnectDelay;
+    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (finished || document.hidden) return;
+      reconnect();
+    }, delay);
+  }
+
+  function reconnect() {
+    if (source) { source.close(); source = null; }
+    connect();
+  }
+
+  function connect() {
+    // Carry the last seen id forward so the server resumes past already-rendered
+    // lines (a freshly created EventSource cannot send the Last-Event-ID header).
+    let url = baseUrl;
+    if (lastId !== null) url += '?lastEventId=' + encodeURIComponent(lastId);
+    source = new EventSource(url);
+
+    source.addEventListener('open', () => {
+      statusText = '';
+      reconnectDelay = 1000;
+      tick();
+    });
+
+    source.addEventListener('msg', (e) => {
+      lastEventAt = Date.now();
+      if (e.lastEventId) lastId = e.lastEventId;
+      statusText = '';
+      reconnectDelay = 1000;
+      raw.textContent += e.data + "\n";
+      raw.scrollTop = raw.scrollHeight;
+      try {
+        render(JSON.parse(e.data));
+      } catch (_) {
+        append('ev-system', e.data); // not JSON: show raw line in readable view too
+      }
+      tick();
+    });
+
+    source.addEventListener('done', () => {
+      // Row actually finished: this is the ONLY path that closes for good.
+      finished = true;
+      statusText = '';
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (source) { source.close(); source = null; }
       append('ev-result-err', "\n[stream closed]");
       tick();
+    });
+
+    source.addEventListener('error', () => {
+      if (finished) return;
+      if (source.readyState === EventSource.CLOSED) {
+        // Browser gave up. Don't die while the row is in flight: a hidden tab
+        // shows "paused" and reconnects on return; otherwise retry with backoff.
+        if (document.hidden) {
+          statusText = 'stream paused - tab inactive';
+        } else {
+          statusText = 'reconnecting...';
+          scheduleReconnect();
+        }
+      } else {
+        // CONNECTING: the browser's own auto-reconnect is in progress.
+        statusText = 'reconnecting...';
+      }
+      tick();
+    });
+  }
+
+  // When the tab comes back, reconnect immediately if we're not already
+  // streaming and the row hasn't finished.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      if (!finished) statusText = 'stream paused - tab inactive';
+    } else if (!finished && (!source || source.readyState === EventSource.CLOSED)) {
+      statusText = 'reconnecting...';
+      reconnectDelay = 1000;
+      reconnect();
     }
+    tick();
   });
+
+  connect();
 </script>
 
 {% endblock %}
