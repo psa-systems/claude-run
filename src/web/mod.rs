@@ -90,6 +90,9 @@ struct RunRow {
     exit_code: Option<i64>,
     rows_processed: i64,
     triggered_by: String,
+    /// CLAUDE-14: key of the row currently being processed, or NULL when no row
+    /// is in flight (run finished, or a legacy run predating the column).
+    current_row_key: Option<String>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -133,7 +136,7 @@ async fn enriched_actions(pool: &SqlitePool) -> Result<Vec<ActionView>, WebError
 
 async fn fetch_recent_runs(pool: &SqlitePool, limit: i64) -> Result<Vec<RunRow>, WebError> {
     let rows = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by FROM runs ORDER BY started_at DESC LIMIT ?",
+        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key FROM runs ORDER BY started_at DESC LIMIT ?",
     )
     .bind(limit)
     .fetch_all(pool)
@@ -219,7 +222,7 @@ async fn action_detail(
             reason: r,
         });
     let runs = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
+        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
     )
     .bind(&name)
     .fetch_all(pool)
@@ -428,15 +431,15 @@ pub struct PlannedRow {
     pub href: Option<String>,
     /// One of:
     /// - "ok" / "fail": an outcome record landed.
-    /// - "running": no outcome, run still active, and a stream log exists on
-    ///   disk (claude is writing). Carries `watch_attempt`.
-    /// - "queued": no outcome, run still active, no stream log yet.
+    /// - "running": no outcome, run still active, and this is the one row the
+    ///   run is processing (`runs.current_row_key`). Carries `watch_attempt`.
+    /// - "queued": no outcome, run still active, not the in-flight row.
     /// - "skipped": no outcome and the run has ended (planned but never
     ///   completed). Replaces the stale "running" badge.
     pub status: String,
-    /// Attempt number for the "watch live" link, set only for "running" rows.
-    /// Resolved from the CLAUDE-9 in-flight registry once it lands, else from
-    /// the highest `<key>-attempt-<n>.jsonl` on disk.
+    /// Attempt number for the "watch live" link, set only for the "running"
+    /// row. Resolved from the highest `<key>-attempt-<n>.jsonl` stream log on
+    /// disk (`None` until claude opens the log for the row's first attempt).
     pub watch_attempt: Option<u32>,
 }
 
@@ -489,7 +492,7 @@ async fn run_detail(
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
     let Some(run): Option<RunRow> = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by FROM runs WHERE id = ?",
+        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key FROM runs WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -520,11 +523,14 @@ async fn run_detail(
     for o in &outcomes {
         outcome_by_key.insert(o.row_key.as_str(), o.ok);
     }
-    // A run with a NULL `ended_at` is still active; only then can a row be
-    // genuinely in flight. Once the run ends, a planned row with no outcome
-    // never started (or never finished), so it must not keep the "running"
-    // badge.
+    // CLAUDE-14: a run with a NULL `ended_at` is still active; only then can a
+    // row be in flight, and exactly the one matching `runs.current_row_key` is.
+    // Rows are processed strictly sequentially, so every other no-outcome row is
+    // queued, not running. Once the run ends, `current_row_key` is NULL and a
+    // no-outcome row never finished (filtered / capped / skipped / not reached),
+    // so it must not keep the "running" badge.
     let run_active = run.ended_at.is_none();
+    let current_row = run.current_row_key.as_deref();
     let logs_dir = s.paths.logs_dir();
     let planned_rows: Vec<PlannedRow> = planned_keys
         .into_iter()
@@ -532,12 +538,13 @@ async fn run_detail(
             let (status, watch_attempt) = match outcome_by_key.get(k.as_str()) {
                 Some(true) => ("ok".to_string(), None),
                 Some(false) => ("fail".to_string(), None),
-                None if run_active => {
-                    match latest_attempt_on_disk(&logs_dir, &run.action_name, &k) {
-                        Some(n) => ("running".to_string(), Some(n)),
-                        None => ("queued".to_string(), None),
-                    }
+                None if run_active && current_row == Some(k.as_str()) => {
+                    // The single in-flight row. Resolve its live-stream attempt
+                    // from disk for the "watch live" link.
+                    let attempt = latest_attempt_on_disk(&logs_dir, &run.action_name, &k);
+                    ("running".to_string(), attempt)
                 }
+                None if run_active => ("queued".to_string(), None),
                 None => ("skipped".to_string(), None),
             };
             let href = link_template
