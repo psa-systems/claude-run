@@ -62,6 +62,9 @@ enum Cmd {
     },
     /// Ask the daemon to run an action immediately (out of cycle).
     Trigger { action: String },
+    /// Cancel an in-flight run by id. Requires a running daemon (the run lives
+    /// inside it). Idempotent: a clear no-op when the run is not in flight.
+    Cancel { run_id: i64 },
     /// Pause global / per-action scheduling. With no `action`, pauses globally.
     Pause {
         action: Option<String>,
@@ -175,6 +178,7 @@ async fn real_main(cli: Cli) -> claude_run::error::Result<i32> {
         Cmd::Stop => stop(&paths).await,
         Cmd::Restart { detach } => restart(detach, cli.actions_dir.as_deref(), &paths).await,
         Cmd::Trigger { action } => trigger(&action, &paths).await,
+        Cmd::Cancel { run_id } => cancel_run(run_id, &paths).await,
         Cmd::Pause { action, reason } => pause(action, reason, &paths).await,
         Cmd::Resume { action } => resume(action, &paths).await,
         Cmd::Status => status(&paths).await,
@@ -234,7 +238,7 @@ async fn run_action(
 
     let snippet = snippet::SnippetRunner::new(on_disk.daemon.nu_binary.as_deref());
     let claude = claude_mod::ClaudeInvoker::new(on_disk.daemon.claude_binary.as_deref());
-    daemon::run_action_inner(&loaded, paths, &pool, &snippet, &claude, "cli").await?;
+    daemon::run_action_inner(&loaded, paths, &pool, &snippet, &claude, "cli", None).await?;
     Ok(exit::OK)
 }
 
@@ -364,6 +368,22 @@ async fn trigger(action: &str, paths: &cfg::Paths) -> claude_run::error::Result<
     let v: serde_json::Value = c
         .post(&format!("/actions/{}/trigger", action), None)
         .await?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(exit::OK)
+}
+
+async fn cancel_run(run_id: i64, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+    let sock = daemon::daemon_socket_path(paths);
+    if !DaemonClient::is_reachable(&sock) {
+        return Err(anyhow::anyhow!(
+            "daemon not reachable at {}; an in-flight run only exists inside the daemon, \
+             so cancellation requires it to be running",
+            sock.display()
+        )
+        .into());
+    }
+    let c = DaemonClient::new(&sock);
+    let v: serde_json::Value = c.post(&format!("/runs/{}/cancel", run_id), None).await?;
     println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(exit::OK)
 }
