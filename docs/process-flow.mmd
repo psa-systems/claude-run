@@ -1,0 +1,21 @@
+stateDiagram-v2
+    direction TB
+
+    [*] --> ToDo : yt issue create
+
+    state "To do" as ToDo
+    state "In Progress" as InProg
+    state "Done" as Done
+
+    ToDo --> InProg : yt issue apply 'State In Progress' (before first edit)
+    InProg --> InProg : commit references issue as bare #KEY-N (link only, no State command), open PR
+    InProg --> Done : human merges PR, then yt issue apply 'State Done' (explicit, post-merge)
+    Done --> [*]
+
+    note right of InProg
+        Commit trailers are applied when the VCS integration parses the
+        pushed commit, not on PR merge. A bare #KEY-N links the PR to the
+        issue without transitioning it, so the issue stays In Progress
+        through review. State Done is a deliberate post-merge action via
+        yt issue apply, never a commit trailer.
+    end note
