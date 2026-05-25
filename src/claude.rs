@@ -16,15 +16,23 @@
 //! the whole stream log - that previously false-positived on MCP "needs-auth"
 //! strings in the `system/init` event.
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::action::ClaudeBlock;
+use crate::cancel::CancellationToken;
 use crate::error::Result;
+
+/// Grace window the claude process group gets after SIGTERM, before the
+/// canceller escalates to SIGKILL.
+const CANCEL_GRACE: Duration = Duration::from_millis(2000);
+/// How often the cancellable wait loop polls the child and the token.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaudeResult {
@@ -69,6 +77,13 @@ impl ClaudeInvoker {
 
     /// Spawn claude, redirect stdout+stderr to `stream_log`, wait, then parse
     /// the last NDJSON line for the final result event.
+    ///
+    /// CLAUDE-9: the child is spawned in its own process group and the wait is
+    /// cancellable. When `cancel` trips, the whole group (the `timeout`
+    /// wrapper, `claude`, and anything they spawned) is terminated with
+    /// SIGTERM, a short grace period, then SIGKILL. The caller (`row.rs`)
+    /// detects the tripped token and synthesizes a cancelled `$claude_result`
+    /// so the action's `post` phase still runs.
     pub fn invoke(
         &self,
         prompt: &str,
@@ -76,6 +91,7 @@ impl ClaudeInvoker {
         timeout: Duration,
         default_cwd: &Path,
         stream_log: &Path,
+        cancel: &CancellationToken,
     ) -> Result<ClaudeResult> {
         if let Some(parent) = stream_log.parent() {
             std::fs::create_dir_all(parent)?;
@@ -103,8 +119,10 @@ impl ClaudeInvoker {
         // We delegate the wall-clock timeout to coreutils `timeout(1)` (same as
         // the nu implementation) so the exit-code-124 contract is preserved.
         // Inside it we run claude with closed stdin and merged stdout+stderr
-        // redirected to the stream log.
-        let status = Command::new("timeout")
+        // redirected to the stream log. `process_group(0)` puts the child (and
+        // therefore claude + descendants) in a fresh group whose pgid equals
+        // the child's pid, so cancellation can signal the whole tree at once.
+        let mut child = Command::new("timeout")
             .arg(format!("{}s", timeout.as_secs()))
             .arg(&self.binary)
             .arg("--print")
@@ -117,7 +135,11 @@ impl ClaudeInvoker {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_err))
-            .status()?;
+            .process_group(0)
+            .spawn()?;
+
+        let pgid = child.id() as i32;
+        let status = wait_or_cancel(&mut child, pgid, cancel)?;
 
         let exit_code = status.code().unwrap_or(-1);
         let final_event = parse_final_result(stream_log).unwrap_or(Value::Null);
@@ -175,6 +197,50 @@ impl ClaudeInvoker {
             transient: false,
         })
     }
+}
+
+/// Wait for the child to exit, watching `cancel`. Returns the child's exit
+/// status on normal completion; on cancellation, terminates the child's
+/// process group and returns the status of the terminated `timeout` wrapper.
+///
+/// Polling (rather than blocking on `wait`) is deliberate: `invoke` is a
+/// synchronous call already blocking its worker thread on the child, so a
+/// 100ms poll adds responsiveness to cancellation without changing the
+/// threading model.
+fn wait_or_cancel(
+    child: &mut Child,
+    pgid: i32,
+    cancel: &CancellationToken,
+) -> std::io::Result<ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if cancel.is_cancelled() {
+            return terminate_group(child, pgid);
+        }
+        std::thread::sleep(CANCEL_POLL);
+    }
+}
+
+/// Terminate the child's process group: SIGTERM, a short grace window, then
+/// SIGKILL. Signalling `-pgid` hits every process in the group (`timeout`,
+/// `claude`, and anything they spawned), so nothing is left orphaned.
+fn terminate_group(child: &mut Child, pgid: i32) -> std::io::Result<ExitStatus> {
+    unsafe {
+        libc::kill(-pgid, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + CANCEL_GRACE;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+    child.wait()
 }
 
 /// Transient = "the API itself told us to back off; a retry might succeed".
@@ -248,5 +314,53 @@ mod tests {
             1,
             &json!({"type":"result","error":"usage limit exceeded"})
         ));
+    }
+
+    /// CLAUDE-9: tripping the token mid-run terminates the child's process
+    /// group, so `invoke` returns long before the (30s) stub/timeout would.
+    #[test]
+    fn invoke_cancellation_terminates_promptly() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Stub "claude": ignore the flags invoke passes and sleep well past the
+        // test budget. SIGTERM to the group ends it immediately.
+        let stub = dir.path().join("claude-stub.sh");
+        {
+            let mut f = std::fs::File::create(&stub).unwrap();
+            writeln!(f, "#!/bin/sh\nexec sleep 30").unwrap();
+        }
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let trip = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            trip.cancel();
+        });
+
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let start = Instant::now();
+        let res = invoker.invoke(
+            "hi",
+            &cfg,
+            Duration::from_secs(30),
+            dir.path(),
+            &log,
+            &cancel,
+        );
+        let elapsed = start.elapsed();
+        canceller.join().unwrap();
+
+        assert!(res.is_ok(), "invoke returns Ok even when cancelled");
+        // SIGTERM + at most a 2s grace + poll slop; comfortably under the 30s
+        // stub. A regression that ignored the token would block ~30s here.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel should terminate fast, took {elapsed:?}"
+        );
     }
 }

@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 use crate::action::{self, LoadedAction};
 use crate::api::{self, AppState};
+use crate::cancel::{CancellationToken, RegistryGuard, RunRegistry};
 use crate::claude::ClaudeInvoker;
 use crate::config::{OnDiskConfig, Paths};
 use crate::error::Result;
@@ -70,10 +71,16 @@ impl Daemon {
         let snippet = SnippetRunner::new(self.on_disk.daemon.nu_binary.as_deref());
         let claude = ClaudeInvoker::new(self.on_disk.daemon.claude_binary.as_deref());
 
+        // CLAUDE-9: one registry shared between the dispatcher (which registers
+        // a token per run) and the API state (whose /runs/:id/cancel handler
+        // trips it).
+        let runs = Arc::new(RunRegistry::new());
+
         let api_state = Arc::new(AppState {
             pool: pool.clone(),
             trigger_tx: trigger_tx.clone(),
             version: VERSION,
+            runs: runs.clone(),
         });
 
         // Unix-socket router: bare paths (`/status`, `/actions`, ...). CLI
@@ -113,6 +120,7 @@ impl Daemon {
             snippet: Arc::new(snippet),
             claude: Arc::new(claude),
             in_flight: Mutex::new(std::collections::HashSet::new()),
+            runs,
         });
 
         let scheduler_task = tokio::spawn(scheduler_loop(dispatch.clone(), trigger_tx.clone()));
@@ -272,6 +280,8 @@ struct Dispatcher {
     snippet: Arc<SnippetRunner>,
     claude: Arc<ClaudeInvoker>,
     in_flight: Mutex<std::collections::HashSet<String>>,
+    /// CLAUDE-9: per-run cancellation tokens, registered by `run_action_inner`.
+    runs: Arc<RunRegistry>,
 }
 
 impl Dispatcher {
@@ -335,12 +345,17 @@ impl Dispatcher {
             &self.snippet,
             &self.claude,
             trigger_source,
+            Some(&self.runs),
         )
         .await
     }
 }
 
 /// Shared by the daemon and the standalone CLI `run` subcommand.
+///
+/// CLAUDE-9: `registry` is `Some` only on the daemon path, where a run can be
+/// cancelled through the socket API. The standalone `claude-run run` path
+/// passes `None` (nothing can reach it to cancel) and gets an inert token.
 pub async fn run_action_inner(
     loaded: &LoadedAction,
     paths: &Paths,
@@ -348,6 +363,7 @@ pub async fn run_action_inner(
     snippet: &SnippetRunner,
     claude: &ClaudeInvoker,
     triggered_by: &str,
+    registry: Option<&RunRegistry>,
 ) -> Result<()> {
     let defaults = RunnerDefaults::default();
     let limits = row::effective_limits(&defaults, loaded);
@@ -367,6 +383,14 @@ pub async fn run_action_inner(
     info!(action = %loaded.action.name, count = rows.len(), "input rows gathered");
 
     let run_id = state::run_begin(pool, &loaded.action.name, triggered_by).await?;
+
+    // CLAUDE-9: register a cancellation token for this run and ensure it is
+    // unregistered on every exit path (including the `?` early returns below).
+    let cancel = match registry {
+        Some(r) => r.register(run_id),
+        None => CancellationToken::new(),
+    };
+    let _registry_guard = RegistryGuard { registry, run_id };
 
     // CLAUDE-1: record the planned row keys so the web UI shows what's
     // queued / in-flight before any outcome record lands.
@@ -388,9 +412,14 @@ pub async fn run_action_inner(
         claude,
         pool,
         run_id,
+        cancel: cancel.clone(),
     };
 
     for (idx, r) in rows.iter().enumerate() {
+        if cancel.is_cancelled() {
+            info!(action = %loaded.action.name, "run cancelled, stopping before next row");
+            break;
+        }
         let current = state::daily_count_get(pool, &loaded.action.name).await?;
         if current >= limits.max_runs_per_day {
             warn!(count = current, "daily cap reached mid-run, stopping");
@@ -437,8 +466,13 @@ pub async fn run_action_inner(
         }
         processed += 1;
     }
-    state::run_finish(pool, run_id, 0, processed).await?;
-    info!(action = %loaded.action.name, processed, "run complete");
+    let exit_code = if cancel.is_cancelled() {
+        crate::exit::CANCELLED
+    } else {
+        crate::exit::OK
+    };
+    state::run_finish(pool, run_id, exit_code, processed).await?;
+    info!(action = %loaded.action.name, processed, exit_code, "run complete");
     Ok(())
 }
 

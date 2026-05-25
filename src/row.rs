@@ -27,6 +27,7 @@ use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use crate::action::LoadedAction;
+use crate::cancel::CancellationToken;
 use crate::claude::{ClaudeInvoker, ClaudeResult};
 use crate::config::Paths;
 use crate::error::{Error, Result};
@@ -84,6 +85,11 @@ pub struct RowContext<'a> {
     pub claude: &'a ClaudeInvoker,
     pub pool: &'a SqlitePool,
     pub run_id: i64,
+    /// CLAUDE-9: tripped when an operator cancels this run. The claude
+    /// invocation watches it to terminate the child; this pipeline watches it
+    /// to synthesize a cancelled `$claude_result` (so `post` still runs) and
+    /// to skip attempt counting.
+    pub cancel: CancellationToken,
 }
 
 /// Compute the row key for a row. If `dedup_key` is set on the action, look
@@ -224,6 +230,17 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
                     ),
                     false,
                 )
+            } else if ctx.cancel.is_cancelled() {
+                // Run was cancelled before this row reached claude; don't spend
+                // an API call. Synthesize a cancelled result so post still runs.
+                warn!(action = %action.name, key = %key, "run cancelled before claude started (post still runs)");
+                (
+                    ClaudeResult::synthesized(
+                        "run cancelled by operator",
+                        "cancelled before claude started",
+                    ),
+                    false,
+                )
             } else {
                 let stream_log = ClaudeInvoker::stream_log_path(
                     &ctx.paths.logs_dir(),
@@ -238,15 +255,30 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
                     ctx.limits.claude_timeout,
                     &workdir_path,
                     &stream_log,
+                    &ctx.cancel,
                 )?;
-                if !r.transient {
-                    if r.ok {
-                        info!(action = %action.name, key = %key, cost = r.cost, "claude completed");
-                    } else {
-                        warn!(action = %action.name, key = %key, error = %r.error, "claude run failed (post still runs)");
+                if ctx.cancel.is_cancelled() {
+                    // The token tripped mid-run; `invoke` already terminated the
+                    // claude child. Synthesize a cancelled result so post runs
+                    // with a uniform shape and no real cost is charged.
+                    warn!(action = %action.name, key = %key, "run cancelled mid-claude (post still runs)");
+                    (
+                        ClaudeResult::synthesized(
+                            "run cancelled by operator",
+                            "claude run cancelled before completion",
+                        ),
+                        false,
+                    )
+                } else {
+                    if !r.transient {
+                        if r.ok {
+                            info!(action = %action.name, key = %key, cost = r.cost, "claude completed");
+                        } else {
+                            warn!(action = %action.name, key = %key, error = %r.error, "claude run failed (post still runs)");
+                        }
                     }
+                    (r, true)
                 }
-                (r, true)
             }
         }
     };
@@ -283,10 +315,13 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
     }
 
     // ---- skip-attempt marker (parked / blocker outcomes) ----
+    // A cancelled run also skips attempt counting: an operator cancel is not a
+    // genuine attempt, so the row retries cleanly on the next firing.
     let skip_marker = workdir_path.join(".claude-run-skip-attempt");
-    let skip_attempt = skip_marker.exists();
+    let cancelled = ctx.cancel.is_cancelled();
+    let skip_attempt = skip_marker.exists() || cancelled;
     if skip_attempt {
-        info!(action = %action.name, key = %key, "skip-attempt marker present, not counting attempt");
+        info!(action = %action.name, key = %key, cancelled, "not counting attempt");
     }
 
     let ok = claude_result.ok && !post_failed;

@@ -11,6 +11,7 @@
 //! | POST | `/actions/<name>/trigger` | queue an immediate run |
 //! | POST | `/actions/<name>/pause` | pause a single action |
 //! | POST | `/actions/<name>/resume` | resume a single action |
+//! | POST | `/runs/<id>/cancel` | cancel an in-flight run |
 //! | POST | `/pause` | global pause |
 //! | POST | `/resume` | global resume |
 
@@ -27,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 
+use crate::cancel::RunRegistry;
 use crate::state;
 
 /// Shared state injected into every handler. `Clone` is trivial because the
@@ -39,6 +41,9 @@ pub struct AppState {
     /// to queue an out-of-cycle run for that action.
     pub trigger_tx: mpsc::Sender<String>,
     pub version: &'static str,
+    /// CLAUDE-9: per-run cancellation tokens. The cancel handler trips the
+    /// token for a given run id; the dispatcher registers/unregisters them.
+    pub runs: Arc<RunRegistry>,
 }
 
 /// JSON API router. Phase 2 mounted it at root over the unix socket;
@@ -51,6 +56,7 @@ pub fn router(state: AppState) -> Router {
         .route("/actions/:name/trigger", post(trigger_action))
         .route("/actions/:name/pause", post(pause_action))
         .route("/actions/:name/resume", post(resume_action))
+        .route("/runs/:id/cancel", post(cancel_run))
         .route("/pause", post(global_pause_handler))
         .route("/resume", post(global_resume_handler))
         .with_state(Arc::new(state))
@@ -179,6 +185,29 @@ async fn resume_action(
         ok: true,
         message: format!("resumed `{name}`"),
     }))
+}
+
+/// CLAUDE-9: cancel an in-flight run. Tripping the token tears the run down:
+/// the claude child is terminated, the in-flight row runs its `post` phase
+/// with a synthesized cancelled result, and the run finalizes with
+/// `exit::CANCELLED`. Cancelling a run that is not in flight (already finished,
+/// never existed, or owned by a different process) is an idempotent no-op that
+/// still returns `ok: true` with an explanatory message.
+async fn cancel_run(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<AckResponse>, AppError> {
+    if s.runs.cancel(id) {
+        Ok(Json(AckResponse {
+            ok: true,
+            message: format!("cancelling run #{id}"),
+        }))
+    } else {
+        Ok(Json(AckResponse {
+            ok: true,
+            message: format!("run #{id} is not in flight; nothing to cancel"),
+        }))
+    }
 }
 
 async fn global_pause_handler(
