@@ -82,9 +82,21 @@ dedup_key: idReadable
 
 filter: |
   #!/usr/bin/env nu
-  # Belt-and-suspenders: query already filters to Queued, but if a race lets a
-  # Working/Done issue through, skip it.
-  let ai_agent = ($row | get -o "AI Agent" | default "")
+  # Re-check the live AI Agent value, not the stale row snapshot. The snapshot
+  # ($row."AI Agent") was captured by input.command when the batch was gathered,
+  # so it always reports Queued for any issue that was Queued at gather time and
+  # is blind to a status change made afterward. filter runs per row immediately
+  # before pre, so a live read here honors a change made anytime in the
+  # gather-to-pre window.
+  let res = (^yt issue get-field $row.idReadable "AI Agent" | complete)
+  if $res.exit_code != 0 {
+      # Be conservative on lookup failure: skip rather than proceed, so a
+      # transient error cannot let an ineligible issue be worked. A still-Queued
+      # row is retried on the next firing.
+      print --stderr $"skipping ($row.idReadable): AI Agent lookup failed (exit ($res.exit_code))"
+      exit 1
+  }
+  let ai_agent = ($res.stdout | str trim)
   if $ai_agent != "Queued" {
       print --stderr $"skipping ($row.idReadable): AI Agent = ($ai_agent)"
       exit 1
