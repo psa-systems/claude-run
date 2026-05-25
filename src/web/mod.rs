@@ -574,6 +574,9 @@ async fn run_detail(
 struct RowStreamTpl {
     version: &'static str,
     run_id: i64,
+    /// Parent action, resolved alongside the stream-log path. Feeds the
+    /// breadcrumb's link back to the action (CLAUDE-19).
+    action_name: String,
     row_key: String,
     attempt: u32,
     stream_path: String,
@@ -594,6 +597,7 @@ async fn row_stream_page(
     let tpl = RowStreamTpl {
         version: s.api.version,
         run_id: id,
+        action_name,
         row_key: key,
         attempt,
         stream_path: stream.display().to_string(),

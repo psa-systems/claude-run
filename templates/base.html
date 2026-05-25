@@ -28,6 +28,11 @@
     header nav a { color: var(--fg-dim); margin-right: 16px; }
     header nav a:hover { color: var(--fg); }
     main { padding: 24px; max-width: 1280px; margin: 0 auto; }
+    .breadcrumb { font-size: 12px; margin: 0 0 20px; }
+    .breadcrumb a { color: var(--fg-dim); }
+    .breadcrumb a:hover { color: var(--fg); }
+    .breadcrumb .sep { margin: 0 8px; color: var(--fg-dim); }
+    .breadcrumb .current { color: var(--fg); }
     h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim); border-bottom: 1px solid var(--border); padding-bottom: 8px; margin: 32px 0 16px; }
     h2:first-child { margin-top: 0; }
     .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
@@ -77,6 +82,9 @@
     </nav>
   </header>
   <main>
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      {% block breadcrumb %}{% endblock %}
+    </nav>
     {% block main %}{% endblock %}
   </main>
   <footer>

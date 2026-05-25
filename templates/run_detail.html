@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}run #{{ run.id }} - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><a href="/actions/{{ run.action_name }}">{{ run.action_name }}</a><span class="sep">/</span><span class="current">Run #{{ run.id }}</span>{% endblock %}
 {% block main %}
 
 {# Run detail polls faster (2s) than the dashboard because a run in progress
