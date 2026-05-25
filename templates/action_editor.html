@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}{{ heading }} - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a>{% if let Some(n) = name %}<span class="sep">/</span><a href="/actions/{{ n }}">{{ n }}</a><span class="sep">/</span><span class="current">Edit</span>{% else %}<span class="sep">/</span><span class="current">New action</span>{% endif %}{% endblock %}
 {% block main %}
 
 <h2>{{ heading }}</h2>
