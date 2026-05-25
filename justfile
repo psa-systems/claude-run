@@ -112,10 +112,9 @@ test:
 build:
     cargo build --release
 
-# Build static binary (musl). Requires the host to have the x86_64-unknown-linux-musl target installed locally; otherwise use `just build-docker-export`.
+# Build the static musl binary through the Docker builder image (delegates to build-docker-export). Writes ./output/claude-run; no host musl target or linker required.
 [group: 'build']
-build-static:
-    cargo build --release --target x86_64-unknown-linux-musl
+build-static: build-docker-export
 
 # Build the full OCI build (builder stage in cache, no runtime image since this repo's Dockerfile has no runtime stage).
 [group: 'build']
