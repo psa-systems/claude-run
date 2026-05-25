@@ -166,6 +166,24 @@ pub async fn run_finish(
     Ok(())
 }
 
+/// CLAUDE-10: reconcile orphaned runs on daemon startup. A freshly started
+/// daemon cannot have any run still executing, so every row with no end state
+/// is a leftover from a dead process. Mark each cancelled with `ended_at` set
+/// to now and `exit_code = exit::CANCELLED`. Returns the number reconciled.
+/// `row_outcomes` is left untouched: a row either has an outcome or it does
+/// not, and no synthetic outcomes are invented. This is a pure DB reconcile,
+/// distinct from the live-cancel path (CLAUDE-9): the previous process is
+/// gone, so there is no child to terminate or `post` phase to run.
+pub async fn cancel_orphaned_runs(pool: &SqlitePool) -> Result<u64> {
+    let now = now_iso();
+    let result = sqlx::query("UPDATE runs SET ended_at = ?, exit_code = ? WHERE ended_at IS NULL")
+        .bind(&now)
+        .bind(crate::exit::CANCELLED as i64)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 #[derive(Debug)]
 pub struct RowOutcome<'a> {
     pub run_id: i64,
@@ -340,4 +358,83 @@ pub async fn action_last_run_started(pool: &SqlitePool, action: &str) -> Result<
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(s,)| s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::MIGRATOR;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn mem_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn exit_code_of(pool: &SqlitePool, run_id: i64) -> Option<i64> {
+        sqlx::query_scalar::<_, Option<i64>>("SELECT exit_code FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn ended_at_of(pool: &SqlitePool, run_id: i64) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>("SELECT ended_at FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancel_orphaned_runs_marks_only_unfinished() {
+        let pool = mem_pool().await;
+
+        // One finished run, two orphaned (no end state).
+        let finished = run_begin(&pool, "act", "cli").await.unwrap();
+        run_finish(&pool, finished, crate::exit::OK, 3)
+            .await
+            .unwrap();
+        let orphan_a = run_begin(&pool, "act", "cli").await.unwrap();
+        let orphan_b = run_begin(&pool, "act", "schedule").await.unwrap();
+
+        let cancelled = cancel_orphaned_runs(&pool).await.unwrap();
+        assert_eq!(cancelled, 2, "both orphaned runs reconciled");
+
+        // Orphans now ended with the CANCELLED sentinel.
+        for orphan in [orphan_a, orphan_b] {
+            assert_eq!(
+                exit_code_of(&pool, orphan).await,
+                Some(crate::exit::CANCELLED as i64)
+            );
+            assert!(ended_at_of(&pool, orphan).await.is_some());
+        }
+
+        // The completed run is untouched.
+        assert_eq!(
+            exit_code_of(&pool, finished).await,
+            Some(crate::exit::OK as i64)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_orphaned_runs_is_noop_when_none() {
+        let pool = mem_pool().await;
+        let finished = run_begin(&pool, "act", "cli").await.unwrap();
+        run_finish(&pool, finished, crate::exit::OK, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(cancel_orphaned_runs(&pool).await.unwrap(), 0);
+        assert_eq!(
+            exit_code_of(&pool, finished).await,
+            Some(crate::exit::OK as i64)
+        );
+    }
 }

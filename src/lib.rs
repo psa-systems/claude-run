@@ -55,4 +55,8 @@ pub mod exit {
     pub const DAILY_CAP: i32 = 4;
     pub const UNEXPECTED: i32 = 5;
     pub const OVER_BUDGET: i32 = 6;
+    /// Sentinel exit_code for a run that was cancelled rather than finished,
+    /// using the SIGINT convention (128 + SIGINT). Used both for live cancel
+    /// (CLAUDE-9) and for orphaned-run reconcile on daemon startup (CLAUDE-10).
+    pub const CANCELLED: i32 = 130;
 }

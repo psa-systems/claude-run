@@ -44,6 +44,15 @@ impl Daemon {
         let _pid_lock = pidfile_lock(&pidfile)?;
 
         let pool = crate::db::open(&self.paths.state_db()).await?;
+
+        // CLAUDE-10: a freshly started daemon cannot have any run still
+        // executing, so any run with no end state is orphaned from a dead
+        // process. Reconcile it to cancelled before scheduling begins.
+        let cancelled = state::cancel_orphaned_runs(&pool).await?;
+        if cancelled > 0 {
+            info!(count = cancelled, "cancelled orphaned runs on startup");
+        }
+
         scan_actions(&pool, &self.paths.actions_dir()).await?;
 
         let (trigger_tx, trigger_rx) = mpsc::channel::<String>(64);
