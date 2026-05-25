@@ -109,8 +109,17 @@
           <td class="mono">
             {% match r.exit_code %}
               {% when Some(0) %}<span class="badge ok">0</span>
+              {% when Some(130) %}<span class="badge cancel">cancelled</span>
               {% when Some(c) %}<span class="badge bad">{{ c }}</span>
-              {% when None %}<span class="badge warn">running</span>
+              {% when None %}
+                <span class="badge warn">running</span>
+                <form hx-post="/api/runs/{{ r.id }}/cancel"
+                      hx-swap="none"
+                      hx-disabled-elt="find button"
+                      hx-on::after-request="htmx.trigger('body', 'refreshNow')"
+                      style="display:inline; margin-left: 6px;">
+                  <button class="btn">Cancel</button>
+                </form>
             {% endmatch %}
           </td>
         </tr>

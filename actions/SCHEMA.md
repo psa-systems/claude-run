@@ -201,6 +201,12 @@ empty-prompt, and pre-step failure all run post. The single exception is
 transient Claude errors (rate limit, auth) - those skip post and return
 early so the row can be retried cleanly on the next firing.
 
+When a run is cancelled while this row is in flight, its claude child is
+terminated and post still runs, with a synthesized cancelled `$claude_result`
+(`ok: false`, `error: "run cancelled by operator"`, `cost: 0`), so end-of-row
+cleanup (resetting an external state field, etc.) happens. A cancelled row does
+not count an attempt, and rows not yet started are skipped without running post.
+
 This makes post the right place for end-of-row cleanup that must happen
 unconditionally - resetting an external state field, posting a status
 comment, releasing a soft lock, etc.
@@ -335,6 +341,10 @@ $CLAUDE_RUN_STATE_DIR/
 | 4    | Daily cap reached (`max_runs_per_day`).                                 |
 | 5    | Unexpected error (see logs).                                            |
 | 6    | Over daily budget (`daily_budget_usd`).                                 |
+| 130  | Run cancelled in flight (operator cancel via the API / web UI / CLI).   |
+
+Exit code 130 is recorded on the `runs` row, not returned by the `run`
+subcommand; the web UI and CLI render it as a distinct "cancelled" badge.
 
 ## Snippet execution model
 

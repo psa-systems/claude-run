@@ -17,6 +17,7 @@
 
 pub mod action;
 pub mod api;
+pub mod cancel;
 pub mod claude;
 pub mod client;
 pub mod config;
@@ -55,4 +56,10 @@ pub mod exit {
     pub const DAILY_CAP: i32 = 4;
     pub const UNEXPECTED: i32 = 5;
     pub const OVER_BUDGET: i32 = 6;
+    /// CLAUDE-9: sentinel exit code recorded on `runs` when an in-flight run is
+    /// cancelled on demand. 130 follows the SIGINT convention (128 + SIGINT);
+    /// it does not collide with the codes above or claude's own exits, so the
+    /// web UI and CLI can map it to a distinct "cancelled" badge without a
+    /// schema migration.
+    pub const CANCELLED: i32 = 130;
 }
