@@ -63,6 +63,27 @@ impl RunRegistry {
             None => false,
         }
     }
+
+    /// CLAUDE-11: trip every in-flight run's token at once, for graceful
+    /// shutdown. Returns the run ids that were signalled (arbitrary order).
+    /// Each tripped run tears down through the same path as a single cancel:
+    /// the claude child is terminated, `post` runs with a synthesized cancelled
+    /// result, and the run finalizes with `exit::CANCELLED`, unregistering
+    /// itself here on the way out.
+    pub fn cancel_all(&self) -> Vec<i64> {
+        let map = self.inner.lock().unwrap();
+        for token in map.values() {
+            token.cancel();
+        }
+        map.keys().copied().collect()
+    }
+
+    /// True when no run is registered, i.e. every in-flight run has finalized
+    /// and unregistered. The shutdown path polls this to know the cancel
+    /// requests it issued have drained.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().is_empty()
+    }
 }
 
 /// RAII guard that unregisters a run's token on drop, so the registry is
@@ -108,6 +129,33 @@ mod tests {
         reg.unregister(9);
         // No longer in flight, so cancel is a no-op.
         assert!(!reg.cancel(9));
+    }
+
+    #[test]
+    fn cancel_all_trips_every_token_and_returns_ids() {
+        let reg = RunRegistry::new();
+        let a = reg.register(1);
+        let b = reg.register(2);
+        assert!(!reg.is_empty());
+        let mut ids = reg.cancel_all();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2]);
+        assert!(a.is_cancelled());
+        assert!(b.is_cancelled());
+        // cancel_all signals but does not unregister; the runs unregister
+        // themselves as they finalize.
+        assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn empty_registry_reports_empty() {
+        let reg = RunRegistry::new();
+        assert!(reg.is_empty());
+        assert!(reg.cancel_all().is_empty());
+        let _ = reg.register(5);
+        assert!(!reg.is_empty());
+        reg.unregister(5);
+        assert!(reg.is_empty());
     }
 
     #[test]

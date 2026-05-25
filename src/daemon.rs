@@ -28,6 +28,11 @@ use crate::state::{self, ActionIndexRow};
 
 const VERSION: &str = crate::VERSION;
 const TICK_SECS: u64 = 5;
+/// CLAUDE-11: how long shutdown waits for cancelled in-flight runs to finalize
+/// before force-finalizing their DB rows and exiting. Bounds a wedged claude
+/// child so it cannot hang the daemon forever. Assumed 30s; revise after
+/// testing per the issue.
+const SHUTDOWN_GRACE_SECS: u64 = 30;
 
 pub struct Daemon {
     pub paths: Paths,
@@ -126,11 +131,13 @@ impl Daemon {
         let scheduler_task = tokio::spawn(scheduler_loop(dispatch.clone(), trigger_tx.clone()));
         let trigger_task = tokio::spawn(trigger_consumer(dispatch.clone(), trigger_rx));
 
-        // Graceful shutdown on SIGINT (Ctrl-C) or SIGTERM (service managers,
-        // `claude-run stop`). Both fall through to the same cleanup below.
+        // Graceful shutdown on SIGINT (Ctrl-C), SIGTERM (service managers,
+        // `claude-run stop`), or SIGQUIT. All fall through to the same cleanup
+        // below.
         use tokio::signal::unix::{signal, SignalKind};
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigquit = signal(SignalKind::quit())?;
         tokio::select! {
             res = server_unix => {
                 warn!(?res, "unix-socket server exited");
@@ -141,9 +148,50 @@ impl Daemon {
             _ = sigterm.recv() => {
                 info!("SIGTERM received, shutting down");
             }
+            _ = sigquit.recv() => {
+                info!("SIGQUIT received, shutting down");
+            }
         }
+
+        // Stop scheduling new work first so nothing dispatches while we drain
+        // the runs that are already in flight.
         scheduler_task.abort();
         trigger_task.abort();
+
+        // CLAUDE-11: cancel in-flight runs through the CLAUDE-9 path (child
+        // terminated, `post` run with a synthesized cancelled result,
+        // `run_finish` with exit::CANCELLED) instead of abandoning them. Wait
+        // for them to finalize, bounded by a grace period so a wedged child
+        // cannot hang the daemon forever.
+        let cancelled = dispatch.runs.cancel_all();
+        if !cancelled.is_empty() {
+            info!(
+                count = cancelled.len(),
+                "cancelling in-flight runs for shutdown"
+            );
+            let grace = std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
+            if tokio::time::timeout(grace, wait_for_runs_drain(&dispatch.runs))
+                .await
+                .is_err()
+            {
+                warn!(
+                    grace_secs = SHUTDOWN_GRACE_SECS,
+                    "shutdown grace elapsed; force-finalizing remaining runs"
+                );
+            }
+            // Sweep any run row left without an end state (e.g. its task was
+            // still mid-`post` when the grace elapsed). Reuses the CLAUDE-10
+            // reconcile, here at shutdown rather than startup, so no orphaned
+            // "running" row survives this shutdown regardless of timing. The
+            // cancelled child is already SIGKILLed by the per-run escalation
+            // the token tripped above.
+            match state::cancel_orphaned_runs(&pool).await {
+                Ok(n) if n > 0 => info!(count = n, "force-finalized runs after grace"),
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "force-finalize sweep failed"),
+            }
+        }
+
         if let Some(t) = server_tcp {
             t.abort();
         }
@@ -474,6 +522,16 @@ pub async fn run_action_inner(
     state::run_finish(pool, run_id, exit_code, processed).await?;
     info!(action = %loaded.action.name, processed, exit_code, "run complete");
     Ok(())
+}
+
+/// CLAUDE-11: resolve once every in-flight run has unregistered, i.e. all the
+/// cancellations issued at shutdown have torn down and finalized. Polls the
+/// registry rather than holding task handles, since runs dispatch on detached
+/// tasks. The caller wraps this in a `timeout` to bound the wait.
+async fn wait_for_runs_drain(runs: &RunRegistry) {
+    while !runs.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 async fn scheduler_loop(
