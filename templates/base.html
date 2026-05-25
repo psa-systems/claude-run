@@ -50,12 +50,17 @@
     .btn:hover { background: #252a34; }
     .btn[disabled] { opacity: 0.4; cursor: not-allowed; }
     .row-actions { display: flex; gap: 8px; }
-    pre.stream { background: #0a0c10; border: 1px solid var(--border); border-radius: 4px; padding: 12px; max-height: 600px; overflow: auto; font-family: var(--mono); font-size: 12px; line-height: 1.4; white-space: pre-wrap; word-break: break-all; }
-    pre.stream .ev-system { color: var(--fg-dim); }
-    pre.stream .ev-assistant { color: var(--accent); }
-    pre.stream .ev-user { color: var(--ok); }
-    pre.stream .ev-result-ok { color: var(--ok); font-weight: bold; }
-    pre.stream .ev-result-err { color: var(--bad); font-weight: bold; }
+    .stream { background: #0a0c10; border: 1px solid var(--border); border-radius: 4px; padding: 12px; max-height: 600px; overflow: auto; font-family: var(--mono); font-size: 12px; line-height: 1.4; white-space: pre-wrap; word-break: break-all; }
+    .stream .ev { display: block; padding: 2px 0; }
+    .stream .ev-system { color: var(--fg-dim); }
+    .stream .ev-assistant { color: var(--accent); }
+    .stream .ev-user { color: var(--ok); }
+    .stream .ev-tool { color: var(--warn); }
+    .stream .ev-result-ok { color: var(--ok); font-weight: bold; }
+    .stream .ev-result-err { color: var(--bad); font-weight: bold; }
+    .activity { font-family: var(--mono); }
+    .activity.stale { color: var(--bad); font-weight: bold; }
+    .activity.live { color: var(--ok); }
     .kv { display: grid; grid-template-columns: 140px 1fr; gap: 4px 12px; }
     .kv dt { color: var(--fg-dim); }
     .kv dd { margin: 0; font-family: var(--mono); font-size: 13px; }
