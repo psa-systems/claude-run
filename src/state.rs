@@ -130,6 +130,19 @@ pub async fn run_set_row_keys(pool: &SqlitePool, run_id: i64, keys: &[String]) -
     Ok(())
 }
 
+/// CLAUDE-14: mark which planned row a run is currently processing, so the web
+/// UI can show exactly the one in-flight row as "running" instead of inferring
+/// it from gaps in `row_outcomes`. Pass `Some(key)` before processing a row;
+/// `run_finish` clears it back to NULL when the run ends.
+pub async fn run_set_current_row(pool: &SqlitePool, run_id: i64, key: Option<&str>) -> Result<()> {
+    sqlx::query("UPDATE runs SET current_row_key = ? WHERE id = ?")
+        .bind(key)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn run_row_keys(pool: &SqlitePool, run_id: i64) -> Result<Vec<String>> {
     let row: Option<(Option<String>,)> = sqlx::query_as("SELECT row_keys FROM runs WHERE id = ?")
         .bind(run_id)
@@ -150,10 +163,13 @@ pub async fn run_finish(
     rows_processed: u32,
 ) -> Result<()> {
     let now = now_iso();
+    // CLAUDE-14: clear current_row_key atomically with the end state. A finished
+    // run has no row in flight, so every break/finish path that reaches here
+    // also drops the stale "running" marker.
     sqlx::query(
         r#"
         UPDATE runs
-        SET ended_at = ?, exit_code = ?, rows_processed = ?
+        SET ended_at = ?, exit_code = ?, rows_processed = ?, current_row_key = NULL
         WHERE id = ?
         "#,
     )

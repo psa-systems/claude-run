@@ -478,6 +478,13 @@ pub async fn run_action_inner(
             warn!(cost_usd = cost, "daily budget reached mid-run, stopping");
             break;
         }
+        // CLAUDE-14: mark this row in flight so the web UI shows exactly one
+        // "running" row. Set after the cap/budget checks (a capped run never
+        // reaches this row) and before process_row; `run_finish` clears it on
+        // every finish/break path below.
+        if let Err(e) = state::run_set_current_row(pool, run_id, Some(&planned_keys[idx])).await {
+            warn!(error = %e, "run_set_current_row failed (non-fatal)");
+        }
         let outcome = row::process_row(&ctx, r, idx).await?;
         if let Some(record) = row::done_record(&outcome) {
             row::append_output_record(paths, loaded, &record);
