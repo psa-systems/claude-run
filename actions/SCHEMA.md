@@ -45,6 +45,9 @@ limits:                     # optional per-action overrides of env defaults
   max_runs_per_day: 20
   claude_timeout_seconds: 600
   daily_budget_usd: 5.00
+schedule:                   # optional; omit for trigger-only (manual)
+  kind: interval            # interval | cron | manual
+  spec: 30m                 # interval/cron spec; omit for manual
 ```
 
 ## Script fields: `run` / `shell`
@@ -288,6 +291,86 @@ Per-action overrides for the runner-wide defaults. Any subset of:
 | `max_runs_per_day`         | `$env.CLAUDE_RUN_MAX_RUNS_PER_DAY`     |
 | `claude_timeout_seconds`   | `$env.CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS` |
 | `daily_budget_usd`         | `$env.CLAUDE_RUN_DAILY_BUDGET_USD`     |
+
+### `schedule` (record, optional)
+
+Controls when the daemon auto-fires the action. A record with a required
+`kind` (one of `interval`, `cron`, `manual`) and an optional `spec`:
+
+```yaml
+schedule:
+  kind: interval
+  spec: 30m
+```
+
+Only the daemon (`claude-run serve`) acts on `schedule:`; a bare
+`claude-run run <action>` ignores it and processes the action once
+immediately.
+
+#### `kind: interval`
+
+`spec` is a [humantime](https://docs.rs/humantime) duration string
+(`90s`, `30m`, `2h`, `1h30m`). The action fires every N measured from the
+**last run's `started_at`**, not from a fixed wall-clock grid. An action
+that has never run fires on the next scheduler tick.
+
+```yaml
+schedule:
+  kind: interval
+  spec: 2h          # fire ~2h after each run starts
+```
+
+#### `kind: cron`
+
+`spec` is a cron expression: either the common **5-field** form
+(`minute hour day-of-month month day-of-week`) or a **6-field**
+seconds-precision form (`second minute hour dom month dow`). A 5-field
+expression is internally prefixed with `0 `, so it fires on the 0th second
+of the matching minute. The action fires at the next instant matching the
+expression after the last run.
+
+```yaml
+schedule:
+  kind: cron
+  spec: "*/30 * * * *"   # every 30 minutes, on the minute
+```
+
+```yaml
+schedule:
+  kind: cron
+  spec: "15 9 * * 1-5"   # 09:15 Mon-Fri
+```
+
+#### `kind: manual`
+
+Never auto-fires. The action runs only when triggered explicitly (see
+below). Omitting the `schedule:` block entirely is equivalent to
+`kind: manual`: the scheduler skips any action with no `schedule.kind`.
+
+```yaml
+schedule:
+  kind: manual
+```
+
+#### Triggering and the one-block rule
+
+Manual triggering via `claude-run trigger <action>` (and the web UI trigger
+button) works **regardless of the schedule kind**, because the trigger path
+is independent of `schedule:`. An interval- or cron-scheduled action can
+still be fired on demand at any time.
+
+Only **one** `schedule:` block is allowed per action (YAML rejects a
+duplicate mapping key). There is therefore no "interval plus manual" mode:
+just use `kind: interval` (or `cron`), and trigger it on demand whenever you
+need an extra run. Declaring two `schedule:` blocks to get both is the
+common gotcha and fails to parse.
+
+#### Resolution
+
+The daemon evaluates schedules on a fixed 5-second tick, so an action fires
+on the first tick at or after its due time. Intervals shorter than 5s are
+not meaningful, and cron seconds-precision is honored only to 5s
+granularity.
 
 ## Runner environment variables
 
