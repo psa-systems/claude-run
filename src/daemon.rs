@@ -1,4 +1,4 @@
-//! Daemon: scans the actions dir, runs a 1s scheduler tick, dispatches due
+//! Daemon: scans the actions dir, runs a 5s scheduler tick, dispatches due
 //! actions to a Tokio task pool. Serves the HTTP API over a unix socket so
 //! the CLI subcommands can talk to it.
 //!
