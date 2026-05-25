@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use askama::Template;
 use axum::body::Body;
-use axum::extract::{Form, Path as AxumPath, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::extract::{Form, Path as AxumPath, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -606,6 +606,8 @@ async fn row_stream_page(
 async fn row_stream_sse(
     State(s): State<WebState>,
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, WebError> {
     let action_name: Option<String> =
         sqlx::query_scalar("SELECT action_name FROM runs WHERE id = ?")
@@ -614,6 +616,21 @@ async fn row_stream_sse(
             .await?;
     let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
     let path = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
+
+    // Resume offset for reconnects. Each `msg` event is tagged with its 0-based
+    // line index as the SSE `id`. On a native browser reconnect the index comes
+    // back in the `Last-Event-ID` header; a manual reconnect (the client gave up
+    // because `readyState` reached CLOSED) carries it as a `lastEventId` query
+    // param instead, since a freshly created `EventSource` cannot set headers.
+    // We resume from the line *after* the last one the client saw (N + 1).
+    let resume_from: u64 = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| params.get("lastEventId").cloned())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|n| n + 1)
+        .unwrap_or(0);
 
     // Stream the file line-by-line. If the run is still writing, keep
     // polling until either we see a `"type":"result"` line (which closes
@@ -647,11 +664,19 @@ async fn row_stream_sse(
         };
         let mut reader = BufReader::new(file).lines();
 
+        // 0-based index of every line read from the log. Becomes the SSE event
+        // `id` so a reconnect can resume past lines it already rendered. Counted
+        // across the whole file (not just the lines we emit) so the id stays a
+        // stable line number even when we skip the already-sent prefix.
+        let mut idx: u64 = 0;
         loop {
             match reader.next_line().await {
                 Ok(Some(line)) => {
                     let is_terminal = line.contains("\"type\":\"result\"");
-                    yield Ok(Event::default().event("msg").data(line));
+                    if idx >= resume_from {
+                        yield Ok(Event::default().event("msg").id(idx.to_string()).data(line));
+                    }
+                    idx += 1;
                     if is_terminal {
                         yield Ok(Event::default().event("done").data(""));
                         return;
