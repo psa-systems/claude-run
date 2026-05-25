@@ -76,7 +76,7 @@ just --list           # show all recipes
 just check            # fmt + clippy + build + tests (what CI runs)
 just test             # cargo test
 just build            # debug build into target/debug/
-just build-static     # musl-static binary into target/x86_64-unknown-linux-musl/release/
+just build-static     # musl-static binary via the Docker builder into ./output/claude-run
 just build-docker     # full OCI build (builder stage)
 just build-docker-export   # extract the static binary out of the OCI build
 just install-hooks    # one-time: install pre-commit hook that runs CI's checks
