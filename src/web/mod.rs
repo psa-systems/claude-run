@@ -95,6 +95,26 @@ struct RunRow {
     current_row_key: Option<String>,
 }
 
+impl RunRow {
+    /// CLAUDE-20: human-readable run duration. A finished or cancelled run shows
+    /// the final span (`ended_at - started_at`); an in-flight run (NULL
+    /// `ended_at`) shows elapsed-so-far against now, which advances on each poll
+    /// refresh. Returns "-" if a timestamp fails to parse.
+    fn duration(&self) -> String {
+        let Ok(start) = chrono::DateTime::parse_from_rfc3339(&self.started_at) else {
+            return "-".to_string();
+        };
+        let end_ms = match self.ended_at.as_deref() {
+            Some(e) => match chrono::DateTime::parse_from_rfc3339(e) {
+                Ok(end) => end.timestamp_millis(),
+                Err(_) => return "-".to_string(),
+            },
+            None => chrono::Utc::now().timestamp_millis(),
+        };
+        format_duration_ms(end_ms - start.timestamp_millis())
+    }
+}
+
 #[derive(Serialize, sqlx::FromRow)]
 struct OutcomeRow {
     row_key: String,
@@ -105,6 +125,41 @@ struct OutcomeRow {
     claude_ok: bool,
     claude_cost_usd: f64,
     attempt_counted: bool,
+    /// CLAUDE-20: full per-row pipeline elapsed; NULL for rows predating the
+    /// column (migration 0005).
+    duration_ms: Option<i64>,
+}
+
+impl OutcomeRow {
+    /// CLAUDE-20: human-readable per-row duration, or "-" for rows predating the
+    /// `duration_ms` column.
+    fn duration(&self) -> String {
+        match self.duration_ms {
+            Some(ms) => format_duration_ms(ms),
+            None => "-".to_string(),
+        }
+    }
+}
+
+/// CLAUDE-20: render a millisecond span human-readably (`820ms`, `4s`,
+/// `1m 17s`, `2h 3m`) rather than as raw milliseconds. Shared by the run-span
+/// and per-row duration columns. Negative inputs clamp to zero.
+fn format_duration_ms(ms: i64) -> String {
+    let ms = ms.max(0);
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
+    let total_secs = ms / 1000;
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else if mins > 0 {
+        format!("{mins}m {secs}s")
+    } else {
+        format!("{secs}s")
+    }
 }
 
 async fn enriched_actions(pool: &SqlitePool) -> Result<Vec<ActionView>, WebError> {
@@ -500,7 +555,7 @@ async fn run_detail(
         return Ok((StatusCode::NOT_FOUND, format!("no run #{id}")).into_response());
     };
     let outcomes = sqlx::query_as::<_, OutcomeRow>(
-        "SELECT row_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, attempt_counted FROM row_outcomes WHERE run_id = ? ORDER BY id ASC",
+        "SELECT row_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, attempt_counted, duration_ms FROM row_outcomes WHERE run_id = ? ORDER BY id ASC",
     )
     .bind(id)
     .fetch_all(pool)
@@ -794,7 +849,20 @@ impl IntoResponse for WebError {
 
 #[cfg(test)]
 mod tests {
-    use super::latest_attempt_on_disk;
+    use super::{format_duration_ms, latest_attempt_on_disk};
+
+    #[test]
+    fn format_duration_ms_buckets() {
+        assert_eq!(format_duration_ms(-5), "0ms");
+        assert_eq!(format_duration_ms(0), "0ms");
+        assert_eq!(format_duration_ms(820), "820ms");
+        assert_eq!(format_duration_ms(999), "999ms");
+        assert_eq!(format_duration_ms(1_000), "1s");
+        assert_eq!(format_duration_ms(4_500), "4s");
+        assert_eq!(format_duration_ms(77_000), "1m 17s");
+        assert_eq!(format_duration_ms(3_600_000), "1h 0m");
+        assert_eq!(format_duration_ms(7_380_000), "2h 3m");
+    }
 
     fn touch(path: &std::path::Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

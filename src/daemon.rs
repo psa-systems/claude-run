@@ -498,6 +498,7 @@ pub async fn run_action_inner(
                 attempt_counted,
                 summary,
                 stream_log_path,
+                duration_ms,
             } = &outcome
             {
                 state::row_outcome_insert(
@@ -514,6 +515,7 @@ pub async fn run_action_inner(
                         attempt_counted: *attempt_counted,
                         summary: Some(summary.as_str()),
                         stream_log_path: stream_log_path.as_deref(),
+                        duration_ms: *duration_ms,
                     },
                 )
                 .await?;

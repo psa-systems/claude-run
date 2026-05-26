@@ -20,7 +20,7 @@
 //!   actually ran (real budget was spent).
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -143,6 +143,11 @@ pub async fn gather_rows(
 /// Process a single row. Returns the per-row outcome record that the runner
 /// will both write to the per-action JSONL and insert into `row_outcomes`.
 pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Result<ProcessedRow> {
+    // CLAUDE-20: measure the full per-row pipeline elapsed (filter / pre /
+    // prompt / claude / post) so the web UI can show a per-row duration. Started
+    // before the attempt-cap check; only the `Done` path carries it into the
+    // outcome record, so capped / filtered rows (no outcome) never read it.
+    let started = Instant::now();
     let action = &ctx.action.action;
     let key = row_key(ctx.action, row, idx);
     let attempts = state::attempts_get(ctx.pool, &action.name, &key).await?;
@@ -355,6 +360,7 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
         attempt_counted: !skip_attempt,
         summary: claude_result.summary,
         stream_log_path,
+        duration_ms: started.elapsed().as_millis() as i64,
     })
 }
 
@@ -387,6 +393,8 @@ pub enum ProcessedRow {
         attempt_counted: bool,
         summary: String,
         stream_log_path: Option<String>,
+        /// CLAUDE-20: full per-row pipeline elapsed in milliseconds.
+        duration_ms: i64,
     },
 }
 
