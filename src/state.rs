@@ -213,6 +213,8 @@ pub struct RowOutcome<'a> {
     pub attempt_counted: bool,
     pub summary: Option<&'a str>,
     pub stream_log_path: Option<&'a str>,
+    /// CLAUDE-20: full per-row pipeline elapsed in milliseconds.
+    pub duration_ms: i64,
 }
 
 pub async fn row_outcome_insert(pool: &SqlitePool, r: &RowOutcome<'_>) -> Result<()> {
@@ -222,8 +224,8 @@ pub async fn row_outcome_insert(pool: &SqlitePool, r: &RowOutcome<'_>) -> Result
         INSERT INTO row_outcomes (
             run_id, action_name, row_key, attempt, ts, ok,
             claude_ran, claude_ok, claude_cost_usd, attempt_counted,
-            summary, stream_log_path
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            summary, stream_log_path, duration_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(r.run_id)
@@ -238,6 +240,7 @@ pub async fn row_outcome_insert(pool: &SqlitePool, r: &RowOutcome<'_>) -> Result
     .bind(r.attempt_counted as i64)
     .bind(r.summary)
     .bind(r.stream_log_path)
+    .bind(r.duration_ms)
     .execute(pool)
     .await?;
     Ok(())
