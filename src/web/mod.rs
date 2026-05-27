@@ -44,6 +44,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/actions/new", get(action_new_page))
         .route("/actions", post(action_create))
         .route("/actions/:name", get(action_detail))
+        .route("/actions/:name/durations", get(action_durations))
         .route(
             "/actions/:name/edit",
             get(action_edit_page).post(action_edit_save),
@@ -113,6 +114,16 @@ impl RunRow {
         };
         format_duration_ms(end_ms - start.timestamp_millis())
     }
+
+    /// CLAUDE-21: completed-run span in milliseconds for the duration chart, or
+    /// `None` when the run is in flight (NULL `ended_at`) or either timestamp
+    /// fails to parse. Unlike [`RunRow::duration`] this never charts a moving
+    /// value: an unfinished run is excluded rather than measured against now.
+    fn duration_ms(&self) -> Option<i64> {
+        let start = chrono::DateTime::parse_from_rfc3339(&self.started_at).ok()?;
+        let end = chrono::DateTime::parse_from_rfc3339(self.ended_at.as_deref()?).ok()?;
+        Some((end.timestamp_millis() - start.timestamp_millis()).max(0))
+    }
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -159,6 +170,126 @@ fn format_duration_ms(ms: i64) -> String {
         format!("{mins}m {secs}s")
     } else {
         format!("{secs}s")
+    }
+}
+
+// ---- duration chart (CLAUDE-21) -------------------------------------------
+
+/// SVG canvas and plot-area geometry for the per-action duration chart. The
+/// plot rectangle is inset by the padding constants to leave room for axis
+/// labels.
+const CHART_W: i64 = 720;
+const CHART_H: i64 = 240;
+const CHART_PAD_L: i64 = 64;
+const CHART_PAD_R: i64 = 24;
+const CHART_PAD_T: i64 = 16;
+const CHART_PAD_B: i64 = 32;
+
+/// One plotted run: pixel position plus a `<title>` tooltip string.
+#[derive(Serialize)]
+struct ChartPoint {
+    x: i64,
+    y: i64,
+    label: String,
+}
+
+/// A y-axis tick: a horizontal gridline at `y` labelled with a duration.
+#[derive(Serialize)]
+struct YTick {
+    y: i64,
+    label: String,
+}
+
+/// Precomputed SVG geometry for the duration chart. Everything the template
+/// needs is resolved to integer pixel coordinates here so the `<svg>` markup
+/// stays declarative. Built by [`build_duration_chart`] from the completed-run
+/// series (oldest to newest); never constructed for an empty series (the
+/// handler renders a placeholder instead).
+#[derive(Serialize)]
+struct DurationChart {
+    width: i64,
+    height: i64,
+    plot_l: i64,
+    plot_r: i64,
+    plot_t: i64,
+    plot_b: i64,
+    /// `<polyline>` points, e.g. `"64,208 200,120 ..."`, oldest to newest.
+    polyline: String,
+    points: Vec<ChartPoint>,
+    y_ticks: Vec<YTick>,
+    /// Start timestamp of the oldest / newest charted run, for the x-axis ends.
+    x_start: String,
+    x_end: String,
+    /// Number of completed runs plotted.
+    count: usize,
+}
+
+/// Compute the duration-chart geometry from a `(started_at, duration_ms)`
+/// series ordered oldest to newest. Pure function of its input so it is
+/// unit-testable without a database. Caller guarantees `series` is non-empty.
+fn build_duration_chart(series: &[(String, i64)]) -> DurationChart {
+    let count = series.len();
+    let plot_l = CHART_PAD_L;
+    let plot_r = CHART_W - CHART_PAD_R;
+    let plot_t = CHART_PAD_T;
+    let plot_b = CHART_H - CHART_PAD_B;
+    let plot_w = plot_r - plot_l;
+    let plot_h = plot_b - plot_t;
+
+    // y axis tops out at the longest run, floored to 1ms so the scale never
+    // divides by zero (a series of all-zero durations still renders flat).
+    let max_ms = series.iter().map(|(_, ms)| *ms).max().unwrap_or(0).max(1);
+
+    let x_at = |i: usize| -> i64 {
+        if count <= 1 {
+            plot_l + plot_w / 2
+        } else {
+            plot_l + (i as i64) * plot_w / (count as i64 - 1)
+        }
+    };
+    let y_at = |ms: i64| -> i64 { plot_b - (ms * plot_h) / max_ms };
+
+    let mut points = Vec::with_capacity(count);
+    let mut coords = Vec::with_capacity(count);
+    for (i, (started, ms)) in series.iter().enumerate() {
+        let x = x_at(i);
+        let y = y_at(*ms);
+        coords.push(format!("{x},{y}"));
+        points.push(ChartPoint {
+            x,
+            y,
+            label: format!("{} at {started}", format_duration_ms(*ms)),
+        });
+    }
+
+    let y_ticks = vec![
+        YTick {
+            y: y_at(0),
+            label: format_duration_ms(0),
+        },
+        YTick {
+            y: y_at(max_ms / 2),
+            label: format_duration_ms(max_ms / 2),
+        },
+        YTick {
+            y: y_at(max_ms),
+            label: format_duration_ms(max_ms),
+        },
+    ];
+
+    DurationChart {
+        width: CHART_W,
+        height: CHART_H,
+        plot_l,
+        plot_r,
+        plot_t,
+        plot_b,
+        polyline: coords.join(" "),
+        points,
+        y_ticks,
+        x_start: series.first().map(|(s, _)| s.clone()).unwrap_or_default(),
+        x_end: series.last().map(|(s, _)| s.clone()).unwrap_or_default(),
+        count,
     }
 }
 
@@ -287,6 +418,50 @@ async fn action_detail(
         action,
         paused,
         runs,
+    };
+    Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
+// ---- duration chart view (CLAUDE-21) --------------------------------------
+
+#[derive(Template)]
+#[template(path = "action_chart.html")]
+struct ActionChartTpl {
+    version: &'static str,
+    action_name: String,
+    /// `None` renders the empty-state placeholder (no completed runs).
+    chart: Option<DurationChart>,
+}
+
+async fn action_durations(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, WebError> {
+    let pool = &s.api.pool;
+    // 404 unknown actions cleanly; only names the daemon has indexed resolve.
+    if indexed_action_path(pool, &name).await?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
+    }
+    // Same recent window as the action-detail table (last 50 by start). The
+    // query returns newest-first; the chart wants oldest-first, so reverse.
+    let runs = sqlx::query_as::<_, RunRow>(
+        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
+    )
+    .bind(&name)
+    .fetch_all(pool)
+    .await?;
+    // Completed runs only: in-flight runs (NULL ended_at) are dropped here so
+    // the chart never plots a moving value.
+    let series: Vec<(String, i64)> = runs
+        .iter()
+        .rev()
+        .filter_map(|r| r.duration_ms().map(|ms| (r.started_at.clone(), ms)))
+        .collect();
+    let chart = (!series.is_empty()).then(|| build_duration_chart(&series));
+    let tpl = ActionChartTpl {
+        version: s.api.version,
+        action_name: name,
+        chart,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
@@ -849,7 +1024,7 @@ impl IntoResponse for WebError {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_duration_ms, latest_attempt_on_disk};
+    use super::{build_duration_chart, format_duration_ms, latest_attempt_on_disk};
 
     #[test]
     fn format_duration_ms_buckets() {
@@ -884,6 +1059,63 @@ mod tests {
 
         assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-9"), Some(2));
         assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-90"), Some(5));
+    }
+
+    #[test]
+    fn chart_scales_to_plot_area_and_orders_points() {
+        let series = vec![
+            ("2026-05-26T10:00:00+00:00".to_string(), 0),
+            ("2026-05-26T11:00:00+00:00".to_string(), 5_000),
+            ("2026-05-26T12:00:00+00:00".to_string(), 10_000),
+        ];
+        let c = build_duration_chart(&series);
+        assert_eq!(c.count, 3);
+        // Three points, evenly spaced across the plot width. First sits on the
+        // left edge, last on the right edge.
+        assert_eq!(c.points.len(), 3);
+        assert_eq!(c.points[0].x, c.plot_l);
+        assert_eq!(c.points[2].x, c.plot_r);
+        // y inverts: the longest run (max) sits at the top, a zero run on the
+        // baseline, the midpoint halfway between.
+        assert_eq!(c.points[0].y, c.plot_b);
+        assert_eq!(c.points[2].y, c.plot_t);
+        assert_eq!(c.points[1].y, (c.plot_t + c.plot_b) / 2);
+        // Tooltip carries a human duration and the run start.
+        assert_eq!(c.points[2].label, "10s at 2026-05-26T12:00:00+00:00");
+        // Polyline is the space-joined "x,y" coordinate list.
+        assert_eq!(
+            c.polyline,
+            format!(
+                "{},{} {},{} {},{}",
+                c.points[0].x,
+                c.points[0].y,
+                c.points[1].x,
+                c.points[1].y,
+                c.points[2].x,
+                c.points[2].y
+            )
+        );
+        // Axis ends label the oldest and newest run start.
+        assert_eq!(c.x_start, "2026-05-26T10:00:00+00:00");
+        assert_eq!(c.x_end, "2026-05-26T12:00:00+00:00");
+    }
+
+    #[test]
+    fn chart_single_point_centers_and_flat_series_does_not_divide_by_zero() {
+        // One run: centered horizontally, no panic.
+        let one = vec![("2026-05-26T10:00:00+00:00".to_string(), 1_234)];
+        let c = build_duration_chart(&one);
+        assert_eq!(c.points.len(), 1);
+        assert_eq!(c.points[0].x, (c.plot_l + c.plot_r) / 2);
+
+        // All-zero durations: max_ms floors to 1 so the scale never divides by
+        // zero; every point lands on the baseline.
+        let flat = vec![
+            ("2026-05-26T10:00:00+00:00".to_string(), 0),
+            ("2026-05-26T11:00:00+00:00".to_string(), 0),
+        ];
+        let c = build_duration_chart(&flat);
+        assert!(c.points.iter().all(|p| p.y == c.plot_b));
     }
 
     #[test]

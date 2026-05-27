@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}{{ action_name }} durations - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><a href="/actions/{{ action_name }}">{{ action_name }}</a><span class="sep">/</span><span class="current">Durations</span>{% endblock %}
+{% block main %}
+
+{# CLAUDE-21: per-action duration chart on its own view so the detail page
+   stays focused. The chart is inline SVG generated server-side (geometry from
+   build_duration_chart); no JS charting library, consistent with the
+   vendored-only asset policy. The poll-region re-fetches this same URL every
+   5s like the detail page so new runs land without a manual refresh. #}
+<div id="poll-region"
+     hx-get="/actions/{{ action_name }}/durations"
+     hx-trigger="every 5s, refreshNow from:body"
+     hx-select="#poll-region"
+     hx-swap="outerHTML">
+
+<h2>{{ action_name }} - run durations</h2>
+
+{% if let Some(c) = chart %}
+<div class="card">
+  <svg viewBox="0 0 {{ c.width }} {{ c.height }}" width="100%" role="img"
+       aria-label="Line chart of the last {{ c.count }} completed run durations for {{ action_name }}, oldest to newest"
+       style="display: block; font-family: var(--mono); font-size: 11px;">
+    {# y-axis gridlines + duration labels #}
+    {% for t in c.y_ticks %}
+      <line x1="{{ c.plot_l }}" y1="{{ t.y }}" x2="{{ c.plot_r }}" y2="{{ t.y }}"
+            style="stroke: var(--border); stroke-width: 1;" />
+      <text x="{{ c.plot_l - 8 }}" y="{{ t.y + 4 }}" text-anchor="end"
+            style="fill: var(--fg-dim);">{{ t.label }}</text>
+    {% endfor %}
+    {# x-axis baseline #}
+    <line x1="{{ c.plot_l }}" y1="{{ c.plot_b }}" x2="{{ c.plot_r }}" y2="{{ c.plot_b }}"
+          style="stroke: var(--border); stroke-width: 1;" />
+    {# duration series, oldest to newest #}
+    <polyline points="{{ c.polyline }}" fill="none"
+              style="stroke: var(--accent); stroke-width: 2;" />
+    {% for p in c.points %}
+      <circle cx="{{ p.x }}" cy="{{ p.y }}" r="3" style="fill: var(--accent);">
+        <title>{{ p.label }}</title>
+      </circle>
+    {% endfor %}
+    {# x-axis end labels: oldest (left) and newest (right) run start #}
+    <text x="{{ c.plot_l }}" y="{{ c.height - 8 }}" text-anchor="start"
+          style="fill: var(--fg-dim);">{{ c.x_start }}</text>
+    <text x="{{ c.plot_r }}" y="{{ c.height - 8 }}" text-anchor="end"
+          style="fill: var(--fg-dim);">{{ c.x_end }}</text>
+  </svg>
+  <div class="dim" style="font-size: 12px; margin-top: 8px;">
+    Last {{ c.count }} completed run{% if c.count != 1 %}s{% endif %}, oldest to newest. In-flight runs are excluded.
+  </div>
+</div>
+{% else %}
+<div class="card"><span class="dim">No completed runs yet for this action.</span></div>
+{% endif %}
+
+</div><!-- /#poll-region -->
+
+{% endblock %}

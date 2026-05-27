@@ -28,6 +28,7 @@
   <div class="row-actions" style="margin-top: 16px;">
     <a class="btn" href="/actions/{{ action.name }}/edit">Edit</a>
     <a class="btn" href="/actions/{{ action.name }}/export">Export</a>
+    <a class="btn" href="/actions/{{ action.name }}/durations">Durations</a>
     <form hx-post="/api/actions/{{ action.name }}/trigger"
           hx-swap="none"
           hx-disabled-elt="find button"
