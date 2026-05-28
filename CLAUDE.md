@@ -1,6 +1,6 @@
 # claude-bot
 
-YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Forgejo PRs, ...), feed each row to `claude --print`, do something with the result. Shipped as a single Rust binary (`claude-run`) that doubles as a CLI and a long-running daemon with a unix-socket API.
+YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Forgejo PRs, ...), feed each job to `claude --print`, do something with the result. Shipped as a single Rust binary (`claude-run`) that doubles as a CLI and a long-running daemon with a unix-socket API.
 
 ## Shape
 
@@ -29,7 +29,7 @@ The Rust port is rolling out in phases against the plan agreed in PR review:
 | 3 | Web UI (axum templates + HTMX + SSE), TCP listener, log streaming | TBD |
 | 4 | Action edit / import / export through the API | TBD |
 | 5 | Token auth for non-loopback binds | TBD |
-| 6 | Retention policy enforcement on `row_outcomes`, polish | TBD |
+| 6 | Retention policy enforcement on `job_outcomes`, polish | TBD |
 
 ## Working on this repo
 

@@ -15,7 +15,7 @@ pub fn now_iso() -> String {
 
 pub async fn attempts_get(pool: &SqlitePool, action: &str, key: &str) -> Result<u32> {
     let row: Option<(i64,)> =
-        sqlx::query_as("SELECT count FROM attempt_counters WHERE action_name = ? AND row_key = ?")
+        sqlx::query_as("SELECT count FROM attempt_counters WHERE action_name = ? AND job_key = ?")
             .bind(action)
             .bind(key)
             .fetch_optional(pool)
@@ -27,9 +27,9 @@ pub async fn attempts_increment(pool: &SqlitePool, action: &str, key: &str) -> R
     let now = now_iso();
     sqlx::query(
         r#"
-        INSERT INTO attempt_counters (action_name, row_key, count, last_at)
+        INSERT INTO attempt_counters (action_name, job_key, count, last_at)
         VALUES (?, ?, 1, ?)
-        ON CONFLICT(action_name, row_key) DO UPDATE SET
+        ON CONFLICT(action_name, job_key) DO UPDATE SET
             count = count + 1,
             last_at = excluded.last_at
         "#,
@@ -116,13 +116,13 @@ pub async fn run_begin(pool: &SqlitePool, action: &str, triggered_by: &str) -> R
     Ok(id)
 }
 
-/// CLAUDE-1: record the planned row keys for a run as soon as input.command
+/// CLAUDE-1: record the planned job keys for a run as soon as input.command
 /// has produced them, so the web UI can show what's queued / in-flight
 /// before any outcome record exists. Stored as a JSON array of strings on
-/// the `runs.row_keys` column.
-pub async fn run_set_row_keys(pool: &SqlitePool, run_id: i64, keys: &[String]) -> Result<()> {
+/// the `runs.job_keys` column.
+pub async fn run_set_job_keys(pool: &SqlitePool, run_id: i64, keys: &[String]) -> Result<()> {
     let payload = serde_json::to_string(keys)?;
-    sqlx::query("UPDATE runs SET row_keys = ? WHERE id = ?")
+    sqlx::query("UPDATE runs SET job_keys = ? WHERE id = ?")
         .bind(payload)
         .bind(run_id)
         .execute(pool)
@@ -130,12 +130,12 @@ pub async fn run_set_row_keys(pool: &SqlitePool, run_id: i64, keys: &[String]) -
     Ok(())
 }
 
-/// CLAUDE-14: mark which planned row a run is currently processing, so the web
-/// UI can show exactly the one in-flight row as "running" instead of inferring
-/// it from gaps in `row_outcomes`. Pass `Some(key)` before processing a row;
+/// CLAUDE-14: mark which planned job a run is currently processing, so the web
+/// UI can show exactly the one in-flight job as "running" instead of inferring
+/// it from gaps in `job_outcomes`. Pass `Some(key)` before processing a job;
 /// `run_finish` clears it back to NULL when the run ends.
-pub async fn run_set_current_row(pool: &SqlitePool, run_id: i64, key: Option<&str>) -> Result<()> {
-    sqlx::query("UPDATE runs SET current_row_key = ? WHERE id = ?")
+pub async fn run_set_current_job(pool: &SqlitePool, run_id: i64, key: Option<&str>) -> Result<()> {
+    sqlx::query("UPDATE runs SET current_job_key = ? WHERE id = ?")
         .bind(key)
         .bind(run_id)
         .execute(pool)
@@ -143,8 +143,8 @@ pub async fn run_set_current_row(pool: &SqlitePool, run_id: i64, key: Option<&st
     Ok(())
 }
 
-pub async fn run_row_keys(pool: &SqlitePool, run_id: i64) -> Result<Vec<String>> {
-    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT row_keys FROM runs WHERE id = ?")
+pub async fn run_job_keys(pool: &SqlitePool, run_id: i64) -> Result<Vec<String>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT job_keys FROM runs WHERE id = ?")
         .bind(run_id)
         .fetch_optional(pool)
         .await?;
@@ -160,22 +160,22 @@ pub async fn run_finish(
     pool: &SqlitePool,
     run_id: i64,
     exit_code: i32,
-    rows_processed: u32,
+    jobs_processed: u32,
 ) -> Result<()> {
     let now = now_iso();
-    // CLAUDE-14: clear current_row_key atomically with the end state. A finished
-    // run has no row in flight, so every break/finish path that reaches here
+    // CLAUDE-14: clear current_job_key atomically with the end state. A finished
+    // run has no job in flight, so every break/finish path that reaches here
     // also drops the stale "running" marker.
     sqlx::query(
         r#"
         UPDATE runs
-        SET ended_at = ?, exit_code = ?, rows_processed = ?, current_row_key = NULL
+        SET ended_at = ?, exit_code = ?, jobs_processed = ?, current_job_key = NULL
         WHERE id = ?
         "#,
     )
     .bind(&now)
     .bind(exit_code as i64)
-    .bind(rows_processed as i64)
+    .bind(jobs_processed as i64)
     .bind(run_id)
     .execute(pool)
     .await?;
@@ -186,7 +186,7 @@ pub async fn run_finish(
 /// daemon cannot have any run still executing, so every row with no end state
 /// is a leftover from a dead process. Mark each cancelled with `ended_at` set
 /// to now and `exit_code = exit::CANCELLED`. Returns the number reconciled.
-/// `row_outcomes` is left untouched: a row either has an outcome or it does
+/// `job_outcomes` is left untouched: a job either has an outcome or it does
 /// not, and no synthetic outcomes are invented. This is a pure DB reconcile,
 /// distinct from the live-cancel path (CLAUDE-9): the previous process is
 /// gone, so there is no child to terminate or `post` phase to run.
@@ -201,10 +201,10 @@ pub async fn cancel_orphaned_runs(pool: &SqlitePool) -> Result<u64> {
 }
 
 #[derive(Debug)]
-pub struct RowOutcome<'a> {
+pub struct JobOutcome<'a> {
     pub run_id: i64,
     pub action_name: &'a str,
-    pub row_key: &'a str,
+    pub job_key: &'a str,
     pub attempt: u32,
     pub ok: bool,
     pub claude_ran: bool,
@@ -213,16 +213,16 @@ pub struct RowOutcome<'a> {
     pub attempt_counted: bool,
     pub summary: Option<&'a str>,
     pub stream_log_path: Option<&'a str>,
-    /// CLAUDE-20: full per-row pipeline elapsed in milliseconds.
+    /// CLAUDE-20: full per-job pipeline elapsed in milliseconds.
     pub duration_ms: i64,
 }
 
-pub async fn row_outcome_insert(pool: &SqlitePool, r: &RowOutcome<'_>) -> Result<()> {
+pub async fn job_outcome_insert(pool: &SqlitePool, r: &JobOutcome<'_>) -> Result<()> {
     let now = now_iso();
     sqlx::query(
         r#"
-        INSERT INTO row_outcomes (
-            run_id, action_name, row_key, attempt, ts, ok,
+        INSERT INTO job_outcomes (
+            run_id, action_name, job_key, attempt, ts, ok,
             claude_ran, claude_ok, claude_cost_usd, attempt_counted,
             summary, stream_log_path, duration_ms
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -230,7 +230,7 @@ pub async fn row_outcome_insert(pool: &SqlitePool, r: &RowOutcome<'_>) -> Result
     )
     .bind(r.run_id)
     .bind(r.action_name)
-    .bind(r.row_key)
+    .bind(r.job_key)
     .bind(r.attempt as i64)
     .bind(&now)
     .bind(r.ok as i64)
@@ -324,7 +324,7 @@ pub struct ActionIndexRow {
     pub schedule_spec: Option<String>,
     pub last_seen_at: String,
     pub parse_error: Option<String>,
-    /// CLAUDE-1: optional URL template for rendering row keys as links.
+    /// CLAUDE-1: optional URL template for rendering job keys as links.
     pub link_template: Option<String>,
 }
 

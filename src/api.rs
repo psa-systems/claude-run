@@ -188,7 +188,7 @@ async fn resume_action(
 }
 
 /// CLAUDE-9: cancel an in-flight run. Tripping the token tears the run down:
-/// the claude child is terminated, the in-flight row runs its `post` phase
+/// the claude child is terminated, the in-flight job runs its `post` phase
 /// with a synthesized cancelled result, and the run finalizes with
 /// `exit::CANCELLED`. Cancelling a run that is not in flight (already finished,
 /// never existed, or owned by a different process) is an idempotent no-op that

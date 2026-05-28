@@ -5,10 +5,10 @@
 //!
 //! - [`config`]: runtime + on-disk settings, XDG paths.
 //! - [`action`]: YAML action loader.
-//! - [`workdir`]: per-row workdir path resolution (env-var expansion only).
+//! - [`workdir`]: per-job workdir path resolution (env-var expansion only).
 //! - [`snippet`]: nu snippet execution (shell out to `nu`).
 //! - [`claude`]: invoke the `claude` CLI with stream-json output.
-//! - [`row`]: per-row pipeline (filter / pre / prompt / claude / post).
+//! - [`job`]: per-job pipeline (filter / pre / prompt / claude / post).
 //! - [`state`]: SQLite-backed attempt counters and daily ledger.
 //! - [`migrate`]: one-shot import of legacy state.json files.
 //!
@@ -24,9 +24,9 @@ pub mod config;
 pub mod daemon;
 pub mod db;
 pub mod error;
+pub mod job;
 pub mod lock;
 pub mod migrate;
-pub mod row;
 pub mod scheduler;
 pub mod snippet;
 pub mod state;

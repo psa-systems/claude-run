@@ -1,14 +1,14 @@
 # claude-run
 
-YAML-driven runner for Claude Code. Poll an external source (YouTrack issues, Forgejo PRs, whatever produces a JSON array), feed each row to `claude --print`, and do something with the result. Single Rust binary, doubles as a CLI and a long-running daemon.
+YAML-driven runner for Claude Code. Poll an external source (YouTrack issues, Forgejo PRs, whatever produces a JSON array), feed each job to `claude --print`, and do something with the result. Single Rust binary, doubles as a CLI and a long-running daemon.
 
 ## What it gives you
 
 - **Per-action YAML files** describe input (a nu snippet that emits a JSON array), an optional filter, pre and post nu snippets, and the prompt sent to claude. See [`actions/SCHEMA.md`](actions/SCHEMA.md).
 - **Scheduling**: each action declares `schedule.kind: interval | cron | manual`; the daemon's built-in scheduler fires on time without external cron.
-- **Per-row streaming logs**: claude is invoked with `--output-format stream-json` and the NDJSON events land in `$STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`. `tail -f` to watch live.
-- **Cost ledger + caps**: per-day Claude-invocation cap, per-day USD budget, per-row attempt cap. All in SQLite.
-- **Skip-attempt marker**: an action's post step can write `$workdir/.claude-run-skip-attempt` for outcomes that park a row pending human input (so the attempt cap doesn't trip).
+- **Per-job streaming logs**: claude is invoked with `--output-format stream-json` and the NDJSON events land in `$STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`. `tail -f` to watch live.
+- **Cost ledger + caps**: per-day Claude-invocation cap, per-day USD budget, per-job attempt cap. All in SQLite.
+- **Skip-attempt marker**: an action's post step can write `$workdir/.claude-run-skip-attempt` for outcomes that park a job pending human input (so the attempt cap doesn't trip).
 - **Pause / resume**: globally or per-action; persisted in SQLite, takes effect on the next scheduler tick.
 - **HTTP API over a unix socket**: the daemon exposes `/status`, `/actions`, `/actions/<n>/trigger`, `/pause`, `/resume`, ... The CLI client speaks that API when the daemon is reachable, else operates on the DB directly.
 
@@ -67,7 +67,7 @@ XDG-compliant; each path overridable by the matching env var.
 | `$XDG_STATE_HOME/claude-run/` | `CLAUDE_RUN_STATE_DIR` | `logs/<action>/YYYY-MM-DD.jsonl`, `logs/<action>/streams/<key>-attempt-<n>.jsonl`, `daemon.log` |
 | `$XDG_RUNTIME_DIR/claude-run/` | `CLAUDE_RUN_RUNTIME_DIR` | `daemon.pid`, `daemon.sock`, `locks/<action>.lock` |
 
-`workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-row workdirs live; defaults to `$DATA_DIR/workdirs/`. Supports `~`, `$VAR`, `${VAR}` expansion.
+`workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-job workdirs live; defaults to `$DATA_DIR/workdirs/`. Supports `~`, `$VAR`, `${VAR}` expansion.
 
 ## Development
 

@@ -4,7 +4,7 @@
 # https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
 
 # Pick up YouTrack issues whose AI Agent custom field is Queued. Resolve each
-# issue's repo via the project's VCS integration, clone it into the row's
+# issue's repo via the project's VCS integration, clone it into the job's
 # workdir, and have Claude work the issue end-to-end per the YouTrack and Git
 # workflows in CLAUDE.md.
 #
@@ -17,7 +17,7 @@
 #   Working      -> claude is running (set in pre step)
 #   Code Review  -> the runner opened a PR after a successful run; the code
 #                   needs human review (finalize post step)
-#   Needs Review -> claude couldn't proceed and parked the row by writing
+#   Needs Review -> claude couldn't proceed and parked the job by writing
 #                   .claude-run-needs-review; the issue needs human input
 #                   (finalize post step) - attempt counter is NOT incremented
 #   Failed       -> claude or a step had a hard failure (finalize post step)
@@ -40,7 +40,7 @@
 
 name: youtrack
 
-# Per-action link template (CLAUDE-1). Row keys (idReadable, e.g. MK-16)
+# Per-action link template (CLAUDE-1). Job keys (idReadable, e.g. MK-16)
 # render as clickable links to the YouTrack issue in the web UI.
 link_template: "https://example.myjetbrains.com/issue/{key}"
 
@@ -80,36 +80,36 @@ input:
 
     # Drop issues whose project has no enabled VCS integration; they cannot be
     # cloned and would just fail in the pre step.
-    let rows = ($issues | each { |i|
+    let jobs = ($issues | each { |i|
         let key = ($i.idReadable | split row "-" | first)
         let repo = ($proj_map | get -o $key)
         if $repo == null { return null }
         $i | merge $repo
     } | compact)
 
-    $rows | to json
+    $jobs | to json
 
 dedup_key: idReadable
 
 filter: |
   #!/usr/bin/env nu
-  # Re-check the live AI Agent value, not the stale row snapshot. The snapshot
-  # ($row."AI Agent") was captured by input.command when the batch was gathered,
+  # Re-check the live AI Agent value, not the stale job snapshot. The snapshot
+  # ($job."AI Agent") was captured by input.command when the batch was gathered,
   # so it always reports Queued for any issue that was Queued at gather time and
-  # is blind to a status change made afterward. filter runs per row immediately
+  # is blind to a status change made afterward. filter runs per job immediately
   # before pre, so a live read here honors a change made anytime in the
   # gather-to-pre window.
-  let res = (^yt issue get-field $row.idReadable "AI Agent" | complete)
+  let res = (^yt issue get-field $job.idReadable "AI Agent" | complete)
   if $res.exit_code != 0 {
       # Be conservative on lookup failure: skip rather than proceed, so a
       # transient error cannot let an ineligible issue be worked. A still-Queued
-      # row is retried on the next firing.
-      print --stderr $"skipping ($row.idReadable): AI Agent lookup failed (exit ($res.exit_code))"
+      # job is retried on the next firing.
+      print --stderr $"skipping ($job.idReadable): AI Agent lookup failed (exit ($res.exit_code))"
       exit 1
   }
   let ai_agent = ($res.stdout | str trim)
   if $ai_agent != "Queued" {
-      print --stderr $"skipping ($row.idReadable): AI Agent = ($ai_agent)"
+      print --stderr $"skipping ($job.idReadable): AI Agent = ($ai_agent)"
       exit 1
   }
 
@@ -117,33 +117,33 @@ pre:
   # Mark the issue Working so concurrent or subsequent runs do not pick it up.
   - |
     #!/usr/bin/env nu
-    ^yt issue set-field $row.idReadable "AI Agent" "Working"
-    ^yt issue set-state $row.idReadable "In Progress"
+    ^yt issue set-field $job.idReadable "AI Agent" "Working"
+    ^yt issue set-state $job.idReadable "In Progress"
 
-  # Clone the repo into the row's workdir. Host git identity handles auth.
+  # Clone the repo into the job's workdir. Host git identity handles auth.
   # Runner already created $workdir as an empty dir. If a previous attempt
   # left state behind, git clone will fail; the attempt counter trips after
   # max_attempts_per_key and a human is expected to investigate $workdir.
   - |
     #!/usr/bin/env nu
-    ^git clone --depth 50 $row.clone_url $workdir
+    ^git clone --depth 50 $job.clone_url $workdir
 
 prompt: |
   #!/usr/bin/env nu
   let lines = [
       "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.",
       "",
-      $"Issue: ($row.idReadable): ($row.summary)",
-      $"Repo: ($row.clone_url)",
+      $"Issue: ($job.idReadable): ($job.summary)",
+      $"Repo: ($job.clone_url)",
       $"Working directory: ($workdir) - the repo is already cloned here, you are inside it.",
       "",
       "Do ONLY local engineering work. Do NOT push, do NOT open a PR, and do NOT touch YouTrack (no 'yt issue set-field', no 'yt issue set-state', no comments). The runner finalizes the issue after you exit: it opens the PR from your local commits and sets the AI Agent field based on the run outcome.",
       "",
       "Steps:",
-      $"1. Run 'yt issue inspect ($row.idReadable)' to read the full description and acceptance criteria.",
+      $"1. Run 'yt issue inspect ($job.idReadable)' to read the full description and acceptance criteria.",
       "2. Create a feature branch off the default branch per the Git workflow in CLAUDE.md.",
       "3. Make the minimum change required to satisfy the acceptance criteria.",
-      $"4. Commit with a message that references the issue on its own line as '#($row.idReadable)' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
+      $"4. Commit with a message that references the issue on its own line as '#($job.idReadable)' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
       "5. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). Run it in the foreground and wait for it inline; do NOT background a long-running job and poll/wait on it across turns - that is what blew the run timeout previously.",
       "6. Stop. Do not push, do not open a PR, do not touch YouTrack. The runner opens the PR from your commits and transitions the issue.",
       "",
@@ -151,7 +151,7 @@ prompt: |
       "  a. Do NOT change any code.",
       "  b. Write the human-facing explanation of exactly what information or decision you need to proceed to this file (the file contents are the reason, posted verbatim as the issue comment by the runner):",
       $"       ($workdir)/.claude-run-needs-review",
-      "  c. Touch this marker file so the runner does NOT count this attempt toward the per-key cap (the row is parked pending human input, not failed):",
+      "  c. Touch this marker file so the runner does NOT count this attempt toward the per-key cap (the job is parked pending human input, not failed):",
       $"       ($workdir)/.claude-run-skip-attempt",
       "  d. Do NOT touch YouTrack yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.",
       "",
@@ -192,7 +192,7 @@ post:
     mut target = ""
 
     if ($needs_review | path exists) {
-        # Blocker: agent parked the row pending human input. Ensure the
+        # Blocker: agent parked the job pending human input. Ensure the
         # skip-attempt marker is present so this attempt is not counted, and
         # surface the reason verbatim. No PR.
         if not ($skip_marker | path exists) { touch $skip_marker }
@@ -203,12 +203,12 @@ post:
         # then report it. fj derives the title/body from the commit messages,
         # which already carry the bare #<KEY>-N reference for auto-linking.
         cd $workdir
-        let host = ($row.repo_host | url parse | get host)
+        let host = ($job.repo_host | url parse | get host)
         let pr = (^fj --host $host pr create -aA | complete)
         if $pr.exit_code == 0 {
             let pr_num = ($pr.stdout | str trim | parse --regex 'pull request #(?P<num>\d+)' | get num.0?)
             let pr_url = if ($pr_num | is-not-empty) {
-                $"($row.repo_host)/($row.repo_path)/pulls/($pr_num)"
+                $"($job.repo_host)/($job.repo_path)/pulls/($pr_num)"
             } else {
                 $pr.stdout | str trim
             }
@@ -229,8 +229,8 @@ post:
 
     # Comment first (through complete so a failure can't abort before the AI
     # Agent write), then write AI Agent last so it is authoritative.
-    ^yt issue comment $row.idReadable $comment | complete | ignore
-    ^yt issue set-field $row.idReadable "AI Agent" $target
+    ^yt issue comment $job.idReadable $comment | complete | ignore
+    ^yt issue set-field $job.idReadable "AI Agent" $target
 
 output:
   file: youtrack.jsonl

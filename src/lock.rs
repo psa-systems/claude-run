@@ -1,7 +1,7 @@
 //! Per-action cross-process advisory lock.
 //!
 //! Both the daemon's worker pool and a standalone `claude-run run <action>`
-//! invocation acquire this lock before processing rows, so they serialize even
+//! invocation acquire this lock before processing jobs, so they serialize even
 //! when running in different processes. Held only for the duration of one
 //! run; released on drop.
 //!

@@ -99,8 +99,8 @@ pub struct Action {
     #[serde(default)]
     pub schedule: Option<Schedule>,
 
-    /// Optional URL template for rendering row keys as clickable links in the
-    /// web UI. `{key}` is substituted with the row key. Example:
+    /// Optional URL template for rendering job keys as clickable links in the
+    /// web UI. `{key}` is substituted with the job key. Example:
     /// `https://example.myjetbrains.com/issue/{key}`.
     #[serde(default)]
     pub link_template: Option<String>,
