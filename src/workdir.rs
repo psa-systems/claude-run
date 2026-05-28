@@ -1,4 +1,4 @@
-//! Per-row workdir path resolution.
+//! Per-job workdir path resolution.
 //!
 //! `workdir_base` is now a plain path that may contain `~`, `$VAR`, and
 //! `${VAR}` references. The nu-expression form (a leading `$` triggering
@@ -11,7 +11,7 @@
 //! 2. `$CLAUDE_RUN_WORKDIR_BASE`, if set.
 //! 3. `<data_dir>/workdirs`.
 //!
-//! The final per-row workdir is `<workdir_base>/<action_name>/<row_key>`.
+//! The final per-job workdir is `<workdir_base>/<action_name>/<job_key>`.
 
 use std::path::{Path, PathBuf};
 
@@ -27,8 +27,8 @@ pub fn resolve_workdir_base(action_workdir_base: Option<&str>, paths: &Paths) ->
     paths.workdirs_dir()
 }
 
-pub fn row_workdir(base: &Path, action_name: &str, row_key: &str) -> PathBuf {
-    base.join(action_name).join(row_key)
+pub fn job_workdir(base: &Path, action_name: &str, job_key: &str) -> PathBuf {
+    base.join(action_name).join(job_key)
 }
 
 #[cfg(test)]
@@ -60,8 +60,8 @@ mod tests {
     }
 
     #[test]
-    fn row_workdir_joins() {
-        let p = row_workdir(Path::new("/base"), "youtrack", "MK-16");
+    fn job_workdir_joins() {
+        let p = job_workdir(Path::new("/base"), "youtrack", "MK-16");
         assert_eq!(p, PathBuf::from("/base/youtrack/MK-16"));
     }
 }

@@ -81,7 +81,7 @@ impl ClaudeInvoker {
     /// CLAUDE-9: the child is spawned in its own process group and the wait is
     /// cancellable. When `cancel` trips, the whole group (the `timeout`
     /// wrapper, `claude`, and anything they spawned) is terminated with
-    /// SIGTERM, a short grace period, then SIGKILL. The caller (`row.rs`)
+    /// SIGTERM, a short grace period, then SIGKILL. The caller (`job.rs`)
     /// detects the tripped token and synthesizes a cancelled `$claude_result`
     /// so the action's `post` phase still runs.
     pub fn invoke(

@@ -4,7 +4,7 @@
 # https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
 
 # Pick up YouTrack issues whose AI Agent custom field is Queued. Resolve each
-# issue's repo via the project's VCS integration, clone it into the row's
+# issue's repo via the project's VCS integration, clone it into the job's
 # workdir, and have Claude work the issue end-to-end per the YouTrack and Git
 # workflows in CLAUDE.md.
 #
@@ -29,7 +29,7 @@
 
 name: youtrack
 
-# Per-action link template (CLAUDE-1). Row keys (idReadable, e.g. MK-16)
+# Per-action link template (CLAUDE-1). Job keys (idReadable, e.g. MK-16)
 # render as clickable links to the YouTrack issue in the web UI.
 link_template: "https://example.myjetbrains.com/issue/{key}"
 
@@ -69,36 +69,36 @@ input:
 
     # Drop issues whose project has no enabled VCS integration; they cannot be
     # cloned and would just fail in the pre step.
-    let rows = ($issues | each { |i|
+    let jobs = ($issues | each { |i|
         let key = ($i.idReadable | split row "-" | first)
         let repo = ($proj_map | get -o $key)
         if $repo == null { return null }
         $i | merge $repo
     } | compact)
 
-    $rows | to json
+    $jobs | to json
 
 dedup_key: idReadable
 
 filter: |
   #!/usr/bin/env nu
-  # Re-check the live AI Agent value, not the stale row snapshot. The snapshot
-  # ($row."AI Agent") was captured by input.command when the batch was gathered,
+  # Re-check the live AI Agent value, not the stale job snapshot. The snapshot
+  # ($job."AI Agent") was captured by input.command when the batch was gathered,
   # so it always reports Queued for any issue that was Queued at gather time and
-  # is blind to a status change made afterward. filter runs per row immediately
+  # is blind to a status change made afterward. filter runs per job immediately
   # before pre, so a live read here honors a change made anytime in the
   # gather-to-pre window.
-  let res = (^yt issue get-field $row.idReadable "AI Agent" | complete)
+  let res = (^yt issue get-field $job.idReadable "AI Agent" | complete)
   if $res.exit_code != 0 {
       # Be conservative on lookup failure: skip rather than proceed, so a
       # transient error cannot let an ineligible issue be worked. A still-Queued
-      # row is retried on the next firing.
-      print --stderr $"skipping ($row.idReadable): AI Agent lookup failed (exit ($res.exit_code))"
+      # job is retried on the next firing.
+      print --stderr $"skipping ($job.idReadable): AI Agent lookup failed (exit ($res.exit_code))"
       exit 1
   }
   let ai_agent = ($res.stdout | str trim)
   if $ai_agent != "Queued" {
-      print --stderr $"skipping ($row.idReadable): AI Agent = ($ai_agent)"
+      print --stderr $"skipping ($job.idReadable): AI Agent = ($ai_agent)"
       exit 1
   }
 
@@ -106,42 +106,42 @@ pre:
   # Mark the issue Working so concurrent or subsequent runs do not pick it up.
   - |
     #!/usr/bin/env nu
-    ^yt issue set-field $row.idReadable "AI Agent" "Working"
-    ^yt issue set-state $row.idReadable "In Progress"
+    ^yt issue set-field $job.idReadable "AI Agent" "Working"
+    ^yt issue set-state $job.idReadable "In Progress"
 
-  # Clone the repo into the row's workdir. Host git identity handles auth.
+  # Clone the repo into the job's workdir. Host git identity handles auth.
   # Runner already created $workdir as an empty dir. If a previous attempt
   # left state behind, git clone will fail; the attempt counter trips after
   # max_attempts_per_key and a human is expected to investigate $workdir.
   - |
     #!/usr/bin/env nu
-    ^git clone --depth 50 $row.clone_url $workdir
+    ^git clone --depth 50 $job.clone_url $workdir
 
 prompt: |
   #!/usr/bin/env nu
   let lines = [
       "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.",
       "",
-      $"Issue: ($row.idReadable): ($row.summary)",
-      $"Repo: ($row.clone_url)",
+      $"Issue: ($job.idReadable): ($job.summary)",
+      $"Repo: ($job.clone_url)",
       $"Working directory: ($workdir) - the repo is already cloned here, you are inside it.",
       "",
       "Steps:",
-      $"1. Run 'yt issue inspect ($row.idReadable)' to read the full description and acceptance criteria.",
+      $"1. Run 'yt issue inspect ($job.idReadable)' to read the full description and acceptance criteria.",
       "2. Create a feature branch off the default branch per the Git workflow in CLAUDE.md.",
       "3. Make the minimum change required to satisfy the acceptance criteria.",
-      $"4. Commit with a message that references the issue on its own line as '#($row.idReadable)' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
+      $"4. Commit with a message that references the issue on its own line as '#($job.idReadable)' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
       "5. Push the branch and open a PR with the issue id in both the title and the body.",
       "6. Set AI Agent to 'Code Review' so the human knows the PR is waiting on them:",
-      $"     yt issue set-field ($row.idReadable) 'AI Agent' 'Code Review'",
+      $"     yt issue set-field ($job.idReadable) 'AI Agent' 'Code Review'",
       "7. Stop after the PR is opened. Do not merge.",
       "",
       "If you CANNOT safely complete the issue - missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue:",
       "  a. Do NOT change any code.",
       "  b. Post a comment on the issue explaining exactly what information or decision you need from a human to proceed.",
       "  c. Set AI Agent to 'Needs Review' (the ISSUE needs human input - distinct from 'Code Review' which means a PR is waiting):",
-      $"       yt issue set-field ($row.idReadable) 'AI Agent' 'Needs Review'",
-      "  d. Touch this marker file so the runner does NOT count this attempt toward the per-key cap (the row is parked pending human input, not failed):",
+      $"       yt issue set-field ($job.idReadable) 'AI Agent' 'Needs Review'",
+      "  d. Touch this marker file so the runner does NOT count this attempt toward the per-key cap (the job is parked pending human input, not failed):",
       $"       touch ($workdir)/.claude-run-skip-attempt",
       "",
       "When you finish, summarize what you did and the PR URL (if any) in plain text.",
@@ -164,9 +164,9 @@ post:
     }
     let lines = [$header, "", $claude_result.summary, "", $"Cost: $($claude_result.cost) USD"]
     let body = ($lines | str join "\n")
-    ^yt issue comment $row.idReadable $body
+    ^yt issue comment $job.idReadable $body
 
-  # Transition AI Agent out of Working so the row is not stuck.
+  # Transition AI Agent out of Working so the job is not stuck.
   # If Claude self-set the field (Code Review / Needs Review / Failed) we
   # preserve it. Only act when current value is still Working - meaning Claude
   # never got to step 6 or the failure path.
@@ -178,15 +178,15 @@ post:
   # Claude is told to touch the marker in the prompt, but belt-and-suspenders.
   - |
     #!/usr/bin/env nu
-    let r = (^yt issue get-field $row.idReadable "AI Agent" | complete)
+    let r = (^yt issue get-field $job.idReadable "AI Agent" | complete)
     let current = if $r.exit_code == 0 { $r.stdout | str trim } else { "" }
 
     if $current == "Working" {
         let target = if $claude_result.ok { "Code Review" } else { "Failed" }
-        ^yt issue set-field $row.idReadable "AI Agent" $target
+        ^yt issue set-field $job.idReadable "AI Agent" $target
     }
 
-    let final_state = (^yt issue get-field $row.idReadable "AI Agent" | complete | get stdout | str trim)
+    let final_state = (^yt issue get-field $job.idReadable "AI Agent" | complete | get stdout | str trim)
     if $final_state == "Needs Review" {
         let marker = $"($workdir)/.claude-run-skip-attempt"
         if not ($marker | path exists) {

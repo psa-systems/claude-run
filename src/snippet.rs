@@ -1,4 +1,4 @@
-//! Run a nu snippet with bindings (`$row`, `$workdir`, `$claude_result`, ...)
+//! Run a nu snippet with bindings (`$job`, `$workdir`, `$claude_result`, ...)
 //! injected via a prelude.
 //!
 //! Each binding is serialized to JSON and written to a tempfile next to the
@@ -61,7 +61,7 @@ impl SnippetRunner {
     /// generated prelude (`let <name> = (open --raw '<path>' | from json)`).
     /// For any other interpreter the prelude does not apply, so each binding is
     /// exposed instead as an environment variable named after the binding,
-    /// holding the compact-JSON value (e.g. `$row`, `$workdir` in a bash
+    /// holding the compact-JSON value (e.g. `$job`, `$workdir` in a bash
     /// snippet, decode with `jq`).
     pub fn run(
         &self,
@@ -126,10 +126,10 @@ impl SnippetRunner {
     }
 }
 
-/// Compute the per-row snippet directory:
-/// `<state_dir>/snippets/<action_name>/<row_key>/`.
-pub fn snippet_dir_for(state_dir: &Path, action_name: &str, row_key: &str) -> PathBuf {
-    state_dir.join("snippets").join(action_name).join(row_key)
+/// Compute the per-job snippet directory:
+/// `<state_dir>/snippets/<action_name>/<job_key>/`.
+pub fn snippet_dir_for(state_dir: &Path, action_name: &str, job_key: &str) -> PathBuf {
+    state_dir.join("snippets").join(action_name).join(job_key)
 }
 
 #[cfg(test)]
@@ -139,13 +139,13 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn snippet_sees_row_binding() {
+    fn snippet_sees_job_binding() {
         let dir = tempdir().unwrap();
         let runner = SnippetRunner::new(None);
         let mut b = Bindings::new();
-        b.insert("row", json!({"id": "hello"}));
+        b.insert("job", json!({"id": "hello"}));
         let out = runner
-            .run(r#"print $row.id"#, &b, dir.path(), "test", None)
+            .run(r#"print $job.id"#, &b, dir.path(), "test", None)
             .unwrap();
         assert!(out.ok, "stderr: {}", out.stderr);
         assert!(out.stdout.trim() == "hello", "got {:?}", out.stdout);
@@ -168,9 +168,9 @@ mod tests {
         let runner = SnippetRunner::new(None);
         // Non-nu interpreter: bindings arrive as env vars holding compact JSON.
         let mut b = Bindings::new();
-        b.insert("row", json!({"id": "hello"}));
+        b.insert("job", json!({"id": "hello"}));
         let out = runner
-            .run(r#"echo "$row""#, &b, dir.path(), "test", Some("bash"))
+            .run(r#"echo "$job""#, &b, dir.path(), "test", Some("bash"))
             .unwrap();
         assert!(out.ok, "stderr: {}", out.stderr);
         assert_eq!(out.stdout.trim(), r#"{"id":"hello"}"#);

@@ -1,4 +1,4 @@
-//! Per-row pipeline. Mirrors `row-process` from `scripts/claude-run.nu`:
+//! Per-job pipeline. Mirrors `row-process` from `scripts/claude-run.nu`:
 //!
 //! ```text
 //! filter -> dir-ensure workdir
@@ -13,9 +13,9 @@
 //! - Post runs on every code path that reached the workdir, including pre /
 //!   prompt failure. `$claude_result` is synthesized on those paths.
 //! - Transient claude errors (rate limit) skip post AND skip attempt counting
-//!   so the row retries cleanly on the next firing.
+//!   so the job retries cleanly on the next firing.
 //! - Per-key attempt count is suppressed when post writes the
-//!   `$workdir/.claude-run-skip-attempt` marker (blocker / parked rows).
+//!   `$workdir/.claude-run-skip-attempt` marker (blocker / parked jobs).
 //! - Daily Claude-invocation count + cost ledger advance only when claude
 //!   actually ran (real budget was spent).
 
@@ -77,7 +77,7 @@ pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> Eff
     }
 }
 
-pub struct RowContext<'a> {
+pub struct JobContext<'a> {
     pub action: &'a LoadedAction,
     pub limits: EffectiveLimits,
     pub paths: &'a Paths,
@@ -92,20 +92,20 @@ pub struct RowContext<'a> {
     pub cancel: CancellationToken,
 }
 
-/// Compute the row key for a row. If `dedup_key` is set on the action, look
+/// Compute the job key for a job. If `dedup_key` is set on the action, look
 /// it up; otherwise use a positional fallback.
-pub fn row_key(action: &LoadedAction, row: &Value, idx: usize) -> String {
+pub fn job_key(action: &LoadedAction, job: &Value, idx: usize) -> String {
     let Some(field) = action.action.dedup_key.as_deref() else {
-        return format!("row-{idx}");
+        return format!("job-{idx}");
     };
-    match row.get(field) {
+    match job.get(field) {
         Some(Value::String(s)) => s.clone(),
         Some(other) => other.to_string().trim_matches('"').to_string(),
-        None => format!("row-{idx}"),
+        None => format!("job-{idx}"),
     }
 }
 
-pub async fn gather_rows(
+pub async fn gather_jobs(
     action: &LoadedAction,
     ctx_snippet: &SnippetRunner,
     paths: &Paths,
@@ -140,31 +140,31 @@ pub async fn gather_rows(
     }
 }
 
-/// Process a single row. Returns the per-row outcome record that the runner
-/// will both write to the per-action JSONL and insert into `row_outcomes`.
-pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Result<ProcessedRow> {
-    // CLAUDE-20: measure the full per-row pipeline elapsed (filter / pre /
-    // prompt / claude / post) so the web UI can show a per-row duration. Started
+/// Process a single job. Returns the per-job outcome record that the runner
+/// will both write to the per-action JSONL and insert into `job_outcomes`.
+pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Result<ProcessedJob> {
+    // CLAUDE-20: measure the full per-job pipeline elapsed (filter / pre /
+    // prompt / claude / post) so the web UI can show a per-job duration. Started
     // before the attempt-cap check; only the `Done` path carries it into the
-    // outcome record, so capped / filtered rows (no outcome) never read it.
+    // outcome record, so capped / filtered jobs (no outcome) never read it.
     let started = Instant::now();
     let action = &ctx.action.action;
-    let key = row_key(ctx.action, row, idx);
+    let key = job_key(ctx.action, job, idx);
     let attempts = state::attempts_get(ctx.pool, &action.name, &key).await?;
 
     if attempts >= ctx.limits.max_attempts_per_key && action.dedup_key.is_some() {
-        info!(action = %action.name, key = %key, attempts, "skipping row, attempt cap reached");
-        return Ok(ProcessedRow::CapHit { key });
+        info!(action = %action.name, key = %key, attempts, "skipping job, attempt cap reached");
+        return Ok(ProcessedJob::CapHit { key });
     }
 
-    info!(action = %action.name, key = %key, attempt = attempts + 1, "processing row");
+    info!(action = %action.name, key = %key, attempt = attempts + 1, "processing job");
 
     let wb_base = workdir::resolve_workdir_base(action.workdir_base.as_deref(), ctx.paths);
-    let workdir_path = workdir::row_workdir(&wb_base, &action.name, &key);
+    let workdir_path = workdir::job_workdir(&wb_base, &action.name, &key);
     let snippet_dir = snippet_dir_for(&ctx.paths.state_dir, &action.name, &key);
 
     let mut bindings = Bindings::new();
-    bindings.insert("row", row.clone());
+    bindings.insert("job", job.clone());
     bindings.insert("workdir", Value::String(workdir_path.display().to_string()));
 
     // ---- filter ----
@@ -177,8 +177,8 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
             filter.shell(),
         )?;
         if !r.ok {
-            info!(action = %action.name, key = %key, stderr = %r.stderr, "row filtered out");
-            return Ok(ProcessedRow::Filtered { key });
+            info!(action = %action.name, key = %key, stderr = %r.stderr, "job filtered out");
+            return Ok(ProcessedJob::Filtered { key });
         }
     }
 
@@ -236,7 +236,7 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
                     false,
                 )
             } else if ctx.cancel.is_cancelled() {
-                // Run was cancelled before this row reached claude; don't spend
+                // Run was cancelled before this job reached claude; don't spend
                 // an API call. Synthesize a cancelled result so post still runs.
                 warn!(action = %action.name, key = %key, "run cancelled before claude started (post still runs)");
                 (
@@ -292,7 +292,7 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
     if claude_result.transient {
         info!(action = %action.name, key = %key, error = %claude_result.error, "transient claude error, not counting attempt");
         cleanup_workdir(&workdir_path);
-        return Ok(ProcessedRow::Transient { key });
+        return Ok(ProcessedJob::Transient { key });
     }
 
     if claude_ran {
@@ -321,7 +321,7 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
 
     // ---- skip-attempt marker (parked / blocker outcomes) ----
     // A cancelled run also skips attempt counting: an operator cancel is not a
-    // genuine attempt, so the row retries cleanly on the next firing.
+    // genuine attempt, so the job retries cleanly on the next firing.
     let skip_marker = workdir_path.join(".claude-run-skip-attempt");
     let cancelled = ctx.cancel.is_cancelled();
     let skip_attempt = skip_marker.exists() || cancelled;
@@ -350,7 +350,7 @@ pub async fn process_row(ctx: &RowContext<'_>, row: &Value, idx: usize) -> Resul
 
     cleanup_workdir(&workdir_path);
 
-    Ok(ProcessedRow::Done {
+    Ok(ProcessedJob::Done {
         key,
         attempt: attempts + 1,
         ok,
@@ -372,17 +372,17 @@ fn cleanup_workdir(workdir: &Path) {
     }
 }
 
-/// Outcome of `process_row`, kept simple enough to fold into both the JSONL
-/// `output.file` and the `row_outcomes` DB table.
+/// Outcome of `process_job`, kept simple enough to fold into both the JSONL
+/// `output.file` and the `job_outcomes` DB table.
 #[derive(Debug)]
-pub enum ProcessedRow {
-    /// Filter snippet rejected the row before any state-mutating work.
+pub enum ProcessedJob {
+    /// Filter snippet rejected the job before any state-mutating work.
     Filtered { key: String },
-    /// Attempt cap reached for this row; row was skipped without invocation.
+    /// Attempt cap reached for this job; job was skipped without invocation.
     CapHit { key: String },
-    /// Transient claude error - row will be retried next firing.
+    /// Transient claude error - job will be retried next firing.
     Transient { key: String },
-    /// Row reached at least pre steps; outcome record is meaningful.
+    /// Job reached at least pre steps; outcome record is meaningful.
     Done {
         key: String,
         attempt: u32,
@@ -393,16 +393,16 @@ pub enum ProcessedRow {
         attempt_counted: bool,
         summary: String,
         stream_log_path: Option<String>,
-        /// CLAUDE-20: full per-row pipeline elapsed in milliseconds.
+        /// CLAUDE-20: full per-job pipeline elapsed in milliseconds.
         duration_ms: i64,
     },
 }
 
-impl ProcessedRow {
+impl ProcessedJob {
     pub fn counted_in_daily(&self) -> bool {
         matches!(
             self,
-            ProcessedRow::Done {
+            ProcessedJob::Done {
                 claude_ran: true,
                 ..
             }
@@ -410,7 +410,7 @@ impl ProcessedRow {
     }
 }
 
-/// Append a row-outcome record to the action's per-action JSONL log (the
+/// Append a job-outcome record to the action's per-action JSONL log (the
 /// `output.file` field on the action). Best-effort; logs but does not fail.
 pub fn append_output_record(paths: &Paths, action: &LoadedAction, record: &Value) {
     let Some(rel) = action.action.output.file.as_deref() else {
@@ -438,10 +438,10 @@ pub fn append_output_record(paths: &Paths, action: &LoadedAction, record: &Value
     }
 }
 
-/// Convert a `ProcessedRow::Done` into the JSONL "done" record the nu
+/// Convert a `ProcessedJob::Done` into the JSONL "done" record the nu
 /// implementation has been writing.
-pub fn done_record(d: &ProcessedRow) -> Option<Value> {
-    if let ProcessedRow::Done {
+pub fn done_record(d: &ProcessedJob) -> Option<Value> {
+    if let ProcessedJob::Done {
         key,
         attempt,
         ok,
@@ -476,17 +476,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn row_key_from_dedup_field() {
+    fn job_key_from_dedup_field() {
         let action = mk_action(Some("idReadable".to_string()));
-        let r = row_key(&action, &json!({"idReadable": "MK-1"}), 0);
+        let r = job_key(&action, &json!({"idReadable": "MK-1"}), 0);
         assert_eq!(r, "MK-1");
     }
 
     #[test]
-    fn row_key_fallback_to_index() {
+    fn job_key_fallback_to_index() {
         let action = mk_action(None);
-        let r = row_key(&action, &json!({"foo": "bar"}), 7);
-        assert_eq!(r, "row-7");
+        let r = job_key(&action, &json!({"foo": "bar"}), 7);
+        assert_eq!(r, "job-7");
     }
 
     fn mk_action(dedup_key: Option<String>) -> LoadedAction {

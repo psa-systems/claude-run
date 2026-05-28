@@ -9,8 +9,8 @@ claude-run.nu /path/to/action.yml
 claude-run.nu youtrack
 ```
 
-Each row produced by `input.command` becomes one Claude invocation. The runner
-provides locking, daily caps, per-row attempt caps, timeouts, and a cost-based
+Each job produced by `input.command` becomes one Claude invocation. The runner
+provides locking, daily caps, per-job attempt caps, timeouts, and a cost-based
 usage check. The action YAML supplies everything specific to the job.
 
 ## File shape
@@ -22,8 +22,8 @@ input:
   command: |                # required, nu snippet, stdout = JSON array
     #!/usr/bin/env nu
     ...
-dedup_key: <field>          # optional, row field used to track attempts
-filter: |                   # optional, nu snippet; exit non-zero to skip row
+dedup_key: <field>          # optional, job field used to track attempts
+filter: |                   # optional, nu snippet; exit non-zero to skip job
   ...
 pre:                        # optional, ordered list of nu snippets
   - |
@@ -39,7 +39,7 @@ post:                       # optional, ordered list of nu snippets
   - |
     ...
 output:
-  file: <name>.log          # optional, appended JSONL of per-row outcomes
+  file: <name>.log          # optional, appended JSONL of per-job outcomes
 limits:                     # optional per-action overrides of env defaults
   max_attempts_per_key: 3
   max_runs_per_day: 20
@@ -68,21 +68,21 @@ filter: exit 0                 # string form, runs with nu
 
 prompt:                        # mapping form
   run: |
-    print $"Work ($row.id)"
+    print $"Work ($job.id)"
   shell: nu
 
 pre:
   - run: |                     # this step runs with bash
       set -euo pipefail
-      echo "$row" | jq -r .id
+      echo "$job" | jq -r .id
     shell: bash
 ```
 
-**Bindings across interpreters.** For `nu` (the default), bindings (`$row`,
+**Bindings across interpreters.** For `nu` (the default), bindings (`$job`,
 `$workdir`, `$claude_result`) are loaded by a generated prelude, exactly as
 before. For any other interpreter the prelude does not apply, so each binding
 is exposed instead as an environment variable of the same name holding the
-compact-JSON value (decode with `jq`): in a `bash` snippet, `$row` is the
+compact-JSON value (decode with `jq`): in a `bash` snippet, `$job` is the
 JSON string `{"id":"..."}`.
 
 ## Field reference
@@ -94,7 +94,7 @@ Should be kebab-case and unique across all actions on the host.
 
 ### `workdir_base` (string, optional)
 
-Per-row working directories are rooted under `<workdir_base>/<name>/<key>`.
+Per-job working directories are rooted under `<workdir_base>/<name>/<key>`.
 Defaults to `$CLAUDE_RUN_WORKDIR_BASE` (which itself defaults to
 `/tmp/claude-run`). Setting this on the action overrides the env for that
 action only - useful when one action needs more disk than `/tmp` allows
@@ -126,7 +126,7 @@ workdir_base: $nu.home-dir | path join workspace   # evaluated
 
 A Nushell snippet executed by the runner with `nu --commands "$snippet"`. Must
 write a JSON array to stdout. Each element of the array becomes one Claude
-invocation, bound to `$row` for downstream snippets.
+invocation, bound to `$job` for downstream snippets.
 
 The snippet inherits the runner's environment. Use host-configured CLIs
 (`yt`, `fj`, `git`, etc.) directly; the runner does not parse or inject
@@ -137,22 +137,22 @@ with exit code 5.
 
 ### `dedup_key` (string, optional)
 
-The name of a field on each row whose value uniquely identifies the unit of
-work. The runner tracks attempts keyed on this value and skips a row whose
+The name of a field on each job whose value uniquely identifies the unit of
+work. The runner tracks attempts keyed on this value and skips a job whose
 attempt count has reached `max_attempts_per_key`.
 
-Omit to disable per-row attempt tracking (every run processes every row).
+Omit to disable per-job attempt tracking (every run processes every job).
 
 ### `filter` (nu snippet, optional)
 
-Run once per row, before any other per-row work. The row JSON is piped to
-stdin and bound as `$row` in the snippet. Exit non-zero to skip the row
+Run once per job, before any other per-job work. The job JSON is piped to
+stdin and bound as `$job` in the snippet. Exit non-zero to skip the job
 without counting an attempt. Exit zero to proceed.
 
 ### `pre` (list of nu snippets, optional)
 
 Ordered steps executed before the Claude invocation. Each step is a separate
-nu snippet with `$row`, `$workdir`, and `$env` in scope. Steps share the
+nu snippet with `$job`, `$workdir`, and `$env` in scope. Steps share the
 runner's working directory unless they `cd` themselves.
 
 If a step exits non-zero, the runner logs the failure, **counts the attempt**,
@@ -161,17 +161,17 @@ runs post steps** so the action can roll back any side effects an earlier
 pre step had (e.g. resetting an external state field that pre step 0 set).
 Post receives a synthesized `$claude_result` with `ok: false`, an `error`
 field naming the failed pre step, and the step's stderr as `summary`.
-Poison rows eventually hit the per-key attempt cap and stop being retried.
+Poison jobs eventually hit the per-key attempt cap and stop being retried.
 
 ### `prompt` (nu snippet, required)
 
 A nu snippet whose return value is the prompt string passed to Claude. Has
-`$row`, `$workdir`, and `$env` in scope. Plain text without `$` interpolation
+`$job`, `$workdir`, and `$env` in scope. Plain text without `$` interpolation
 is fine; nu treats it as a string literal.
 
 ```yaml
 prompt: |
-  $"Work YouTrack issue ($row.id): ($row.summary)"
+  $"Work YouTrack issue ($job.id): ($job.summary)"
 ```
 
 ### `claude` (record, optional)
@@ -180,13 +180,13 @@ Tuning for the `claude` CLI call. All keys are optional.
 
 | Key               | Default                                  | Meaning                                                   |
 |-------------------|------------------------------------------|-----------------------------------------------------------|
-| `cwd`             | per-row `$workdir`                       | Working directory for the claude process. Plain string.   |
+| `cwd`             | per-job `$workdir`                       | Working directory for the claude process. Plain string.   |
 | `allowed_tools`   | `Read,Edit,Write,Bash,Glob,Grep`         | Passed as `--allowed-tools`.                              |
 | `permission_mode` | `acceptEdits`                            | Passed as `--permission-mode`.                            |
 
 The runner always passes `--print --verbose --output-format stream-json`. It
 wraps the call in `timeout $claude_timeout_seconds`. Stdout+stderr are
-redirected to a per-row NDJSON stream log:
+redirected to a per-job NDJSON stream log:
 
 ```
 $CLAUDE_RUN_LOG_DIR/<name>/streams/<key>-attempt-<n>.jsonl
@@ -202,19 +202,19 @@ Ordered steps that run after every code path that reached the workdir:
 Claude success, Claude non-transient failure, prompt-snippet failure,
 empty-prompt, and pre-step failure all run post. The single exception is
 transient Claude errors (rate limit, auth) - those skip post and return
-early so the row can be retried cleanly on the next firing.
+early so the job can be retried cleanly on the next firing.
 
-When a run is cancelled while this row is in flight, its claude child is
+When a run is cancelled while this job is in flight, its claude child is
 terminated and post still runs, with a synthesized cancelled `$claude_result`
-(`ok: false`, `error: "run cancelled by operator"`, `cost: 0`), so end-of-row
-cleanup (resetting an external state field, etc.) happens. A cancelled row does
-not count an attempt, and rows not yet started are skipped without running post.
+(`ok: false`, `error: "run cancelled by operator"`, `cost: 0`), so end-of-job
+cleanup (resetting an external state field, etc.) happens. A cancelled job does
+not count an attempt, and jobs not yet started are skipped without running post.
 
-This makes post the right place for end-of-row cleanup that must happen
+This makes post the right place for end-of-job cleanup that must happen
 unconditionally - resetting an external state field, posting a status
 comment, releasing a soft lock, etc.
 
-Each step has `$row`, `$workdir`, `$env`, and `$claude_result` in scope.
+Each step has `$job`, `$workdir`, `$env`, and `$claude_result` in scope.
 On pre/prompt failure `$claude_result` is synthesized (`ok: false`,
 `error` names the failing phase, `summary` carries the step stderr) so
 post sees a uniform shape regardless of which upstream step failed.
@@ -240,14 +240,14 @@ success vs failure cleanup.
 
 Same step-failure handling as `pre`: if a post step exits non-zero, the
 runner logs the failure, **counts the attempt**, and stops running
-subsequent post steps. The row's overall outcome record (the "done" line in
+subsequent post steps. The job's overall outcome record (the "done" line in
 the per-action JSONL log) has `ok: false` if either claude or any post step
 failed.
 
 #### Skip-attempt marker (parked / blocker outcomes)
 
-By default every row processed past pre counts toward `max_attempts_per_key`.
-A post step can opt this row out of attempt counting by writing a sentinel
+By default every job processed past pre counts toward `max_attempts_per_key`.
+A post step can opt this job out of attempt counting by writing a sentinel
 file:
 
 ```nu
@@ -258,7 +258,7 @@ The runner checks for that file after the post loop. If present, the
 per-key attempt counter is **not** incremented. Daily Claude-invocation
 count still increments when claude actually ran (real budget was spent).
 
-Use this for outcomes where the row is **parked pending external input**,
+Use this for outcomes where the job is **parked pending external input**,
 not failed:
 
 - The work depends on information that has to come from a human.
@@ -266,20 +266,20 @@ not failed:
 - The work was deliberately deferred (out of scope, wrong priority).
 
 Do **not** use it for hard failures (timeout, exception, claude can't even
-investigate). Those should consume an attempt slot so poison rows eventually
+investigate). Those should consume an attempt slot so poison jobs eventually
 stop being retried.
 
 The `done` outcome record gains an `attempt_counted: bool` field reflecting
-the runner's decision, so downstream tooling can see at a glance which rows
+the runner's decision, so downstream tooling can see at a glance which jobs
 were parked vs failed.
 
 ### `output.file` (string, optional)
 
-If set, the runner appends one JSON line per row to
-`$CLAUDE_RUN_LOG_DIR/<name>/<output.file>` summarizing the outcome (row key,
+If set, the runner appends one JSON line per job to
+`$CLAUDE_RUN_LOG_DIR/<name>/<output.file>` summarizing the outcome (job key,
 attempt number, claude cost, push/comment results from post steps, etc.).
 
-If omitted, per-row outcomes are only visible in the daily JSONL log.
+If omitted, per-job outcomes are only visible in the daily JSONL log.
 
 ### `limits` (record, optional)
 
@@ -379,9 +379,9 @@ granularity.
 | `CLAUDE_RUN_STATE_DIR`                | `~/.local/share/claude-run`      | State, locks, PAUSED flags, cost ledger.                |
 | `CLAUDE_RUN_LOG_DIR`                  | `$CLAUDE_RUN_STATE_DIR/logs`     | Daily JSONL logs and per-action output files.           |
 | `CLAUDE_RUN_ACTIONS_DIR`              | `./actions`                      | Resolves bare action names to YAML files.               |
-| `CLAUDE_RUN_WORKDIR_BASE`             | `/tmp/claude-run`                | Per-row workdir root. Final path = `<base>/<name>/<key>`. Overridable per action via `workdir_base`. |
+| `CLAUDE_RUN_WORKDIR_BASE`             | `/tmp/claude-run`                | Per-job workdir root. Final path = `<base>/<name>/<key>`. Overridable per action via `workdir_base`. |
 | `CLAUDE_RUN_MAX_RUNS_PER_DAY`         | `20`                             | Hard cap on Claude invocations per action per day.      |
-| `CLAUDE_RUN_MAX_ATTEMPTS_PER_KEY`     | `3`                              | Per-row attempt cap when `dedup_key` is set.            |
+| `CLAUDE_RUN_MAX_ATTEMPTS_PER_KEY`     | `3`                              | Per-job attempt cap when `dedup_key` is set.            |
 | `CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS`   | `600`                            | `timeout` wrapper around the `claude` CLI call.         |
 | `CLAUDE_RUN_DAILY_BUDGET_USD`         | `5.00`                           | Skip run when today's cost ledger meets/exceeds this.   |
 
@@ -394,7 +394,7 @@ $CLAUDE_RUN_STATE_DIR/
   locks/<name>.lock            # PID lock keyed on action name
   state/<name>.json            # {attempts, daily_count, daily_cost_usd}
   logs/<name>/YYYY-MM-DD.log   # JSONL runner log
-  logs/<name>/<output.file>    # JSONL per-row outcomes if output.file set
+  logs/<name>/<output.file>    # JSONL per-job outcomes if output.file set
   logs/<name>/streams/<key>-attempt-<n>.jsonl  # claude stream-json output per attempt
 ```
 
@@ -443,14 +443,14 @@ non-nu `shell` the same names are environment variables holding compact JSON):
 | Binding          | `input.command` | `filter` | `pre` | `prompt` | `post` |
 |------------------|:---------------:|:--------:|:-----:|:--------:|:------:|
 | `$env`           | yes             | yes      | yes   | yes      | yes    |
-| `$row`           | -               | yes      | yes   | yes      | yes    |
+| `$job`           | -               | yes      | yes   | yes      | yes    |
 | `$workdir`       | -               | yes      | yes   | yes      | yes    |
 | `$claude_result` | -               | -        | -     | -        | yes    |
 
-`$workdir` is `<workdir_base>/<name>/<dedup_key-or-row-index>`, where
+`$workdir` is `<workdir_base>/<name>/<dedup_key-or-job-index>`, where
 `workdir_base` is the action's `workdir_base` field if set, else
 `$CLAUDE_RUN_WORKDIR_BASE`, else `/tmp/claude-run`. The runner creates it
-before the first `pre` step and **removes it at end of row regardless of
+before the first `pre` step and **removes it at end of job regardless of
 outcome** (success, claude failure, pre/post step failure, transient error).
 Plain `rm -r` is used, not `rm -rf`, so permission or read-only issues
 surface as real errors instead of being silently force-deleted.
@@ -460,5 +460,5 @@ To inspect what happened in a failed run, look at the per-attempt stream log
 across runs since it lives outside `$workdir`.
 
 For `filter` and `pre`/`post`, exit code 0 = continue, non-zero = step
-failure (skip row, count attempt). The snippet's stdout is captured into the
+failure (skip job, count attempt). The snippet's stdout is captured into the
 daily log; stderr passes through.

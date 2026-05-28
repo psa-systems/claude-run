@@ -8,11 +8,11 @@
 //! token.
 //!
 //! Tripping the token does three things downstream, in this order:
-//! 1. the per-row pipeline terminates the in-flight claude child (SIGTERM,
+//! 1. the per-job pipeline terminates the in-flight claude child (SIGTERM,
 //!    grace, then SIGKILL on its process group) - see [`crate::claude`],
-//! 2. the in-flight row still runs its `post` phase with a synthesized
-//!    cancelled `$claude_result` - see [`crate::row`],
-//! 3. the run loop stops launching further rows and finalizes with
+//! 2. the in-flight job still runs its `post` phase with a synthesized
+//!    cancelled `$claude_result` - see [`crate::job`],
+//! 3. the run loop stops launching further jobs and finalizes with
 //!    [`crate::exit::CANCELLED`].
 //!
 //! A `std::sync::Mutex` (not the tokio one) guards the map: every operation is
