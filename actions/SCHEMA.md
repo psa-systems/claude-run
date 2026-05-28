@@ -273,6 +273,27 @@ The `done` outcome record gains an `attempt_counted: bool` field reflecting
 the runner's decision, so downstream tooling can see at a glance which jobs
 were parked vs failed.
 
+#### Needs-review marker (agent-signalled blocker)
+
+A complement to the skip-attempt marker, used by the `youtrack` action so the
+agent can signal a blocker without writing to the external system itself. When
+the claude agent decides it cannot safely proceed, it makes no code change and
+writes the human-facing reason to a second sentinel:
+
+```nu
+"Need decision X from a human." | save $"($workdir)/.claude-run-needs-review"
+touch $"($workdir)/.claude-run-skip-attempt"
+```
+
+The action's finalize post step then reads this marker after claude exits: if
+`.claude-run-needs-review` exists it parks the job (ensuring the skip-attempt
+marker is present), posts the file's contents verbatim as the issue comment, and
+sets the status field to the project's "needs human input" value, creating no
+PR. This keeps every external mutation in one post step gated on the run
+outcome, rather than having the agent mutate the external system mid-run. The
+marker is a plain convention between an action's prompt and its post step; the
+runner itself only special-cases `.claude-run-skip-attempt`.
+
 ### `output.file` (string, optional)
 
 If set, the runner appends one JSON line per job to
