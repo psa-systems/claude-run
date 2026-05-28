@@ -20,7 +20,7 @@
     <dt>Ended</dt>         <dd>{{ run.ended_at.as_deref().unwrap_or("running") }}</dd>
     <dt>Duration</dt>      <dd>{{ run.duration() }}</dd>
     <dt>Triggered by</dt>  <dd>{{ run.triggered_by }}</dd>
-    <dt>Rows processed</dt><dd>{{ run.rows_processed }}{% if run.failed_rows > 0 %} <span style="color: var(--bad);">({{ run.failed_rows }} failed)</span>{% endif %}</dd>
+    <dt>Jobs processed</dt><dd>{{ run.jobs_processed }}{% if run.failed_jobs > 0 %} <span style="color: var(--bad);">({{ run.failed_jobs }} failed)</span>{% endif %}</dd>
     <dt>Exit</dt>
     <dd>
       {% match run.exit_code %}
@@ -41,19 +41,19 @@
   </dl>
 </div>
 
-{# CLAUDE-1 / CLAUDE-12: planned rows from input.command, populated at
+{# CLAUDE-1 / CLAUDE-12: planned jobs from input.command, populated at
    run-start. Each key links out via the action's link_template when set.
-   Status is derived from row_outcomes plus the on-disk stream log: "running"
+   Status is derived from job_outcomes plus the on-disk stream log: "running"
    = in flight (stream log present, run still active) and carries a watch-live
    link; "queued" = waiting its turn; "skipped" = the run ended before this
-   row produced an outcome; "ok" / "fail" once an outcome lands. #}
-{% if !planned_rows.is_empty() %}
-  <h2>Rows in this batch</h2>
+   job produced an outcome; "ok" / "fail" once an outcome lands. #}
+{% if !planned_jobs.is_empty() %}
+  <h2>Jobs in this batch</h2>
   <div class="card">
     <table>
-      <thead><tr><th>Row</th><th>State</th><th>Live</th></tr></thead>
+      <thead><tr><th>Job</th><th>State</th><th>Live</th></tr></thead>
       <tbody>
-        {% for p in planned_rows %}
+        {% for p in planned_jobs %}
           <tr>
             <td class="mono">
               {% if let Some(h) = p.href %}
@@ -77,7 +77,7 @@
             </td>
             <td>
               {% if let Some(a) = p.watch_attempt %}
-                <a href="/runs/{{ run.id }}/rows/{{ p.key }}/attempt/{{ a }}">watch live</a>
+                <a href="/runs/{{ run.id }}/jobs/{{ p.key }}/attempt/{{ a }}">watch live</a>
               {% else %}
                 <span class="dim">-</span>
               {% endif %}
@@ -89,9 +89,9 @@
   </div>
 {% endif %}
 
-<h2>Row outcomes</h2>
+<h2>Job outcomes</h2>
 {% if outcomes.is_empty() %}
-  <div class="card"><span class="dim">No rows yet.</span></div>
+  <div class="card"><span class="dim">No jobs yet.</span></div>
 {% else %}
   <table>
     <thead>
@@ -104,9 +104,9 @@
         <tr>
           <td class="mono">
             {% if let Some(t) = link_template %}
-              <a href="{{ crate::action::render_link(t, o.row_key.as_str()) }}" target="_blank" rel="noopener">{{ o.row_key }}</a>
+              <a href="{{ crate::action::render_link(t, o.job_key.as_str()) }}" target="_blank" rel="noopener">{{ o.job_key }}</a>
             {% else %}
-              {{ o.row_key }}
+              {{ o.job_key }}
             {% endif %}
           </td>
           <td class="mono">{{ o.attempt }}</td>
@@ -129,7 +129,7 @@
           <td class="mono">{{ o.duration() }}</td>
           <td>
             {% if o.claude_ran %}
-              <a href="/runs/{{ run.id }}/rows/{{ o.row_key }}/attempt/{{ o.attempt }}">view stream</a>
+              <a href="/runs/{{ run.id }}/jobs/{{ o.job_key }}/attempt/{{ o.attempt }}">view stream</a>
             {% else %}<span class="dim">-</span>{% endif %}
           </td>
         </tr>

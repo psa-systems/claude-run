@@ -1,13 +1,13 @@
 {% extends "base.html" %}
-{% block title %}{{ row_key }} - run #{{ run_id }} - claude-run{% endblock %}
-{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><a href="/actions/{{ action_name }}">{{ action_name }}</a><span class="sep">/</span><a href="/runs/{{ run_id }}">Run #{{ run_id }}</a><span class="sep">/</span><span class="current">{{ row_key }} (attempt {{ attempt }})</span>{% endblock %}
+{% block title %}{{ job_key }} - run #{{ run_id }} - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><a href="/actions/{{ action_name }}">{{ action_name }}</a><span class="sep">/</span><a href="/runs/{{ run_id }}">Run #{{ run_id }}</a><span class="sep">/</span><span class="current">{{ job_key }} (attempt {{ attempt }})</span>{% endblock %}
 {% block main %}
 
-<h2><a href="/runs/{{ run_id }}">Run #{{ run_id }}</a> - {{ row_key }} (attempt {{ attempt }})</h2>
+<h2><a href="/runs/{{ run_id }}">Run #{{ run_id }}</a> - {{ job_key }} (attempt {{ attempt }})</h2>
 
 <div class="card">
   <div class="meta">
-    Streaming from <code>{{ stream_path }}</code>. New events append at the bottom; the connection closes once the row finishes.
+    Streaming from <code>{{ stream_path }}</code>. New events append at the bottom; the connection closes once the job finishes.
   </div>
   <div>
     Last activity: <span id="activity" class="activity">waiting...</span>
@@ -31,11 +31,11 @@
   const raw = document.getElementById('raw');
   const activity = document.getElementById('activity');
   const rawToggle = document.getElementById('raw-toggle');
-  const baseUrl = "/sse/runs/{{ run_id }}/rows/{{ row_key }}/attempt/{{ attempt }}";
+  const baseUrl = "/sse/runs/{{ run_id }}/jobs/{{ job_key }}/attempt/{{ attempt }}";
 
   let lastEventAt = null;        // wall-clock of the last rendered event
   let lastId = null;             // last SSE event id, carried into reconnects to resume
-  let finished = false;          // set true ONLY by the 'done' event (row actually complete)
+  let finished = false;          // set true ONLY by the 'done' event (job actually complete)
   let source = null;             // current EventSource (re-created on manual reconnect)
   let reconnectDelay = 1000;     // backoff, doubles to RECONNECT_MAX
   let reconnectTimer = null;
@@ -103,7 +103,7 @@
   }
 
   // Refresh the status line every second. The four states are explicit:
-  //   - finished:        the row is genuinely done ('done' fired).
+  //   - finished:        the job is genuinely done ('done' fired).
   //   - tab hidden:      stream paused, not closed.
   //   - reconnecting:    connection dropped while in flight, retrying.
   //   - connected:       healthy; keep-alive comments hold the connection even
@@ -177,7 +177,7 @@
     });
 
     source.addEventListener('done', () => {
-      // Row actually finished: this is the ONLY path that closes for good.
+      // Job actually finished: this is the ONLY path that closes for good.
       finished = true;
       statusText = '';
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -189,7 +189,7 @@
     source.addEventListener('error', () => {
       if (finished) return;
       if (source.readyState === EventSource.CLOSED) {
-        // Browser gave up. Don't die while the row is in flight: a hidden tab
+        // Browser gave up. Don't die while the job is in flight: a hidden tab
         // shows "paused" and reconnects on return; otherwise retry with backoff.
         if (document.hidden) {
           statusText = 'stream paused - tab inactive';
@@ -206,7 +206,7 @@
   }
 
   // When the tab comes back, reconnect immediately if we're not already
-  // streaming and the row hasn't finished.
+  // streaming and the job hasn't finished.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       if (!finished) statusText = 'stream paused - tab inactive';

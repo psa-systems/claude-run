@@ -51,10 +51,10 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         )
         .route("/actions/:name/export", get(action_export))
         .route("/runs/:id", get(run_detail))
-        .route("/runs/:id/rows/:key/attempt/:attempt", get(row_stream_page))
+        .route("/runs/:id/jobs/:key/attempt/:attempt", get(job_stream_page))
         .route(
-            "/sse/runs/:id/rows/:key/attempt/:attempt",
-            get(row_stream_sse),
+            "/sse/runs/:id/jobs/:key/attempt/:attempt",
+            get(job_stream_sse),
         )
         .route("/static/htmx.min.js", get(htmx_handler))
         .with_state(st)
@@ -89,15 +89,15 @@ struct RunRow {
     started_at: String,
     ended_at: Option<String>,
     exit_code: Option<i64>,
-    rows_processed: i64,
+    jobs_processed: i64,
     triggered_by: String,
-    /// CLAUDE-14: key of the row currently being processed, or NULL when no row
+    /// CLAUDE-14: key of the job currently being processed, or NULL when no job
     /// is in flight (run finished, or a legacy run predating the column).
-    current_row_key: Option<String>,
-    /// CLAUDE-22: count of distinct rows whose LATEST attempt failed (`ok = 0`),
-    /// matching the per-row `fail` badges on run-detail. A row that failed an
+    current_job_key: Option<String>,
+    /// CLAUDE-22: count of distinct jobs whose LATEST attempt failed (`ok = 0`),
+    /// matching the per-job `fail` badges on run-detail. A job that failed an
     /// earlier attempt but passed its latest does not count.
-    failed_rows: i64,
+    failed_jobs: i64,
 }
 
 impl RunRow {
@@ -131,8 +131,8 @@ impl RunRow {
 }
 
 #[derive(Serialize, sqlx::FromRow)]
-struct OutcomeRow {
-    row_key: String,
+struct JobOutcomeRow {
+    job_key: String,
     attempt: i64,
     ts: String,
     ok: bool,
@@ -140,13 +140,13 @@ struct OutcomeRow {
     claude_ok: bool,
     claude_cost_usd: f64,
     attempt_counted: bool,
-    /// CLAUDE-20: full per-row pipeline elapsed; NULL for rows predating the
+    /// CLAUDE-20: full per-job pipeline elapsed; NULL for jobs predating the
     /// column (migration 0005).
     duration_ms: Option<i64>,
 }
 
-impl OutcomeRow {
-    /// CLAUDE-20: human-readable per-row duration, or "-" for rows predating the
+impl JobOutcomeRow {
+    /// CLAUDE-20: human-readable per-job duration, or "-" for jobs predating the
     /// `duration_ms` column.
     fn duration(&self) -> String {
         match self.duration_ms {
@@ -158,7 +158,7 @@ impl OutcomeRow {
 
 /// CLAUDE-20: render a millisecond span human-readably (`820ms`, `4s`,
 /// `1m 17s`, `2h 3m`) rather than as raw milliseconds. Shared by the run-span
-/// and per-row duration columns. Negative inputs clamp to zero.
+/// and per-job duration columns. Negative inputs clamp to zero.
 fn format_duration_ms(ms: i64) -> String {
     let ms = ms.max(0);
     if ms < 1000 {
@@ -326,7 +326,7 @@ async fn enriched_actions(pool: &SqlitePool) -> Result<Vec<ActionView>, WebError
 
 async fn fetch_recent_runs(pool: &SqlitePool, limit: i64) -> Result<Vec<RunRow>, WebError> {
     let rows = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key, (SELECT COUNT(*) FROM row_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM row_outcomes o2 WHERE o2.run_id = o.run_id AND o2.row_key = o.row_key)) AS failed_rows FROM runs ORDER BY started_at DESC LIMIT ?",
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs ORDER BY started_at DESC LIMIT ?",
     )
     .bind(limit)
     .fetch_all(pool)
@@ -412,7 +412,7 @@ async fn action_detail(
             reason: r,
         });
     let runs = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key, (SELECT COUNT(*) FROM row_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM row_outcomes o2 WHERE o2.run_id = o.run_id AND o2.row_key = o.row_key)) AS failed_rows FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
     )
     .bind(&name)
     .fetch_all(pool)
@@ -449,7 +449,7 @@ async fn action_durations(
     // Same recent window as the action-detail table (last 50 by start). The
     // query returns newest-first; the chart wants oldest-first, so reverse.
     let runs = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key, (SELECT COUNT(*) FROM row_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM row_outcomes o2 WHERE o2.run_id = o.run_id AND o2.row_key = o.row_key)) AS failed_rows FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
     )
     .bind(&name)
     .fetch_all(pool)
@@ -500,11 +500,11 @@ struct ActionForm {
 const NEW_ACTION_TEMPLATE: &str = "name: my-action\n\
 input:\n\
 \x20\x20command: |\n\
-\x20\x20\x20\x20# nu: print a JSON array of rows to stdout\n\
+\x20\x20\x20\x20# nu: print a JSON array of jobs to stdout\n\
 \x20\x20\x20\x20print '[]'\n\
 prompt: |\n\
-\x20\x20# nu: print the Claude prompt for the current row to stdout\n\
-\x20\x20print \"Describe the task for this row.\"\n\
+\x20\x20# nu: print the Claude prompt for the current job to stdout\n\
+\x20\x20print \"Describe the task for this job.\"\n\
 enabled: false\n";
 
 /// Resolve an indexed action's on-disk path by exact name. Only names the
@@ -660,27 +660,27 @@ async fn action_export(
 }
 
 #[derive(Serialize)]
-pub struct PlannedRow {
+pub struct PlannedJob {
     pub key: String,
     pub href: Option<String>,
     /// One of:
     /// - "ok" / "fail": an outcome record landed.
-    /// - "running": no outcome, run still active, and this is the one row the
-    ///   run is processing (`runs.current_row_key`). Carries `watch_attempt`.
-    /// - "queued": no outcome, run still active, not the in-flight row.
+    /// - "running": no outcome, run still active, and this is the one job the
+    ///   run is processing (`runs.current_job_key`). Carries `watch_attempt`.
+    /// - "queued": no outcome, run still active, not the in-flight job.
     /// - "skipped": no outcome and the run has ended (planned but never
     ///   completed). Replaces the stale "running" badge.
     pub status: String,
     /// Attempt number for the "watch live" link, set only for the "running"
-    /// row. Resolved from the highest `<key>-attempt-<n>.jsonl` stream log on
-    /// disk (`None` until claude opens the log for the row's first attempt).
+    /// job. Resolved from the highest `<key>-attempt-<n>.jsonl` stream log on
+    /// disk (`None` until claude opens the log for the job's first attempt).
     pub watch_attempt: Option<u32>,
 }
 
 /// Resolve the highest attempt number with a stream log on disk for `key`.
 /// Stream logs are written live by `ClaudeInvoker::invoke` to
 /// `<logs>/<action>/streams/<key>-attempt-<n>.jsonl`, so the presence of one
-/// without a matching `row_outcomes` record means that row is in flight. This
+/// without a matching `job_outcomes` record means that job is in flight. This
 /// is the on-disk fallback for the CLAUDE-9 per-run in-flight registry.
 fn latest_attempt_on_disk(logs_dir: &std::path::Path, action: &str, key: &str) -> Option<u32> {
     let dir = logs_dir.join(action).join("streams");
@@ -710,12 +710,12 @@ fn latest_attempt_on_disk(logs_dir: &std::path::Path, action: &str, key: &str) -
 struct RunDetailTpl {
     version: &'static str,
     run: RunRow,
-    outcomes: Vec<OutcomeRow>,
-    /// CLAUDE-1: rows planned at run-start; populated as soon as
-    /// `input.command` returns. Pre-existing rows have NULL `run.row_keys`
+    outcomes: Vec<JobOutcomeRow>,
+    /// CLAUDE-1: jobs planned at run-start; populated as soon as
+    /// `input.command` returns. Pre-existing runs have NULL `run.job_keys`
     /// and this stays empty.
-    planned_rows: Vec<PlannedRow>,
-    /// Per-row href builder for the outcomes table. Empty string when the
+    planned_jobs: Vec<PlannedJob>,
+    /// Per-job href builder for the outcomes table. Empty string when the
     /// action declares no `link_template`.
     link_template: Option<String>,
 }
@@ -726,22 +726,22 @@ async fn run_detail(
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
     let Some(run): Option<RunRow> = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key, (SELECT COUNT(*) FROM row_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM row_outcomes o2 WHERE o2.run_id = o.run_id AND o2.row_key = o.row_key)) AS failed_rows FROM runs WHERE id = ?",
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
     .await? else {
         return Ok((StatusCode::NOT_FOUND, format!("no run #{id}")).into_response());
     };
-    let outcomes = sqlx::query_as::<_, OutcomeRow>(
-        "SELECT row_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, attempt_counted, duration_ms FROM row_outcomes WHERE run_id = ? ORDER BY id ASC",
+    let outcomes = sqlx::query_as::<_, JobOutcomeRow>(
+        "SELECT job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, attempt_counted, duration_ms FROM job_outcomes WHERE run_id = ? ORDER BY id ASC",
     )
     .bind(id)
     .fetch_all(pool)
     .await?;
 
     // Look up the action's link_template once and reuse for both planned
-    // rows and the outcomes table.
+    // jobs and the outcomes table.
     let link_template: Option<String> =
         sqlx::query_scalar("SELECT link_template FROM actions WHERE name = ?")
             .bind(&run.action_name)
@@ -749,31 +749,31 @@ async fn run_detail(
             .await?
             .flatten();
 
-    let planned_keys = state::run_row_keys(pool, run.id).await.unwrap_or_default();
-    // Build a quick lookup: key -> overall ok flag from row_outcomes (latest
+    let planned_keys = state::run_job_keys(pool, run.id).await.unwrap_or_default();
+    // Build a quick lookup: key -> overall ok flag from job_outcomes (latest
     // attempt wins, since outcomes are inserted in order).
     let mut outcome_by_key: std::collections::HashMap<&str, bool> =
         std::collections::HashMap::new();
     for o in &outcomes {
-        outcome_by_key.insert(o.row_key.as_str(), o.ok);
+        outcome_by_key.insert(o.job_key.as_str(), o.ok);
     }
     // CLAUDE-14: a run with a NULL `ended_at` is still active; only then can a
-    // row be in flight, and exactly the one matching `runs.current_row_key` is.
-    // Rows are processed strictly sequentially, so every other no-outcome row is
-    // queued, not running. Once the run ends, `current_row_key` is NULL and a
-    // no-outcome row never finished (filtered / capped / skipped / not reached),
+    // job be in flight, and exactly the one matching `runs.current_job_key` is.
+    // Jobs are processed strictly sequentially, so every other no-outcome job is
+    // queued, not running. Once the run ends, `current_job_key` is NULL and a
+    // no-outcome job never finished (filtered / capped / skipped / not reached),
     // so it must not keep the "running" badge.
     let run_active = run.ended_at.is_none();
-    let current_row = run.current_row_key.as_deref();
+    let current_job = run.current_job_key.as_deref();
     let logs_dir = s.paths.logs_dir();
-    let planned_rows: Vec<PlannedRow> = planned_keys
+    let planned_jobs: Vec<PlannedJob> = planned_keys
         .into_iter()
         .map(|k| {
             let (status, watch_attempt) = match outcome_by_key.get(k.as_str()) {
                 Some(true) => ("ok".to_string(), None),
                 Some(false) => ("fail".to_string(), None),
-                None if run_active && current_row == Some(k.as_str()) => {
-                    // The single in-flight row. Resolve its live-stream attempt
+                None if run_active && current_job == Some(k.as_str()) => {
+                    // The single in-flight job. Resolve its live-stream attempt
                     // from disk for the "watch live" link.
                     let attempt = latest_attempt_on_disk(&logs_dir, &run.action_name, &k);
                     ("running".to_string(), attempt)
@@ -784,7 +784,7 @@ async fn run_detail(
             let href = link_template
                 .as_ref()
                 .map(|t| crate::action::render_link(t, &k));
-            PlannedRow {
+            PlannedJob {
                 key: k,
                 href,
                 status,
@@ -797,26 +797,26 @@ async fn run_detail(
         version: s.api.version,
         run,
         outcomes,
-        planned_rows,
+        planned_jobs,
         link_template,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
 #[derive(Template)]
-#[template(path = "row_stream.html")]
-struct RowStreamTpl {
+#[template(path = "job_stream.html")]
+struct JobStreamTpl {
     version: &'static str,
     run_id: i64,
     /// Parent action, resolved alongside the stream-log path. Feeds the
     /// breadcrumb's link back to the action (CLAUDE-19).
     action_name: String,
-    row_key: String,
+    job_key: String,
     attempt: u32,
     stream_path: String,
 }
 
-async fn row_stream_page(
+async fn job_stream_page(
     State(s): State<WebState>,
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
 ) -> Result<Html<String>, WebError> {
@@ -828,11 +828,11 @@ async fn row_stream_page(
             .await?;
     let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
     let stream = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
-    let tpl = RowStreamTpl {
+    let tpl = JobStreamTpl {
         version: s.api.version,
         run_id: id,
         action_name,
-        row_key: key,
+        job_key: key,
         attempt,
         stream_path: stream.display().to_string(),
     };
@@ -841,7 +841,7 @@ async fn row_stream_page(
 
 // ---- SSE ------------------------------------------------------------------
 
-async fn row_stream_sse(
+async fn job_stream_sse(
     State(s): State<WebState>,
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
     headers: HeaderMap,
@@ -872,8 +872,8 @@ async fn row_stream_sse(
 
     // Stream the file line-by-line. If the run is still writing, keep
     // polling until either we see a `"type":"result"` line (which closes
-    // the stream cleanly with a `done` SSE event) or the row's outcome
-    // record lands in `row_outcomes` (run has moved on past this attempt).
+    // the stream cleanly with a `done` SSE event) or the job's outcome
+    // record lands in `job_outcomes` (run has moved on past this attempt).
     let pool = s.api.pool.clone();
     let stream = async_stream::stream! {
         // Wait briefly for the file to exist (claude may be spinning up).
@@ -924,7 +924,7 @@ async fn row_stream_sse(
                     // EOF: either the run is still writing more, or it's done.
                     // Check the DB to decide whether to keep waiting.
                     let done: Option<i64> = sqlx::query_scalar(
-                        "SELECT id FROM row_outcomes WHERE run_id = ? AND row_key = ? AND attempt = ?",
+                        "SELECT id FROM job_outcomes WHERE run_id = ? AND job_key = ? AND attempt = ?",
                     )
                     .bind(id)
                     .bind(&key)

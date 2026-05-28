@@ -60,18 +60,18 @@ pub async fn import_legacy_state(pool: &SqlitePool, legacy_dir: &Path) -> Result
             "importing legacy state"
         );
 
-        for (row_key, att) in &parsed.attempts {
+        for (job_key, att) in &parsed.attempts {
             sqlx::query(
                 r#"
-                INSERT INTO attempt_counters (action_name, row_key, count, last_at)
+                INSERT INTO attempt_counters (action_name, job_key, count, last_at)
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(action_name, row_key) DO UPDATE SET
+                ON CONFLICT(action_name, job_key) DO UPDATE SET
                     count = excluded.count,
                     last_at = excluded.last_at
                 "#,
             )
             .bind(&action_name)
-            .bind(row_key)
+            .bind(job_key)
             .bind(att.count)
             .bind(&att.last_at)
             .execute(pool)

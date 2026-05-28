@@ -20,8 +20,8 @@ use crate::cancel::{CancellationToken, RegistryGuard, RunRegistry};
 use crate::claude::ClaudeInvoker;
 use crate::config::{OnDiskConfig, Paths};
 use crate::error::Result;
+use crate::job::{self, RunnerDefaults};
 use crate::lock::ActionLock;
-use crate::row::{self, RunnerDefaults};
 use crate::scheduler::{self, ParsedSchedule};
 use crate::snippet::SnippetRunner;
 use crate::state::{self, ActionIndexRow};
@@ -414,7 +414,7 @@ pub async fn run_action_inner(
     registry: Option<&RunRegistry>,
 ) -> Result<()> {
     let defaults = RunnerDefaults::default();
-    let limits = row::effective_limits(&defaults, loaded);
+    let limits = job::effective_limits(&defaults, loaded);
 
     let daily = state::daily_count_get(pool, &loaded.action.name).await?;
     if daily >= limits.max_runs_per_day {
@@ -427,8 +427,8 @@ pub async fn run_action_inner(
         return Ok(());
     }
 
-    let rows = row::gather_rows(loaded, snippet, paths).await?;
-    info!(action = %loaded.action.name, count = rows.len(), "input rows gathered");
+    let jobs = job::gather_jobs(loaded, snippet, paths).await?;
+    info!(action = %loaded.action.name, count = jobs.len(), "input jobs gathered");
 
     let run_id = state::run_begin(pool, &loaded.action.name, triggered_by).await?;
 
@@ -440,19 +440,19 @@ pub async fn run_action_inner(
     };
     let _registry_guard = RegistryGuard { registry, run_id };
 
-    // CLAUDE-1: record the planned row keys so the web UI shows what's
+    // CLAUDE-1: record the planned job keys so the web UI shows what's
     // queued / in-flight before any outcome record lands.
-    let planned_keys: Vec<String> = rows
+    let planned_keys: Vec<String> = jobs
         .iter()
         .enumerate()
-        .map(|(i, r)| row::row_key(loaded, r, i))
+        .map(|(i, j)| job::job_key(loaded, j, i))
         .collect();
-    if let Err(e) = state::run_set_row_keys(pool, run_id, &planned_keys).await {
-        warn!(error = %e, "run_set_row_keys failed (non-fatal)");
+    if let Err(e) = state::run_set_job_keys(pool, run_id, &planned_keys).await {
+        warn!(error = %e, "run_set_job_keys failed (non-fatal)");
     }
 
     let mut processed: u32 = 0;
-    let ctx = row::RowContext {
+    let ctx = job::JobContext {
         action: loaded,
         limits,
         paths,
@@ -463,9 +463,9 @@ pub async fn run_action_inner(
         cancel: cancel.clone(),
     };
 
-    for (idx, r) in rows.iter().enumerate() {
+    for (idx, job) in jobs.iter().enumerate() {
         if cancel.is_cancelled() {
-            info!(action = %loaded.action.name, "run cancelled, stopping before next row");
+            info!(action = %loaded.action.name, "run cancelled, stopping before next job");
             break;
         }
         let current = state::daily_count_get(pool, &loaded.action.name).await?;
@@ -478,17 +478,17 @@ pub async fn run_action_inner(
             warn!(cost_usd = cost, "daily budget reached mid-run, stopping");
             break;
         }
-        // CLAUDE-14: mark this row in flight so the web UI shows exactly one
-        // "running" row. Set after the cap/budget checks (a capped run never
-        // reaches this row) and before process_row; `run_finish` clears it on
+        // CLAUDE-14: mark this job in flight so the web UI shows exactly one
+        // "running" job. Set after the cap/budget checks (a capped run never
+        // reaches this job) and before process_job; `run_finish` clears it on
         // every finish/break path below.
-        if let Err(e) = state::run_set_current_row(pool, run_id, Some(&planned_keys[idx])).await {
-            warn!(error = %e, "run_set_current_row failed (non-fatal)");
+        if let Err(e) = state::run_set_current_job(pool, run_id, Some(&planned_keys[idx])).await {
+            warn!(error = %e, "run_set_current_job failed (non-fatal)");
         }
-        let outcome = row::process_row(&ctx, r, idx).await?;
-        if let Some(record) = row::done_record(&outcome) {
-            row::append_output_record(paths, loaded, &record);
-            if let row::ProcessedRow::Done {
+        let outcome = job::process_job(&ctx, job, idx).await?;
+        if let Some(record) = job::done_record(&outcome) {
+            job::append_output_record(paths, loaded, &record);
+            if let job::ProcessedJob::Done {
                 key,
                 attempt,
                 ok,
@@ -501,12 +501,12 @@ pub async fn run_action_inner(
                 duration_ms,
             } = &outcome
             {
-                state::row_outcome_insert(
+                state::job_outcome_insert(
                     pool,
-                    &state::RowOutcome {
+                    &state::JobOutcome {
                         run_id,
                         action_name: &loaded.action.name,
-                        row_key: key,
+                        job_key: key,
                         attempt: *attempt,
                         ok: *ok,
                         claude_ran: *claude_ran,

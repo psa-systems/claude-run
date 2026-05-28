@@ -58,7 +58,7 @@
   <div class="card"><span class="dim">No runs yet for this action.</span></div>
 {% else %}
   <table>
-    <thead><tr><th>Run</th><th>Started</th><th>Ended</th><th>Duration</th><th>Triggered</th><th>Rows</th><th>Exit</th></tr></thead>
+    <thead><tr><th>Run</th><th>Started</th><th>Ended</th><th>Duration</th><th>Triggered</th><th>Jobs</th><th>Exit</th></tr></thead>
     <tbody>
       {% for r in runs %}
         <tr>
@@ -67,7 +67,7 @@
           <td class="mono dim">{{ r.ended_at.as_deref().unwrap_or("-") }}</td>
           <td class="mono">{{ r.duration() }}</td>
           <td class="dim">{{ r.triggered_by }}</td>
-          <td class="mono">{{ r.rows_processed }}{% if r.failed_rows > 0 %} <span style="color: var(--bad);">({{ r.failed_rows }} failed)</span>{% endif %}</td>
+          <td class="mono">{{ r.jobs_processed }}{% if r.failed_jobs > 0 %} <span style="color: var(--bad);">({{ r.failed_jobs }} failed)</span>{% endif %}</td>
           <td class="mono">
             {% match r.exit_code %}
               {% when Some(0) %}<span class="badge ok">0</span>

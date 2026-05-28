@@ -25,7 +25,7 @@ use claude_run::{
     version = claude_run::VERSION,
     about = "YAML-driven Claude Code runner",
     long_about = "Run actions defined in $CONFIG_DIR/actions/*.yml. Each action's input.command \
-                  emits a JSON array; one Claude invocation per row. See actions/SCHEMA.md."
+                  emits a JSON array; one Claude invocation per job. See actions/SCHEMA.md."
 )]
 struct Cli {
     /// Override the actions directory (default: $CONFIG_DIR/actions/).

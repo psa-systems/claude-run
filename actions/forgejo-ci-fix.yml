@@ -36,7 +36,7 @@ input:
     let auth_header = [Authorization $"token ($token)"]
     let cutoff = (date now) - ($window_minutes * 1min)
 
-    let rows = ($repos | each { |repo|
+    let jobs = ($repos | each { |repo|
         let prs_url = $"https://($host)/api/v1/repos/($repo)/pulls?state=open"
         let prs = (try { http get --headers $auth_header $prs_url } catch { [] })
         $prs | each { |pr|
@@ -60,15 +60,15 @@ input:
             }
         } | compact
     } | flatten)
-    $rows | to json
+    $jobs | to json
 
 dedup_key: head_sha
 
 filter: |
   #!/usr/bin/env nu
   # Skip PRs authored by the bot itself, otherwise feedback loop.
-  if $row.author == "claude-bot" {
-      print --stderr $"skipping bot-authored PR #($row.pr_number)"
+  if $job.author == "claude-bot" {
+      print --stderr $"skipping bot-authored PR #($job.pr_number)"
       exit 1
   }
 
@@ -79,9 +79,9 @@ pre:
     # $workdir as an empty dir. If a previous attempt left state behind, git
     # clone will fail; attempt counter trips and a human investigates.
     let keys = (open ~/.local/share/forgejo-cli/keys.json)
-    let token = ($keys.hosts | get $row.host | get token)
-    let url = $"https://oauth2:($token)@($row.host)/($row.repo).git"
-    ^git clone --branch $row.branch --depth 50 $url $workdir
+    let token = ($keys.hosts | get $job.host | get token)
+    let url = $"https://oauth2:($token)@($job.host)/($job.repo).git"
+    ^git clone --branch $job.branch --depth 50 $url $workdir
 
 claude:
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
@@ -94,9 +94,9 @@ prompt: |
   The repository is checked out in the current working directory.
   The CI workflow files are in .forgejo/workflows/.
 
-  PR: #($row.pr_number): ($row.title)
-  Branch: ($row.branch)
-  Commit: ($row.head_sha)
+  PR: #($job.pr_number): ($job.title)
+  Branch: ($job.branch)
+  Commit: ($job.head_sha)
 
   Your job:
     1. Read the CI workflow files to understand what checks run
@@ -158,21 +158,21 @@ post:
     }
 
     let keys = (open ~/.local/share/forgejo-cli/keys.json)
-    let token = ($keys.hosts | get $row.host | get token)
+    let token = ($keys.hosts | get $job.host | get token)
 
     cd $workdir
     git config user.name "claude-bot"
     git config user.email "claude-bot@a8n.run"
     git add -A
 
-    let msg_lines = [$"fix: Claude auto-fix for PR #($row.pr_number)", "", $claude_result.summary, "", "[skip claude]"]
+    let msg_lines = [$"fix: Claude auto-fix for PR #($job.pr_number)", "", $claude_result.summary, "", "[skip claude]"]
     let msg_file = $"($workdir)/.claude-run-commit-msg"
     if ($msg_file | path exists) { rm $msg_file }
     ($msg_lines | str join "\n") | save $msg_file
     ^git commit --file $msg_file
 
-    let push_url = $"https://oauth2:($token)@($row.host)/($row.repo).git"
-    ^git push $push_url $row.branch
+    let push_url = $"https://oauth2:($token)@($job.host)/($job.repo).git"
+    ^git push $push_url $job.branch
 
   # Step 2: post PR comment summarizing the run via fj.
   - |
@@ -192,7 +192,7 @@ post:
     ($lines | str join "\n") | save $body_file
 
     cd $workdir
-    ^fj --host $row.host pr comment $row.pr_number --body-file $body_file
+    ^fj --host $job.host pr comment $job.pr_number --body-file $body_file
 
 output:
   file: forgejo-ci-fix.jsonl
