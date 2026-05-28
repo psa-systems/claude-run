@@ -94,6 +94,10 @@ struct RunRow {
     /// CLAUDE-14: key of the row currently being processed, or NULL when no row
     /// is in flight (run finished, or a legacy run predating the column).
     current_row_key: Option<String>,
+    /// CLAUDE-22: count of distinct rows whose LATEST attempt failed (`ok = 0`),
+    /// matching the per-row `fail` badges on run-detail. A row that failed an
+    /// earlier attempt but passed its latest does not count.
+    failed_rows: i64,
 }
 
 impl RunRow {
@@ -322,7 +326,7 @@ async fn enriched_actions(pool: &SqlitePool) -> Result<Vec<ActionView>, WebError
 
 async fn fetch_recent_runs(pool: &SqlitePool, limit: i64) -> Result<Vec<RunRow>, WebError> {
     let rows = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key FROM runs ORDER BY started_at DESC LIMIT ?",
+        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key, (SELECT COUNT(*) FROM row_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM row_outcomes o2 WHERE o2.run_id = o.run_id AND o2.row_key = o.row_key)) AS failed_rows FROM runs ORDER BY started_at DESC LIMIT ?",
     )
     .bind(limit)
     .fetch_all(pool)
@@ -408,7 +412,7 @@ async fn action_detail(
             reason: r,
         });
     let runs = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
+        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key, (SELECT COUNT(*) FROM row_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM row_outcomes o2 WHERE o2.run_id = o.run_id AND o2.row_key = o.row_key)) AS failed_rows FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
     )
     .bind(&name)
     .fetch_all(pool)
@@ -445,7 +449,7 @@ async fn action_durations(
     // Same recent window as the action-detail table (last 50 by start). The
     // query returns newest-first; the chart wants oldest-first, so reverse.
     let runs = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
+        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key, (SELECT COUNT(*) FROM row_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM row_outcomes o2 WHERE o2.run_id = o.run_id AND o2.row_key = o.row_key)) AS failed_rows FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
     )
     .bind(&name)
     .fetch_all(pool)
@@ -722,7 +726,7 @@ async fn run_detail(
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
     let Some(run): Option<RunRow> = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key FROM runs WHERE id = ?",
+        "SELECT id, action_name, started_at, ended_at, exit_code, rows_processed, triggered_by, current_row_key, (SELECT COUNT(*) FROM row_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM row_outcomes o2 WHERE o2.run_id = o.run_id AND o2.row_key = o.row_key)) AS failed_rows FROM runs WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)

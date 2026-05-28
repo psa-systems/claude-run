@@ -20,7 +20,7 @@
     <dt>Ended</dt>         <dd>{{ run.ended_at.as_deref().unwrap_or("running") }}</dd>
     <dt>Duration</dt>      <dd>{{ run.duration() }}</dd>
     <dt>Triggered by</dt>  <dd>{{ run.triggered_by }}</dd>
-    <dt>Rows processed</dt><dd>{{ run.rows_processed }}</dd>
+    <dt>Rows processed</dt><dd>{{ run.rows_processed }}{% if run.failed_rows > 0 %} <span style="color: var(--bad);">({{ run.failed_rows }} failed)</span>{% endif %}</dd>
     <dt>Exit</dt>
     <dd>
       {% match run.exit_code %}
