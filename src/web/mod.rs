@@ -1001,6 +1001,7 @@ async fn htmx_handler() -> Response {
 
 // ---- error ----------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct WebError {
     status: StatusCode,
     message: String,
@@ -1060,6 +1061,214 @@ impl IntoResponse for WebError {
 #[cfg(test)]
 mod tests {
     use super::{build_duration_chart, format_duration_ms, latest_attempt_on_disk};
+
+    // ---- action editor handlers (CLAUDE-34) -------------------------------
+    //
+    // The editor is kind-agnostic: `action_edit_save` / `action_create` route
+    // every submission through the kind-aware `crate::action::validate_str`, so
+    // a native youtrack action is accepted, validated against the native schema,
+    // and rejected inline on bad config exactly as a scripted action is. These
+    // tests exercise that path end-to-end against an in-memory DB and a tempdir
+    // actions directory.
+    mod editor {
+        use super::super::{action_create, action_edit_save, action_export, ActionForm, WebState};
+        use crate::api::AppState;
+        use crate::cancel::RunRegistry;
+        use crate::config::Paths;
+        use crate::db::MIGRATOR;
+        use crate::state;
+        use axum::extract::{Form, Path as AxumPath, State};
+        use axum::http::StatusCode;
+        use axum::response::{IntoResponse, Response};
+        use sqlx::sqlite::SqlitePoolOptions;
+        use sqlx::SqlitePool;
+        use std::sync::Arc;
+
+        /// A valid native youtrack action. `native: {}` resolves every field to
+        /// its default.
+        const NATIVE_MINIMAL: &str = "name: youtrack\nkind: youtrack\nnative: {}\n";
+
+        /// Build a `WebState` backed by an in-memory DB and a tempdir-rooted
+        /// `Paths`. The trigger receiver is dropped; none of the editor handlers
+        /// send on it.
+        async fn web_state(tmp: &std::path::Path) -> WebState {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            MIGRATOR.run(&pool).await.unwrap();
+            let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
+            let api = Arc::new(AppState {
+                pool,
+                trigger_tx,
+                version: "test",
+                runs: Arc::new(RunRegistry::new()),
+            });
+            let paths = Paths {
+                config_dir: tmp.join("config"),
+                data_dir: tmp.join("data"),
+                state_dir: tmp.join("state"),
+                runtime_dir: tmp.join("runtime"),
+            };
+            WebState { api, paths }
+        }
+
+        /// Register an action in the index so `indexed_action_path` resolves it
+        /// to `file_path` (the only names the edit/export handlers will touch).
+        async fn index_action(pool: &SqlitePool, name: &str, file_path: &str) {
+            state::action_index_upsert(
+                pool,
+                &state::ActionIndexRow {
+                    name: name.to_string(),
+                    file_path: file_path.to_string(),
+                    yaml_sha256: "0".repeat(64),
+                    enabled: false,
+                    schedule_kind: None,
+                    schedule_spec: None,
+                    last_seen_at: "2026-01-01T00:00:00+00:00".to_string(),
+                    parse_error: None,
+                    link_template: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn body_string(resp: Response) -> String {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn edit_save_accepts_and_writes_native_action() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("youtrack.yml");
+            std::fs::write(&file, NATIVE_MINIMAL).unwrap();
+            index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
+
+            // A native action with an overridden query validates against the
+            // native schema and is written to disk.
+            let new_yaml = "name: youtrack\nkind: youtrack\nnative:\n  youtrack:\n    query: \"-Resolved AI Agent: Ready\"\n";
+            let resp = action_edit_save(
+                State(s.clone()),
+                AxumPath("youtrack".to_string()),
+                Form(ActionForm {
+                    yaml: new_yaml.to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+
+            // Redirect::to is 303 See Other.
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), new_yaml);
+        }
+
+        #[tokio::test]
+        async fn edit_save_rejects_invalid_native_config_inline() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("youtrack.yml");
+            std::fs::write(&file, NATIVE_MINIMAL).unwrap();
+            index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
+
+            // An unknown key under the native config is rejected by the native
+            // schema (`deny_unknown_fields`).
+            let bad =
+                "name: youtrack\nkind: youtrack\nnative:\n  youtrack:\n    bogus_field: nope\n";
+            let resp = action_edit_save(
+                State(s.clone()),
+                AxumPath("youtrack".to_string()),
+                Form(ActionForm {
+                    yaml: bad.to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            // The on-disk file is left untouched.
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), NATIVE_MINIMAL);
+            // The submitted draft is preserved in the re-rendered editor.
+            let body = body_string(resp).await;
+            assert!(body.contains("bogus_field"));
+        }
+
+        #[tokio::test]
+        async fn create_accepts_native_action() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let yaml = "name: yt-native\nkind: youtrack\nnative: {}\n";
+            let resp = action_create(
+                State(s.clone()),
+                Form(ActionForm {
+                    yaml: yaml.to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let dest = s.paths.actions_dir().join("yt-native.yml");
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), yaml);
+        }
+
+        #[tokio::test]
+        async fn create_rejects_invalid_native_config_inline() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let bad = "name: yt-native\nkind: youtrack\nnative:\n  forgejo:\n    bogus: 1\n";
+            let resp = action_create(
+                State(s.clone()),
+                Form(ActionForm {
+                    yaml: bad.to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            // Nothing is written for a rejected draft.
+            assert!(!s.paths.actions_dir().join("yt-native.yml").exists());
+            let body = body_string(resp).await;
+            assert!(body.contains("bogus"));
+        }
+
+        #[tokio::test]
+        async fn export_returns_native_config_unchanged() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            // Comments and field ordering must survive export byte-for-byte.
+            let content = "# native youtrack action\nname: youtrack\nkind: youtrack\nnative:\n  youtrack:\n    query: \"-Resolved AI Agent: Queued\"\n";
+            let file = actions.join("youtrack.yml");
+            std::fs::write(&file, content).unwrap();
+            index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
+
+            let resp = action_export(State(s.clone()), AxumPath("youtrack".to_string()))
+                .await
+                .unwrap()
+                .into_response();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_string(resp).await, content);
+        }
+    }
 
     #[test]
     fn format_duration_ms_buckets() {
