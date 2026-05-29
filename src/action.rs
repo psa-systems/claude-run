@@ -63,15 +63,88 @@ impl From<&str> for Script {
     }
 }
 
+/// How an action is executed (CLAUDE-30 dispatch discriminator).
+///
+/// `scripted` (the default, kept for back-compat) runs the generic nu-snippet
+/// pipeline `input.command` -> `filter` -> `pre` -> `prompt` -> `claude` ->
+/// `post`. It is **deprecated**: new actions should prefer a native kind once
+/// one exists for their source. Native kinds (currently only `youtrack`) route
+/// to a built-in Rust handler and supply a typed [`NativeConfig`] under
+/// `native` instead of the script-bearing fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// Generic nu-snippet pipeline (deprecated). Default for back-compat.
+    #[default]
+    Scripted,
+    /// Built-in YouTrack handler. Config lives in `native` as
+    /// [`NativeConfig::Youtrack`]; the real handler lands in CLAUDE-33.
+    Youtrack,
+}
+
+impl ActionKind {
+    /// True for any kind routed to a built-in Rust handler (everything but
+    /// `scripted`).
+    pub fn is_native(self) -> bool {
+        !matches!(self, ActionKind::Scripted)
+    }
+
+    /// Lowercase wire name, matching the serde `snake_case` rename.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActionKind::Scripted => "scripted",
+            ActionKind::Youtrack => "youtrack",
+        }
+    }
+}
+
+/// Typed configuration for a native (non-scripted) action: one variant per
+/// native [`ActionKind`], supplied under the action's `native:` key. Required
+/// when `kind` names a native handler, and its variant must match `kind`. The
+/// variant payloads are placeholders this phase (CLAUDE-30) and get fleshed out
+/// in CLAUDE-33.
+///
+/// `#[serde(untagged)]`: the action's top-level `kind` is the discriminator, so
+/// `native:` holds the variant's fields directly (e.g. `native: {}` for the
+/// youtrack placeholder) rather than re-tagging the variant in YAML.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum NativeConfig {
+    /// YouTrack built-in handler config (placeholder).
+    Youtrack(YoutrackConfig),
+}
+
+impl NativeConfig {
+    /// The [`ActionKind`] this config variant corresponds to.
+    pub fn kind(&self) -> ActionKind {
+        match self {
+            NativeConfig::Youtrack(_) => ActionKind::Youtrack,
+        }
+    }
+}
+
+/// Placeholder config for the native YouTrack handler. Fields land in CLAUDE-33
+/// (Phase 4); an empty mapping (`native: {}`) validates today.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct YoutrackConfig {}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Action {
     pub name: String,
 
+    /// Dispatch discriminator (CLAUDE-30). Defaults to `scripted`.
+    #[serde(default)]
+    pub kind: ActionKind,
+
     #[serde(default)]
     pub workdir_base: Option<String>,
 
-    pub input: InputBlock,
+    /// Required for `scripted` actions; optional (and ignored) for native
+    /// kinds, which produce their jobs in the Rust handler instead.
+    #[serde(default)]
+    pub input: Option<InputBlock>,
 
     #[serde(default)]
     pub dedup_key: Option<String>,
@@ -82,7 +155,15 @@ pub struct Action {
     #[serde(default)]
     pub pre: Vec<Script>,
 
-    pub prompt: Script,
+    /// Required for `scripted` actions; optional (and ignored) for native
+    /// kinds.
+    #[serde(default)]
+    pub prompt: Option<Script>,
+
+    /// Typed config for native kinds; required when `kind` is native, absent
+    /// for `scripted`.
+    #[serde(default)]
+    pub native: Option<NativeConfig>,
 
     #[serde(default)]
     pub claude: ClaudeBlock,
@@ -151,9 +232,13 @@ post:
 "#;
         let action: Action = serde_yaml::from_str(yaml).unwrap();
 
+        // Default kind is scripted.
+        assert_eq!(action.kind, ActionKind::Scripted);
+
         // Plain string -> default interpreter (nu).
-        assert_eq!(action.input.command.code(), "echo []");
-        assert_eq!(action.input.command.shell(), None);
+        let input = action.input.as_ref().unwrap();
+        assert_eq!(input.command.code(), "echo []");
+        assert_eq!(input.command.shell(), None);
 
         // Mapping with explicit shell.
         let filter = action.filter.as_ref().unwrap();
@@ -165,8 +250,9 @@ post:
         assert_eq!(action.pre[0].shell(), None);
 
         // Mapping with omitted shell -> default (nu).
-        assert_eq!(action.prompt.code(), "print hi");
-        assert_eq!(action.prompt.shell(), None);
+        let prompt = action.prompt.as_ref().unwrap();
+        assert_eq!(prompt.code(), "print hi");
+        assert_eq!(prompt.shell(), None);
 
         // List of mappings.
         assert_eq!(action.post[0].code(), "echo done");
@@ -196,6 +282,45 @@ post:
             validate_str(&raw, "<candidate>").unwrap_err(),
             Error::Yaml(_)
         ));
+    }
+
+    const NATIVE: &str = "name: yt\nkind: youtrack\nnative: {}\n";
+
+    #[test]
+    fn validate_str_accepts_native_action_without_script_fields() {
+        let loaded = validate_str(NATIVE, "<candidate>").expect("valid native");
+        assert_eq!(loaded.action.kind, ActionKind::Youtrack);
+        assert!(loaded.action.kind.is_native());
+        assert!(loaded.action.input.is_none());
+        assert!(loaded.action.prompt.is_none());
+        assert_eq!(
+            loaded.action.native,
+            Some(NativeConfig::Youtrack(YoutrackConfig {}))
+        );
+    }
+
+    #[test]
+    fn validate_str_rejects_native_action_without_native_config() {
+        let raw = "name: yt\nkind: youtrack\n";
+        let err = validate_str(raw, "<candidate>").unwrap_err();
+        assert!(matches!(err, Error::ActionMissingField { field, .. } if field == "native"));
+    }
+
+    #[test]
+    fn validate_str_rejects_unknown_kind() {
+        let raw = "name: yt\nkind: bogus\nnative: {}\n";
+        assert!(matches!(
+            validate_str(raw, "<candidate>").unwrap_err(),
+            Error::Yaml(_)
+        ));
+    }
+
+    #[test]
+    fn scripted_kind_still_requires_prompt() {
+        // An explicit `kind: scripted` validates its script fields as before.
+        let raw = "name: demo\nkind: scripted\ninput:\n  command: echo '[]'\n";
+        let err = validate_str(raw, "<candidate>").unwrap_err();
+        assert!(matches!(err, Error::ActionMissingField { field, .. } if field == "prompt"));
     }
 }
 
@@ -300,19 +425,14 @@ pub fn validate_str(raw: &str, label: &str) -> Result<LoadedAction> {
             path: label.to_string(),
         });
     }
-    if action.input.command.code().trim().is_empty() {
-        return Err(Error::ActionMissingField {
-            name: action.name.clone(),
-            field: "input.command".into(),
-            path: label.to_string(),
-        });
-    }
-    if action.prompt.code().trim().is_empty() {
-        return Err(Error::ActionMissingField {
-            name: action.name.clone(),
-            field: "prompt".into(),
-            path: label.to_string(),
-        });
+
+    // CLAUDE-30: `kind` selects which fields are required. Scripted actions
+    // validate their script-bearing fields exactly as before; native kinds
+    // ignore those and require a matching typed `NativeConfig` instead.
+    if action.kind.is_native() {
+        validate_native(&action, label)?;
+    } else {
+        validate_scripted(&action, label)?;
     }
 
     let mut hasher = Sha256::new();
@@ -324,6 +444,50 @@ pub fn validate_str(raw: &str, label: &str) -> Result<LoadedAction> {
         path: PathBuf::from(label),
         yaml_sha256,
     })
+}
+
+/// Validate the script-bearing fields a `scripted` action requires:
+/// a non-empty `input.command` and a non-empty `prompt`.
+fn validate_scripted(action: &Action, label: &str) -> Result<()> {
+    let missing = |field: &str| Error::ActionMissingField {
+        name: action.name.clone(),
+        field: field.to_string(),
+        path: label.to_string(),
+    };
+    let input = action
+        .input
+        .as_ref()
+        .ok_or_else(|| missing("input.command"))?;
+    if input.command.code().trim().is_empty() {
+        return Err(missing("input.command"));
+    }
+    let prompt = action.prompt.as_ref().ok_or_else(|| missing("prompt"))?;
+    if prompt.code().trim().is_empty() {
+        return Err(missing("prompt"));
+    }
+    Ok(())
+}
+
+/// Validate a native action: it must carry a `native` config whose variant
+/// matches `kind`. The script-bearing fields are not required.
+fn validate_native(action: &Action, label: &str) -> Result<()> {
+    let native = action
+        .native
+        .as_ref()
+        .ok_or_else(|| Error::ActionMissingField {
+            name: action.name.clone(),
+            field: "native".to_string(),
+            path: label.to_string(),
+        })?;
+    if native.kind() != action.kind {
+        return Err(Error::ActionKindMismatch {
+            name: action.name.clone(),
+            kind: action.kind.as_str().to_string(),
+            native: native.kind().as_str().to_string(),
+            path: label.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Resolve `arg` to a path and load. Convenience for the CLI.

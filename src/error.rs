@@ -27,6 +27,17 @@ pub enum Error {
     #[error("action `{name}` not found in {searched}")]
     ActionNotFound { name: String, searched: String },
 
+    #[error("action {name}: kind `{kind}` does not match native config `{native}` ({path})")]
+    ActionKindMismatch {
+        name: String,
+        kind: String,
+        native: String,
+        path: String,
+    },
+
+    #[error("native action kind `{kind}` is not implemented yet")]
+    NativeUnimplemented { kind: String },
+
     #[error("snippet {phase} failed (exit {exit_code}): {stderr}")]
     SnippetFailed {
         phase: String,

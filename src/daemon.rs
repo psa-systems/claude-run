@@ -413,6 +413,21 @@ pub async fn run_action_inner(
     triggered_by: &str,
     registry: Option<&RunRegistry>,
 ) -> Result<()> {
+    // CLAUDE-30: native kinds route to a built-in Rust handler. Scripted
+    // actions fall through to the generic nu-snippet pipeline below, unchanged.
+    if loaded.action.kind.is_native() {
+        return crate::native::dispatch(crate::native::NativeContext {
+            action: loaded,
+            paths,
+            pool,
+            snippet,
+            claude,
+            triggered_by,
+            registry,
+        })
+        .await;
+    }
+
     let defaults = RunnerDefaults::default();
     let limits = job::effective_limits(&defaults, loaded);
 
@@ -691,5 +706,28 @@ mod tests {
         assert_eq!(read_pidfile(&paths), Some(12345));
         std::fs::write(daemon_pidfile_path(&paths), "not-a-pid").unwrap();
         assert_eq!(read_pidfile(&paths), None);
+    }
+
+    // CLAUDE-30: a native action routes to the native-handler seam instead of
+    // the scripted gather + per-job loop. The youtrack handler is a stub this
+    // phase, so the run surfaces `NativeUnimplemented`.
+    #[tokio::test]
+    async fn run_action_inner_dispatches_native_to_handler_stub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let snippet = SnippetRunner::new(None);
+        let claude = ClaudeInvoker::new(None);
+
+        let raw = "name: yt\nkind: youtrack\nnative: {}\n";
+        let loaded = crate::action::validate_str(raw, "<test>").unwrap();
+
+        let err = run_action_inner(&loaded, &paths, &pool, &snippet, &claude, "test", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::NativeUnimplemented { .. }
+        ));
     }
 }

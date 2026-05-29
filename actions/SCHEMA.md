@@ -17,6 +17,7 @@ usage check. The action YAML supplies everything specific to the job.
 
 ```yaml
 name: <kebab-id>            # required
+kind: scripted              # optional discriminator: scripted (default) | youtrack
 workdir_base: /path/to/dir  # optional, overrides $CLAUDE_RUN_WORKDIR_BASE for this action
 input:
   command: |                # required, nu snippet, stdout = JSON array
@@ -92,6 +93,40 @@ JSON string `{"id":"..."}`.
 Identifier used for the lock file, state file, log directory, and PAUSED flag.
 Should be kebab-case and unique across all actions on the host.
 
+### `kind` (enum, optional, default `scripted`)
+
+The dispatch discriminator (CLAUDE-30). Selects how the runner executes the
+action:
+
+- `scripted` (default): runs the generic nu-snippet pipeline
+  (`input.command` -> `filter` -> `pre` -> `prompt` -> `claude` -> `post`)
+  described in the rest of this document. **Deprecated**: it is kept for
+  back-compat, but new actions should prefer a native kind once one exists for
+  their source.
+- `youtrack`: a built-in Rust handler for YouTrack. The script-bearing fields
+  (`input.command`, `prompt`, `filter`, `pre`, `post`) are not used; the action
+  instead supplies a typed [`native`](#native-record-required-for-native-kinds)
+  block. The handler is a stub until CLAUDE-33.
+
+`scripted` and native kinds share all the run accounting (locking, daily caps,
+per-job attempt caps, budget, job-outcome records); only job production and the
+per-job pipeline differ.
+
+### `native` (record, required for native kinds)
+
+Typed configuration for a native `kind`. Required when `kind` names a native
+handler and forbidden field set is validated against that handler. Because
+`kind` is already the discriminator, the block holds the handler's config
+directly (no nested variant tag). For `kind: youtrack` the config is a
+placeholder this phase, so an empty mapping is valid:
+
+```yaml
+kind: youtrack
+native: {}
+```
+
+Omit `native` entirely for `kind: scripted`.
+
 ### `workdir_base` (string, optional)
 
 Per-job working directories are rooted under `<workdir_base>/<name>/<key>`.
@@ -122,7 +157,7 @@ workdir_base: /mnt/data/claude-run                 # literal, absolute
 workdir_base: $nu.home-dir | path join workspace   # evaluated
 ```
 
-### `input.command` (nu snippet, required)
+### `input.command` (nu snippet, required for `kind: scripted`)
 
 A Nushell snippet executed by the runner with `nu --commands "$snippet"`. Must
 write a JSON array to stdout. Each element of the array becomes one Claude
@@ -163,7 +198,7 @@ Post receives a synthesized `$claude_result` with `ok: false`, an `error`
 field naming the failed pre step, and the step's stderr as `summary`.
 Poison jobs eventually hit the per-key attempt cap and stop being retried.
 
-### `prompt` (nu snippet, required)
+### `prompt` (nu snippet, required for `kind: scripted`)
 
 A nu snippet whose return value is the prompt string passed to Claude. Has
 `$job`, `$workdir`, and `$env` in scope. Plain text without `$` interpolation
