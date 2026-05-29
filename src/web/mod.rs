@@ -788,14 +788,19 @@ async fn run_detail(
     for o in &outcomes {
         outcome_by_key.insert(o.job_key.as_str(), o.ok);
     }
-    // CLAUDE-14: a run with a NULL `ended_at` is still active; only then can a
-    // job be in flight, and exactly the one matching `runs.current_job_key` is.
-    // Jobs are processed strictly sequentially, so every other no-outcome job is
-    // queued, not running. Once the run ends, `current_job_key` is NULL and a
-    // no-outcome job never finished (filtered / capped / skipped / not reached),
-    // so it must not keep the "running" badge.
+    // CLAUDE-14 / CLAUDE-28: a run with a NULL `ended_at` is still active; only
+    // then can jobs be in flight. CLAUDE-28 runs distinct-key jobs in parallel,
+    // so several jobs can be in flight at once: `run_inflight_jobs` holds that
+    // set, and any planned job whose key is in it is "running". Every other
+    // no-outcome job is queued. Once the run ends, the in-flight set is empty
+    // and a no-outcome job never finished (filtered / capped / skipped / not
+    // reached), so it must not keep the "running" badge.
     let run_active = run.ended_at.is_none();
-    let current_job = run.current_job_key.as_deref();
+    let inflight: std::collections::HashSet<String> = state::run_inflight_keys(pool, run.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     let logs_dir = s.paths.logs_dir();
     let planned_jobs: Vec<PlannedJob> = planned_keys
         .into_iter()
@@ -803,9 +808,9 @@ async fn run_detail(
             let (status, watch_attempt) = match outcome_by_key.get(k.as_str()) {
                 Some(true) => ("ok".to_string(), None),
                 Some(false) => ("fail".to_string(), None),
-                None if run_active && current_job == Some(k.as_str()) => {
-                    // The single in-flight job. Resolve its live-stream attempt
-                    // from disk for the "watch live" link.
+                None if run_active && inflight.contains(k.as_str()) => {
+                    // An in-flight job. Resolve its live-stream attempt from disk
+                    // for the "watch live" link.
                     let attempt = latest_attempt_on_disk(&logs_dir, &run.action_name, &k);
                     ("running".to_string(), attempt)
                 }

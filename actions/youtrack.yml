@@ -77,3 +77,13 @@ limits:
   max_runs_per_day: 20
   claude_timeout_seconds: 3600
   daily_budget_usd: 100.00
+
+# CLAUDE-28: run independent issues in parallel. Each issue's project/repo forms
+# the concurrency key (workflow is unset today), so issues in different repos run
+# concurrently while issues in the same repo serialize (they would otherwise
+# collide on the clone dir, branch, and PR). max_parallel caps how many distinct
+# repos run at once; keep it at or below the host's spare core count, since each
+# running issue holds a thread for its claude invocation. Set to 1 to restore
+# the previous strictly-sequential behavior.
+concurrency:
+  max_parallel: 4

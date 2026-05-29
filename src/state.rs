@@ -143,6 +143,38 @@ pub async fn run_set_current_job(pool: &SqlitePool, run_id: i64, key: Option<&st
     Ok(())
 }
 
+/// CLAUDE-28: mark a job key as in flight for a run. Replaces the single
+/// `run_set_current_job` marker so a run with several jobs running in parallel
+/// badges all of them. Idempotent (`INSERT OR IGNORE`).
+pub async fn run_inflight_add(pool: &SqlitePool, run_id: i64, key: &str) -> Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO run_inflight_jobs (run_id, job_key) VALUES (?, ?)")
+        .bind(run_id)
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// CLAUDE-28: clear one job's in-flight marker when it finishes.
+pub async fn run_inflight_remove(pool: &SqlitePool, run_id: i64, key: &str) -> Result<()> {
+    sqlx::query("DELETE FROM run_inflight_jobs WHERE run_id = ? AND job_key = ?")
+        .bind(run_id)
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// CLAUDE-28: the set of job keys currently in flight for a run.
+pub async fn run_inflight_keys(pool: &SqlitePool, run_id: i64) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT job_key FROM run_inflight_jobs WHERE run_id = ?")
+            .bind(run_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(k,)| k).collect())
+}
+
 pub async fn run_job_keys(pool: &SqlitePool, run_id: i64) -> Result<Vec<String>> {
     let row: Option<(Option<String>,)> = sqlx::query_as("SELECT job_keys FROM runs WHERE id = ?")
         .bind(run_id)
@@ -179,6 +211,12 @@ pub async fn run_finish(
     .bind(run_id)
     .execute(pool)
     .await?;
+    // CLAUDE-28: a finished run has nothing in flight; drop any stale in-flight
+    // job markers alongside clearing the legacy single-job marker above.
+    sqlx::query("DELETE FROM run_inflight_jobs WHERE run_id = ?")
+        .bind(run_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -195,6 +233,11 @@ pub async fn cancel_orphaned_runs(pool: &SqlitePool) -> Result<u64> {
     let result = sqlx::query("UPDATE runs SET ended_at = ?, exit_code = ? WHERE ended_at IS NULL")
         .bind(&now)
         .bind(crate::exit::CANCELLED as i64)
+        .execute(pool)
+        .await?;
+    // CLAUDE-28: at startup nothing is in flight, so any in-flight job markers
+    // are leftovers from the dead process. Clear them all.
+    sqlx::query("DELETE FROM run_inflight_jobs")
         .execute(pool)
         .await?;
     Ok(result.rows_affected())

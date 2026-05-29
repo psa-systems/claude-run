@@ -20,10 +20,12 @@ pub mod youtrack;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::action::{ActionKind, LoadedAction};
 use crate::cancel::RunRegistry;
 use crate::claude::ClaudeInvoker;
+use crate::concurrency::KeyGate;
 use crate::config::Paths;
 use crate::error::{Error, Result};
 use crate::snippet::SnippetRunner;
@@ -36,10 +38,14 @@ pub struct NativeContext<'a> {
     pub action: &'a LoadedAction,
     pub paths: &'a Paths,
     pub pool: &'a SqlitePool,
-    pub snippet: &'a SnippetRunner,
-    pub claude: &'a ClaudeInvoker,
+    /// `Arc` (not `&`) so the native handler can clone it into the per-job
+    /// tasks spawned by the CLAUDE-28 keyed executor.
+    pub snippet: Arc<SnippetRunner>,
+    pub claude: Arc<ClaudeInvoker>,
     pub triggered_by: &'a str,
     pub registry: Option<&'a RunRegistry>,
+    /// CLAUDE-28: daemon-wide per-key gate, used by the handler's executor.
+    pub keygate: KeyGate,
 }
 
 /// Boxed future returned by a [`NativeHandler`]. Hand-rolled (rather than
