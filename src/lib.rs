@@ -27,6 +27,7 @@ pub mod error;
 pub mod job;
 pub mod lock;
 pub mod migrate;
+pub mod native;
 pub mod scheduler;
 pub mod snippet;
 pub mod state;

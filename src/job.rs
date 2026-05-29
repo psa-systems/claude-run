@@ -115,12 +115,23 @@ pub async fn gather_jobs(
         .join("snippets")
         .join(&action.action.name)
         .join("_input");
+    // Scripted-only path: `run_action_inner` dispatches native kinds away
+    // before gathering, so a scripted action always has `input` here.
+    let input = action
+        .action
+        .input
+        .as_ref()
+        .ok_or_else(|| Error::SnippetFailed {
+            phase: "input.command".into(),
+            exit_code: crate::exit::CONFIG_ERROR,
+            stderr: "scripted action missing input.command".into(),
+        })?;
     let outcome = ctx_snippet.run(
-        action.action.input.command.code(),
+        input.command.code(),
         &Bindings::new(),
         &snippet_dir,
         "input",
-        action.action.input.command.shell(),
+        input.command.shell(),
     )?;
     if !outcome.ok {
         return Err(Error::SnippetFailed {
@@ -208,12 +219,19 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
             false,
         )
     } else {
+        // Scripted-only path: native kinds never reach `process_job`, so a
+        // scripted action always has `prompt` here.
+        let prompt_script = action.prompt.as_ref().ok_or_else(|| Error::SnippetFailed {
+            phase: "prompt".into(),
+            exit_code: crate::exit::CONFIG_ERROR,
+            stderr: "scripted action missing prompt".into(),
+        })?;
         let prompt_r = ctx.snippet.run(
-            action.prompt.code(),
+            prompt_script.code(),
             &bindings,
             &snippet_dir,
             "prompt",
-            action.prompt.shell(),
+            prompt_script.shell(),
         )?;
         if !prompt_r.ok {
             warn!(action = %action.name, key = %key, exit_code = prompt_r.exit_code, "prompt snippet failed (post still runs)");
@@ -493,14 +511,16 @@ mod tests {
         LoadedAction {
             action: crate::action::Action {
                 name: "t".into(),
+                kind: Default::default(),
                 workdir_base: None,
-                input: crate::action::InputBlock {
+                input: Some(crate::action::InputBlock {
                     command: "x".into(),
-                },
+                }),
                 dedup_key,
                 filter: None,
                 pre: vec![],
-                prompt: "y".into(),
+                prompt: Some("y".into()),
+                native: None,
                 claude: Default::default(),
                 post: vec![],
                 output: Default::default(),
