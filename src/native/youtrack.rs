@@ -381,12 +381,8 @@ async fn process_job(
         }
         Ok(()) => {
             let prompt = build_prompt(job, &workdir_path);
-            let stream_log = ClaudeInvoker::stream_log_path(
-                &paths.logs_dir(),
-                &action.name,
-                key,
-                attempts + 1,
-            );
+            let stream_log =
+                ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1);
             info!(action = %action.name, key = %key, stream_log = %stream_log.display(), "invoking claude");
             let r = claude.invoke(
                 &prompt,

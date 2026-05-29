@@ -454,7 +454,7 @@ pub async fn run_action_inner(
         return Ok(());
     }
 
-    let jobs = job::gather_jobs(loaded, snippet, paths).await?;
+    let jobs = job::gather_jobs(loaded, snippet.as_ref(), paths).await?;
     info!(action = %loaded.action.name, count = jobs.len(), "input jobs gathered");
 
     let run_id = state::run_begin(pool, &loaded.action.name, triggered_by).await?;
@@ -504,7 +504,8 @@ pub async fn run_action_inner(
             // CLAUDE-28: best-effort cap/budget check before launch. Up to
             // `max_parallel` tasks can pass this before any of them increments
             // the ledger, so the overshoot is bounded by `max_parallel - 1`.
-            if state::daily_count_get(&pool, &loaded.action.name).await? >= limits.max_runs_per_day {
+            if state::daily_count_get(&pool, &loaded.action.name).await? >= limits.max_runs_per_day
+            {
                 warn!(action = %loaded.action.name, "daily cap reached, skipping job");
                 return Ok(false);
             }

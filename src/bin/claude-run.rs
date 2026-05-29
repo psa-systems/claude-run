@@ -237,7 +237,9 @@ async fn run_action(
         }
     };
 
-    let snippet = Arc::new(snippet::SnippetRunner::new(on_disk.daemon.nu_binary.as_deref()));
+    let snippet = Arc::new(snippet::SnippetRunner::new(
+        on_disk.daemon.nu_binary.as_deref(),
+    ));
     let claude = Arc::new(claude_mod::ClaudeInvoker::new(
         on_disk.daemon.claude_binary.as_deref(),
     ));
@@ -245,7 +247,10 @@ async fn run_action(
     // gets its own ephemeral key gate; the per-action lock already prevents it
     // from overlapping a daemon-driven run of the same action.
     let keygate = claude_run::concurrency::KeyGate::new();
-    daemon::run_action_inner(&loaded, paths, &pool, snippet, claude, "cli", None, &keygate).await?;
+    daemon::run_action_inner(
+        &loaded, paths, &pool, snippet, claude, "cli", None, &keygate,
+    )
+    .await?;
     Ok(exit::OK)
 }
 

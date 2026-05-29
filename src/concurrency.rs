@@ -159,7 +159,13 @@ mod tests {
             .map(|i| {
                 (
                     format!("key-{i}"),
-                    probe(live.clone(), peak.clone(), dummy.clone(), dummy.clone(), false),
+                    probe(
+                        live.clone(),
+                        peak.clone(),
+                        dummy.clone(),
+                        dummy.clone(),
+                        false,
+                    ),
                 )
             })
             .collect();
@@ -214,7 +220,13 @@ mod tests {
             .map(|i| {
                 (
                     format!("key-{i}"),
-                    probe(live.clone(), peak.clone(), dummy.clone(), dummy.clone(), false),
+                    probe(
+                        live.clone(),
+                        peak.clone(),
+                        dummy.clone(),
+                        dummy.clone(),
+                        false,
+                    ),
                 )
             })
             .collect();
