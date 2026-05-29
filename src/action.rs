@@ -80,6 +80,10 @@ pub enum ActionKind {
     /// Built-in YouTrack handler. Config lives in `native` as
     /// [`NativeConfig::Youtrack`]; the real handler lands in CLAUDE-33.
     Youtrack,
+    /// Built-in Forgejo CI-fix handler (CLAUDE-29, supersedes DEV-330). Config
+    /// lives in `native` as [`NativeConfig::ForgejoCiFix`].
+    #[serde(rename = "forgejo-ci-fix")]
+    ForgejoCiFix,
 }
 
 impl ActionKind {
@@ -94,6 +98,7 @@ impl ActionKind {
         match self {
             ActionKind::Scripted => "scripted",
             ActionKind::Youtrack => "youtrack",
+            ActionKind::ForgejoCiFix => "forgejo-ci-fix",
         }
     }
 }
@@ -110,6 +115,8 @@ impl ActionKind {
 pub enum NativeConfig {
     /// YouTrack built-in handler config.
     Youtrack(YoutrackConfig),
+    /// Forgejo CI-fix built-in handler config (CLAUDE-29).
+    ForgejoCiFix(ForgejoCiFixConfig),
 }
 
 impl NativeConfig {
@@ -117,6 +124,7 @@ impl NativeConfig {
     pub fn kind(&self) -> ActionKind {
         match self {
             NativeConfig::Youtrack(_) => ActionKind::Youtrack,
+            NativeConfig::ForgejoCiFix(_) => ActionKind::ForgejoCiFix,
         }
     }
 }
@@ -221,6 +229,72 @@ pub struct ForgejoTarget {
     pub base_url: Option<String>,
     /// API token (inline plaintext for now; CLAUDE-26 encrypts it).
     pub token: Option<String>,
+}
+
+/// Config for the native Forgejo CI-fix handler (CLAUDE-29, supersedes
+/// DEV-330). Supplied under the action's `native:` key when
+/// `kind: forgejo-ci-fix`.
+///
+/// The handler scans `repos` on `host` for open PRs whose head-commit combined
+/// CI status is `failure` and that were updated within `window_minutes`, skips
+/// PRs authored by `bot_author` (anti-feedback-loop), clones the PR branch,
+/// runs Claude to fix the failing CI, applies a diff-size decision gate
+/// (`no_changes` / `too_big` against `max_files` + `max_lines` / `push`),
+/// commits as the bot identity with the `skip_marker`, pushes, and comments on
+/// the PR. The dedup / attempt key is the PR head SHA (per-commit attempt cap).
+///
+/// Every field defaults, so a bare config validates; `repos` defaults to empty
+/// (a no-op scan) so a freshly imported action does nothing until the allow-list
+/// is filled in. Reads and writes go through the `fj` CLI (no raw REST), which
+/// must be a build carrying FJ-1 (`pr search --json`) and FJ-2
+/// (`pr status --json`).
+///
+/// The generic blocks (`workdir_base`, `claude`, `limits`, `schedule`,
+/// `output`) stay on [`Action`]; only the Forgejo-specific settings live here.
+/// `token` is inline plaintext for now (CLAUDE-26 encrypts it); the CLI backend
+/// authenticates clone / push from `fj`'s own credential store today.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForgejoCiFixConfig {
+    /// Forgejo host, e.g. `dev.a8n.run` (bare host, no scheme), passed to
+    /// `fj --host`.
+    pub host: String,
+    /// Allow-list of `owner/name` repos to scan for failing PRs. Empty means
+    /// scan nothing.
+    pub repos: Vec<String>,
+    /// Only consider PRs updated within this many minutes of the run.
+    pub window_minutes: u64,
+    /// Decision gate: a diff touching more than this many files is `too_big`.
+    pub max_files: u64,
+    /// Decision gate: a diff changing more than this many lines is `too_big`.
+    pub max_lines: u64,
+    /// PR author login skipped to avoid a fix-on-fix feedback loop; also the
+    /// git author name used for the fix commit.
+    pub bot_author: String,
+    /// Git author email used for the fix commit.
+    pub bot_email: String,
+    /// Marker appended to the fix commit message so the bot's own push does not
+    /// re-trigger this action.
+    pub skip_marker: String,
+    /// Forgejo API token (inline plaintext for now; CLAUDE-26 encrypts it). The
+    /// CLI backend ignores it and uses `fj`'s credential store today.
+    pub token: Option<String>,
+}
+
+impl Default for ForgejoCiFixConfig {
+    fn default() -> Self {
+        Self {
+            host: "dev.a8n.run".to_string(),
+            repos: Vec::new(),
+            window_minutes: 45,
+            max_files: 10,
+            max_lines: 300,
+            bot_author: "claude-bot".to_string(),
+            bot_email: "claude-bot@a8n.run".to_string(),
+            skip_marker: "[skip claude]".to_string(),
+            token: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -495,6 +569,102 @@ native:
         // Generic blocks stay on the Action, not in the native config.
         assert_eq!(action.workdir_base.as_deref(), Some("~/workspace"));
         assert_eq!(action.limits.max_attempts_per_key, Some(3));
+
+        // Serialize -> parse round-trip yields an identical native config.
+        let reserialized = serde_yaml::to_string(&action).unwrap();
+        let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
+        assert_eq!(reloaded.action.native, action.native);
+        assert_eq!(reloaded.action.kind, action.kind);
+    }
+
+    #[test]
+    fn forgejo_ci_fix_native_parses_and_defaults() {
+        let raw = "\
+name: forgejo-ci-fix
+kind: forgejo-ci-fix
+native:
+  host: dev.a8n.run
+  repos:
+    - contoso/claude-bot
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        assert_eq!(loaded.action.kind, ActionKind::ForgejoCiFix);
+        assert!(loaded.action.kind.is_native());
+        let Some(NativeConfig::ForgejoCiFix(cfg)) = loaded.action.native else {
+            panic!("expected forgejo-ci-fix native config");
+        };
+        assert_eq!(cfg.host, "dev.a8n.run");
+        assert_eq!(cfg.repos, vec!["contoso/claude-bot".to_string()]);
+        // Unset fields fall back to the documented defaults.
+        assert_eq!(cfg.window_minutes, 45);
+        assert_eq!(cfg.max_files, 10);
+        assert_eq!(cfg.max_lines, 300);
+        assert_eq!(cfg.bot_author, "claude-bot");
+        assert_eq!(cfg.bot_email, "claude-bot@a8n.run");
+        assert_eq!(cfg.skip_marker, "[skip claude]");
+        assert!(cfg.token.is_none());
+    }
+
+    #[test]
+    fn forgejo_ci_fix_native_overrides_and_rejects_unknown_keys() {
+        let raw = "\
+name: ci
+kind: forgejo-ci-fix
+native:
+  host: forge.example
+  repos: [a/b, c/d]
+  window_minutes: 90
+  max_files: 5
+  max_lines: 120
+  bot_author: ci-bot
+  bot_email: ci-bot@example.test
+  skip_marker: \"[skip ci]\"
+  token: secret-fj
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::ForgejoCiFix(cfg)) = loaded.action.native else {
+            panic!("expected forgejo-ci-fix native config");
+        };
+        assert_eq!(cfg.host, "forge.example");
+        assert_eq!(cfg.repos, vec!["a/b".to_string(), "c/d".to_string()]);
+        assert_eq!(cfg.window_minutes, 90);
+        assert_eq!(cfg.max_files, 5);
+        assert_eq!(cfg.max_lines, 120);
+        assert_eq!(cfg.bot_author, "ci-bot");
+        assert_eq!(cfg.bot_email, "ci-bot@example.test");
+        assert_eq!(cfg.skip_marker, "[skip ci]");
+        assert_eq!(cfg.token.as_deref(), Some("secret-fj"));
+
+        let bogus = format!("{raw}  bogus: nope\n");
+        assert!(matches!(
+            validate_str(&bogus, "<candidate>").unwrap_err(),
+            Error::Yaml(_)
+        ));
+    }
+
+    /// The shipped `actions/forgejo-ci-fix.yml`, migrated to the native form:
+    /// loads, is recognized as a native forgejo-ci-fix action with no
+    /// script-bearing fields, and round-trips through serialize -> parse
+    /// unchanged (AC1 + AC3).
+    #[test]
+    fn shipped_forgejo_ci_fix_action_is_native_and_round_trips() {
+        const SHIPPED: &str = include_str!("../actions/forgejo-ci-fix.yml");
+        let loaded =
+            validate_str(SHIPPED, "actions/forgejo-ci-fix.yml").expect("shipped action valid");
+        let action = loaded.action;
+
+        assert_eq!(action.name, "forgejo-ci-fix");
+        assert_eq!(action.kind, ActionKind::ForgejoCiFix);
+        // No script-bearing fields remain on the migrated file.
+        assert!(action.input.is_none());
+        assert!(action.filter.is_none());
+        assert!(action.pre.is_empty());
+        assert!(action.prompt.is_none());
+        assert!(action.post.is_empty());
+
+        let Some(NativeConfig::ForgejoCiFix(_)) = &action.native else {
+            panic!("expected forgejo-ci-fix native config");
+        };
 
         // Serialize -> parse round-trip yields an identical native config.
         let reserialized = serde_yaml::to_string(&action).unwrap();

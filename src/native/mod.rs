@@ -15,6 +15,7 @@
 //! [`crate::job::done_record`], [`crate::job::append_output_record`]) so its
 //! outcome records and JSONL output stay byte-identical to the scripted path.
 
+pub mod forgejo_ci_fix;
 pub mod youtrack;
 
 use std::future::Future;
@@ -62,6 +63,7 @@ fn handler_for(kind: ActionKind) -> Option<Box<dyn NativeHandler>> {
     match kind {
         ActionKind::Scripted => None,
         ActionKind::Youtrack => Some(Box::new(youtrack::YoutrackHandler)),
+        ActionKind::ForgejoCiFix => Some(Box::new(forgejo_ci_fix::ForgejoCiFixHandler)),
     }
 }
 
@@ -89,5 +91,10 @@ mod tests {
     #[test]
     fn youtrack_has_a_native_handler() {
         assert!(handler_for(ActionKind::Youtrack).is_some());
+    }
+
+    #[test]
+    fn forgejo_ci_fix_has_a_native_handler() {
+        assert!(handler_for(ActionKind::ForgejoCiFix).is_some());
     }
 }

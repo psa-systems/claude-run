@@ -1,198 +1,63 @@
 ---
-# yaml-embedded-languages: nushell
-# https://github.com/harrydowning/vscode-yaml-embedded-languages
-# https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
-
 # Unattended Claude Code fix for failing CI on Forgejo PRs.
 #
-# Ports the original scripts/claude-run.nu (pre-refactor) behavior to the
-# generic runner.
+# Native action (CLAUDE-29, supersedes DEV-330): `kind: forgejo-ci-fix` routes
+# to the built-in Rust handler in `src/native/forgejo_ci_fix.rs` instead of the
+# generic nu-snippet pipeline. This file is config only and carries no
+# script-bearing fields (input.command / filter / pre / prompt / post).
 #
-# TODO(MK-12): the input.command bypasses `fj` for listing PRs because
-# `fj pr search` has no --json output. Switch to `fj pr search --json` once
-# that ships.
-# TODO(MK-13): same for CI status. `fj pr status` has no --json output (and a
-# bug with relative-URL parsing). Switch to `fj pr status --json` once that
-# ships.
+# Pipeline (all in typed Rust):
+#   gather  -> per allow-listed repo, list open PRs (fj pr search --json) and
+#              read head-commit CI status (fj pr status --json); keep PRs whose
+#              combined CI state is `failure` and that were updated within
+#              window_minutes. The dedup / attempt key is the PR head SHA.
+#   filter  -> skip PRs authored by `bot_author` (anti-feedback-loop).
+#   pre     -> git clone --branch <head_ref> --depth 50 (token auth from fj's
+#              credential store; the clone stays a git subprocess).
+#   claude  -> the action's `claude` block fixes the failing CI locally only.
+#   post    -> decision gate (no_changes / too_big via max_files + max_lines /
+#              push); on push, commit as the bot identity with the skip marker
+#              and push the branch. A PR comment is posted on EVERY outcome path.
 #
-# `fj pr comment` is used directly (it supports --body-file). Auth for the
-# remaining REST calls reuses fj's own credential store at
+# All Forgejo reads and writes go through the `fj` CLI (no raw REST). Auth for
+# clone / push reuses fj's own credential store at
 # ~/.local/share/forgejo-cli/keys.json, so no token lives in YAML or env.
+#
+# DEPLOYMENT PREREQUISITE: the runner's `fj` must be a build that exposes
+# `--json` on `pr search` (FJ-1) and `pr status` (FJ-2). An older `fj` without
+# `--json` cannot drive the gather reads.
 
 name: forgejo-ci-fix
 
-# /home has more space than /tmp
-workdir_base: $"($nu.home-dir | path join workspace)"
+kind: forgejo-ci-fix
 
-input:
-  command: |
-    #!/usr/bin/env nu
-    let host = "dev.a8n.run"
-    let repos = ["contoso/claude-fix-sandbox"]
-    let window_minutes = 45
+# Typed config for the native handler. Every field defaults; `repos` is the
+# allow-list of repositories to scan (empty means scan nothing).
+native:
+  host: dev.a8n.run
+  repos:
+    - contoso/claude-fix-sandbox
+  # Only consider PRs updated within this many minutes of the run.
+  window_minutes: 45
+  # Decision gate: a diff over either cap is too large for an unattended push.
+  max_files: 10
+  max_lines: 300
+  # Anti-feedback-loop: PRs authored by this login are skipped. Also the git
+  # author identity used for the fix commit.
+  bot_author: claude-bot
+  bot_email: claude-bot@a8n.run
+  # Appended to the fix commit message so the bot's own push does not
+  # re-trigger this action.
+  skip_marker: "[skip claude]"
+  # token: inline plaintext placeholder for CLAUDE-26 (encrypted secrets); the
+  # CLI backend uses fj's credential store today and ignores it.
 
-    let keys = (open ~/.local/share/forgejo-cli/keys.json)
-    let token = ($keys.hosts | get $host | get token)
-    let auth_header = [Authorization $"token ($token)"]
-    let cutoff = (date now) - ($window_minutes * 1min)
-
-    let jobs = ($repos | each { |repo|
-        let prs_url = $"https://($host)/api/v1/repos/($repo)/pulls?state=open"
-        let prs = (try { http get --headers $auth_header $prs_url } catch { [] })
-        $prs | each { |pr|
-            let sha = $pr.head.sha
-            let status_url = $"https://($host)/api/v1/repos/($repo)/commits/($sha)/status"
-            let status = (try { http get --headers $auth_header $status_url } catch { null })
-            if $status == null { return null }
-            if $status.state != "failure" { return null }
-            let updated = (try { $pr.updated_at | into datetime } catch { return null })
-            if $updated < $cutoff { return null }
-            {
-                host: $host,
-                repo: $repo,
-                pr_number: $pr.number,
-                branch: $pr.head.ref,
-                head_sha: $sha,
-                title: $pr.title,
-                author: ($pr | get -o user | get -o login | default "unknown"),
-                html_url: $pr.html_url,
-                updated_at: $pr.updated_at,
-            }
-        } | compact
-    } | flatten)
-    $jobs | to json
-
-dedup_key: head_sha
-
-filter: |
-  #!/usr/bin/env nu
-  # Skip PRs authored by the bot itself, otherwise feedback loop.
-  if $job.author == "claude-bot" {
-      print --stderr $"skipping bot-authored PR #($job.pr_number)"
-      exit 1
-  }
-
-pre:
-  - |
-    #!/usr/bin/env nu
-    # Clone the PR branch using fj's stored token. Runner already created
-    # $workdir as an empty dir. If a previous attempt left state behind, git
-    # clone will fail; attempt counter trips and a human investigates.
-    let keys = (open ~/.local/share/forgejo-cli/keys.json)
-    let token = ($keys.hosts | get $job.host | get token)
-    let url = $"https://oauth2:($token)@($job.host)/($job.repo).git"
-    ^git clone --branch $job.branch --depth 50 $url $workdir
+# /home has more space than /tmp.
+workdir_base: ~/workspace
 
 claude:
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
   permission_mode: acceptEdits
-
-prompt: |
-  #!/usr/bin/env nu
-  $"You are fixing a failing CI build on a pull request.
-
-  The repository is checked out in the current working directory.
-  The CI workflow files are in .forgejo/workflows/.
-
-  PR: #($job.pr_number): ($job.title)
-  Branch: ($job.branch)
-  Commit: ($job.head_sha)
-
-  Your job:
-    1. Read the CI workflow files to understand what checks run
-    2. Investigate the code to find the cause of the failure
-    3. Make the MINIMUM change needed to fix it
-    4. Do NOT weaken tests, add retries to flaky tests, or skip checks
-    5. If the failure is something you cannot safely fix (flaky test, infra issue, ambiguous requirement), explain why and make no changes
-
-  When you are done, summarize what you changed and why in plain text."
-
-post:
-  # Step 0: write a decision report for subsequent steps. Post now runs even
-  # when claude failed (timeout, error), so the very first thing is to branch
-  # on $claude_result.ok.
-  - |
-    #!/usr/bin/env nu
-    let report_file = $"($workdir)/.claude-run-post.json"
-    if ($report_file | path exists) { rm $report_file }
-
-    if not $claude_result.ok {
-        {decision: "claude_failed", files: 0, lines: 0} | to json | save $report_file
-        exit 0
-    }
-
-    let max_files = 10
-    let max_lines = 300
-
-    cd $workdir
-    let raw = (^git diff --numstat | complete)
-    let lines_list = ($raw.stdout | lines | where ($it | str trim | is-not-empty))
-    let stats = ($lines_list | each { |l|
-        let parts = ($l | split row "\t")
-        let added = (try { $parts.0 | into int } catch { 0 })
-        let deleted = (try { $parts.1 | into int } catch { 0 })
-        {added: $added, deleted: $deleted}
-    })
-    let files = ($stats | length)
-    let lines_changed = (if $files == 0 { 0 } else { $stats | each { |s| $s.added + $s.deleted } | math sum })
-    let too_big = ($files > $max_files or $lines_changed > $max_lines)
-
-    let claude_says_no = (($claude_result.summary | str downcase | str contains "no changes") or ($claude_result.summary | str downcase | str contains "making no changes") or ($claude_result.summary | str downcase | str contains "changes made: none"))
-
-    let decision = if $files == 0 or $claude_says_no {
-        "no_changes"
-    } else if $too_big {
-        "too_big"
-    } else {
-        "push"
-    }
-
-    {decision: $decision, files: $files, lines: $lines_changed} | to json | save $report_file
-
-  # Step 1: commit and push if decision == push.
-  - |
-    #!/usr/bin/env nu
-    let report = (open $"($workdir)/.claude-run-post.json")
-    if $report.decision != "push" {
-        exit 0
-    }
-
-    let keys = (open ~/.local/share/forgejo-cli/keys.json)
-    let token = ($keys.hosts | get $job.host | get token)
-
-    cd $workdir
-    git config user.name "claude-bot"
-    git config user.email "claude-bot@a8n.run"
-    git add -A
-
-    let msg_lines = [$"fix: Claude auto-fix for PR #($job.pr_number)", "", $claude_result.summary, "", "[skip claude]"]
-    let msg_file = $"($workdir)/.claude-run-commit-msg"
-    if ($msg_file | path exists) { rm $msg_file }
-    ($msg_lines | str join "\n") | save $msg_file
-    ^git commit --file $msg_file
-
-    let push_url = $"https://oauth2:($token)@($job.host)/($job.repo).git"
-    ^git push $push_url $job.branch
-
-  # Step 2: post PR comment summarizing the run via fj.
-  - |
-    #!/usr/bin/env nu
-    let report = (open $"($workdir)/.claude-run-post.json")
-    let lines = if $report.decision == "claude_failed" {
-        [$"**Claude run FAILED \(($claude_result.error)\).**", "", "Summary / stream log tail:", $claude_result.summary, "", "No changes were pushed. See the per-attempt stream log on the runner host for full context."]
-    } else if $report.decision == "push" {
-        ["**Claude pushed a fix.**", "", $claude_result.summary, "", "CI will re-run on the new commit. Review the diff before merging."]
-    } else if $report.decision == "too_big" {
-        ["**Claude attempted a fix but the diff is too large for unattended push.**", "", $"Files: ($report.files), Lines: ($report.lines)", "", "Summary:", $claude_result.summary, "", "This needs human review."]
-    } else {
-        ["**Claude ran but made no changes.**", "", $claude_result.summary]
-    }
-    let body_file = $"($workdir)/.claude-run-pr-comment.md"
-    if ($body_file | path exists) { rm $body_file }
-    ($lines | str join "\n") | save $body_file
-
-    cd $workdir
-    ^fj --host $job.host pr comment $job.pr_number --body-file $body_file
 
 output:
   file: forgejo-ci-fix.jsonl

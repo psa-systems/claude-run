@@ -47,6 +47,31 @@ pub struct VcsRepo {
     pub clone_url: String,
 }
 
+/// An open pull request as `fj pr search --json` reports it. Only the fields
+/// the CI-fix handler consumes are modelled; unknown fields are ignored so a
+/// newer `fj` adding columns does not break parsing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgePullRequest {
+    /// PR number.
+    pub number: u64,
+    #[serde(default)]
+    pub title: String,
+    /// Head-commit SHA; the CI-fix dedup / attempt key.
+    #[serde(default)]
+    pub head_sha: String,
+    /// Head branch name, cloned by the handler.
+    #[serde(default)]
+    pub head_ref: String,
+    /// Author login, matched against the bot-author skip.
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub html_url: String,
+    /// Last-update timestamp (RFC 3339), used for the scan window.
+    #[serde(default)]
+    pub updated_at: String,
+}
+
 /// A pull request opened by a [`Forge`] backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
@@ -92,6 +117,26 @@ pub trait Forge: Send + Sync {
     /// CLI's stored credentials (no token in YAML or env). `repo` is the
     /// `owner/name` path.
     fn clone_url(&self, host: &str, repo: &str) -> Result<String>;
+
+    /// List open PRs for `repo` (`owner/name`) on `host`. Backs the CI-fix scan
+    /// (`fj pr search --repo <repo> --state open --json`, FJ-1).
+    fn list_open_prs(&self, host: &str, repo: &str) -> Result<Vec<ForgePullRequest>>;
+
+    /// Combined CI status of PR `pr_number` in `repo` on `host`, e.g.
+    /// `"success"` / `"failure"` / `"pending"` (`fj pr status <repo>#<n> --json`,
+    /// FJ-2). The PR is addressed as `owner/repo#n` so no local checkout is
+    /// needed to resolve the repo.
+    fn pr_ci_state(&self, host: &str, repo: &str, pr_number: u64) -> Result<String>;
+
+    /// Post a comment on PR `pr_number` in `repo` on `host`, body read from
+    /// `body_file` (`fj pr comment <repo>#<n> --body-file <path>`).
+    fn pr_comment(
+        &self,
+        host: &str,
+        repo: &str,
+        pr_number: u64,
+        body_file: &std::path::Path,
+    ) -> Result<()>;
 }
 
 /// A backend implementing the full provider surface. Marker super-trait so the
