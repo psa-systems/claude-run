@@ -106,7 +106,7 @@ action:
 - `youtrack`: a built-in Rust handler for YouTrack. The script-bearing fields
   (`input.command`, `prompt`, `filter`, `pre`, `post`) are not used; the action
   instead supplies a typed [`native`](#native-record-required-for-native-kinds)
-  block. The handler is a stub until CLAUDE-33.
+  block.
 
 `scripted` and native kinds share all the run accounting (locking, daily caps,
 per-job attempt caps, budget, job-outcome records); only job production and the
@@ -115,17 +115,50 @@ per-job pipeline differ.
 ### `native` (record, required for native kinds)
 
 Typed configuration for a native `kind`. Required when `kind` names a native
-handler and forbidden field set is validated against that handler. Because
-`kind` is already the discriminator, the block holds the handler's config
-directly (no nested variant tag). For `kind: youtrack` the config is a
-placeholder this phase, so an empty mapping is valid:
+handler, validated against that handler. Because `kind` is already the
+discriminator, the block holds the handler's config directly (no nested variant
+tag). Omit `native` entirely for `kind: scripted`.
+
+#### `kind: youtrack`
+
+Two sub-records, `youtrack` (the issue source) and `forgejo` (the PR target).
+Every field defaults, so a bare `native: {}` validates and reproduces the
+behavior the scripted youtrack action had. The generic blocks (`workdir_base`,
+`link_template`, `limits`, `schedule`, `claude`, `output`) stay at the top level
+of the action, not inside `native`.
 
 ```yaml
 kind: youtrack
-native: {}
+native:
+  youtrack:
+    base_url: https://yt.example     # optional; default uses host-configured yt
+    token: <token>                   # optional; inline plaintext (CLAUDE-26 encrypts)
+    query: "-Resolved AI Agent: Queued"   # issues to pick up
+    custom_field: "AI Agent"         # field holding the state machine
+    states:                          # AI Agent / State labels the handler drives
+      queued: Queued
+      working: Working
+      code_review: Code Review
+      needs_review: Needs Review
+      failed: Failed
+      in_progress: In Progress       # the standard State field value set in pre
+  forgejo:
+    base_url: https://forge.example  # optional; default derives host per issue VCS
+    token: <token>                   # optional; inline plaintext (CLAUDE-26 encrypts)
 ```
 
-Omit `native` entirely for `kind: scripted`.
+| Key                        | Default                      | Meaning                                                      |
+|----------------------------|------------------------------|--------------------------------------------------------------|
+| `youtrack.base_url`        | host-configured `yt`         | YouTrack base URL. Consumed once tokens move to config (CLAUDE-26). |
+| `youtrack.token`           | none                         | API token, inline plaintext for now (CLAUDE-26 encrypts).    |
+| `youtrack.query`           | `-Resolved AI Agent: Queued` | Issue query selecting the jobs this action picks up.         |
+| `youtrack.custom_field`    | `AI Agent`                   | Custom field holding the AI Agent state machine.             |
+| `youtrack.states.*`        | see above                    | Labels the handler reads/writes for each AI Agent / State value. |
+| `forgejo.base_url`         | per-issue VCS host           | Forgejo base URL. Consumed once tokens move to config (CLAUDE-26). |
+| `forgejo.token`            | none                         | API token, inline plaintext for now (CLAUDE-26 encrypts).    |
+
+`base_url` / `token` are placeholders for CLAUDE-26 (encrypted secrets); the
+CLI backend uses host-configured `yt` / `fj` credentials today and ignores them.
 
 ### `workdir_base` (string, optional)
 

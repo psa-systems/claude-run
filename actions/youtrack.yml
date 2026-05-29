@@ -1,236 +1,73 @@
 ---
-# yaml-embedded-languages: nushell
-# https://github.com/harrydowning/vscode-yaml-embedded-languages
-# https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
-
 # Pick up YouTrack issues whose AI Agent custom field is Queued. Resolve each
 # issue's repo via the project's VCS integration, clone it into the job's
 # workdir, and have Claude work the issue end-to-end per the YouTrack and Git
 # workflows in CLAUDE.md.
 #
-# Auth: yt CLI is host-configured. No tokens in YAML.
+# Native action (CLAUDE-33): `kind: youtrack` routes to the built-in Rust
+# handler in `src/native/youtrack.rs` instead of the generic nu-snippet
+# pipeline. The handler owns gather / filter / pre / prompt / claude / finalize
+# in typed Rust; this file is config only and carries no script-bearing fields
+# (input.command / filter / pre / prompt / post).
 #
-# Requires yt 0.3.0+ (project vcs, issue get-field, issue set-field).
+# Auth: the `yt` / `fj` CLIs are host-configured. base_url / token under the
+# native blocks are inline plaintext placeholders for CLAUDE-26 (encrypted
+# secrets); the CLI backend ignores them and uses host credentials today.
 #
-# AI Agent state machine:
+# AI Agent state machine (labels configurable under native.youtrack.states):
 #   Queued       -> picked up by this action
-#   Working      -> claude is running (set in pre step)
+#   Working      -> claude is running (set in the pre step)
 #   Code Review  -> the runner opened a PR after a successful run; the code
-#                   needs human review (finalize post step)
+#                   needs human review (finalize step)
 #   Needs Review -> claude couldn't proceed and parked the job by writing
 #                   .claude-run-needs-review; the issue needs human input
-#                   (finalize post step) - attempt counter is NOT incremented
-#   Failed       -> claude or a step had a hard failure (finalize post step)
+#                   (finalize step) - the attempt counter is NOT incremented
+#   Failed       -> claude or a step had a hard failure (finalize step)
 #
 # The agent does ONLY local engineering work (read issue, branch, change, commit
 # locally, run the repo's checks). It performs NO external mutation: no git
-# push, no PR, no YouTrack write. The single finalize post step owns every
-# external mutation - PR creation and the AI Agent transition - and runs them
-# after the claude process exits, gated on the run outcome. This guarantees a PR
-# is created only on success and the AI Agent field is always advanced off
-# Working exactly once, reflecting the real outcome. The agent signals a blocker
-# by writing .claude-run-needs-review (reason text) + .claude-run-skip-attempt.
+# push, no PR, no YouTrack write. The handler's finalize step owns every external
+# mutation - PR creation and the AI Agent transition - and runs them after the
+# claude process exits, gated on the run outcome. The agent signals a blocker by
+# writing .claude-run-needs-review (reason text) + .claude-run-skip-attempt.
 #
 # State (the standard YouTrack field) is independent of AI Agent. The pre step
-# sets State=In Progress. Submitting a PR does NOT move State to Done: the
-# commit links the PR to the issue but carries no State command, so the issue
-# stays In Progress until a human merges the PR and sets State=Done themselves.
-# (State=Done while AI Agent=Code Review would be contradictory - the PR is
-# open, not merged.)
+# sets State=In Progress. Submitting a PR does NOT move State to Done: the commit
+# links the PR to the issue but carries no State command, so the issue stays In
+# Progress until a human merges the PR and sets State=Done themselves.
 
 name: youtrack
+
+kind: youtrack
+
+# Typed config for the native handler. Every field defaults, so an empty
+# `native: {}` reproduces the behavior the scripted action had; the youtrack
+# block below pins the query and custom field explicitly for documentation.
+native:
+  youtrack:
+    # --query value the handler passes to `yt list`. Starts with `-Resolved`,
+    # which the handler sends as `--query=<value>` so it is not mistaken for a
+    # flag.
+    query: "-Resolved AI Agent: Queued"
+    custom_field: "AI Agent"
+    # base_url / token: see CLAUDE-26 (encrypted secrets); host CLI auth today.
+    # states: defaults to Queued / Working / Code Review / Needs Review / Failed
+    #         and State=In Progress; override here only if the project renames
+    #         these AI Agent values.
+  forgejo: {}
+    # base_url / token: see CLAUDE-26; the host derives the forge host from each
+    # issue's resolved VCS integration today.
 
 # Per-action link template (CLAUDE-1). Job keys (idReadable, e.g. MK-16)
 # render as clickable links to the YouTrack issue in the web UI.
 link_template: "https://example.myjetbrains.com/issue/{key}"
 
 # /home has more space than /tmp.
-# Plain shell expansion: ~, $VAR, and ${VAR} are honored. The old nu-eval
-# form ($"...") is gone with the Rust port.
 workdir_base: ~/workspace
-
-input:
-  command: |
-    #!/usr/bin/env nu
-    # --query=VAL (not --query VAL): the YouTrack query starts with `-Resolved`
-    # which clap (yt arg parser) would otherwise read as an unknown short flag and bail.
-    let issues_raw = (^yt list --query='-Resolved AI Agent: Queued' --json | complete)
-    if $issues_raw.exit_code != 0 {
-        print --stderr $"yt list failed: ($issues_raw.stderr)"
-        exit 1
-    }
-    let issues = ($issues_raw.stdout | from json)
-
-    # Resolve each project's enabled VCS processor once per project key.
-    # Cached so N issues in the same project make one yt project vcs call.
-    let project_keys = ($issues | each { |i| $i.idReadable | split row "-" | first } | uniq)
-    let proj_map = ($project_keys | reduce --fold {} { |key, acc|
-        let r = (^yt project vcs $key --enabled-only --json | complete)
-        if $r.exit_code != 0 {
-            return ($acc | upsert $key null)
-        }
-        let procs = (try { $r.stdout | from json } catch { [] })
-        if ($procs | is-empty) {
-            return ($acc | upsert $key null)
-        }
-        let p = ($procs | first)
-        let host = ($p.serverUrl | str trim --right --char "/")
-        $acc | upsert $key {repo_host: $host, repo_path: $p.path, clone_url: $"($host)/($p.path).git"}
-    })
-
-    # Drop issues whose project has no enabled VCS integration; they cannot be
-    # cloned and would just fail in the pre step.
-    let jobs = ($issues | each { |i|
-        let key = ($i.idReadable | split row "-" | first)
-        let repo = ($proj_map | get -o $key)
-        if $repo == null { return null }
-        $i | merge $repo
-    } | compact)
-
-    $jobs | to json
-
-dedup_key: idReadable
-
-filter: |
-  #!/usr/bin/env nu
-  # Re-check the live AI Agent value, not the stale job snapshot. The snapshot
-  # ($job."AI Agent") was captured by input.command when the batch was gathered,
-  # so it always reports Queued for any issue that was Queued at gather time and
-  # is blind to a status change made afterward. filter runs per job immediately
-  # before pre, so a live read here honors a change made anytime in the
-  # gather-to-pre window.
-  let res = (^yt issue get-field $job.idReadable "AI Agent" | complete)
-  if $res.exit_code != 0 {
-      # Be conservative on lookup failure: skip rather than proceed, so a
-      # transient error cannot let an ineligible issue be worked. A still-Queued
-      # job is retried on the next firing.
-      print --stderr $"skipping ($job.idReadable): AI Agent lookup failed (exit ($res.exit_code))"
-      exit 1
-  }
-  let ai_agent = ($res.stdout | str trim)
-  if $ai_agent != "Queued" {
-      print --stderr $"skipping ($job.idReadable): AI Agent = ($ai_agent)"
-      exit 1
-  }
-
-pre:
-  # Mark the issue Working so concurrent or subsequent runs do not pick it up.
-  - |
-    #!/usr/bin/env nu
-    ^yt issue set-field $job.idReadable "AI Agent" "Working"
-    ^yt issue set-state $job.idReadable "In Progress"
-
-  # Clone the repo into the job's workdir. Host git identity handles auth.
-  # Runner already created $workdir as an empty dir. If a previous attempt
-  # left state behind, git clone will fail; the attempt counter trips after
-  # max_attempts_per_key and a human is expected to investigate $workdir.
-  - |
-    #!/usr/bin/env nu
-    ^git clone --depth 50 $job.clone_url $workdir
-
-prompt: |
-  #!/usr/bin/env nu
-  let lines = [
-      "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.",
-      "",
-      $"Issue: ($job.idReadable): ($job.summary)",
-      $"Repo: ($job.clone_url)",
-      $"Working directory: ($workdir) - the repo is already cloned here, you are inside it.",
-      "",
-      "Do ONLY local engineering work. Do NOT push, do NOT open a PR, and do NOT touch YouTrack (no 'yt issue set-field', no 'yt issue set-state', no comments). The runner finalizes the issue after you exit: it opens the PR from your local commits and sets the AI Agent field based on the run outcome.",
-      "",
-      "Steps:",
-      $"1. Run 'yt issue inspect ($job.idReadable)' to read the full description and acceptance criteria.",
-      "2. Create a feature branch off the default branch per the Git workflow in CLAUDE.md.",
-      "3. Make the minimum change required to satisfy the acceptance criteria.",
-      $"4. Commit with a message that references the issue on its own line as '#($job.idReadable)' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
-      "5. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). Run it in the foreground and wait for it inline; do NOT background a long-running job and poll/wait on it across turns - that is what blew the run timeout previously.",
-      "6. Stop. Do not push, do not open a PR, do not touch YouTrack. The runner opens the PR from your commits and transitions the issue.",
-      "",
-      "If you CANNOT safely complete the issue - missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue:",
-      "  a. Do NOT change any code.",
-      "  b. Write the human-facing explanation of exactly what information or decision you need to proceed to this file (the file contents are the reason, posted verbatim as the issue comment by the runner):",
-      $"       ($workdir)/.claude-run-needs-review",
-      "  c. Touch this marker file so the runner does NOT count this attempt toward the per-key cap (the job is parked pending human input, not failed):",
-      $"       ($workdir)/.claude-run-skip-attempt",
-      "  d. Do NOT touch YouTrack yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.",
-      "",
-      "When you finish, summarize what you did in plain text. Do not include a PR URL - the runner creates the PR.",
-  ]
-  $lines | str join "\n"
 
 claude:
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
   permission_mode: acceptEdits
-
-post:
-  # Single finalize step. The agent does no external mutation; every external
-  # write (PR creation, the issue comment, the AI Agent transition) happens here,
-  # after claude exits, gated on the run outcome. Collapsing this into ONE post
-  # step sidesteps the runner's break-on-first-failure (a flaky earlier step can
-  # never strand AI Agent on Working). Sub-commands run through `complete` so a
-  # failing fj/yt call records an outcome instead of aborting the step before the
-  # AI Agent write. That write is unconditional and is the LAST operation, so
-  # YouTrack reflects the final state only after PR creation and the comment, and
-  # the field never stays on Working.
-  #
-  #   blocked  (.claude-run-needs-review exists) -> park (ensure skip marker),
-  #            comment the file's reason, AI Agent=Needs Review, no PR.
-  #   success  ($claude_result.ok) -> fj pr create -aA from the agent's local
-  #            commits; comment the summary + PR URL, AI Agent=Code Review. If
-  #            fj fails, comment the fj error, AI Agent=Failed.
-  #   failure  (timeout, crash, empty prompt, pre/post failure) -> comment the
-  #            error, AI Agent=Failed, no PR.
-  #
-  # State is never set to Done here; it stays In Progress until a human merges.
-  - |
-    #!/usr/bin/env nu
-    let needs_review = $"($workdir)/.claude-run-needs-review"
-    let skip_marker = $"($workdir)/.claude-run-skip-attempt"
-
-    mut comment = ""
-    mut target = ""
-
-    if ($needs_review | path exists) {
-        # Blocker: agent parked the job pending human input. Ensure the
-        # skip-attempt marker is present so this attempt is not counted, and
-        # surface the reason verbatim. No PR.
-        if not ($skip_marker | path exists) { touch $skip_marker }
-        $comment = (open --raw $needs_review | decode utf-8 | str trim)
-        $target = "Needs Review"
-    } else if $claude_result.ok {
-        # Success: open the PR from the agent's local commits via agit+autofill,
-        # then report it. fj derives the title/body from the commit messages,
-        # which already carry the bare #<KEY>-N reference for auto-linking.
-        cd $workdir
-        let host = ($job.repo_host | url parse | get host)
-        let pr = (^fj --host $host pr create -aA | complete)
-        if $pr.exit_code == 0 {
-            let pr_num = ($pr.stdout | str trim | parse --regex 'pull request #(?P<num>\d+)' | get num.0?)
-            let pr_url = if ($pr_num | is-not-empty) {
-                $"($job.repo_host)/($job.repo_path)/pulls/($pr_num)"
-            } else {
-                $pr.stdout | str trim
-            }
-            let lines = ["Claude AI agent run summary:", "", $claude_result.summary, "", $"PR: ($pr_url)", "", $"Cost: $($claude_result.cost) USD"]
-            $comment = ($lines | str join "\n")
-            $target = "Code Review"
-        } else {
-            let lines = ["Claude AI agent run completed but PR creation FAILED:", "", ($pr.stderr | str trim), "", $claude_result.summary, "", $"Cost: $($claude_result.cost) USD"]
-            $comment = ($lines | str join "\n")
-            $target = "Failed"
-        }
-    } else {
-        # Failure: timeout (exit 124), crash, empty prompt, or pre-step failure.
-        let lines = [$"Claude AI agent run FAILED \(($claude_result.error)\):", "", $claude_result.summary, "", $"Cost: $($claude_result.cost) USD"]
-        $comment = ($lines | str join "\n")
-        $target = "Failed"
-    }
-
-    # Comment first (through complete so a failure can't abort before the AI
-    # Agent write), then write AI Agent last so it is authoritative.
-    ^yt issue comment $job.idReadable $comment | complete | ignore
-    ^yt issue set-field $job.idReadable "AI Agent" $target
 
 output:
   file: youtrack.jsonl

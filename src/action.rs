@@ -100,17 +100,15 @@ impl ActionKind {
 
 /// Typed configuration for a native (non-scripted) action: one variant per
 /// native [`ActionKind`], supplied under the action's `native:` key. Required
-/// when `kind` names a native handler, and its variant must match `kind`. The
-/// variant payloads are placeholders this phase (CLAUDE-30) and get fleshed out
-/// in CLAUDE-33.
+/// when `kind` names a native handler, and its variant must match `kind`.
 ///
 /// `#[serde(untagged)]`: the action's top-level `kind` is the discriminator, so
-/// `native:` holds the variant's fields directly (e.g. `native: {}` for the
-/// youtrack placeholder) rather than re-tagging the variant in YAML.
+/// `native:` holds the variant's fields directly (e.g. the `youtrack` blocks
+/// under `native:`) rather than re-tagging the variant in YAML.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum NativeConfig {
-    /// YouTrack built-in handler config (placeholder).
+    /// YouTrack built-in handler config.
     Youtrack(YoutrackConfig),
 }
 
@@ -123,11 +121,107 @@ impl NativeConfig {
     }
 }
 
-/// Placeholder config for the native YouTrack handler. Fields land in CLAUDE-33
-/// (Phase 4); an empty mapping (`native: {}`) validates today.
+/// Config for the native YouTrack handler (CLAUDE-33, Phase 4 of the
+/// native-action epic CLAUDE-25). Supplied under the action's `native:` key when
+/// `kind: youtrack`.
+///
+/// The generic blocks (`workdir_base`, `link_template`, `limits`, `schedule`,
+/// `claude`, `output`) stay on [`Action`]; only the YouTrack- and Forge-specific
+/// settings live here. Every field defaults, so a bare `native: {}` validates
+/// and resolves to the same behavior the scripted action had.
+///
+/// Tokens are inline plaintext for now; CLAUDE-26 moves them to encrypted
+/// storage.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct YoutrackConfig {}
+pub struct YoutrackConfig {
+    /// YouTrack source: where jobs come from and how their state is tracked.
+    pub youtrack: YoutrackSource,
+    /// Forgejo target: where the runner opens PRs from the agent's commits.
+    pub forgejo: ForgejoTarget,
+}
+
+/// YouTrack-side settings for the native handler.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct YoutrackSource {
+    /// YouTrack base URL. `None` uses the host-configured `yt` CLI default.
+    /// Consumed once tokens move into config (CLAUDE-26); the CLI backend is
+    /// host-configured today.
+    pub base_url: Option<String>,
+    /// API token (inline plaintext for now; CLAUDE-26 encrypts it).
+    pub token: Option<String>,
+    /// Issue query selecting the jobs this action picks up.
+    pub query: String,
+    /// Custom field holding the AI Agent state machine.
+    pub custom_field: String,
+    /// Labels of the AI Agent / State machine the handler drives.
+    pub states: YoutrackStates,
+}
+
+impl Default for YoutrackSource {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            token: None,
+            query: default_query(),
+            custom_field: default_custom_field(),
+            states: YoutrackStates::default(),
+        }
+    }
+}
+
+fn default_query() -> String {
+    "-Resolved AI Agent: Queued".to_string()
+}
+
+fn default_custom_field() -> String {
+    "AI Agent".to_string()
+}
+
+/// The AI Agent (and standard `State`) values the handler reads and writes.
+/// Defaults match the merged scripted action's hardcoded labels.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct YoutrackStates {
+    /// AI Agent value an issue must hold to be picked up.
+    pub queued: String,
+    /// AI Agent value set while claude runs.
+    pub working: String,
+    /// AI Agent value set after a PR opens (awaiting human review).
+    pub code_review: String,
+    /// AI Agent value set when the agent parks the job pending human input.
+    pub needs_review: String,
+    /// AI Agent value set on a hard failure.
+    pub failed: String,
+    /// Standard `State` field value set in the pre step.
+    pub in_progress: String,
+}
+
+impl Default for YoutrackStates {
+    fn default() -> Self {
+        Self {
+            queued: "Queued".to_string(),
+            working: "Working".to_string(),
+            code_review: "Code Review".to_string(),
+            needs_review: "Needs Review".to_string(),
+            failed: "Failed".to_string(),
+            in_progress: "In Progress".to_string(),
+        }
+    }
+}
+
+/// Forgejo-side settings for the native handler.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForgejoTarget {
+    /// Forgejo base URL. `None` derives the host from each issue's resolved VCS
+    /// integration (the current behavior). Consumed once tokens move into
+    /// config (CLAUDE-26).
+    pub base_url: Option<String>,
+    /// API token (inline plaintext for now; CLAUDE-26 encrypts it).
+    pub token: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -293,10 +387,74 @@ post:
         assert!(loaded.action.kind.is_native());
         assert!(loaded.action.input.is_none());
         assert!(loaded.action.prompt.is_none());
+        // A bare `native: {}` resolves every field to its default.
         assert_eq!(
             loaded.action.native,
-            Some(NativeConfig::Youtrack(YoutrackConfig {}))
+            Some(NativeConfig::Youtrack(YoutrackConfig::default()))
         );
+    }
+
+    #[test]
+    fn native_config_defaults_match_the_scripted_action() {
+        let raw = "name: yt\nkind: youtrack\nnative: {}\n";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert_eq!(cfg.youtrack.query, "-Resolved AI Agent: Queued");
+        assert_eq!(cfg.youtrack.custom_field, "AI Agent");
+        assert_eq!(cfg.youtrack.states.queued, "Queued");
+        assert_eq!(cfg.youtrack.states.working, "Working");
+        assert_eq!(cfg.youtrack.states.code_review, "Code Review");
+        assert_eq!(cfg.youtrack.states.needs_review, "Needs Review");
+        assert_eq!(cfg.youtrack.states.failed, "Failed");
+        assert_eq!(cfg.youtrack.states.in_progress, "In Progress");
+        assert!(cfg.youtrack.base_url.is_none());
+        assert!(cfg.youtrack.token.is_none());
+        assert!(cfg.forgejo.base_url.is_none());
+    }
+
+    #[test]
+    fn native_config_parses_overrides_and_rejects_unknown_keys() {
+        let raw = "\
+name: yt
+kind: youtrack
+native:
+  youtrack:
+    base_url: https://yt.example
+    token: secret-yt
+    query: \"-Resolved AI Agent: Ready\"
+    custom_field: Bot State
+    states:
+      queued: Ready
+      working: Busy
+  forgejo:
+    base_url: https://forge.example
+    token: secret-fj
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert_eq!(cfg.youtrack.base_url.as_deref(), Some("https://yt.example"));
+        assert_eq!(cfg.youtrack.token.as_deref(), Some("secret-yt"));
+        assert_eq!(cfg.youtrack.query, "-Resolved AI Agent: Ready");
+        assert_eq!(cfg.youtrack.custom_field, "Bot State");
+        // Overridden labels apply; the rest keep their defaults.
+        assert_eq!(cfg.youtrack.states.queued, "Ready");
+        assert_eq!(cfg.youtrack.states.working, "Busy");
+        assert_eq!(cfg.youtrack.states.code_review, "Code Review");
+        assert_eq!(
+            cfg.forgejo.base_url.as_deref(),
+            Some("https://forge.example")
+        );
+        assert_eq!(cfg.forgejo.token.as_deref(), Some("secret-fj"));
+
+        let bogus = format!("{raw}    bogus: nope\n");
+        assert!(matches!(
+            validate_str(&bogus, "<candidate>").unwrap_err(),
+            Error::Yaml(_)
+        ));
     }
 
     #[test]
@@ -304,6 +462,40 @@ post:
         let raw = "name: yt\nkind: youtrack\n";
         let err = validate_str(raw, "<candidate>").unwrap_err();
         assert!(matches!(err, Error::ActionMissingField { field, .. } if field == "native"));
+    }
+
+    /// The shipped `actions/youtrack.yml` migrated to the native form: it loads,
+    /// is recognized as a native youtrack action with no script-bearing fields,
+    /// and round-trips through serialize -> parse unchanged (AC2 + AC4).
+    #[test]
+    fn shipped_youtrack_action_is_native_and_round_trips() {
+        const SHIPPED: &str = include_str!("../actions/youtrack.yml");
+        let loaded = validate_str(SHIPPED, "actions/youtrack.yml").expect("shipped action valid");
+        let action = loaded.action;
+
+        assert_eq!(action.name, "youtrack");
+        assert_eq!(action.kind, ActionKind::Youtrack);
+        // No script-bearing fields remain on the migrated file.
+        assert!(action.input.is_none());
+        assert!(action.filter.is_none());
+        assert!(action.pre.is_empty());
+        assert!(action.prompt.is_none());
+        assert!(action.post.is_empty());
+
+        let Some(NativeConfig::Youtrack(cfg)) = &action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert_eq!(cfg.youtrack.query, "-Resolved AI Agent: Queued");
+        assert_eq!(cfg.youtrack.custom_field, "AI Agent");
+        // Generic blocks stay on the Action, not in the native config.
+        assert_eq!(action.workdir_base.as_deref(), Some("~/workspace"));
+        assert_eq!(action.limits.max_attempts_per_key, Some(3));
+
+        // Serialize -> parse round-trip yields an identical native config.
+        let reserialized = serde_yaml::to_string(&action).unwrap();
+        let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
+        assert_eq!(reloaded.action.native, action.native);
+        assert_eq!(reloaded.action.kind, action.kind);
     }
 
     #[test]
