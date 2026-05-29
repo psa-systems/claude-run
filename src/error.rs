@@ -51,6 +51,30 @@ pub enum Error {
     #[error("input.command stdout was not a JSON array: {0}")]
     InputNotJsonArray(String),
 
+    #[error("provider CLI `{binary}` not found in PATH")]
+    CliNotFound { binary: String },
+
+    #[error("provider CLI `{binary} {args}` failed (exit {exit_code}): {stderr}")]
+    CliFailed {
+        binary: String,
+        args: String,
+        exit_code: i32,
+        stderr: String,
+    },
+
+    #[error("provider CLI `{binary}` output parse failed ({context}): {source}")]
+    CliParse {
+        binary: String,
+        context: String,
+        source: serde_json::Error,
+    },
+
+    #[error("no enabled VCS integration for project `{0}`")]
+    NoVcsIntegration(String),
+
+    #[error("no usable provider backend (tried: {0})")]
+    NoBackend(String),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
