@@ -324,13 +324,29 @@ async fn enriched_actions(pool: &SqlitePool) -> Result<Vec<ActionView>, WebError
     Ok(out)
 }
 
-async fn fetch_recent_runs(pool: &SqlitePool, limit: i64) -> Result<Vec<RunRow>, WebError> {
-    let rows = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs ORDER BY started_at DESC LIMIT ?",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+/// CLAUDE-35: when `show_empty` is false, finished runs that processed zero jobs
+/// are hidden. In-progress runs (`exit_code IS NULL`) are always kept so a
+/// just-started run never momentarily vanishes (it can legitimately sit at
+/// `jobs_processed = 0` before its first job lands). The `LIMIT` applies after
+/// the filter, so up to `limit` matching runs are returned, not `limit` minus
+/// the hidden rows.
+async fn fetch_recent_runs(
+    pool: &SqlitePool,
+    limit: i64,
+    show_empty: bool,
+) -> Result<Vec<RunRow>, WebError> {
+    let where_clause = if show_empty {
+        ""
+    } else {
+        " WHERE jobs_processed > 0 OR exit_code IS NULL"
+    };
+    let sql = format!(
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs{where_clause} ORDER BY started_at DESC LIMIT ?"
+    );
+    let rows = sqlx::query_as::<_, RunRow>(&sql)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 
@@ -346,9 +362,23 @@ struct DashboardTpl {
     today_cost: f64,
     actions: Vec<ActionView>,
     recent_runs: Vec<RunRow>,
+    /// CLAUDE-35: current state of the "Show empty runs" toggle. Threaded into
+    /// the poll-region `hx-get` so the choice survives the 5s self-refresh.
+    show_empty: bool,
 }
 
-async fn dashboard(State(s): State<WebState>) -> Result<Html<String>, WebError> {
+/// CLAUDE-35: query params for the dashboard. `show_empty` defaults to `false`
+/// when the param is absent, so the page loads with 0-job finished runs hidden.
+#[derive(Deserialize, Default)]
+struct DashboardQuery {
+    #[serde(default)]
+    show_empty: bool,
+}
+
+async fn dashboard(
+    State(s): State<WebState>,
+    Query(q): Query<DashboardQuery>,
+) -> Result<Html<String>, WebError> {
     let pool = &s.api.pool;
     let global_pause = state::global_pause_status(pool)
         .await?
@@ -357,7 +387,7 @@ async fn dashboard(State(s): State<WebState>) -> Result<Html<String>, WebError> 
             reason: r,
         });
     let actions = enriched_actions(pool).await?;
-    let recent_runs = fetch_recent_runs(pool, 20).await?;
+    let recent_runs = fetch_recent_runs(pool, 20, q.show_empty).await?;
 
     // Today totals: sum across all actions
     let today = state::today_local().to_string();
@@ -383,6 +413,7 @@ async fn dashboard(State(s): State<WebState>) -> Result<Html<String>, WebError> 
         today_cost,
         actions,
         recent_runs,
+        show_empty: q.show_empty,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
