@@ -254,6 +254,39 @@ impl Forge for CliBackend {
         })
     }
 
+    fn list_open_prs(&self, host: &str, repo: &str) -> Result<Vec<super::ForgePullRequest>> {
+        let args = [
+            "--host", host, "pr", "search", "--repo", repo, "--state", "open", "--json",
+        ];
+        let out = self.runner.run(&self.fj, &args)?;
+        let stdout = Self::checked(&self.fj, out, &args)?;
+        Self::parse_json(&self.fj, "fj pr search --json", &stdout)
+    }
+
+    fn pr_ci_state(&self, host: &str, repo: &str, pr_number: u64) -> Result<String> {
+        // Address the PR as `owner/repo#n` so `fj` resolves the repo without a
+        // local checkout (gather runs before any clone).
+        let id = format!("{repo}#{pr_number}");
+        let args = ["--host", host, "pr", "status", &id, "--json"];
+        let out = self.runner.run(&self.fj, &args)?;
+        let stdout = Self::checked(&self.fj, out, &args)?;
+        #[derive(Deserialize)]
+        struct Status {
+            state: String,
+        }
+        let status: Status = Self::parse_json(&self.fj, "fj pr status --json", &stdout)?;
+        Ok(status.state)
+    }
+
+    fn pr_comment(&self, host: &str, repo: &str, pr_number: u64, body_file: &Path) -> Result<()> {
+        let id = format!("{repo}#{pr_number}");
+        let body = body_file.to_string_lossy();
+        let args = ["--host", host, "pr", "comment", &id, "--body-file", &body];
+        let out = self.runner.run(&self.fj, &args)?;
+        Self::checked(&self.fj, out, &args)?;
+        Ok(())
+    }
+
     fn clone_url(&self, host: &str, repo: &str) -> Result<String> {
         // fj exposes no command to emit an authenticated clone URL, so read its
         // own key store (the same store `fj` writes). No token in YAML or env.
@@ -518,6 +551,88 @@ mod tests {
         assert_eq!(
             url,
             "https://oauth2:secret@dev.a8n.run/contoso/claude-bot.git"
+        );
+    }
+
+    #[test]
+    fn list_open_prs_parses_search_json() {
+        let json = r#"[{"number":52,"title":"feat: x","state":"open","head_sha":"abc","head_ref":"feat/x","base_ref":"main","author":"David","html_url":"https://dev.a8n.run/n/c/pulls/52","updated_at":"2026-05-29T11:10:28Z","draft":false,"labels":[]}]"#;
+        let b = backend(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "search",
+                "--repo",
+                "contoso/claude-bot",
+                "--state",
+                "open",
+                "--json",
+            ],
+            json,
+        ));
+        let prs = b
+            .list_open_prs("dev.a8n.run", "contoso/claude-bot")
+            .unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 52);
+        assert_eq!(prs[0].head_sha, "abc");
+        assert_eq!(prs[0].head_ref, "feat/x");
+        assert_eq!(prs[0].author, "David");
+        assert_eq!(prs[0].updated_at, "2026-05-29T11:10:28Z");
+    }
+
+    #[test]
+    fn pr_ci_state_extracts_combined_state() {
+        let json = r#"{"pr":52,"head_sha":"abc","state":"failure","statuses":[],"mergeable":true,"merged":false}"#;
+        let b = backend(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "status",
+                "contoso/claude-bot#52",
+                "--json",
+            ],
+            json,
+        ));
+        assert_eq!(
+            b.pr_ci_state("dev.a8n.run", "contoso/claude-bot", 52)
+                .unwrap(),
+            "failure"
+        );
+    }
+
+    #[test]
+    fn pr_comment_addresses_pr_by_owner_repo_hash() {
+        let runner = std::sync::Arc::new(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "comment",
+                "contoso/claude-bot#52",
+                "--body-file",
+                "/tmp/body.md",
+            ],
+            "",
+        ));
+        let b = CliBackend::new(runner.clone());
+        b.pr_comment(
+            "dev.a8n.run",
+            "contoso/claude-bot",
+            52,
+            Path::new("/tmp/body.md"),
+        )
+        .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c
+                == "fj --host dev.a8n.run pr comment contoso/claude-bot#52 --body-file /tmp/body.md"),
+            "{calls:?}"
         );
     }
 

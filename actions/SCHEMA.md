@@ -107,6 +107,9 @@ action:
   (`input.command`, `prompt`, `filter`, `pre`, `post`) are not used; the action
   instead supplies a typed [`native`](#native-record-required-for-native-kinds)
   block.
+- `forgejo-ci-fix`: a built-in Rust handler that fixes failing CI on Forgejo PRs
+  (CLAUDE-29, supersedes DEV-330). Like `youtrack` it is config only and supplies
+  a typed [`native`](#native-record-required-for-native-kinds) block.
 
 `scripted` and native kinds share all the run accounting (locking, daily caps,
 per-job attempt caps, budget, job-outcome records); only job production and the
@@ -159,6 +162,51 @@ native:
 
 `base_url` / `token` are placeholders for CLAUDE-26 (encrypted secrets); the
 CLI backend uses host-configured `yt` / `fj` credentials today and ignores them.
+
+#### `kind: forgejo-ci-fix`
+
+A single flat config record (no sub-records). The handler scans `repos` on
+`host` for open PRs whose head-commit combined CI state is `failure` and that
+were updated within `window_minutes`, skips PRs authored by `bot_author`, clones
+the PR branch, runs Claude to fix the failing CI, applies a diff-size decision
+gate, commits as the bot identity with `skip_marker` and pushes on `push`, and
+posts a PR comment on every outcome path. The dedup / attempt key is the PR head
+SHA (a per-commit attempt cap). The generic blocks (`workdir_base`, `claude`,
+`limits`, `schedule`, `output`) stay at the top level of the action, not inside
+`native`.
+
+```yaml
+kind: forgejo-ci-fix
+native:
+  host: dev.a8n.run                # forge host passed to `fj --host`
+  repos:                           # allow-list of owner/name repos to scan
+    - contoso/claude-fix-sandbox
+  window_minutes: 45               # only PRs updated this recently
+  max_files: 10                    # decision gate: too_big over this many files
+  max_lines: 300                   # decision gate: too_big over this many lines
+  bot_author: claude-bot           # skipped author + git commit author name
+  bot_email: claude-bot@a8n.run    # git commit author email
+  skip_marker: "[skip claude]"     # appended to the fix commit message
+  token: <token>                   # optional; inline plaintext (CLAUDE-26 encrypts)
+```
+
+| Key              | Default              | Meaning                                                          |
+|------------------|----------------------|------------------------------------------------------------------|
+| `host`           | `dev.a8n.run`        | Forgejo host (bare, no scheme) passed to `fj --host`.            |
+| `repos`          | `[]`                 | Allow-list of `owner/name` repos to scan. Empty means scan none. |
+| `window_minutes` | `45`                 | Only consider PRs updated within this many minutes of the run.   |
+| `max_files`      | `10`                 | Decision gate: a diff touching more files is `too_big`.          |
+| `max_lines`      | `300`                | Decision gate: a diff changing more lines is `too_big`.          |
+| `bot_author`     | `claude-bot`         | Author login skipped (anti-feedback-loop) + git commit author.   |
+| `bot_email`      | `claude-bot@a8n.run` | Git commit author email.                                         |
+| `skip_marker`    | `[skip claude]`      | Appended to the fix commit so the bot's push does not re-trigger.|
+| `token`          | none                 | API token, inline plaintext for now (CLAUDE-26 encrypts).        |
+
+All Forgejo reads (open PRs, head-commit CI status) and the comment write go
+through the `fj` CLI (no raw REST); clone / push auth comes from `fj`'s own
+credential store. **Deployment prerequisite:** the runner's `fj` must be a build
+that exposes `--json` on `pr search` (FJ-1) and `pr status` (FJ-2). An older
+`fj` without `--json` cannot drive the gather reads.
 
 ### `workdir_base` (string, optional)
 
