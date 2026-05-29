@@ -31,6 +31,7 @@ pub mod migrate;
 pub mod native;
 pub mod provider;
 pub mod scheduler;
+pub mod secrets;
 pub mod snippet;
 pub mod state;
 pub mod web;

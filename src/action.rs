@@ -138,8 +138,9 @@ impl NativeConfig {
 /// settings live here. Every field defaults, so a bare `native: {}` validates
 /// and resolves to the same behavior the scripted action had.
 ///
-/// Tokens are inline plaintext for now; CLAUDE-26 moves them to encrypted
-/// storage.
+/// Credentials are referenced by name (`token_ref`), not embedded: see
+/// [`crate::secrets`] (CLAUDE-26). When neither block sets a `token_ref` the
+/// CLIs use host auth, exactly as the scripted action did.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct YoutrackConfig {
@@ -153,12 +154,14 @@ pub struct YoutrackConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct YoutrackSource {
-    /// YouTrack base URL. `None` uses the host-configured `yt` CLI default.
-    /// Consumed once tokens move into config (CLAUDE-26); the CLI backend is
-    /// host-configured today.
+    /// YouTrack base URL. `None` uses the host-configured `yt` CLI default; it
+    /// is required when `token_ref` is set, since the injected `yt` config needs
+    /// a `url` (CLAUDE-26).
     pub base_url: Option<String>,
-    /// API token (inline plaintext for now; CLAUDE-26 encrypts it).
-    pub token: Option<String>,
+    /// Name of the encrypted secret holding the YouTrack API token (CLAUDE-26).
+    /// `None` uses host `yt` auth. The raw token is never stored here; it is
+    /// resolved from the [`crate::secrets`] store and injected at run time.
+    pub token_ref: Option<String>,
     /// Issue query selecting the jobs this action picks up.
     pub query: String,
     /// Custom field holding the AI Agent state machine.
@@ -171,7 +174,7 @@ impl Default for YoutrackSource {
     fn default() -> Self {
         Self {
             base_url: None,
-            token: None,
+            token_ref: None,
             query: default_query(),
             custom_field: default_custom_field(),
             states: YoutrackStates::default(),
@@ -224,11 +227,12 @@ impl Default for YoutrackStates {
 #[serde(default, deny_unknown_fields)]
 pub struct ForgejoTarget {
     /// Forgejo base URL. `None` derives the host from each issue's resolved VCS
-    /// integration (the current behavior). Consumed once tokens move into
-    /// config (CLAUDE-26).
+    /// integration (the current behavior).
     pub base_url: Option<String>,
-    /// API token (inline plaintext for now; CLAUDE-26 encrypts it).
-    pub token: Option<String>,
+    /// Name of the encrypted secret holding the Forgejo API token (CLAUDE-26).
+    /// `None` uses host `fj` auth. The raw token is never stored here; it is
+    /// resolved from the [`crate::secrets`] store and injected at run time.
+    pub token_ref: Option<String>,
 }
 
 /// Config for the native Forgejo CI-fix handler (CLAUDE-29, supersedes
@@ -489,8 +493,9 @@ post:
         assert_eq!(cfg.youtrack.states.failed, "Failed");
         assert_eq!(cfg.youtrack.states.in_progress, "In Progress");
         assert!(cfg.youtrack.base_url.is_none());
-        assert!(cfg.youtrack.token.is_none());
+        assert!(cfg.youtrack.token_ref.is_none());
         assert!(cfg.forgejo.base_url.is_none());
+        assert!(cfg.forgejo.token_ref.is_none());
     }
 
     #[test]
@@ -501,7 +506,7 @@ kind: youtrack
 native:
   youtrack:
     base_url: https://yt.example
-    token: secret-yt
+    token_ref: yt-prod
     query: \"-Resolved AI Agent: Ready\"
     custom_field: Bot State
     states:
@@ -509,14 +514,14 @@ native:
       working: Busy
   forgejo:
     base_url: https://forge.example
-    token: secret-fj
+    token_ref: fj-prod
 ";
         let loaded = validate_str(raw, "<candidate>").unwrap();
         let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
             panic!("expected youtrack native config");
         };
         assert_eq!(cfg.youtrack.base_url.as_deref(), Some("https://yt.example"));
-        assert_eq!(cfg.youtrack.token.as_deref(), Some("secret-yt"));
+        assert_eq!(cfg.youtrack.token_ref.as_deref(), Some("yt-prod"));
         assert_eq!(cfg.youtrack.query, "-Resolved AI Agent: Ready");
         assert_eq!(cfg.youtrack.custom_field, "Bot State");
         // Overridden labels apply; the rest keep their defaults.
@@ -527,7 +532,7 @@ native:
             cfg.forgejo.base_url.as_deref(),
             Some("https://forge.example")
         );
-        assert_eq!(cfg.forgejo.token.as_deref(), Some("secret-fj"));
+        assert_eq!(cfg.forgejo.token_ref.as_deref(), Some("fj-prod"));
 
         let bogus = format!("{raw}    bogus: nope\n");
         assert!(matches!(

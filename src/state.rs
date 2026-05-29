@@ -422,6 +422,89 @@ pub async fn action_last_run_started(pool: &SqlitePool, action: &str) -> Result<
     Ok(row.map(|(s,)| s))
 }
 
+// ---- CLAUDE-26: encrypted secrets ---------------------------------------
+
+/// Metadata for one stored secret. The ciphertext is never carried in this
+/// view, so the listing the web UI renders can never leak a value.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct SecretMeta {
+    pub name: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+}
+
+/// List stored secrets (names + timestamps only), alphabetical by name.
+pub async fn secret_list(pool: &SqlitePool) -> Result<Vec<SecretMeta>> {
+    let rows = sqlx::query_as::<_, SecretMeta>(
+        "SELECT name, created_at, last_used_at FROM secrets ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// True when a secret with `name` already exists.
+pub async fn secret_exists(pool: &SqlitePool, name: &str) -> Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM secrets WHERE name = ?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Create a new secret. Errors via the UNIQUE constraint when `name` is taken;
+/// callers should check [`secret_exists`] first for a friendly message.
+pub async fn secret_create(pool: &SqlitePool, name: &str, ciphertext: &[u8]) -> Result<()> {
+    let now = now_iso();
+    sqlx::query("INSERT INTO secrets (name, ciphertext, created_at) VALUES (?, ?, ?)")
+        .bind(name)
+        .bind(ciphertext)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Rotate an existing secret's value in place (keeps `created_at`). Returns
+/// `false` when no secret with `name` exists.
+pub async fn secret_rotate(pool: &SqlitePool, name: &str, ciphertext: &[u8]) -> Result<bool> {
+    let res = sqlx::query("UPDATE secrets SET ciphertext = ? WHERE name = ?")
+        .bind(ciphertext)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Delete a secret. Returns `false` when no secret with `name` exists.
+pub async fn secret_delete(pool: &SqlitePool, name: &str) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM secrets WHERE name = ?")
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Fetch a secret's raw ciphertext for decryption at run time.
+pub async fn secret_get_ciphertext(pool: &SqlitePool, name: &str) -> Result<Option<Vec<u8>>> {
+    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT ciphertext FROM secrets WHERE name = ?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(c,)| c))
+}
+
+/// Bump a secret's `last_used_at` to now (best-effort run-time audit).
+pub async fn secret_touch(pool: &SqlitePool, name: &str) -> Result<()> {
+    let now = now_iso();
+    sqlx::query("UPDATE secrets SET last_used_at = ? WHERE name = ?")
+        .bind(&now)
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +566,44 @@ mod tests {
             exit_code_of(&pool, finished).await,
             Some(crate::exit::OK as i64)
         );
+    }
+
+    #[tokio::test]
+    async fn secrets_crud_round_trips() {
+        let pool = mem_pool().await;
+        assert!(secret_list(&pool).await.unwrap().is_empty());
+        assert!(!secret_exists(&pool, "yt").await.unwrap());
+
+        secret_create(&pool, "yt", b"ciphertext-v1").await.unwrap();
+        assert!(secret_exists(&pool, "yt").await.unwrap());
+        // Duplicate create is rejected by the UNIQUE constraint.
+        assert!(secret_create(&pool, "yt", b"dup").await.is_err());
+
+        let list = secret_list(&pool).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "yt");
+        assert!(list[0].last_used_at.is_none());
+
+        assert_eq!(
+            secret_get_ciphertext(&pool, "yt").await.unwrap().unwrap(),
+            b"ciphertext-v1"
+        );
+
+        // Rotate replaces the ciphertext; touch records use.
+        assert!(secret_rotate(&pool, "yt", b"ciphertext-v2").await.unwrap());
+        assert_eq!(
+            secret_get_ciphertext(&pool, "yt").await.unwrap().unwrap(),
+            b"ciphertext-v2"
+        );
+        secret_touch(&pool, "yt").await.unwrap();
+        assert!(secret_list(&pool).await.unwrap()[0].last_used_at.is_some());
+
+        // Rotating / deleting an unknown name reports "did not exist".
+        assert!(!secret_rotate(&pool, "ghost", b"x").await.unwrap());
+        assert!(!secret_delete(&pool, "ghost").await.unwrap());
+
+        assert!(secret_delete(&pool, "yt").await.unwrap());
+        assert!(secret_list(&pool).await.unwrap().is_empty());
     }
 
     #[tokio::test]

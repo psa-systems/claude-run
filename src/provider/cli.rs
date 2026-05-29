@@ -25,15 +25,34 @@ pub struct CmdOutput {
 }
 
 /// Abstraction over spawning a process. The real impl is [`ProcessRunner`];
-/// tests substitute a stub. `run`/`run_in` return [`Error::CliNotFound`] when
+/// tests substitute a stub. The methods return [`Error::CliNotFound`] when
 /// `binary` is absent from `PATH`, so callers can probe availability.
+///
+/// [`CommandRunner::run_in_env`] is the one required method (CLAUDE-26: it adds
+/// per-child env injection so a job's decrypted credentials reach the `yt` / `fj`
+/// child only). `run` / `run_in` are thin wrappers, so existing call sites that
+/// need neither a working dir nor env are unchanged.
 pub trait CommandRunner: Send + Sync {
+    /// Run `binary args...` in optional working dir `dir`, with `envs`
+    /// (`(name, value)`) set on the child process only.
+    fn run_in_env(
+        &self,
+        dir: Option<&Path>,
+        binary: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> Result<CmdOutput>;
+
     /// Run `binary args...` and capture its output.
-    fn run(&self, binary: &str, args: &[&str]) -> Result<CmdOutput>;
+    fn run(&self, binary: &str, args: &[&str]) -> Result<CmdOutput> {
+        self.run_in_env(None, binary, args, &[])
+    }
 
     /// Run `binary args...` with the working directory set to `dir` (needed for
     /// `fj pr create`, which reads the repo from `cwd`).
-    fn run_in(&self, dir: &Path, binary: &str, args: &[&str]) -> Result<CmdOutput>;
+    fn run_in(&self, dir: &Path, binary: &str, args: &[&str]) -> Result<CmdOutput> {
+        self.run_in_env(Some(dir), binary, args, &[])
+    }
 }
 
 /// Real [`CommandRunner`]: shells out via [`std::process::Command`].
@@ -45,7 +64,12 @@ impl ProcessRunner {
         Self
     }
 
-    fn exec(binary: &str, args: &[&str], dir: Option<&Path>) -> Result<CmdOutput> {
+    fn exec(
+        binary: &str,
+        args: &[&str],
+        dir: Option<&Path>,
+        envs: &[(&str, &str)],
+    ) -> Result<CmdOutput> {
         let mut cmd = Command::new(binary);
         cmd.args(args)
             .stdin(Stdio::null())
@@ -53,6 +77,9 @@ impl ProcessRunner {
             .stderr(Stdio::piped());
         if let Some(d) = dir {
             cmd.current_dir(d);
+        }
+        for (k, v) in envs {
+            cmd.env(k, v);
         }
         let output = match cmd.output() {
             Ok(o) => o,
@@ -75,12 +102,14 @@ impl ProcessRunner {
 }
 
 impl CommandRunner for ProcessRunner {
-    fn run(&self, binary: &str, args: &[&str]) -> Result<CmdOutput> {
-        Self::exec(binary, args, None)
-    }
-
-    fn run_in(&self, dir: &Path, binary: &str, args: &[&str]) -> Result<CmdOutput> {
-        Self::exec(binary, args, Some(dir))
+    fn run_in_env(
+        &self,
+        dir: Option<&Path>,
+        binary: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> Result<CmdOutput> {
+        Self::exec(binary, args, dir, envs)
     }
 }
 
@@ -91,8 +120,16 @@ pub struct CliBackend {
     yt: String,
     fj: String,
     /// Path to the forge CLI's key store (`forgejo-cli/keys.json`), read by
-    /// [`Forge::clone_url`]. Overridable for tests.
+    /// [`Forge::clone_url`]. Overridable for tests and for CLAUDE-26's per-job
+    /// temp credential store.
     keys_path: PathBuf,
+    /// CLAUDE-26: env (`(name, value)`) injected on the `yt` child only, e.g.
+    /// `YOUTRACK_CLI_CONFIG` pointing at a temp single-file config holding the
+    /// decrypted token. Empty (the default) leaves the `yt` CLI on host auth.
+    yt_env: Vec<(String, String)>,
+    /// CLAUDE-26: env injected on the `fj` child only, e.g. an `XDG_DATA_HOME`
+    /// override pointing at a temp `forgejo-cli/keys.json`. Empty by default.
+    fj_env: Vec<(String, String)>,
 }
 
 /// Shape of the forge CLI key store (`~/.local/share/forgejo-cli/keys.json`):
@@ -128,6 +165,8 @@ impl CliBackend {
             yt: "yt".to_string(),
             fj: "fj".to_string(),
             keys_path,
+            yt_env: Vec::new(),
+            fj_env: Vec::new(),
         }
     }
 
@@ -144,6 +183,36 @@ impl CliBackend {
         self
     }
 
+    /// CLAUDE-26: inject env on the `yt` child only (decrypted-credential
+    /// `YOUTRACK_CLI_CONFIG`). Empty leaves host auth.
+    pub fn with_yt_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.yt_env = env;
+        self
+    }
+
+    /// CLAUDE-26: inject env on the `fj` child only (an `XDG_DATA_HOME` override
+    /// pointing at a temp `keys.json`). Empty leaves host auth.
+    pub fn with_fj_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.fj_env = env;
+        self
+    }
+
+    /// Borrow the `yt` child env as the `(&str, &str)` slice the runner takes.
+    fn yt_envs(&self) -> Vec<(&str, &str)> {
+        self.yt_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
+    /// Borrow the `fj` child env as the `(&str, &str)` slice the runner takes.
+    fn fj_envs(&self) -> Vec<(&str, &str)> {
+        self.fj_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
     /// Probe that both CLIs are invokable (`<bin> --version`). Used by the
     /// factory to decide whether this backend is usable. A missing binary
     /// surfaces as [`Error::CliNotFound`].
@@ -156,7 +225,10 @@ impl CliBackend {
     /// Run `yt args...`, returning trimmed stdout on success or
     /// [`Error::CliFailed`] on a non-zero exit.
     fn yt_ok(&self, args: &[&str]) -> Result<String> {
-        Self::checked(&self.yt, self.runner.run(&self.yt, args)?, args)
+        let out = self
+            .runner
+            .run_in_env(None, &self.yt, args, &self.yt_envs())?;
+        Self::checked(&self.yt, out, args)
     }
 
     /// Convert a [`CmdOutput`] into trimmed stdout or a typed [`Error::CliFailed`].
@@ -240,7 +312,9 @@ impl Forge for CliBackend {
         // Runner-side agit + autofill: fj derives the title/body from the local
         // commit messages, which already carry the bare #<KEY>-N reference.
         let args = ["--host", host, "pr", "create", "-aA"];
-        let out = self.runner.run_in(workdir, &self.fj, &args)?;
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), &self.fj, &args, &self.fj_envs())?;
         let stdout = Self::checked(&self.fj, out, &args)?;
         let trimmed = stdout.trim();
         // fj prints a line containing `pull request #<n>`; pull the number out.
@@ -258,7 +332,9 @@ impl Forge for CliBackend {
         let args = [
             "--host", host, "pr", "search", "--repo", repo, "--state", "open", "--json",
         ];
-        let out = self.runner.run(&self.fj, &args)?;
+        let out = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
         let stdout = Self::checked(&self.fj, out, &args)?;
         Self::parse_json(&self.fj, "fj pr search --json", &stdout)
     }
@@ -268,7 +344,9 @@ impl Forge for CliBackend {
         // local checkout (gather runs before any clone).
         let id = format!("{repo}#{pr_number}");
         let args = ["--host", host, "pr", "status", &id, "--json"];
-        let out = self.runner.run(&self.fj, &args)?;
+        let out = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
         let stdout = Self::checked(&self.fj, out, &args)?;
         #[derive(Deserialize)]
         struct Status {
@@ -282,7 +360,9 @@ impl Forge for CliBackend {
         let id = format!("{repo}#{pr_number}");
         let body = body_file.to_string_lossy();
         let args = ["--host", host, "pr", "comment", &id, "--body-file", &body];
-        let out = self.runner.run(&self.fj, &args)?;
+        let out = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
         Self::checked(&self.fj, out, &args)?;
         Ok(())
     }
@@ -324,6 +404,9 @@ pub mod testutil {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    /// One recorded env injection: `(binary, [(name, value), ...])`.
+    pub type EnvCall = (String, Vec<(String, String)>);
+
     #[derive(Default)]
     pub struct StubRunner {
         /// (binary, joined-args) -> outcome.
@@ -332,6 +415,8 @@ pub mod testutil {
         missing: Vec<String>,
         /// Records every (binary, args) invocation for assertions.
         pub calls: Mutex<Vec<String>>,
+        /// CLAUDE-26: records the injected child env per invocation for assertions.
+        pub envs: Mutex<Vec<EnvCall>>,
     }
 
     impl StubRunner {
@@ -397,11 +482,19 @@ pub mod testutil {
     }
 
     impl CommandRunner for StubRunner {
-        fn run(&self, binary: &str, args: &[&str]) -> Result<CmdOutput> {
-            self.lookup(binary, args)
-        }
-
-        fn run_in(&self, _dir: &Path, binary: &str, args: &[&str]) -> Result<CmdOutput> {
+        fn run_in_env(
+            &self,
+            _dir: Option<&Path>,
+            binary: &str,
+            args: &[&str],
+            envs: &[(&str, &str)],
+        ) -> Result<CmdOutput> {
+            self.envs.lock().unwrap().push((
+                binary.to_string(),
+                envs.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ));
             self.lookup(binary, args)
         }
     }
@@ -634,6 +727,58 @@ mod tests {
                 == "fj --host dev.a8n.run pr comment contoso/claude-bot#52 --body-file /tmp/body.md"),
             "{calls:?}"
         );
+    }
+
+    #[test]
+    fn injected_env_reaches_yt_and_fj_children_only() {
+        // CLAUDE-26: a credentialed backend injects YOUTRACK_CLI_CONFIG onto the
+        // yt child and an XDG_DATA_HOME override onto the fj child, each on its
+        // own child only.
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Queued\n",
+                )
+                .ok(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
+                    "Created pull request #7",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone())
+            .with_yt_env(vec![(
+                "YOUTRACK_CLI_CONFIG".to_string(),
+                "/tmp/creds/yt-config.yml".to_string(),
+            )])
+            .with_fj_env(vec![(
+                "XDG_DATA_HOME".to_string(),
+                "/tmp/creds".to_string(),
+            )]);
+
+        backend.get_field("MK-16", "AI Agent").unwrap();
+        backend
+            .create_pr(Path::new("/tmp/x"), "dev.a8n.run")
+            .unwrap();
+
+        let envs = runner.envs.lock().unwrap();
+        let yt = envs.iter().find(|(b, _)| b == "yt").unwrap();
+        assert_eq!(
+            yt.1,
+            vec![(
+                "YOUTRACK_CLI_CONFIG".to_string(),
+                "/tmp/creds/yt-config.yml".to_string()
+            )]
+        );
+        // The yt child never sees the fj env, and vice versa.
+        assert!(!yt.1.iter().any(|(k, _)| k == "XDG_DATA_HOME"));
+        let fj = envs.iter().find(|(b, _)| b == "fj").unwrap();
+        assert_eq!(
+            fj.1,
+            vec![("XDG_DATA_HOME".to_string(), "/tmp/creds".to_string())]
+        );
+        assert!(!fj.1.iter().any(|(k, _)| k == "YOUTRACK_CLI_CONFIG"));
     }
 
     #[test]

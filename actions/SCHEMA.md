@@ -137,8 +137,8 @@ of the action, not inside `native`.
 kind: youtrack
 native:
   youtrack:
-    base_url: https://yt.example     # optional; default uses host-configured yt
-    token: <token>                   # optional; inline plaintext (CLAUDE-26 encrypts)
+    base_url: https://yt.example     # optional; required when token_ref is set
+    token_ref: yt-prod               # optional; name of an encrypted secret
     query: "-Resolved AI Agent: Queued"   # issues to pick up
     custom_field: "AI Agent"         # field holding the state machine
     states:                          # AI Agent / State labels the handler drives
@@ -150,21 +150,30 @@ native:
       in_progress: In Progress       # the standard State field value set in pre
   forgejo:
     base_url: https://forge.example  # optional; default derives host per issue VCS
-    token: <token>                   # optional; inline plaintext (CLAUDE-26 encrypts)
+    token_ref: fj-prod               # optional; name of an encrypted secret
 ```
 
 | Key                        | Default                      | Meaning                                                      |
 |----------------------------|------------------------------|--------------------------------------------------------------|
-| `youtrack.base_url`        | host-configured `yt`         | YouTrack base URL. Consumed once tokens move to config (CLAUDE-26). |
-| `youtrack.token`           | none                         | API token, inline plaintext for now (CLAUDE-26 encrypts).    |
+| `youtrack.base_url`        | host-configured `yt`         | YouTrack base URL. Required when `token_ref` is set (the injected `yt` config needs a `url`). |
+| `youtrack.token_ref`       | none                         | Name of an encrypted secret holding the YouTrack API token (CLAUDE-26). `None` uses host `yt` auth. |
 | `youtrack.query`           | `-Resolved AI Agent: Queued` | Issue query selecting the jobs this action picks up.         |
 | `youtrack.custom_field`    | `AI Agent`                   | Custom field holding the AI Agent state machine.             |
 | `youtrack.states.*`        | see above                    | Labels the handler reads/writes for each AI Agent / State value. |
-| `forgejo.base_url`         | per-issue VCS host           | Forgejo base URL. Consumed once tokens move to config (CLAUDE-26). |
-| `forgejo.token`            | none                         | API token, inline plaintext for now (CLAUDE-26 encrypts).    |
+| `forgejo.base_url`         | per-issue VCS host           | Forgejo base URL.                                            |
+| `forgejo.token_ref`        | none                         | Name of an encrypted secret holding the Forgejo API token (CLAUDE-26). `None` uses host `fj` auth. |
 
-`base_url` / `token` are placeholders for CLAUDE-26 (encrypted secrets); the
-CLI backend uses host-configured `yt` / `fj` credentials today and ignores them.
+#### Credential injection (CLAUDE-26)
+
+`token_ref` names an entry in the encrypted secrets store (managed under
+`/secrets` in the web UI, encrypted at rest with the `age` key file named by
+`CLAUDE_RUN_SECRETS_KEY_FILE`). A raw token is **never** written to the action
+YAML, exported, or logged. When a block sets `token_ref`, the runner decrypts the
+secret at run time and materializes per-job, mode-`0600` credential files (a
+single-file `yt` config and a temp forgejo `keys.json`), injecting them into the
+`yt` / `fj` children for that job only and scrubbing them when the job finishes.
+When neither block sets `token_ref`, the CLIs fall back to host-configured
+credentials exactly as the scripted action did.
 
 #### `kind: forgejo-ci-fix`
 
