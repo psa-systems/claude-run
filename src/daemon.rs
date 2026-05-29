@@ -18,6 +18,7 @@ use crate::action::{self, LoadedAction};
 use crate::api::{self, AppState};
 use crate::cancel::{CancellationToken, RegistryGuard, RunRegistry};
 use crate::claude::ClaudeInvoker;
+use crate::concurrency::{Executor, KeyGate};
 use crate::config::{OnDiskConfig, Paths};
 use crate::error::Result;
 use crate::job::{self, RunnerDefaults};
@@ -125,6 +126,10 @@ impl Daemon {
             snippet: Arc::new(snippet),
             claude: Arc::new(claude),
             in_flight: Mutex::new(std::collections::HashSet::new()),
+            // CLAUDE-28: one daemon-wide key gate, shared across every dispatch,
+            // so two executions sharing a concurrency key never overlap even
+            // across a scheduled run and a manual trigger.
+            keygate: KeyGate::new(),
             runs,
         });
 
@@ -328,6 +333,9 @@ struct Dispatcher {
     snippet: Arc<SnippetRunner>,
     claude: Arc<ClaudeInvoker>,
     in_flight: Mutex<std::collections::HashSet<String>>,
+    /// CLAUDE-28: daemon-wide per-key gate, threaded into every run so jobs
+    /// sharing a concurrency key serialize across runs and triggers.
+    keygate: KeyGate,
     /// CLAUDE-9: per-run cancellation tokens, registered by `run_action_inner`.
     runs: Arc<RunRegistry>,
 }
@@ -390,10 +398,11 @@ impl Dispatcher {
             &loaded,
             &self.paths,
             &self.pool,
-            &self.snippet,
-            &self.claude,
+            self.snippet.clone(),
+            self.claude.clone(),
             trigger_source,
             Some(&self.runs),
+            &self.keygate,
         )
         .await
     }
@@ -404,14 +413,16 @@ impl Dispatcher {
 /// CLAUDE-9: `registry` is `Some` only on the daemon path, where a run can be
 /// cancelled through the socket API. The standalone `claude-run run` path
 /// passes `None` (nothing can reach it to cancel) and gets an inert token.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_action_inner(
     loaded: &LoadedAction,
     paths: &Paths,
     pool: &SqlitePool,
-    snippet: &SnippetRunner,
-    claude: &ClaudeInvoker,
+    snippet: Arc<SnippetRunner>,
+    claude: Arc<ClaudeInvoker>,
     triggered_by: &str,
     registry: Option<&RunRegistry>,
+    keygate: &KeyGate,
 ) -> Result<()> {
     // CLAUDE-30: native kinds route to a built-in Rust handler. Scripted
     // actions fall through to the generic nu-snippet pipeline below, unchanged.
@@ -424,6 +435,7 @@ pub async fn run_action_inner(
             claude,
             triggered_by,
             registry,
+            keygate: keygate.clone(),
         })
         .await;
     }
@@ -466,84 +478,129 @@ pub async fn run_action_inner(
         warn!(error = %e, "run_set_job_keys failed (non-fatal)");
     }
 
-    let mut processed: u32 = 0;
-    let ctx = job::JobContext {
-        action: loaded,
-        limits,
-        paths,
-        snippet,
-        claude,
-        pool,
-        run_id,
+    // CLAUDE-28: replace the strictly-sequential per-job loop with a keyed,
+    // bounded-parallel executor. Each job becomes one task that acquires its
+    // concurrency-key gate (same key serializes) and a parallelism permit
+    // (`max_parallel` distinct keys at once). `max_parallel: 1` reproduces the
+    // original sequential behavior. Shared `loaded`/`paths`/`pool` are cloned
+    // into each task so the spawned futures own their data.
+    let max_parallel = loaded.action.concurrency.max_parallel.max(1) as usize;
+    let loaded_arc = Arc::new(loaded.clone());
+    let paths_owned = paths.clone();
+    let pool_owned = pool.clone();
+
+    let mut items: Vec<(String, crate::concurrency::JobFuture)> = Vec::with_capacity(jobs.len());
+    for (idx, job) in jobs.iter().enumerate() {
+        let gate_key = job::concurrency_key(loaded, job, idx);
+        let job_key = planned_keys[idx].clone();
+        let job = job.clone();
+        let loaded = loaded_arc.clone();
+        let paths = paths_owned.clone();
+        let pool = pool_owned.clone();
+        let snippet = snippet.clone();
+        let claude = claude.clone();
+        let job_cancel = cancel.clone();
+        let fut: crate::concurrency::JobFuture = Box::pin(async move {
+            // CLAUDE-28: best-effort cap/budget check before launch. Up to
+            // `max_parallel` tasks can pass this before any of them increments
+            // the ledger, so the overshoot is bounded by `max_parallel - 1`.
+            if state::daily_count_get(&pool, &loaded.action.name).await? >= limits.max_runs_per_day {
+                warn!(action = %loaded.action.name, "daily cap reached, skipping job");
+                return Ok(false);
+            }
+            if state::daily_cost_get(&pool, &loaded.action.name).await? >= limits.daily_budget_usd {
+                warn!(action = %loaded.action.name, "daily budget reached, skipping job");
+                return Ok(false);
+            }
+            // CLAUDE-28: mark this job in flight (cleared below and by
+            // `run_finish`) so the web UI can badge every running job.
+            if let Err(e) = state::run_inflight_add(&pool, run_id, &job_key).await {
+                warn!(error = %e, "run_inflight_add failed (non-fatal)");
+            }
+            let ctx = job::JobContext {
+                action: loaded.as_ref(),
+                limits,
+                paths: &paths,
+                snippet: snippet.as_ref(),
+                claude: claude.as_ref(),
+                pool: &pool,
+                run_id,
+                cancel: job_cancel,
+            };
+            let outcome = job::process_job(&ctx, &job, idx).await;
+            if let Err(e) = state::run_inflight_remove(&pool, run_id, &job_key).await {
+                warn!(error = %e, "run_inflight_remove failed (non-fatal)");
+            }
+            let outcome = outcome?;
+            if let Some(record) = job::done_record(&outcome) {
+                job::append_output_record(&paths, loaded.as_ref(), &record);
+                if let job::ProcessedJob::Done {
+                    key,
+                    attempt,
+                    ok,
+                    claude_ran,
+                    claude_ok,
+                    claude_cost,
+                    attempt_counted,
+                    summary,
+                    stream_log_path,
+                    duration_ms,
+                } = &outcome
+                {
+                    state::job_outcome_insert(
+                        &pool,
+                        &state::JobOutcome {
+                            run_id,
+                            action_name: &loaded.action.name,
+                            job_key: key,
+                            attempt: *attempt,
+                            ok: *ok,
+                            claude_ran: *claude_ran,
+                            claude_ok: *claude_ok,
+                            claude_cost_usd: *claude_cost,
+                            attempt_counted: *attempt_counted,
+                            summary: Some(summary.as_str()),
+                            stream_log_path: stream_log_path.as_deref(),
+                            duration_ms: *duration_ms,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            Ok::<bool, crate::error::Error>(true)
+        });
+        items.push((gate_key, fut));
+    }
+
+    let exec = Executor {
+        max_parallel,
+        gate: keygate.clone(),
         cancel: cancel.clone(),
     };
-
-    for (idx, job) in jobs.iter().enumerate() {
-        if cancel.is_cancelled() {
-            info!(action = %loaded.action.name, "run cancelled, stopping before next job");
-            break;
-        }
-        let current = state::daily_count_get(pool, &loaded.action.name).await?;
-        if current >= limits.max_runs_per_day {
-            warn!(count = current, "daily cap reached mid-run, stopping");
-            break;
-        }
-        let cost = state::daily_cost_get(pool, &loaded.action.name).await?;
-        if cost >= limits.daily_budget_usd {
-            warn!(cost_usd = cost, "daily budget reached mid-run, stopping");
-            break;
-        }
-        // CLAUDE-14: mark this job in flight so the web UI shows exactly one
-        // "running" job. Set after the cap/budget checks (a capped run never
-        // reaches this job) and before process_job; `run_finish` clears it on
-        // every finish/break path below.
-        if let Err(e) = state::run_set_current_job(pool, run_id, Some(&planned_keys[idx])).await {
-            warn!(error = %e, "run_set_current_job failed (non-fatal)");
-        }
-        let outcome = job::process_job(&ctx, job, idx).await?;
-        if let Some(record) = job::done_record(&outcome) {
-            job::append_output_record(paths, loaded, &record);
-            if let job::ProcessedJob::Done {
-                key,
-                attempt,
-                ok,
-                claude_ran,
-                claude_ok,
-                claude_cost,
-                attempt_counted,
-                summary,
-                stream_log_path,
-                duration_ms,
-            } = &outcome
-            {
-                state::job_outcome_insert(
-                    pool,
-                    &state::JobOutcome {
-                        run_id,
-                        action_name: &loaded.action.name,
-                        job_key: key,
-                        attempt: *attempt,
-                        ok: *ok,
-                        claude_ran: *claude_ran,
-                        claude_ok: *claude_ok,
-                        claude_cost_usd: *claude_cost,
-                        attempt_counted: *attempt_counted,
-                        summary: Some(summary.as_str()),
-                        stream_log_path: stream_log_path.as_deref(),
-                        duration_ms: *duration_ms,
-                    },
-                )
-                .await?;
+    let results = exec.run(items).await;
+    let mut processed: u32 = 0;
+    let mut first_err: Option<crate::error::Error> = None;
+    for r in results {
+        match r {
+            Ok(true) => processed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         }
-        processed += 1;
     }
+
     let exit_code = if cancel.is_cancelled() {
         crate::exit::CANCELLED
     } else {
         crate::exit::OK
     };
     state::run_finish(pool, run_id, exit_code, processed).await?;
+    if let Some(e) = first_err {
+        warn!(action = %loaded.action.name, error = %e, "one or more jobs errored during the run");
+    }
     info!(action = %loaded.action.name, processed, exit_code, "run complete");
     Ok(())
 }
@@ -725,8 +782,17 @@ mod tests {
         let raw = "name: yt\nkind: youtrack\nnative: {}\nlimits:\n  max_runs_per_day: 0\n";
         let loaded = crate::action::validate_str(raw, "<test>").unwrap();
 
-        run_action_inner(&loaded, &paths, &pool, &snippet, &claude, "test", None)
-            .await
-            .expect("native handler caps out cleanly");
+        run_action_inner(
+            &loaded,
+            &paths,
+            &pool,
+            Arc::new(snippet),
+            Arc::new(claude),
+            "test",
+            None,
+            &KeyGate::new(),
+        )
+        .await
+        .expect("native handler caps out cleanly");
     }
 }

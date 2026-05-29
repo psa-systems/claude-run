@@ -19,6 +19,7 @@ pub mod action;
 pub mod api;
 pub mod cancel;
 pub mod claude;
+pub mod concurrency;
 pub mod client;
 pub mod config;
 pub mod daemon;

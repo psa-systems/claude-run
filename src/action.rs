@@ -271,6 +271,11 @@ pub struct Action {
     #[serde(default)]
     pub limits: Limits,
 
+    /// CLAUDE-28: keyed parallel execution. Defaults to strictly sequential
+    /// (`max_parallel: 1`) so existing actions are unchanged.
+    #[serde(default)]
+    pub concurrency: Concurrency,
+
     #[serde(default)]
     pub schedule: Option<Schedule>,
 
@@ -547,6 +552,45 @@ pub struct Limits {
     pub max_runs_per_day: Option<u32>,
     pub claude_timeout_seconds: Option<u32>,
     pub daily_budget_usd: Option<f64>,
+}
+
+/// CLAUDE-28: per-action keyed parallel execution.
+///
+/// Within a run, jobs are partitioned by a *concurrency key* resolved from each
+/// job's fields ([`Concurrency::key`]). At most one job per resolved key runs at
+/// a time (same key serializes); distinct keys run in parallel up to
+/// [`Concurrency::max_parallel`]. Per-key concurrency is fixed at 1 - two jobs
+/// against the same repo would collide on the clone dir, branch, and PR - so
+/// only `max_parallel` is tunable.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Concurrency {
+    /// Maximum distinct-key jobs in flight at once within a run. `1` (the
+    /// default) reproduces the original strictly-sequential behavior.
+    pub max_parallel: u32,
+    /// Job fields whose values compose the concurrency key, in order. Defaults
+    /// to the project / repo / workflow tuple. Configurable, not hard-coded, so
+    /// the serialization scope can be widened (e.g. a whole project) or narrowed
+    /// without a code change. `workflow` is forward-looking (reserved for a
+    /// future Forgejo-failed-workflow action) and unset on YouTrack jobs today.
+    pub key: Vec<String>,
+}
+
+impl Default for Concurrency {
+    fn default() -> Self {
+        Self {
+            max_parallel: 1,
+            key: default_concurrency_key(),
+        }
+    }
+}
+
+fn default_concurrency_key() -> Vec<String> {
+    vec![
+        "project".to_string(),
+        "repo".to_string(),
+        "workflow".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

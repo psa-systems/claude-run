@@ -27,14 +27,18 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Instant;
 
+use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use super::{HandlerFuture, NativeContext, NativeHandler};
 use crate::action::{NativeConfig, YoutrackSource};
 use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::claude::{ClaudeInvoker, ClaudeResult};
+use crate::concurrency::Executor;
+use crate::config::Paths;
 use crate::error::{Error, Result};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
 use crate::provider::{self, Backend, PullRequest};
@@ -106,7 +110,8 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     }
 
     // Resolve a provider backend (CLI-first). Errors clearly if yt/fj absent.
-    let backend = provider::resolve(provider::DEFAULT_PRIORITY)?;
+    // `Arc` so it can be shared across the CLAUDE-28 per-job tasks.
+    let backend: Arc<dyn Backend> = Arc::from(provider::resolve(provider::DEFAULT_PRIORITY)?);
 
     // gather (before run_begin: a gather failure is a no-op run, same as the
     // scripted path).
@@ -132,29 +137,82 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         warn!(error = %e, "run_set_job_keys failed (non-fatal)");
     }
 
+    // CLAUDE-28: keyed, bounded-parallel execution. Distinct repos (the
+    // concurrency key) run in parallel; jobs against the same repo serialize so
+    // they never collide on the clone dir / branch / PR. `max_parallel: 1`
+    // reproduces the original strictly-sequential behavior.
+    let max_parallel = action.concurrency.max_parallel.max(1) as usize;
+    let key_fields = action.concurrency.key.clone();
+    let loaded_arc = Arc::new(loaded.clone());
+    let paths_owned = ctx.paths.clone();
+    let pool_owned = pool.clone();
+    let src_owned = src.clone();
+
+    let mut items: Vec<(String, crate::concurrency::JobFuture)> = Vec::with_capacity(jobs.len());
+    for job in jobs.into_iter() {
+        let gate_key = concurrency_key(&key_fields, &job);
+        let loaded = loaded_arc.clone();
+        let paths = paths_owned.clone();
+        let pool = pool_owned.clone();
+        let claude = ctx.claude.clone();
+        let backend = backend.clone();
+        let src = src_owned.clone();
+        let job_cancel = cancel.clone();
+        let fut: crate::concurrency::JobFuture = Box::pin(async move {
+            let action = &loaded.action;
+            // CLAUDE-28: best-effort cap/budget check before launch; bounded
+            // overshoot of at most `max_parallel - 1`.
+            if state::daily_count_get(&pool, &action.name).await? >= limits.max_runs_per_day {
+                warn!(action = %action.name, "daily cap reached, skipping job");
+                return Ok(false);
+            }
+            if state::daily_cost_get(&pool, &action.name).await? >= limits.daily_budget_usd {
+                warn!(action = %action.name, "daily budget reached, skipping job");
+                return Ok(false);
+            }
+            if let Err(e) = state::run_inflight_add(&pool, run_id, &job.key).await {
+                warn!(error = %e, "run_inflight_add failed (non-fatal)");
+            }
+            let outcome = process_job(
+                loaded.as_ref(),
+                &paths,
+                &pool,
+                claude.as_ref(),
+                backend.as_ref(),
+                &src,
+                &limits,
+                &job_cancel,
+                &job,
+            )
+            .await;
+            if let Err(e) = state::run_inflight_remove(&pool, run_id, &job.key).await {
+                warn!(error = %e, "run_inflight_remove failed (non-fatal)");
+            }
+            let outcome = outcome?;
+            record_outcome(loaded.as_ref(), &paths, &pool, run_id, &outcome).await?;
+            Ok::<bool, crate::error::Error>(true)
+        });
+        items.push((gate_key, fut));
+    }
+
+    let exec = Executor {
+        max_parallel,
+        gate: ctx.keygate.clone(),
+        cancel: cancel.clone(),
+    };
+    let results = exec.run(items).await;
     let mut processed: u32 = 0;
-    for (idx, job) in jobs.iter().enumerate() {
-        if cancel.is_cancelled() {
-            info!(action = %action.name, "run cancelled, stopping before next job");
-            break;
+    let mut first_err: Option<crate::error::Error> = None;
+    for r in results {
+        match r {
+            Ok(true) => processed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
         }
-        let current = state::daily_count_get(pool, &action.name).await?;
-        if current >= limits.max_runs_per_day {
-            warn!(count = current, "daily cap reached mid-run, stopping");
-            break;
-        }
-        let cost = state::daily_cost_get(pool, &action.name).await?;
-        if cost >= limits.daily_budget_usd {
-            warn!(cost_usd = cost, "daily budget reached mid-run, stopping");
-            break;
-        }
-        // CLAUDE-14: exactly one job shows as "running" at a time.
-        if let Err(e) = state::run_set_current_job(pool, run_id, Some(&planned_keys[idx])).await {
-            warn!(error = %e, "run_set_current_job failed (non-fatal)");
-        }
-        let outcome = process_job(&ctx, backend.as_ref(), src, &limits, &cancel, job).await?;
-        record_outcome(&ctx, run_id, &outcome).await?;
-        processed += 1;
     }
 
     let exit_code = if cancel.is_cancelled() {
@@ -163,8 +221,37 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         crate::exit::OK
     };
     state::run_finish(pool, run_id, exit_code, processed).await?;
+    if let Some(e) = first_err {
+        warn!(action = %action.name, error = %e, "one or more jobs errored during the run");
+    }
     info!(action = %action.name, processed, exit_code, "run complete");
     Ok(())
+}
+
+/// CLAUDE-28: resolve a YouTrack job's concurrency key from the configured key
+/// fields. `project` is the issue id's prefix, `repo` is the resolved repo path;
+/// `workflow` is reserved for a future action and unset today (it contributes
+/// nothing). Falls back to the issue id when no field resolves, so each job is
+/// treated as independent rather than all sharing one empty key.
+fn concurrency_key(fields: &[String], job: &YoutrackJob) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for field in fields {
+        let value = match field.as_str() {
+            "project" => project_key(&job.key),
+            "repo" => job.repo_path.clone(),
+            // `workflow` is forward-looking; the youtrack action does not
+            // populate it, so it contributes nothing to the key today.
+            _ => String::new(),
+        };
+        if !value.is_empty() {
+            parts.push(value);
+        }
+    }
+    if parts.is_empty() {
+        job.key.clone()
+    } else {
+        parts.join("\u{1f}")
+    }
 }
 
 /// gather: list queued issues, resolve each project's VCS once (cached), and
@@ -226,8 +313,12 @@ fn project_key(idreadable: &str) -> String {
 /// claude errors skip finalize + attempt counting, the skip-attempt marker (or
 /// a cancel) suppresses attempt counting, and the daily ledger advances only
 /// when claude actually ran.
+#[allow(clippy::too_many_arguments)]
 async fn process_job(
-    ctx: &NativeContext<'_>,
+    loaded: &crate::action::LoadedAction,
+    paths: &Paths,
+    pool: &SqlitePool,
+    claude: &ClaudeInvoker,
     backend: &dyn Backend,
     src: &YoutrackSource,
     limits: &EffectiveLimits,
@@ -235,9 +326,9 @@ async fn process_job(
     job: &YoutrackJob,
 ) -> Result<ProcessedJob> {
     let started = Instant::now();
-    let action = &ctx.action.action;
+    let action = &loaded.action;
     let key = &job.key;
-    let attempts = state::attempts_get(ctx.pool, &action.name, key).await?;
+    let attempts = state::attempts_get(pool, &action.name, key).await?;
 
     // YouTrack jobs always carry a stable key (idReadable), so the attempt cap
     // always applies.
@@ -248,7 +339,7 @@ async fn process_job(
 
     info!(action = %action.name, key = %key, attempt = attempts + 1, "processing job");
 
-    let wb_base = workdir::resolve_workdir_base(action.workdir_base.as_deref(), ctx.paths);
+    let wb_base = workdir::resolve_workdir_base(action.workdir_base.as_deref(), paths);
     let workdir_path = workdir::job_workdir(&wb_base, &action.name, key);
 
     // ---- filter: live AI Agent re-read ----
@@ -291,13 +382,13 @@ async fn process_job(
         Ok(()) => {
             let prompt = build_prompt(job, &workdir_path);
             let stream_log = ClaudeInvoker::stream_log_path(
-                &ctx.paths.logs_dir(),
+                &paths.logs_dir(),
                 &action.name,
                 key,
                 attempts + 1,
             );
             info!(action = %action.name, key = %key, stream_log = %stream_log.display(), "invoking claude");
-            let r = ctx.claude.invoke(
+            let r = claude.invoke(
                 &prompt,
                 &action.claude,
                 limits.claude_timeout,
@@ -338,7 +429,7 @@ async fn process_job(
     }
 
     if claude_ran {
-        state::daily_cost_add(ctx.pool, &action.name, claude_result.cost).await?;
+        state::daily_cost_add(pool, &action.name, claude_result.cost).await?;
     }
 
     // ---- finalize (the native "post"): every external mutation lives here ----
@@ -369,7 +460,7 @@ async fn process_job(
     let ok = claude_result.ok && !post_failed;
     let stream_log_path = if claude_ran {
         Some(
-            ClaudeInvoker::stream_log_path(&ctx.paths.logs_dir(), &action.name, key, attempts + 1)
+            ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1)
                 .display()
                 .to_string(),
         )
@@ -378,10 +469,10 @@ async fn process_job(
     };
 
     if !skip_attempt {
-        state::attempts_increment(ctx.pool, &action.name, key).await?;
+        state::attempts_increment(pool, &action.name, key).await?;
     }
     if claude_ran {
-        state::daily_count_increment(ctx.pool, &action.name).await?;
+        state::daily_count_increment(pool, &action.name).await?;
     }
 
     cleanup_workdir(&workdir_path);
@@ -626,15 +717,16 @@ fn failure_comment(r: &ClaudeResult) -> String {
 /// Map a `ProcessedJob::Done` into the JSONL record + `job_outcomes` insert,
 /// identical to the scripted path in [`crate::daemon::run_action_inner`].
 async fn record_outcome(
-    ctx: &NativeContext<'_>,
+    loaded: &crate::action::LoadedAction,
+    paths: &Paths,
+    pool: &SqlitePool,
     run_id: i64,
     outcome: &ProcessedJob,
 ) -> Result<()> {
-    let loaded = ctx.action;
     let Some(record) = job::done_record(outcome) else {
         return Ok(());
     };
-    job::append_output_record(ctx.paths, loaded, &record);
+    job::append_output_record(paths, loaded, &record);
     if let ProcessedJob::Done {
         key,
         attempt,
@@ -649,7 +741,7 @@ async fn record_outcome(
     } = outcome
     {
         state::job_outcome_insert(
-            ctx.pool,
+            pool,
             &state::JobOutcome {
                 run_id,
                 action_name: &loaded.action.name,

@@ -105,6 +105,35 @@ pub fn job_key(action: &LoadedAction, job: &Value, idx: usize) -> String {
     }
 }
 
+/// CLAUDE-28: resolve a job's concurrency key from the action's
+/// `concurrency.key` fields. Same key serializes; distinct keys run in parallel.
+/// Field values are joined with a unit-separator so distinct tuples never
+/// collide. When none of the configured fields are present on the job (e.g. a
+/// scripted job whose JSON lacks `project`/`repo`/`workflow`), it falls back to
+/// the job's own key so each such job is treated as independent rather than all
+/// sharing one empty key.
+pub fn concurrency_key(action: &LoadedAction, job: &Value, idx: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for field in &action.action.concurrency.key {
+        match job.get(field) {
+            Some(Value::String(s)) if !s.is_empty() => parts.push(s.clone()),
+            Some(Value::Null) | None => {}
+            Some(other) => {
+                let s = other.to_string();
+                let s = s.trim_matches('"');
+                if !s.is_empty() {
+                    parts.push(s.to_string());
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        job_key(action, job, idx)
+    } else {
+        parts.join("\u{1f}")
+    }
+}
+
 pub async fn gather_jobs(
     action: &LoadedAction,
     ctx_snippet: &SnippetRunner,
@@ -525,6 +554,7 @@ mod tests {
                 post: vec![],
                 output: Default::default(),
                 limits: Default::default(),
+                concurrency: Default::default(),
                 schedule: None,
                 link_template: None,
                 enabled: true,
