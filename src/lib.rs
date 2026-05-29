@@ -28,6 +28,7 @@ pub mod job;
 pub mod lock;
 pub mod migrate;
 pub mod native;
+pub mod provider;
 pub mod scheduler;
 pub mod snippet;
 pub mod state;
