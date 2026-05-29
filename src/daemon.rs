@@ -708,26 +708,25 @@ mod tests {
         assert_eq!(read_pidfile(&paths), None);
     }
 
-    // CLAUDE-30: a native action routes to the native-handler seam instead of
-    // the scripted gather + per-job loop. The youtrack handler is a stub this
-    // phase, so the run surfaces `NativeUnimplemented`.
+    // CLAUDE-30/CLAUDE-32: a native action routes to the native-handler seam
+    // (`crate::native::dispatch`) instead of the scripted gather + per-job loop.
+    // With `max_runs_per_day: 0` the youtrack handler trips its own daily cap
+    // and returns before touching the provider backend, so this exercises the
+    // native branch deterministically (no `yt`/`fj`, no network). A scripted
+    // action would instead fail at gather on the missing `input.command`.
     #[tokio::test]
-    async fn run_action_inner_dispatches_native_to_handler_stub() {
+    async fn run_action_inner_dispatches_native_to_youtrack_handler() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_runtime(tmp.path());
         let pool = crate::db::open(&paths.state_db()).await.unwrap();
         let snippet = SnippetRunner::new(None);
         let claude = ClaudeInvoker::new(None);
 
-        let raw = "name: yt\nkind: youtrack\nnative: {}\n";
+        let raw = "name: yt\nkind: youtrack\nnative: {}\nlimits:\n  max_runs_per_day: 0\n";
         let loaded = crate::action::validate_str(raw, "<test>").unwrap();
 
-        let err = run_action_inner(&loaded, &paths, &pool, &snippet, &claude, "test", None)
+        run_action_inner(&loaded, &paths, &pool, &snippet, &claude, "test", None)
             .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::Error::NativeUnimplemented { .. }
-        ));
+            .expect("native handler caps out cleanly");
     }
 }

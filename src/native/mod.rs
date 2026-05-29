@@ -2,14 +2,20 @@
 //!
 //! Scripted actions run the generic nu-snippet pipeline in [`crate::job`].
 //! Native actions route here instead: each native [`ActionKind`] maps to a
-//! built-in Rust [`NativeHandler`] via the [`handler_for`] registry. This phase
-//! ships only the seam, so the youtrack handler is a stub that returns
-//! [`Error::NativeUnimplemented`]; the real logic lands in CLAUDE-33 (Phase 4).
+//! built-in Rust [`NativeHandler`] via the [`handler_for`] registry. CLAUDE-30
+//! shipped the seam with a stub; CLAUDE-32 (Phase 3) lands the real YouTrack
+//! handler in [`youtrack`].
 //!
-//! Shared run accounting (run_begin/run_finish, planned keys, caps/budget,
-//! job-outcome inserts) stays in [`crate::daemon::run_action_inner`]; native
-//! handlers plug their job production into that common scaffolding once they
-//! exist.
+//! Unlike a scripted action (whose run accounting lives in
+//! [`crate::daemon::run_action_inner`]), a native handler owns its whole run:
+//! it produces typed jobs from the provider backend and drives the same
+//! run_begin/run_finish, caps/budget, planned-keys and job-outcome scaffolding
+//! itself (see [`youtrack`]). It reuses the [`crate::job`] helpers
+//! ([`crate::job::effective_limits`], [`crate::job::ProcessedJob`],
+//! [`crate::job::done_record`], [`crate::job::append_output_record`]) so its
+//! outcome records and JSONL output stay byte-identical to the scripted path.
+
+pub mod youtrack;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -49,7 +55,7 @@ pub trait NativeHandler: Send + Sync {
 fn handler_for(kind: ActionKind) -> Option<Box<dyn NativeHandler>> {
     match kind {
         ActionKind::Scripted => None,
-        ActionKind::Youtrack => Some(Box::new(YoutrackHandler)),
+        ActionKind::Youtrack => Some(Box::new(youtrack::YoutrackHandler)),
     }
 }
 
@@ -62,19 +68,6 @@ pub async fn dispatch(ctx: NativeContext<'_>) -> Result<()> {
         None => Err(Error::NativeUnimplemented {
             kind: kind.as_str().to_string(),
         }),
-    }
-}
-
-/// Stub YouTrack handler. Real implementation lands in CLAUDE-33.
-struct YoutrackHandler;
-
-impl NativeHandler for YoutrackHandler {
-    fn run<'a>(&self, _ctx: NativeContext<'a>) -> HandlerFuture<'a> {
-        Box::pin(async move {
-            Err(Error::NativeUnimplemented {
-                kind: ActionKind::Youtrack.as_str().to_string(),
-            })
-        })
     }
 }
 
