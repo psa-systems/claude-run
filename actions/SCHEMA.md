@@ -46,6 +46,9 @@ limits:                     # optional per-action overrides of env defaults
   max_runs_per_day: 20
   claude_timeout_seconds: 600
   daily_budget_usd: 5.00
+concurrency:                # optional; default is strictly sequential
+  max_parallel: 1           # distinct-key jobs in flight at once (default 1)
+  key: [project, repo, workflow]   # job fields composing the concurrency key
 schedule:                   # optional; omit for trigger-only (manual)
   kind: interval            # interval | cron | manual
   spec: 30m                 # interval/cron spec; omit for manual
@@ -380,6 +383,50 @@ Per-action overrides for the runner-wide defaults. Any subset of:
 | `max_runs_per_day`         | `$env.CLAUDE_RUN_MAX_RUNS_PER_DAY`     |
 | `claude_timeout_seconds`   | `$env.CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS` |
 | `daily_budget_usd`         | `$env.CLAUDE_RUN_DAILY_BUDGET_USD`     |
+
+### `concurrency` (record, optional)
+
+Controls keyed parallel execution of a run's jobs. By default a run processes
+its jobs strictly one at a time. With `concurrency` you can run independent jobs
+in parallel while guaranteeing that two jobs touching the same unit of work
+never run at once.
+
+```yaml
+concurrency:
+  max_parallel: 4                  # up to 4 distinct-key jobs at a time
+  key: [project, repo, workflow]   # default; the per-job concurrency key
+```
+
+| Key            | Default                      | Meaning                                                                 |
+|----------------|------------------------------|-------------------------------------------------------------------------|
+| `max_parallel` | `1`                          | Maximum distinct-key jobs in flight at once within a run.                |
+| `key`          | `[project, repo, workflow]`  | Job fields whose values compose the concurrency key.                     |
+
+Semantics:
+
+- **Same key serializes.** At most one job per resolved key runs at a time, so
+  two jobs against the same repo never collide on the clone dir, branch, or PR.
+  Per-key concurrency is fixed at 1 and is not configurable.
+- **Distinct keys parallelize**, up to `max_parallel`. `max_parallel: 1` (the
+  default) reproduces the original strictly-sequential behavior exactly.
+- **Key resolution.** For a scripted action the key is built from the listed
+  fields on each job's JSON object; for the native `youtrack` action the handler
+  maps `project` to the issue-id prefix and `repo` to the resolved repo path.
+  `workflow` is forward-looking (reserved for a future Forgejo-failed-workflow
+  action) and is unset on YouTrack jobs today. When none of the configured
+  fields resolve, the job's own key is used so it is treated as independent.
+- **Daemon-wide gate.** The key gate is held at the daemon level, so two
+  executions sharing a key never overlap even across a scheduled run and a
+  manual trigger. (It is in-memory per process; a standalone `claude-run run`
+  uses its own gate but the per-action lock still prevents it from overlapping a
+  daemon-driven run of the same action.)
+- **Caps stay best-effort.** The daily cap and budget are checked before each
+  job launches; because up to `max_parallel` jobs can pass the check before any
+  of them advances the ledger, the cap may overshoot by at most
+  `max_parallel - 1` jobs.
+- **`max_parallel` is bounded by available worker threads.** Each running job
+  occupies a thread for the duration of its `claude` invocation, so set
+  `max_parallel` no higher than the host has cores to spare.
 
 ### `schedule` (record, optional)
 

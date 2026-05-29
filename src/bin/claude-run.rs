@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -236,9 +237,20 @@ async fn run_action(
         }
     };
 
-    let snippet = snippet::SnippetRunner::new(on_disk.daemon.nu_binary.as_deref());
-    let claude = claude_mod::ClaudeInvoker::new(on_disk.daemon.claude_binary.as_deref());
-    daemon::run_action_inner(&loaded, paths, &pool, &snippet, &claude, "cli", None).await?;
+    let snippet = Arc::new(snippet::SnippetRunner::new(
+        on_disk.daemon.nu_binary.as_deref(),
+    ));
+    let claude = Arc::new(claude_mod::ClaudeInvoker::new(
+        on_disk.daemon.claude_binary.as_deref(),
+    ));
+    // CLAUDE-28: a standalone `run` is a single process with no daemon, so it
+    // gets its own ephemeral key gate; the per-action lock already prevents it
+    // from overlapping a daemon-driven run of the same action.
+    let keygate = claude_run::concurrency::KeyGate::new();
+    daemon::run_action_inner(
+        &loaded, paths, &pool, snippet, claude, "cli", None, &keygate,
+    )
+    .await?;
     Ok(exit::OK)
 }
 

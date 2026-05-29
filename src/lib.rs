@@ -20,6 +20,7 @@ pub mod api;
 pub mod cancel;
 pub mod claude;
 pub mod client;
+pub mod concurrency;
 pub mod config;
 pub mod daemon;
 pub mod db;
