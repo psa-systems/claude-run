@@ -32,6 +32,7 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 use super::{HandlerFuture, NativeContext, NativeHandler};
+use crate::action::{NativeConfig, YoutrackSource};
 use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::claude::{ClaudeInvoker, ClaudeResult};
 use crate::error::{Error, Result};
@@ -40,10 +41,6 @@ use crate::provider::{self, Backend, PullRequest};
 use crate::state;
 use crate::workdir;
 
-/// YouTrack query for issues this action picks up.
-const QUEUED_QUERY: &str = "-Resolved AI Agent: Queued";
-/// Custom field the AI Agent state machine lives in.
-const AI_AGENT_FIELD: &str = "AI Agent";
 /// Workdir marker the agent writes to park a job pending human input.
 const NEEDS_REVIEW_MARKER: &str = ".claude-run-needs-review";
 /// Workdir marker that suppresses attempt counting for this run.
@@ -82,6 +79,17 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     let action = &loaded.action;
     let pool = ctx.pool;
 
+    // Typed config (CLAUDE-33). Validation guarantees a matching `native` block
+    // for `kind: youtrack`, so anything else is a misrouted action.
+    let src = match &action.native {
+        Some(NativeConfig::Youtrack(cfg)) => &cfg.youtrack,
+        _ => {
+            return Err(Error::NativeUnimplemented {
+                kind: action.kind.as_str().to_string(),
+            })
+        }
+    };
+
     let defaults = RunnerDefaults::default();
     let limits = job::effective_limits(&defaults, loaded);
 
@@ -102,7 +110,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
 
     // gather (before run_begin: a gather failure is a no-op run, same as the
     // scripted path).
-    let jobs = gather(backend.as_ref())?;
+    let jobs = gather(backend.as_ref(), &src.query)?;
     info!(action = %action.name, count = jobs.len(), "youtrack jobs gathered");
 
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
@@ -144,7 +152,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         if let Err(e) = state::run_set_current_job(pool, run_id, Some(&planned_keys[idx])).await {
             warn!(error = %e, "run_set_current_job failed (non-fatal)");
         }
-        let outcome = process_job(&ctx, backend.as_ref(), &limits, &cancel, job).await?;
+        let outcome = process_job(&ctx, backend.as_ref(), src, &limits, &cancel, job).await?;
         record_outcome(&ctx, run_id, &outcome).await?;
         processed += 1;
     }
@@ -162,8 +170,8 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
 /// gather: list queued issues, resolve each project's VCS once (cached), and
 /// drop issues whose project has no usable VCS integration. Mirrors the
 /// scripted `input.command`.
-fn gather(backend: &dyn Backend) -> Result<Vec<YoutrackJob>> {
-    let issues = backend.list_queued(QUEUED_QUERY)?;
+fn gather(backend: &dyn Backend, query: &str) -> Result<Vec<YoutrackJob>> {
+    let issues = backend.list_queued(query)?;
     let mut vcs_cache: std::collections::HashMap<String, Option<provider::VcsRepo>> =
         std::collections::HashMap::new();
     let mut jobs = Vec::new();
@@ -221,6 +229,7 @@ fn project_key(idreadable: &str) -> String {
 async fn process_job(
     ctx: &NativeContext<'_>,
     backend: &dyn Backend,
+    src: &YoutrackSource,
     limits: &EffectiveLimits,
     cancel: &CancellationToken,
     job: &YoutrackJob,
@@ -243,8 +252,8 @@ async fn process_job(
     let workdir_path = workdir::job_workdir(&wb_base, &action.name, key);
 
     // ---- filter: live AI Agent re-read ----
-    match backend.get_field(key, AI_AGENT_FIELD) {
-        Ok(v) if v.trim() == "Queued" => {}
+    match backend.get_field(key, &src.custom_field) {
+        Ok(v) if v.trim() == src.states.queued => {}
         Ok(v) => {
             info!(action = %action.name, key = %key, ai_agent = %v.trim(), "job filtered out");
             return Ok(ProcessedJob::Filtered { key: key.clone() });
@@ -261,7 +270,7 @@ async fn process_job(
     std::fs::create_dir_all(&workdir_path)?;
 
     // ---- pre: mark Working / In Progress, then clone ----
-    let pre_result = run_pre(backend, job, &workdir_path);
+    let pre_result = run_pre(backend, src, job, &workdir_path);
 
     // ---- prompt + claude (skipped on pre failure / cancel) ----
     let (claude_result, claude_ran) = match pre_result {
@@ -333,7 +342,7 @@ async fn process_job(
     }
 
     // ---- finalize (the native "post"): every external mutation lives here ----
-    let finalize_res = finalize(backend, job, &workdir_path, &claude_result);
+    let finalize_res = finalize(backend, src, job, &workdir_path, &claude_result);
     let post_failed = match &finalize_res {
         Ok(Finalized::CodeReview { pr_url }) => {
             info!(action = %action.name, key = %key, pr_url = %pr_url, "finalized: Code Review");
@@ -396,15 +405,16 @@ async fn process_job(
 /// synthesize a failed claude result and still finalize.
 fn run_pre(
     backend: &dyn Backend,
+    src: &YoutrackSource,
     job: &YoutrackJob,
     workdir: &Path,
 ) -> std::result::Result<(), String> {
     backend
-        .set_field(&job.key, AI_AGENT_FIELD, "Working")
-        .map_err(|e| format!("set AI Agent=Working: {e}"))?;
+        .set_field(&job.key, &src.custom_field, &src.states.working)
+        .map_err(|e| format!("set {}={}: {e}", src.custom_field, src.states.working))?;
     backend
-        .set_state(&job.key, "In Progress")
-        .map_err(|e| format!("set State=In Progress: {e}"))?;
+        .set_state(&job.key, &src.states.in_progress)
+        .map_err(|e| format!("set State={}: {e}", src.states.in_progress))?;
     clone_repo(&job.clone_url, workdir).map_err(|e| format!("git clone: {e}"))?;
     Ok(())
 }
@@ -495,6 +505,7 @@ impl Finalized {
 /// set to Done; it stays In Progress until a human merges the PR.
 fn finalize(
     backend: &dyn Backend,
+    src: &YoutrackSource,
     job: &YoutrackJob,
     workdir: &Path,
     claude_result: &ClaudeResult,
@@ -509,7 +520,7 @@ fn finalize(
             std::fs::write(&skip_marker, b"")?;
         }
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
-        comment_then_field(backend, &job.key, &reason, "Needs Review")?;
+        comment_then_field(backend, src, &job.key, &reason, &src.states.needs_review)?;
         Ok(Finalized::NeedsReview)
     } else if claude_result.ok {
         // Success: open the PR from the agent's local commits via agit+autofill,
@@ -520,19 +531,19 @@ fn finalize(
             Ok(pr) => {
                 let url = pr_url(job, &pr);
                 let body = success_comment(claude_result, &url);
-                comment_then_field(backend, &job.key, &body, "Code Review")?;
+                comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
                 Ok(Finalized::CodeReview { pr_url: url })
             }
             Err(e) => {
                 let body = pr_failure_comment(claude_result, &e);
-                comment_then_field(backend, &job.key, &body, "Failed")?;
+                comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
                 Ok(Finalized::Failed)
             }
         }
     } else {
         // Failure: timeout (exit 124), crash, empty prompt, or pre failure.
         let body = failure_comment(claude_result);
-        comment_then_field(backend, &job.key, &body, "Failed")?;
+        comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
         Ok(Finalized::Failed)
     }
 }
@@ -541,11 +552,17 @@ fn finalize(
 /// write. A comment failure is logged and ignored so it cannot prevent the
 /// field from advancing off Working; a set_field failure propagates and marks
 /// the job's finalize as failed.
-fn comment_then_field(backend: &dyn Backend, key: &str, body: &str, target: &str) -> Result<()> {
+fn comment_then_field(
+    backend: &dyn Backend,
+    src: &YoutrackSource,
+    key: &str,
+    body: &str,
+    target: &str,
+) -> Result<()> {
     if let Err(e) = backend.comment(key, body) {
         warn!(key = %key, error = %e, "issue comment failed (continuing to AI Agent write)");
     }
-    backend.set_field(key, AI_AGENT_FIELD, target)
+    backend.set_field(key, &src.custom_field, target)
 }
 
 /// Bare host of a forge server URL: `https://dev.a8n.run` -> `dev.a8n.run`,
@@ -679,6 +696,10 @@ mod tests {
         }
     }
 
+    fn src() -> YoutrackSource {
+        YoutrackSource::default()
+    }
+
     fn ok_result() -> ClaudeResult {
         ClaudeResult {
             ok: true,
@@ -744,7 +765,7 @@ mod tests {
                 "[]",
             );
         let backend = CliBackend::new(Arc::new(runner));
-        let jobs = gather(&backend).unwrap();
+        let jobs = gather(&backend, &src().query).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, "MK-16");
         assert_eq!(jobs[0].summary, "a");
@@ -765,7 +786,14 @@ mod tests {
             "",
         ));
         let backend = CliBackend::new(runner.clone());
-        let res = finalize(&backend, &job(), wd, &ClaudeResult::synthesized("e", "s")).unwrap();
+        let res = finalize(
+            &backend,
+            &src(),
+            &job(),
+            wd,
+            &ClaudeResult::synthesized("e", "s"),
+        )
+        .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
         // The skip-attempt marker is created if the agent didn't already.
         assert!(wd.join(SKIP_ATTEMPT_MARKER).exists());
@@ -797,7 +825,7 @@ mod tests {
                 ),
         );
         let backend = CliBackend::new(runner.clone());
-        let res = finalize(&backend, &job(), dir.path(), &ok_result()).unwrap();
+        let res = finalize(&backend, &src(), &job(), dir.path(), &ok_result()).unwrap();
         assert_eq!(
             res,
             Finalized::CodeReview {
@@ -820,6 +848,50 @@ mod tests {
     }
 
     #[test]
+    fn finalize_uses_configured_field_and_state_labels() {
+        // A non-default custom_field / state label drives the yt write, proving
+        // the config threads through finalize rather than using the old literals.
+        let dir = tempfile::tempdir().unwrap();
+        let s = YoutrackSource {
+            custom_field: "Bot State".into(),
+            states: crate::action::YoutrackStates {
+                code_review: "Awaiting Review".into(),
+                ..crate::action::YoutrackStates::default()
+            },
+            ..YoutrackSource::default()
+        };
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
+                    "Created pull request #7",
+                )
+                .ok(
+                    "yt",
+                    &[
+                        "issue",
+                        "set-field",
+                        "MK-16",
+                        "Bot State",
+                        "Awaiting Review",
+                    ],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(&backend, &s, &job(), dir.path(), &ok_result()).unwrap();
+        assert!(matches!(res, Finalized::CodeReview { .. }));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 Bot State Awaiting Review"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
     fn finalize_pr_create_failure_sets_failed() {
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(
@@ -837,7 +909,7 @@ mod tests {
                 ),
         );
         let backend = CliBackend::new(runner.clone());
-        let res = finalize(&backend, &job(), dir.path(), &ok_result()).unwrap();
+        let res = finalize(&backend, &src(), &job(), dir.path(), &ok_result()).unwrap();
         assert_eq!(res, Finalized::Failed);
         let calls = runner.calls.lock().unwrap();
         assert!(
@@ -859,7 +931,7 @@ mod tests {
         let backend = CliBackend::new(runner.clone());
         // FJMCP-6 case: claude errored on the job.
         let claude = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "error tail");
-        let res = finalize(&backend, &job(), dir.path(), &claude).unwrap();
+        let res = finalize(&backend, &src(), &job(), dir.path(), &claude).unwrap();
         assert_eq!(res, Finalized::Failed);
         let calls = runner.calls.lock().unwrap();
         assert!(
