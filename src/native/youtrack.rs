@@ -60,7 +60,7 @@ struct YoutrackJob {
     summary: String,
     /// Forge server URL, trailing slash trimmed (e.g. `https://dev.a8n.run`).
     repo_host: String,
-    /// Repo path (e.g. `contoso/claude-bot`).
+    /// Repo path (e.g. `contoso/claude-run`).
     repo_path: String,
     /// Full clone URL: `<repo_host>/<repo_path>.git`.
     clone_url: String,
@@ -838,8 +838,8 @@ mod tests {
             key: "MK-16".into(),
             summary: "Do the thing".into(),
             repo_host: "https://dev.a8n.run".into(),
-            repo_path: "contoso/claude-bot".into(),
-            clone_url: "https://dev.a8n.run/contoso/claude-bot.git".into(),
+            repo_path: "contoso/claude-run".into(),
+            clone_url: "https://dev.a8n.run/contoso/claude-run.git".into(),
         }
     }
 
@@ -881,7 +881,7 @@ mod tests {
         };
         assert_eq!(
             pr_url(&j, &with_num),
-            "https://dev.a8n.run/contoso/claude-bot/pulls/7"
+            "https://dev.a8n.run/contoso/claude-run/pulls/7"
         );
         let no_num = PullRequest {
             number: None,
@@ -903,7 +903,7 @@ mod tests {
             .ok(
                 "yt",
                 &["project", "vcs", "MK", "--enabled-only", "--json"],
-                r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-bot"}]"#,
+                r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#,
             )
             // ZZ has no enabled VCS -> its issue is dropped.
             .ok(
@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(jobs[0].summary, "a");
         assert_eq!(
             jobs[0].clone_url,
-            "https://dev.a8n.run/contoso/claude-bot.git"
+            "https://dev.a8n.run/contoso/claude-run.git"
         );
     }
 
@@ -976,7 +976,7 @@ mod tests {
         assert_eq!(
             res,
             Finalized::CodeReview {
-                pr_url: "https://dev.a8n.run/contoso/claude-bot/pulls/7".into()
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into()
             }
         );
         let calls = runner.calls.lock().unwrap();

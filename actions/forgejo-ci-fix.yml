@@ -44,8 +44,8 @@ native:
   max_lines: 300
   # Anti-feedback-loop: PRs authored by this login are skipped. Also the git
   # author identity used for the fix commit.
-  bot_author: claude-bot
-  bot_email: claude-bot@a8n.run
+  bot_author: claude-run
+  bot_email: claude-run@a8n.run
   # Appended to the fix commit message so the bot's own push does not
   # re-trigger this action.
   skip_marker: "[skip claude]"

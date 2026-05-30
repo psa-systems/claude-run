@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "YAML-driven Claude Code runner. Rust port of scripts/claude-run.nu."
 license = "MIT"
-repository = "https://dev.a8n.run/psa-systems/claude-bot"
+repository = "https://dev.a8n.run/psa-systems/claude-run"
 
 [[bin]]
 name = "claude-run"
