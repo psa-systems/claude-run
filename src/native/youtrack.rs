@@ -41,7 +41,8 @@ use crate::concurrency::Executor;
 use crate::config::Paths;
 use crate::error::{Error, Result};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
-use crate::provider::{self, Backend, PullRequest};
+use crate::provider::{self, Backend, CliBackend, CommandRunner, PullRequest};
+use crate::secrets::{self, JobCredentials};
 use crate::state;
 use crate::workdir;
 
@@ -85,8 +86,8 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
 
     // Typed config (CLAUDE-33). Validation guarantees a matching `native` block
     // for `kind: youtrack`, so anything else is a misrouted action.
-    let src = match &action.native {
-        Some(NativeConfig::Youtrack(cfg)) => &cfg.youtrack,
+    let (src, forge) = match &action.native {
+        Some(NativeConfig::Youtrack(cfg)) => (&cfg.youtrack, &cfg.forgejo),
         _ => {
             return Err(Error::NativeUnimplemented {
                 kind: action.kind.as_str().to_string(),
@@ -109,13 +110,30 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         return Ok(());
     }
 
-    // Resolve a provider backend (CLI-first). Errors clearly if yt/fj absent.
-    // `Arc` so it can be shared across the CLAUDE-28 per-job tasks.
-    let backend: Arc<dyn Backend> = Arc::from(provider::resolve(provider::DEFAULT_PRIORITY)?);
+    // Resolve a CLI runner (CLI-first). Errors clearly if yt/fj absent. The
+    // runner is shared across the CLAUDE-28 per-job tasks, each of which builds
+    // its own (optionally credentialed) backend from it.
+    let runner = provider::resolve_runner(provider::DEFAULT_PRIORITY)?;
+
+    // CLAUDE-26: resolve any `token_ref` to a decrypted credential once per run.
+    // An all-None set (the shipped, host-auth config) materializes nothing and
+    // every backend below falls back to host `yt` / `fj` auth.
+    let creds = Arc::new(secrets::resolve_youtrack_credentials(pool, src, forge).await?);
+    let cred_base = ctx.paths.runtime_dir.join("credentials").join(&action.name);
 
     // gather (before run_begin: a gather failure is a no-op run, same as the
-    // scripted path).
-    let jobs = gather(backend.as_ref(), &src.query)?;
+    // scripted path). gather only invokes `yt`, so its credentials are yt-only.
+    let jobs = {
+        let (gather_backend, _gather_guard) = if creds.is_empty() {
+            (CliBackend::new(runner.clone()), None)
+        } else {
+            let dir = cred_base.join(format!("gather-{}", std::process::id()));
+            let guard = JobCredentials::materialize(&dir, &creds, None)?;
+            let backend = credentialed_backend(&runner, &guard);
+            (backend, Some(guard))
+        };
+        gather(&gather_backend, &src.query)?
+    };
     info!(action = %action.name, count = jobs.len(), "youtrack jobs gathered");
 
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
@@ -155,7 +173,9 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         let paths = paths_owned.clone();
         let pool = pool_owned.clone();
         let claude = ctx.claude.clone();
-        let backend = backend.clone();
+        let runner = runner.clone();
+        let creds = creds.clone();
+        let cred_base = cred_base.clone();
         let src = src_owned.clone();
         let job_cancel = cancel.clone();
         let fut: crate::concurrency::JobFuture = Box::pin(async move {
@@ -170,6 +190,22 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 warn!(action = %action.name, "daily budget reached, skipping job");
                 return Ok(false);
             }
+            // CLAUDE-26: materialize this job's own credential files (yt config +
+            // forge keys.json keyed by the issue's resolved VCS host). The guard
+            // scrubs them when the job's provider calls finish; concurrent jobs
+            // never share a credential file. No token_ref -> host auth, no files.
+            let (job_backend, _job_creds): (CliBackend, Option<JobCredentials>) =
+                if creds.is_empty() {
+                    (CliBackend::new(runner.clone()), None)
+                } else {
+                    let dir = cred_base
+                        .join(format!("run-{run_id}"))
+                        .join(sanitize_key(&job.key));
+                    let host = host_only(&job.repo_host);
+                    let guard = JobCredentials::materialize(&dir, &creds, Some(&host))?;
+                    let backend = credentialed_backend(&runner, &guard);
+                    (backend, Some(guard))
+                };
             if let Err(e) = state::run_inflight_add(&pool, run_id, &job.key).await {
                 warn!(error = %e, "run_inflight_add failed (non-fatal)");
             }
@@ -178,7 +214,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 &paths,
                 &pool,
                 claude.as_ref(),
-                backend.as_ref(),
+                &job_backend,
                 &src,
                 &limits,
                 &job_cancel,
@@ -252,6 +288,29 @@ fn concurrency_key(fields: &[String], job: &YoutrackJob) -> String {
     } else {
         parts.join("\u{1f}")
     }
+}
+
+/// CLAUDE-26: build a [`CliBackend`] from `runner`, applying a job's materialized
+/// credentials (yt config env, fj store env, and the temp `keys.json` path so
+/// `clone_url` reads the same store). An empty credential set leaves host auth.
+fn credentialed_backend(runner: &Arc<dyn CommandRunner>, creds: &JobCredentials) -> CliBackend {
+    let mut backend = CliBackend::new(runner.clone());
+    if !creds.yt_env.is_empty() {
+        backend = backend.with_yt_env(creds.yt_env.clone());
+    }
+    if !creds.fj_env.is_empty() {
+        backend = backend.with_fj_env(creds.fj_env.clone());
+    }
+    if let Some(path) = &creds.fj_keys_path {
+        backend = backend.with_keys_path(path.clone());
+    }
+    backend
+}
+
+/// Make a job key safe as a single path component for the per-job credential
+/// dir (issue ids like `MK-16` are already safe; defensively strip separators).
+fn sanitize_key(key: &str) -> String {
+    key.replace(['/', '\\', '.'], "_")
 }
 
 /// gather: list queued issues, resolve each project's VCS once (cached), and

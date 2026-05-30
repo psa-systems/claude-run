@@ -10,9 +10,12 @@
 # in typed Rust; this file is config only and carries no script-bearing fields
 # (input.command / filter / pre / prompt / post).
 #
-# Auth: the `yt` / `fj` CLIs are host-configured. base_url / token under the
-# native blocks are inline plaintext placeholders for CLAUDE-26 (encrypted
-# secrets); the CLI backend ignores them and uses host credentials today.
+# Auth (CLAUDE-26): the `yt` / `fj` CLIs are host-configured by default. To give
+# this action its own credentials, set `token_ref` under the native blocks to the
+# name of an encrypted secret (managed under /secrets in the web UI; encrypted at
+# rest with the age key file named by CLAUDE_RUN_SECRETS_KEY_FILE). The runner
+# decrypts it at run time and injects it into the CLIs per job; no raw token is
+# ever written to this file. With no `token_ref`, host credentials are used.
 #
 # AI Agent state machine (labels configurable under native.youtrack.states):
 #   Queued       -> picked up by this action
@@ -50,13 +53,14 @@ native:
     # flag.
     query: "-Resolved AI Agent: Queued"
     custom_field: "AI Agent"
-    # base_url / token: see CLAUDE-26 (encrypted secrets); host CLI auth today.
+    # base_url / token_ref (CLAUDE-26): omitted here, so the host-configured yt
+    # CLI is used. To inject a token, set base_url plus token_ref: <secret-name>.
     # states: defaults to Queued / Working / Code Review / Needs Review / Failed
     #         and State=In Progress; override here only if the project renames
     #         these AI Agent values.
   forgejo: {}
-    # base_url / token: see CLAUDE-26; the host derives the forge host from each
-    # issue's resolved VCS integration today.
+    # base_url / token_ref (CLAUDE-26): omitted, so the host fj credentials are
+    # used and the forge host derives from each issue's resolved VCS integration.
 
 # Per-action link template (CLAUDE-1). Job keys (idReadable, e.g. MK-16)
 # render as clickable links to the YouTrack issue in the web UI.

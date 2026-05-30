@@ -50,6 +50,9 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             get(action_edit_page).post(action_edit_save),
         )
         .route("/actions/:name/export", get(action_export))
+        .route("/secrets", get(secrets_page).post(secret_create))
+        .route("/secrets/:name/rotate", post(secret_rotate))
+        .route("/secrets/:name/delete", post(secret_delete))
         .route("/runs/:id", get(run_detail))
         .route("/runs/:id/jobs/:key/attempt/:attempt", get(job_stream_page))
         .route(
@@ -690,6 +693,173 @@ async fn action_export(
     Ok(resp)
 }
 
+// ---- secrets management (CLAUDE-26) ---------------------------------------
+//
+// Values are write-only: the create / rotate forms accept a value, but the
+// listing only ever shows a secret's name + timestamps. A stored value is never
+// re-rendered or sent back to the browser; it leaves the DB only as ciphertext,
+// decrypted in-process at run time. Encryption needs the `age` key file named by
+// `CLAUDE_RUN_SECRETS_KEY_FILE`; when it is missing, create / rotate fail closed
+// with an inline error and the listing shows a banner.
+
+#[derive(Template)]
+#[template(path = "secrets.html")]
+struct SecretsTpl {
+    version: &'static str,
+    secrets: Vec<state::SecretMeta>,
+    /// Inline error from a rejected create / rotate / delete, rendered up top.
+    error: Option<String>,
+    /// Whether the secrets key file loads; gates the create / rotate forms.
+    key_ready: bool,
+    /// Why the key file did not load (shown when `key_ready` is false).
+    key_error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SecretCreateForm {
+    name: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct SecretValueForm {
+    value: String,
+}
+
+/// Constrain a secret name to a safe handle: non-empty, `[A-Za-z0-9._-]` only.
+fn valid_secret_name(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty()
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Render the secrets page (HTTP `status`), loading the listing and the key
+/// status. Never renders any secret value.
+async fn render_secrets(
+    s: &WebState,
+    status: StatusCode,
+    error: Option<String>,
+) -> Result<Response, WebError> {
+    let secrets = state::secret_list(&s.api.pool).await?;
+    let (key_ready, key_error) = match crate::secrets::SecretsKey::load() {
+        Ok(_) => (true, None),
+        Err(e) => (false, Some(e.to_string())),
+    };
+    let tpl = SecretsTpl {
+        version: s.api.version,
+        secrets,
+        error,
+        key_ready,
+        key_error,
+    };
+    Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
+}
+
+async fn secrets_page(State(s): State<WebState>) -> Result<Response, WebError> {
+    render_secrets(&s, StatusCode::OK, None).await
+}
+
+async fn secret_create(
+    State(s): State<WebState>,
+    Form(form): Form<SecretCreateForm>,
+) -> Result<Response, WebError> {
+    let name = form.name.trim().to_string();
+    if !valid_secret_name(&name) {
+        return render_secrets(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some(format!(
+                "secret name `{name}` is invalid (allowed: letters, digits, '-', '_', '.')"
+            )),
+        )
+        .await;
+    }
+    if form.value.is_empty() {
+        return render_secrets(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("a secret value is required".to_string()),
+        )
+        .await;
+    }
+    let key = match crate::secrets::SecretsKey::load() {
+        Ok(k) => k,
+        Err(e) => {
+            return render_secrets(&s, StatusCode::UNPROCESSABLE_ENTITY, Some(e.to_string())).await
+        }
+    };
+    if state::secret_exists(&s.api.pool, &name).await? {
+        return render_secrets(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some(format!(
+                "a secret named `{name}` already exists; rotate it instead"
+            )),
+        )
+        .await;
+    }
+    let ciphertext = match key.encrypt(&form.value) {
+        Ok(c) => c,
+        Err(e) => {
+            return render_secrets(&s, StatusCode::UNPROCESSABLE_ENTITY, Some(e.to_string())).await
+        }
+    };
+    state::secret_create(&s.api.pool, &name, &ciphertext).await?;
+    Ok(Redirect::to("/secrets").into_response())
+}
+
+async fn secret_rotate(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+    Form(form): Form<SecretValueForm>,
+) -> Result<Response, WebError> {
+    if form.value.is_empty() {
+        return render_secrets(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("a new secret value is required to rotate".to_string()),
+        )
+        .await;
+    }
+    let key = match crate::secrets::SecretsKey::load() {
+        Ok(k) => k,
+        Err(e) => {
+            return render_secrets(&s, StatusCode::UNPROCESSABLE_ENTITY, Some(e.to_string())).await
+        }
+    };
+    let ciphertext = match key.encrypt(&form.value) {
+        Ok(c) => c,
+        Err(e) => {
+            return render_secrets(&s, StatusCode::UNPROCESSABLE_ENTITY, Some(e.to_string())).await
+        }
+    };
+    if !state::secret_rotate(&s.api.pool, &name, &ciphertext).await? {
+        return render_secrets(
+            &s,
+            StatusCode::NOT_FOUND,
+            Some(format!("no secret named `{name}`")),
+        )
+        .await;
+    }
+    Ok(Redirect::to("/secrets").into_response())
+}
+
+async fn secret_delete(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, WebError> {
+    if !state::secret_delete(&s.api.pool, &name).await? {
+        return render_secrets(
+            &s,
+            StatusCode::NOT_FOUND,
+            Some(format!("no secret named `{name}`")),
+        )
+        .await;
+    }
+    Ok(Redirect::to("/secrets").into_response())
+}
+
 #[derive(Serialize)]
 pub struct PlannedJob {
     pub key: String,
@@ -1272,6 +1442,143 @@ mod tests {
 
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(body_string(resp).await, content);
+        }
+    }
+
+    // ---- secrets UI (CLAUDE-26) -------------------------------------------
+    //
+    // One test owns the `CLAUDE_RUN_SECRETS_KEY_FILE` env (no other test reads
+    // it), so create -> list -> rotate -> delete runs against a stable key
+    // without an env race. It proves the listing is write-only: the page shows
+    // a secret's name but never its value, and the stored bytes are ciphertext.
+    mod secrets_ui {
+        use super::super::{
+            secret_create, secret_delete, secret_rotate, secrets_page, SecretCreateForm,
+            SecretValueForm, WebState,
+        };
+        use crate::api::AppState;
+        use crate::cancel::RunRegistry;
+        use crate::config::Paths;
+        use crate::db::MIGRATOR;
+        use crate::state;
+        use age::secrecy::ExposeSecret;
+        use axum::extract::{Form, Path as AxumPath, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::sync::Arc;
+
+        async fn web_state(tmp: &std::path::Path) -> WebState {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            MIGRATOR.run(&pool).await.unwrap();
+            let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
+            let api = Arc::new(AppState {
+                pool,
+                trigger_tx,
+                version: "test",
+                runs: Arc::new(RunRegistry::new()),
+            });
+            let paths = Paths {
+                config_dir: tmp.join("config"),
+                data_dir: tmp.join("data"),
+                state_dir: tmp.join("state"),
+                runtime_dir: tmp.join("runtime"),
+            };
+            WebState { api, paths }
+        }
+
+        async fn body_string(resp: axum::response::Response) -> String {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn create_list_rotate_delete_is_write_only() {
+            let tmp = tempfile::tempdir().unwrap();
+            // Generate an age key and point the env at it for this test only.
+            let key_path = tmp.path().join("key.txt");
+            let identity = age::x25519::Identity::generate();
+            std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();
+            std::env::set_var(crate::secrets::KEY_FILE_ENV, &key_path);
+
+            let s = web_state(tmp.path()).await;
+            let value = "perm:super-secret-token-value";
+
+            // Create.
+            let resp = secret_create(
+                State(s.clone()),
+                Form(SecretCreateForm {
+                    name: "yt-prod".into(),
+                    value: value.into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+            // Listing shows the name but never the value (write-only).
+            let page = body_string(
+                secrets_page(State(s.clone()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(page.contains("yt-prod"));
+            assert!(
+                !page.contains(value),
+                "secret value leaked into the listing"
+            );
+
+            // Stored at rest as ciphertext, not plaintext.
+            let ct = state::secret_get_ciphertext(&s.api.pool, "yt-prod")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(ct, value.as_bytes());
+
+            // Duplicate create is rejected; nothing changes.
+            let dup = secret_create(
+                State(s.clone()),
+                Form(SecretCreateForm {
+                    name: "yt-prod".into(),
+                    value: "other".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(dup.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+            // Rotate replaces the value in place.
+            let rotated = secret_rotate(
+                State(s.clone()),
+                AxumPath("yt-prod".to_string()),
+                Form(SecretValueForm {
+                    value: "perm:rotated".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(rotated.status(), StatusCode::SEE_OTHER);
+
+            // Delete removes it.
+            let deleted = secret_delete(State(s.clone()), AxumPath("yt-prod".to_string()))
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+            assert!(!state::secret_exists(&s.api.pool, "yt-prod").await.unwrap());
+
+            std::env::remove_var(crate::secrets::KEY_FILE_ENV);
         }
     }
 

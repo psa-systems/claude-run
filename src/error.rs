@@ -75,6 +75,9 @@ pub enum Error {
     #[error("no usable provider backend (tried: {0})")]
     NoBackend(String),
 
+    #[error("secret: {0}")]
+    Secret(String),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

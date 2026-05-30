@@ -189,6 +189,34 @@ pub fn resolve_with(
     Err(Error::NoBackend(tried.join("; ")))
 }
 
+/// Resolve the [`CommandRunner`] of the first usable backend, walking `priority`
+/// and probing exactly as [`resolve`] does. Callers that need to build per-job
+/// [`CliBackend`]s with injected credentials (CLAUDE-26) use this to obtain a
+/// shareable runner instead of an opaque `Box<dyn Backend>`. CLI-only today.
+pub fn resolve_runner(priority: &[BackendKind]) -> Result<Arc<dyn CommandRunner>> {
+    resolve_runner_with(priority, Arc::new(ProcessRunner::new()))
+}
+
+/// [`resolve_runner`] with an injectable runner (tests).
+pub fn resolve_runner_with(
+    priority: &[BackendKind],
+    runner: Arc<dyn CommandRunner>,
+) -> Result<Arc<dyn CommandRunner>> {
+    let mut tried: Vec<String> = Vec::new();
+    for kind in priority {
+        match kind {
+            BackendKind::Cli => {
+                let backend = CliBackend::new(runner.clone());
+                match backend.probe() {
+                    Ok(()) => return Ok(runner),
+                    Err(e) => tried.push(format!("cli: {e}")),
+                }
+            }
+        }
+    }
+    Err(Error::NoBackend(tried.join("; ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
