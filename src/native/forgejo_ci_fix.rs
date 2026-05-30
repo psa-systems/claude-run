@@ -59,7 +59,7 @@ struct ForgejoCiFixJob {
     key: String,
     /// Forgejo host, e.g. `dev.a8n.run`.
     host: String,
-    /// Repo path, e.g. `contoso/claude-bot`.
+    /// Repo path, e.g. `contoso/claude-run`.
     repo: String,
     pr_number: u64,
     /// Head branch name, cloned and pushed.
@@ -820,7 +820,7 @@ mod tests {
 
     fn cfg() -> ForgejoCiFixConfig {
         ForgejoCiFixConfig {
-            repos: vec!["contoso/claude-bot".to_string()],
+            repos: vec!["contoso/claude-run".to_string()],
             ..ForgejoCiFixConfig::default()
         }
     }
@@ -829,7 +829,7 @@ mod tests {
         ForgejoCiFixJob {
             key: "abc123".into(),
             host: "dev.a8n.run".into(),
-            repo: "contoso/claude-bot".into(),
+            repo: "contoso/claude-run".into(),
             pr_number: 52,
             branch: "feat/x".into(),
             head_sha: "abc123".into(),
@@ -986,7 +986,7 @@ mod tests {
                     "pr",
                     "search",
                     "--repo",
-                    "contoso/claude-bot",
+                    "contoso/claude-run",
                     "--state",
                     "open",
                     "--json",
@@ -1001,7 +1001,7 @@ mod tests {
                     "dev.a8n.run",
                     "pr",
                     "status",
-                    "contoso/claude-bot#1",
+                    "contoso/claude-run#1",
                     "--json",
                 ],
                 r#"{"pr":1,"state":"failure"}"#,
@@ -1013,7 +1013,7 @@ mod tests {
                     "dev.a8n.run",
                     "pr",
                     "status",
-                    "contoso/claude-bot#2",
+                    "contoso/claude-run#2",
                     "--json",
                 ],
                 r#"{"pr":2,"state":"success"}"#,
@@ -1038,7 +1038,7 @@ mod tests {
                 "pr",
                 "search",
                 "--repo",
-                "contoso/claude-bot",
+                "contoso/claude-run",
                 "--state",
                 "open",
                 "--json",
@@ -1065,7 +1065,7 @@ mod tests {
                 "dev.a8n.run",
                 "pr",
                 "comment",
-                "contoso/claude-bot#52",
+                "contoso/claude-run#52",
                 "--body-file",
                 body_path.to_str().unwrap(),
             ],
@@ -1081,7 +1081,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c.contains("pr comment contoso/claude-bot#52")),
+                .any(|c| c.contains("pr comment contoso/claude-run#52")),
             "{calls:?}"
         );
         // The body file holds the failure comment.
@@ -1103,7 +1103,7 @@ mod tests {
                 "dev.a8n.run",
                 "pr",
                 "comment",
-                "contoso/claude-bot#52",
+                "contoso/claude-run#52",
                 "--body-file",
                 body_path.to_str().unwrap(),
             ],

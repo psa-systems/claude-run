@@ -196,8 +196,8 @@ native:
   window_minutes: 45               # only PRs updated this recently
   max_files: 10                    # decision gate: too_big over this many files
   max_lines: 300                   # decision gate: too_big over this many lines
-  bot_author: claude-bot           # skipped author + git commit author name
-  bot_email: claude-bot@a8n.run    # git commit author email
+  bot_author: claude-run           # skipped author + git commit author name
+  bot_email: claude-run@a8n.run    # git commit author email
   skip_marker: "[skip claude]"     # appended to the fix commit message
   token: <token>                   # optional; inline plaintext (CLAUDE-26 encrypts)
 ```
@@ -209,8 +209,8 @@ native:
 | `window_minutes` | `45`                 | Only consider PRs updated within this many minutes of the run.   |
 | `max_files`      | `10`                 | Decision gate: a diff touching more files is `too_big`.          |
 | `max_lines`      | `300`                | Decision gate: a diff changing more lines is `too_big`.          |
-| `bot_author`     | `claude-bot`         | Author login skipped (anti-feedback-loop) + git commit author.   |
-| `bot_email`      | `claude-bot@a8n.run` | Git commit author email.                                         |
+| `bot_author`     | `claude-run`         | Author login skipped (anti-feedback-loop) + git commit author.   |
+| `bot_email`      | `claude-run@a8n.run` | Git commit author email.                                         |
 | `skip_marker`    | `[skip claude]`      | Appended to the fix commit so the bot's push does not re-trigger.|
 | `token`          | none                 | API token, inline plaintext for now (CLAUDE-26 encrypts).        |
 

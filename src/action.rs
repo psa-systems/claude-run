@@ -293,8 +293,8 @@ impl Default for ForgejoCiFixConfig {
             window_minutes: 45,
             max_files: 10,
             max_lines: 300,
-            bot_author: "claude-bot".to_string(),
-            bot_email: "claude-bot@a8n.run".to_string(),
+            bot_author: "claude-run".to_string(),
+            bot_email: "claude-run@a8n.run".to_string(),
             skip_marker: "[skip claude]".to_string(),
             token: None,
         }
@@ -590,7 +590,7 @@ kind: forgejo-ci-fix
 native:
   host: dev.a8n.run
   repos:
-    - contoso/claude-bot
+    - contoso/claude-run
 ";
         let loaded = validate_str(raw, "<candidate>").unwrap();
         assert_eq!(loaded.action.kind, ActionKind::ForgejoCiFix);
@@ -599,13 +599,13 @@ native:
             panic!("expected forgejo-ci-fix native config");
         };
         assert_eq!(cfg.host, "dev.a8n.run");
-        assert_eq!(cfg.repos, vec!["contoso/claude-bot".to_string()]);
+        assert_eq!(cfg.repos, vec!["contoso/claude-run".to_string()]);
         // Unset fields fall back to the documented defaults.
         assert_eq!(cfg.window_minutes, 45);
         assert_eq!(cfg.max_files, 10);
         assert_eq!(cfg.max_lines, 300);
-        assert_eq!(cfg.bot_author, "claude-bot");
-        assert_eq!(cfg.bot_email, "claude-bot@a8n.run");
+        assert_eq!(cfg.bot_author, "claude-run");
+        assert_eq!(cfg.bot_email, "claude-run@a8n.run");
         assert_eq!(cfg.skip_marker, "[skip claude]");
         assert!(cfg.token.is_none());
     }

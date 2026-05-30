@@ -41,7 +41,7 @@ pub struct VcsRepo {
     /// Forge server URL with any trailing slash trimmed, e.g.
     /// `https://dev.a8n.run`.
     pub repo_host: String,
-    /// Repository path, e.g. `contoso/claude-bot`.
+    /// Repository path, e.g. `contoso/claude-run`.
     pub repo_path: String,
     /// Full clone URL: `<repo_host>/<repo_path>.git`.
     pub clone_url: String,

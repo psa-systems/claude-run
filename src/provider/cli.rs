@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn resolve_vcs_builds_repo() {
-        let json = r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-bot"}]"#;
+        let json = r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#;
         let b = backend(StubRunner::new().ok(
             "yt",
             &["project", "vcs", "MK", "--enabled-only", "--json"],
@@ -588,10 +588,10 @@ mod tests {
         ));
         let repo = b.resolve_vcs("MK").unwrap();
         assert_eq!(repo.repo_host, "https://dev.a8n.run");
-        assert_eq!(repo.repo_path, "contoso/claude-bot");
+        assert_eq!(repo.repo_path, "contoso/claude-run");
         assert_eq!(
             repo.clone_url,
-            "https://dev.a8n.run/contoso/claude-bot.git"
+            "https://dev.a8n.run/contoso/claude-run.git"
         );
     }
 
@@ -640,10 +640,10 @@ mod tests {
         let keys = dir.path().join("keys.json");
         std::fs::write(&keys, r#"{"hosts":{"dev.a8n.run":{"token":"secret"}}}"#).unwrap();
         let b = CliBackend::new(Arc::new(StubRunner::new())).with_keys_path(&keys);
-        let url = b.clone_url("dev.a8n.run", "contoso/claude-bot").unwrap();
+        let url = b.clone_url("dev.a8n.run", "contoso/claude-run").unwrap();
         assert_eq!(
             url,
-            "https://oauth2:secret@dev.a8n.run/contoso/claude-bot.git"
+            "https://oauth2:secret@dev.a8n.run/contoso/claude-run.git"
         );
     }
 
@@ -658,7 +658,7 @@ mod tests {
                 "pr",
                 "search",
                 "--repo",
-                "contoso/claude-bot",
+                "contoso/claude-run",
                 "--state",
                 "open",
                 "--json",
@@ -666,7 +666,7 @@ mod tests {
             json,
         ));
         let prs = b
-            .list_open_prs("dev.a8n.run", "contoso/claude-bot")
+            .list_open_prs("dev.a8n.run", "contoso/claude-run")
             .unwrap();
         assert_eq!(prs.len(), 1);
         assert_eq!(prs[0].number, 52);
@@ -686,13 +686,13 @@ mod tests {
                 "dev.a8n.run",
                 "pr",
                 "status",
-                "contoso/claude-bot#52",
+                "contoso/claude-run#52",
                 "--json",
             ],
             json,
         ));
         assert_eq!(
-            b.pr_ci_state("dev.a8n.run", "contoso/claude-bot", 52)
+            b.pr_ci_state("dev.a8n.run", "contoso/claude-run", 52)
                 .unwrap(),
             "failure"
         );
@@ -707,7 +707,7 @@ mod tests {
                 "dev.a8n.run",
                 "pr",
                 "comment",
-                "contoso/claude-bot#52",
+                "contoso/claude-run#52",
                 "--body-file",
                 "/tmp/body.md",
             ],
@@ -716,7 +716,7 @@ mod tests {
         let b = CliBackend::new(runner.clone());
         b.pr_comment(
             "dev.a8n.run",
-            "contoso/claude-bot",
+            "contoso/claude-run",
             52,
             Path::new("/tmp/body.md"),
         )
@@ -724,7 +724,7 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls.iter().any(|c| c
-                == "fj --host dev.a8n.run pr comment contoso/claude-bot#52 --body-file /tmp/body.md"),
+                == "fj --host dev.a8n.run pr comment contoso/claude-run#52 --body-file /tmp/body.md"),
             "{calls:?}"
         );
     }

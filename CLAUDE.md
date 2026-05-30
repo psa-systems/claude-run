@@ -1,4 +1,4 @@
-# claude-bot
+# claude-run
 
 YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Forgejo PRs, ...), feed each job to `claude --print`, do something with the result. Shipped as a single Rust binary (`claude-run`) that doubles as a CLI and a long-running daemon with a unix-socket API.
 
@@ -9,11 +9,11 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 - Runtime state in SQLite at `$CLAUDE_RUN_DATA_DIR/state.db`. Per-attempt stream logs at `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`.
 - Daemon (`claude-run serve`) owns scheduling and exposes an HTTP API over `$CLAUDE_RUN_RUNTIME_DIR/daemon.sock`. CLI subcommands delegate to the daemon when reachable, else operate directly on the DB.
 - Runtime tool dependencies (host-installed, not bundled in the binary): `nu`, `claude` (Claude Code CLI), `timeout` (coreutils). Optional: `yt`, `fj`, `git` if the actions need them.
-- Forgejo home: `psa-systems/claude-bot`.
+- Forgejo home: `psa-systems/claude-run`.
 
 ## Conventions
 
-- Governance lives at `niceguyit/governance`. `CHECKLIST.md`, `CI.md`, `PRE_COMMIT.md`, `FORGEJO_ORGS.md`, `GIT_WORKFLOW.md` are the source of truth; this file documents only claude-bot-specific deviations.
+- Governance lives at `niceguyit/governance`. `CHECKLIST.md`, `CI.md`, `PRE_COMMIT.md`, `FORGEJO_ORGS.md`, `GIT_WORKFLOW.md` are the source of truth; this file documents only claude-run-specific deviations.
 - Builder image: `dev.a8n.run/pandoras-box/rust-builder-musl:v1.0.0-rust1.94-alpine`. No runtime image - the binary ships as a Generic Package only. Users install `nu` + `claude` themselves.
 - Compose files, `.env.example`, HOST_IP/PORT, port assignments do NOT apply. The daemon binds a unix socket by default (Phase 2); the TCP web UI is Phase 3 and will be reachable on `127.0.0.1:7321` by default.
 - Action schema is documented in `actions/SCHEMA.md`. Authoritative; changes here ripple to both the runner and the doc.
