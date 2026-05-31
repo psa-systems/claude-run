@@ -27,7 +27,8 @@ use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::action::{
-    Action, ClaudeBlock, ForgejoTarget, Limits, NativeConfig, YoutrackConfig, YoutrackSource,
+    Action, ClaudeBlock, ForgejoTarget, GithubTarget, Limits, NativeConfig, YoutrackConfig,
+    YoutrackSource,
 };
 use crate::api::AppState;
 use crate::claude::ClaudeInvoker;
@@ -1019,6 +1020,10 @@ fn youtrack_form_to_yaml(
             base_url: opt(&form.fj_base_url),
             token_ref: opt(&form.fj_token_ref),
         },
+        // CLAUDE-50: the web form has no GitHub fields yet; default routes
+        // GitHub jobs through the GitHub backend with host gh auth. `prune_yaml`
+        // drops the all-default block so existing actions are unchanged on save.
+        github: GithubTarget::default(),
     };
     let native_val = prune_yaml(serde_yaml::to_value(&native).map_err(|e| e.to_string())?)
         .unwrap_or_else(|| Value::Mapping(serde_yaml::Mapping::new()));
