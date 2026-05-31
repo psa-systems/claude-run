@@ -88,6 +88,9 @@ pub fn expand_path(raw: &str) -> String {
 pub struct OnDiskConfig {
     pub web: WebConfig,
     pub daemon: DaemonConfig,
+    /// CLAUDE-43: Forgejo webhook listener settings (HMAC secret reference,
+    /// repo allow-list, replay window, rate limit).
+    pub webhook: WebhookConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -102,6 +105,40 @@ impl Default for WebConfig {
         Self {
             bind: "127.0.0.1".to_string(),
             port: 7321,
+        }
+    }
+}
+
+/// CLAUDE-43: Forgejo webhook listener config. Lives in `config.toml` because
+/// the daemon needs it before it binds the TCP listener. The HMAC secret itself
+/// is never inlined here; `secret_ref` names a credential in the CLAUDE-26
+/// `secrets` table, resolved (and decrypted) at request time.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebhookConfig {
+    /// Name of the secret (in the `secrets` table) holding the Forgejo webhook
+    /// HMAC secret. When unset, the `/webhooks/forgejo` endpoint fails closed
+    /// and rejects every request with 401.
+    pub secret_ref: Option<String>,
+    /// Allow-list of `owner/repo` full names. Only `action_run_failure` events
+    /// from a repo on this list produce a verified-failure event; every other
+    /// authenticated request is acked (2xx) and dropped so Forgejo does not retry.
+    pub allowed_repos: Vec<String>,
+    /// Replay-protection window in seconds. A delivery whose `X-Forgejo-Delivery`
+    /// id was already seen inside this window is rejected with 409.
+    pub replay_window_secs: u64,
+    /// Fixed-window rate limit: max accepted requests per minute across the
+    /// endpoint. Excess requests get 429 before any crypto work.
+    pub rate_limit_per_min: u32,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            secret_ref: None,
+            allowed_repos: Vec::new(),
+            replay_window_secs: 300,
+            rate_limit_per_min: 60,
         }
     }
 }
