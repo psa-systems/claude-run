@@ -657,7 +657,11 @@ async fn action_edit_save(
         return editor_error(s.api.version, false, Some(name), form.yaml, e.to_string());
     }
     std::fs::write(&path, form.yaml.as_bytes()).map_err(WebError::from)?;
-    // The daemon's 5s directory re-scan picks up the new sha256; no restart.
+    // Re-index synchronously so the redirect reflects the edit immediately,
+    // instead of waiting for the daemon's next periodic scan (CLAUDE-39).
+    crate::daemon::scan_actions(&s.api.pool, &s.paths.actions_dir())
+        .await
+        .map_err(WebError::from)?;
     Ok(Redirect::to(&format!("/actions/{name}")).into_response())
 }
 
@@ -698,6 +702,11 @@ async fn action_create(
     }
     std::fs::create_dir_all(&actions_dir).map_err(WebError::from)?;
     std::fs::write(&dest, form.yaml.as_bytes()).map_err(WebError::from)?;
+    // Index the new action synchronously so the redirect target resolves now,
+    // rather than 404ing until the daemon's next periodic scan (CLAUDE-39).
+    crate::daemon::scan_actions(&s.api.pool, &actions_dir)
+        .await
+        .map_err(WebError::from)?;
     Ok(Redirect::to(&format!("/actions/{}", loaded.action.name)).into_response())
 }
 
@@ -1164,6 +1173,11 @@ async fn youtrack_edit_save(
         }
     };
     std::fs::write(&path, yaml.as_bytes()).map_err(WebError::from)?;
+    // Re-index synchronously so the redirect reflects the edit immediately,
+    // instead of waiting for the daemon's next periodic scan (CLAUDE-39).
+    crate::daemon::scan_actions(&s.api.pool, &s.paths.actions_dir())
+        .await
+        .map_err(WebError::from)?;
     // Redirect to the action's own `name`, which may differ from the URL path
     // when the form renames it (the daemon re-indexes by the `name:` field).
     Ok(Redirect::to(&format!("/actions/{}", loaded.action.name)).into_response())
@@ -1217,6 +1231,11 @@ async fn youtrack_create(
     }
     std::fs::create_dir_all(&actions_dir).map_err(WebError::from)?;
     std::fs::write(&dest, yaml.as_bytes()).map_err(WebError::from)?;
+    // Index the new action synchronously so the redirect target resolves now,
+    // rather than 404ing until the daemon's next periodic scan (CLAUDE-39).
+    crate::daemon::scan_actions(&s.api.pool, &actions_dir)
+        .await
+        .map_err(WebError::from)?;
     Ok(Redirect::to(&format!("/actions/{}", loaded.action.name)).into_response())
 }
 
@@ -2156,6 +2175,27 @@ mod tests {
             let dest = s.paths.actions_dir().join("yt.yml");
             let written = std::fs::read_to_string(&dest).unwrap();
             crate::action::validate_str(&written, "<test>").unwrap();
+        }
+
+        #[tokio::test]
+        async fn youtrack_create_indexes_action_immediately() {
+            // CLAUDE-39: create re-indexes synchronously, so the action the
+            // redirect points at is in the index the instant create returns -
+            // no transient `unknown action` 404 while the daemon scan catches up.
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let resp = youtrack_create(State(s.clone()), Form(filled_form()))
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+            let rows = state::action_index_list(&s.api.pool).await.unwrap();
+            assert!(
+                rows.iter().any(|r| r.name == "yt"),
+                "index missing: {rows:?}"
+            );
         }
 
         #[tokio::test]
