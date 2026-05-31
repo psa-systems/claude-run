@@ -88,6 +88,10 @@ jobs:
           # compiled musl binary; this repo's Dockerfile has no runtime stage.
           ^docker buildx build --target binary --output type=local,dest=./output ...$build_args -f oci-build/Dockerfile .
           cp ./output/claude-run ./claude-run-linux-x86_64
+          # CLAUDE-49: publish a sha256 sidecar so `version update` can verify
+          # the download before swapping the running binary.
+          ^sha256sum claude-run-linux-x86_64 | save --raw claude-run-linux-x86_64.sha256
+          print (open --raw claude-run-linux-x86_64.sha256)
 
       - name: Publish binary as Generic Package
         shell: nu {0}
@@ -96,24 +100,30 @@ jobs:
           let tags = ($tags_str | split row ",")
           let owner = $env.REGISTRY_USER
           let provider = $env.REGISTRY_PROVIDER
+          # CLAUDE-49: publish the binary and its sha256 sidecar to the same
+          # generic-package path for every tag, so `version update` can verify
+          # the download before swapping the running binary.
+          let assets = [claude-run-linux-x86_64 claude-run-linux-x86_64.sha256]
           for tag in $tags {
-            let url = $"https://($provider)/api/packages/($owner)/generic/claude-run/($tag)/claude-run-linux-x86_64"
-            print $"Deleting existing package at ($url) - ignoring 404"
-            let delete_status = (
-              http delete
-                --full
-                --allow-errors
-                --user $owner --password $env.REGISTRY_PASSWORD
-                $url
-              | get status
-            )
-            if $delete_status not-in [204 404] {
-              print --stderr $"Unexpected DELETE status: ($delete_status)"
-              exit 1
+            for asset in $assets {
+              let url = $"https://($provider)/api/packages/($owner)/generic/claude-run/($tag)/($asset)"
+              print $"Deleting existing package at ($url) - ignoring 404"
+              let delete_status = (
+                http delete
+                  --full
+                  --allow-errors
+                  --user $owner --password $env.REGISTRY_PASSWORD
+                  $url
+                | get status
+              )
+              if $delete_status not-in [204 404] {
+                print --stderr $"Unexpected DELETE status: ($delete_status)"
+                exit 1
+              }
+              print $"DELETE returned ($delete_status)"
+              print $"Publishing ($asset) to ($url)"
+              ^curl --silent --show-error --fail-with-body --upload-file $"./($asset)" --user $"($owner):($env.REGISTRY_PASSWORD)" $url
             }
-            print $"DELETE returned ($delete_status)"
-            print $"Publishing binary to ($url)"
-            ^curl --silent --show-error --fail-with-body --upload-file ./claude-run-linux-x86_64 --user $"($owner):($env.REGISTRY_PASSWORD)" $url
           }
 
       - name: Print published URLs

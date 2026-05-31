@@ -34,6 +34,7 @@ pub mod scheduler;
 pub mod secrets;
 pub mod snippet;
 pub mod state;
+pub mod update;
 pub mod web;
 pub mod workdir;
 

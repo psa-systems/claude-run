@@ -4,7 +4,7 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 
 ## Shape
 
-- Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,pause,resume,status,action,migrate}`.
+- Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,pause,resume,status,action,migrate,version}`.
 - Actions are YAML files under `$CLAUDE_RUN_CONFIG_DIR/actions/` (default `~/.config/claude-run/actions/`). Each action's `input.command` / `filter` / `pre[]` / `prompt` / `post[]` is a nu snippet shelled out via the host's `nu` binary.
 - Runtime state in SQLite at `$CLAUDE_RUN_DATA_DIR/state.db`. Per-attempt stream logs at `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`.
 - Daemon (`claude-run serve`) owns scheduling and exposes an HTTP API over `$CLAUDE_RUN_RUNTIME_DIR/daemon.sock`. CLI subcommands delegate to the daemon when reachable, else operate directly on the DB.
