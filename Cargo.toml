@@ -1,6 +1,6 @@
 [package]
 name = "claude-run"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "YAML-driven Claude Code runner. Rust port of scripts/claude-run.nu."
 license = "MIT"
@@ -88,10 +88,6 @@ features = [
 ]
 
 [dependencies.reqwest]
-# CLAUDE-50: outbound HTTPS for the embedded GitHub MCP client. rustls-tls (no
-# default openssl-tls feature) keeps the static musl build OpenSSL-free. Shared
-# with CLAUDE-49 so the two issues add a single HTTP/TLS stack, not competing
-# ones. `blocking` because the provider `Forge` trait is synchronous.
 version = "0.12"
 default-features = false
 features = [
