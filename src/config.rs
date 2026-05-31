@@ -111,6 +111,13 @@ pub struct WebConfig {
     /// Off by default so local development stays unauthenticated; set true to
     /// exercise the gate locally.
     pub require_auth_on_loopback: bool,
+    /// Username for the browser login form. When set (and auth is required), an
+    /// unauthenticated browser request is redirected to `/login`, where this
+    /// username plus the `auth_token_ref` secret value (as the password) mint a
+    /// session cookie. Lets a password manager (e.g. Bitwarden) sign in without
+    /// crafting an `Authorization: Bearer` header. Unset disables the form;
+    /// `Authorization: Bearer <token>` still works for API clients.
+    pub auth_username: Option<String>,
 }
 
 impl Default for WebConfig {
@@ -120,6 +127,7 @@ impl Default for WebConfig {
             port: 7321,
             auth_token_ref: None,
             require_auth_on_loopback: false,
+            auth_username: None,
         }
     }
 }

@@ -18,31 +18,120 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use askama::Template;
 use axum::{
-    extract::{Request, State},
-    http::{header, StatusCode},
+    extract::{Form, Request, State},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::get,
     Router,
 };
+use hmac::{Hmac, Mac};
+use serde::Deserialize;
+use sha2::Sha256;
 use sqlx::SqlitePool;
 
 use crate::config::WebConfig;
 use crate::error::{Error, Result};
 
-/// Holds the expected bearer token, shared (cheaply cloned) into the middleware.
+/// Session cookie name set on a successful form login and accepted by the gate
+/// in lieu of a bearer header.
+const SESSION_COOKIE: &str = "claude_run_session";
+/// How long a login session stays valid before the browser must sign in again.
+const SESSION_TTL_SECS: u64 = 12 * 3600;
+
+/// Holds the expected bearer token (and, when form login is enabled, the
+/// configured username), shared (cheaply cloned) into the middleware.
 #[derive(Clone)]
 pub struct TokenGate {
     token: Arc<String>,
+    /// `Some` when `web.auth_username` is set: enables the `/login` form and the
+    /// redirect-to-login behavior for unauthenticated browser requests.
+    username: Option<Arc<String>>,
 }
 
 impl TokenGate {
+    /// Bearer-only gate (no form login). Used by tests and any caller that does
+    /// not configure a username.
     pub fn new(token: String) -> Self {
         Self {
             token: Arc::new(token),
+            username: None,
         }
     }
+
+    /// Gate with the browser login form enabled for `username`.
+    pub fn with_login(token: String, username: String) -> Self {
+        Self {
+            token: Arc::new(token),
+            username: Some(Arc::new(username)),
+        }
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Sign a session for `expiry` (unix seconds) under `token`, returning the
+/// cookie value `"<expiry>.<hex-hmac>"`. The HMAC keys on the token, so rotating
+/// the secret invalidates every outstanding session.
+fn sign_session(token: &str, expiry: u64) -> String {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(expiry.to_string().as_bytes());
+    format!("{expiry}.{}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// True when `cookie_val` is a non-expired session signed by `token`.
+fn verify_session(token: &str, cookie_val: &str) -> bool {
+    let Some((exp_str, _)) = cookie_val.split_once('.') else {
+        return false;
+    };
+    let Ok(expiry) = exp_str.parse::<u64>() else {
+        return false;
+    };
+    if now_unix() > expiry {
+        return false;
+    }
+    constant_time_eq(
+        sign_session(token, expiry).as_bytes(),
+        cookie_val.as_bytes(),
+    )
+}
+
+/// The `Set-Cookie` value for a fresh session: HttpOnly + Secure + SameSite=Lax,
+/// scoped to the whole site, expiring with the session TTL.
+fn session_set_cookie(token: &str) -> String {
+    let value = sign_session(token, now_unix() + SESSION_TTL_SECS);
+    format!(
+        "{SESSION_COOKIE}={value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECS}"
+    )
+}
+
+/// Read the session cookie value from a request's `Cookie` header, if present.
+fn session_cookie(request: &Request) -> Option<String> {
+    let raw = request.headers().get(header::COOKIE)?.to_str().ok()?;
+    raw.split(';').map(str::trim).find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == SESSION_COOKIE).then(|| v.to_string())
+    })
+}
+
+/// Whether the request looks like a browser navigation that should be redirected
+/// to the login page rather than answered with a bare 401.
+fn wants_html(request: &Request) -> bool {
+    request
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"))
 }
 
 /// True when the TCP surface must require a token: any non-loopback bind, or an
@@ -92,21 +181,43 @@ pub async fn resolve_gate(web: &WebConfig, pool: &SqlitePool) -> Result<Option<T
             "secret `{name}` (web.auth_token_ref) is empty; refusing to gate with an empty token"
         )));
     }
-    Ok(Some(TokenGate::new(token)))
+    let gate = match web.auth_username.as_deref() {
+        Some(u) if !u.trim().is_empty() => TokenGate::with_login(token, u.trim().to_string()),
+        _ => TokenGate::new(token),
+    };
+    Ok(Some(gate))
 }
 
-/// Wrap `router` so every request must carry `Authorization: Bearer <token>`
-/// matching the gate, except requests under the `/webhooks/` prefix.
+/// Wrap `router` so every request must carry either `Authorization: Bearer
+/// <token>` or a valid session cookie, except requests under the `/webhooks/`
+/// prefix and the login routes. When the gate has a configured username, the
+/// `/login` (+ `/logout`) form routes are mounted so a browser / password
+/// manager can sign in.
 pub fn protect(router: Router, gate: TokenGate) -> Router {
+    let mut router = router;
+    if let Some(username) = gate.username.clone() {
+        let login = Router::new()
+            .route("/login", get(login_page).post(login_submit))
+            .route("/logout", get(logout))
+            .with_state(LoginState {
+                token: gate.token.clone(),
+                username,
+            });
+        router = router.merge(login);
+    }
     router.layer(axum::middleware::from_fn_with_state(gate, require_token))
 }
 
-/// Axum middleware enforcing the bearer token. Exempts the webhook prefix; all
-/// other paths get a 401 unless a matching token is presented.
+/// Axum middleware enforcing the bearer token or session cookie. Exempts the
+/// webhook prefix and the login routes. An unauthenticated browser navigation
+/// (GET accepting HTML) is redirected to `/login` when the form is enabled;
+/// everything else gets a 401.
 async fn require_token(State(gate): State<TokenGate>, request: Request, next: Next) -> Response {
     // The webhook route authenticates itself via HMAC and Forgejo cannot send a
-    // bearer token, so it is never gated here.
-    if request.uri().path().starts_with("/webhooks/") {
+    // bearer token, so it is never gated here. The login routes must be reachable
+    // unauthenticated or there is no way in.
+    let path = request.uri().path();
+    if path.starts_with("/webhooks/") || path == "/login" || path == "/logout" {
         return next.run(request).await;
     }
     if let Some(presented) = bearer_token(&request) {
@@ -114,12 +225,83 @@ async fn require_token(State(gate): State<TokenGate>, request: Request, next: Ne
             return next.run(request).await;
         }
     }
+    if let Some(cookie) = session_cookie(&request) {
+        if verify_session(&gate.token, &cookie) {
+            return next.run(request).await;
+        }
+    }
+    // Send browsers to the login form (when enabled) instead of a bare 401, so a
+    // password manager can complete the sign-in. API clients still get 401.
+    if gate.username.is_some() && request.method() == Method::GET && wants_html(&request) {
+        return Redirect::to("/login").into_response();
+    }
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, "Bearer")],
         "missing or invalid bearer token",
     )
         .into_response()
+}
+
+/// State for the login routes: the expected password (the resolved bearer
+/// token) and the configured username.
+#[derive(Clone)]
+struct LoginState {
+    token: Arc<String>,
+    username: Arc<String>,
+}
+
+#[derive(Template)]
+#[template(path = "login.html")]
+struct LoginTpl {
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+}
+
+/// GET `/login`: render the sign-in form.
+async fn login_page() -> Response {
+    render_login(None, StatusCode::OK)
+}
+
+/// POST `/login`: verify username + password (the `auth_token_ref` secret),
+/// mint a session cookie, and redirect to the dashboard. On mismatch, re-render
+/// the form with a 401 and a generic error (no hint which field was wrong).
+async fn login_submit(State(st): State<LoginState>, Form(form): Form<LoginForm>) -> Response {
+    let user_ok = constant_time_eq(form.username.as_bytes(), st.username.as_bytes());
+    let pass_ok = constant_time_eq(form.password.as_bytes(), st.token.as_bytes());
+    if !(user_ok && pass_ok) {
+        return render_login(
+            Some("Invalid username or password.".to_string()),
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+    let mut resp = Redirect::to("/").into_response();
+    if let Ok(v) = HeaderValue::from_str(&session_set_cookie(&st.token)) {
+        resp.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    resp
+}
+
+/// GET `/logout`: clear the session cookie and bounce back to the login form.
+async fn logout() -> Response {
+    let mut resp = Redirect::to("/login").into_response();
+    let clear = format!("{SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0");
+    if let Ok(v) = HeaderValue::from_str(&clear) {
+        resp.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    resp
+}
+
+fn render_login(error: Option<String>, status: StatusCode) -> Response {
+    match (LoginTpl { error }).render() {
+        Ok(html) => (status, Html(html)).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "login template error").into_response(),
+    }
 }
 
 /// Extract the token from an `Authorization: Bearer <token>` header, if present.
@@ -272,5 +454,108 @@ mod tests {
             .unwrap();
         // No Authorization header, yet the webhook passes through.
         assert_eq!(status_of(gated_router("s3cret"), req).await, StatusCode::OK);
+    }
+
+    #[test]
+    fn session_round_trips_and_rejects_tampering() {
+        let cookie = sign_session("s3cret", now_unix() + 60);
+        assert!(verify_session("s3cret", &cookie));
+        // Wrong token, garbage, and a non-numeric expiry all fail.
+        assert!(!verify_session("other", &cookie));
+        assert!(!verify_session("s3cret", "not-a-session"));
+        assert!(!verify_session("s3cret", "abc.deadbeef"));
+        // A flipped signature byte fails.
+        let mut bad = cookie.clone();
+        bad.pop();
+        bad.push(if cookie.ends_with('0') { '1' } else { '0' });
+        assert!(!verify_session("s3cret", &bad));
+    }
+
+    #[test]
+    fn expired_session_is_rejected() {
+        let cookie = sign_session("s3cret", now_unix() - 1);
+        assert!(!verify_session("s3cret", &cookie));
+    }
+
+    /// A router protected with form login enabled.
+    fn login_router(token: &str, user: &str) -> Router {
+        let app = Router::new().route("/", get(|| async { "home" }));
+        protect(
+            app,
+            TokenGate::with_login(token.to_string(), user.to_string()),
+        )
+    }
+
+    #[tokio::test]
+    async fn browser_request_without_auth_redirects_to_login() {
+        let req = Request::builder()
+            .uri("/")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(login_router("s3cret", "admin"), req).await,
+            StatusCode::SEE_OTHER
+        );
+    }
+
+    #[tokio::test]
+    async fn login_form_route_is_reachable_unauthenticated() {
+        let req = Request::builder()
+            .uri("/login")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(login_router("s3cret", "admin"), req).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn login_submit_sets_cookie_and_cookie_unlocks_the_gate() {
+        // Correct credentials -> redirect + Set-Cookie.
+        let body = "username=admin&password=s3cret";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = login_router("s3cret", "admin").oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cookie.contains("HttpOnly") && cookie.contains("Secure"));
+        // The minted cookie then authenticates a normal request.
+        let cookie_val = cookie.split(';').next().unwrap().to_string();
+        let req2 = Request::builder()
+            .uri("/")
+            .header(header::COOKIE, cookie_val)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(login_router("s3cret", "admin"), req2).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn login_submit_rejects_wrong_password() {
+        let body = "username=admin&password=wrong";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = login_router("s3cret", "admin").oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
     }
 }
