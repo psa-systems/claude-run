@@ -17,7 +17,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use claude_run::{
     action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db, exit, lock,
-    migrate, snippet, state,
+    migrate, snippet, state, update,
 };
 
 #[derive(Parser)]
@@ -83,6 +83,41 @@ enum Cmd {
     Migrate {
         #[arg(long)]
         from: Option<String>,
+    },
+    /// Show the running version, check the registry for a newer build, or
+    /// self-update in place. With no subcommand, behaves like `show`.
+    Version {
+        #[command(subcommand)]
+        cmd: Option<VersionCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VersionCmd {
+    /// Print the build-stamped version banner (identical to `--version`).
+    Show,
+    /// Report the current version, the newest available `vX.Y.Z` in the
+    /// registry, and whether an update is available. Exits non-zero only on a
+    /// registry/transport error.
+    Check {
+        /// On a 401/403, use the `fj` token for the registry host without an
+        /// interactive prompt.
+        #[arg(long)]
+        use_fj_token: bool,
+    },
+    /// Download the newest build (or `--version <tag>`), verify its SHA-256
+    /// against the published sidecar, and atomically replace this binary.
+    Update {
+        /// Pin a specific release tag (e.g. v0.2.0) instead of the newest.
+        #[arg(long = "version")]
+        version: Option<String>,
+        /// On a 401/403, use the `fj` token for the registry host without an
+        /// interactive prompt.
+        #[arg(long)]
+        use_fj_token: bool,
+        /// Skip the confirmation prompt before swapping the binary.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -204,6 +239,22 @@ async fn real_main(cli: Cli) -> claude_run::error::Result<i32> {
             );
             Ok(exit::OK)
         }
+        Cmd::Version { cmd } => version_cmd(cmd).await,
+    }
+}
+
+async fn version_cmd(cmd: Option<VersionCmd>) -> claude_run::error::Result<i32> {
+    match cmd.unwrap_or(VersionCmd::Show) {
+        VersionCmd::Show => {
+            println!("{}", claude_run::VERSION);
+            Ok(exit::OK)
+        }
+        VersionCmd::Check { use_fj_token } => update::check(use_fj_token).await,
+        VersionCmd::Update {
+            version,
+            use_fj_token,
+            yes,
+        } => update::update(version, use_fj_token, yes).await,
     }
 }
 
