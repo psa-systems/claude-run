@@ -181,7 +181,8 @@ create-release bump:
     # Create release branch, bump version, and commit
     git checkout -b $release_branch
     open Cargo.toml | update package.version $bare | to toml | collect | save --force Cargo.toml
-    git add Cargo.toml
+    ^cargo update --package claude-run --precise $bare
+    git add Cargo.toml Cargo.lock
     git commit --signoff --message $"Release ($tag)"
 
     # Push release branch
