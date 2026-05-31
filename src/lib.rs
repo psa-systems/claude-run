@@ -26,6 +26,7 @@ pub mod config;
 pub mod daemon;
 pub mod db;
 pub mod error;
+pub mod forge_log;
 pub mod job;
 pub mod lock;
 pub mod migrate;
@@ -35,6 +36,7 @@ pub mod scheduler;
 pub mod secrets;
 pub mod snippet;
 pub mod state;
+pub mod update;
 pub mod web;
 pub mod workdir;
 
