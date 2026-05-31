@@ -1,93 +1,89 @@
 ---
-# Pick up YouTrack issues whose AI Agent custom field is Queued. Resolve each
-# issue's repo via the project's VCS integration, clone it into the job's
-# workdir, and have Claude work the issue end-to-end per the YouTrack and Git
+# yaml-embedded-languages: nushell
+# https://github.com/harrydowning/vscode-yaml-embedded-languages
+# https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
+
+# Pick up YouTrack issues whose AI Agent custom field is Queued. Resolve each issue's repo via the project's VCS
+# integration, clone it into the job's workdir, and have Claude work the issue end-to-end per the YouTrack and Git
 # workflows in CLAUDE.md.
 #
-# Native action (CLAUDE-33): `kind: youtrack` routes to the built-in Rust
-# handler in `src/native/youtrack.rs` instead of the generic nu-snippet
-# pipeline. The handler owns gather / filter / pre / prompt / claude / finalize
-# in typed Rust; this file is config only and carries no script-bearing fields
-# (input.command / filter / pre / prompt / post).
+# Native action (CLAUDE-33): `kind: youtrack` routes to the built-in Rust handler in `src/native/youtrack.rs` instead of
+# the generic nu-snippet pipeline. The handler owns gather / filter / pre / prompt / claude / finalize in typed Rust;
+# this file is config only and carries no script-bearing fields (input.command / filter / pre / prompt / post).
 #
-# Auth (CLAUDE-26): the `yt` / `fj` CLIs are host-configured by default. To give
-# this action its own credentials, set `token_ref` under the native blocks to the
-# name of an encrypted secret (managed under /secrets in the web UI; encrypted at
-# rest with the age key file named by CLAUDE_RUN_SECRETS_KEY_FILE). The runner
-# decrypts it at run time and injects it into the CLIs per job; no raw token is
-# ever written to this file. With no `token_ref`, host credentials are used.
+# Auth (CLAUDE-26): the `yt` / `fj` CLIs are host-configured by default. To give this action its own credentials, set
+# `token_ref` under the native blocks to the name of an encrypted secret (managed under /secrets in the web UI;
+# encrypted at rest with the age key file named by CLAUDE_RUN_SECRETS_KEY_FILE). The runner decrypts it at run time and
+# injects it into the CLIs per job; no raw token is ever written to this file. With no `token_ref`, host credentials are
+# used.
 #
 # AI Agent state machine (labels configurable under native.youtrack.states):
 #   Queued       -> picked up by this action
 #   Working      -> claude is running (set in the pre step)
-#   Code Review  -> the runner opened a PR after a successful run; the code
-#                   needs human review (finalize step)
-#   Needs Review -> claude couldn't proceed and parked the job by writing
-#                   .claude-run-needs-review; the issue needs human input
-#                   (finalize step) - the attempt counter is NOT incremented
+#   Code Review  -> the runner opened a PR after a successful run; the code needs human review (finalize step)
+#   Needs Review -> claude couldn't proceed and parked the job by writing .claude-run-needs-review; the issue needs
+#                   human input (finalize step) - the attempt counter is NOT incremented
 #   Failed       -> claude or a step had a hard failure (finalize step)
 #
-# The agent does ONLY local engineering work (read issue, branch, change, commit
-# locally, run the repo's checks). It performs NO external mutation: no git
-# push, no PR, no YouTrack write. The handler's finalize step owns every external
-# mutation - PR creation and the AI Agent transition - and runs them after the
-# claude process exits, gated on the run outcome. The agent signals a blocker by
-# writing .claude-run-needs-review (reason text) + .claude-run-skip-attempt.
+# The agent does ONLY local engineering work (read issue, branch, change, commit locally, run the repo's checks). It
+# performs NO external mutation: no git push, no PR, no YouTrack write. The handler's finalize step owns every external
+# mutation - PR creation and the AI Agent transition - and runs them after the claude process exits, gated on the run
+# outcome. The agent signals a blocker by writing .claude-run-needs-review (reason text) + .claude-run-skip-attempt.
 #
-# State (the standard YouTrack field) is independent of AI Agent. The pre step
-# sets State=In Progress. Submitting a PR does NOT move State to Done: the commit
-# links the PR to the issue but carries no State command, so the issue stays In
+# State (the standard YouTrack field) is independent of AI Agent. The pre step sets State=In Progress. Submitting a PR
+# does NOT move State to Done: the commit links the PR to the issue but carries no State command, so the issue stays In
 # Progress until a human merges the PR and sets State=Done themselves.
 
 name: youtrack
 
 kind: youtrack
 
-# Typed config for the native handler. Every field defaults, so an empty
-# `native: {}` reproduces the behavior the scripted action had; the youtrack
-# block below pins the query and custom field explicitly for documentation.
-native:
-  youtrack:
-    # --query value the handler passes to `yt list`. Starts with `-Resolved`,
-    # which the handler sends as `--query=<value>` so it is not mistaken for a
-    # flag.
-    query: "-Resolved AI Agent: Queued"
-    custom_field: "AI Agent"
-    # base_url / token_ref (CLAUDE-26): omitted here, so the host-configured yt
-    # CLI is used. To inject a token, set base_url plus token_ref: <secret-name>.
-    # states: defaults to Queued / Working / Code Review / Needs Review / Failed
-    #         and State=In Progress; override here only if the project renames
-    #         these AI Agent values.
-  forgejo: {}
-    # base_url / token_ref (CLAUDE-26): omitted, so the host fj credentials are
-    # used and the forge host derives from each issue's resolved VCS integration.
+limits:
+  max_attempts_per_key: 3
+  max_runs_per_day: 100
+  claude_timeout_seconds: 3600
+  daily_budget_usd: 150.00
 
-# Per-action link template (CLAUDE-1). Job keys (idReadable, e.g. MK-16)
-# render as clickable links to the YouTrack issue in the web UI.
-link_template: "https://example.myjetbrains.com/issue/{key}"
+schedule:
+  kind: interval
+  spec: 5m
 
 # /home has more space than /tmp.
+# Plain shell expansion: ~, $VAR, and ${VAR} are honored. The old nu-eval
+# form ($"...") is gone with the Rust port.
 workdir_base: ~/workspace
 
 claude:
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
   permission_mode: acceptEdits
 
-output:
-  file: youtrack.jsonl
-
-limits:
-  max_attempts_per_key: 3
-  max_runs_per_day: 20
-  claude_timeout_seconds: 3600
-  daily_budget_usd: 100.00
-
-# CLAUDE-28: run independent issues in parallel. Each issue's project/repo forms
-# the concurrency key (workflow is unset today), so issues in different repos run
-# concurrently while issues in the same repo serialize (they would otherwise
-# collide on the clone dir, branch, and PR). max_parallel caps how many distinct
-# repos run at once; keep it at or below the host's spare core count, since each
-# running issue holds a thread for its claude invocation. Set to 1 to restore
+# CLAUDE-28: run independent issues in parallel. Each issue's project/repo forms the concurrency key (workflow is unset
+# today), so issues in different repos run concurrently while issues in the same repo serialize (they would otherwise
+# collide on the clone dir, branch, and PR). max_parallel caps how many distinct repos run at once; keep it at or below
+# the host's spare core count, since each running issue holds a thread for its Claude invocation. Set to 1 to restore
 # the previous strictly-sequential behavior.
 concurrency:
   max_parallel: 4
+
+# Typed config for the native handler. Every field defaults, so an empty `native: {}` reproduces the behavior the
+# scripted action had; the youtrack block below pins the query and custom field explicitly for documentation.
+native:
+  youtrack:
+    # --query value the handler passes to `yt list`. Starts with `-Resolved`, which the handler sends as
+    # `--query=<value>` so it is not mistaken for a flag.
+    query: "-Resolved AI Agent: Queued"
+    custom_field: "AI Agent"
+    # base_url / token_ref (CLAUDE-26): omitted here, so the host-configured yt CLI is used. To inject a token, set
+    # base_url plus token_ref: <secret-name>.
+    # states: defaults to Queued / Working / Code Review / Needs Review / Failed and State=In Progress; override here
+    #         only if the project renames these AI Agent values.
+  forgejo: {}
+    # base_url / token_ref (CLAUDE-26): omitted, so the host fj credentials are used and the forge host derives from
+    # each issue's resolved VCS integration.
+
+# Per-action link template (CLAUDE-1). Job keys (idReadable, e.g. MK-16) render as clickable links to the YouTrack issue
+# in the web UI.
+link_template: "https://example.myjetbrains.com/issue/{key}"
+
+output:
+  file: youtrack.jsonl
