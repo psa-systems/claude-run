@@ -24,6 +24,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use crate::action::{
+    Action, ClaudeBlock, ForgejoTarget, Limits, NativeConfig, YoutrackConfig, YoutrackSource,
+};
 use crate::api::AppState;
 use crate::claude::ClaudeInvoker;
 use crate::config::Paths;
@@ -42,12 +45,18 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/actions/new", get(action_new_page))
+        .route("/actions/new/youtrack", get(youtrack_new_page))
         .route("/actions", post(action_create))
+        .route("/actions/youtrack", post(youtrack_create))
         .route("/actions/:name", get(action_detail))
         .route("/actions/:name/durations", get(action_durations))
         .route(
             "/actions/:name/edit",
             get(action_edit_page).post(action_edit_save),
+        )
+        .route(
+            "/actions/:name/form",
+            get(youtrack_edit_page).post(youtrack_edit_save),
         )
         .route("/actions/:name/export", get(action_export))
         .route("/secrets", get(secrets_page).post(secret_create))
@@ -521,6 +530,9 @@ struct ActionEditorTpl {
     is_new: bool,
     /// Existing action name; drives the Cancel / Export links.
     name: Option<String>,
+    /// Link to the structured editor, shown when one applies (a `kind: youtrack`
+    /// action being edited, or the new-action page offering a YouTrack form).
+    form_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -589,6 +601,7 @@ fn editor_error(
         error: Some(message),
         is_new,
         name,
+        form_url: None,
     };
     Ok((
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -605,6 +618,13 @@ async fn action_edit_page(
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
     let yaml = std::fs::read_to_string(&path).map_err(WebError::from)?;
+    // Offer the structured editor only for a parseable `kind: youtrack` action.
+    let form_url = match crate::action::validate_str(&yaml, &path) {
+        Ok(loaded) if matches!(loaded.action.native, Some(NativeConfig::Youtrack(_))) => {
+            Some(format!("/actions/{name}/form"))
+        }
+        _ => None,
+    };
     let tpl = ActionEditorTpl {
         version: s.api.version,
         heading: format!("Edit {name}"),
@@ -613,6 +633,7 @@ async fn action_edit_page(
         error: None,
         is_new: false,
         name: Some(name),
+        form_url,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
@@ -644,6 +665,7 @@ async fn action_new_page(State(s): State<WebState>) -> Result<Html<String>, WebE
         error: None,
         is_new: true,
         name: None,
+        form_url: Some("/actions/new/youtrack".into()),
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
@@ -691,6 +713,506 @@ async fn action_export(
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
     Ok(resp)
+}
+
+// ---- structured YouTrack action editor (CLAUDE-27) ------------------------
+//
+// A field-based form for the native `kind: youtrack` action, an alternative to
+// the raw-YAML textarea above. The form owns the native config (youtrack source
+// + forgejo target) plus the generic Action blocks it surfaces (workdir_base,
+// link_template, schedule, claude, limits, enabled); every other key the file
+// carries (concurrency, output, dedup_key, ...) is left untouched on save.
+// `token_ref` fields are dropdowns of stored secret *names* - a value is never
+// rendered (CLAUDE-26). Submissions round-trip through the same
+// `crate::action::validate_str` the raw editor uses, so a bad config is rejected
+// inline with the entered values preserved.
+
+#[derive(Template)]
+#[template(path = "youtrack_editor.html")]
+struct YoutrackEditorTpl {
+    version: &'static str,
+    heading: String,
+    /// URL the form POSTs to.
+    post_url: String,
+    /// URL of the raw-YAML editor for the same action (advanced / fallback).
+    raw_url: String,
+    /// Prefilled (or submitted-and-rejected) field values.
+    form: YoutrackEditForm,
+    /// Stored secret names offered in the `token_ref` dropdowns. Names only -
+    /// values are never loaded here.
+    secrets: Vec<String>,
+    /// Inline validation error, rendered above the form when set.
+    error: Option<String>,
+    /// Existing action name (`None` in create mode); drives the heading,
+    /// breadcrumb, and Cancel link.
+    name: Option<String>,
+}
+
+/// Flat form backing the structured editor. Every input posts a string; the
+/// mapping into the typed config (and number / enum parsing) happens in
+/// [`youtrack_form_to_yaml`]. `#[serde(default)]` lets an unchecked checkbox or
+/// an omitted field deserialize cleanly.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct YoutrackEditForm {
+    name: String,
+    yt_base_url: String,
+    yt_token_ref: String,
+    yt_query: String,
+    yt_custom_field: String,
+    state_queued: String,
+    state_working: String,
+    state_code_review: String,
+    state_needs_review: String,
+    state_failed: String,
+    state_in_progress: String,
+    fj_base_url: String,
+    fj_token_ref: String,
+    workdir_base: String,
+    link_template: String,
+    /// "", "interval", "cron", or "manual".
+    schedule_kind: String,
+    schedule_spec: String,
+    claude_cwd: String,
+    claude_allowed_tools: String,
+    claude_permission_mode: String,
+    limit_max_attempts_per_key: String,
+    limit_max_runs_per_day: String,
+    limit_claude_timeout_seconds: String,
+    limit_daily_budget_usd: String,
+    /// Present ("on") when the enabled checkbox is checked, absent otherwise.
+    enabled: Option<String>,
+}
+
+impl YoutrackEditForm {
+    /// Whether the enabled checkbox was ticked (the browser omits an unchecked
+    /// box, so absence means false).
+    fn is_enabled(&self) -> bool {
+        self.enabled.is_some()
+    }
+}
+
+/// Field defaults for a brand-new YouTrack action: blank identity, but the
+/// query / custom field / state labels seeded from [`YoutrackConfig::default`]
+/// so the form opens with the same values a bare `native: {}` resolves to.
+fn youtrack_form_defaults() -> YoutrackEditForm {
+    let c = YoutrackConfig::default();
+    YoutrackEditForm {
+        yt_query: c.youtrack.query,
+        yt_custom_field: c.youtrack.custom_field,
+        state_queued: c.youtrack.states.queued,
+        state_working: c.youtrack.states.working,
+        state_code_review: c.youtrack.states.code_review,
+        state_needs_review: c.youtrack.states.needs_review,
+        state_failed: c.youtrack.states.failed,
+        state_in_progress: c.youtrack.states.in_progress,
+        ..Default::default()
+    }
+}
+
+/// Prefill the form from a loaded action. Returns `None` when the action is not
+/// a native `kind: youtrack` action (the structured editor only handles that
+/// kind; callers redirect to the raw editor instead).
+fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
+    let NativeConfig::Youtrack(yt) = a.native.as_ref()? else {
+        return None;
+    };
+    let s = |o: &Option<String>| o.clone().unwrap_or_default();
+    let n = |o: Option<u32>| o.map(|v| v.to_string()).unwrap_or_default();
+    Some(YoutrackEditForm {
+        name: a.name.clone(),
+        yt_base_url: s(&yt.youtrack.base_url),
+        yt_token_ref: s(&yt.youtrack.token_ref),
+        yt_query: yt.youtrack.query.clone(),
+        yt_custom_field: yt.youtrack.custom_field.clone(),
+        state_queued: yt.youtrack.states.queued.clone(),
+        state_working: yt.youtrack.states.working.clone(),
+        state_code_review: yt.youtrack.states.code_review.clone(),
+        state_needs_review: yt.youtrack.states.needs_review.clone(),
+        state_failed: yt.youtrack.states.failed.clone(),
+        state_in_progress: yt.youtrack.states.in_progress.clone(),
+        fj_base_url: s(&yt.forgejo.base_url),
+        fj_token_ref: s(&yt.forgejo.token_ref),
+        workdir_base: s(&a.workdir_base),
+        link_template: s(&a.link_template),
+        schedule_kind: a
+            .schedule
+            .as_ref()
+            .map(|sc| {
+                match sc.kind {
+                    crate::action::ScheduleKind::Interval => "interval",
+                    crate::action::ScheduleKind::Cron => "cron",
+                    crate::action::ScheduleKind::Manual => "manual",
+                }
+                .to_string()
+            })
+            .unwrap_or_default(),
+        schedule_spec: a
+            .schedule
+            .as_ref()
+            .and_then(|sc| sc.spec.clone())
+            .unwrap_or_default(),
+        claude_cwd: s(&a.claude.cwd),
+        claude_allowed_tools: s(&a.claude.allowed_tools),
+        claude_permission_mode: s(&a.claude.permission_mode),
+        limit_max_attempts_per_key: n(a.limits.max_attempts_per_key),
+        limit_max_runs_per_day: n(a.limits.max_runs_per_day),
+        limit_claude_timeout_seconds: n(a.limits.claude_timeout_seconds),
+        limit_daily_budget_usd: a
+            .limits
+            .daily_budget_usd
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        enabled: a.enabled.then(|| "on".to_string()),
+    })
+}
+
+/// Recursively drop `null` values and empty maps / sequences so the emitted
+/// YAML carries only the fields the user actually set (a `None` `token_ref`
+/// disappears rather than serializing as `token_ref: null`). Returns `None`
+/// when the whole value prunes away to nothing.
+fn prune_yaml(v: serde_yaml::Value) -> Option<serde_yaml::Value> {
+    use serde_yaml::Value;
+    match v {
+        Value::Null => None,
+        Value::Mapping(m) => {
+            let mut out = serde_yaml::Mapping::new();
+            for (k, val) in m {
+                if let Some(p) = prune_yaml(val) {
+                    out.insert(k, p);
+                }
+            }
+            (!out.is_empty()).then_some(Value::Mapping(out))
+        }
+        Value::Sequence(seq) => {
+            let pruned: Vec<Value> = seq.into_iter().filter_map(prune_yaml).collect();
+            (!pruned.is_empty()).then_some(Value::Sequence(pruned))
+        }
+        scalar => Some(scalar),
+    }
+}
+
+/// Map the structured form into a full action YAML string, overlaid onto `base`
+/// (the parsed existing file for an edit, or an empty mapping for a create).
+/// The form owns the `name`, `kind`, `native`, `claude`, `limits`, `schedule`,
+/// `workdir_base`, `link_template`, and `enabled` keys; every other key in
+/// `base` is preserved untouched. Returns `Err` with a human-readable message
+/// when a numeric limit or the schedule kind fails to parse.
+fn youtrack_form_to_yaml(
+    mut base: serde_yaml::Value,
+    form: &YoutrackEditForm,
+) -> Result<String, String> {
+    use serde_yaml::Value;
+
+    let map = base
+        .as_mapping_mut()
+        .ok_or_else(|| "the action file is not a YAML mapping".to_string())?;
+
+    // Empty text input -> unset (None); trimmed non-empty -> Some.
+    let opt = |raw: &str| -> Option<String> {
+        let t = raw.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    // Identity.
+    map.insert(Value::from("name"), Value::from(form.name.trim()));
+    map.insert(Value::from("kind"), Value::from("youtrack"));
+
+    // Native YouTrack config. Required string fields fall back to their
+    // defaults when left blank so a cleared field never becomes an empty label.
+    let mut youtrack = YoutrackSource {
+        base_url: opt(&form.yt_base_url),
+        token_ref: opt(&form.yt_token_ref),
+        ..YoutrackSource::default()
+    };
+    if let Some(q) = opt(&form.yt_query) {
+        youtrack.query = q;
+    }
+    if let Some(c) = opt(&form.yt_custom_field) {
+        youtrack.custom_field = c;
+    }
+    let states = &mut youtrack.states;
+    if let Some(v) = opt(&form.state_queued) {
+        states.queued = v;
+    }
+    if let Some(v) = opt(&form.state_working) {
+        states.working = v;
+    }
+    if let Some(v) = opt(&form.state_code_review) {
+        states.code_review = v;
+    }
+    if let Some(v) = opt(&form.state_needs_review) {
+        states.needs_review = v;
+    }
+    if let Some(v) = opt(&form.state_failed) {
+        states.failed = v;
+    }
+    if let Some(v) = opt(&form.state_in_progress) {
+        states.in_progress = v;
+    }
+    let native = YoutrackConfig {
+        youtrack,
+        forgejo: ForgejoTarget {
+            base_url: opt(&form.fj_base_url),
+            token_ref: opt(&form.fj_token_ref),
+        },
+    };
+    let native_val = prune_yaml(serde_yaml::to_value(&native).map_err(|e| e.to_string())?)
+        .unwrap_or_else(|| Value::Mapping(serde_yaml::Mapping::new()));
+    map.insert(Value::from("native"), native_val);
+
+    // Limits. Blank -> unset; non-numeric -> inline error.
+    let pu32 = |label: &str, raw: &str| -> Result<Option<u32>, String> {
+        match raw.trim() {
+            "" => Ok(None),
+            t => t
+                .parse::<u32>()
+                .map(Some)
+                .map_err(|_| format!("{label} must be a whole number (got `{t}`)")),
+        }
+    };
+    let limits = Limits {
+        max_attempts_per_key: pu32("Max attempts per key", &form.limit_max_attempts_per_key)?,
+        max_runs_per_day: pu32("Max runs per day", &form.limit_max_runs_per_day)?,
+        claude_timeout_seconds: pu32(
+            "Claude timeout (seconds)",
+            &form.limit_claude_timeout_seconds,
+        )?,
+        daily_budget_usd: match form.limit_daily_budget_usd.trim() {
+            "" => None,
+            t => Some(
+                t.parse::<f64>()
+                    .map_err(|_| format!("Daily budget (USD) must be a number (got `{t}`)"))?,
+            ),
+        },
+    };
+    set_or_remove(
+        map,
+        "limits",
+        prune_yaml(serde_yaml::to_value(&limits).map_err(|e| e.to_string())?),
+    );
+
+    // Claude block.
+    let claude = ClaudeBlock {
+        cwd: opt(&form.claude_cwd),
+        allowed_tools: opt(&form.claude_allowed_tools),
+        permission_mode: opt(&form.claude_permission_mode),
+    };
+    set_or_remove(
+        map,
+        "claude",
+        prune_yaml(serde_yaml::to_value(&claude).map_err(|e| e.to_string())?),
+    );
+
+    // Schedule.
+    match form.schedule_kind.trim() {
+        "" | "none" => {
+            map.remove("schedule");
+        }
+        kind @ ("interval" | "cron" | "manual") => {
+            let mut sm = serde_yaml::Mapping::new();
+            sm.insert(Value::from("kind"), Value::from(kind));
+            if let Some(spec) = opt(&form.schedule_spec) {
+                sm.insert(Value::from("spec"), Value::from(spec));
+            }
+            map.insert(Value::from("schedule"), Value::Mapping(sm));
+        }
+        other => return Err(format!("unknown schedule kind `{other}`")),
+    }
+
+    // Scalars that drop out of the file when cleared.
+    set_scalar_or_remove(map, "workdir_base", opt(&form.workdir_base));
+    set_scalar_or_remove(map, "link_template", opt(&form.link_template));
+    map.insert(Value::from("enabled"), Value::from(form.is_enabled()));
+
+    serde_yaml::to_string(&base).map_err(|e| e.to_string())
+}
+
+/// Insert `val` under `key`, or remove the key when `val` is `None`.
+fn set_or_remove(map: &mut serde_yaml::Mapping, key: &str, val: Option<serde_yaml::Value>) {
+    match val {
+        Some(v) => {
+            map.insert(serde_yaml::Value::from(key), v);
+        }
+        None => {
+            map.remove(key);
+        }
+    }
+}
+
+/// Insert a scalar string under `key`, or remove the key when `val` is `None`.
+fn set_scalar_or_remove(map: &mut serde_yaml::Mapping, key: &str, val: Option<String>) {
+    set_or_remove(map, key, val.map(serde_yaml::Value::from));
+}
+
+/// Stored secret names, with any `token_ref` the action already references that
+/// no longer exists folded in so an orphaned reference still shows as selected.
+async fn token_ref_options(s: &WebState, form: &YoutrackEditForm) -> Result<Vec<String>, WebError> {
+    let mut names: Vec<String> = state::secret_list(&s.api.pool)
+        .await?
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
+    for r in [&form.yt_token_ref, &form.fj_token_ref] {
+        let r = r.trim();
+        if !r.is_empty() && !names.iter().any(|n| n == r) {
+            names.push(r.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// Render the structured editor at `status`, preserving the supplied `form`.
+async fn render_youtrack_editor(
+    s: &WebState,
+    status: StatusCode,
+    name: Option<String>,
+    form: YoutrackEditForm,
+    error: Option<String>,
+) -> Result<Response, WebError> {
+    let secrets = token_ref_options(s, &form).await?;
+    let (heading, post_url, raw_url) = match &name {
+        Some(n) => (
+            format!("Edit {n}"),
+            format!("/actions/{n}/form"),
+            format!("/actions/{n}/edit"),
+        ),
+        None => (
+            "New YouTrack action".to_string(),
+            "/actions/youtrack".to_string(),
+            "/actions/new".to_string(),
+        ),
+    };
+    let tpl = YoutrackEditorTpl {
+        version: s.api.version,
+        heading,
+        post_url,
+        raw_url,
+        form,
+        secrets,
+        error,
+        name,
+    };
+    Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
+}
+
+async fn youtrack_new_page(State(s): State<WebState>) -> Result<Response, WebError> {
+    render_youtrack_editor(&s, StatusCode::OK, None, youtrack_form_defaults(), None).await
+}
+
+async fn youtrack_edit_page(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, WebError> {
+    let Some(path) = indexed_action_path(&s.api.pool, &name).await? else {
+        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
+    };
+    let yaml = std::fs::read_to_string(&path).map_err(WebError::from)?;
+    // A file that no longer parses, or is not a youtrack action, has no
+    // structured form; send the user to the raw editor instead.
+    let form = match crate::action::validate_str(&yaml, &path) {
+        Ok(loaded) => action_to_youtrack_form(&loaded.action),
+        Err(_) => None,
+    };
+    let Some(form) = form else {
+        return Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response());
+    };
+    render_youtrack_editor(&s, StatusCode::OK, Some(name), form, None).await
+}
+
+async fn youtrack_edit_save(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+    Form(form): Form<YoutrackEditForm>,
+) -> Result<Response, WebError> {
+    let Some(path) = indexed_action_path(&s.api.pool, &name).await? else {
+        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
+    };
+    let existing = std::fs::read_to_string(&path).map_err(WebError::from)?;
+    let base: serde_yaml::Value = serde_yaml::from_str(&existing)
+        .unwrap_or_else(|_| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let yaml = match youtrack_form_to_yaml(base, &form) {
+        Ok(y) => y,
+        Err(msg) => {
+            return render_youtrack_editor(
+                &s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some(name),
+                form,
+                Some(msg),
+            )
+            .await
+        }
+    };
+    let loaded = match crate::action::validate_str(&yaml, &path) {
+        Ok(l) => l,
+        Err(e) => {
+            return render_youtrack_editor(
+                &s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some(name),
+                form,
+                Some(e.to_string()),
+            )
+            .await
+        }
+    };
+    std::fs::write(&path, yaml.as_bytes()).map_err(WebError::from)?;
+    // Redirect to the action's own `name`, which may differ from the URL path
+    // when the form renames it (the daemon re-indexes by the `name:` field).
+    Ok(Redirect::to(&format!("/actions/{}", loaded.action.name)).into_response())
+}
+
+async fn youtrack_create(
+    State(s): State<WebState>,
+    Form(form): Form<YoutrackEditForm>,
+) -> Result<Response, WebError> {
+    let base = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    let yaml = match youtrack_form_to_yaml(base, &form) {
+        Ok(y) => y,
+        Err(msg) => {
+            return render_youtrack_editor(
+                &s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+                form,
+                Some(msg),
+            )
+            .await
+        }
+    };
+    let loaded = match crate::action::validate_str(&yaml, "<import>") {
+        Ok(l) => l,
+        Err(e) => {
+            return render_youtrack_editor(
+                &s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+                form,
+                Some(e.to_string()),
+            )
+            .await
+        }
+    };
+    let Some(stem) = safe_action_stem(&loaded.action.name) else {
+        let msg = format!(
+            "action name `{}` is not a safe filename (allowed: letters, digits, '-', '_', '.')",
+            loaded.action.name
+        );
+        return render_youtrack_editor(&s, StatusCode::UNPROCESSABLE_ENTITY, None, form, Some(msg))
+            .await;
+    };
+    let actions_dir = s.paths.actions_dir();
+    let dest = actions_dir.join(format!("{stem}.yml"));
+    if dest.exists() {
+        let msg = format!("`{stem}.yml` already exists; edit it instead of creating a duplicate");
+        return render_youtrack_editor(&s, StatusCode::UNPROCESSABLE_ENTITY, None, form, Some(msg))
+            .await;
+    }
+    std::fs::create_dir_all(&actions_dir).map_err(WebError::from)?;
+    std::fs::write(&dest, yaml.as_bytes()).map_err(WebError::from)?;
+    Ok(Redirect::to(&format!("/actions/{}", loaded.action.name)).into_response())
 }
 
 // ---- secrets management (CLAUDE-26) ---------------------------------------
@@ -1246,7 +1768,11 @@ mod tests {
     // tests exercise that path end-to-end against an in-memory DB and a tempdir
     // actions directory.
     mod editor {
-        use super::super::{action_create, action_edit_save, action_export, ActionForm, WebState};
+        use super::super::{
+            action_create, action_edit_save, action_export, action_to_youtrack_form,
+            youtrack_create, youtrack_edit_page, youtrack_edit_save, youtrack_form_to_yaml,
+            youtrack_new_page, ActionForm, WebState, YoutrackEditForm,
+        };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
         use crate::config::Paths;
@@ -1442,6 +1968,277 @@ mod tests {
 
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(body_string(resp).await, content);
+        }
+
+        // ---- structured YouTrack editor (CLAUDE-27) -----------------------
+
+        /// A populated form, covering native config + the generic blocks.
+        fn filled_form() -> YoutrackEditForm {
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.yt_base_url = "https://youtrack.example.com".to_string();
+            f.yt_token_ref = "yt-prod".to_string();
+            f.yt_query = "-Resolved AI Agent: Ready".to_string();
+            f.fj_token_ref = "fj-prod".to_string();
+            f.workdir_base = "~/work".to_string();
+            f.link_template = "https://youtrack.example.com/issue/{key}".to_string();
+            f.schedule_kind = "interval".to_string();
+            f.schedule_spec = "5m".to_string();
+            f.claude_permission_mode = "acceptEdits".to_string();
+            f.limit_max_runs_per_day = "24".to_string();
+            f.limit_daily_budget_usd = "1.50".to_string();
+            f.enabled = Some("on".to_string());
+            f
+        }
+
+        fn empty_base() -> serde_yaml::Value {
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+        }
+
+        #[test]
+        fn form_maps_to_valid_native_config() {
+            let yaml = youtrack_form_to_yaml(empty_base(), &filled_form()).unwrap();
+            // The generated YAML validates through the same schema the loader uses.
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let a = loaded.action;
+            assert_eq!(a.name, "yt");
+            assert_eq!(a.kind, crate::action::ActionKind::Youtrack);
+            assert!(a.enabled);
+            assert_eq!(a.workdir_base.as_deref(), Some("~/work"));
+            assert_eq!(
+                a.link_template.as_deref(),
+                Some("https://youtrack.example.com/issue/{key}")
+            );
+            assert_eq!(a.limits.max_runs_per_day, Some(24));
+            assert_eq!(a.limits.daily_budget_usd, Some(1.5));
+            assert_eq!(a.claude.permission_mode.as_deref(), Some("acceptEdits"));
+            let sched = a.schedule.unwrap();
+            assert_eq!(sched.kind, crate::action::ScheduleKind::Interval);
+            assert_eq!(sched.spec.as_deref(), Some("5m"));
+            let crate::action::NativeConfig::Youtrack(yt) = a.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(
+                yt.youtrack.base_url.as_deref(),
+                Some("https://youtrack.example.com")
+            );
+            assert_eq!(yt.youtrack.token_ref.as_deref(), Some("yt-prod"));
+            assert_eq!(yt.youtrack.query, "-Resolved AI Agent: Ready");
+            // A blank required field keeps the type default rather than blanking.
+            assert_eq!(yt.youtrack.custom_field, "AI Agent");
+            assert_eq!(yt.forgejo.token_ref.as_deref(), Some("fj-prod"));
+            assert!(yt.forgejo.base_url.is_none());
+        }
+
+        #[test]
+        fn form_output_omits_unset_fields() {
+            // A near-empty form should not emit `null`s for the optional fields.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            assert!(!yaml.contains("null"), "unexpected null in:\n{yaml}");
+            assert!(!yaml.contains("token_ref"), "blank token leaked:\n{yaml}");
+            assert!(!yaml.contains("schedule"), "no schedule expected:\n{yaml}");
+        }
+
+        #[test]
+        fn form_rejects_non_numeric_limit() {
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.limit_max_runs_per_day = "lots".to_string();
+            let err = youtrack_form_to_yaml(empty_base(), &f).unwrap_err();
+            assert!(err.contains("Max runs per day"), "{err}");
+        }
+
+        #[test]
+        fn form_preserves_untouched_keys() {
+            // A key the form does not own (here `concurrency`) survives the
+            // round-trip untouched.
+            let base: serde_yaml::Value = serde_yaml::from_str(
+                "name: yt\nkind: youtrack\nnative: {}\nconcurrency:\n  max_parallel: 4\n",
+            )
+            .unwrap();
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            let yaml = youtrack_form_to_yaml(base, &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            assert_eq!(loaded.action.concurrency.max_parallel, 4);
+        }
+
+        #[test]
+        fn prefill_round_trips() {
+            // Map an action to form fields and back; the config is unchanged.
+            let yaml = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    query: \"q\"\n    token_ref: yt-prod\n  forgejo:\n    base_url: https://dev.a8n.run\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            let out = youtrack_form_to_yaml(empty_base(), &form).unwrap();
+            let reloaded = crate::action::validate_str(&out, "<test>").unwrap();
+            assert_eq!(reloaded.action.native, loaded.action.native);
+        }
+
+        #[test]
+        fn prefill_rejects_non_youtrack_action() {
+            // A scripted action has no structured form.
+            let yaml = "name: s\ninput:\n  command: echo '[]'\nprompt: hi\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            assert!(action_to_youtrack_form(&loaded.action).is_none());
+        }
+
+        #[tokio::test]
+        async fn youtrack_edit_save_writes_clean_yaml() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("yt.yml");
+            std::fs::write(&file, "name: yt\nkind: youtrack\nnative: {}\n").unwrap();
+            index_action(&s.api.pool, "yt", file.to_str().unwrap()).await;
+
+            let resp = youtrack_edit_save(
+                State(s.clone()),
+                AxumPath("yt".to_string()),
+                Form(filled_form()),
+            )
+            .await
+            .unwrap()
+            .into_response();
+
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let written = std::fs::read_to_string(&file).unwrap();
+            // Persisted file re-validates and carries the edited query.
+            let loaded = crate::action::validate_str(&written, "<test>").unwrap();
+            assert_eq!(loaded.action.name, "yt");
+            assert!(written.contains("-Resolved AI Agent: Ready"));
+        }
+
+        #[tokio::test]
+        async fn youtrack_edit_save_redirects_to_renamed_action() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("yt.yml");
+            std::fs::write(&file, "name: yt\nkind: youtrack\nnative: {}\n").unwrap();
+            index_action(&s.api.pool, "yt", file.to_str().unwrap()).await;
+
+            // The form renames the action; the redirect must target the new name
+            // (the daemon re-indexes by the `name:` field), not the URL path.
+            let mut f = filled_form();
+            f.name = "yt-renamed".to_string();
+            let resp = youtrack_edit_save(State(s.clone()), AxumPath("yt".to_string()), Form(f))
+                .await
+                .unwrap()
+                .into_response();
+
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                resp.headers().get("location").unwrap(),
+                "/actions/yt-renamed"
+            );
+        }
+
+        #[tokio::test]
+        async fn youtrack_create_writes_new_action() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let resp = youtrack_create(State(s.clone()), Form(filled_form()))
+                .await
+                .unwrap()
+                .into_response();
+
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let dest = s.paths.actions_dir().join("yt.yml");
+            let written = std::fs::read_to_string(&dest).unwrap();
+            crate::action::validate_str(&written, "<test>").unwrap();
+        }
+
+        #[tokio::test]
+        async fn youtrack_create_rejects_bad_number_inline() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let mut f = filled_form();
+            f.limit_claude_timeout_seconds = "soon".to_string();
+
+            let resp = youtrack_create(State(s.clone()), Form(f))
+                .await
+                .unwrap()
+                .into_response();
+
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(!s.paths.actions_dir().join("yt.yml").exists());
+            // The submitted values are preserved in the re-rendered form.
+            let body = body_string(resp).await;
+            assert!(body.contains("Claude timeout"));
+        }
+
+        #[tokio::test]
+        async fn youtrack_new_page_renders_form() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let resp = youtrack_new_page(State(s.clone()))
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            // Default state labels and section headings are present.
+            assert!(body.contains("New YouTrack action"));
+            assert!(body.contains("AI Agent state labels"));
+            assert!(body.contains("Code Review"));
+            assert!(body.contains("/actions/youtrack"));
+        }
+
+        #[tokio::test]
+        async fn youtrack_edit_page_renders_prefilled_form() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("yt.yml");
+            std::fs::write(
+                &file,
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    query: \"my-query\"\nschedule:\n  kind: interval\n  spec: 5m\n",
+            )
+            .unwrap();
+            index_action(&s.api.pool, "yt", file.to_str().unwrap()).await;
+
+            let resp = youtrack_edit_page(State(s.clone()), AxumPath("yt".to_string()))
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            assert!(body.contains("value=\"my-query\""));
+            // The interval schedule option is preselected.
+            assert!(body.contains("value=\"interval\" selected"));
+        }
+
+        #[tokio::test]
+        async fn youtrack_edit_page_redirects_for_scripted_action() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("scripted.yml");
+            std::fs::write(
+                &file,
+                "name: scripted\ninput:\n  command: echo '[]'\nprompt: hi\n",
+            )
+            .unwrap();
+            index_action(&s.api.pool, "scripted", file.to_str().unwrap()).await;
+
+            let resp = youtrack_edit_page(State(s.clone()), AxumPath("scripted".to_string()))
+                .await
+                .unwrap()
+                .into_response();
+
+            // Not a youtrack action -> redirect to the raw editor.
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                resp.headers().get("location").unwrap(),
+                "/actions/scripted/edit"
+            );
         }
     }
 

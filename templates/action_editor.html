@@ -5,6 +5,12 @@
 
 <h2>{{ heading }}</h2>
 
+{% if let Some(u) = form_url %}
+<div class="card" style="margin-bottom: 16px;">
+  <span class="dim">{% if is_new %}Prefer a guided form? <a href="{{ u }}">Create a YouTrack action with the structured editor</a>.{% else %}This is a YouTrack action. <a href="{{ u }}">Edit it with the structured form</a> instead of raw YAML.{% endif %}</span>
+</div>
+{% endif %}
+
 {% if let Some(e) = error %}
 <div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
   <strong style="color: var(--bad);">Not saved - validation failed</strong>
