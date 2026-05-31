@@ -51,7 +51,7 @@
 <div class="card" style="margin-bottom: 16px;">
   <span class="dim">Structured editor for a native <code>kind: youtrack</code> action. Token fields
   reference a stored <a href="/secrets">secret</a> by name; values are never shown here. Fields this
-  form does not cover (concurrency, output, raw script blocks) are preserved untouched on save -
+  form does not cover (output, raw script blocks) are preserved untouched on save -
   use the <a href="{{ raw_url }}">raw YAML editor</a> for those.</span>
 </div>
 
@@ -140,6 +140,15 @@
       {% call numfield("Claude timeout (seconds)", "limit_claude_timeout_seconds", form.limit_claude_timeout_seconds, "unset = no timeout", "1") %}
       {% call numfield("Daily budget (USD)", "limit_daily_budget_usd", form.limit_daily_budget_usd, "unset = no budget", "0.01") %}
     </div>
+  </div>
+
+  <div class="card">
+    <h3>Concurrency</h3>
+    <div class="grid2">
+      {% call numfield("Max parallel", "concurrency_max_parallel", form.concurrency_max_parallel, "1 = strictly sequential", "1") %}
+      {% call textfield("Concurrency key", "concurrency_key", form.concurrency_key, "project, repo, workflow") %}
+    </div>
+    <span class="dim" style="font-size: 12px; margin-top: 4px; display: block;">Max parallel is the per-run cap on distinct-key jobs in flight. The comma-separated key names the job fields whose values compose the per-key serialization scope (per-key concurrency is fixed at 1). The defaults (max parallel 1, key <code>project, repo, workflow</code>) are omitted from the saved file.</span>
   </div>
 
   <div class="row-actions" style="margin-top: 12px;">

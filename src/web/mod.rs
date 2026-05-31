@@ -27,8 +27,8 @@ use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::action::{
-    Action, ClaudeBlock, ForgejoTarget, GithubTarget, Limits, NativeConfig, YoutrackConfig,
-    YoutrackSource,
+    Action, ClaudeBlock, Concurrency, ForgejoTarget, GithubTarget, Limits, NativeConfig,
+    YoutrackConfig, YoutrackSource,
 };
 use crate::api::AppState;
 use crate::claude::ClaudeInvoker;
@@ -787,8 +787,8 @@ async fn action_delete(
 // A field-based form for the native `kind: youtrack` action, an alternative to
 // the raw-YAML textarea above. The form owns the native config (youtrack source
 // + forgejo target) plus the generic Action blocks it surfaces (workdir_base,
-// link_template, schedule, claude, limits, enabled); every other key the file
-// carries (concurrency, output, dedup_key, ...) is left untouched on save.
+// link_template, schedule, claude, limits, concurrency, enabled); every other
+// key the file carries (output, dedup_key, ...) is left untouched on save.
 // `token_ref` fields are dropdowns of stored secret *names* - a value is never
 // rendered (CLAUDE-26). Submissions round-trip through the same
 // `crate::action::validate_str` the raw editor uses, so a bad config is rejected
@@ -847,6 +847,10 @@ struct YoutrackEditForm {
     limit_max_runs_per_day: String,
     limit_claude_timeout_seconds: String,
     limit_daily_budget_usd: String,
+    /// Per-run parallelism cap (number-as-text, like the `limit_*` fields).
+    concurrency_max_parallel: String,
+    /// Comma-separated job-field names composing the concurrency key.
+    concurrency_key: String,
     /// Present ("on") when the enabled checkbox is checked, absent otherwise.
     enabled: Option<String>,
 }
@@ -864,6 +868,7 @@ impl YoutrackEditForm {
 /// so the form opens with the same values a bare `native: {}` resolves to.
 fn youtrack_form_defaults() -> YoutrackEditForm {
     let c = YoutrackConfig::default();
+    let conc = Concurrency::default();
     YoutrackEditForm {
         yt_query: c.youtrack.query,
         yt_custom_field: c.youtrack.custom_field,
@@ -873,6 +878,8 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
         state_needs_review: c.youtrack.states.needs_review,
         state_failed: c.youtrack.states.failed,
         state_in_progress: c.youtrack.states.in_progress,
+        concurrency_max_parallel: conc.max_parallel.to_string(),
+        concurrency_key: conc.key.join(", "),
         ..Default::default()
     }
 }
@@ -930,6 +937,8 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
             .daily_budget_usd
             .map(|v| v.to_string())
             .unwrap_or_default(),
+        concurrency_max_parallel: a.concurrency.max_parallel.to_string(),
+        concurrency_key: a.concurrency.key.join(", "),
         enabled: a.enabled.then(|| "on".to_string()),
     })
 }
@@ -1088,6 +1097,53 @@ fn youtrack_form_to_yaml(
             map.insert(Value::from("schedule"), Value::Mapping(sm));
         }
         other => return Err(format!("unknown schedule kind `{other}`")),
+    }
+
+    // Concurrency. Blank max_parallel -> the default (1); non-numeric -> inline
+    // error like the limit fields. The key splits on commas, trims, and drops
+    // empties; a blank key falls back to the default tuple. When the result
+    // equals `Concurrency::default()` the whole block is removed so freshly
+    // created files stay minimal, matching how limits / claude / schedule omit
+    // defaulted values.
+    let max_parallel = match form.concurrency_max_parallel.trim() {
+        "" => Concurrency::default().max_parallel,
+        t => t
+            .parse::<u32>()
+            .map_err(|_| format!("Max parallel must be a whole number (got `{t}`)"))?,
+    };
+    let key: Vec<String> = {
+        let parsed: Vec<String> = form
+            .concurrency_key
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if parsed.is_empty() {
+            Concurrency::default().key
+        } else {
+            parsed
+        }
+    };
+    let concurrency = Concurrency { max_parallel, key };
+    if concurrency == Concurrency::default() {
+        map.remove("concurrency");
+    } else {
+        // Read-modify-write: overlay onto any existing `concurrency` mapping so
+        // an unrelated future sub-field is preserved rather than blown away.
+        let serialized = serde_yaml::to_value(&concurrency).map_err(|e| e.to_string())?;
+        let merged = match (map.remove("concurrency"), serialized) {
+            (Some(Value::Mapping(mut existing)), Value::Mapping(new)) => {
+                for (k, v) in new {
+                    existing.insert(k, v);
+                }
+                Value::Mapping(existing)
+            }
+            (_, v) => v,
+        };
+        if let Some(p) = prune_yaml(merged) {
+            map.insert(Value::from("concurrency"), p);
+        }
     }
 
     // Scalars that drop out of the file when cleared.
@@ -2205,9 +2261,10 @@ mod tests {
         }
 
         #[test]
-        fn form_preserves_untouched_keys() {
-            // A key the form does not own (here `concurrency`) survives the
-            // round-trip untouched.
+        fn form_now_owns_concurrency() {
+            // The form owns `concurrency`: a default form overwrites a
+            // non-default block in the base rather than leaving it untouched
+            // (and, being the default, the key is dropped entirely).
             let base: serde_yaml::Value = serde_yaml::from_str(
                 "name: yt\nkind: youtrack\nnative: {}\nconcurrency:\n  max_parallel: 4\n",
             )
@@ -2215,8 +2272,67 @@ mod tests {
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             let yaml = youtrack_form_to_yaml(base, &f).unwrap();
+            assert!(
+                !yaml.contains("concurrency"),
+                "default not omitted:\n{yaml}"
+            );
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            assert_eq!(loaded.action.concurrency.max_parallel, 1);
+        }
+
+        #[test]
+        fn form_writes_non_default_concurrency() {
+            // Non-default max_parallel + key serialize and round-trip back to
+            // the same Concurrency the form showed.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.concurrency_max_parallel = "4".to_string();
+            f.concurrency_key = " project , repo ".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
             let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
             assert_eq!(loaded.action.concurrency.max_parallel, 4);
+            assert_eq!(
+                loaded.action.concurrency.key,
+                vec!["project".to_string(), "repo".to_string()]
+            );
+        }
+
+        #[test]
+        fn form_omits_default_concurrency() {
+            // A default-valued concurrency (max_parallel 1, blank key -> the
+            // default tuple) produces no `concurrency` key in the file.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.concurrency_max_parallel = "1".to_string();
+            f.concurrency_key = "  ".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            assert!(
+                !yaml.contains("concurrency"),
+                "default concurrency leaked:\n{yaml}"
+            );
+        }
+
+        #[test]
+        fn form_rejects_non_numeric_concurrency() {
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.concurrency_max_parallel = "lots".to_string();
+            let err = youtrack_form_to_yaml(empty_base(), &f).unwrap_err();
+            assert!(err.contains("Max parallel"), "{err}");
+        }
+
+        #[test]
+        fn concurrency_prefill_round_trips() {
+            // An action with a non-default concurrency maps to the form and back
+            // unchanged.
+            let yaml = "name: yt\nkind: youtrack\nnative: {}\nconcurrency:\n  max_parallel: 3\n  key:\n    - project\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            assert_eq!(form.concurrency_max_parallel, "3");
+            assert_eq!(form.concurrency_key, "project");
+            let out = youtrack_form_to_yaml(empty_base(), &form).unwrap();
+            let reloaded = crate::action::validate_str(&out, "<test>").unwrap();
+            assert_eq!(reloaded.action.concurrency, loaded.action.concurrency);
         }
 
         #[test]
