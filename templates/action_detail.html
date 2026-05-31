@@ -4,7 +4,7 @@
 {% block main %}
 
 <div id="poll-region"
-     hx-get="/actions/{{ action.name }}"
+     hx-get="/actions/{{ action.name }}?show_empty={{ show_empty }}"
      hx-trigger="every 5s, refreshNow from:body"
      hx-select="#poll-region"
      hx-swap="outerHTML">
@@ -57,7 +57,19 @@
   </div>
 </div>
 
-<h2>Recent runs</h2>
+<h2>Recent runs
+  <label style="float: right; font-size: 11px; text-transform: none; letter-spacing: 0; font-weight: normal; cursor: pointer;">
+    <input type="checkbox"
+           {% if show_empty %}checked{% endif %}
+           hx-get="/actions/{{ action.name }}"
+           hx-vals="js:{show_empty: event.target.checked}"
+           hx-target="#poll-region"
+           hx-select="#poll-region"
+           hx-swap="outerHTML"
+           hx-trigger="change">
+    Show empty runs
+  </label>
+</h2>
 {% if runs.is_empty() %}
   <div class="card"><span class="dim">No runs yet for this action.</span></div>
 {% else %}
