@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block title %}{{ heading }} - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a>{% if let Some(n) = name %}<span class="sep">/</span><a href="/actions/{{ n }}">{{ n }}</a><span class="sep">/</span><span class="current">Edit (form)</span>{% else %}<span class="sep">/</span><span class="current">New YouTrack action</span>{% endif %}{% endblock %}
+
+{% macro textfield(label, fname, value, placeholder) %}
+<label class="fld">
+  <span>{{ label }}</span>
+  <input type="text" name="{{ fname }}" value="{{ value }}" placeholder="{{ placeholder }}"
+         autocomplete="off" autocapitalize="off" spellcheck="false">
+</label>
+{% endmacro %}
+
+{% macro numfield(label, fname, value, placeholder, step) %}
+<label class="fld">
+  <span>{{ label }}</span>
+  <input type="number" name="{{ fname }}" value="{{ value }}" placeholder="{{ placeholder }}"
+         step="{{ step }}" min="0" autocomplete="off">
+</label>
+{% endmacro %}
+
+{% macro tokenfield(label, fname, value) %}
+<label class="fld">
+  <span>{{ label }}</span>
+  <select name="{{ fname }}">
+    <option value="">(host auth / none)</option>
+    {% for sname in secrets %}
+    <option value="{{ sname }}"{% if value.as_str() == sname.as_str() %} selected{% endif %}>{{ sname }}</option>
+    {% endfor %}
+  </select>
+</label>
+{% endmacro %}
+
+{% block main %}
+
+<style>
+  .yt-form .grid2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px 20px; }
+  .yt-form .fld { display: flex; flex-direction: column; gap: 4px; }
+  .yt-form .fld > span { color: var(--fg-dim); font-size: 12px; }
+  .yt-form .fld input, .yt-form .fld select {
+    background: #0a0c10; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px; width: 100%;
+  }
+  .yt-form .fld-inline { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+  .yt-form .fld-inline span { font-size: 13px; }
+  .yt-form .card { margin-bottom: 16px; }
+  .yt-form .card h3 { color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.05em; font-size: 12px; }
+</style>
+
+<h2>{{ heading }}</h2>
+
+<div class="card" style="margin-bottom: 16px;">
+  <span class="dim">Structured editor for a native <code>kind: youtrack</code> action. Token fields
+  reference a stored <a href="/secrets">secret</a> by name; values are never shown here. Fields this
+  form does not cover (concurrency, output, raw script blocks) are preserved untouched on save -
+  use the <a href="{{ raw_url }}">raw YAML editor</a> for those.</span>
+</div>
+
+{% if let Some(e) = error %}
+<div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
+  <strong style="color: var(--bad);">Not saved - validation failed</strong>
+  <pre class="stream" style="max-height: 240px; margin: 8px 0 0;">{{ e }}</pre>
+</div>
+{% endif %}
+
+<form method="post" action="{{ post_url }}" class="yt-form">
+
+  <div class="card">
+    <h3>Identity</h3>
+    <div class="grid2">
+      {% call textfield("Name", "name", form.name, "youtrack") %}
+      {% call textfield("Workdir base", "workdir_base", form.workdir_base, "~/.local/share/claude-run/workdirs") %}
+      {% call textfield("Link template", "link_template", form.link_template, "https://youtrack.example.com/issue/{key}") %}
+    </div>
+    <label class="fld-inline">
+      <input type="checkbox" name="enabled"{% if form.is_enabled() %} checked{% endif %}>
+      <span>Enabled (action is scheduled and eligible to run)</span>
+    </label>
+  </div>
+
+  <div class="card">
+    <h3>YouTrack source</h3>
+    <div class="grid2">
+      {% call textfield("Base URL", "yt_base_url", form.yt_base_url, "https://youtrack.example.com (blank = host yt auth)") %}
+      {% call tokenfield("Token secret", "yt_token_ref", form.yt_token_ref) %}
+      {% call textfield("Issue query", "yt_query", form.yt_query, "-Resolved AI Agent: Queued") %}
+      {% call textfield("Custom field", "yt_custom_field", form.yt_custom_field, "AI Agent") %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>AI Agent state labels</h3>
+    <div class="grid2">
+      {% call textfield("Queued", "state_queued", form.state_queued, "Queued") %}
+      {% call textfield("Working", "state_working", form.state_working, "Working") %}
+      {% call textfield("Code review", "state_code_review", form.state_code_review, "Code Review") %}
+      {% call textfield("Needs review", "state_needs_review", form.state_needs_review, "Needs Review") %}
+      {% call textfield("Failed", "state_failed", form.state_failed, "Failed") %}
+      {% call textfield("In progress (State field)", "state_in_progress", form.state_in_progress, "In Progress") %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Forgejo target</h3>
+    <div class="grid2">
+      {% call textfield("Base URL", "fj_base_url", form.fj_base_url, "blank = derive from each issue's VCS") %}
+      {% call tokenfield("Token secret", "fj_token_ref", form.fj_token_ref) %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Schedule</h3>
+    <div class="grid2">
+      <label class="fld">
+        <span>Kind</span>
+        <select name="schedule_kind">
+          <option value=""{% if form.schedule_kind.is_empty() %} selected{% endif %}>(none)</option>
+          <option value="interval"{% if form.schedule_kind.as_str() == "interval" %} selected{% endif %}>interval</option>
+          <option value="cron"{% if form.schedule_kind.as_str() == "cron" %} selected{% endif %}>cron</option>
+          <option value="manual"{% if form.schedule_kind.as_str() == "manual" %} selected{% endif %}>manual</option>
+        </select>
+      </label>
+      {% call textfield("Spec", "schedule_spec", form.schedule_spec, "e.g. 5m or 0 */2 * * *") %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Claude</h3>
+    <div class="grid2">
+      {% call textfield("CWD", "claude_cwd", form.claude_cwd, "working directory override") %}
+      {% call textfield("Allowed tools", "claude_allowed_tools", form.claude_allowed_tools, "e.g. Edit,Bash") %}
+      {% call textfield("Permission mode", "claude_permission_mode", form.claude_permission_mode, "e.g. acceptEdits") %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Limits</h3>
+    <div class="grid2">
+      {% call numfield("Max attempts per key", "limit_max_attempts_per_key", form.limit_max_attempts_per_key, "unset = no cap", "1") %}
+      {% call numfield("Max runs per day", "limit_max_runs_per_day", form.limit_max_runs_per_day, "unset = no cap", "1") %}
+      {% call numfield("Claude timeout (seconds)", "limit_claude_timeout_seconds", form.limit_claude_timeout_seconds, "unset = no timeout", "1") %}
+      {% call numfield("Daily budget (USD)", "limit_daily_budget_usd", form.limit_daily_budget_usd, "unset = no budget", "0.01") %}
+    </div>
+  </div>
+
+  <div class="row-actions" style="margin-top: 12px;">
+    <button class="btn" type="submit">Save</button>
+    {% if let Some(n) = name %}
+      <a class="btn" href="/actions/{{ n }}">Cancel</a>
+    {% else %}
+      <a class="btn" href="/">Cancel</a>
+    {% endif %}
+    <a class="btn" href="{{ raw_url }}">Raw YAML</a>
+  </div>
+</form>
+
+{% endblock %}
