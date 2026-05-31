@@ -162,8 +162,17 @@ impl Daemon {
         };
 
         // CLAUDE-43: drain verified webhook failure events for the lifetime of
-        // the daemon.
-        let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(webhook_rx));
+        // the daemon. CLAUDE-44: each event triggers an internal-route log fetch
+        // with retry + secret redaction; the redacted artifacts land under
+        // `state_dir/webhook-logs/`.
+        let webhook_log_dir = self.paths.state_dir.join("webhook-logs");
+        let webhook_transport: Arc<dyn crate::forge_log::LogTransport> =
+            Arc::new(crate::forge_log::HttpLogTransport::new());
+        let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(
+            webhook_rx,
+            webhook_transport,
+            webhook_log_dir,
+        ));
 
         let dispatch = Arc::new(Dispatcher {
             paths: self.paths.clone(),

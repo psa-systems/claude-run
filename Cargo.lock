@@ -514,6 +514,7 @@ dependencies = [
  "hyperlocal",
  "libc",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

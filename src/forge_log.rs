@@ -1,0 +1,616 @@
+//! Forgejo Action log fetch with retry and secret redaction (CLAUDE-44).
+//!
+//! The sanctioned REST log API (FJ-22 / Forgejo PR 12666) is not in the deployed
+//! Forgejo, so a failing job's log is pulled from the internal web route:
+//!
+//! ```text
+//! GET /{owner}/{repo}/actions/runs/{index}/jobs/{job}/attempt/{n}/logs
+//! ```
+//!
+//! which returns `200 text/plain`. The `/attempt/{n}/` segment is required
+//! (omitting it 404s). Logs are pruned after a retention window, and a freshly
+//! finished run can briefly 404 / return `resource does not exist` before its
+//! logs flush, so the fetch retries with exponential backoff and a persistent
+//! miss is surfaced as a *transient* outcome ([`LogOutcome::TransientMiss`]),
+//! never an error or a panic (triage bucket 3 in the epic). Before any value is
+//! returned or written to disk the text is run through [`redact`] so CI tokens
+//! (a failed publish step can echo one) do not land in storage or a YouTrack
+//! attachment.
+//!
+//! This internal route stays off-limits to the `fj` CLI (FJ-22) until PR 12666
+//! ships a REST endpoint; it is sanctioned for this service only.
+//!
+//! ## Private-repo auth (AC: resolve or document)
+//!
+//! The route needs no auth for a *public* repo. For a private repo an API token
+//! sent as `Authorization: token <t>` returned 404 on the internal web route in
+//! testing (the route appears to want a browser *session* cookie, not a token),
+//! so private-repo auth on this route is **unresolved and tracked as a
+//! follow-up**. [`LogTarget::token`] carries the token the day the constraint is
+//! lifted; until then it is left `None`. The pilot repo (`forgejo-cli`) is
+//! public, so this does not block the fast-path.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::error::Result;
+
+/// Job index probed for a run. The fast-path targets single-job CI workflows
+/// (the pilot), whose failing job is index 0. Multi-job resolution is a future
+/// refinement; documented as an explicit assumption per the issue.
+pub const DEFAULT_JOB_INDEX: u64 = 0;
+
+/// Attempt number probed for a run. A run's first execution is attempt 1; a
+/// re-run increments it. The webhook payload carries no attempt, so the
+/// first-run value is assumed.
+pub const DEFAULT_ATTEMPT: u64 = 1;
+
+/// Marker substituted for any redacted secret.
+const REDACTED: &str = "[REDACTED]";
+
+/// Token prefixes that unambiguously denote a secret regardless of context.
+const SECRET_PREFIXES: &[&str] = &[
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "AGE-SECRET-KEY-",
+];
+
+/// A known secret value shorter than this is not masked, to avoid redacting a
+/// common substring that merely happens to equal a trivial secret.
+const MIN_KNOWN_SECRET_LEN: usize = 8;
+
+/// Minimum length of a token that follows an auth keyword (`Bearer` / `token` /
+/// `Basic`) before it is treated as a secret value. Combined with a digit check
+/// this keeps ordinary prose ("the token implementation") from being redacted.
+const MIN_VALUE_LEN: usize = 16;
+
+/// A single HTTP response from the log route: status code plus the body text.
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+/// Transport seam for the GET against the internal log route. Abstracted so the
+/// retry/redaction logic is unit-testable without a network (mirrors the
+/// `McpTransport` seam in [`crate::provider::github`]).
+pub trait LogTransport: Send + Sync {
+    /// GET `url`, optionally bearing `token`. Returns the status + body on a
+    /// completed request, or a human-readable error string on a transport
+    /// failure (DNS, connect, TLS, ...). The retry loop treats a transport
+    /// error the same as a not-ready body: retry, then surface as transient.
+    fn get(&self, url: &str, token: Option<&str>) -> std::result::Result<HttpResponse, String>;
+}
+
+/// Real transport: a blocking `reqwest` GET run on a dedicated thread so it
+/// never blocks the async runtime (same pattern as the GitHub MCP transport).
+#[derive(Debug, Default, Clone)]
+pub struct HttpLogTransport;
+
+impl HttpLogTransport {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl LogTransport for HttpLogTransport {
+    fn get(&self, url: &str, token: Option<&str>) -> std::result::Result<HttpResponse, String> {
+        let url = url.to_string();
+        let token = token.map(str::to_string);
+        std::thread::spawn(move || -> std::result::Result<HttpResponse, String> {
+            let client = reqwest::blocking::Client::builder()
+                .build()
+                .map_err(|e| format!("log http client: {e}"))?;
+            let mut req = client.get(&url).header("Accept", "text/plain");
+            if let Some(t) = &token {
+                // The day private-repo auth is resolved (see module docs) this is
+                // the header to populate; today it is never set for the pilot.
+                req = req.header("Authorization", format!("token {t}"));
+            }
+            let resp = req
+                .send()
+                .map_err(|e| format!("log request to {url}: {e}"))?;
+            let status = resp.status().as_u16();
+            let body = resp.text().map_err(|e| format!("log response body: {e}"))?;
+            Ok(HttpResponse { status, body })
+        })
+        .join()
+        .map_err(|_| "log transport thread panicked".to_string())?
+    }
+}
+
+/// Where to fetch a failing job's log from.
+#[derive(Debug, Clone)]
+pub struct LogTarget {
+    /// Forge origin, e.g. `https://dev.a8n.run` (no trailing slash needed).
+    pub base_url: String,
+    /// `owner/repo`.
+    pub repo: String,
+    /// Run index within the repo (`index_in_repo` from the webhook).
+    pub run_index: i64,
+    /// Job index within the run.
+    pub job_index: u64,
+    /// Attempt number.
+    pub attempt: u64,
+    /// Token for a private repo. `None` for a public repo (the pilot). See the
+    /// module docs: private-repo auth on this route is an unresolved follow-up.
+    pub token: Option<String>,
+}
+
+impl LogTarget {
+    /// Build a target for `(repo, run_index)` from the failure event's
+    /// `html_url`, deriving the forge origin from it. Defaults to the first job
+    /// and first attempt (see [`DEFAULT_JOB_INDEX`] / [`DEFAULT_ATTEMPT`]).
+    /// Returns `None` when the origin cannot be derived from `html_url`.
+    pub fn for_run(html_url: &str, repo: &str, run_index: i64) -> Option<Self> {
+        let base_url = base_from_html_url(html_url, repo)?;
+        Some(Self {
+            base_url,
+            repo: repo.to_string(),
+            run_index,
+            job_index: DEFAULT_JOB_INDEX,
+            attempt: DEFAULT_ATTEMPT,
+            token: None,
+        })
+    }
+
+    /// The internal log-route URL for this target.
+    pub fn logs_url(&self) -> String {
+        format!(
+            "{}/{}/actions/runs/{}/jobs/{}/attempt/{}/logs",
+            self.base_url.trim_end_matches('/'),
+            self.repo,
+            self.run_index,
+            self.job_index,
+            self.attempt,
+        )
+    }
+}
+
+/// Tunables for the fetch retry/backoff loop.
+#[derive(Debug, Clone)]
+pub struct LogFetchConfig {
+    /// Number of *retries* after the first attempt. Total GETs = `1 + max_retries`.
+    pub max_retries: u32,
+    /// Backoff before the first retry.
+    pub initial_backoff: Duration,
+    /// Cap the (doubling) backoff at this value.
+    pub max_backoff: Duration,
+}
+
+impl Default for LogFetchConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 5,
+            initial_backoff: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+/// A successfully fetched and redacted log.
+#[derive(Debug, Clone)]
+pub struct RedactedLog {
+    /// Redacted log text, usable in a summary.
+    pub text: String,
+    /// Path to the redacted log written to disk, for a YouTrack attachment (one
+    /// job can exceed an inline-comment size limit).
+    pub artifact: PathBuf,
+}
+
+/// Outcome of a fetch. A persistent miss is `TransientMiss`, not an error, so
+/// the caller treats it as "logs not available yet / pruned" rather than a fault.
+#[derive(Debug, Clone)]
+pub enum LogOutcome {
+    Fetched(RedactedLog),
+    TransientMiss { reason: String },
+}
+
+/// One classified attempt: the log is ready, or it is not (missing / pruned /
+/// not-yet-flushed / a transport error), with a reason for the latter.
+enum Probe {
+    Ready(String),
+    NotReady(String),
+}
+
+/// Fetch the failing job's log for `target`, retrying on not-ready logs, redact
+/// it, and write the redacted text to an artifact file under `out_dir`. Returns
+/// [`LogOutcome::Fetched`] on success or [`LogOutcome::TransientMiss`] after the
+/// retries are exhausted. `known_secrets` are masked verbatim in addition to the
+/// pattern-based redaction (pass the values the service itself knows leaked).
+///
+/// `sleep` is injected so tests drive the backoff without waiting; production
+/// passes `std::thread::sleep`. The only hard error this returns is an I/O
+/// failure writing the artifact; a missing log is a `TransientMiss`, never `Err`.
+pub fn fetch_failing_job_log<S: FnMut(Duration)>(
+    transport: &dyn LogTransport,
+    cfg: &LogFetchConfig,
+    target: &LogTarget,
+    out_dir: &Path,
+    known_secrets: &[String],
+    mut sleep: S,
+) -> Result<LogOutcome> {
+    let url = target.logs_url();
+    let mut backoff = cfg.initial_backoff;
+    let mut last_reason = "no attempt made".to_string();
+
+    for attempt_no in 0..=cfg.max_retries {
+        let resp = transport.get(&url, target.token.as_deref());
+        match classify(resp) {
+            Probe::Ready(body) => {
+                let text = redact(&body, known_secrets);
+                let artifact = write_artifact(out_dir, target, &text)?;
+                return Ok(LogOutcome::Fetched(RedactedLog { text, artifact }));
+            }
+            Probe::NotReady(reason) => {
+                last_reason = reason;
+                if attempt_no < cfg.max_retries {
+                    sleep(backoff);
+                    backoff = (backoff * 2).min(cfg.max_backoff);
+                }
+            }
+        }
+    }
+
+    Ok(LogOutcome::TransientMiss {
+        reason: last_reason,
+    })
+}
+
+/// Classify a transport result. A `200` with a non-empty body that is not the
+/// not-found sentinel is ready; everything else (non-200, empty body, the
+/// `resource does not exist` sentinel, or a transport error) is not-ready.
+fn classify(resp: std::result::Result<HttpResponse, String>) -> Probe {
+    match resp {
+        Ok(r) if r.status == 200 && is_ready_body(&r.body) => Probe::Ready(r.body),
+        Ok(r) => Probe::NotReady(format!(
+            "status {}, {} body bytes (logs not ready or pruned)",
+            r.status,
+            r.body.len()
+        )),
+        Err(e) => Probe::NotReady(format!("transport error: {e}")),
+    }
+}
+
+/// True when a body is real log content (non-empty and not the route's
+/// `resource does not exist` miss sentinel).
+fn is_ready_body(body: &str) -> bool {
+    let t = body.trim();
+    !t.is_empty() && !t.to_ascii_lowercase().contains("resource does not exist")
+}
+
+/// Derive the forge origin (scheme + host[:port]) from a run's `html_url` by
+/// stripping the `/{repo}/...` tail. Returns `None` if `html_url` does not
+/// contain the repo segment.
+fn base_from_html_url(html_url: &str, repo: &str) -> Option<String> {
+    let needle = format!("/{repo}/");
+    html_url
+        .split_once(&needle)
+        .map(|(base, _)| base.to_string())
+        .filter(|b| !b.is_empty())
+}
+
+/// Write `text` to a per-(repo, run, job, attempt) artifact file under `out_dir`
+/// and return its path. `out_dir` is created if absent.
+fn write_artifact(out_dir: &Path, target: &LogTarget, text: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(out_dir)?;
+    let stem = target.repo.replace('/', "_");
+    let name = format!(
+        "{stem}-run{}-job{}-attempt{}.log",
+        target.run_index, target.job_index, target.attempt
+    );
+    let path = out_dir.join(name);
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+/// Redact secrets from `input`: first mask each known secret value verbatim,
+/// then redact token *shapes* (known prefixes, and high-entropy values that
+/// follow an auth keyword). Pure; the unit of the AC's redaction test.
+pub fn redact(input: &str, known_secrets: &[String]) -> String {
+    let mut text = input.to_string();
+    for s in known_secrets {
+        let s = s.trim();
+        if s.len() >= MIN_KNOWN_SECRET_LEN {
+            text = text.replace(s, REDACTED);
+        }
+    }
+    redact_token_shapes(&text)
+}
+
+/// True for a character that is part of a token (identifier-ish run). Includes
+/// `-` so `AGE-SECRET-KEY-...` and `glpat-...` stay one token.
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// True if `tok` begins with one of the unambiguous secret prefixes.
+fn has_secret_prefix(tok: &str) -> bool {
+    SECRET_PREFIXES.iter().any(|p| tok.starts_with(p))
+}
+
+/// True if `tok` (lowercased) is an auth keyword whose following token is a
+/// secret value.
+fn is_auth_keyword(tok: &str) -> bool {
+    matches!(
+        tok.to_ascii_lowercase().as_str(),
+        "bearer" | "token" | "basic"
+    )
+}
+
+/// True if `tok` looks like a secret value: long and containing at least one
+/// digit. Used to gate keyword-triggered redaction so ordinary words after the
+/// word "token" are left alone.
+fn looks_secretish(tok: &str) -> bool {
+    tok.len() >= MIN_VALUE_LEN && tok.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Redact token shapes: any token with a secret prefix, plus any secret-ish
+/// token immediately following an auth keyword on the same line.
+fn redact_token_shapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    // Whether the previous token on this line was an auth keyword.
+    let mut prev_keyword = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if is_token_char(c) {
+            let start = i;
+            while i < chars.len() && is_token_char(chars[i]) {
+                i += 1;
+            }
+            let tok: String = chars[start..i].iter().collect();
+            if has_secret_prefix(&tok) || (prev_keyword && looks_secretish(&tok)) {
+                out.push_str(REDACTED);
+            } else {
+                out.push_str(&tok);
+            }
+            prev_keyword = is_auth_keyword(&tok);
+        } else {
+            out.push(c);
+            if c == '\n' {
+                prev_keyword = false;
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// Scripted transport: pops queued responses in order, defaulting to a
+    /// not-ready 404 once drained so an "always not ready" run is easy to set up.
+    struct StubTransport {
+        responses: Mutex<VecDeque<std::result::Result<HttpResponse, String>>>,
+        calls: Mutex<u32>,
+    }
+
+    impl StubTransport {
+        fn new(responses: Vec<std::result::Result<HttpResponse, String>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                calls: Mutex::new(0),
+            }
+        }
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl LogTransport for StubTransport {
+        fn get(
+            &self,
+            _url: &str,
+            _token: Option<&str>,
+        ) -> std::result::Result<HttpResponse, String> {
+            *self.calls.lock().unwrap() += 1;
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(HttpResponse {
+                    status: 404,
+                    body: "resource does not exist".to_string(),
+                }))
+        }
+    }
+
+    fn ready(body: &str) -> std::result::Result<HttpResponse, String> {
+        Ok(HttpResponse {
+            status: 200,
+            body: body.to_string(),
+        })
+    }
+
+    fn not_ready() -> std::result::Result<HttpResponse, String> {
+        Ok(HttpResponse {
+            status: 404,
+            body: "resource does not exist".to_string(),
+        })
+    }
+
+    fn target() -> LogTarget {
+        LogTarget {
+            base_url: "https://dev.a8n.run".to_string(),
+            repo: "contoso/claude-run".to_string(),
+            run_index: 7,
+            job_index: 0,
+            attempt: 1,
+            token: None,
+        }
+    }
+
+    fn cfg() -> LogFetchConfig {
+        LogFetchConfig {
+            max_retries: 3,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(8),
+        }
+    }
+
+    // ---- URL / base derivation -------------------------------------------
+
+    #[test]
+    fn logs_url_has_required_attempt_segment() {
+        assert_eq!(
+            target().logs_url(),
+            "https://dev.a8n.run/contoso/claude-run/actions/runs/7/jobs/0/attempt/1/logs"
+        );
+    }
+
+    #[test]
+    fn base_url_derived_from_html_url() {
+        let t = LogTarget::for_run(
+            "https://dev.a8n.run/contoso/claude-run/actions/runs/7",
+            "contoso/claude-run",
+            7,
+        )
+        .unwrap();
+        assert_eq!(t.base_url, "https://dev.a8n.run");
+        assert_eq!(t.job_index, DEFAULT_JOB_INDEX);
+        assert_eq!(t.attempt, DEFAULT_ATTEMPT);
+        assert!(t.token.is_none());
+    }
+
+    #[test]
+    fn base_url_none_when_repo_absent() {
+        assert!(
+            LogTarget::for_run("https://dev.a8n.run/other/repo", "contoso/claude-run", 7)
+                .is_none()
+        );
+    }
+
+    // ---- AC 1: fetch returns redacted text + a file artifact -------------
+
+    #[test]
+    fn fetch_returns_redacted_text_and_artifact_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = StubTransport::new(vec![ready(
+            "step 1 ok\nAuthorization: token ghp_abcdefghij0123456789ABCDEFG\nstep 2 failed",
+        )]);
+        let secrets: Vec<String> = vec![];
+        let out =
+            fetch_failing_job_log(&transport, &cfg(), &target(), tmp.path(), &secrets, |_| {})
+                .unwrap();
+        let LogOutcome::Fetched(log) = out else {
+            panic!("expected Fetched, got {out:?}");
+        };
+        // The artifact exists and matches the returned text.
+        assert!(log.artifact.exists());
+        let on_disk = std::fs::read_to_string(&log.artifact).unwrap();
+        assert_eq!(on_disk, log.text);
+        // The secret is gone from both the summary text and the file.
+        assert!(!log.text.contains("ghp_abcdefghij0123456789ABCDEFG"));
+        assert!(log.text.contains(REDACTED));
+        assert!(log.text.contains("step 2 failed"));
+        assert_eq!(transport.calls(), 1);
+    }
+
+    // ---- AC 2: retries on not-ready; persistent miss is transient --------
+
+    #[test]
+    fn retries_then_succeeds_when_logs_flush_late() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = StubTransport::new(vec![not_ready(), not_ready(), ready("the logs")]);
+        let mut sleeps = 0u32;
+        let out = fetch_failing_job_log(&transport, &cfg(), &target(), tmp.path(), &[], |_| {
+            sleeps += 1
+        })
+        .unwrap();
+        assert!(matches!(out, LogOutcome::Fetched(_)));
+        assert_eq!(transport.calls(), 3, "two misses then a hit");
+        assert_eq!(sleeps, 2, "backed off before each retry");
+    }
+
+    #[test]
+    fn persistent_miss_is_transient_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty queue -> the stub's drained default (not-ready) every time.
+        let transport = StubTransport::new(vec![]);
+        let out =
+            fetch_failing_job_log(&transport, &cfg(), &target(), tmp.path(), &[], |_| {}).unwrap();
+        match out {
+            LogOutcome::TransientMiss { reason } => assert!(reason.contains("not ready")),
+            other => panic!("expected TransientMiss, got {other:?}"),
+        }
+        // 1 initial attempt + max_retries.
+        assert_eq!(transport.calls(), 1 + cfg().max_retries);
+    }
+
+    #[test]
+    fn transport_error_is_retried_and_surfaced_as_transient() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = StubTransport::new(vec![
+            Err("connect refused".to_string()),
+            Err("connect refused".to_string()),
+            Err("connect refused".to_string()),
+            Err("connect refused".to_string()),
+        ]);
+        let out =
+            fetch_failing_job_log(&transport, &cfg(), &target(), tmp.path(), &[], |_| {}).unwrap();
+        match out {
+            LogOutcome::TransientMiss { reason } => assert!(reason.contains("transport error")),
+            other => panic!("expected TransientMiss, got {other:?}"),
+        }
+    }
+
+    // ---- AC 3: secret redaction ------------------------------------------
+
+    #[test]
+    fn redact_masks_known_secret_value() {
+        let secrets = vec!["super-secret-ci-token-value".to_string()];
+        let out = redact("publishing with super-secret-ci-token-value now", &secrets);
+        assert!(!out.contains("super-secret-ci-token-value"));
+        assert!(out.contains(REDACTED));
+    }
+
+    #[test]
+    fn redact_masks_prefixed_tokens() {
+        let cases = [
+            "ghp_abcdefghij0123456789ABCDEFGHIJ012345",
+            "github_pat_11ABCDE0123456789_aBcDeFgHiJkLmNoP",
+            "glpat-abcdef0123456789ABCD",
+            "AGE-SECRET-KEY-1QWERTYUIOPASDFGHJKLZXCVBNM0123456789ABCD",
+        ];
+        for tok in cases {
+            let out = redact(&format!("line before\nleaked={tok}\nline after"), &[]);
+            assert!(!out.contains(tok), "token not redacted: {tok}");
+            assert!(out.contains("line before") && out.contains("line after"));
+        }
+    }
+
+    #[test]
+    fn redact_masks_value_after_auth_keyword() {
+        let out = redact("Authorization: Bearer aaaaaaaa1111bbbbbbbb2222", &[]);
+        assert!(!out.contains("aaaaaaaa1111bbbbbbbb2222"));
+        assert!(out.contains(REDACTED));
+    }
+
+    #[test]
+    fn redact_leaves_ordinary_prose_alone() {
+        // No prefix, no digit-bearing secret-ish value after a keyword.
+        let input = "the token implementation was refactored in this commit\nall tests passed";
+        assert_eq!(redact(input, &[]), input);
+    }
+
+    #[test]
+    fn redact_short_known_secret_not_masked() {
+        // Below MIN_KNOWN_SECRET_LEN: not masked (avoids nuking common substrings).
+        let out = redact("value is abc", &["abc".to_string()]);
+        assert_eq!(out, "value is abc");
+    }
+}
