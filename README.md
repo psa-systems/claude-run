@@ -52,6 +52,11 @@ claude-run resume youtrack
 claude-run action list
 claude-run action show youtrack
 
+# Secrets (encrypted at rest under CLAUDE_RUN_SECRETS_KEY_FILE; value read from stdin, never argv).
+printf %s $token | claude-run secret set web-ui-token
+claude-run secret list
+claude-run secret delete web-ui-token
+
 # Import legacy ~/.local/share/claude-run/state/*.json into SQLite (one-time migration off the nu runner).
 claude-run migrate
 ```
@@ -107,12 +112,15 @@ Auth (and every action `token_ref`) reads from an encrypted secrets store. Two t
 
    Back this file up. If you lose it, every stored secret becomes undecryptable and must be re-entered under a new key.
 
-2. **The secret itself.** Secrets are created on the **web UI Secrets page** (there is no CLI for it yet), which on an exposed bind is gated by the very token you are setting up. Bootstrap on loopback first:
+2. **The secret itself.** Create it with the CLI (no daemon required - it writes straight to the state DB, so it works while the daemon is down for exactly this bootstrap):
 
-   1. Start with a loopback bind (the default `bind = "127.0.0.1"`); the web UI is unauthenticated there.
-   2. Open `http://127.0.0.1:7321/secrets` and create a secret, e.g. name `web-ui-token`, value = a strong random string (this value is both the bearer token and the browser-login password).
-   3. Set `web.auth_token_ref = "web-ui-token"` (the secret **name**, not its value), optionally `web.auth_username`, and switch `web.bind` to the exposed address.
-   4. Restart. The daemon now decrypts the secret and brings up the gated TCP listener.
+   ```sh
+   printf %s 'a-strong-random-string' | claude-run secret set web-ui-token
+   ```
+
+   The value is read from stdin (never argv, so it stays out of shell history and `ps`) and this same value is both the bearer token and the browser-login password. Then set `web.auth_token_ref = "web-ui-token"` (the secret **name**, not its value), optionally `web.auth_username`, switch `web.bind` to the exposed address, and restart so the daemon decrypts the secret and brings up the gated TCP listener. `claude-run secret list` shows stored names (never values); `claude-run secret delete <name>` removes one.
+
+   Alternatively, secrets can be created on the web UI Secrets page, but on an exposed bind that page is gated by the very token you are setting up, so you would first have to start on a loopback bind (the default `bind = "127.0.0.1"`, unauthenticated) and create the secret at `http://127.0.0.1:7321/secrets`. The CLI avoids that loopback round-trip.
 
    `auth_token_ref` is the **name** of a stored secret. It is not the token value and not the `age` public key.
 
