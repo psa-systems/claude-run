@@ -422,6 +422,59 @@ pub async fn action_last_run_started(pool: &SqlitePool, action: &str) -> Result<
     Ok(row.map(|(s,)| s))
 }
 
+/// CLAUDE-40: delete the `actions` index row for `name`. Returns `false` when
+/// no row matched, mirroring [`secret_delete`]. Only touches the derived index;
+/// the caller is responsible for the on-disk YAML and the runtime purge.
+pub async fn action_index_delete(pool: &SqlitePool, name: &str) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM actions WHERE name = ?")
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// CLAUDE-40: purge an action's control state on delete: the `attempt_counters`
+/// and `daily_ledger` rows keyed on `action_name`. The `paused_actions` row is
+/// cleared separately via [`action_pause_clear`]. Run history (`runs`,
+/// `job_outcomes`) and on-disk stream logs are intentionally left intact so a
+/// re-created same-name action re-associates its audit trail.
+pub async fn action_runtime_purge(pool: &SqlitePool, name: &str) -> Result<()> {
+    sqlx::query("DELETE FROM attempt_counters WHERE action_name = ?")
+        .bind(name)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM daily_ledger WHERE action_name = ?")
+        .bind(name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// CLAUDE-40: purge an action's derived index + control state in one call:
+/// the `actions` index row, the `paused_actions` row, and the
+/// `attempt_counters` / `daily_ledger` rows. Returns the index row's prior
+/// existence (`true` = a row was deleted), so callers can distinguish a real
+/// delete from an unknown action. History (`runs`, `job_outcomes`) is kept.
+pub async fn action_purge_state(pool: &SqlitePool, name: &str) -> Result<bool> {
+    let existed = action_index_delete(pool, name).await?;
+    action_pause_clear(pool, name).await?;
+    action_runtime_purge(pool, name).await?;
+    Ok(existed)
+}
+
+/// CLAUDE-40: true when a run for `action` is still in flight in the DB (a
+/// `runs` row with no `ended_at`). The delete flow refuses with a conflict when
+/// this holds. The daemon additionally consults its in-memory in-flight set for
+/// a job dispatched but not yet recorded as a run.
+pub async fn action_has_active_run(pool: &SqlitePool, action: &str) -> Result<bool> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT id FROM runs WHERE action_name = ? AND ended_at IS NULL LIMIT 1")
+            .bind(action)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
+}
+
 // ---- CLAUDE-26: encrypted secrets ---------------------------------------
 
 /// Metadata for one stored secret. The ciphertext is never carried in this
@@ -618,6 +671,89 @@ mod tests {
         assert_eq!(
             exit_code_of(&pool, finished).await,
             Some(crate::exit::OK as i64)
+        );
+    }
+
+    // ---- CLAUDE-40: action delete ----------------------------------------
+
+    fn index_row(name: &str, path: &str) -> ActionIndexRow {
+        ActionIndexRow {
+            name: name.to_string(),
+            file_path: path.to_string(),
+            yaml_sha256: "0".repeat(64),
+            enabled: true,
+            schedule_kind: None,
+            schedule_spec: None,
+            last_seen_at: now_iso(),
+            parse_error: None,
+            link_template: None,
+        }
+    }
+
+    async fn runs_count(pool: &SqlitePool, action: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM runs WHERE action_name = ?")
+            .bind(action)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn action_index_delete_reports_existence() {
+        let pool = mem_pool().await;
+        action_index_upsert(&pool, &index_row("act", "/tmp/act.yml"))
+            .await
+            .unwrap();
+        // First delete removes the row and reports it existed; second is false.
+        assert!(action_index_delete(&pool, "act").await.unwrap());
+        assert!(!action_index_delete(&pool, "act").await.unwrap());
+        assert!(!action_index_delete(&pool, "ghost").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn action_purge_state_clears_control_but_keeps_history() {
+        let pool = mem_pool().await;
+        // Seed index + control state + a finished run (history).
+        action_index_upsert(&pool, &index_row("act", "/tmp/act.yml"))
+            .await
+            .unwrap();
+        action_pause_set(&pool, "act", Some("hold")).await.unwrap();
+        attempts_increment(&pool, "act", "job-1").await.unwrap();
+        daily_count_increment(&pool, "act").await.unwrap();
+        let run = run_begin(&pool, "act", "cli").await.unwrap();
+        run_finish(&pool, run, crate::exit::OK, 1).await.unwrap();
+
+        let existed = action_purge_state(&pool, "act").await.unwrap();
+        assert!(existed, "purge reports the index row existed");
+
+        // Control state is gone.
+        assert!(action_index_list(&pool).await.unwrap().is_empty());
+        assert!(action_pause_status(&pool, "act").await.unwrap().is_none());
+        assert_eq!(attempts_get(&pool, "act", "job-1").await.unwrap(), 0);
+        assert_eq!(daily_count_get(&pool, "act").await.unwrap(), 0);
+
+        // History is kept: the runs row survives.
+        assert_eq!(runs_count(&pool, "act").await, 1);
+
+        // Purging an unknown action reports it did not exist.
+        assert!(!action_purge_state(&pool, "ghost").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn action_has_active_run_tracks_in_flight() {
+        let pool = mem_pool().await;
+        assert!(!action_has_active_run(&pool, "act").await.unwrap());
+
+        let run = run_begin(&pool, "act", "cli").await.unwrap();
+        assert!(
+            action_has_active_run(&pool, "act").await.unwrap(),
+            "an unfinished run counts as in flight"
+        );
+
+        run_finish(&pool, run, crate::exit::OK, 0).await.unwrap();
+        assert!(
+            !action_has_active_run(&pool, "act").await.unwrap(),
+            "a finished run is no longer in flight"
         );
     }
 }

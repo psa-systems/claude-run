@@ -539,6 +539,16 @@ $CLAUDE_RUN_STATE_DIR/
 }
 ```
 
+## Deleting an action
+
+An action can be deleted from all three surfaces: the CLI (`claude-run action delete <name>`), the web UI (the Delete button on an action's detail page), and the JSON API (`POST /actions/<name>/delete`).
+
+Delete is a config-and-control purge, not a history wipe. It removes the on-disk YAML file, the `actions` index row, the `paused_actions` row, and the `attempt_counters` / `daily_ledger` rows for that action. It KEEPS the action's run history: the `runs` and `job_outcomes` rows and the on-disk stream logs under `logs/<name>/` survive. Re-creating an action with the same name re-associates that retained history, which is the intended audit behavior.
+
+Delete is refused while a run for the action is in flight, so removing a config can never orphan a running job. The CLI returns exit code 7 (conflict) and the API / web UI return HTTP 409; cancel the run (`claude-run cancel <run-id>`) or wait for it to finish, then retry. An unknown action returns exit code 3 from the CLI and HTTP 404 from the API / web UI.
+
+The index is self-healing: `scan_actions` prunes any `actions` row whose backing YAML no longer exists on disk, so an out-of-band `rm` of an action file is reconciled on the next scan rather than leaving a stale dashboard row. Pruning removes only the index row; retained run history is untouched.
+
 ## Exit codes
 
 | Code | Meaning                                                                   |
@@ -550,6 +560,7 @@ $CLAUDE_RUN_STATE_DIR/
 | 4    | Daily cap reached (`max_runs_per_day`).                                   |
 | 5    | Unexpected error (see logs).                                              |
 | 6    | Over daily budget (`daily_budget_usd`).                                   |
+| 7    | Conflict: a mutating command was refused (e.g. `action delete` while a run for that action is in flight). |
 | 130  | Run cancelled in flight (operator cancel via the API / web UI / CLI).     |
 
 Exit code 130 is recorded on the `runs` row, not returned by the `run` subcommand; the web UI and CLI render it as a

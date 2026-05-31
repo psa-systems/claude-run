@@ -16,7 +16,7 @@ use serde_json::json;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use claude_run::{
-    action, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db, exit, lock,
+    action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db, exit, lock,
     migrate, snippet, state,
 };
 
@@ -92,6 +92,10 @@ enum ActionCmd {
     List,
     /// Show one action's metadata.
     Show { name: String },
+    /// Delete an action: remove its YAML file, index row, and control state
+    /// (paused/counters/ledger). Run history is kept. Refuses with
+    /// `exit::CONFLICT` when a run for the action is in flight.
+    Delete { name: String },
 }
 
 fn main() -> ExitCode {
@@ -476,7 +480,8 @@ async fn action_cmd(
 ) -> claude_run::error::Result<i32> {
     let pool = db::open(&paths.state_db()).await?;
     let sock = daemon::daemon_socket_path(paths);
-    if !DaemonClient::is_reachable(&sock) {
+    let reachable = DaemonClient::is_reachable(&sock);
+    if !reachable {
         // Refresh the index ourselves; without a daemon, nobody else does.
         daemon::scan_actions(&pool, actions_dir).await?;
     }
@@ -494,6 +499,46 @@ async fn action_cmd(
                     return Ok(exit::CONFIG_ERROR);
                 }
             }
+        }
+        ActionCmd::Delete { name } => {
+            // CLAUDE-40: delegate to the daemon when it is up (it owns the
+            // authoritative in-flight set); otherwise delete directly against
+            // the DB + filesystem after the same active-run guard.
+            if reachable {
+                let c = DaemonClient::new(&sock);
+                let (status, body) = c
+                    .post_status(&format!("/actions/{name}/delete"), None)
+                    .await?;
+                return match status {
+                    200 => {
+                        println!("deleted `{name}`");
+                        Ok(exit::OK)
+                    }
+                    404 => {
+                        eprintln!("no action `{name}` in index");
+                        Ok(exit::CONFIG_ERROR)
+                    }
+                    409 => {
+                        eprintln!(
+                            "action `{name}` has a run in flight; cancel or wait before deleting"
+                        );
+                        Ok(exit::CONFLICT)
+                    }
+                    _ => {
+                        eprintln!("daemon returned {status}: {body}");
+                        Ok(exit::UNEXPECTED)
+                    }
+                };
+            }
+            if state::action_has_active_run(&pool, &name).await? {
+                eprintln!("action `{name}` has a run in flight; cancel or wait before deleting");
+                return Ok(exit::CONFLICT);
+            }
+            if !api::delete_indexed_action(&pool, &name).await? {
+                eprintln!("no action `{name}` in index");
+                return Ok(exit::CONFIG_ERROR);
+            }
+            println!("deleted `{name}`");
         }
     }
     Ok(exit::OK)

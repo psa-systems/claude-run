@@ -27,6 +27,9 @@ pub enum Error {
     #[error("action `{name}` not found in {searched}")]
     ActionNotFound { name: String, searched: String },
 
+    #[error("action `{name}` has a run in flight; cancel or wait before deleting")]
+    ActionInFlight { name: String },
+
     #[error("action {name}: kind `{kind}` does not match native config `{native}` ({path})")]
     ActionKindMismatch {
         name: String,

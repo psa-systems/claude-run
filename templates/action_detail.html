@@ -29,6 +29,10 @@
     <a class="btn" href="/actions/{{ action.name }}/edit">Edit</a>
     <a class="btn" href="/actions/{{ action.name }}/export">Export</a>
     <a class="btn" href="/actions/{{ action.name }}/durations">Durations</a>
+    <form method="post" action="/actions/{{ action.name }}/delete"
+          onsubmit="return confirm('Delete action {{ action.name }}? The YAML file and its index/pause/counter state are removed; run history is kept.');">
+      <button class="btn" type="submit">Delete</button>
+    </form>
     <form hx-post="/api/actions/{{ action.name }}/trigger"
           hx-swap="none"
           hx-disabled-elt="find button"
