@@ -148,6 +148,14 @@ pub struct YoutrackConfig {
     pub youtrack: YoutrackSource,
     /// Forgejo target: where the runner opens PRs from the agent's commits.
     pub forgejo: ForgejoTarget,
+    /// GitHub target (CLAUDE-50): where the runner opens PRs when a job's repo
+    /// resolves to a GitHub host. All fields default, so existing actions are
+    /// unchanged; routing is automatic by the resolved `repo_host`. Skipped on
+    /// serialize when fully default (the default `mcp_endpoint` is a non-empty
+    /// string, so unlike `forgejo` it would not otherwise prune away) so saving
+    /// a Forgejo-only action through the web form writes no `github` block.
+    #[serde(skip_serializing_if = "GithubTarget::is_default")]
+    pub github: GithubTarget,
 }
 
 /// YouTrack-side settings for the native handler.
@@ -233,6 +241,52 @@ pub struct ForgejoTarget {
     /// `None` uses host `fj` auth. The raw token is never stored here; it is
     /// resolved from the [`crate::secrets`] store and injected at run time.
     pub token_ref: Option<String>,
+}
+
+/// GitHub-side settings for the native handler (CLAUDE-50). A job whose
+/// resolved `repo_host` is GitHub (`github.com` plus any host in `hosts`) opens
+/// its PR through the GitHub `Forge` backend instead of `fj`; every other host
+/// keeps using `fj` unchanged. Auto-routing means no per-action forge selector:
+/// every field is optional and defaults so existing Forgejo actions validate
+/// and behave identically.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GithubTarget {
+    /// Extra GitHub host(s) beyond `github.com` to treat as GitHub, e.g. GitHub
+    /// Enterprise hosts. Bare hosts (no scheme). Empty by default.
+    pub hosts: Vec<String>,
+    /// Override for the remote GitHub MCP endpoint. Defaults to GitHub's hosted
+    /// MCP server, which needs no local install.
+    pub mcp_endpoint: String,
+    /// Name of the encrypted secret (CLAUDE-26) holding the GitHub PAT, used for
+    /// the MCP call, the authenticated push, and `gh`. `None` falls back to host
+    /// `gh` auth / `GH_TOKEN`. The raw token is never stored here; it is resolved
+    /// from the [`crate::secrets`] store and injected at run time. The PAT needs
+    /// `repo` + `pull_request` scope.
+    pub token_ref: Option<String>,
+}
+
+impl Default for GithubTarget {
+    fn default() -> Self {
+        Self {
+            hosts: Vec::new(),
+            mcp_endpoint: default_github_mcp_endpoint(),
+            token_ref: None,
+        }
+    }
+}
+
+impl GithubTarget {
+    /// True when every field is at its default. Used to skip serializing an
+    /// untouched `github` block (see [`YoutrackConfig`]).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// GitHub's hosted remote MCP endpoint (no local server to install).
+pub fn default_github_mcp_endpoint() -> String {
+    "https://api.githubcopilot.com/mcp/".to_string()
 }
 
 /// Config for the native Forgejo CI-fix handler (CLAUDE-29, supersedes
@@ -496,6 +550,43 @@ post:
         assert!(cfg.youtrack.token_ref.is_none());
         assert!(cfg.forgejo.base_url.is_none());
         assert!(cfg.forgejo.token_ref.is_none());
+        // CLAUDE-50: the github block defaults to the hosted MCP endpoint, no
+        // extra hosts, and host gh auth (no token_ref).
+        assert!(cfg.github.hosts.is_empty());
+        assert_eq!(
+            cfg.github.mcp_endpoint,
+            "https://api.githubcopilot.com/mcp/"
+        );
+        assert!(cfg.github.token_ref.is_none());
+    }
+
+    #[test]
+    fn native_config_parses_github_block() {
+        // CLAUDE-50: the optional github block parses its hosts / mcp_endpoint /
+        // token_ref; unknown keys inside it are still rejected.
+        let raw = "\
+name: yt
+kind: youtrack
+native:
+  github:
+    hosts:
+      - ghe.example.com
+    mcp_endpoint: https://ghe.example.com/api/mcp/
+    token_ref: gh-prod
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert_eq!(cfg.github.hosts, vec!["ghe.example.com".to_string()]);
+        assert_eq!(cfg.github.mcp_endpoint, "https://ghe.example.com/api/mcp/");
+        assert_eq!(cfg.github.token_ref.as_deref(), Some("gh-prod"));
+
+        let bogus = format!("{raw}    bogus: nope\n");
+        assert!(matches!(
+            validate_str(&bogus, "<candidate>").unwrap_err(),
+            Error::Yaml(_)
+        ));
     }
 
     #[test]
