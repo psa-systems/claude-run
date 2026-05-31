@@ -21,6 +21,7 @@
 //! epic decision (handled by the external proxy / the linked auth issue).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -127,10 +128,18 @@ pub fn router(state: WebhookState) -> Router {
         .with_state(state)
 }
 
-/// Drain emitted events. This slice has no triage; it only logs each verified
-/// failure so the daemon records that the fast-path fired. The sibling subtask
-/// replaces this consumer with log fetch + triage.
-pub async fn consume_events(mut rx: mpsc::Receiver<VerifiedFailureEvent>) {
+/// Drain emitted events. For each verified failure this fetches the failing
+/// job's log via the internal route, redacts secrets, and writes a redacted
+/// artifact (CLAUDE-44). Triage (turning the redacted log into an enriched task)
+/// is a sibling subtask; this slice logs the fetch outcome. The fetch is
+/// best-effort: a not-ready / pruned log is a transient miss, not a fault, and
+/// never strands the consumer.
+pub async fn consume_events(
+    mut rx: mpsc::Receiver<VerifiedFailureEvent>,
+    transport: Arc<dyn crate::forge_log::LogTransport>,
+    out_dir: PathBuf,
+) {
+    let cfg = crate::forge_log::LogFetchConfig::default();
     while let Some(ev) = rx.recv().await {
         info!(
             repo = %ev.repo,
@@ -141,6 +150,53 @@ pub async fn consume_events(mut rx: mpsc::Receiver<VerifiedFailureEvent>) {
             html_url = %ev.html_url,
             "verified action_run_failure received"
         );
+
+        let Some(target) =
+            crate::forge_log::LogTarget::for_run(&ev.html_url, &ev.repo, ev.index_in_repo)
+        else {
+            warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge origin from html_url; skipping log fetch");
+            continue;
+        };
+
+        // The fetch is blocking (reqwest on a thread + backoff sleeps); run it
+        // off the async runtime. No service-injected secrets reach the CI run,
+        // so `known_secrets` is empty here and pattern redaction does the work.
+        let transport = transport.clone();
+        let cfg = cfg.clone();
+        let out_dir = out_dir.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::forge_log::fetch_failing_job_log(
+                transport.as_ref(),
+                &cfg,
+                &target,
+                &out_dir,
+                &[],
+                std::thread::sleep,
+            )
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(crate::forge_log::LogOutcome::Fetched(log))) => info!(
+                repo = %ev.repo,
+                run = ev.index_in_repo,
+                bytes = log.text.len(),
+                artifact = %log.artifact.display(),
+                "fetched and redacted failing job log"
+            ),
+            Ok(Ok(crate::forge_log::LogOutcome::TransientMiss { reason })) => warn!(
+                repo = %ev.repo,
+                run = ev.index_in_repo,
+                %reason,
+                "failing job log not available (transient miss)"
+            ),
+            Ok(Err(e)) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch failed")
+            }
+            Err(e) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch task panicked")
+            }
+        }
     }
 }
 

@@ -26,6 +26,7 @@ pub mod config;
 pub mod daemon;
 pub mod db;
 pub mod error;
+pub mod forge_log;
 pub mod job;
 pub mod lock;
 pub mod migrate;
