@@ -4,8 +4,10 @@
 //! - Interactivity: HTMX (vendored under `assets/htmx.min.js`, embedded into
 //!   the binary via `include_bytes!` so the binary stays self-contained).
 //! - Live log streaming: Server-Sent Events.
-//! - Auth: localhost-only for now. Phase 5 layers a token check for
-//!   non-loopback binds.
+//! - Auth: loopback binds are unauthenticated by default; a non-loopback bind
+//!   gates the web UI and `/api/*` behind a bearer token (CLAUDE-48, Phase 5).
+//!   The token layer is applied to the TCP router in `daemon.rs` via
+//!   `crate::auth::protect`; the `/webhooks/` prefix stays exempt.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -25,12 +27,15 @@ use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::action::{
-    Action, ClaudeBlock, ForgejoTarget, Limits, NativeConfig, YoutrackConfig, YoutrackSource,
+    Action, ClaudeBlock, ForgejoTarget, GithubTarget, Limits, NativeConfig, YoutrackConfig,
+    YoutrackSource,
 };
 use crate::api::AppState;
 use crate::claude::ClaudeInvoker;
 use crate::config::Paths;
 use crate::state;
+
+pub mod webhooks;
 
 const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
 
@@ -1017,6 +1022,10 @@ fn youtrack_form_to_yaml(
             base_url: opt(&form.fj_base_url),
             token_ref: opt(&form.fj_token_ref),
         },
+        // CLAUDE-50: the web form has no GitHub fields yet; default routes
+        // GitHub jobs through the GitHub backend with host gh auth. `prune_yaml`
+        // drops the all-default block so existing actions are unchanged on save.
+        github: GithubTarget::default(),
     };
     let native_val = prune_yaml(serde_yaml::to_value(&native).map_err(|e| e.to_string())?)
         .unwrap_or_else(|| Value::Mapping(serde_yaml::Mapping::new()));

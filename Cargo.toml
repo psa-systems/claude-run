@@ -25,6 +25,7 @@ dirs = "5"
 fs2 = "0.4"
 futures-util = "0.3"
 hex = "0.4"
+hmac = "0.12"
 humantime = "2"
 http-body-util = "0.1"
 hyperlocal = "0.9"
@@ -44,14 +45,6 @@ tracing = "0.1"
 [dependencies.axum]
 version = "0.7"
 features = ["macros"]
-
-# CLAUDE-49: `version update` self-updater needs an outbound HTTPS client.
-# default-features = false drops the bundled OpenSSL-backed TLS; rustls-tls
-# keeps the static musl build free of OpenSSL.
-[dependencies.reqwest]
-version = "0.12"
-default-features = false
-features = ["rustls-tls"]
 
 [dependencies.chrono]
 version = "0.4"
@@ -92,6 +85,19 @@ features = [
     "macros",
     "chrono",
     "migrate",
+]
+
+[dependencies.reqwest]
+# CLAUDE-50: outbound HTTPS for the embedded GitHub MCP client. rustls-tls (no
+# default openssl-tls feature) keeps the static musl build OpenSSL-free. Shared
+# with CLAUDE-49 so the two issues add a single HTTP/TLS stack, not competing
+# ones. `blocking` because the provider `Forge` trait is synchronous.
+version = "0.12"
+default-features = false
+features = [
+    "blocking",
+    "rustls-tls",
+    "json",
 ]
 
 [dependencies.tokio]

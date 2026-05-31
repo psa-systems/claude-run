@@ -104,27 +104,66 @@ impl Daemon {
         // as the unix-socket flavor, just nested + sibling-mounted.
         let api_for_tcp = api::router((*api_state).clone());
         let web_router = crate::web::router(api_state.clone(), self.paths.clone());
+
+        // CLAUDE-43: Forgejo webhook listener. Verified `action_run_failure`
+        // events are emitted onto a channel drained by `consume_events`; this
+        // slice only logs them (log fetch / triage is a sibling subtask).
+        let (webhook_tx, webhook_rx) =
+            mpsc::channel::<crate::web::webhooks::VerifiedFailureEvent>(64);
+        let webhook_state = crate::web::webhooks::WebhookState::new(
+            pool.clone(),
+            self.on_disk.webhook.clone(),
+            webhook_tx,
+        );
+        let webhook_router = crate::web::webhooks::router(webhook_state);
+
         let tcp_app = axum::Router::new()
             .merge(web_router)
+            .merge(webhook_router)
             .nest("/api", api_for_tcp);
+
+        // CLAUDE-48 (Phase 5): gate the TCP surface (web UI + /api/*) behind a
+        // bearer token whenever the bind is non-loopback. The /webhooks/ prefix
+        // keeps its own HMAC and is exempt. When auth is required but the token
+        // cannot be resolved, fail closed: drop the TCP listener entirely rather
+        // than expose an unauthenticated surface. The unix-socket API is
+        // unaffected (loopback-only by construction).
+        let tcp_app = match crate::auth::resolve_gate(&self.on_disk.web, &pool).await {
+            Ok(None) => Some(tcp_app),
+            Ok(Some(gate)) => {
+                info!("token auth enabled for the TCP web UI and /api/*");
+                Some(crate::auth::protect(tcp_app, gate))
+            }
+            Err(e) => {
+                warn!(error = %e, "token auth required but unavailable; TCP web UI disabled this run");
+                None
+            }
+        };
 
         // Tasks: unix-socket server, TCP server, scheduler tick, trigger consumer.
         let server_unix = tokio::spawn(serve_unix(listener, unix_app));
 
-        let tcp_bind = format!("{}:{}", self.on_disk.web.bind, self.on_disk.web.port);
-        let tcp_listener = match tokio::net::TcpListener::bind(&tcp_bind).await {
-            Ok(l) => {
-                info!(address = %tcp_bind, "web UI listening");
-                Some(l)
+        let server_tcp = if let Some(tcp_app) = tcp_app {
+            let tcp_bind = format!("{}:{}", self.on_disk.web.bind, self.on_disk.web.port);
+            match tokio::net::TcpListener::bind(&tcp_bind).await {
+                Ok(l) => {
+                    info!(address = %tcp_bind, "web UI listening");
+                    Some(tokio::spawn(serve_tcp(l, tcp_app)))
+                }
+                Err(e) => {
+                    // Don't fail the whole daemon just because the TCP port is
+                    // taken - the unix-socket API still works.
+                    warn!(address = %tcp_bind, error = %e, "TCP bind failed; web UI disabled this run");
+                    None
+                }
             }
-            Err(e) => {
-                // Don't fail the whole daemon just because the TCP port is
-                // taken - the unix-socket API still works.
-                warn!(address = %tcp_bind, error = %e, "TCP bind failed; web UI disabled this run");
-                None
-            }
+        } else {
+            None
         };
-        let server_tcp = tcp_listener.map(|l| tokio::spawn(serve_tcp(l, tcp_app)));
+
+        // CLAUDE-43: drain verified webhook failure events for the lifetime of
+        // the daemon.
+        let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(webhook_rx));
 
         let dispatch = Arc::new(Dispatcher {
             paths: self.paths.clone(),
@@ -206,6 +245,7 @@ impl Daemon {
         if let Some(t) = server_tcp {
             t.abort();
         }
+        webhook_consumer.abort();
         // pidfile lock released on drop
         let _ = std::fs::remove_file(&sock_path);
         Ok(())

@@ -26,6 +26,7 @@
 //! call in `tokio::task::spawn_blocking`.
 
 pub mod cli;
+pub mod github;
 
 use std::sync::Arc;
 
@@ -34,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 pub use cli::{CliBackend, CmdOutput, CommandRunner, ProcessRunner};
+pub use github::{is_github_host, GithubForge, HttpMcpTransport, McpTransport};
 
 /// A repository resolved from a YouTrack project's enabled VCS integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,13 +148,22 @@ pub trait Backend: IssueTracker + Forge {
     fn name(&self) -> &'static str;
 }
 
-/// Ordered backend preference. CLI only for now; an `Mcp` variant slots in here
-/// later (the factory and callers do not change).
+/// Ordered backend preference. The YouTrack / Forgejo provider resolution
+/// ([`resolve`], [`resolve_runner`]) walks `[Cli]`. The GitHub `Forge`
+/// (CLAUDE-50) walks `[Mcp, Gh]`: prefer the remote MCP, fall back to the `gh`
+/// CLI. Variants are shared so one ordered priority type covers every backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     /// Shell out to the host `yt` / `fj` CLIs.
     Cli,
+    /// Talk to a remote MCP server over HTTPS (the GitHub hosted MCP).
+    Mcp,
+    /// Shell out to the host `gh` CLI.
+    Gh,
 }
+
+/// Default GitHub `Forge` priority: prefer the remote MCP, fall back to `gh`.
+pub const GITHUB_PRIORITY: &[BackendKind] = &[BackendKind::Mcp, BackendKind::Gh];
 
 /// Default priority: CLI-first, and CLI-only for this phase.
 pub const DEFAULT_PRIORITY: &[BackendKind] = &[BackendKind::Cli];
@@ -184,6 +195,9 @@ pub fn resolve_with(
                     Err(e) => tried.push(format!("cli: {e}")),
                 }
             }
+            // Mcp / Gh resolve the GitHub `Forge` (see [`github`]), not the
+            // YouTrack/Forgejo `Backend`; they never appear in this priority list.
+            BackendKind::Mcp | BackendKind::Gh => {}
         }
     }
     Err(Error::NoBackend(tried.join("; ")))
@@ -212,6 +226,7 @@ pub fn resolve_runner_with(
                     Err(e) => tried.push(format!("cli: {e}")),
                 }
             }
+            BackendKind::Mcp | BackendKind::Gh => {}
         }
     }
     Err(Error::NoBackend(tried.join("; ")))

@@ -17,6 +17,7 @@
 
 pub mod action;
 pub mod api;
+pub mod auth;
 pub mod cancel;
 pub mod claude;
 pub mod client;
