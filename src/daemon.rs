@@ -82,11 +82,17 @@ impl Daemon {
         // trips it).
         let runs = Arc::new(RunRegistry::new());
 
+        // CLAUDE-40: one in-flight set shared between the dispatcher (which
+        // tracks dispatched runs) and the API (whose delete handler refuses a
+        // delete while a run is dispatched but not yet recorded in `runs`).
+        let in_flight: api::InFlight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
         let api_state = Arc::new(AppState {
             pool: pool.clone(),
             trigger_tx: trigger_tx.clone(),
             version: VERSION,
             runs: runs.clone(),
+            in_flight: in_flight.clone(),
         });
 
         // Unix-socket router: bare paths (`/status`, `/actions`, ...). CLI
@@ -125,7 +131,7 @@ impl Daemon {
             pool: pool.clone(),
             snippet: Arc::new(snippet),
             claude: Arc::new(claude),
-            in_flight: Mutex::new(std::collections::HashSet::new()),
+            in_flight,
             // CLAUDE-28: one daemon-wide key gate, shared across every dispatch,
             // so two executions sharing a concurrency key never overlap even
             // across a scheduled run and a manual trigger.
@@ -316,6 +322,16 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
             }
         }
     }
+    // CLAUDE-40: self-heal the index. Prune rows whose backing YAML no longer
+    // exists on disk, so an out-of-band `rm` (or a delete whose row removal
+    // ever diverged from the file removal) cannot strand a stale dashboard row.
+    // Pruning removes only the index row; retained `runs`/`job_outcomes` history
+    // is left intact.
+    for row in state::action_index_list(pool).await? {
+        if !Path::new(&row.file_path).exists() {
+            state::action_index_delete(pool, &row.name).await?;
+        }
+    }
     Ok(())
 }
 
@@ -332,7 +348,7 @@ struct Dispatcher {
     pool: SqlitePool,
     snippet: Arc<SnippetRunner>,
     claude: Arc<ClaudeInvoker>,
-    in_flight: Mutex<std::collections::HashSet<String>>,
+    in_flight: api::InFlight,
     /// CLAUDE-28: daemon-wide per-key gate, threaded into every run so jobs
     /// sharing a concurrency key serialize across runs and triggers.
     keygate: KeyGate,
@@ -795,5 +811,56 @@ mod tests {
         )
         .await
         .expect("native handler caps out cleanly");
+    }
+
+    // CLAUDE-40: an out-of-band `rm` of an action file must be reconciled by the
+    // next scan, which prunes the stale index row while leaving run history.
+    #[tokio::test]
+    async fn scan_actions_prunes_vanished_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let actions_dir = tmp.path().join("actions");
+        std::fs::create_dir_all(&actions_dir).unwrap();
+        let file = actions_dir.join("doomed.yml");
+        std::fs::write(
+            &file,
+            "name: doomed\ninput:\n  command: print '[]'\nprompt: print 'hi'\nenabled: false\n",
+        )
+        .unwrap();
+
+        // First scan indexes the file.
+        scan_actions(&pool, &actions_dir).await.unwrap();
+        assert!(state::action_index_list(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.name == "doomed"));
+
+        // Seed a finished run so we can assert pruning keeps history.
+        let run = state::run_begin(&pool, "doomed", "cli").await.unwrap();
+        state::run_finish(&pool, run, crate::exit::OK, 0)
+            .await
+            .unwrap();
+
+        // Out-of-band removal; the next scan must prune the stale index row.
+        std::fs::remove_file(&file).unwrap();
+        scan_actions(&pool, &actions_dir).await.unwrap();
+        assert!(
+            !state::action_index_list(&pool)
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.name == "doomed"),
+            "vanished file's index row is pruned"
+        );
+
+        // History survives the prune.
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE action_name = ?")
+            .bind("doomed")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 1, "run history is retained across a prune");
     }
 }

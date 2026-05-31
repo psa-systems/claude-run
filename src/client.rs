@@ -70,6 +70,41 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("daemon request: {e}"))?;
         read_json(resp).await
     }
+
+    /// CLAUDE-40: POST that surfaces the HTTP status alongside the parsed JSON
+    /// body, instead of collapsing every non-2xx into an opaque error. The CLI
+    /// uses it to translate the delete handler's 404 / 409 into the matching
+    /// `exit::CONFIG_ERROR` / `exit::CONFLICT` codes.
+    pub async fn post_status(&self, path: &str, body: Option<&Value>) -> Result<(u16, Value)> {
+        let bytes = match body {
+            Some(b) => Bytes::from(serde_json::to_vec(b)?),
+            None => Bytes::new(),
+        };
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri(self.uri(path))
+            .header("content-type", "application/json")
+            .body(Full::new(bytes))
+            .map_err(|e| anyhow::anyhow!("build request: {e}"))?;
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .map_err(|e| anyhow::anyhow!("daemon request: {e}"))?;
+        let status = resp.status().as_u16();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("collect response body: {e}"))?
+            .to_bytes();
+        let value: Value = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap_or(Value::Null)
+        };
+        Ok((status, value))
+    }
 }
 
 async fn read_json<T: DeserializeOwned>(resp: hyper::Response<hyper::body::Incoming>) -> Result<T> {
