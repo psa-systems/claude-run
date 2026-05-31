@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::action::ClaudeBlock;
 use crate::cancel::CancellationToken;
@@ -33,6 +34,13 @@ use crate::error::Result;
 const CANCEL_GRACE: Duration = Duration::from_millis(2000);
 /// How often the cancellable wait loop polls the child and the token.
 const CANCEL_POLL: Duration = Duration::from_millis(100);
+/// CLAUDE-53: once claude emits its terminal `result` event the turn is
+/// functionally done. Give a well-behaved claude this long to flush and exit on
+/// its own; if it doesn't (a leftover background task is holding it open), the
+/// runner terminates the group and finalizes from the captured result rather
+/// than waiting out the full `timeout`. A plain constant for now; expose via
+/// config only if real runs show a legitimate longer tail.
+const RESULT_EXIT_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaudeResult {
@@ -66,12 +74,17 @@ impl ClaudeResult {
 
 pub struct ClaudeInvoker {
     pub binary: String,
+    /// CLAUDE-53: how long to wait for claude to exit on its own after its
+    /// terminal `result` event before force-terminating the group. Defaults to
+    /// `RESULT_EXIT_GRACE`; tests override it to keep the hang case fast.
+    result_exit_grace: Duration,
 }
 
 impl ClaudeInvoker {
     pub fn new(binary: Option<&str>) -> Self {
         Self {
             binary: binary.unwrap_or("claude").to_string(),
+            result_exit_grace: RESULT_EXIT_GRACE,
         }
     }
 
@@ -146,12 +159,19 @@ impl ClaudeInvoker {
             .spawn()?;
 
         let pgid = child.id() as i32;
-        let status = wait_or_cancel(&mut child, pgid, cancel)?;
+        let outcome = wait_or_cancel(&mut child, pgid, stream_log, self.result_exit_grace, cancel)?;
+        let status = outcome.status;
 
         let exit_code = status.code().unwrap_or(-1);
         let final_event = parse_final_result(stream_log).unwrap_or(Value::Null);
 
-        if exit_code != 0 {
+        // CLAUDE-53: when we force-terminated a hung-but-done group after its
+        // terminal `result` event, the wrapper exits non-zero (SIGTERM 143 /
+        // SIGKILL 137). The captured result event is the authoritative outcome,
+        // so skip the exit-code failure branch and build from the result below.
+        // The exit-code / timeout path is reserved for runs where NO terminal
+        // result was ever observed (a genuine hang or crash).
+        if exit_code != 0 && !outcome.finalized_on_result {
             let tail = read_tail(stream_log, 2000).unwrap_or_default();
             return Ok(ClaudeResult {
                 ok: false,
@@ -210,9 +230,26 @@ impl ClaudeInvoker {
     }
 }
 
-/// Wait for the child to exit, watching `cancel`. Returns the child's exit
-/// status on normal completion; on cancellation, terminates the child's
-/// process group and returns the status of the terminated `timeout` wrapper.
+/// Outcome of the cancellable wait loop.
+struct WaitOutcome {
+    status: ExitStatus,
+    /// CLAUDE-53: true when claude emitted its terminal `result` event but did
+    /// not exit within the grace window, so the loop force-terminated the (hung)
+    /// group. The caller must build the outcome from the captured result event,
+    /// not from the signal-induced exit code.
+    finalized_on_result: bool,
+}
+
+/// Wait for the child to exit, watching `cancel` and the stream log. Returns the
+/// child's exit status on normal completion; on cancellation, terminates the
+/// child's process group and returns the status of the terminated `timeout`
+/// wrapper.
+///
+/// CLAUDE-53: additionally watches the stream log for claude's terminal `result`
+/// event. Once that event appears the turn is functionally done; the child gets
+/// `result_exit_grace` to exit on its own, after which the loop terminates the
+/// group and flags `finalized_on_result` so the caller finalizes from the
+/// captured result instead of waiting out the full `timeout`.
 ///
 /// Polling (rather than blocking on `wait`) is deliberate: `invoke` is a
 /// synchronous call already blocking its worker thread on the child, so a
@@ -221,17 +258,65 @@ impl ClaudeInvoker {
 fn wait_or_cancel(
     child: &mut Child,
     pgid: i32,
+    stream_log: &Path,
+    result_exit_grace: Duration,
     cancel: &CancellationToken,
-) -> std::io::Result<ExitStatus> {
+) -> std::io::Result<WaitOutcome> {
+    // Set once claude's terminal `result` event is first observed; the child is
+    // force-terminated if it is still alive at this instant.
+    let mut result_deadline: Option<Instant> = None;
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(status);
+            return Ok(WaitOutcome {
+                status,
+                finalized_on_result: false,
+            });
         }
+        // Cancellation wins over the result-event path and terminates immediately.
         if cancel.is_cancelled() {
-            return terminate_group(child, pgid);
+            let status = terminate_group(child, pgid)?;
+            return Ok(WaitOutcome {
+                status,
+                finalized_on_result: false,
+            });
+        }
+        match result_deadline {
+            None => {
+                if stream_has_terminal_result(stream_log) {
+                    result_deadline = Some(Instant::now() + result_exit_grace);
+                }
+            }
+            Some(deadline) => {
+                if Instant::now() >= deadline {
+                    warn!(
+                        pid = child.id(),
+                        pgid,
+                        grace_secs = result_exit_grace.as_secs(),
+                        "claude emitted its terminal result but did not exit within the grace window; terminating the process group (leftover background task?)"
+                    );
+                    let status = terminate_group(child, pgid)?;
+                    return Ok(WaitOutcome {
+                        status,
+                        finalized_on_result: true,
+                    });
+                }
+            }
         }
         std::thread::sleep(CANCEL_POLL);
     }
+}
+
+/// Whether the last complete JSON line in the stream log is a terminal `result`
+/// event. A partial trailing write fails to parse and reads as "not yet", so the
+/// grace timer only starts once the full event has landed.
+fn stream_has_terminal_result(stream_log: &Path) -> bool {
+    parse_final_result(stream_log)
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| s == "result")
+        })
+        .unwrap_or(false)
 }
 
 /// Terminate the child's process group: SIGTERM, a short grace window, then
@@ -361,6 +446,99 @@ mod tests {
         assert!(res.timed_out, "exit 124 should set timed_out");
         assert!(!res.ok, "a timeout is not ok");
         assert!(!res.transient, "a timeout is never transient");
+    }
+
+    const RESULT_LINE: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.42}"#;
+
+    fn write_stub(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// CLAUDE-53: claude emits its terminal result event and then exits on its
+    /// own within the grace window. Behavior is unchanged from today: the result
+    /// event is parsed for the success outcome, and nothing is force-terminated.
+    #[test]
+    fn invoke_result_then_clean_exit_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        write_stub(
+            &stub,
+            &format!("#!/bin/sh\nprintf '%s\\n' '{RESULT_LINE}'\nexit 0\n"),
+        );
+
+        let invoker = ClaudeInvoker {
+            binary: stub.to_str().unwrap().to_string(),
+            result_exit_grace: Duration::from_secs(30),
+        };
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let res = invoker
+            .invoke(
+                "hi",
+                &cfg,
+                Duration::from_secs(10),
+                dir.path(),
+                &log,
+                &cancel,
+            )
+            .unwrap();
+        assert!(res.ok, "a success result event finalizes as ok");
+        assert_eq!(res.summary, "done");
+        assert_eq!(res.cost, 0.42);
+        assert!(!res.timed_out, "a clean exit is not a timeout");
+    }
+
+    /// CLAUDE-53: claude emits its terminal result event but does NOT exit (a
+    /// leftover background task holds it open). The runner force-terminates the
+    /// group after the grace window and finalizes from the captured result, so a
+    /// success result is preserved as success - not reported as a timeout - and
+    /// the wait is bounded by the grace, not the full `timeout`.
+    #[test]
+    fn invoke_result_then_hang_terminated_at_grace_preserves_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        write_stub(
+            &stub,
+            &format!("#!/bin/sh\nprintf '%s\\n' '{RESULT_LINE}'\nsleep 30\n"),
+        );
+
+        let invoker = ClaudeInvoker {
+            binary: stub.to_str().unwrap().to_string(),
+            // Short grace so the test doesn't wait the production 30s.
+            result_exit_grace: Duration::from_millis(300),
+        };
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let start = Instant::now();
+        let res = invoker
+            // Wall-clock timeout far exceeds the grace, so finalization is driven
+            // by the result event, not the `timeout(1)` wrapper.
+            .invoke(
+                "hi",
+                &cfg,
+                Duration::from_secs(30),
+                dir.path(),
+                &log,
+                &cancel,
+            )
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            res.ok,
+            "captured success result is preserved despite SIGTERM"
+        );
+        assert_eq!(res.summary, "done");
+        assert_eq!(res.cost, 0.42);
+        assert!(!res.timed_out, "result-driven finalize is not a timeout");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should finalize at the grace window, not the 30s timeout (took {elapsed:?})"
+        );
     }
 
     /// CLAUDE-9: tripping the token mid-run terminates the child's process
