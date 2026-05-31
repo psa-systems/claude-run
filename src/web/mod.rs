@@ -443,11 +443,24 @@ struct ActionDetailTpl {
     action: ActionView,
     paused: Option<PauseInfo>,
     runs: Vec<RunRow>,
+    /// CLAUDE-42: current state of the "Show empty runs" toggle. Threaded into
+    /// the poll-region `hx-get` so the choice survives the 5s self-refresh.
+    show_empty: bool,
+}
+
+/// CLAUDE-42: query params for the action detail page. Mirrors `DashboardQuery`:
+/// `show_empty` defaults to `false` when the param is absent, so the Recent runs
+/// table loads with 0-job finished runs hidden.
+#[derive(Deserialize, Default)]
+struct ActionDetailQuery {
+    #[serde(default)]
+    show_empty: bool,
 }
 
 async fn action_detail(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
+    Query(q): Query<ActionDetailQuery>,
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
     let actions = enriched_actions(pool).await?;
@@ -460,17 +473,28 @@ async fn action_detail(
             paused_at: at,
             reason: r,
         });
-    let runs = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
-    )
-    .bind(&name)
-    .fetch_all(pool)
-    .await?;
+    // CLAUDE-42: mirror the dashboard's "Show empty runs" toggle. When
+    // `show_empty` is false, finished runs that processed zero jobs are hidden;
+    // in-progress runs (`exit_code IS NULL`) stay visible. The filter applies
+    // before the `LIMIT`, exactly as in `fetch_recent_runs`.
+    let empty_filter = if q.show_empty {
+        ""
+    } else {
+        " AND (jobs_processed > 0 OR exit_code IS NULL)"
+    };
+    let sql = format!(
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE action_name = ?{empty_filter} ORDER BY started_at DESC LIMIT 50"
+    );
+    let runs = sqlx::query_as::<_, RunRow>(&sql)
+        .bind(&name)
+        .fetch_all(pool)
+        .await?;
     let tpl = ActionDetailTpl {
         version: s.api.version,
         action,
         paused,
         runs,
+        show_empty: q.show_empty,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
