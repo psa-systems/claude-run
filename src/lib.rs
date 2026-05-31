@@ -30,6 +30,7 @@ pub mod forge_log;
 pub mod job;
 pub mod lock;
 pub mod migrate;
+pub mod mint;
 pub mod native;
 pub mod provider;
 pub mod scheduler;

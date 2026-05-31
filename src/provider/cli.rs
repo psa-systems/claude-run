@@ -305,6 +305,52 @@ impl IssueTracker for CliBackend {
             clone_url,
         })
     }
+
+    fn create_issue(
+        &self,
+        project: &str,
+        summary: &str,
+        description: &str,
+        assignee: Option<&str>,
+    ) -> Result<String> {
+        // `--description` (not `--description-file`): std::process passes the
+        // body as a single argv entry, so embedded newlines / Markdown need no
+        // shell escaping and no temp file. `--json` makes the new id parseable.
+        let mut args: Vec<&str> = vec![
+            "issue",
+            "create",
+            "--project",
+            project,
+            "--summary",
+            summary,
+            "--description",
+            description,
+        ];
+        if let Some(login) = assignee {
+            args.push("--assignee");
+            args.push(login);
+        }
+        args.push("--json");
+        let stdout = self.yt_ok(&args)?;
+        // `yt issue create --json` emits the created issue; pull its idReadable.
+        let value: serde_json::Value =
+            Self::parse_json(&self.yt, "yt issue create --json", &stdout)?;
+        value
+            .get("idReadable")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
+                    "yt issue create --json returned no idReadable: {value}"
+                ))
+            })
+    }
+
+    fn attach_file(&self, key: &str, file: &Path) -> Result<()> {
+        let file_arg = file.to_string_lossy();
+        self.yt_ok(&["issue", "attachment", "add", key, &file_arg])?;
+        Ok(())
+    }
 }
 
 impl Forge for CliBackend {
