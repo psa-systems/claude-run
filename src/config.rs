@@ -98,6 +98,15 @@ pub struct OnDiskConfig {
 pub struct WebConfig {
     pub bind: String,
     pub port: u16,
+    /// Phase 5 (CLAUDE-48): name of the stored secret (CLAUDE-26) holding the
+    /// bearer token that gates the web UI and `/api/*` when the bind is
+    /// non-loopback. Unset is fine for a loopback bind; required (else the TCP
+    /// listener fails closed) for any exposed bind.
+    pub auth_token_ref: Option<String>,
+    /// Phase 5 (CLAUDE-48): require the bearer token even on a loopback bind.
+    /// Off by default so local development stays unauthenticated; set true to
+    /// exercise the gate locally.
+    pub require_auth_on_loopback: bool,
 }
 
 impl Default for WebConfig {
@@ -105,6 +114,8 @@ impl Default for WebConfig {
         Self {
             bind: "127.0.0.1".to_string(),
             port: 7321,
+            auth_token_ref: None,
+            require_auth_on_loopback: false,
         }
     }
 }

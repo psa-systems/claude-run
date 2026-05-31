@@ -113,9 +113,10 @@ Because `kind` is already the discriminator, the block holds the handler's confi
 
 #### `kind: youtrack`
 
-Two sub-records, `youtrack` (the issue source) and `forgejo` (the PR target). Every field defaults, so a bare `native:
-{}` validates and reproduces the behavior the scripted youtrack action had. The generic blocks (`workdir_base`,
-`link_template`, `limits`, `schedule`, `claude`, `output`) stay at the top level of the action, not inside `native`.
+Three sub-records: `youtrack` (the issue source), `forgejo` (the Forgejo PR target), and `github` (the GitHub PR
+target). Every field defaults, so a bare `native: {}` validates and reproduces the behavior the scripted youtrack action
+had. The generic blocks (`workdir_base`, `link_template`, `limits`, `schedule`, `claude`, `output`) stay at the top
+level of the action, not inside `native`.
 
 ```yaml
 kind: youtrack
@@ -135,17 +136,36 @@ native:
   forgejo:
     base_url: https://forge.example       # optional; default derives host per issue VCS
     token_ref: fj-prod                    # optional; name of an encrypted secret
+  github:                                 # optional; all fields default
+    hosts:                                # extra GitHub hosts beyond github.com (GHE)
+      - ghe.example.com
+    mcp_endpoint: https://api.githubcopilot.com/mcp/  # override the remote GitHub MCP URL
+    token_ref: gh-prod                    # optional; name of an encrypted secret (GitHub PAT)
 ```
 
-| Key                     | Default                      | Meaning                                                                                             |
-|-------------------------|------------------------------|-----------------------------------------------------------------------------------------------------|
-| `youtrack.base_url`     | host-configured `yt`         | YouTrack base URL. Required when `token_ref` is set (the injected `yt` config needs a `url`).       |
-| `youtrack.token_ref`    | none                         | Name of an encrypted secret holding the YouTrack API token (CLAUDE-26). `None` uses host `yt` auth. |
-| `youtrack.query`        | `-Resolved AI Agent: Queued` | Issue query selecting the jobs this action picks up.                                                |
-| `youtrack.custom_field` | `AI Agent`                   | Custom field holding the AI Agent state machine.                                                    |
-| `youtrack.states.*`     | see above                    | Labels the handler reads/writes for each AI Agent / State value.                                    |
-| `forgejo.base_url`      | per-issue VCS host           | Forgejo base URL.                                                                                   |
-| `forgejo.token_ref`     | none                         | Name of an encrypted secret holding the Forgejo API token (CLAUDE-26). `None` uses host `fj` auth.  |
+| Key                     | Default                            | Meaning                                                                                             |
+|-------------------------|------------------------------------|-----------------------------------------------------------------------------------------------------|
+| `youtrack.base_url`     | host-configured `yt`               | YouTrack base URL. Required when `token_ref` is set (the injected `yt` config needs a `url`).       |
+| `youtrack.token_ref`    | none                               | Name of an encrypted secret holding the YouTrack API token (CLAUDE-26). `None` uses host `yt` auth. |
+| `youtrack.query`        | `-Resolved AI Agent: Queued`       | Issue query selecting the jobs this action picks up.                                                |
+| `youtrack.custom_field` | `AI Agent`                         | Custom field holding the AI Agent state machine.                                                    |
+| `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value.                                    |
+| `forgejo.base_url`      | per-issue VCS host                 | Forgejo base URL.                                                                                   |
+| `forgejo.token_ref`     | none                               | Name of an encrypted secret holding the Forgejo API token (CLAUDE-26). `None` uses host `fj` auth.  |
+| `github.hosts`          | empty                              | Extra GitHub host(s) beyond `github.com` to treat as GitHub (e.g. GitHub Enterprise). Bare hosts.   |
+| `github.mcp_endpoint`   | `https://api.githubcopilot.com/mcp/` | Remote GitHub MCP endpoint used to open the PR (no local server to install).                      |
+| `github.token_ref`      | none                               | Name of an encrypted secret holding the GitHub PAT (CLAUDE-26). `None` uses host `gh` auth / `GH_TOKEN`. |
+
+##### Forge auto-routing by host (CLAUDE-50)
+
+The PR target is chosen automatically from each job's resolved VCS `repo_host`; there is **no** per-action forge
+selector. A job whose repo host is GitHub (`github.com` plus any host listed in `github.hosts`) opens its PR through the
+GitHub backend; every other host opens through `fj` exactly as before, so no existing Forgejo action changes behavior.
+
+The GitHub backend prefers GitHub's remote MCP (`create_pull_request`) and falls back to `gh pr create` when the MCP
+endpoint is unreachable; with neither available it errors. Unlike Forgejo's AGit flow (`fj -aA`), GitHub has no AGit
+equivalent, so the backend pushes the working branch before opening the PR. The PAT supplied via `github.token_ref`
+must carry the **`repo`** and **`pull_request`** scopes (used for the authenticated push, the MCP call, and `gh`).
 
 #### Credential injection (CLAUDE-26)
 
@@ -153,8 +173,11 @@ native:
 with the `age` key file named by `CLAUDE_RUN_SECRETS_KEY_FILE`). A raw token is **never** written to the action YAML,
 exported, or logged. When a block sets `token_ref`, the runner decrypts the secret at run time and materializes per-job,
 mode-`0600` credential files (a single-file `yt` config and a temp forgejo `keys.json`), injecting them into the `yt` /
-`fj` children for that job only and scrubbing them when the job finishes. When neither block sets `token_ref`, the CLIs
-fall back to host-configured credentials exactly as the scripted action did.
+`fj` children for that job only and scrubbing them when the job finishes. The GitHub PAT (`github.token_ref`) is
+injected as the `gh` child's `GH_TOKEN`, the MCP bearer, and the authenticated push URL for that job only; being an
+env-var / URL component it leaves no on-disk plaintext to scrub and is dropped with the job. When no block sets
+`token_ref`, the CLIs fall back to host-configured credentials (`gh` host auth / `GH_TOKEN` for GitHub) exactly as the
+scripted action did.
 
 #### `kind: forgejo-ci-fix`
 

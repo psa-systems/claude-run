@@ -69,6 +69,23 @@ XDG-compliant; each path overridable by the matching env var.
 
 `workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-job workdirs live; defaults to `$DATA_DIR/workdirs/`. Supports `~`, `$VAR`, `${VAR}` expansion.
 
+## Web UI / API auth
+
+The daemon's TCP web UI and JSON API (`/api/*`) bind to loopback (`127.0.0.1:7321`) by default and are unauthenticated there. When you expose the surface beyond loopback (a non-loopback `web.bind`, or a reverse proxy that forwards to it), the daemon requires a bearer token on every request to the web UI and `/api/*`:
+
+```toml
+# config.toml
+[web]
+bind = "0.0.0.0"
+port = 7321
+# Name of a stored secret (see `claude-run`'s secrets page / CLAUDE-26) holding the bearer token.
+auth_token_ref = "web-ui-token"
+# Optional: require the token even on a loopback bind (off by default; useful for local testing).
+require_auth_on_loopback = false
+```
+
+Callers send `Authorization: Bearer <token>`. The token value lives encrypted in the secrets store (resolved once at daemon startup); only its name appears in `config.toml`. If `web.bind` is non-loopback but `auth_token_ref` is unset or its secret cannot be decrypted, the daemon fails closed and does not bring up the TCP listener at all, rather than serve an unauthenticated surface. Run the daemon behind TLS-terminating reverse proxy when exposed; the token is bearer credentials and must not cross the network in plaintext. The future `/webhooks/` route keeps its own HMAC verification and is exempt from the token gate.
+
 ## Development
 
 ```nu
