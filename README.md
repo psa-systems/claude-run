@@ -78,13 +78,43 @@ The daemon's TCP web UI and JSON API (`/api/*`) bind to loopback (`127.0.0.1:732
 [web]
 bind = "0.0.0.0"
 port = 7321
-# Name of a stored secret (see `claude-run`'s secrets page / CLAUDE-26) holding the bearer token.
+# Name of a stored secret (see "Secrets store" below) holding the bearer token / web password.
 auth_token_ref = "web-ui-token"
+# Optional: enable the browser login form with this username (lets a password manager sign in).
+auth_username = "admin"
 # Optional: require the token even on a loopback bind (off by default; useful for local testing).
 require_auth_on_loopback = false
 ```
 
-Callers send `Authorization: Bearer <token>`. The token value lives encrypted in the secrets store (resolved once at daemon startup); only its name appears in `config.toml`. If `web.bind` is non-loopback but `auth_token_ref` is unset or its secret cannot be decrypted, the daemon fails closed and does not bring up the TCP listener at all, rather than serve an unauthenticated surface. Run the daemon behind TLS-terminating reverse proxy when exposed; the token is bearer credentials and must not cross the network in plaintext. The future `/webhooks/` route keeps its own HMAC verification and is exempt from the token gate.
+Callers send `Authorization: Bearer <token>`. The token value lives encrypted in the secrets store (resolved once at daemon startup); only its name appears in `config.toml`. If `web.bind` is non-loopback but `auth_token_ref` is unset or its secret cannot be decrypted, the daemon fails closed and does not bring up the TCP listener at all, rather than serve an unauthenticated surface. Run the daemon behind a TLS-terminating reverse proxy when exposed; the token is bearer credentials and must not cross the network in plaintext. The `/webhooks/` route keeps its own HMAC verification and is exempt from the token gate.
+
+### Browser login (for password managers)
+
+A bearer header is awkward in a browser (a password manager such as Bitwarden fills a username/password form, not an `Authorization` header). Set `web.auth_username` to enable a form login: an unauthenticated browser request (a GET that accepts HTML) is redirected to `/login`, where the configured **username** plus the **`auth_token_ref` secret value as the password** mint a session cookie (`HttpOnly`, `Secure`, `SameSite=Lax`, 12-hour lifetime). `GET /logout` clears it. The session is an HMAC over the token, so rotating the secret invalidates every outstanding session. `Authorization: Bearer <token>` continues to work for API clients regardless of `auth_username`. Because the cookie is `Secure`, the login flow only works over HTTPS, i.e. behind the reverse proxy (which is the only context where the surface is exposed anyway).
+
+### Secrets store
+
+Auth (and every action `token_ref`) reads from an encrypted secrets store. Two things are required before `auth_token_ref` resolves:
+
+1. **A key file.** The store is encrypted with an [`age`](https://github.com/FiloSottile/age) X25519 identity. Generate one and point `CLAUDE_RUN_SECRETS_KEY_FILE` at it (the daemon reads only this env var; it is never put in `config.toml`):
+
+   ```sh
+   age-keygen -o /etc/claude-run/secrets.key
+   chmod 600 /etc/claude-run/secrets.key   # readable only by the service user
+   ```
+
+   Under systemd, set the env var in the unit (e.g. `systemctl edit claude-run` -> `[Service]` -> `Environment=CLAUDE_RUN_SECRETS_KEY_FILE=/etc/claude-run/secrets.key`, then `systemctl daemon-reload`). A missing/unset key file is exactly the `secret: CLAUDE_RUN_SECRETS_KEY_FILE is not set` error that disables the TCP web UI on an exposed bind.
+
+   Back this file up. If you lose it, every stored secret becomes undecryptable and must be re-entered under a new key.
+
+2. **The secret itself.** Secrets are created on the **web UI Secrets page** (there is no CLI for it yet), which on an exposed bind is gated by the very token you are setting up. Bootstrap on loopback first:
+
+   1. Start with a loopback bind (the default `bind = "127.0.0.1"`); the web UI is unauthenticated there.
+   2. Open `http://127.0.0.1:7321/secrets` and create a secret, e.g. name `web-ui-token`, value = a strong random string (this value is both the bearer token and the browser-login password).
+   3. Set `web.auth_token_ref = "web-ui-token"` (the secret **name**, not its value), optionally `web.auth_username`, and switch `web.bind` to the exposed address.
+   4. Restart. The daemon now decrypts the secret and brings up the gated TCP listener.
+
+   `auth_token_ref` is the **name** of a stored secret. It is not the token value and not the `age` public key.
 
 ## Webhook fast-path
 
