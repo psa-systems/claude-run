@@ -108,23 +108,44 @@ impl Daemon {
             .merge(web_router)
             .nest("/api", api_for_tcp);
 
-        // Tasks: unix-socket server, TCP server, scheduler tick, trigger consumer.
-        let server_unix = tokio::spawn(serve_unix(listener, unix_app));
-
-        let tcp_bind = format!("{}:{}", self.on_disk.web.bind, self.on_disk.web.port);
-        let tcp_listener = match tokio::net::TcpListener::bind(&tcp_bind).await {
-            Ok(l) => {
-                info!(address = %tcp_bind, "web UI listening");
-                Some(l)
+        // CLAUDE-48 (Phase 5): gate the TCP surface (web UI + /api/*) behind a
+        // bearer token whenever the bind is non-loopback. The /webhooks/ prefix
+        // keeps its own HMAC and is exempt. When auth is required but the token
+        // cannot be resolved, fail closed: drop the TCP listener entirely rather
+        // than expose an unauthenticated surface. The unix-socket API is
+        // unaffected (loopback-only by construction).
+        let tcp_app = match crate::auth::resolve_gate(&self.on_disk.web, &pool).await {
+            Ok(None) => Some(tcp_app),
+            Ok(Some(gate)) => {
+                info!("token auth enabled for the TCP web UI and /api/*");
+                Some(crate::auth::protect(tcp_app, gate))
             }
             Err(e) => {
-                // Don't fail the whole daemon just because the TCP port is
-                // taken - the unix-socket API still works.
-                warn!(address = %tcp_bind, error = %e, "TCP bind failed; web UI disabled this run");
+                warn!(error = %e, "token auth required but unavailable; TCP web UI disabled this run");
                 None
             }
         };
-        let server_tcp = tcp_listener.map(|l| tokio::spawn(serve_tcp(l, tcp_app)));
+
+        // Tasks: unix-socket server, TCP server, scheduler tick, trigger consumer.
+        let server_unix = tokio::spawn(serve_unix(listener, unix_app));
+
+        let server_tcp = if let Some(tcp_app) = tcp_app {
+            let tcp_bind = format!("{}:{}", self.on_disk.web.bind, self.on_disk.web.port);
+            match tokio::net::TcpListener::bind(&tcp_bind).await {
+                Ok(l) => {
+                    info!(address = %tcp_bind, "web UI listening");
+                    Some(tokio::spawn(serve_tcp(l, tcp_app)))
+                }
+                Err(e) => {
+                    // Don't fail the whole daemon just because the TCP port is
+                    // taken - the unix-socket API still works.
+                    warn!(address = %tcp_bind, error = %e, "TCP bind failed; web UI disabled this run");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let dispatch = Arc::new(Dispatcher {
             paths: self.paths.clone(),
