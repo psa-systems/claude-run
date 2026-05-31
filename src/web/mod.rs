@@ -64,6 +64,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             get(youtrack_edit_page).post(youtrack_edit_save),
         )
         .route("/actions/:name/export", get(action_export))
+        .route("/actions/:name/delete", post(action_delete))
         .route("/secrets", get(secrets_page).post(secret_create))
         .route("/secrets/:name/rotate", post(secret_rotate))
         .route("/secrets/:name/delete", post(secret_delete))
@@ -727,6 +728,29 @@ async fn action_export(
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
     Ok(resp)
+}
+
+/// CLAUDE-40: delete an action from the web UI. Mirrors `secret_delete`: 404s
+/// an unknown action, renders a 409 when a run for it is in flight, otherwise
+/// removes the YAML file + purges the derived index/control state (keeping run
+/// history) and redirects to the dashboard, which no longer lists it.
+async fn action_delete(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, WebError> {
+    if indexed_action_path(&s.api.pool, &name).await?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
+    }
+    let dispatched = s.api.in_flight.lock().await.contains(&name);
+    if dispatched || state::action_has_active_run(&s.api.pool, &name).await? {
+        return Ok((
+            StatusCode::CONFLICT,
+            format!("action `{name}` has a run in flight; cancel or wait before deleting"),
+        )
+            .into_response());
+    }
+    crate::api::delete_indexed_action(&s.api.pool, &name).await?;
+    Ok(Redirect::to("/").into_response())
 }
 
 // ---- structured YouTrack action editor (CLAUDE-27) ------------------------
@@ -1793,7 +1817,7 @@ mod tests {
     // actions directory.
     mod editor {
         use super::super::{
-            action_create, action_edit_save, action_export, action_to_youtrack_form,
+            action_create, action_delete, action_edit_save, action_export, action_to_youtrack_form,
             youtrack_create, youtrack_edit_page, youtrack_edit_save, youtrack_form_to_yaml,
             youtrack_new_page, ActionForm, WebState, YoutrackEditForm,
         };
@@ -1829,6 +1853,7 @@ mod tests {
                 trigger_tx,
                 version: "test",
                 runs: Arc::new(RunRegistry::new()),
+                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             });
             let paths = Paths {
                 config_dir: tmp.join("config"),
@@ -1992,6 +2017,78 @@ mod tests {
 
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(body_string(resp).await, content);
+        }
+
+        // ---- delete (CLAUDE-40) -------------------------------------------
+
+        #[tokio::test]
+        async fn action_delete_404s_unknown_409s_in_flight_then_removes() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("act.yml");
+            std::fs::write(&file, "name: act\nkind: youtrack\nnative: {}\n").unwrap();
+            index_action(&s.api.pool, "act", file.to_str().unwrap()).await;
+            // Seed control state that the delete must purge.
+            state::action_pause_set(&s.api.pool, "act", None)
+                .await
+                .unwrap();
+            state::attempts_increment(&s.api.pool, "act", "job-1")
+                .await
+                .unwrap();
+
+            // Unknown action -> 404.
+            let resp = action_delete(State(s.clone()), AxumPath("ghost".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+            // A run in flight -> 409, and the file is left untouched.
+            let run = state::run_begin(&s.api.pool, "act", "cli").await.unwrap();
+            let resp = action_delete(State(s.clone()), AxumPath("act".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            assert!(file.exists(), "a refused delete leaves the file on disk");
+            assert!(
+                !state::action_index_list(&s.api.pool)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a refused delete leaves the index row"
+            );
+            state::run_finish(&s.api.pool, run, crate::exit::OK, 0)
+                .await
+                .unwrap();
+
+            // Now the delete succeeds: redirect, file gone, index + control purged.
+            let resp = action_delete(State(s.clone()), AxumPath("act".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert!(!file.exists(), "the YAML file is removed");
+            assert!(state::action_index_list(&s.api.pool)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(state::action_pause_status(&s.api.pool, "act")
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                state::attempts_get(&s.api.pool, "act", "job-1")
+                    .await
+                    .unwrap(),
+                0
+            );
+            // History is kept.
+            let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE action_name = ?")
+                .bind("act")
+                .fetch_one(&s.api.pool)
+                .await
+                .unwrap();
+            assert_eq!(runs, 1, "run history survives the delete");
         }
 
         // ---- structured YouTrack editor (CLAUDE-27) -----------------------
@@ -2354,6 +2451,7 @@ mod tests {
                 trigger_tx,
                 version: "test",
                 runs: Arc::new(RunRegistry::new()),
+                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             });
             let paths = Paths {
                 config_dir: tmp.join("config"),

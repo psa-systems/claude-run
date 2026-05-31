@@ -11,9 +11,17 @@
 //! | POST | `/actions/<name>/trigger` | queue an immediate run |
 //! | POST | `/actions/<name>/pause` | pause a single action |
 //! | POST | `/actions/<name>/resume` | resume a single action |
+//! | POST | `/actions/<name>/delete` | delete an action (file + index + control state) |
 //! | POST | `/runs/<id>/cancel` | cancel an in-flight run |
 //! | POST | `/pause` | global pause |
 //! | POST | `/resume` | global resume |
+//!
+//! `POST /actions/<name>/delete` removes the YAML file, the `actions` index
+//! row, and the action's control state (`paused_actions`, `attempt_counters`,
+//! `daily_ledger`). It KEEPS run history (`runs`, `job_outcomes`, on-disk
+//! stream logs) for audit. It returns 404 for an unknown action and 409 when a
+//! run for that action is in flight (the in-memory in-flight set or a `runs`
+//! row with no `ended_at`).
 
 use std::sync::Arc;
 
@@ -31,6 +39,12 @@ use tokio::sync::mpsc;
 use crate::cancel::RunRegistry;
 use crate::state;
 
+/// CLAUDE-40: the daemon's in-memory set of action names with a dispatched run.
+/// Shared between the dispatcher (which inserts/removes names as runs start and
+/// finish) and the API delete handler (which consults it for the in-flight
+/// guard, authoritative for a job dispatched before its `runs` row is written).
+pub type InFlight = Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>;
+
 /// Shared state injected into every handler. `Clone` is trivial because the
 /// fields are already cheap-clone (`SqlitePool` is `Arc`-shaped, `Sender`
 /// is `Clone`, version is `&'static`).
@@ -44,6 +58,9 @@ pub struct AppState {
     /// CLAUDE-9: per-run cancellation tokens. The cancel handler trips the
     /// token for a given run id; the dispatcher registers/unregisters them.
     pub runs: Arc<RunRegistry>,
+    /// CLAUDE-40: shared with the dispatcher so the delete handler can refuse a
+    /// delete for an action whose run is dispatched but not yet in `runs`.
+    pub in_flight: InFlight,
 }
 
 /// JSON API router. Phase 2 mounted it at root over the unix socket;
@@ -56,6 +73,7 @@ pub fn router(state: AppState) -> Router {
         .route("/actions/:name/trigger", post(trigger_action))
         .route("/actions/:name/pause", post(pause_action))
         .route("/actions/:name/resume", post(resume_action))
+        .route("/actions/:name/delete", post(delete_action))
         .route("/runs/:id/cancel", post(cancel_run))
         .route("/pause", post(global_pause_handler))
         .route("/resume", post(global_resume_handler))
@@ -187,6 +205,60 @@ async fn resume_action(
     }))
 }
 
+/// CLAUDE-40: delete an action from every surface. Refuses (409) when a run is
+/// in flight, 404s an unknown action, otherwise removes the YAML file, the
+/// `actions` index row, and the control state (`paused_actions`,
+/// `attempt_counters`, `daily_ledger`) while keeping run history.
+async fn delete_action(
+    State(s): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<AckResponse>, AppError> {
+    // 404 before any side effect: only indexed actions are deletable.
+    let rows = state::action_index_list(&s.pool).await?;
+    if !rows.iter().any(|r| r.name == name) {
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("unknown action `{name}`"),
+        });
+    }
+    // 409 if a run is in flight: the in-memory set catches a job dispatched
+    // before its `runs` row exists; the DB query catches a recorded live run.
+    let dispatched = s.in_flight.lock().await.contains(&name);
+    if dispatched || state::action_has_active_run(&s.pool, &name).await? {
+        return Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: format!("action `{name}` has a run in flight; cancel or wait before deleting"),
+        });
+    }
+    delete_indexed_action(&s.pool, &name).await?;
+    Ok(Json(AckResponse {
+        ok: true,
+        message: format!("deleted `{name}`"),
+    }))
+}
+
+/// CLAUDE-40: remove an indexed action's YAML file (tolerating an already-gone
+/// file) and purge its derived index + control state. Run history is kept.
+/// Returns `false` when `name` is not in the index (unknown action). Shared by
+/// the API, web, and CLI-direct delete paths; the in-flight guard is each
+/// caller's responsibility (the API additionally consults its in-flight set).
+pub async fn delete_indexed_action(
+    pool: &SqlitePool,
+    name: &str,
+) -> Result<bool, crate::error::Error> {
+    let rows = state::action_index_list(pool).await?;
+    let Some(row) = rows.into_iter().find(|r| r.name == name) else {
+        return Ok(false);
+    };
+    match std::fs::remove_file(&row.file_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    state::action_purge_state(pool, name).await?;
+    Ok(true)
+}
+
 /// CLAUDE-9: cancel an in-flight run. Tripping the token tears the run down:
 /// the claude child is terminated, the in-flight job runs its `post` phase
 /// with a synthesized cancelled result, and the run finalizes with
@@ -240,8 +312,13 @@ struct AppError {
 
 impl From<crate::error::Error> for AppError {
     fn from(e: crate::error::Error) -> Self {
+        // CLAUDE-40: an in-flight refusal maps to 409, not a 500.
+        let status = match &e {
+            crate::error::Error::ActionInFlight { .. } => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
         Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
+            status,
             message: e.to_string(),
         }
     }

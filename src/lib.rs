@@ -60,6 +60,10 @@ pub mod exit {
     pub const DAILY_CAP: i32 = 4;
     pub const UNEXPECTED: i32 = 5;
     pub const OVER_BUDGET: i32 = 6;
+    /// CLAUDE-40: a mutating command was refused because it conflicts with live
+    /// state, e.g. `action delete` while a run for that action is in flight.
+    /// The web UI / API map the same condition to HTTP 409.
+    pub const CONFLICT: i32 = 7;
     /// Sentinel exit_code for a run that was cancelled rather than finished,
     /// following the SIGINT convention (128 + SIGINT). Used both for live
     /// cancel on demand (CLAUDE-9) and for orphaned-run reconcile on daemon
