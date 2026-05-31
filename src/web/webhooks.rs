@@ -13,9 +13,17 @@
 //!    malformed request -> 400.
 //! 5. Parse the `ActionPayload`. Keep only `action_run_failure` (payload
 //!    `action == "failure"`) for an allow-listed repo and emit a typed
-//!    [`VerifiedFailureEvent`] to the next stage (log fetch / triage, a sibling
-//!    subtask) -> 202. Every other authenticated event is acked -> 200 and
-//!    dropped so Forgejo does not retry.
+//!    [`VerifiedFailureEvent`] to [`consume_events`] -> 202. Every other
+//!    authenticated event is acked -> 200 and dropped so Forgejo does not retry.
+//!
+//! CLAUDE-47 wires the fast-path end-to-end: [`consume_events`] composes the
+//! sibling subtasks - log fetch + redaction (CLAUDE-44), the hybrid triage
+//! engine (CLAUDE-45), and the triage-driven issue mint + dedupe + loop safety
+//! (CLAUDE-46) - so a verified failure turns into a minted issue (bucket 1 ->
+//! `AI Agent=Queued` for forgejo-ci-fix, bucket 2 -> a human-assigned issue) or
+//! nothing (bucket 3, transient). The scheduled `youtrack` / `forgejo-ci-fix`
+//! actions stay as the backstop and dedupe against webhook-minted issues through
+//! the same [`crate::mint`] markers.
 //!
 //! TLS / reverse proxy and service authentication are out of scope here per the
 //! epic decision (handled by the external proxy / the linked auth issue).
@@ -38,8 +46,24 @@ use sqlx::SqlitePool;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
-use crate::config::WebhookConfig;
+use crate::config::{MintConfig, WebhookConfig};
+use crate::forge_log::LogOutcome;
+use crate::job::RunnerDefaults;
+use crate::mint::{self, MintCaps, MintOutcome, MintRequest};
+use crate::provider::{Backend, ForgePullRequest};
 use crate::secrets::{self, SecretsKey};
+use crate::state;
+use crate::triage::{self, FailureClassifier, TriageInput};
+
+/// Synthetic action name the webhook fast-path records its DEV-335 caps under
+/// (per-key attempt counter + daily run ledger in [`crate::state`]), so the
+/// event-driven mint throttles on the same accounting shape as the scheduled
+/// actions instead of re-deriving its own.
+pub const WEBHOOK_MINT_ACTION: &str = "webhook-fast-path";
+
+/// Wall-clock cap for one triage classification (`claude --print`). The pass is
+/// a single bounded-log JSON reply, so it needs far less than a full code run.
+pub const TRIAGE_TIMEOUT_SECS: u64 = 120;
 
 /// Hex-encoded HMAC-SHA256 of the raw body, keyed by the webhook secret.
 pub const SIGNATURE_HEADER: &str = "X-Forgejo-Signature";
@@ -128,16 +152,38 @@ pub fn router(state: WebhookState) -> Router {
         .with_state(state)
 }
 
+/// Everything [`consume_events`] needs to triage a verified failure and mint
+/// (or decline to mint) a YouTrack issue from it. Built once at daemon start
+/// from the resolved provider backend (CLAUDE-46 `IssueTracker` + `Forge`), the
+/// on-disk mint config, and the shared `claude` invoker behind a
+/// [`FailureClassifier`]. When the daemon cannot build one (no usable `yt`/`fj`
+/// backend) it passes `None` and the consumer falls back to log-only behaviour.
+pub struct MintContext {
+    /// State DB, for the reused DEV-335 caps ledger.
+    pub pool: SqlitePool,
+    /// The LLM pass for the residue the deterministic rules cannot label.
+    pub classifier: Arc<dyn FailureClassifier>,
+    /// Provider backend: the `IssueTracker` the mint writes through and the
+    /// `Forge` the `has_open_pr` signal is read from.
+    pub backend: Arc<dyn Backend>,
+    /// Repo-to-project routing, loop-safety bot logins, bucket-2 assignee, etc.
+    pub mint_cfg: MintConfig,
+    /// Caps applied to the event-driven mint (per-key attempts + daily runs).
+    pub defaults: RunnerDefaults,
+}
+
 /// Drain emitted events. For each verified failure this fetches the failing
 /// job's log via the internal route, redacts secrets, and writes a redacted
-/// artifact (CLAUDE-44). Triage (turning the redacted log into an enriched task)
-/// is a sibling subtask; this slice logs the fetch outcome. The fetch is
-/// best-effort: a not-ready / pruned log is a transient miss, not a fault, and
-/// never strands the consumer.
+/// artifact (CLAUDE-44); then, when a [`MintContext`] is configured, triages the
+/// failure (CLAUDE-45) and mints / declines a YouTrack issue (CLAUDE-46). The
+/// fetch is best-effort: a not-ready / pruned log is a transient miss, not a
+/// fault. A miss does not strand the consumer - it feeds triage as a bucket-3
+/// signal (the rules pass routes an unavailable log to transient).
 pub async fn consume_events(
     mut rx: mpsc::Receiver<VerifiedFailureEvent>,
     transport: Arc<dyn crate::forge_log::LogTransport>,
     out_dir: PathBuf,
+    mint: Option<MintContext>,
 ) {
     let cfg = crate::forge_log::LogFetchConfig::default();
     while let Some(ev) = rx.recv().await {
@@ -162,12 +208,12 @@ pub async fn consume_events(
         // off the async runtime. No service-injected secrets reach the CI run,
         // so `known_secrets` is empty here and pattern redaction does the work.
         let transport = transport.clone();
-        let cfg = cfg.clone();
+        let fetch_cfg = cfg.clone();
         let out_dir = out_dir.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             crate::forge_log::fetch_failing_job_log(
                 transport.as_ref(),
-                &cfg,
+                &fetch_cfg,
                 &target,
                 &out_dir,
                 &[],
@@ -176,26 +222,225 @@ pub async fn consume_events(
         })
         .await;
 
-        match outcome {
-            Ok(Ok(crate::forge_log::LogOutcome::Fetched(log))) => info!(
-                repo = %ev.repo,
-                run = ev.index_in_repo,
-                bytes = log.text.len(),
-                artifact = %log.artifact.display(),
-                "fetched and redacted failing job log"
-            ),
-            Ok(Ok(crate::forge_log::LogOutcome::TransientMiss { reason })) => warn!(
-                repo = %ev.repo,
-                run = ev.index_in_repo,
-                %reason,
-                "failing job log not available (transient miss)"
-            ),
+        // Normalise the fetch result into the triage inputs. A `TransientMiss`,
+        // a fetch error, and a panicked task all collapse to "no log" - which is
+        // itself a bucket-3 signal - so a flaky fetch never blocks the pipeline.
+        let (log_text, log_available, log_artifact) = match outcome {
+            Ok(Ok(LogOutcome::Fetched(log))) => {
+                info!(
+                    repo = %ev.repo,
+                    run = ev.index_in_repo,
+                    bytes = log.text.len(),
+                    artifact = %log.artifact.display(),
+                    "fetched and redacted failing job log"
+                );
+                (log.text, true, Some(log.artifact))
+            }
+            Ok(Ok(LogOutcome::TransientMiss { reason })) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, %reason, "failing job log not available (transient miss)");
+                (String::new(), false, None)
+            }
             Ok(Err(e)) => {
-                warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch failed")
+                warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch failed");
+                (String::new(), false, None)
             }
             Err(e) => {
-                warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch task panicked")
+                warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch task panicked");
+                (String::new(), false, None)
             }
+        };
+
+        let Some(ctx) = mint.as_ref() else {
+            // No mint configured (no usable backend): log-only, as before.
+            continue;
+        };
+        triage_and_mint(ctx, &ev, log_text, log_available, log_artifact).await;
+    }
+}
+
+/// Triage a verified failure and mint (or decline to mint) a YouTrack issue.
+/// Reads the reused DEV-335 caps from the DB, resolves the `has_open_pr` signal
+/// from the forge, runs the hybrid triage + mint on a blocking thread (every
+/// step shells out), and advances the caps ledger only when an issue was
+/// actually created. Logs the decision; never propagates an error to the loop.
+async fn triage_and_mint(
+    ctx: &MintContext,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_artifact: Option<PathBuf>,
+) {
+    // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
+    // run's (repo, index); the daily ledger is per synthetic action. The
+    // read-then-increment below is race-free because `consume_events` drains the
+    // channel serially - one event is fully processed (this `.await` completes)
+    // before the next is pulled - so no two mints read the same stale counters.
+    let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
+    let attempts = state::attempts_get(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key)
+        .await
+        .unwrap_or(0);
+    let daily = state::daily_count_get(&ctx.pool, WEBHOOK_MINT_ACTION)
+        .await
+        .unwrap_or(0);
+    let caps = MintCaps {
+        attempts,
+        max_attempts: ctx.defaults.max_attempts_per_key,
+        daily,
+        max_runs_per_day: ctx.defaults.max_runs_per_day,
+    };
+
+    let backend = ctx.backend.clone();
+    let classifier = ctx.classifier.clone();
+    let mint_cfg = ctx.mint_cfg.clone();
+    let event = ev.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let has_open_pr = resolve_has_open_pr(backend.as_ref(), &event);
+        decide_mint(
+            classifier.as_ref(),
+            backend.as_ref(),
+            &mint_cfg,
+            &caps,
+            &event,
+            log_text,
+            log_available,
+            log_artifact.as_deref(),
+            has_open_pr,
+        )
+    })
+    .await;
+
+    let outcome = match outcome {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "triage/mint failed");
+            return;
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "triage/mint task panicked");
+            return;
+        }
+    };
+
+    // Advance the caps ledger only on a real mint, so repeated failures for the
+    // same key (and a busy day) throttle exactly like the scheduled path. Skips
+    // (transient, dedupe, cap-hit, loop) create no issue and must not count.
+    if matches!(outcome, MintOutcome::Created { .. }) {
+        if let Err(e) = state::attempts_increment(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key).await {
+            warn!(error = %e, "advancing webhook attempt counter failed");
+        }
+        if let Err(e) = state::daily_count_increment(&ctx.pool, WEBHOOK_MINT_ACTION).await {
+            warn!(error = %e, "advancing webhook daily ledger failed");
+        }
+    }
+
+    log_mint_outcome(ev, &outcome);
+}
+
+/// Pure triage + mint composition over the two traits, with `has_open_pr`
+/// already resolved. Factored out so the bucket routing and dedupe are unit
+/// tested against stub a classifier / tracker with no forge, DB, or process
+/// spawn. Builds the [`TriageInput`], runs the hybrid [`triage::triage`], then
+/// [`mint::mint`] on the result.
+#[allow(clippy::too_many_arguments)]
+fn decide_mint(
+    classifier: &dyn FailureClassifier,
+    tracker: &dyn crate::provider::IssueTracker,
+    mint_cfg: &MintConfig,
+    caps: &MintCaps,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_artifact: Option<&std::path::Path>,
+    has_open_pr: bool,
+) -> crate::error::Result<MintOutcome> {
+    let input = TriageInput {
+        repo: ev.repo.clone(),
+        workflow_id: ev.workflow_id.clone(),
+        commit_sha: ev.commit_sha.clone(),
+        html_url: ev.html_url.clone(),
+        log: log_text,
+        log_available,
+        has_open_pr,
+    };
+    let verdict = triage::triage(&input, classifier);
+    let req = MintRequest {
+        repo: &ev.repo,
+        index_in_repo: ev.index_in_repo,
+        commit_sha: &ev.commit_sha,
+        workflow_id: &ev.workflow_id,
+        html_url: &ev.html_url,
+        trigger_user: &ev.trigger_user,
+        triage: &verdict,
+        log_path: log_artifact,
+    };
+    mint::mint(tracker, mint_cfg, &req, caps)
+}
+
+/// Best-effort `has_open_pr` signal for the triage classifier: list the repo's
+/// open PRs and check whether the failing commit is the head of one. A forge
+/// error or an underivable host degrades to `false` (treated as "no PR"), never
+/// an error - the signal is advisory context for bucket 1 vs 2.
+fn resolve_has_open_pr(backend: &dyn Backend, ev: &VerifiedFailureEvent) -> bool {
+    let Some(host) = forge_host_from_url(&ev.html_url) else {
+        warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge host for has_open_pr; assuming none");
+        return false;
+    };
+    match backend.list_open_prs(&host, &ev.repo) {
+        Ok(prs) => pr_matches_commit(&prs, &ev.commit_sha),
+        Err(e) => {
+            warn!(repo = %ev.repo, error = %e, "listing open PRs for has_open_pr failed; assuming none");
+            false
+        }
+    }
+}
+
+/// True when some open PR's head commit matches `commit_sha`. Tolerates short /
+/// long SHA mismatches by accepting a prefix relationship in either direction.
+fn pr_matches_commit(prs: &[ForgePullRequest], commit_sha: &str) -> bool {
+    prs.iter().any(|p| {
+        !p.head_sha.is_empty()
+            && (p.head_sha == commit_sha
+                || commit_sha.starts_with(&p.head_sha)
+                || p.head_sha.starts_with(commit_sha))
+    })
+}
+
+/// Authority (`host[:port]`) of a forge `html_url`, the bare host the `fj`
+/// forge backend addresses repos by (e.g. `dev.a8n.run`). `None` when the URL
+/// has no host segment.
+fn forge_host_from_url(url: &str) -> Option<String> {
+    let after = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = after.split('/').next().unwrap_or("");
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Structured log line for one mint decision, one branch per [`MintOutcome`].
+fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
+    match outcome {
+        MintOutcome::Created {
+            key,
+            project,
+            bucket,
+        } => {
+            info!(repo = %ev.repo, run = ev.index_in_repo, %key, %project, bucket = %bucket, "minted YouTrack issue from verified failure")
+        }
+        MintOutcome::SkippedTransient => {
+            info!(repo = %ev.repo, run = ev.index_in_repo, "transient failure; minted nothing")
+        }
+        MintOutcome::SkippedBotLoop => {
+            info!(repo = %ev.repo, run = ev.index_in_repo, trigger_user = %ev.trigger_user, "bot-loop guard; minted nothing")
+        }
+        MintOutcome::SkippedAttemptCap => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, "per-key attempt cap reached; minted nothing")
+        }
+        MintOutcome::SkippedDailyCap => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, "daily run cap reached; minted nothing")
+        }
+        MintOutcome::SkippedDuplicateOpen { existing } => {
+            info!(repo = %ev.repo, run = ev.index_in_repo, %existing, "open issue already exists; minted nothing")
+        }
+        MintOutcome::SkippedResolved { existing } => {
+            info!(repo = %ev.repo, run = ev.index_in_repo, %existing, "resolved issue exists; not reopening")
         }
     }
 }
@@ -512,5 +757,282 @@ mod tests {
         // Next window resets the budget.
         let next = t0 + window + Duration::from_secs(1);
         assert!(rl.allow(next));
+    }
+
+    // ---- CLAUDE-47: triage + mint composition -----------------------------
+
+    use crate::triage::{ClassifiedBy, Triage, TriageBucket};
+    use std::path::Path;
+    use std::sync::Mutex as StdMutex;
+
+    /// Canned [`FailureClassifier`]: returns a fixed bucket, recording that it
+    /// ran so a test can assert the deterministic rules short-circuited it.
+    struct StubClassifier {
+        bucket: TriageBucket,
+        calls: StdMutex<u32>,
+    }
+
+    impl StubClassifier {
+        fn new(bucket: TriageBucket) -> Self {
+            Self {
+                bucket,
+                calls: StdMutex::new(0),
+            }
+        }
+    }
+
+    impl FailureClassifier for StubClassifier {
+        fn classify(&self, _input: &TriageInput) -> crate::error::Result<Triage> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(Triage {
+                bucket: self.bucket,
+                analysis: "stub analysis".to_string(),
+                classified_by: ClassifiedBy::Llm,
+            })
+        }
+    }
+
+    /// Minimal [`IssueTracker`] recording the mint's mutations; dedupe searches
+    /// always miss (no existing issue).
+    struct StubTracker {
+        calls: StdMutex<Vec<String>>,
+    }
+
+    impl StubTracker {
+        fn new() -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::provider::IssueTracker for StubTracker {
+        fn list_queued(&self, query: &str) -> crate::error::Result<Vec<serde_json::Value>> {
+            self.calls.lock().unwrap().push(format!("list {query}"));
+            Ok(Vec::new())
+        }
+        fn get_field(&self, _key: &str, _field: &str) -> crate::error::Result<String> {
+            unreachable!()
+        }
+        fn set_field(&self, key: &str, field: &str, value: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_field {key} {field} {value}"));
+            Ok(())
+        }
+        fn set_state(&self, key: &str, state: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_state {key} {state}"));
+            Ok(())
+        }
+        fn comment(&self, _key: &str, _body: &str) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        fn resolve_vcs(
+            &self,
+            _project_key: &str,
+        ) -> crate::error::Result<crate::provider::VcsRepo> {
+            unreachable!()
+        }
+        fn create_issue(
+            &self,
+            project: &str,
+            _summary: &str,
+            _description: &str,
+            assignee: Option<&str>,
+        ) -> crate::error::Result<String> {
+            self.calls.lock().unwrap().push(format!(
+                "create {project} assignee={}",
+                assignee.unwrap_or("-")
+            ));
+            Ok("CLAUDE-99".to_string())
+        }
+        fn attach_file(&self, _key: &str, _file: &Path) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn event() -> VerifiedFailureEvent {
+        VerifiedFailureEvent {
+            repo: "fabrikam/forgejo-cli".to_string(),
+            index_in_repo: 7,
+            commit_sha: "abc123def456".to_string(),
+            workflow_id: "ci.yml".to_string(),
+            trigger_user: "alice".to_string(),
+            html_url: "https://dev.a8n.run/fabrikam/forgejo-cli/actions/runs/7".to_string(),
+        }
+    }
+
+    fn mint_cfg() -> MintConfig {
+        MintConfig {
+            repo_project_map: [("fabrikam/forgejo-cli".to_string(), "FJ".to_string())]
+                .into_iter()
+                .collect(),
+            human_assignee: Some("bob".to_string()),
+            ..MintConfig::default()
+        }
+    }
+
+    fn caps() -> MintCaps {
+        MintCaps {
+            attempts: 0,
+            max_attempts: 3,
+            daily: 0,
+            max_runs_per_day: 20,
+        }
+    }
+
+    #[test]
+    fn unavailable_log_short_circuits_to_transient_without_the_classifier() {
+        // log_available = false -> the deterministic rules route to bucket 3, so
+        // the LLM classifier must never run and nothing is minted.
+        let classifier = StubClassifier::new(TriageBucket::CodeFix);
+        let tracker = StubTracker::new();
+        let out = decide_mint(
+            &classifier,
+            &tracker,
+            &mint_cfg(),
+            &caps(),
+            &event(),
+            String::new(),
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(out, MintOutcome::SkippedTransient);
+        assert_eq!(*classifier.calls.lock().unwrap(), 0, "rules short-circuit");
+        assert!(tracker.calls().is_empty());
+    }
+
+    #[test]
+    fn transient_signature_in_log_mints_nothing() {
+        // A clear infra signature is bucket 3 by the rules pass, even with a log.
+        let classifier = StubClassifier::new(TriageBucket::CodeFix);
+        let tracker = StubTracker::new();
+        let out = decide_mint(
+            &classifier,
+            &tracker,
+            &mint_cfg(),
+            &caps(),
+            &event(),
+            "error: no runner available for this job".to_string(),
+            true,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(out, MintOutcome::SkippedTransient);
+        assert_eq!(*classifier.calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn code_fix_classification_mints_and_queues() {
+        // A non-transient log + a code_fix verdict -> issue in the mapped project,
+        // queued for the fix bot, no human assignee.
+        let classifier = StubClassifier::new(TriageBucket::CodeFix);
+        let tracker = StubTracker::new();
+        let out = decide_mint(
+            &classifier,
+            &tracker,
+            &mint_cfg(),
+            &caps(),
+            &event(),
+            "assertion failed: expected 1 got 2".to_string(),
+            true,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            MintOutcome::Created {
+                key: "CLAUDE-99".to_string(),
+                project: "FJ".to_string(),
+                bucket: TriageBucket::CodeFix,
+            }
+        );
+        assert_eq!(*classifier.calls.lock().unwrap(), 1, "classifier ran once");
+        let calls = tracker.calls();
+        assert!(
+            calls.iter().any(|c| c == "create FJ assignee=-"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn human_action_classification_assigns_a_human() {
+        let classifier = StubClassifier::new(TriageBucket::HumanAction);
+        let tracker = StubTracker::new();
+        let out = decide_mint(
+            &classifier,
+            &tracker,
+            &mint_cfg(),
+            &caps(),
+            &event(),
+            "the release tag push to main failed".to_string(),
+            true,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            out,
+            MintOutcome::Created {
+                bucket: TriageBucket::HumanAction,
+                ..
+            }
+        ));
+        let calls = tracker.calls();
+        assert!(
+            calls.iter().any(|c| c == "create FJ assignee=bob"),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("AI Agent")), "{calls:?}");
+    }
+
+    #[test]
+    fn pr_matches_commit_handles_exact_and_prefix() {
+        let pr = |sha: &str| ForgePullRequest {
+            number: 1,
+            title: String::new(),
+            head_sha: sha.to_string(),
+            head_ref: String::new(),
+            author: String::new(),
+            html_url: String::new(),
+            updated_at: String::new(),
+        };
+        assert!(pr_matches_commit(&[pr("abc123")], "abc123"));
+        // Full failing SHA, short PR head SHA -> prefix match still counts.
+        assert!(pr_matches_commit(&[pr("abc123")], "abc123def456"));
+        assert!(!pr_matches_commit(&[pr("def999")], "abc123def456"));
+        // An empty head_sha never matches.
+        assert!(!pr_matches_commit(&[pr("")], "abc123"));
+        assert!(!pr_matches_commit(&[], "abc123"));
+    }
+
+    #[test]
+    fn forge_host_from_url_extracts_authority() {
+        assert_eq!(
+            forge_host_from_url("https://dev.a8n.run/owner/repo/actions/runs/7").as_deref(),
+            Some("dev.a8n.run")
+        );
+        assert_eq!(
+            forge_host_from_url("http://localhost:3000/o/r").as_deref(),
+            Some("localhost:3000")
+        );
+        assert_eq!(forge_host_from_url("").as_deref(), None);
     }
 }

@@ -75,7 +75,11 @@ impl Daemon {
         info!(socket = %sock_path.display(), "daemon listening");
 
         let snippet = SnippetRunner::new(self.on_disk.daemon.nu_binary.as_deref());
-        let claude = ClaudeInvoker::new(self.on_disk.daemon.claude_binary.as_deref());
+        // `Arc` so the same invoker backs both the dispatcher and the webhook
+        // fast-path triage classifier (CLAUDE-47).
+        let claude = Arc::new(ClaudeInvoker::new(
+            self.on_disk.daemon.claude_binary.as_deref(),
+        ));
 
         // CLAUDE-9: one registry shared between the dispatcher (which registers
         // a token per run) and the API state (whose /runs/:id/cancel handler
@@ -106,8 +110,9 @@ impl Daemon {
         let web_router = crate::web::router(api_state.clone(), self.paths.clone());
 
         // CLAUDE-43: Forgejo webhook listener. Verified `action_run_failure`
-        // events are emitted onto a channel drained by `consume_events`; this
-        // slice only logs them (log fetch / triage is a sibling subtask).
+        // events are emitted onto a channel drained by `consume_events`, which
+        // (CLAUDE-44/45/46/47) fetches the log, triages it, and mints/declines a
+        // YouTrack issue.
         let (webhook_tx, webhook_rx) =
             mpsc::channel::<crate::web::webhooks::VerifiedFailureEvent>(64);
         let webhook_state = crate::web::webhooks::WebhookState::new(
@@ -164,21 +169,25 @@ impl Daemon {
         // CLAUDE-43: drain verified webhook failure events for the lifetime of
         // the daemon. CLAUDE-44: each event triggers an internal-route log fetch
         // with retry + secret redaction; the redacted artifacts land under
-        // `state_dir/webhook-logs/`.
+        // `state_dir/webhook-logs/`. CLAUDE-47: each event is then triaged
+        // (CLAUDE-45) and minted / declined (CLAUDE-46) when a provider backend
+        // is usable.
         let webhook_log_dir = self.paths.state_dir.join("webhook-logs");
         let webhook_transport: Arc<dyn crate::forge_log::LogTransport> =
             Arc::new(crate::forge_log::HttpLogTransport::new());
+        let mint_ctx = build_mint_context(&pool, &self.on_disk.mint, &claude, &webhook_log_dir);
         let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(
             webhook_rx,
             webhook_transport,
             webhook_log_dir,
+            mint_ctx,
         ));
 
         let dispatch = Arc::new(Dispatcher {
             paths: self.paths.clone(),
             pool: pool.clone(),
             snippet: Arc::new(snippet),
-            claude: Arc::new(claude),
+            claude: claude.clone(),
             in_flight,
             // CLAUDE-28: one daemon-wide key gate, shared across every dispatch,
             // so two executions sharing a concurrency key never overlap even
@@ -259,6 +268,62 @@ impl Daemon {
         let _ = std::fs::remove_file(&sock_path);
         Ok(())
     }
+}
+
+/// Build the webhook fast-path [`crate::web::webhooks::MintContext`] (CLAUDE-47):
+/// resolve a provider backend (CLI-first), wrap the shared `claude` invoker in a
+/// triage [`crate::triage::ClaudeClassifier`], and bundle the on-disk mint
+/// config + caps. Returns `None` (mint disabled, the consumer runs log-only)
+/// when no `yt`/`fj` backend is usable or the triage workdir cannot be created,
+/// so a daemon on a host without the forge CLIs still ingests and logs failures.
+fn build_mint_context(
+    pool: &SqlitePool,
+    mint_cfg: &crate::config::MintConfig,
+    claude: &Arc<ClaudeInvoker>,
+    webhook_log_dir: &Path,
+) -> Option<crate::web::webhooks::MintContext> {
+    use crate::action::ClaudeBlock;
+    use crate::triage::{ClaudeClassifier, FailureClassifier};
+
+    let backend: Arc<dyn crate::provider::Backend> = match crate::provider::resolve(
+        crate::provider::DEFAULT_PRIORITY,
+    ) {
+        Ok(b) => Arc::from(b),
+        Err(e) => {
+            warn!(error = %e, "no usable provider backend; webhook fast-path runs log-only (no mint)");
+            return None;
+        }
+    };
+
+    // Classification is a single bounded-log JSON reply: no repo checkout, no
+    // edit tools. Run claude read-only in a stable cwd under the webhook log dir.
+    let cwd = webhook_log_dir.join("triage");
+    if let Err(e) = std::fs::create_dir_all(&cwd) {
+        warn!(error = %e, "creating triage workdir failed; webhook fast-path runs log-only (no mint)");
+        return None;
+    }
+    let claude_cfg = ClaudeBlock {
+        cwd: None,
+        allowed_tools: Some(String::new()),
+        permission_mode: Some("default".to_string()),
+    };
+    let stream_log = cwd.join("triage-stream.jsonl");
+    let classifier: Arc<dyn FailureClassifier> = Arc::new(ClaudeClassifier::new(
+        claude.clone(),
+        claude_cfg,
+        std::time::Duration::from_secs(crate::web::webhooks::TRIAGE_TIMEOUT_SECS),
+        cwd,
+        stream_log,
+    ));
+
+    info!(backend = backend.name(), "webhook fast-path mint enabled");
+    Some(crate::web::webhooks::MintContext {
+        pool: pool.clone(),
+        classifier,
+        backend,
+        mint_cfg: mint_cfg.clone(),
+        defaults: RunnerDefaults::default(),
+    })
 }
 
 fn pidfile_lock(pidfile: &Path) -> Result<std::fs::File> {

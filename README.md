@@ -86,6 +86,39 @@ require_auth_on_loopback = false
 
 Callers send `Authorization: Bearer <token>`. The token value lives encrypted in the secrets store (resolved once at daemon startup); only its name appears in `config.toml`. If `web.bind` is non-loopback but `auth_token_ref` is unset or its secret cannot be decrypted, the daemon fails closed and does not bring up the TCP listener at all, rather than serve an unauthenticated surface. Run the daemon behind TLS-terminating reverse proxy when exposed; the token is bearer credentials and must not cross the network in plaintext. The future `/webhooks/` route keeps its own HMAC verification and is exempt from the token gate.
 
+## Webhook fast-path
+
+The daemon turns a Forgejo `action_run_failure` delivery into a triaged YouTrack issue in seconds, instead of waiting for the next scheduled poll. The pipeline is `POST /webhooks/forgejo` (HMAC-verified, replay-protected, rate-limited) -> internal-route log fetch + redaction -> hybrid triage -> issue mint, all inside the running daemon. The scheduled `youtrack` / `forgejo-ci-fix` actions remain the backstop and dedupe against webhook-minted issues through the same hidden markers, so a poll that races the webhook never files a second issue.
+
+Triage sorts each verified failure into one of three buckets: a failing PR check that a code change fixes (`code_fix`) mints an issue and sets `AI Agent = Queued` so `forgejo-ci-fix` opens the fix PR; a failure no PR fixes (`human_action`, e.g. a main-branch / tag / release / missing-secret failure) mints a human-assigned issue with no PR; a transient / infra / flaky failure (`transient`) mints nothing. A failing run triggered by the fix bot's own login mints nothing (loop safety), and the reused per-key + daily caps throttle a storm of failures.
+
+```toml
+# config.toml
+
+[webhook]
+# Name of the stored secret (see CLAUDE-26 secrets) holding the Forgejo HMAC key.
+secret_ref = "forgejo-webhook-secret"
+# Pilot allow-list. Only failures from these repos are acted on; every other
+# authenticated delivery is acked and dropped. Pilot is forgejo-cli only;
+# expanding the list is gated on a separate decision.
+allowed_repos = ["pandoras-box/forgejo-cli"]
+replay_window_secs = 300
+rate_limit_per_min = 60
+
+[mint]
+# Route the pilot repo's issues to its own YouTrack project; CLAUDE is the
+# fallback for any repo not listed.
+fallback_project = "CLAUDE"
+# bot_logins defaults to ["claude-run"] (the fix bot's login); add others here.
+
+[mint.repo_project_map]
+"pandoras-box/forgejo-cli" = "FJ"
+```
+
+The mint needs the `yt` (and, for the `has_open_pr` triage signal and the fix PR, `fj`) CLIs on the daemon host. With no usable backend the consumer still ingests and logs failures but mints nothing.
+
+Register the webhook on the pilot repo with **only** the Action Run Failure event (Forgejo: repo Settings -> Webhooks -> Add Webhook -> Forgejo), pointing at the daemon's `/webhooks/forgejo` URL, with the same HMAC secret stored under `secret_ref`. Selecting only the Failure event keeps `success` / `recover` deliveries off the wire entirely; any that do arrive are acked and dropped.
+
 ## Development
 
 ```nu
