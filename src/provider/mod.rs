@@ -106,6 +106,22 @@ pub trait IssueTracker: Send + Sync {
     /// Resolve a project's enabled VCS integration to a clonable repo. Errors
     /// [`Error::NoVcsIntegration`] when the project has none.
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo>;
+
+    /// Create a new issue in `project` (short name, e.g. `CLAUDE`) with `summary`
+    /// and a Markdown `description`, optionally pre-assigning `assignee` (a login).
+    /// Returns the new issue's `idReadable` (e.g. `CLAUDE-47`). Backs the
+    /// triage-driven issue mint (CLAUDE-46).
+    fn create_issue(
+        &self,
+        project: &str,
+        summary: &str,
+        description: &str,
+        assignee: Option<&str>,
+    ) -> Result<String>;
+
+    /// Upload `file` as an attachment on issue `key`. Backs attaching the
+    /// redacted failing-job log to a minted issue (CLAUDE-46).
+    fn attach_file(&self, key: &str, file: &std::path::Path) -> Result<()>;
 }
 
 /// The Forgejo-side operations native handlers need.

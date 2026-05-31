@@ -12,6 +12,7 @@
 //! `~`, `$VAR`, and `${VAR}` are expanded in all values (the env override and
 //! the `workdir_base` field on actions both go through `expand_path`).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,9 @@ pub struct OnDiskConfig {
     /// CLAUDE-43: Forgejo webhook listener settings (HMAC secret reference,
     /// repo allow-list, replay window, rate limit).
     pub webhook: WebhookConfig,
+    /// CLAUDE-46: triage-driven issue-mint settings (repo-to-project map,
+    /// fallback project, loop-safety bot logins, bucket-2 assignee).
+    pub mint: MintConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -150,6 +154,50 @@ impl Default for WebhookConfig {
             allowed_repos: Vec::new(),
             replay_window_secs: 300,
             rate_limit_per_min: 60,
+        }
+    }
+}
+
+/// CLAUDE-46: settings for minting (or updating) a YouTrack issue from a triaged
+/// failure. Lives in `config.toml` because the daemon's webhook consumer needs it
+/// at startup. The repo-to-project routing decision (2026-05-31) sends an issue to
+/// the repo's own YouTrack project, with `fallback_project` (CLAUDE) for any repo
+/// not in `repo_project_map`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MintConfig {
+    /// Map of `owner/repo` full name to the YouTrack project short name the
+    /// minted issue should land in, e.g. `fabrikam/forgejo-cli` -> `FJ`.
+    /// A repo absent from this map falls back to [`MintConfig::fallback_project`].
+    pub repo_project_map: BTreeMap<String, String>,
+    /// Project short name used for any repo not in `repo_project_map`.
+    pub fallback_project: String,
+    /// Loop-safety allow-list of trigger-user logins whose failing runs never
+    /// mint a task. The CI-fix bot pushes fixes as itself, so a failing fix-PR
+    /// run is triggered by one of these logins; minting from it would recurse.
+    pub bot_logins: Vec<String>,
+    /// Bucket-2 (human-action) assignee login. `None` leaves the minted issue
+    /// unassigned: the project is watched, so a human is still notified.
+    pub human_assignee: Option<String>,
+    /// `State` value set on a freshly minted issue. Default `To do`.
+    pub target_state: String,
+    /// `AI Agent` custom-field name driven on the minted issue.
+    pub ai_agent_field: String,
+    /// `AI Agent` value set on a bucket-1 (code-fix) issue so the existing
+    /// forgejo-ci-fix pickup logic (CLAUDE-29) opens the fix PR. Default `Queued`.
+    pub queued_value: String,
+}
+
+impl Default for MintConfig {
+    fn default() -> Self {
+        Self {
+            repo_project_map: BTreeMap::new(),
+            fallback_project: "CLAUDE".to_string(),
+            bot_logins: vec!["claude-run".to_string()],
+            human_assignee: None,
+            target_state: "To do".to_string(),
+            ai_agent_field: "AI Agent".to_string(),
+            queued_value: "Queued".to_string(),
         }
     }
 }
