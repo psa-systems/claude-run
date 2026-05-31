@@ -104,8 +104,22 @@ impl Daemon {
         // as the unix-socket flavor, just nested + sibling-mounted.
         let api_for_tcp = api::router((*api_state).clone());
         let web_router = crate::web::router(api_state.clone(), self.paths.clone());
+
+        // CLAUDE-43: Forgejo webhook listener. Verified `action_run_failure`
+        // events are emitted onto a channel drained by `consume_events`; this
+        // slice only logs them (log fetch / triage is a sibling subtask).
+        let (webhook_tx, webhook_rx) =
+            mpsc::channel::<crate::web::webhooks::VerifiedFailureEvent>(64);
+        let webhook_state = crate::web::webhooks::WebhookState::new(
+            pool.clone(),
+            self.on_disk.webhook.clone(),
+            webhook_tx,
+        );
+        let webhook_router = crate::web::webhooks::router(webhook_state);
+
         let tcp_app = axum::Router::new()
             .merge(web_router)
+            .merge(webhook_router)
             .nest("/api", api_for_tcp);
 
         // CLAUDE-48 (Phase 5): gate the TCP surface (web UI + /api/*) behind a
@@ -146,6 +160,10 @@ impl Daemon {
         } else {
             None
         };
+
+        // CLAUDE-43: drain verified webhook failure events for the lifetime of
+        // the daemon.
+        let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(webhook_rx));
 
         let dispatch = Arc::new(Dispatcher {
             paths: self.paths.clone(),
@@ -227,6 +245,7 @@ impl Daemon {
         if let Some(t) = server_tcp {
             t.abort();
         }
+        webhook_consumer.abort();
         // pidfile lock released on drop
         let _ = std::fs::remove_file(&sock_path);
         Ok(())

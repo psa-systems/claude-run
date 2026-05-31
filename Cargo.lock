@@ -506,6 +506,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "hex",
+ "hmac",
  "http-body-util",
  "humantime",
  "hyper",

@@ -35,6 +35,8 @@ use crate::claude::ClaudeInvoker;
 use crate::config::Paths;
 use crate::state;
 
+pub mod webhooks;
+
 const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
 
 #[derive(Clone)]
