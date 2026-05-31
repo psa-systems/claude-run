@@ -45,9 +45,14 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/actions/new", get(action_new_page))
-        .route("/actions/new/youtrack", get(youtrack_new_page))
+        // GET renders the structured new-action form; POST creates it. Kept under
+        // `/actions/new/` so it never shadows the `/actions/:name` detail route
+        // (a bare `/actions/youtrack` would mask the action named `youtrack`).
+        .route(
+            "/actions/new/youtrack",
+            get(youtrack_new_page).post(youtrack_create),
+        )
         .route("/actions", post(action_create))
-        .route("/actions/youtrack", post(youtrack_create))
         .route("/actions/:name", get(action_detail))
         .route("/actions/:name/durations", get(action_durations))
         .route(
@@ -1080,7 +1085,7 @@ async fn render_youtrack_editor(
         ),
         None => (
             "New YouTrack action".to_string(),
-            "/actions/youtrack".to_string(),
+            "/actions/new/youtrack".to_string(),
             "/actions/new".to_string(),
         ),
     };
@@ -2186,7 +2191,9 @@ mod tests {
             assert!(body.contains("New YouTrack action"));
             assert!(body.contains("AI Agent state labels"));
             assert!(body.contains("Code Review"));
-            assert!(body.contains("/actions/youtrack"));
+            // The form posts to the create route, which lives under /actions/new/
+            // so it never shadows the /actions/:name detail route.
+            assert!(body.contains("/actions/new/youtrack"));
         }
 
         #[tokio::test]
@@ -2239,6 +2246,35 @@ mod tests {
                 resp.headers().get("location").unwrap(),
                 "/actions/scripted/edit"
             );
+        }
+
+        #[tokio::test]
+        async fn detail_route_not_shadowed_by_youtrack_create() {
+            use tower::ServiceExt;
+            // An action named exactly `youtrack` must still resolve at
+            // GET /actions/youtrack. The structured-create route lives under
+            // /actions/new/youtrack so it does not shadow /actions/:name; a
+            // bare POST /actions/youtrack would make this GET return 405.
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("youtrack.yml");
+            std::fs::write(&file, "name: youtrack\nkind: youtrack\nnative: {}\n").unwrap();
+            index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
+
+            let app = super::super::router(s.api.clone(), s.paths.clone());
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/actions/youtrack")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
         }
     }
 
