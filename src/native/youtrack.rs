@@ -41,7 +41,7 @@ use crate::concurrency::Executor;
 use crate::config::Paths;
 use crate::error::{Error, Result};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
-use crate::provider::{self, Backend, CliBackend, CommandRunner, PullRequest};
+use crate::provider::{self, Backend, CliBackend, CommandRunner, Forge, PullRequest};
 use crate::secrets::{self, JobCredentials};
 use crate::state;
 use crate::workdir;
@@ -86,8 +86,8 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
 
     // Typed config (CLAUDE-33). Validation guarantees a matching `native` block
     // for `kind: youtrack`, so anything else is a misrouted action.
-    let (src, forge) = match &action.native {
-        Some(NativeConfig::Youtrack(cfg)) => (&cfg.youtrack, &cfg.forgejo),
+    let (src, forge, gh) = match &action.native {
+        Some(NativeConfig::Youtrack(cfg)) => (&cfg.youtrack, &cfg.forgejo, &cfg.github),
         _ => {
             return Err(Error::NativeUnimplemented {
                 kind: action.kind.as_str().to_string(),
@@ -118,7 +118,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     // CLAUDE-26: resolve any `token_ref` to a decrypted credential once per run.
     // An all-None set (the shipped, host-auth config) materializes nothing and
     // every backend below falls back to host `yt` / `fj` auth.
-    let creds = Arc::new(secrets::resolve_youtrack_credentials(pool, src, forge).await?);
+    let creds = Arc::new(secrets::resolve_youtrack_credentials(pool, src, forge, gh).await?);
     let cred_base = ctx.paths.runtime_dir.join("credentials").join(&action.name);
 
     // gather (before run_begin: a gather failure is a no-op run, same as the
@@ -165,6 +165,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     let paths_owned = ctx.paths.clone();
     let pool_owned = pool.clone();
     let src_owned = src.clone();
+    let gh_owned = gh.clone();
 
     let mut items: Vec<(String, crate::concurrency::JobFuture)> = Vec::with_capacity(jobs.len());
     for job in jobs.into_iter() {
@@ -177,6 +178,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         let creds = creds.clone();
         let cred_base = cred_base.clone();
         let src = src_owned.clone();
+        let gh = gh_owned.clone();
         let job_cancel = cancel.clone();
         let fut: crate::concurrency::JobFuture = Box::pin(async move {
             let action = &loaded.action;
@@ -209,12 +211,33 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
             if let Err(e) = state::run_inflight_add(&pool, run_id, &job.key).await {
                 warn!(error = %e, "run_inflight_add failed (non-fatal)");
             }
+            // CLAUDE-50: pick the Forge by the job's resolved host. A GitHub host
+            // (github.com plus any configured GHE host) routes to the GitHub
+            // backend; every other host reuses the credentialed `fj` backend
+            // unchanged. The GitHub PAT (when an action set `github.token_ref`)
+            // comes from this job's materialized credentials.
+            let host = host_only(&job.repo_host);
+            let gh_forge = if provider::is_github_host(&host, &gh.hosts) {
+                let token = _job_creds.as_ref().and_then(|c| c.github_token.clone());
+                Some(provider::GithubForge::new(
+                    runner.clone(),
+                    gh.mcp_endpoint.clone(),
+                    token,
+                ))
+            } else {
+                None
+            };
+            let forge: &dyn Forge = match &gh_forge {
+                Some(f) => f,
+                None => &job_backend,
+            };
             let outcome = process_job(
                 loaded.as_ref(),
                 &paths,
                 &pool,
                 claude.as_ref(),
                 &job_backend,
+                forge,
                 &src,
                 &limits,
                 &job_cancel,
@@ -379,6 +402,7 @@ async fn process_job(
     pool: &SqlitePool,
     claude: &ClaudeInvoker,
     backend: &dyn Backend,
+    forge: &dyn Forge,
     src: &YoutrackSource,
     limits: &EffectiveLimits,
     cancel: &CancellationToken,
@@ -488,7 +512,7 @@ async fn process_job(
     }
 
     // ---- finalize (the native "post"): every external mutation lives here ----
-    let finalize_res = finalize(backend, src, job, &workdir_path, &claude_result);
+    let finalize_res = finalize(backend, forge, src, job, &workdir_path, &claude_result);
     let post_failed = match &finalize_res {
         Ok(Finalized::CodeReview { pr_url }) => {
             info!(action = %action.name, key = %key, pr_url = %pr_url, "finalized: Code Review");
@@ -651,6 +675,7 @@ impl Finalized {
 /// set to Done; it stays In Progress until a human merges the PR.
 fn finalize(
     backend: &dyn Backend,
+    forge: &dyn Forge,
     src: &YoutrackSource,
     job: &YoutrackJob,
     workdir: &Path,
@@ -669,11 +694,13 @@ fn finalize(
         comment_then_field(backend, src, &job.key, &reason, &src.states.needs_review)?;
         Ok(Finalized::NeedsReview)
     } else if claude_result.ok {
-        // Success: open the PR from the agent's local commits via agit+autofill,
-        // then report it. fj derives the title/body from the commit messages,
-        // which already carry the bare #<KEY>-N reference.
+        // Success: open the PR from the agent's local commits via the resolved
+        // Forge (CLAUDE-50: `fj` agit+autofill for Forgejo hosts, the GitHub
+        // backend for GitHub hosts), then report it. Both derive the title/body
+        // from the commit messages, which already carry the bare #<KEY>-N
+        // reference.
         let host = host_only(&job.repo_host);
-        match backend.create_pr(workdir, &host) {
+        match forge.create_pr(workdir, &host) {
             Ok(pr) => {
                 let url = pr_url(job, &pr);
                 let body = success_comment(claude_result, &url);
@@ -723,9 +750,14 @@ fn host_only(repo_host: &str) -> String {
         .to_string()
 }
 
-/// PR URL for the issue comment: prefer the parsed PR number rendered against
-/// the repo's pulls path, falling back to the raw `fj` output line.
+/// PR URL for the issue comment. When the forge returned a real HTTP URL (the
+/// GitHub backend reports the PR `html_url`), use it verbatim. Otherwise (the
+/// `fj` backend reports a `Created pull request #<n>` line, not a URL) render the
+/// parsed number against the Forgejo `pulls` path, falling back to the raw line.
 fn pr_url(job: &YoutrackJob, pr: &PullRequest) -> String {
+    if pr.url.starts_with("https://") || pr.url.starts_with("http://") {
+        return pr.url.clone();
+    }
     match pr.number {
         Some(n) => format!("{}/{}/pulls/{}", job.repo_host, job.repo_path, n),
         None => pr.url.clone(),
@@ -888,6 +920,13 @@ mod tests {
             url: "fallback line".into(),
         };
         assert_eq!(pr_url(&j, &no_num), "fallback line");
+        // CLAUDE-50: a real HTTP URL (the GitHub backend's html_url) is used
+        // verbatim rather than rebuilt against the Forgejo `pulls` path.
+        let gh = PullRequest {
+            number: Some(11),
+            url: "https://github.com/octo/widget/pull/11".into(),
+        };
+        assert_eq!(pr_url(&j, &gh), "https://github.com/octo/widget/pull/11");
     }
 
     #[test]
@@ -935,6 +974,7 @@ mod tests {
         let backend = CliBackend::new(runner.clone());
         let res = finalize(
             &backend,
+            &backend,
             &src(),
             &job(),
             wd,
@@ -972,7 +1012,7 @@ mod tests {
                 ),
         );
         let backend = CliBackend::new(runner.clone());
-        let res = finalize(&backend, &src(), &job(), dir.path(), &ok_result()).unwrap();
+        let res = finalize(&backend, &backend, &src(), &job(), dir.path(), &ok_result()).unwrap();
         assert_eq!(
             res,
             Finalized::CodeReview {
@@ -992,6 +1032,95 @@ mod tests {
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Code Review"),
             "{calls:?}"
         );
+    }
+
+    #[test]
+    fn finalize_github_job_opens_pr_via_forge_and_sets_code_review() {
+        // CLAUDE-50: a GitHub job finalizes through the GitHub `Forge`. The PR's
+        // real html_url is linked exactly as the Forgejo path links its PR, and
+        // AI Agent transitions to Code Review.
+        use crate::provider::{GithubForge, McpTransport};
+        use std::sync::Mutex;
+
+        struct OkTransport(Mutex<Vec<String>>);
+        impl McpTransport for OkTransport {
+            fn initialize(&self, _e: &str, _t: Option<&str>) -> Result<()> {
+                self.0.lock().unwrap().push("initialize".into());
+                Ok(())
+            }
+            fn call_tool(
+                &self,
+                _e: &str,
+                _t: Option<&str>,
+                name: &str,
+                _a: Value,
+            ) -> Result<Value> {
+                self.0.lock().unwrap().push(format!("call:{name}"));
+                Ok(serde_json::json!({
+                    "structuredContent": {
+                        "number": 11,
+                        "html_url": "https://github.com/octo/widget/pull/11"
+                    }
+                }))
+            }
+        }
+
+        let gh_job = YoutrackJob {
+            key: "GH-1".into(),
+            summary: "do x".into(),
+            repo_host: "https://github.com".into(),
+            repo_path: "octo/widget".into(),
+            clone_url: "https://github.com/octo/widget.git".into(),
+        };
+        // Tracker runner: only the authoritative set-field is registered; the
+        // best-effort comment falls through (no canned response) and is ignored.
+        let tracker_runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["issue", "set-field", "GH-1", "AI Agent", "Code Review"],
+            "",
+        ));
+        let tracker = CliBackend::new(tracker_runner.clone());
+        // Forge runner: the git interrogation + push the GitHub backend issues.
+        let forge_runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://github.com/octo/widget.git\n",
+                )
+                .ok("git", &["rev-parse", "--abbrev-ref", "HEAD"], "feat/gh")
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main\n",
+                )
+                .ok("git", &["log", "-1", "--pretty=format:%s"], "feat: x")
+                .ok("git", &["log", "-1", "--pretty=format:%b"], "")
+                .ok("git", &["push", "origin", "HEAD:feat/gh"], ""),
+        );
+        let forge = GithubForge::with_transport(
+            forge_runner,
+            Arc::new(OkTransport(Mutex::new(Vec::new()))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let res = finalize(&tracker, &forge, &src(), &gh_job, dir.path(), &ok_result()).unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://github.com/octo/widget/pull/11".into()
+            }
+        );
+        let calls = tracker_runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field GH-1 AI Agent Code Review"),
+            "{calls:?}"
+        );
+        // No `fj` was invoked for a GitHub job.
+        assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 
     #[test]
@@ -1027,7 +1156,7 @@ mod tests {
                 ),
         );
         let backend = CliBackend::new(runner.clone());
-        let res = finalize(&backend, &s, &job(), dir.path(), &ok_result()).unwrap();
+        let res = finalize(&backend, &backend, &s, &job(), dir.path(), &ok_result()).unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
         let calls = runner.calls.lock().unwrap();
         assert!(
@@ -1056,7 +1185,7 @@ mod tests {
                 ),
         );
         let backend = CliBackend::new(runner.clone());
-        let res = finalize(&backend, &src(), &job(), dir.path(), &ok_result()).unwrap();
+        let res = finalize(&backend, &backend, &src(), &job(), dir.path(), &ok_result()).unwrap();
         assert_eq!(res, Finalized::Failed);
         let calls = runner.calls.lock().unwrap();
         assert!(
@@ -1078,7 +1207,7 @@ mod tests {
         let backend = CliBackend::new(runner.clone());
         // FJMCP-6 case: claude errored on the job.
         let claude = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "error tail");
-        let res = finalize(&backend, &src(), &job(), dir.path(), &claude).unwrap();
+        let res = finalize(&backend, &backend, &src(), &job(), dir.path(), &claude).unwrap();
         assert_eq!(res, Finalized::Failed);
         let calls = runner.calls.lock().unwrap();
         assert!(

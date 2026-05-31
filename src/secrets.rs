@@ -20,7 +20,7 @@ use std::str::FromStr;
 
 use sqlx::SqlitePool;
 
-use crate::action::{ForgejoTarget, YoutrackSource};
+use crate::action::{ForgejoTarget, GithubTarget, YoutrackSource};
 use crate::error::{Error, Result};
 use crate::state;
 
@@ -122,12 +122,16 @@ pub struct ResolvedCredentials {
     /// Decrypted forge token, when `forgejo.token_ref` is set. The forge host is
     /// supplied per job (it comes from the issue's resolved VCS integration).
     pub fj_token: Option<String>,
+    /// Decrypted GitHub PAT, when `github.token_ref` is set (CLAUDE-50). Used as
+    /// the bearer for the MCP call, the `gh` child's `GH_TOKEN`, and the
+    /// authenticated push. `None` falls back to host `gh` auth / `GH_TOKEN`.
+    pub github_token: Option<String>,
 }
 
 impl ResolvedCredentials {
-    /// True when neither block referenced a secret (host-auth path).
+    /// True when no block referenced a secret (host-auth path).
     pub fn is_empty(&self) -> bool {
-        self.yt.is_none() && self.fj_token.is_none()
+        self.yt.is_none() && self.fj_token.is_none() && self.github_token.is_none()
     }
 }
 
@@ -138,8 +142,9 @@ pub async fn resolve_youtrack_credentials(
     pool: &SqlitePool,
     youtrack: &YoutrackSource,
     forgejo: &ForgejoTarget,
+    github: &GithubTarget,
 ) -> Result<ResolvedCredentials> {
-    if youtrack.token_ref.is_none() && forgejo.token_ref.is_none() {
+    if youtrack.token_ref.is_none() && forgejo.token_ref.is_none() && github.token_ref.is_none() {
         return Ok(ResolvedCredentials::default());
     }
     let key = SecretsKey::load()?;
@@ -155,6 +160,9 @@ pub async fn resolve_youtrack_credentials(
     }
     if let Some(name) = &forgejo.token_ref {
         out.fj_token = Some(resolve_secret(pool, &key, name).await?);
+    }
+    if let Some(name) = &github.token_ref {
+        out.github_token = Some(resolve_secret(pool, &key, name).await?);
     }
     Ok(out)
 }
@@ -172,6 +180,11 @@ pub struct JobCredentials {
     /// Temp `keys.json` path, so `Forge::clone_url` reads the same store the
     /// `fj` child does.
     pub fj_keys_path: Option<PathBuf>,
+    /// Decrypted GitHub PAT (CLAUDE-50), passed to the GitHub `Forge` for the MCP
+    /// bearer, the `gh` child's `GH_TOKEN`, and the authenticated push. Not
+    /// written to a file (an env var leaves no on-disk plaintext to scrub); it is
+    /// dropped with this guard when the job ends. `None` leaves host `gh` auth.
+    pub github_token: Option<String>,
 }
 
 impl JobCredentials {
@@ -232,6 +245,7 @@ impl JobCredentials {
             yt_env,
             fj_env,
             fj_keys_path,
+            github_token: creds.github_token.clone(),
         })
     }
 }
@@ -306,6 +320,7 @@ mod tests {
         let creds = ResolvedCredentials {
             yt: Some(("https://yt.example".into(), "perm:yt".into())),
             fj_token: Some("fj-token".into()),
+            github_token: None,
         };
         let job_dir = tmp.path().join("creds").join("MK-16");
         let cfg_path;
@@ -355,6 +370,7 @@ mod tests {
         let creds = ResolvedCredentials {
             yt: Some(("https://yt.example".into(), "perm:yt".into())),
             fj_token: Some("fj-token".into()),
+            github_token: None,
         };
         let dir = tmp.path().join("gather");
         let guard = JobCredentials::materialize(&dir, &creds, None).unwrap();
@@ -362,5 +378,36 @@ mod tests {
         assert!(guard.fj_keys_path.is_none());
         assert!(guard.fj_env.is_empty());
         assert!(!dir.join("forgejo-cli").exists());
+    }
+
+    #[test]
+    fn github_token_ref_set_is_carried_env_only() {
+        // CLAUDE-50: a resolved GitHub PAT makes the set non-empty and is carried
+        // through to the guard for the GitHub `Forge`, with no on-disk file (it
+        // travels as an env var / push-URL component only).
+        let tmp = tempfile::tempdir().unwrap();
+        let creds = ResolvedCredentials {
+            yt: None,
+            fj_token: None,
+            github_token: Some("ghp_secret".into()),
+        };
+        assert!(!creds.is_empty());
+        let dir = tmp.path().join("gh");
+        let guard = JobCredentials::materialize(&dir, &creds, Some("github.com")).unwrap();
+        assert_eq!(guard.github_token.as_deref(), Some("ghp_secret"));
+        // No yt/fj credential files materialized for a github-only token.
+        assert!(guard.yt_env.is_empty());
+        assert!(guard.fj_env.is_empty());
+        assert!(guard.fj_keys_path.is_none());
+        assert!(!dir.join("forgejo-cli").exists());
+    }
+
+    #[test]
+    fn host_auth_fallback_when_no_token_refs() {
+        // No block set a token_ref: the host-auth path. Nothing resolved, the set
+        // is empty, and the github token is absent (falls back to host gh auth).
+        let creds = ResolvedCredentials::default();
+        assert!(creds.is_empty());
+        assert!(creds.github_token.is_none());
     }
 }
