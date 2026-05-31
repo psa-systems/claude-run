@@ -602,6 +602,7 @@ pub async fn run_action_inner(
                     summary,
                     stream_log_path,
                     duration_ms,
+                    timed_out,
                 } = &outcome
                 {
                     state::job_outcome_insert(
@@ -619,6 +620,7 @@ pub async fn run_action_inner(
                             summary: Some(summary.as_str()),
                             stream_log_path: stream_log_path.as_deref(),
                             duration_ms: *duration_ms,
+                            timed_out: *timed_out,
                         },
                     )
                     .await?;

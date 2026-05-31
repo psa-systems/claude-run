@@ -258,6 +258,10 @@ pub struct JobOutcome<'a> {
     pub stream_log_path: Option<&'a str>,
     /// CLAUDE-20: full per-job pipeline elapsed in milliseconds.
     pub duration_ms: i64,
+    /// CLAUDE-52: the job's claude run hit the wall-clock limit (exit 124) and
+    /// was SIGKILLed. Distinct from a hard failure (`ok = 0`, `timed_out = 0`):
+    /// the UI badges it separately and the failed-job count excludes it.
+    pub timed_out: bool,
 }
 
 pub async fn job_outcome_insert(pool: &SqlitePool, r: &JobOutcome<'_>) -> Result<()> {
@@ -267,8 +271,8 @@ pub async fn job_outcome_insert(pool: &SqlitePool, r: &JobOutcome<'_>) -> Result
         INSERT INTO job_outcomes (
             run_id, action_name, job_key, attempt, ts, ok,
             claude_ran, claude_ok, claude_cost_usd, attempt_counted,
-            summary, stream_log_path, duration_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            summary, stream_log_path, duration_ms, timed_out
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(r.run_id)
@@ -284,6 +288,7 @@ pub async fn job_outcome_insert(pool: &SqlitePool, r: &JobOutcome<'_>) -> Result
     .bind(r.summary)
     .bind(r.stream_log_path)
     .bind(r.duration_ms)
+    .bind(r.timed_out as i64)
     .execute(pool)
     .await?;
     Ok(())
@@ -672,6 +677,69 @@ mod tests {
             exit_code_of(&pool, finished).await,
             Some(crate::exit::OK as i64)
         );
+    }
+
+    #[tokio::test]
+    async fn timed_out_outcome_persists_and_is_excluded_from_failed_count() {
+        // CLAUDE-52: a timed-out outcome round-trips `timed_out = 1` (still
+        // `ok = 0`) and is NOT counted as a failed job, while a plain failure is.
+        let pool = mem_pool().await;
+        let run_id = run_begin(&pool, "act", "cli").await.unwrap();
+
+        let base = JobOutcome {
+            run_id,
+            action_name: "act",
+            job_key: "",
+            attempt: 1,
+            ok: false,
+            claude_ran: true,
+            claude_ok: false,
+            claude_cost_usd: 0.1,
+            attempt_counted: true,
+            summary: None,
+            stream_log_path: None,
+            duration_ms: 10,
+            timed_out: false,
+        };
+        // A hard failure and a timeout in the same run.
+        job_outcome_insert(
+            &pool,
+            &JobOutcome {
+                job_key: "FAIL-1",
+                ..base
+            },
+        )
+        .await
+        .unwrap();
+        job_outcome_insert(
+            &pool,
+            &JobOutcome {
+                job_key: "TIMEOUT-1",
+                timed_out: true,
+                ..base
+            },
+        )
+        .await
+        .unwrap();
+
+        // The timed_out column persisted exactly for the timeout job.
+        let flag: i64 =
+            sqlx::query_scalar("SELECT timed_out FROM job_outcomes WHERE job_key = 'TIMEOUT-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(flag, 1);
+
+        // The web failed-job count (ok = 0 AND timed_out = 0) sees only the
+        // hard failure, not the timeout.
+        let failed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = ? AND o.ok = 0 AND o.timed_out = 0",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(failed, 1, "timed-out job excluded from failed count");
     }
 
     // ---- CLAUDE-40: action delete ----------------------------------------

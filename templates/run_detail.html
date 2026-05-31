@@ -65,6 +65,8 @@
             <td>
               {% if p.status == "ok" %}
                 <span class="badge ok">done</span>
+              {% else if p.status == "timed_out" %}
+                <span class="badge warn">timed out</span>
               {% else if p.status == "fail" %}
                 <span class="badge bad">failed</span>
               {% else if p.status == "running" %}
@@ -112,6 +114,7 @@
           <td class="mono">{{ o.attempt }}</td>
           <td>
             {% if o.ok %}<span class="badge ok">ok</span>
+            {% else if o.timed_out %}<span class="badge warn">timed out</span>
             {% else %}<span class="badge bad">fail</span>{% endif %}
           </td>
           <td>
