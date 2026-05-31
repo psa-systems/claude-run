@@ -17,7 +17,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use claude_run::{
     action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db, exit, lock,
-    migrate, snippet, state, update,
+    migrate, secrets, snippet, state, update,
 };
 
 #[derive(Parser)]
@@ -79,6 +79,11 @@ enum Cmd {
     /// Action management subcommands.
     #[command(subcommand)]
     Action(ActionCmd),
+    /// Manage encrypted secrets (the web auth token, action `token_ref`s).
+    /// Operates directly on the local state DB and the age key file
+    /// (`CLAUDE_RUN_SECRETS_KEY_FILE`); no daemon required.
+    #[command(subcommand)]
+    Secret(SecretCmd),
     /// Import legacy `~/.local/share/claude-run/state/*.json` files into SQLite.
     Migrate {
         #[arg(long)]
@@ -130,6 +135,18 @@ enum ActionCmd {
     /// Delete an action: remove its YAML file, index row, and control state
     /// (paused/counters/ledger). Run history is kept. Refuses with
     /// `exit::CONFLICT` when a run for the action is in flight.
+    Delete { name: String },
+}
+
+#[derive(Subcommand)]
+enum SecretCmd {
+    /// Create or replace a secret. The plaintext value is read from stdin (so it
+    /// never lands in shell history or `ps`); a single trailing newline is
+    /// stripped. Example: `printf %s "$TOKEN" | claude-run secret set web-ui-token`.
+    Set { name: String },
+    /// List secret names and timestamps as JSON. Values are never printed.
+    List,
+    /// Delete a secret. Exits `CONFIG_ERROR` when no secret has that name.
     Delete { name: String },
 }
 
@@ -223,6 +240,7 @@ async fn real_main(cli: Cli) -> claude_run::error::Result<i32> {
         Cmd::Resume { action } => resume(action, &paths).await,
         Cmd::Status => status(&paths).await,
         Cmd::Action(c) => action_cmd(c, &paths, &actions_dir).await,
+        Cmd::Secret(c) => secret_cmd(c, &paths).await,
         Cmd::Migrate { from } => {
             let pool = db::open(&paths.state_db()).await?;
             let legacy = from.map(PathBuf::from).unwrap_or_else(|| {
@@ -593,4 +611,58 @@ async fn action_cmd(
         }
     }
     Ok(exit::OK)
+}
+
+async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+    let pool = db::open(&paths.state_db()).await?;
+    match cmd {
+        SecretCmd::Set { name } => {
+            // Read the value from stdin so it never appears in argv (shell
+            // history, `ps`). Strip a single trailing newline (echo / heredoc /
+            // terminal input add one); multi-line secrets pass through otherwise.
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            let value = buf
+                .strip_suffix('\n')
+                .map(|s| s.strip_suffix('\r').unwrap_or(s))
+                .unwrap_or(&buf);
+            if value.is_empty() {
+                eprintln!("refusing to store an empty secret `{name}` (stdin was empty)");
+                return Ok(exit::CONFIG_ERROR);
+            }
+            // Encrypt under the age key (CLAUDE_RUN_SECRETS_KEY_FILE). A missing
+            // key file surfaces the same clear error the daemon emits.
+            let key = secrets::SecretsKey::load()?;
+            let ciphertext = key.encrypt(value)?;
+            if state::secret_exists(&pool, &name).await? {
+                state::secret_rotate(&pool, &name, &ciphertext).await?;
+                println!("rotated secret `{name}`");
+            } else {
+                state::secret_create(&pool, &name, &ciphertext).await?;
+                println!("created secret `{name}`");
+            }
+            // The web-auth gate resolves its token once at daemon startup, so a
+            // change to that secret needs a restart to take effect.
+            eprintln!(
+                "note: if this is the web UI auth token, restart the daemon to apply it \
+                 (the auth gate resolves it at startup)"
+            );
+            Ok(exit::OK)
+        }
+        SecretCmd::List => {
+            let rows = state::secret_list(&pool).await?;
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+            Ok(exit::OK)
+        }
+        SecretCmd::Delete { name } => {
+            if state::secret_delete(&pool, &name).await? {
+                println!("deleted secret `{name}`");
+                Ok(exit::OK)
+            } else {
+                eprintln!("no secret named `{name}`");
+                Ok(exit::CONFIG_ERROR)
+            }
+        }
+    }
 }

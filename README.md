@@ -52,6 +52,11 @@ claude-run resume youtrack
 claude-run action list
 claude-run action show youtrack
 
+# Secrets (encrypted at rest under CLAUDE_RUN_SECRETS_KEY_FILE; value read from stdin, never argv).
+printf %s $token | claude-run secret set web-ui-token
+claude-run secret list
+claude-run secret delete web-ui-token
+
 # Import legacy ~/.local/share/claude-run/state/*.json into SQLite (one-time migration off the nu runner).
 claude-run migrate
 ```
