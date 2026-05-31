@@ -4,8 +4,10 @@
 //! - Interactivity: HTMX (vendored under `assets/htmx.min.js`, embedded into
 //!   the binary via `include_bytes!` so the binary stays self-contained).
 //! - Live log streaming: Server-Sent Events.
-//! - Auth: localhost-only for now. Phase 5 layers a token check for
-//!   non-loopback binds.
+//! - Auth: loopback binds are unauthenticated by default; a non-loopback bind
+//!   gates the web UI and `/api/*` behind a bearer token (CLAUDE-48, Phase 5).
+//!   The token layer is applied to the TCP router in `daemon.rs` via
+//!   `crate::auth::protect`; the `/webhooks/` prefix stays exempt.
 
 use std::convert::Infallible;
 use std::sync::Arc;
