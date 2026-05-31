@@ -391,6 +391,7 @@ async fn process_job(
         summary: claude_result.summary,
         stream_log_path,
         duration_ms: started.elapsed().as_millis() as i64,
+        timed_out: claude_result.timed_out,
     })
 }
 
@@ -778,6 +779,7 @@ async fn record_outcome(
         summary,
         stream_log_path,
         duration_ms,
+        timed_out,
     } = outcome
     {
         state::job_outcome_insert(
@@ -795,6 +797,7 @@ async fn record_outcome(
                 summary: Some(summary.as_str()),
                 stream_log_path: stream_log_path.as_deref(),
                 duration_ms: *duration_ms,
+                timed_out: *timed_out,
             },
         )
         .await?;
@@ -846,6 +849,7 @@ mod tests {
             raw: Value::Null,
             error: String::new(),
             transient: false,
+            timed_out: false,
         }
     }
 

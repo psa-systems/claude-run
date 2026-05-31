@@ -408,6 +408,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
         summary: claude_result.summary,
         stream_log_path,
         duration_ms: started.elapsed().as_millis() as i64,
+        timed_out: claude_result.timed_out,
     })
 }
 
@@ -442,6 +443,9 @@ pub enum ProcessedJob {
         stream_log_path: Option<String>,
         /// CLAUDE-20: full per-job pipeline elapsed in milliseconds.
         duration_ms: i64,
+        /// CLAUDE-52: claude hit the wall-clock limit (exit 124). Carried into
+        /// the persisted outcome so a timeout renders distinctly from a failure.
+        timed_out: bool,
     },
 }
 
@@ -497,6 +501,7 @@ pub fn done_record(d: &ProcessedJob) -> Option<Value> {
         claude_cost,
         attempt_counted,
         summary,
+        timed_out,
         ..
     } = d
     {
@@ -511,6 +516,7 @@ pub fn done_record(d: &ProcessedJob) -> Option<Value> {
             "attempt_counted": attempt_counted,
             "claude_ok": claude_ok,
             "summary": summary,
+            "timed_out": timed_out,
         }))
     } else {
         None

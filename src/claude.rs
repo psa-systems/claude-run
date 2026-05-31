@@ -42,6 +42,12 @@ pub struct ClaudeResult {
     pub raw: Value,
     pub error: String,
     pub transient: bool,
+    /// CLAUDE-52: the `timeout <N>s claude` wrapper SIGKILLed the run (exit 124).
+    /// A timeout is distinct from a hard failure: the agent may have completed
+    /// all, some, or none of the work before being killed, so the handler
+    /// surfaces it as a "Timed Out" outcome rather than "Failed". Always paired
+    /// with `ok = false`.
+    pub timed_out: bool,
 }
 
 impl ClaudeResult {
@@ -53,6 +59,7 @@ impl ClaudeResult {
             raw: Value::Object(Default::default()),
             error: error.into(),
             transient: false,
+            timed_out: false,
         }
     }
 }
@@ -156,6 +163,8 @@ impl ClaudeInvoker {
                 raw: final_event.clone(),
                 error: format!("claude exited {}, see {}", exit_code, stream_log.display()),
                 transient: classify_transient(exit_code, &final_event),
+                // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
+                timed_out: exit_code == 124,
             });
         }
 
@@ -171,6 +180,7 @@ impl ClaudeInvoker {
                     stream_log.display()
                 ),
                 transient: false,
+                timed_out: false,
             });
         }
 
@@ -195,6 +205,7 @@ impl ClaudeInvoker {
                 .to_string(),
             raw: final_event,
             transient: false,
+            timed_out: false,
         })
     }
 }
@@ -314,6 +325,42 @@ mod tests {
             1,
             &json!({"type":"result","error":"usage limit exceeded"})
         ));
+    }
+
+    /// CLAUDE-52: a `claude` that outlives the wall-clock budget is SIGKILLed by
+    /// the `timeout(1)` wrapper (exit 124). The result carries `timed_out = true`
+    /// alongside `ok = false`, distinguishing a timeout from a hard failure.
+    #[test]
+    fn invoke_timeout_sets_timed_out() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Stub "claude": sleep well past the 1s budget so the wrapper kills it.
+        let stub = dir.path().join("claude-stub.sh");
+        {
+            let mut f = std::fs::File::create(&stub).unwrap();
+            writeln!(f, "#!/bin/sh\nexec sleep 30").unwrap();
+        }
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let res = invoker
+            .invoke(
+                "hi",
+                &cfg,
+                Duration::from_secs(1),
+                dir.path(),
+                &log,
+                &cancel,
+            )
+            .unwrap();
+        assert!(res.timed_out, "exit 124 should set timed_out");
+        assert!(!res.ok, "a timeout is not ok");
+        assert!(!res.transient, "a timeout is never transient");
     }
 
     /// CLAUDE-9: tripping the token mid-run terminates the child's process

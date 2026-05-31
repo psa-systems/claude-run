@@ -166,6 +166,10 @@ struct JobOutcomeRow {
     /// CLAUDE-20: full per-job pipeline elapsed; NULL for jobs predating the
     /// column (migration 0005).
     duration_ms: Option<i64>,
+    /// CLAUDE-52: the job's claude run hit the wall-clock limit (exit 124).
+    /// Rendered with a distinct "timed out" badge instead of "fail", and
+    /// excluded from the run's failed-job count.
+    timed_out: bool,
 }
 
 impl JobOutcomeRow {
@@ -364,7 +368,7 @@ async fn fetch_recent_runs(
         " WHERE jobs_processed > 0 OR exit_code IS NULL"
     };
     let sql = format!(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs{where_clause} ORDER BY started_at DESC LIMIT ?"
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs{where_clause} ORDER BY started_at DESC LIMIT ?"
     );
     let rows = sqlx::query_as::<_, RunRow>(&sql)
         .bind(limit)
@@ -488,7 +492,7 @@ async fn action_detail(
         " AND (jobs_processed > 0 OR exit_code IS NULL)"
     };
     let sql = format!(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE action_name = ?{empty_filter} ORDER BY started_at DESC LIMIT 50"
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE action_name = ?{empty_filter} ORDER BY started_at DESC LIMIT 50"
     );
     let runs = sqlx::query_as::<_, RunRow>(&sql)
         .bind(&name)
@@ -527,7 +531,7 @@ async fn action_durations(
     // Same recent window as the action-detail table (last 50 by start). The
     // query returns newest-first; the chart wants oldest-first, so reverse.
     let runs = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
     )
     .bind(&name)
     .fetch_all(pool)
@@ -1586,7 +1590,7 @@ async fn run_detail(
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
     let Some(run): Option<RunRow> = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE id = ?",
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -1594,7 +1598,7 @@ async fn run_detail(
         return Ok((StatusCode::NOT_FOUND, format!("no run #{id}")).into_response());
     };
     let outcomes = sqlx::query_as::<_, JobOutcomeRow>(
-        "SELECT job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, attempt_counted, duration_ms FROM job_outcomes WHERE run_id = ? ORDER BY id ASC",
+        "SELECT job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, attempt_counted, duration_ms, timed_out FROM job_outcomes WHERE run_id = ? ORDER BY id ASC",
     )
     .bind(id)
     .fetch_all(pool)
@@ -1614,8 +1618,16 @@ async fn run_detail(
     // attempt wins, since outcomes are inserted in order).
     let mut outcome_by_key: std::collections::HashMap<&str, bool> =
         std::collections::HashMap::new();
+    // CLAUDE-52: keys whose latest outcome timed out, badged distinctly from a
+    // plain failure in the planned-jobs table.
+    let mut timed_out_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for o in &outcomes {
         outcome_by_key.insert(o.job_key.as_str(), o.ok);
+        if o.timed_out {
+            timed_out_keys.insert(o.job_key.as_str());
+        } else {
+            timed_out_keys.remove(o.job_key.as_str());
+        }
     }
     // CLAUDE-14 / CLAUDE-28: a run with a NULL `ended_at` is still active; only
     // then can jobs be in flight. CLAUDE-28 runs distinct-key jobs in parallel,
@@ -1636,6 +1648,9 @@ async fn run_detail(
         .map(|k| {
             let (status, watch_attempt) = match outcome_by_key.get(k.as_str()) {
                 Some(true) => ("ok".to_string(), None),
+                Some(false) if timed_out_keys.contains(k.as_str()) => {
+                    ("timed_out".to_string(), None)
+                }
                 Some(false) => ("fail".to_string(), None),
                 None if run_active && inflight.contains(k.as_str()) => {
                     // An in-flight job. Resolve its live-stream attempt from disk

@@ -567,6 +567,7 @@ async fn process_job(
         summary: claude_result.summary,
         stream_log_path,
         duration_ms: started.elapsed().as_millis() as i64,
+        timed_out: claude_result.timed_out,
     })
 }
 
@@ -629,7 +630,7 @@ fn build_prompt(job: &YoutrackJob, workdir: &Path) -> String {
         "2. Create a feature branch off the default branch per the Git workflow in CLAUDE.md.".to_string(),
         "3. Make the minimum change required to satisfy the acceptance criteria.".to_string(),
         format!("4. Commit with a message that references the issue on its own line as '#{key}' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR."),
-        "5. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). Run it in the foreground and wait for it inline; do NOT background a long-running job and poll/wait on it across turns - that is what blew the run timeout previously.".to_string(),
+        "5. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop.".to_string(),
         "6. Stop. Do not push, do not open a PR, do not touch YouTrack. The runner opens the PR from your commits and transitions the issue.".to_string(),
         String::new(),
         "If you CANNOT safely complete the issue - missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue:".to_string(),
@@ -653,9 +654,15 @@ enum Finalized {
     NeedsReview,
     /// Success: PR opened; AI Agent=Code Review.
     CodeReview { pr_url: String },
-    /// Hard failure (claude error/timeout, pre failure, or PR-create failure);
+    /// Hard failure (claude error, pre failure, or PR-create failure);
     /// AI Agent=Failed, no PR (or a failed PR).
     Failed,
+    /// CLAUDE-52: claude hit the wall-clock limit (exit 124). The work may be
+    /// complete, partial, or absent, so the issue is NOT marked Failed: a
+    /// timeout-specific comment is posted and the AI Agent field is advanced to
+    /// Needs Review only when still Working (a human/agent-advanced state is left
+    /// untouched).
+    TimedOut,
 }
 
 impl Finalized {
@@ -664,6 +671,7 @@ impl Finalized {
             Finalized::NeedsReview => "Needs Review",
             Finalized::CodeReview { .. } => "Code Review",
             Finalized::Failed => "Failed",
+            Finalized::TimedOut => "Timed Out",
         }
     }
 }
@@ -713,8 +721,28 @@ fn finalize(
                 Ok(Finalized::Failed)
             }
         }
+    } else if claude_result.timed_out {
+        // CLAUDE-52: timeout (exit 124). Ambiguous outcome: the agent may have
+        // finished the work yet a lingering background task held the process
+        // open past the limit. Do NOT mark Failed. Comment with the situation,
+        // and advance AI Agent to Needs Review only when it is still Working;
+        // if a human/agent already moved it on (Done, Code Review, ...), leave
+        // the field untouched so we never stomp an advanced state.
+        let body = timeout_comment(claude_result);
+        if let Err(e) = backend.comment(&job.key, &body) {
+            warn!(key = %job.key, error = %e, "timeout comment failed (continuing)");
+        }
+        let current = backend
+            .get_field(&job.key, &src.custom_field)
+            .unwrap_or_default();
+        if current.trim() == src.states.working {
+            backend.set_field(&job.key, &src.custom_field, &src.states.needs_review)?;
+        } else {
+            info!(key = %job.key, current = %current, "timeout: AI Agent already advanced off Working, leaving untouched");
+        }
+        Ok(Finalized::TimedOut)
     } else {
-        // Failure: timeout (exit 124), crash, empty prompt, or pre failure.
+        // Failure: crash, empty prompt, or pre failure.
         let body = failure_comment(claude_result);
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
         Ok(Finalized::Failed)
@@ -790,6 +818,27 @@ fn pr_failure_comment(r: &ClaudeResult, err: &Error) -> String {
     .join("\n")
 }
 
+/// CLAUDE-52: timeout-specific comment. Surfaces the ambiguity (the work may be
+/// complete despite the kill, e.g. a backgrounded command held the process open
+/// past the limit), states the runner did NOT mark the issue Failed, and points
+/// a human at the branch/PR and the run log (`r.error` carries the log path).
+fn timeout_comment(r: &ClaudeResult) -> String {
+    [
+        "Claude AI agent run TIMED OUT (the run hit its time limit and was killed):".to_string(),
+        String::new(),
+        format!("Details: {}", r.error),
+        String::new(),
+        "The agent may have completed all, some, or none of the work before being killed. A backgrounded command can hold the process open past the limit even after the functional work is done, so this is not necessarily a failure. The runner did NOT mark this issue Failed.".to_string(),
+        String::new(),
+        "A human should inspect the branch/PR and the run log above, then either resolve the issue manually or re-queue it (set AI Agent = Queued).".to_string(),
+        String::new(),
+        r.summary.clone(),
+        String::new(),
+        format!("Cost: ${} USD", r.cost),
+    ]
+    .join("\n")
+}
+
 fn failure_comment(r: &ClaudeResult) -> String {
     [
         format!("Claude AI agent run FAILED ({}):", r.error),
@@ -825,6 +874,7 @@ async fn record_outcome(
         summary,
         stream_log_path,
         duration_ms,
+        timed_out,
     } = outcome
     {
         state::job_outcome_insert(
@@ -842,6 +892,7 @@ async fn record_outcome(
                 summary: Some(summary.as_str()),
                 stream_log_path: stream_log_path.as_deref(),
                 duration_ms: *duration_ms,
+                timed_out: *timed_out,
             },
         )
         .await?;
@@ -887,6 +938,19 @@ mod tests {
             raw: Value::Null,
             error: String::new(),
             transient: false,
+            timed_out: false,
+        }
+    }
+
+    fn timed_out_result() -> ClaudeResult {
+        ClaudeResult {
+            ok: false,
+            summary: "partial work before kill".into(),
+            cost: 0.3,
+            raw: Value::Null,
+            error: "claude exited 124, see stream.jsonl".into(),
+            transient: false,
+            timed_out: true,
         }
     }
 
@@ -1216,6 +1280,86 @@ mod tests {
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
             "{calls:?}"
         );
+        assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    #[test]
+    fn finalize_timeout_sets_needs_review_when_still_working() {
+        // CLAUDE-52: a timeout (exit 124) with AI Agent still on Working advances
+        // the field to Needs Review and posts the timeout comment - never Failed.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &timed_out_result(),
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::TimedOut);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+        // Never marked Failed, never opened a PR.
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Failed"),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    #[test]
+    fn finalize_timeout_leaves_field_when_already_advanced() {
+        // CLAUDE-52: a timeout whose AI Agent has already moved off Working (e.g.
+        // a human/agent set Done) leaves the field untouched - only the comment
+        // is posted. No set-field write at all.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["issue", "get-field", "MK-16", "AI Agent"],
+            "Done\n",
+        ));
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &timed_out_result(),
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::TimedOut);
+        let calls = runner.calls.lock().unwrap();
+        // The field is read but never written.
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue get-field MK-16 AI Agent"),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 }
