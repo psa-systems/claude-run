@@ -44,6 +44,7 @@
   .yt-form .fld-inline span { font-size: 13px; }
   .yt-form .card { margin-bottom: 16px; }
   .yt-form .card h3 { color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.05em; font-size: 12px; }
+  .yt-form .hint { font-size: 12px; margin: 8px 0 0; }
 </style>
 
 <h2>{{ heading }}</h2>
@@ -105,6 +106,14 @@
       {% call textfield("Base URL", "fj_base_url", form.fj_base_url, "blank = derive from each issue's VCS") %}
       {% call tokenfield("Token secret", "fj_token_ref", form.fj_token_ref) %}
     </div>
+  </div>
+
+  <div class="card">
+    <h3>GitHub target</h3>
+    <div class="grid2">
+      {% call tokenfield("Token secret", "github_token_ref", form.github_token_ref) %}
+    </div>
+    <p class="hint dim"><code>github.com</code> repos need no token (host <code>gh</code> auth is the fallback). The PAT needs <code>repo</code> + <code>pull_request</code> scope. <code>hosts</code> (GitHub Enterprise) and <code>mcp_endpoint</code> are advanced fields edited via the raw-YAML editor; they are preserved on save.</p>
   </div>
 
   <div class="card">
