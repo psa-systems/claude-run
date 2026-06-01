@@ -105,6 +105,10 @@ enum VersionCmd {
     /// registry, and whether an update is available. Exits non-zero only on a
     /// registry/transport error.
     Check {
+        /// Update channel: `release` (newest semver) or `latest` (moving main
+        /// build). Defaults to `[update].train` in config.toml (`release`).
+        #[arg(long, value_enum)]
+        train: Option<update::UpdateTrain>,
         /// On a 401/403, use the `fj` token for the registry host without an
         /// interactive prompt.
         #[arg(long)]
@@ -114,8 +118,13 @@ enum VersionCmd {
     /// against the published sidecar, and atomically replace this binary.
     Update {
         /// Pin a specific release tag (e.g. v0.2.0) instead of the newest.
+        /// Independent of `--train`.
         #[arg(long = "version")]
         version: Option<String>,
+        /// Update channel: `release` (newest semver) or `latest` (moving main
+        /// build). Defaults to `[update].train` in config.toml (`release`).
+        #[arg(long, value_enum)]
+        train: Option<update::UpdateTrain>,
         /// On a 401/403, use the `fj` token for the registry host without an
         /// interactive prompt.
         #[arg(long)]
@@ -257,23 +266,66 @@ async fn real_main(cli: Cli) -> claude_run::error::Result<i32> {
             );
             Ok(exit::OK)
         }
-        Cmd::Version { cmd } => version_cmd(cmd).await,
+        Cmd::Version { cmd } => version_cmd(cmd, &paths, &on_disk).await,
     }
 }
 
-async fn version_cmd(cmd: Option<VersionCmd>) -> claude_run::error::Result<i32> {
+async fn version_cmd(
+    cmd: Option<VersionCmd>,
+    paths: &cfg::Paths,
+    on_disk: &cfg::OnDiskConfig,
+) -> claude_run::error::Result<i32> {
     match cmd.unwrap_or(VersionCmd::Show) {
         VersionCmd::Show => {
             println!("{}", claude_run::VERSION);
             Ok(exit::OK)
         }
-        VersionCmd::Check { use_fj_token } => update::check(use_fj_token).await,
+        VersionCmd::Check {
+            train,
+            use_fj_token,
+        } => {
+            let train = resolve_train(train, &on_disk.update.train)?;
+            let token = resolve_update_token(paths, on_disk).await?;
+            update::check(train, use_fj_token, token).await
+        }
         VersionCmd::Update {
             version,
+            train,
             use_fj_token,
             yes,
-        } => update::update(version, use_fj_token, yes).await,
+        } => {
+            let train = resolve_train(train, &on_disk.update.train)?;
+            let token = resolve_update_token(paths, on_disk).await?;
+            update::update(train, version, use_fj_token, token, yes).await
+        }
     }
+}
+
+/// CLI `--train` flag overrides the `[update].train` config default.
+fn resolve_train(
+    flag: Option<update::UpdateTrain>,
+    config_train: &str,
+) -> claude_run::error::Result<update::UpdateTrain> {
+    match flag {
+        Some(t) => Ok(t),
+        None => update::UpdateTrain::from_config_str(config_train),
+    }
+}
+
+/// Resolve the registry token from `[update].token_ref` (CLAUDE-55). `None` when
+/// no `token_ref` is configured (the anonymous-first path). When set, the secret
+/// is decrypted from the store; a missing secret or key file surfaces an error.
+async fn resolve_update_token(
+    paths: &cfg::Paths,
+    on_disk: &cfg::OnDiskConfig,
+) -> claude_run::error::Result<Option<String>> {
+    let Some(name) = on_disk.update.token_ref.as_deref() else {
+        return Ok(None);
+    };
+    let pool = db::open(&paths.state_db()).await?;
+    let key = secrets::SecretsKey::load()?;
+    let token = secrets::resolve_secret(&pool, &key, name).await?;
+    Ok(Some(token))
 }
 
 async fn run_action(

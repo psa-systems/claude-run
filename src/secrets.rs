@@ -402,6 +402,40 @@ mod tests {
         assert!(!dir.join("forgejo-cli").exists());
     }
 
+    async fn mem_pool() -> SqlitePool {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::db::MIGRATOR.run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn token_ref_resolves_to_decrypted_secret() {
+        // CLAUDE-55: a `[update].token_ref` names a secret; resolving it decrypts
+        // the stored ciphertext under the loaded age key and returns the token.
+        let tmp = tempfile::tempdir().unwrap();
+        let key = SecretsKey::load_from_file(&write_key(tmp.path())).unwrap();
+        let pool = mem_pool().await;
+
+        let ciphertext = key.encrypt("registry-token-value").unwrap();
+        state::secret_create(&pool, "registry-token", &ciphertext)
+            .await
+            .unwrap();
+
+        let resolved = resolve_secret(&pool, &key, "registry-token").await.unwrap();
+        assert_eq!(resolved, "registry-token-value");
+
+        // An unknown ref name fails closed rather than returning an empty token.
+        assert!(matches!(
+            resolve_secret(&pool, &key, "no-such-ref").await,
+            Err(Error::Secret(_))
+        ));
+    }
+
     #[test]
     fn host_auth_fallback_when_no_token_refs() {
         // No block set a token_ref: the host-auth path. Nothing resolved, the set

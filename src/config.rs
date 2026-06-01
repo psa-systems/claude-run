@@ -95,6 +95,9 @@ pub struct OnDiskConfig {
     /// CLAUDE-46: triage-driven issue-mint settings (repo-to-project map,
     /// fallback project, loop-safety bot logins, bucket-2 assignee).
     pub mint: MintConfig,
+    /// CLAUDE-55: `version` self-update settings (release/latest train default
+    /// and the name of the secret holding the registry token).
+    pub update: UpdateConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -210,6 +213,35 @@ impl Default for MintConfig {
     }
 }
 
+/// CLAUDE-55: settings for the `version` self-update command. Lives in
+/// `config.toml` so an operator can pin a default channel (and reference a
+/// registry token) without passing flags every time. The token itself is never
+/// inlined here; `token_ref` names a credential in the CLAUDE-26 `secrets`
+/// table, resolved (and decrypted) at run time and used for the registry list /
+/// asset requests when private packages require auth. The `train` string is
+/// validated into [`crate::update::UpdateTrain`] when the command runs.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Default update channel: `release` (newest semver `vX.Y.Z`) or `latest`
+    /// (the moving `latest` main build). Overridable per invocation by
+    /// `version {check,update} --train <release|latest>`.
+    pub train: String,
+    /// Name of the secret (in the `secrets` table) holding the registry token.
+    /// When unset, the updater stays anonymous-first and falls back to the `fj`
+    /// token only on a 401/403 with `--use-fj-token`.
+    pub token_ref: Option<String>,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            train: "release".to_string(),
+            token_ref: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
@@ -245,5 +277,29 @@ mod tests {
         assert_eq!(out, "bar/x");
         let out = expand_path("~/x");
         assert!(out.starts_with('/'));
+    }
+
+    #[test]
+    fn update_config_defaults_to_release_train_no_token() {
+        let cfg = UpdateConfig::default();
+        assert_eq!(cfg.train, "release");
+        assert!(cfg.token_ref.is_none());
+        // An empty config still yields the release default.
+        let parsed: OnDiskConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed.update, UpdateConfig::default());
+    }
+
+    #[test]
+    fn update_block_parses_train_and_token_ref() {
+        let parsed: OnDiskConfig = toml::from_str(
+            r#"
+            [update]
+            train = "latest"
+            token_ref = "registry-token"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.update.train, "latest");
+        assert_eq!(parsed.update.token_ref.as_deref(), Some("registry-token"));
     }
 }

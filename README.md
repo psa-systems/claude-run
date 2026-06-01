@@ -59,6 +59,14 @@ claude-run secret delete web-ui-token
 
 # Import legacy ~/.local/share/claude-run/state/*.json into SQLite (one-time migration off the nu runner).
 claude-run migrate
+
+# Self-update. `check` reports whether a newer build is published; `update` swaps the binary in place.
+claude-run version                         # print the build-stamped banner (same as `version show`)
+claude-run version check                   # uses the [update].train default (release)
+claude-run version check --train latest    # track the moving main build instead
+claude-run version update --yes            # install the newest release-train build
+claude-run version update --train latest   # install the moving `latest` build
+claude-run version update --version v0.2.0 # pin an exact tag (independent of train)
 ```
 
 ## Filesystem layout
@@ -73,6 +81,26 @@ XDG-compliant; each path overridable by the matching env var.
 | `$XDG_RUNTIME_DIR/claude-run/` | `CLAUDE_RUN_RUNTIME_DIR` | `daemon.pid`, `daemon.sock`, `locks/<action>.lock` |
 
 `workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-job workdirs live; defaults to `$DATA_DIR/workdirs/`. Supports `~`, `$VAR`, `${VAR}` expansion.
+
+## Self-update (release trains)
+
+`claude-run version {show,check,update}` self-updates the binary from the Forgejo Generic Package registry. CI publishes two channels ("trains"), and `[update].train` in `config.toml` picks the default; `--train <release|latest>` overrides it per invocation:
+
+```toml
+# config.toml
+[update]
+# Default channel: "release" (newest semver vX.Y.Z, the default) or "latest" (moving main build).
+train = "release"
+# Optional: name of a stored secret (see "Secrets store") holding the registry token,
+# used for private packages. Unset stays anonymous-first.
+token_ref = "registry-token"
+```
+
+- **`release`** resolves the newest semver `vX.Y.Z` package, ignoring the moving `latest` tag. `check` compares it against the running version by semver.
+- **`latest`** tracks the moving `latest` package (re-published on every push to main). Because that tag is non-semver and moving, `check` reports update-available by comparing the running binary's SHA-256 against the published `latest.sha256` sidecar rather than by semver.
+- `--version <tag>` pins an exact published tag and is independent of the train.
+
+Auth is anonymous-first. When `[update].token_ref` is set, the named secret is decrypted from the store (same mechanism as `web.auth_token_ref` and action `token_ref`s; the raw token never appears in `config.toml`) and used for the registry requests. When it is unset, a private registry still falls back to the host `fj` token on a 401/403 with `claude-run version check --use-fj-token`. The download is always verified against the published SHA-256 sidecar before the binary is atomically swapped in place.
 
 ## Web UI / API auth
 
