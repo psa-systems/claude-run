@@ -13,9 +13,17 @@
 //! source of truth for what is installable, so consuming its API here builds
 //! the canonical capability rather than working around a missing one.
 //!
-//! Authentication is anonymous-first: on a 401/403 the caller may supply an
-//! `fj` token for the host, otherwise the operation fails with an actionable
-//! message and never swaps the binary.
+//! Authentication is anonymous-first: on a 401/403 the caller may supply a
+//! registry token (CLAUDE-55: resolved from `[update].token_ref` in the secrets
+//! store) or an `fj` token for the host, otherwise the operation fails with an
+//! actionable message and never swaps the binary.
+//!
+//! CLAUDE-55 adds release trains. `release` (the default) keeps the original
+//! behavior: the newest semver `vX.Y.Z` package, ignoring the moving `latest`
+//! tag. `latest` tracks the moving `latest` package; since that tag is non-semver
+//! and re-published on every push to main, "update available" is decided by
+//! comparing the running binary's SHA-256 against the published `latest.sha256`
+//! sidecar rather than by semver.
 
 use std::io::{IsTerminal, Write as _};
 use std::os::unix::fs::PermissionsExt;
@@ -33,6 +41,41 @@ const DEFAULT_OWNER: &str = "psa-systems";
 const DEFAULT_PACKAGE: &str = "claude-run";
 /// Asset filename published per tag (and its sha256 sidecar, CLAUDE-49).
 const ASSET: &str = "claude-run-linux-x86_64";
+/// The moving tag CI re-publishes on every push to main (CLAUDE-55 `latest`
+/// train). Excluded from the `release` train's semver pick.
+pub const LATEST_TAG: &str = "latest";
+
+/// The self-update channel (CLAUDE-55), mirroring yotun's `UpdateTrain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum UpdateTrain {
+    /// Newest semver `vX.Y.Z` package, excluding the moving `latest` tag.
+    #[default]
+    Release,
+    /// The moving `latest` package (most recent main build).
+    Latest,
+}
+
+impl UpdateTrain {
+    /// Parse the `[update].train` config string. Case-insensitive; any other
+    /// value is a configuration error rather than a silent fallback.
+    pub fn from_config_str(s: &str) -> Result<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "release" => Ok(Self::Release),
+            "latest" => Ok(Self::Latest),
+            other => Err(anyhow::anyhow!(
+                "invalid [update].train `{other}`; expected `release` or `latest`"
+            )
+            .into()),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Latest => "latest",
+        }
+    }
+}
 
 /// Registry coordinates. Overridable by env so tests can point at a stub and
 /// operators can retarget a mirror without a rebuild.
@@ -241,6 +284,16 @@ impl Updater {
         Ok(bytes.to_vec())
     }
 
+    /// Fetch just the SHA-256 sidecar text for `tag` (CLAUDE-55 `latest`-train
+    /// check, which compares digests without downloading the whole binary).
+    pub async fn fetch_sidecar(&self, cred: &Cred, tag: &str) -> Result<String> {
+        let bytes = self
+            .get_bytes(&self.registry.sidecar_url(tag), cred)
+            .await?;
+        String::from_utf8(bytes)
+            .map_err(|e| anyhow::anyhow!("sha256 sidecar is not valid UTF-8: {e}").into())
+    }
+
     /// Download the binary and its sidecar for `tag`.
     pub async fn download(&self, cred: &Cred, tag: &str) -> Result<(Vec<u8>, String)> {
         let bin = self.get_bytes(&self.registry.asset_url(tag), cred).await?;
@@ -317,6 +370,52 @@ pub fn current_version() -> Result<semver::Version> {
         .map_err(|e| anyhow::anyhow!("parse CARGO_PKG_VERSION: {e}").into())
 }
 
+/// SHA-256 (lowercased hex) of the running executable. On the `latest` train the
+/// published tag is non-semver and moving, so update-availability is decided by
+/// comparing this digest against the published `latest.sha256` sidecar.
+pub fn current_exe_sha256() -> Result<String> {
+    let path =
+        std::env::current_exe().map_err(|e| anyhow::anyhow!("resolve current executable: {e}"))?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| anyhow::anyhow!("read current executable {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Resolve the tag to install for `train` from the published `versions`. An
+/// exact `--version <tag>` pin overrides the train entirely (CLAUDE-55): it is
+/// normalized to `vX.Y.Z` and must be published. With no pin, `release` picks
+/// the newest semver and `latest` picks the moving `latest` package.
+pub fn select_target(train: UpdateTrain, versions: &[String], pin: Option<&str>) -> Result<String> {
+    if let Some(tag) = pin {
+        let tag = normalize_tag(tag);
+        if !versions.iter().any(|v| v == &tag) {
+            return Err(anyhow::anyhow!(
+                "tag {tag} is not published in the registry. Available: {}",
+                available_list(versions)
+            )
+            .into());
+        }
+        return Ok(tag);
+    }
+    match train {
+        UpdateTrain::Release => {
+            let newest = select_newest(versions)
+                .ok_or_else(|| anyhow::anyhow!("no vX.Y.Z releases found in registry"))?;
+            Ok(format!("v{newest}"))
+        }
+        UpdateTrain::Latest => {
+            if !versions.iter().any(|v| v == LATEST_TAG) {
+                return Err(
+                    anyhow::anyhow!("no `{LATEST_TAG}` build published in registry").into(),
+                );
+            }
+            Ok(LATEST_TAG.to_string())
+        }
+    }
+}
+
 /// Atomically replace the running binary with `bytes`.
 ///
 /// Writes to a temp file in the SAME directory as the live binary (same
@@ -375,59 +474,86 @@ fn install_err(current: &Path, dir: &Path, e: std::io::Error) -> Error {
 // CLI orchestration
 // ---------------------------------------------------------------------------
 
-/// `claude-run version check`.
-pub async fn check(use_fj_token: bool) -> Result<i32> {
+/// `claude-run version check [--train <release|latest>]`.
+///
+/// `configured_token` is the registry token resolved from `[update].token_ref`
+/// (CLAUDE-55), or `None` for the anonymous-first path.
+pub async fn check(
+    train: UpdateTrain,
+    use_fj_token: bool,
+    configured_token: Option<String>,
+) -> Result<i32> {
     let updater = Updater::new()?;
     let host = updater.registry.host.clone();
-    let (_, versions) = updater
-        .list_versions(authorizer(&host, use_fj_token))
+    let (cred, versions) = updater
+        .list_versions(authorizer(&host, use_fj_token, configured_token))
         .await?;
-    let current = current_version()?;
-    println!("current:   v{current}");
-    match select_newest(&versions) {
-        Some(newest) => {
-            println!("available: v{newest}");
-            match compare(&current, &newest) {
-                UpdateStatus::UpdateAvailable => {
-                    println!("update available; run `claude-run version update`");
+    println!("train:     {}", train.label());
+    match train {
+        UpdateTrain::Release => {
+            let current = current_version()?;
+            println!("current:   v{current}");
+            match select_newest(&versions) {
+                Some(newest) => {
+                    println!("available: v{newest}");
+                    match compare(&current, &newest) {
+                        UpdateStatus::UpdateAvailable => {
+                            println!("update available; run `claude-run version update`");
+                        }
+                        UpdateStatus::UpToDate => println!("up to date"),
+                        UpdateStatus::Ahead => {
+                            println!("running a newer build than the registry; nothing to do");
+                        }
+                    }
                 }
-                UpdateStatus::UpToDate => println!("up to date"),
-                UpdateStatus::Ahead => {
-                    println!("running a newer build than the registry; nothing to do");
-                }
+                None => println!("available: (no vX.Y.Z releases found in registry)"),
             }
         }
-        None => println!("available: (no vX.Y.Z releases found in registry)"),
+        UpdateTrain::Latest => {
+            if !versions.iter().any(|v| v == LATEST_TAG) {
+                println!("available: (no `{LATEST_TAG}` build published in registry)");
+                return Ok(exit::OK);
+            }
+            // The `latest` tag is moving and non-semver, so compare digests: the
+            // running binary's SHA-256 vs the published `latest.sha256` sidecar.
+            let sidecar = updater.fetch_sidecar(&cred, LATEST_TAG).await?;
+            let published = parse_sha256_sidecar(&sidecar).ok_or_else(|| {
+                anyhow::anyhow!("could not parse the published sha256 sidecar for `{LATEST_TAG}`")
+            })?;
+            let installed = current_exe_sha256()?;
+            println!("installed: {installed}");
+            println!("published: {published}");
+            if installed.eq_ignore_ascii_case(&published) {
+                println!("up to date");
+            } else {
+                println!(
+                    "update available; run `claude-run version update --train {}`",
+                    UpdateTrain::Latest.label()
+                );
+            }
+        }
     }
     Ok(exit::OK)
 }
 
-/// `claude-run version update [--version <tag>]`.
-pub async fn update(pin: Option<String>, use_fj_token: bool, yes: bool) -> Result<i32> {
+/// `claude-run version update [--train <release|latest>] [--version <tag>]`.
+///
+/// `configured_token` is the registry token resolved from `[update].token_ref`
+/// (CLAUDE-55), or `None` for the anonymous-first path.
+pub async fn update(
+    train: UpdateTrain,
+    pin: Option<String>,
+    use_fj_token: bool,
+    configured_token: Option<String>,
+    yes: bool,
+) -> Result<i32> {
     let updater = Updater::new()?;
     let host = updater.registry.host.clone();
     let (cred, versions) = updater
-        .list_versions(authorizer(&host, use_fj_token))
+        .list_versions(authorizer(&host, use_fj_token, configured_token))
         .await?;
 
-    let target = match pin {
-        Some(tag) => {
-            let tag = normalize_tag(&tag);
-            if !versions.iter().any(|v| v == &tag) {
-                return Err(anyhow::anyhow!(
-                    "tag {tag} is not published in the registry. Available: {}",
-                    available_list(&versions)
-                )
-                .into());
-            }
-            tag
-        }
-        None => {
-            let newest = select_newest(&versions)
-                .ok_or_else(|| anyhow::anyhow!("no vX.Y.Z releases found in registry"))?;
-            format!("v{newest}")
-        }
-    };
+    let target = select_target(train, &versions, pin.as_deref())?;
 
     if !yes && std::io::stdin().is_terminal() && !confirm(&format!("Install {target}?")) {
         println!("aborted");
@@ -457,11 +583,19 @@ fn available_list(versions: &[String]) -> String {
 }
 
 /// Build the `authorize` callback for [`Updater::list_versions`]: only consulted
-/// on a 401/403. Confirmation is granted by `--use-fj-token`, the
-/// `CLAUDE_RUN_USE_FJ_TOKEN` env opt-in, or an interactive prompt; the token
-/// itself comes from `fj`'s `keys.json` for the host.
-fn authorizer(host: &str, use_fj_token: bool) -> impl FnOnce() -> Option<String> + '_ {
+/// on a 401/403. A `configured_token` (CLAUDE-55, from `[update].token_ref`) is
+/// used directly with no prompt. Otherwise confirmation is granted by
+/// `--use-fj-token`, the `CLAUDE_RUN_USE_FJ_TOKEN` env opt-in, or an interactive
+/// prompt; the token then comes from `fj`'s `keys.json` for the host.
+fn authorizer(
+    host: &str,
+    use_fj_token: bool,
+    configured_token: Option<String>,
+) -> impl FnOnce() -> Option<String> + '_ {
     move || {
+        if let Some(token) = configured_token {
+            return Some(token);
+        }
         let opt_in = use_fj_token
             || matches!(
                 std::env::var("CLAUDE_RUN_USE_FJ_TOKEN").as_deref(),
@@ -547,6 +681,57 @@ mod tests {
     fn normalize_tag_adds_v_prefix() {
         assert_eq!(normalize_tag("0.2.0"), "v0.2.0");
         assert_eq!(normalize_tag("v0.2.0"), "v0.2.0");
+    }
+
+    #[test]
+    fn train_parses_release_and_latest_case_insensitively() {
+        assert_eq!(
+            UpdateTrain::from_config_str("release").unwrap(),
+            UpdateTrain::Release
+        );
+        assert_eq!(
+            UpdateTrain::from_config_str("  LATEST ").unwrap(),
+            UpdateTrain::Latest
+        );
+        assert_eq!(UpdateTrain::default(), UpdateTrain::Release);
+        assert!(UpdateTrain::from_config_str("nightly").is_err());
+    }
+
+    #[test]
+    fn select_target_picks_per_train() {
+        let versions = vec![
+            "v0.1.0".to_string(),
+            "v0.2.0".to_string(),
+            LATEST_TAG.to_string(),
+        ];
+        // release -> newest semver, ignoring the moving `latest` tag.
+        assert_eq!(
+            select_target(UpdateTrain::Release, &versions, None).unwrap(),
+            "v0.2.0"
+        );
+        // latest -> the moving `latest` package.
+        assert_eq!(
+            select_target(UpdateTrain::Latest, &versions, None).unwrap(),
+            LATEST_TAG
+        );
+    }
+
+    #[test]
+    fn select_target_pin_overrides_train_and_must_be_published() {
+        let versions = vec!["v0.1.0".to_string(), "v0.2.0".to_string()];
+        // A pin is honored regardless of train and normalized to vX.Y.Z.
+        assert_eq!(
+            select_target(UpdateTrain::Latest, &versions, Some("0.1.0")).unwrap(),
+            "v0.1.0"
+        );
+        // An unpublished pin is rejected.
+        assert!(select_target(UpdateTrain::Release, &versions, Some("9.9.9")).is_err());
+    }
+
+    #[test]
+    fn select_target_latest_errors_when_not_published() {
+        let versions = vec!["v0.1.0".to_string()];
+        assert!(select_target(UpdateTrain::Latest, &versions, None).is_err());
     }
 
     #[test]
