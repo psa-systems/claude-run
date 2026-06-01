@@ -839,6 +839,10 @@ struct YoutrackEditForm {
     state_in_progress: String,
     fj_base_url: String,
     fj_token_ref: String,
+    /// GitHub PAT secret name (CLAUDE-54). The form exposes only `token_ref`;
+    /// `github.hosts` / `github.mcp_endpoint` stay raw-YAML-only and are
+    /// preserved on save.
+    github_token_ref: String,
     workdir_base: String,
     link_template: String,
     /// "", "interval", "cron", or "manual".
@@ -911,6 +915,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         state_in_progress: yt.youtrack.states.in_progress.clone(),
         fj_base_url: s(&yt.forgejo.base_url),
         fj_token_ref: s(&yt.forgejo.token_ref),
+        github_token_ref: s(&yt.github.token_ref),
         workdir_base: s(&a.workdir_base),
         link_template: s(&a.link_template),
         schedule_kind: a
@@ -1029,16 +1034,26 @@ fn youtrack_form_to_yaml(
     if let Some(v) = opt(&form.state_in_progress) {
         states.in_progress = v;
     }
+    // CLAUDE-54: preserve a hand-written `github` block. The form exposes only
+    // `token_ref`, so read the existing `native.github` sub-block off the parsed
+    // on-disk action (before we overwrite the `native` key below) to carry its
+    // `hosts` / `mcp_endpoint` forward, then overlay `token_ref` from the form.
+    // Missing or unparsable block -> defaults; `prune_yaml` still drops an
+    // all-default github block so Forgejo-only actions write no `github`.
+    let mut github = map
+        .get("native")
+        .and_then(|n| n.get("github"))
+        .cloned()
+        .and_then(|g| serde_yaml::from_value::<GithubTarget>(g).ok())
+        .unwrap_or_default();
+    github.token_ref = opt(&form.github_token_ref);
     let native = YoutrackConfig {
         youtrack,
         forgejo: ForgejoTarget {
             base_url: opt(&form.fj_base_url),
             token_ref: opt(&form.fj_token_ref),
         },
-        // CLAUDE-50: the web form has no GitHub fields yet; default routes
-        // GitHub jobs through the GitHub backend with host gh auth. `prune_yaml`
-        // drops the all-default block so existing actions are unchanged on save.
-        github: GithubTarget::default(),
+        github,
     };
     let native_val = prune_yaml(serde_yaml::to_value(&native).map_err(|e| e.to_string())?)
         .unwrap_or_else(|| Value::Mapping(serde_yaml::Mapping::new()));
@@ -1183,7 +1198,11 @@ async fn token_ref_options(s: &WebState, form: &YoutrackEditForm) -> Result<Vec<
         .into_iter()
         .map(|m| m.name)
         .collect();
-    for r in [&form.yt_token_ref, &form.fj_token_ref] {
+    for r in [
+        &form.yt_token_ref,
+        &form.fj_token_ref,
+        &form.github_token_ref,
+    ] {
         let r = r.trim();
         if !r.is_empty() && !names.iter().any(|n| n == r) {
             names.push(r.to_string());
@@ -2359,6 +2378,65 @@ mod tests {
             let out = youtrack_form_to_yaml(empty_base(), &form).unwrap();
             let reloaded = crate::action::validate_str(&out, "<test>").unwrap();
             assert_eq!(reloaded.action.native, loaded.action.native);
+        }
+
+        #[test]
+        fn github_token_ref_prefills() {
+            // CLAUDE-54: a loaded action with native.github.token_ref populates
+            // the form field.
+            let yaml = "name: yt\nkind: youtrack\nnative:\n  github:\n    token_ref: gh-prod\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            assert_eq!(form.github_token_ref, "gh-prod");
+        }
+
+        #[test]
+        fn github_token_ref_set_and_clear_round_trip() {
+            // CLAUDE-54: setting github_token_ref writes native.github.token_ref;
+            // clearing it drops the key and prunes an otherwise-default github
+            // block.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.github_token_ref = "gh-prod".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(yt.github.token_ref.as_deref(), Some("gh-prod"));
+
+            // Clearing the field drops the key; the all-default github block prunes
+            // away entirely.
+            f.github_token_ref = String::new();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            assert!(!yaml.contains("github"), "github block leaked:\n{yaml}");
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert!(yt.github.token_ref.is_none());
+        }
+
+        #[test]
+        fn github_block_preserved_on_save() {
+            // CLAUDE-54 no-wipe regression: an action whose YAML carries a full
+            // github block survives a structured-form save with hosts and
+            // mcp_endpoint intact; only token_ref is touched by the form.
+            let base: serde_yaml::Value = serde_yaml::from_str(
+                "name: yt\nkind: youtrack\nnative:\n  github:\n    token_ref: gh-old\n    hosts:\n      - ghe.example.com\n    mcp_endpoint: https://ghe.example.com/mcp/\n",
+            )
+            .unwrap();
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.github_token_ref = "gh-new".to_string();
+            let yaml = youtrack_form_to_yaml(base, &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(yt.github.token_ref.as_deref(), Some("gh-new"));
+            assert_eq!(yt.github.hosts, vec!["ghe.example.com".to_string()]);
+            assert_eq!(yt.github.mcp_endpoint, "https://ghe.example.com/mcp/");
         }
 
         #[test]
