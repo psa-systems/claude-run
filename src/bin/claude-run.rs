@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
 use claude_run::{
     action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db, exit,
@@ -191,7 +191,7 @@ enum SecretCmd {
 }
 
 fn main() -> ExitCode {
-    init_tracing();
+    let log_reload = init_tracing();
 
     // Resolve the color choice BEFORE clap renders any help/error: clap
     // colorizes its own output during parse, before we could read the parsed
@@ -227,7 +227,7 @@ fn main() -> ExitCode {
         }
     };
     rt.block_on(async move {
-        match real_main(cli).await {
+        match real_main(cli, log_reload).await {
             Ok(code) => ExitCode::from(code as u8),
             Err(e) => {
                 tracing::error!(error = %e, "fatal");
@@ -314,18 +314,62 @@ fn detach_now() -> claude_run::error::Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+/// Build the tracing subscriber and return a reload handle for its `EnvFilter`.
+/// The initial filter is unchanged from before CLAUDE-62 (`CLAUDE_RUN_LOG` if
+/// set, else the built-in default), so every line emitted before config load
+/// logs exactly as it did. Wrapping the filter in a `reload::Layer` lets
+/// `apply_config_log_filter` swap in `[daemon].log_filter` once the config is
+/// loaded, without a second (illegal) `set_global_default`.
+fn init_tracing() -> reload::Handle<EnvFilter, Registry> {
     let filter = EnvFilter::try_from_env("CLAUDE_RUN_LOG")
         .unwrap_or_else(|_| EnvFilter::new("info,claude_run=info,sqlx=warn"));
+    let (filter_layer, reload_handle) = reload::Layer::new(filter);
     tracing_subscriber::registry()
-        .with(filter)
+        .with(filter_layer)
         .with(fmt::layer().with_target(false).json())
         .init();
+    reload_handle
 }
 
-async fn real_main(cli: Cli) -> claude_run::error::Result<i32> {
+/// CLAUDE-62: apply `[daemon].log_filter` after config load, honoring the
+/// `CLAUDE_RUN_LOG` > file > default precedence (see [`cfg::log_filter_choice`]).
+/// An unparseable directive logs a warning and keeps the active filter rather
+/// than aborting the daemon.
+fn apply_config_log_filter(
+    handle: &reload::Handle<EnvFilter, Registry>,
+    file_filter: Option<&str>,
+) {
+    let env_set = std::env::var_os("CLAUDE_RUN_LOG").is_some();
+    match cfg::log_filter_choice(env_set, file_filter) {
+        cfg::LogFilterChoice::EnvWins => {
+            tracing::debug!(
+                "CLAUDE_RUN_LOG set; [daemon].log_filter ignored (env takes precedence)"
+            );
+        }
+        cfg::LogFilterChoice::KeepDefault => {}
+        cfg::LogFilterChoice::ApplyFile(f) => match EnvFilter::try_new(&f) {
+            Ok(filter) => match handle.reload(filter) {
+                Ok(()) => tracing::info!(filter = %f, "log filter applied from config.toml"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to swap log filter; keeping current filter")
+                }
+            },
+            Err(e) => tracing::warn!(
+                value = %f,
+                error = %e,
+                "invalid [daemon].log_filter; keeping current filter"
+            ),
+        },
+    }
+}
+
+async fn real_main(
+    cli: Cli,
+    log_reload: reload::Handle<EnvFilter, Registry>,
+) -> claude_run::error::Result<i32> {
     let paths = cfg::Paths::resolve()?;
     let (on_disk, config_source) = cfg::OnDiskConfig::load(&paths)?;
+    apply_config_log_filter(&log_reload, on_disk.daemon.log_filter.as_deref());
 
     let actions_dir = cli
         .actions_dir
