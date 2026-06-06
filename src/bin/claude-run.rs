@@ -149,9 +149,11 @@ enum ActionCmd {
 
 #[derive(Subcommand)]
 enum SecretCmd {
-    /// Create or replace a secret. The plaintext value is read from stdin (so it
-    /// never lands in shell history or `ps`); a single trailing newline is
-    /// stripped. Example: `printf %s "$TOKEN" | claude-run secret set web-ui-token`.
+    /// Create or replace a secret. The plaintext value never lands in argv (shell
+    /// history, `ps`). When run interactively the command prompts twice with input
+    /// hidden (re-enter to confirm). When stdin is piped or redirected it reads the
+    /// value from stdin and strips a single trailing newline, e.g.
+    /// `printf %s "$TOKEN" | claude-run secret set web-ui-token`.
     Set { name: String },
     /// List secret names and timestamps as JSON. Values are never printed.
     List,
@@ -674,18 +676,42 @@ async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Re
     let pool = db::open(&paths.state_db()).await?;
     match cmd {
         SecretCmd::Set { name } => {
-            // Read the value from stdin so it never appears in argv (shell
-            // history, `ps`). Strip a single trailing newline (echo / heredoc /
-            // terminal input add one); multi-line secrets pass through otherwise.
-            use std::io::Read;
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            let value = buf
-                .strip_suffix('\n')
-                .map(|s| s.strip_suffix('\r').unwrap_or(s))
-                .unwrap_or(&buf);
+            // The value never appears in argv (shell history, `ps`). Interactive
+            // terminals get a masked double-entry prompt; piped/redirected stdin is
+            // read as before. Detect the difference with IsTerminal, the same
+            // pattern src/update.rs uses for its confirmation gate.
+            use std::io::IsTerminal;
+            let owned;
+            let value: &str = if std::io::stdin().is_terminal() {
+                // TTY path: prompt twice with echo disabled. Double entry catches
+                // typos that masked input would otherwise hide (passwd convention).
+                eprintln!("input is hidden; you will be asked to re-enter to confirm");
+                let first =
+                    rpassword::prompt_password(format!("Enter secret value for `{name}`: "))?;
+                let second = rpassword::prompt_password("Re-enter to confirm: ")?;
+                if first != second {
+                    eprintln!("entries do not match; nothing stored");
+                    return Ok(exit::CONFIG_ERROR);
+                }
+                owned = first;
+                &owned
+            } else {
+                // Piped path: announce the read on stderr (stdout stays clean for
+                // scripts), then read to EOF. Strip a single trailing newline (echo
+                // / heredoc add one); multi-line secrets pass through otherwise.
+                use std::io::Read;
+                eprintln!("reading secret value from stdin");
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                owned = buf
+                    .strip_suffix('\n')
+                    .map(|s| s.strip_suffix('\r').unwrap_or(s))
+                    .unwrap_or(&buf)
+                    .to_string();
+                &owned
+            };
             if value.is_empty() {
-                eprintln!("refusing to store an empty secret `{name}` (stdin was empty)");
+                eprintln!("refusing to store an empty secret `{name}`");
                 return Ok(exit::CONFIG_ERROR);
             }
             // Encrypt under the age key (CLAUDE_RUN_SECRETS_KEY_FILE). A missing
