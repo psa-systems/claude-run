@@ -34,6 +34,13 @@ const TICK_SECS: u64 = 5;
 /// child so it cannot hang the daemon forever. Assumed 30s; revise after
 /// testing per the issue.
 const SHUTDOWN_GRACE_SECS: u64 = 30;
+/// CLAUDE-57: fixed retry interval for a web-UI bind that fails with
+/// `AddrNotAvailable` (the configured IP is not assigned yet, e.g. a boot race).
+/// Retried indefinitely; the unix-socket API stays up throughout.
+const WEB_BIND_RETRY_SECS: u64 = 5;
+/// Log a throttled progress line every Nth `AddrNotAvailable` retry (~once per
+/// minute at the 5s interval) so a long boot race does not spam the journal.
+const WEB_BIND_RETRY_LOG_EVERY: u64 = 12;
 
 pub struct Daemon {
     pub paths: Paths,
@@ -148,23 +155,17 @@ impl Daemon {
         // Tasks: unix-socket server, TCP server, scheduler tick, trigger consumer.
         let server_unix = tokio::spawn(serve_unix(listener, unix_app));
 
-        let server_tcp = if let Some(tcp_app) = tcp_app {
+        // CLAUDE-57: bind + serve the web UI in its own task. The bind retries
+        // on the boot-race `AddrNotAvailable` (configured IP not assigned yet)
+        // instead of disabling the web UI for the whole run, and never blocks
+        // the scheduler or the unix-socket API while it waits. Other bind error
+        // kinds keep the fail-once-and-disable behavior. The config path travels
+        // along so every bind log line correlates to its source.
+        let server_tcp = tcp_app.map(|tcp_app| {
             let tcp_bind = format!("{}:{}", self.on_disk.web.bind, self.on_disk.web.port);
-            match tokio::net::TcpListener::bind(&tcp_bind).await {
-                Ok(l) => {
-                    info!(address = %tcp_bind, "web UI listening");
-                    Some(tokio::spawn(serve_tcp(l, tcp_app)))
-                }
-                Err(e) => {
-                    // Don't fail the whole daemon just because the TCP port is
-                    // taken - the unix-socket API still works.
-                    warn!(address = %tcp_bind, error = %e, "TCP bind failed; web UI disabled this run");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            let config_path = self.paths.config_file();
+            tokio::spawn(bind_and_serve_tcp(tcp_bind, config_path, tcp_app))
+        });
 
         // CLAUDE-43: drain verified webhook failure events for the lifetime of
         // the daemon. CLAUDE-44: each event triggers an internal-route log fetch
@@ -356,6 +357,126 @@ fn pidfile_lock(pidfile: &Path) -> Result<std::fs::File> {
 async fn serve_tcp(listener: tokio::net::TcpListener, app: axum::Router) -> Result<()> {
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// CLAUDE-57: classified web-UI bind failure. Carries a stable `kind` tag, a
+/// one-line operator hint, and whether the daemon should retry. Only the
+/// boot-race `AddrNotAvailable` retries; every other kind disables the web UI
+/// for the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindFailure {
+    pub kind: &'static str,
+    pub hint: &'static str,
+    pub retry: bool,
+}
+
+/// Map a bind [`std::io::ErrorKind`] to its classified [`BindFailure`]. Pure (no
+/// logging, no I/O) so the classification is unit-testable without a socket.
+pub fn classify_bind_error(kind: std::io::ErrorKind) -> BindFailure {
+    use std::io::ErrorKind;
+    match kind {
+        ErrorKind::AddrNotAvailable => BindFailure {
+            kind: "AddrNotAvailable",
+            hint: "address is not assigned to any interface; the interface may not be up yet (boot race) or [web].bind is wrong",
+            retry: true,
+        },
+        ErrorKind::AddrInUse => BindFailure {
+            kind: "AddrInUse",
+            hint: "another process is listening on this address:port",
+            retry: false,
+        },
+        ErrorKind::PermissionDenied => BindFailure {
+            kind: "PermissionDenied",
+            hint: "binding this address/port requires elevated privileges",
+            retry: false,
+        },
+        _ => BindFailure {
+            kind: "other",
+            hint: "see the underlying OS error for the cause",
+            retry: false,
+        },
+    }
+}
+
+/// CLAUDE-57: bind `tcp_bind`, retrying indefinitely on the boot-race
+/// `AddrNotAvailable` and giving up (web UI disabled this run) on every other
+/// classified kind. Generic over the bind closure so the retry loop is testable
+/// with an injected result sequence. Returns the bound listener, or `None` when
+/// a non-retryable error disabled the web UI. Every outcome logs the full
+/// attempted `address`, the OS error, and the classified hint so the operator
+/// can correlate against the configured bind.
+async fn retry_bind<F, Fut>(
+    tcp_bind: &str,
+    config_path: &Path,
+    retry_interval: std::time::Duration,
+    mut bind: F,
+) -> Option<tokio::net::TcpListener>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<tokio::net::TcpListener>>,
+{
+    let mut attempt: u64 = 0;
+    loop {
+        match bind().await {
+            Ok(listener) => return Some(listener),
+            Err(e) => {
+                let failure = classify_bind_error(e.kind());
+                if !failure.retry {
+                    warn!(
+                        address = %tcp_bind,
+                        config = %config_path.display(),
+                        error = %e,
+                        kind = failure.kind,
+                        hint = failure.hint,
+                        "TCP bind failed; web UI disabled this run"
+                    );
+                    return None;
+                }
+                if attempt == 0 {
+                    warn!(
+                        address = %tcp_bind,
+                        config = %config_path.display(),
+                        error = %e,
+                        kind = failure.kind,
+                        hint = failure.hint,
+                        retry_secs = WEB_BIND_RETRY_SECS,
+                        "TCP bind failed; retrying until the address is available"
+                    );
+                } else if attempt.is_multiple_of(WEB_BIND_RETRY_LOG_EVERY) {
+                    info!(
+                        address = %tcp_bind,
+                        config = %config_path.display(),
+                        attempts = attempt,
+                        "TCP bind still failing (address not available); retrying"
+                    );
+                }
+                attempt += 1;
+                tokio::time::sleep(retry_interval).await;
+            }
+        }
+    }
+}
+
+/// CLAUDE-57: bind the web UI (with boot-race retry) and then serve it. Logs the
+/// effective bind before attempting it so a successful default bind is traceable
+/// to its source, then `web UI listening` once the bind succeeds. Returns early
+/// (web UI disabled this run) when a non-retryable bind error was classified.
+async fn bind_and_serve_tcp(tcp_bind: String, config_path: PathBuf, app: axum::Router) {
+    info!(address = %tcp_bind, config = %config_path.display(), "binding web UI");
+    let Some(listener) = retry_bind(
+        &tcp_bind,
+        &config_path,
+        std::time::Duration::from_secs(WEB_BIND_RETRY_SECS),
+        || tokio::net::TcpListener::bind(&tcp_bind),
+    )
+    .await
+    else {
+        return;
+    };
+    info!(address = %tcp_bind, "web UI listening");
+    if let Err(e) = serve_tcp(listener, app).await {
+        warn!(address = %tcp_bind, error = %e, "web UI server exited with error");
+    }
 }
 
 async fn serve_unix(listener: UnixListener, app: axum::Router) -> Result<()> {
@@ -885,6 +1006,107 @@ mod tests {
     fn absurd_pid_is_not_alive() {
         // A PID near the 32-bit max is never allocated on these hosts.
         assert!(!process_alive(0x7fff_fff0));
+    }
+
+    // CLAUDE-57: each bind error kind maps to a stable tag, a hint, and the
+    // right retry decision (only AddrNotAvailable retries).
+    #[test]
+    fn classify_bind_error_maps_each_kind() {
+        use std::io::ErrorKind;
+        let a = classify_bind_error(ErrorKind::AddrNotAvailable);
+        assert_eq!(a.kind, "AddrNotAvailable");
+        assert!(a.retry, "the boot-race kind must retry");
+        let b = classify_bind_error(ErrorKind::AddrInUse);
+        assert_eq!(b.kind, "AddrInUse");
+        assert!(!b.retry);
+        let c = classify_bind_error(ErrorKind::PermissionDenied);
+        assert_eq!(c.kind, "PermissionDenied");
+        assert!(!c.retry);
+        let d = classify_bind_error(ErrorKind::Unsupported);
+        assert_eq!(d.kind, "other");
+        assert!(!d.retry);
+    }
+
+    // CLAUDE-57: a real bind to an unassigned TEST-NET-1 address (RFC 5737,
+    // never on a local NIC) surfaces AddrNotAvailable, the boot-race case the
+    // retry loop is built for.
+    #[tokio::test]
+    async fn bind_unassigned_address_classifies_addr_not_available() {
+        let err = tokio::net::TcpListener::bind("192.0.2.1:7321")
+            .await
+            .expect_err("binding an unassigned address must fail");
+        let f = classify_bind_error(err.kind());
+        assert_eq!(f.kind, "AddrNotAvailable", "got OS kind {:?}", err.kind());
+        assert!(f.retry);
+    }
+
+    // CLAUDE-57: a second bind on a port already held surfaces AddrInUse, which
+    // is non-retryable (web UI disabled this run).
+    #[tokio::test]
+    async fn double_bind_classifies_addr_in_use() {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = first.local_addr().unwrap();
+        let err = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect_err("second bind on the same port must fail");
+        let f = classify_bind_error(err.kind());
+        assert_eq!(f.kind, "AddrInUse", "got OS kind {:?}", err.kind());
+        assert!(!f.retry);
+    }
+
+    // CLAUDE-57: the retry loop tolerates an AddrNotAvailable, sleeps the (here
+    // near-zero) interval, retries, and returns the listener once the bind
+    // succeeds.
+    #[tokio::test]
+    async fn retry_bind_recovers_after_addr_not_available() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let bind = || {
+            let n = calls.get();
+            calls.set(n + 1);
+            async move {
+                if n == 0 {
+                    Err(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))
+                } else {
+                    tokio::net::TcpListener::bind("127.0.0.1:0").await
+                }
+            }
+        };
+        let path = std::path::PathBuf::from("/tmp/claude-run/config.toml");
+        let listener = retry_bind(
+            "127.0.0.1:0",
+            &path,
+            std::time::Duration::from_millis(1),
+            bind,
+        )
+        .await;
+        assert!(
+            listener.is_some(),
+            "listener should come up after the retry"
+        );
+        assert_eq!(calls.get(), 2, "expected one failure then one success");
+    }
+
+    // CLAUDE-57: a non-retryable kind short-circuits the loop to None (web UI
+    // disabled this run) on the first attempt, without sleeping.
+    #[tokio::test]
+    async fn retry_bind_gives_up_on_non_retryable_kind() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let bind = || {
+            calls.set(calls.get() + 1);
+            async move { Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)) }
+        };
+        let path = std::path::PathBuf::from("/tmp/claude-run/config.toml");
+        let listener = retry_bind(
+            "127.0.0.1:1",
+            &path,
+            std::time::Duration::from_millis(1),
+            bind,
+        )
+        .await;
+        assert!(listener.is_none(), "non-retryable kind disables the web UI");
+        assert_eq!(calls.get(), 1, "must not retry a non-retryable kind");
     }
 
     #[test]
