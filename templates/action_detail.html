@@ -12,6 +12,17 @@
 <h2>{{ action.name }}</h2>
 
 <div class="card">
+  {% if action.synthetic %}
+  <dl class="kv">
+    <dt>Kind</dt>          <dd><span class="badge ok">event-driven</span> webhook fast-path (read-only)</dd>
+    <dt>Source</dt>        <dd>Forgejo webhook deliveries; minted on verified CI failures.</dd>
+    <dt>Schedule</dt>      <dd><span class="dim">none (fires on webhook events)</span></dd>
+  </dl>
+  <div class="row-actions" style="margin-top: 16px;">
+    <a class="btn" href="/actions/{{ action.name }}/durations">Durations</a>
+    <span class="badge neutral">read-only - no edit / delete / trigger</span>
+  </div>
+  {% else %}
   <dl class="kv">
     <dt>File</dt>          <dd>{{ action.file_path }}</dd>
     <dt>SHA-256</dt>       <dd>{{ action.yaml_sha256 }}</dd>
@@ -55,6 +66,7 @@
       </form>
     {% endif %}
   </div>
+  {% endif %}
 </div>
 
 <h2>Recent runs

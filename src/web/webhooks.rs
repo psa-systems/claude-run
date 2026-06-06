@@ -61,6 +61,12 @@ use crate::triage::{self, FailureClassifier, TriageInput};
 /// actions instead of re-deriving its own.
 pub const WEBHOOK_MINT_ACTION: &str = "webhook-fast-path";
 
+/// `runs.triggered_by` value for the event-driven webhook fast-path, alongside
+/// the existing `scheduler` / `trigger` / `cli` sources (CLAUDE-61). Each
+/// consumed verified failure becomes one run recorded under this source so the
+/// dashboard / action-detail surfaces show webhook activity like any action.
+pub const WEBHOOK_TRIGGERED_BY: &str = "webhook";
+
 /// Wall-clock cap for one triage classification (`claude --print`). The pass is
 /// a single bounded-log JSON reply, so it needs far less than a full code run.
 pub const TRIAGE_TIMEOUT_SECS: u64 = 120;
@@ -199,6 +205,7 @@ pub struct MintContext {
 /// signal (the rules pass routes an unavailable log to transient).
 pub async fn consume_events(
     mut rx: mpsc::Receiver<VerifiedFailureEvent>,
+    pool: SqlitePool,
     transport: Arc<dyn crate::forge_log::LogTransport>,
     out_dir: PathBuf,
     mint: Option<MintContext>,
@@ -215,10 +222,26 @@ pub async fn consume_events(
             "verified action_run_failure received"
         );
 
+        // CLAUDE-61: open a run row for every consumed event (user decision:
+        // full observability including skips) so the web UI surfaces webhook
+        // activity. `run_id` is `None` only if `run_begin` itself failed; the
+        // pipeline still runs, it just goes unrecorded.
+        let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
+        let run_id = begin_webhook_run(&pool, &job_key).await;
+
         let Some(target) =
             crate::forge_log::LogTarget::for_run(&ev.html_url, &ev.repo, ev.index_in_repo)
         else {
             warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge origin from html_url; skipping log fetch");
+            finish_webhook_run(
+                &pool,
+                run_id,
+                &job_key,
+                "could not derive forge origin from html_url; log fetch skipped",
+                false,
+                None,
+            )
+            .await;
             continue;
         };
 
@@ -269,10 +292,149 @@ pub async fn consume_events(
         };
 
         let Some(ctx) = mint.as_ref() else {
-            // No mint configured (no usable backend): log-only, as before.
+            // No mint configured (no usable backend): log-only, as before. The
+            // run is still recorded so the operator sees the event landed.
+            let summary = if log_available {
+                "log fetched and redacted; no provider backend configured (log-only)"
+            } else {
+                "log unavailable; no provider backend configured (log-only)"
+            };
+            finish_webhook_run(
+                &pool,
+                run_id,
+                &job_key,
+                summary,
+                true,
+                log_artifact.as_deref(),
+            )
+            .await;
             continue;
         };
-        triage_and_mint(ctx, &ev, log_text, log_available, log_artifact).await;
+        let artifact = log_artifact.clone();
+        let result = triage_and_mint(ctx, &ev, log_text, log_available, log_artifact).await;
+        finish_webhook_run(
+            &pool,
+            run_id,
+            &job_key,
+            &result.text,
+            result.ok,
+            artifact.as_deref(),
+        )
+        .await;
+    }
+}
+
+/// CLAUDE-61: open the `runs` row for one webhook fast-path event and stamp its
+/// single planned job key. Returns the run id, or `None` when `run_begin`
+/// failed (the pipeline still runs, just unrecorded). Failures are logged, not
+/// propagated: a DB hiccup must never strand the event consumer.
+async fn begin_webhook_run(pool: &SqlitePool, job_key: &str) -> Option<i64> {
+    match state::run_begin(pool, WEBHOOK_MINT_ACTION, WEBHOOK_TRIGGERED_BY).await {
+        Ok(id) => {
+            if let Err(e) =
+                state::run_set_job_keys(pool, id, std::slice::from_ref(&job_key.to_string())).await
+            {
+                warn!(error = %e, "recording webhook run job key failed");
+            }
+            Some(id)
+        }
+        Err(e) => {
+            warn!(error = %e, "opening webhook run row failed; event runs unrecorded");
+            None
+        }
+    }
+}
+
+/// CLAUDE-61: close a webhook fast-path run. Writes one `job_outcomes` row
+/// carrying the human-readable `summary` (triage bucket + mint result, plus the
+/// redacted-log artifact path when present) and finalizes the run. A webhook run
+/// has no `claude --print` stream (`claude_ran = false`), so the run-detail page
+/// shows the summary instead of a stream link. `attempt_counted = false`: the
+/// DEV-335 caps ledger is advanced separately inside [`triage_and_mint`] and
+/// must not be double counted here. A no-op when `run_id` is `None`.
+async fn finish_webhook_run(
+    pool: &SqlitePool,
+    run_id: Option<i64>,
+    job_key: &str,
+    summary: &str,
+    ok: bool,
+    artifact: Option<&std::path::Path>,
+) {
+    let Some(run_id) = run_id else {
+        return;
+    };
+    let full = match artifact {
+        Some(p) => format!("{summary}; log={}", p.display()),
+        None => summary.to_string(),
+    };
+    let outcome = state::JobOutcome {
+        run_id,
+        action_name: WEBHOOK_MINT_ACTION,
+        job_key,
+        attempt: 1,
+        ok,
+        claude_ran: false,
+        claude_ok: false,
+        claude_cost_usd: 0.0,
+        attempt_counted: false,
+        summary: Some(&full),
+        stream_log_path: None,
+        duration_ms: 0,
+        timed_out: false,
+    };
+    if let Err(e) = state::job_outcome_insert(pool, &outcome).await {
+        warn!(error = %e, "recording webhook run outcome failed");
+    }
+    let exit_code = if ok {
+        crate::exit::OK
+    } else {
+        crate::exit::UNEXPECTED
+    };
+    if let Err(e) = state::run_finish(pool, run_id, exit_code, 1).await {
+        warn!(error = %e, "finalizing webhook run failed");
+    }
+}
+
+/// CLAUDE-61: the run-record summary for one webhook fast-path event. `text` is
+/// the human-readable outcome (triage bucket + mint result, or an error), and
+/// `ok` is whether the pipeline completed: a decided outcome (mint or any skip)
+/// is `ok`, a triage/mint fault is not.
+struct WebhookRunSummary {
+    text: String,
+    ok: bool,
+}
+
+impl WebhookRunSummary {
+    fn decided(bucket: crate::triage::TriageBucket, outcome: &MintOutcome) -> Self {
+        Self {
+            text: format!("triage={bucket}; {}", mint_summary(outcome)),
+            ok: true,
+        }
+    }
+
+    fn error(message: String) -> Self {
+        Self {
+            text: format!("triage/mint error: {message}"),
+            ok: false,
+        }
+    }
+}
+
+/// One-line description of a [`MintOutcome`] for the run summary: the minted
+/// issue key on success, or the skip reason otherwise.
+fn mint_summary(outcome: &MintOutcome) -> String {
+    match outcome {
+        MintOutcome::Created { key, project, .. } => format!("minted {key} in {project}"),
+        MintOutcome::SkippedTransient => "no issue (transient)".to_string(),
+        MintOutcome::SkippedBotLoop => "no issue (bot-loop guard)".to_string(),
+        MintOutcome::SkippedAttemptCap => "no issue (per-key attempt cap)".to_string(),
+        MintOutcome::SkippedDailyCap => "no issue (daily run cap)".to_string(),
+        MintOutcome::SkippedDuplicateOpen { existing } => {
+            format!("no issue (duplicate of open {existing})")
+        }
+        MintOutcome::SkippedResolved { existing } => {
+            format!("no issue (resolved {existing} not reopened)")
+        }
     }
 }
 
@@ -287,7 +449,7 @@ async fn triage_and_mint(
     log_text: String,
     log_available: bool,
     log_artifact: Option<PathBuf>,
-) {
+) -> WebhookRunSummary {
     // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
     // run's (repo, index); the daily ledger is per synthetic action. The
     // read-then-increment below is race-free because `consume_events` drains the
@@ -327,15 +489,15 @@ async fn triage_and_mint(
     })
     .await;
 
-    let outcome = match outcome {
+    let (bucket, outcome) = match outcome {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "triage/mint failed");
-            return;
+            return WebhookRunSummary::error(e.to_string());
         }
         Err(e) => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "triage/mint task panicked");
-            return;
+            return WebhookRunSummary::error(format!("task panicked: {e}"));
         }
     };
 
@@ -352,6 +514,7 @@ async fn triage_and_mint(
     }
 
     log_mint_outcome(ev, &outcome);
+    WebhookRunSummary::decided(bucket, &outcome)
 }
 
 /// Pure triage + mint composition over the two traits, with `has_open_pr`
@@ -370,7 +533,7 @@ fn decide_mint(
     log_available: bool,
     log_artifact: Option<&std::path::Path>,
     has_open_pr: bool,
-) -> crate::error::Result<MintOutcome> {
+) -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
     let input = TriageInput {
         repo: ev.repo.clone(),
         workflow_id: ev.workflow_id.clone(),
@@ -391,7 +554,8 @@ fn decide_mint(
         triage: &verdict,
         log_path: log_artifact,
     };
-    mint::mint(tracker, mint_cfg, &req, caps)
+    let outcome = mint::mint(tracker, mint_cfg, &req, caps)?;
+    Ok((verdict.bucket, outcome))
 }
 
 /// Best-effort `has_open_pr` signal for the triage classifier: list the repo's
@@ -940,7 +1104,7 @@ mod tests {
         // the LLM classifier must never run and nothing is minted.
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
-        let out = decide_mint(
+        let (bucket, out) = decide_mint(
             &classifier,
             &tracker,
             &mint_cfg(),
@@ -952,6 +1116,7 @@ mod tests {
             false,
         )
         .unwrap();
+        assert_eq!(bucket, TriageBucket::Transient);
         assert_eq!(out, MintOutcome::SkippedTransient);
         assert_eq!(*classifier.calls.lock().unwrap(), 0, "rules short-circuit");
         assert!(tracker.calls().is_empty());
@@ -962,7 +1127,7 @@ mod tests {
         // A clear infra signature is bucket 3 by the rules pass, even with a log.
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
-        let out = decide_mint(
+        let (bucket, out) = decide_mint(
             &classifier,
             &tracker,
             &mint_cfg(),
@@ -974,6 +1139,7 @@ mod tests {
             true,
         )
         .unwrap();
+        assert_eq!(bucket, TriageBucket::Transient);
         assert_eq!(out, MintOutcome::SkippedTransient);
         assert_eq!(*classifier.calls.lock().unwrap(), 0);
     }
@@ -984,7 +1150,7 @@ mod tests {
         // queued for the fix bot, no human assignee.
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
-        let out = decide_mint(
+        let (bucket, out) = decide_mint(
             &classifier,
             &tracker,
             &mint_cfg(),
@@ -996,6 +1162,7 @@ mod tests {
             true,
         )
         .unwrap();
+        assert_eq!(bucket, TriageBucket::CodeFix);
         assert_eq!(
             out,
             MintOutcome::Created {
@@ -1022,7 +1189,7 @@ mod tests {
     fn human_action_classification_assigns_a_human() {
         let classifier = StubClassifier::new(TriageBucket::HumanAction);
         let tracker = StubTracker::new();
-        let out = decide_mint(
+        let (bucket, out) = decide_mint(
             &classifier,
             &tracker,
             &mint_cfg(),
@@ -1034,6 +1201,7 @@ mod tests {
             false,
         )
         .unwrap();
+        assert_eq!(bucket, TriageBucket::HumanAction);
         assert!(matches!(
             out,
             MintOutcome::Created {
@@ -1080,5 +1248,98 @@ mod tests {
             Some("localhost:3000")
         );
         assert_eq!(forge_host_from_url("").as_deref(), None);
+    }
+
+    // ---- CLAUDE-61: webhook runs are recorded ----------------------------
+
+    /// Canned [`LogTransport`] returning a fixed 200 body, so the fetch is
+    /// `Ready` on the first attempt and the backoff loop never sleeps.
+    struct ReadyTransport;
+    impl crate::forge_log::LogTransport for ReadyTransport {
+        fn get(
+            &self,
+            _url: &str,
+            _token: Option<&str>,
+        ) -> std::result::Result<crate::forge_log::HttpResponse, String> {
+            Ok(crate::forge_log::HttpResponse {
+                status: 200,
+                body: "assertion failed: expected 1 got 2".to_string(),
+            })
+        }
+    }
+
+    async fn memory_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::db::MIGRATOR.run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn consumed_event_records_a_webhook_run() {
+        // Drive `consume_events` with one event and no mint context (log-only),
+        // then assert the run + outcome rows landed under the synthetic action.
+        let pool = memory_pool().await;
+        let out_dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(event()).await.unwrap();
+        drop(tx); // close the channel so `consume_events` returns after draining.
+
+        consume_events(
+            rx,
+            pool.clone(),
+            Arc::new(ReadyTransport),
+            out_dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+
+        // One finished run, recorded under the synthetic action + webhook source.
+        let (action, triggered, jobs, exit): (String, String, i64, Option<i64>) =
+            sqlx::query_as("SELECT action_name, triggered_by, jobs_processed, exit_code FROM runs")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(action, WEBHOOK_MINT_ACTION);
+        assert_eq!(triggered, WEBHOOK_TRIGGERED_BY);
+        assert_eq!(jobs, 1);
+        assert_eq!(exit, Some(crate::exit::OK as i64));
+
+        // The outcome carries a summary; with no backend it is the log-only note,
+        // and it references the redacted artifact that the ready fetch wrote.
+        let (job_key, summary): (String, Option<String>) =
+            sqlx::query_as("SELECT job_key, summary FROM job_outcomes")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(job_key, "fabrikam/forgejo-cli#7");
+        let summary = summary.expect("summary recorded");
+        assert!(summary.contains("log-only"), "{summary}");
+        assert!(summary.contains("log="), "artifact reference: {summary}");
+    }
+
+    #[test]
+    fn mint_summary_describes_each_outcome() {
+        assert_eq!(
+            mint_summary(&MintOutcome::Created {
+                key: "CLAUDE-99".to_string(),
+                project: "FJ".to_string(),
+                bucket: crate::triage::TriageBucket::CodeFix,
+            }),
+            "minted CLAUDE-99 in FJ"
+        );
+        assert!(mint_summary(&MintOutcome::SkippedTransient).contains("transient"));
+        assert!(mint_summary(&MintOutcome::SkippedDailyCap).contains("daily run cap"));
+        // A decided skip is still an `ok` run (the pipeline completed).
+        let s = WebhookRunSummary::decided(
+            crate::triage::TriageBucket::Transient,
+            &MintOutcome::SkippedTransient,
+        );
+        assert!(s.ok);
+        assert!(s.text.contains("triage=transient"));
+        assert!(!WebhookRunSummary::error("boom".to_string()).ok);
     }
 }

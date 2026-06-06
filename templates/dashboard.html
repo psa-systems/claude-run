@@ -44,24 +44,29 @@
     <div class="card">
       <h3><a href="/actions/{{ a.name }}">{{ a.name }}</a></h3>
       <div class="meta">
-        {% if a.parse_error.is_some() %}
-          <span class="badge bad">parse error</span>
-        {% else if !a.enabled %}
-          <span class="badge neutral">disabled</span>
-        {% else if a.paused.is_some() %}
-          <span class="badge pause">paused</span>
+        {% if a.synthetic %}
+          <span class="badge ok">event-driven</span> - webhook fast-path (read-only)
         {% else %}
-          <span class="badge ok">enabled</span>
-        {% endif %}
-        {% if let Some(k) = a.schedule_kind %}
-          - {{ k }}{% if let Some(s) = a.schedule_spec %} {{ s }}{% endif %}
-        {% else %}
-          - no schedule
+          {% if a.parse_error.is_some() %}
+            <span class="badge bad">parse error</span>
+          {% else if !a.enabled %}
+            <span class="badge neutral">disabled</span>
+          {% else if a.paused.is_some() %}
+            <span class="badge pause">paused</span>
+          {% else %}
+            <span class="badge ok">enabled</span>
+          {% endif %}
+          {% if let Some(k) = a.schedule_kind %}
+            - {{ k }}{% if let Some(s) = a.schedule_spec %} {{ s }}{% endif %}
+          {% else %}
+            - no schedule
+          {% endif %}
         {% endif %}
       </div>
       <div class="meta">
         last run: {% if let Some(t) = a.last_run_started %}{{ t }}{% else %}<span class="dim">never</span>{% endif %}
       </div>
+      {% if !a.synthetic %}
       <div class="row-actions">
         <form hx-post="/api/actions/{{ a.name }}/trigger"
               hx-swap="none"
@@ -85,6 +90,7 @@
           </form>
         {% endif %}
       </div>
+      {% endif %}
     </div>
   {% endfor %}
   {% if actions.is_empty() %}
