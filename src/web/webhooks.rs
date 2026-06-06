@@ -92,10 +92,28 @@ pub struct ActionRun {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "ActionUserRaw")]
 pub struct ActionUser {
-    /// Forgejo user objects carry both `login` and `username`; accept either.
-    #[serde(alias = "username")]
+    /// Forgejo user objects carry both `login` and `username` (often with the
+    /// same value). Both keys are accepted independently and reconciled in
+    /// `TryFrom<ActionUserRaw>`, preferring `login`; at least one must be present.
     pub login: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ActionUserRaw {
+    login: Option<String>,
+    username: Option<String>,
+}
+
+impl TryFrom<ActionUserRaw> for ActionUser {
+    type Error = String;
+    fn try_from(raw: ActionUserRaw) -> Result<Self, Self::Error> {
+        raw.login
+            .or(raw.username)
+            .map(|login| ActionUser { login })
+            .ok_or_else(|| "user object has neither `login` nor `username`".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -718,6 +736,34 @@ mod tests {
         let allowed = vec!["contoso/claude-run".to_string()];
         let event = verified_failure_event(&payload, &allowed).unwrap();
         assert_eq!(event.trigger_user, "carol");
+    }
+
+    #[test]
+    fn trigger_user_accepts_both_login_and_username() {
+        // Live Forgejo 14.0.2 payloads carry both keys in one user object; the
+        // old `#[serde(alias = "username")]` rejected this with `duplicate field
+        // `login``. Both present must parse and yield the `login` value.
+        let body = r#"{"action":"failure","run":{"index_in_repo":1,"commit_sha":"x",
+            "workflow_id":"ci.yml","status":"failure",
+            "trigger_user":{"login":"dave","username":"dave"},
+            "html_url":"https://dev.a8n.run/contoso/claude-run/actions/runs/1",
+            "repository":{"full_name":"contoso/claude-run"}}}"#;
+        let payload: ActionPayload = serde_json::from_str(body).unwrap();
+        let allowed = vec!["contoso/claude-run".to_string()];
+        let event = verified_failure_event(&payload, &allowed).unwrap();
+        assert_eq!(event.trigger_user, "dave");
+    }
+
+    #[test]
+    fn trigger_user_with_neither_key_fails_parse() {
+        let body = r#"{"action":"failure","run":{"index_in_repo":1,"commit_sha":"x",
+            "workflow_id":"ci.yml","status":"failure","trigger_user":{},
+            "html_url":"https://dev.a8n.run/contoso/claude-run/actions/runs/1",
+            "repository":{"full_name":"contoso/claude-run"}}}"#;
+        let err = serde_json::from_str::<ActionPayload>(body).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("login"), "error names `login`: {msg}");
+        assert!(msg.contains("username"), "error names `username`: {msg}");
     }
 
     #[test]
