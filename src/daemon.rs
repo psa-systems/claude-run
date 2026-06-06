@@ -114,7 +114,10 @@ impl Daemon {
         // TCP router: web UI at root, JSON API under `/api/`. Same handlers
         // as the unix-socket flavor, just nested + sibling-mounted.
         let api_for_tcp = api::router((*api_state).clone());
-        let web_router = crate::web::router(api_state.clone(), self.paths.clone());
+        // CLAUDE-61: the web layer injects the synthetic `webhook-fast-path`
+        // action only when the webhook fast-path is configured (`secret_ref` set).
+        let webhook_enabled = self.on_disk.webhook.secret_ref.is_some();
+        let web_router = crate::web::router(api_state.clone(), self.paths.clone(), webhook_enabled);
 
         // CLAUDE-43: Forgejo webhook listener. Verified `action_run_failure`
         // events are emitted onto a channel drained by `consume_events`, which
@@ -179,6 +182,7 @@ impl Daemon {
         let mint_ctx = build_mint_context(&pool, &self.on_disk.mint, &claude, &webhook_log_dir);
         let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(
             webhook_rx,
+            pool.clone(),
             webhook_transport,
             webhook_log_dir,
             mint_ctx,
@@ -519,6 +523,19 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
         }
         match action::load_from_path(&path) {
             Ok(la) => {
+                // CLAUDE-61: `webhook-fast-path` is a reserved synthetic action
+                // name the web layer injects for the event-driven webhook runs.
+                // An on-disk YAML claiming it would be editable / schedulable and
+                // would collide with the synthetic entry, so refuse to index it.
+                if la.action.name == crate::web::webhooks::WEBHOOK_MINT_ACTION {
+                    warn!(
+                        path = %path.display(),
+                        name = %la.action.name,
+                        "refusing to index action: `{}` is a reserved synthetic name",
+                        crate::web::webhooks::WEBHOOK_MINT_ACTION
+                    );
+                    continue;
+                }
                 let row = ActionIndexRow {
                     name: la.action.name.clone(),
                     file_path: la.path.display().to_string(),
@@ -542,6 +559,16 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("invalid");
+                // CLAUDE-61: same reservation as the parse-ok branch - never let a
+                // file (even an unparseable one) occupy the synthetic name's slot.
+                if stem == crate::web::webhooks::WEBHOOK_MINT_ACTION {
+                    warn!(
+                        path = %path.display(),
+                        "refusing to index file: `{}` is a reserved synthetic name",
+                        crate::web::webhooks::WEBHOOK_MINT_ACTION
+                    );
+                    continue;
+                }
                 let row = ActionIndexRow {
                     name: stem.to_string(),
                     file_path: path.display().to_string(),
@@ -1200,5 +1227,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(runs, 1, "run history is retained across a prune");
+    }
+
+    // CLAUDE-61: an on-disk YAML claiming the reserved synthetic name
+    // `webhook-fast-path` must not be indexed (it would collide with the
+    // synthetic action the web layer injects, and become editable/schedulable).
+    #[tokio::test]
+    async fn scan_actions_refuses_reserved_synthetic_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let actions_dir = tmp.path().join("actions");
+        std::fs::create_dir_all(&actions_dir).unwrap();
+        // A perfectly valid action that simply claims the reserved name.
+        let file = actions_dir.join("webhook-fast-path.yml");
+        std::fs::write(
+            &file,
+            "name: webhook-fast-path\ninput:\n  command: print '[]'\nprompt: print 'hi'\nenabled: false\n",
+        )
+        .unwrap();
+
+        scan_actions(&pool, &actions_dir).await.unwrap();
+        assert!(
+            !state::action_index_list(&pool)
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.name == crate::web::webhooks::WEBHOOK_MINT_ACTION),
+            "a YAML using the reserved synthetic name must not be indexed"
+        );
     }
 }

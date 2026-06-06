@@ -154,6 +154,17 @@ async fn trigger_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AckResponse>, AppError> {
+    // CLAUDE-61: the synthetic `webhook-fast-path` action is event-driven; it has
+    // no input/prompt and the scheduler never dispatches it, so a manual trigger
+    // is meaningless. Reject it explicitly rather than 404 as "unknown".
+    if name == crate::web::webhooks::WEBHOOK_MINT_ACTION {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!(
+                "`{name}` is an event-driven synthetic action and cannot be triggered"
+            ),
+        });
+    }
     // Confirm the action exists before queueing.
     let rows = state::action_index_list(&s.pool).await?;
     if !rows.iter().any(|r| r.name == name) {
@@ -213,6 +224,14 @@ async fn delete_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AckResponse>, AppError> {
+    // CLAUDE-61: the synthetic `webhook-fast-path` action has no backing YAML to
+    // remove; refuse deletion explicitly.
+    if name == crate::web::webhooks::WEBHOOK_MINT_ACTION {
+        return Err(AppError {
+            status: StatusCode::FORBIDDEN,
+            message: format!("`{name}` is a synthetic event-driven action and cannot be deleted"),
+        });
+    }
     // 404 before any side effect: only indexed actions are deletable.
     let rows = state::action_index_list(&s.pool).await?;
     if !rows.iter().any(|r| r.name == name) {
@@ -331,5 +350,52 @@ impl IntoResponse for AppError {
             Json(serde_json::json!({"error": self.message})),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::MIGRATOR;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn app_state() -> Arc<AppState> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let (trigger_tx, _rx) = mpsc::channel(8);
+        Arc::new(AppState {
+            pool,
+            trigger_tx,
+            version: "test",
+            runs: Arc::new(RunRegistry::new()),
+            in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        })
+    }
+
+    /// CLAUDE-61: the event-driven synthetic action cannot be triggered.
+    #[tokio::test]
+    async fn trigger_rejects_synthetic_action() {
+        let s = app_state().await;
+        let name = crate::web::webhooks::WEBHOOK_MINT_ACTION.to_string();
+        let err = trigger_action(State(s.clone()), AxumPath(name))
+            .await
+            .expect_err("synthetic trigger must error");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("event-driven"), "{}", err.message);
+    }
+
+    /// CLAUDE-61: the synthetic action cannot be deleted (no backing YAML).
+    #[tokio::test]
+    async fn delete_rejects_synthetic_action() {
+        let s = app_state().await;
+        let name = crate::web::webhooks::WEBHOOK_MINT_ACTION.to_string();
+        let err = delete_action(State(s.clone()), AxumPath(name))
+            .await
+            .expect_err("synthetic delete must error");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 }
