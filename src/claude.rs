@@ -16,10 +16,13 @@
 //! the whole stream log - that previously false-positived on MCP "needs-auth"
 //! strings in the `system/init` event.
 
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+use chrono::SecondsFormat;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -95,8 +98,10 @@ impl ClaudeInvoker {
             .join(format!("{key}-attempt-{attempt}.jsonl"))
     }
 
-    /// Spawn claude, redirect stdout+stderr to `stream_log`, wait, then parse
-    /// the last NDJSON line for the final result event.
+    /// Spawn claude, relay its stdout to `stream_log` stamping each JSON event
+    /// line with an arrival-time `ts` (stderr is a direct, unstamped redirect to
+    /// the same file), wait, then parse the last NDJSON line for the final
+    /// result event.
     ///
     /// CLAUDE-9: the child is spawned in its own process group and the wait is
     /// cancellable. When `cancel` trips, the whole group (the `timeout`
@@ -133,15 +138,31 @@ impl ClaudeInvoker {
             .clone()
             .unwrap_or_else(|| "acceptEdits".to_string());
 
+        // CLAUDE-63: the relay thread (below) owns `log_file` and writes
+        // per-event-stamped stdout lines to it; stderr keeps a direct fd
+        // redirect via a `try_clone`. Both clones share the same open file
+        // description (and therefore a single append cursor), so stamped stdout
+        // and unstamped stderr interleave in arrival order without clobbering.
         let log_file = std::fs::File::create(stream_log)?;
         let log_err = log_file.try_clone()?;
 
         // We delegate the wall-clock timeout to coreutils `timeout(1)` (same as
         // the nu implementation) so the exit-code-124 contract is preserved.
-        // Inside it we run claude with closed stdin and merged stdout+stderr
-        // redirected to the stream log. `process_group(0)` puts the child (and
-        // therefore claude + descendants) in a fresh group whose pgid equals
-        // the child's pid, so cancellation can signal the whole tree at once.
+        // Inside it we run claude with closed stdin. `process_group(0)` puts the
+        // child (and therefore claude + descendants) in a fresh group whose pgid
+        // equals the child's pid, so cancellation can signal the whole tree at
+        // once.
+        //
+        // CLAUDE-63: stdout is piped (not a direct fd redirect) so a relay
+        // thread can stamp each JSON event line with its arrival time before it
+        // lands in the stream log. stderr stays a direct redirect: claude's
+        // stderr is incidental non-JSON noise and is left unstamped by design.
+        //
+        // Tradeoff: the old direct fd redirect let the child keep writing even
+        // if the runner died; the pipe relay means a dead runner blocks the
+        // child's stdout pipe. Accepted because the runner already owns the
+        // child's lifecycle (timeout kill, CLAUDE-52 / CLAUDE-53), so a dead
+        // runner already implies a dead run.
         let mut child = Command::new("timeout")
             .arg(format!("{}s", timeout.as_secs()))
             .arg(&self.binary)
@@ -153,14 +174,30 @@ impl ClaudeInvoker {
             .arg(prompt)
             .current_dir(&cwd)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file))
+            .stdout(Stdio::piped())
             .stderr(Stdio::from(log_err))
             .process_group(0)
             .spawn()?;
 
+        // Relay claude's piped stdout to the stream log, stamping each JSON
+        // object line with its arrival time. Runs on its own thread next to the
+        // blocking wait below and drains to EOF (the pipe closes when the child
+        // group exits, including a timeout/cancel kill, so all output up to the
+        // kill is captured).
+        let relay = child
+            .stdout
+            .take()
+            .map(|stdout| std::thread::spawn(move || relay_stamped_stdout(stdout, log_file)));
+
         let pgid = child.id() as i32;
         let outcome = wait_or_cancel(&mut child, pgid, stream_log, self.result_exit_grace, cancel)?;
         let status = outcome.status;
+
+        // Drain the relay: the child group has exited, so the stdout pipe is at
+        // EOF and the thread has flushed every line it read up to the kill.
+        if let Some(relay) = relay {
+            let _ = relay.join();
+        }
 
         let exit_code = status.code().unwrap_or(-1);
         let final_event = parse_final_result(stream_log).unwrap_or(Value::Null);
@@ -360,6 +397,56 @@ fn classify_transient(exit_code: i32, final_event: &Value) -> bool {
         || api_status.contains("429")
         || event_err.contains("rate limit")
         || event_err.contains("usage limit")
+}
+
+/// CLAUDE-63: relay the child's piped stdout to `sink`, stamping each line that
+/// parses as a JSON object with a top-level RFC 3339 `ts` (arrival time). Lines
+/// that do not parse as a JSON object pass through byte-identically (defensive:
+/// never lose output). Flush per line so the SSE tail and the terminal-result
+/// poller see events promptly.
+fn relay_stamped_stdout(stdout: ChildStdout, mut sink: std::fs::File) {
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let stamped = stamp_line(&line);
+        if sink.write_all(&stamped).is_err() {
+            break;
+        }
+        let _ = sink.flush();
+    }
+}
+
+/// Augment a single stream line with an arrival-time `ts` key. `raw` is the line
+/// as read, including its trailing `\n` if present. A line whose content parses
+/// as a JSON object gets a top-level `ts` (RFC 3339, millis, UTC) inserted and
+/// is re-serialized, preserving every original key; the trailing newline (if
+/// any) is reattached. Anything else (a non-object JSON value, a partial line,
+/// or non-JSON noise) is returned unchanged, byte for byte.
+fn stamp_line(raw: &[u8]) -> Vec<u8> {
+    let (content, newline): (&[u8], &[u8]) = match raw.last() {
+        Some(b'\n') => (&raw[..raw.len() - 1], &raw[raw.len() - 1..]),
+        _ => (raw, b""),
+    };
+    let Ok(Value::Object(mut map)) = serde_json::from_slice::<Value>(content) else {
+        return raw.to_vec();
+    };
+    let ts = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    map.insert("ts".to_string(), Value::String(ts));
+    match serde_json::to_vec(&Value::Object(map)) {
+        Ok(mut out) => {
+            out.extend_from_slice(newline);
+            out
+        }
+        // Re-serialization should never fail for a value we just deserialized;
+        // if it somehow does, fall back to the original bytes.
+        Err(_) => raw.to_vec(),
+    }
 }
 
 fn parse_final_result(stream_log: &Path) -> Option<Value> {
@@ -782,6 +869,125 @@ mod tests {
             res.raw.get("api_error_status").and_then(|v| v.as_str()),
             Some("529")
         );
+    }
+
+    /// CLAUDE-63: a JSON object line is augmented with a top-level `ts` that
+    /// parses as RFC 3339, every original key is preserved, and the trailing
+    /// newline is kept.
+    #[test]
+    fn stamp_line_augments_json_object() {
+        let raw = b"{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"opus\"}\n";
+        let stamped = stamp_line(raw);
+        assert_eq!(stamped.last(), Some(&b'\n'), "trailing newline preserved");
+        let v: Value = serde_json::from_slice(&stamped).unwrap();
+        assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("system"));
+        assert_eq!(v.get("subtype").and_then(|t| t.as_str()), Some("init"));
+        assert_eq!(v.get("model").and_then(|t| t.as_str()), Some("opus"));
+        let ts = v.get("ts").and_then(|t| t.as_str()).expect("ts present");
+        chrono::DateTime::parse_from_rfc3339(ts).expect("ts is RFC 3339");
+    }
+
+    /// CLAUDE-63: a non-JSON line (and a non-object JSON value) passes through
+    /// byte-identically - we never lose or rewrite output we can't stamp.
+    #[test]
+    fn stamp_line_passes_non_object_through_unchanged() {
+        for raw in [
+            &b"not json at all\n"[..],
+            &b"[1,2,3]\n"[..],             // valid JSON, but not an object
+            &b"\"a string\"\n"[..],        // valid JSON scalar
+            &b"{partial line no newl"[..], // no trailing newline, unparseable
+            &b"\n"[..],                    // a bare blank line
+        ] {
+            assert_eq!(stamp_line(raw), raw.to_vec(), "{:?} must pass through", raw);
+        }
+    }
+
+    /// CLAUDE-63: a JSON object line without a trailing newline still gets a
+    /// `ts` and stays newline-free (no spurious newline is appended).
+    #[test]
+    fn stamp_line_no_trailing_newline() {
+        let raw = b"{\"type\":\"result\"}";
+        let stamped = stamp_line(raw);
+        assert_ne!(stamped.last(), Some(&b'\n'), "no newline added");
+        let v: Value = serde_json::from_slice(&stamped).unwrap();
+        assert!(v.get("ts").is_some());
+        assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("result"));
+    }
+
+    /// CLAUDE-63: `parse_final_result` still finds the terminal result event in a
+    /// stamped log (the added `ts` key does not disturb the `type` lookup).
+    #[test]
+    fn parse_final_result_finds_result_in_stamped_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        let stamped = String::from_utf8(stamp_line(format!("{RESULT_LINE}\n").as_bytes())).unwrap();
+        std::fs::write(&log, stamped).unwrap();
+        let final_event = parse_final_result(&log).unwrap();
+        assert_eq!(
+            final_event.get("type").and_then(|t| t.as_str()),
+            Some("result")
+        );
+        assert!(
+            final_event.get("ts").is_some(),
+            "stamped result keeps its ts"
+        );
+    }
+
+    /// CLAUDE-63 (smoke): a run through a stub claude that emits several JSON
+    /// events produces a stream file where every JSON line carries a `ts` and
+    /// the timestamps are monotonically non-decreasing.
+    #[test]
+    fn invoke_stamps_every_json_line_monotonically() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        // Emit an init event, a tool_use, then the terminal result, with a small
+        // gap so arrival times advance.
+        write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n\
+             printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[]}}'\n\
+             sleep 0.05\n\
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"total_cost_usd\":0.1}'\n\
+             exit 0\n",
+        );
+
+        let invoker = ClaudeInvoker {
+            binary: stub.to_str().unwrap().to_string(),
+            result_exit_grace: Duration::from_secs(30),
+        };
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let res = invoker
+            .invoke(
+                "hi",
+                &cfg,
+                Duration::from_secs(10),
+                dir.path(),
+                &log,
+                &cancel,
+            )
+            .unwrap();
+        assert!(res.ok, "stub run succeeds");
+
+        let raw = std::fs::read_to_string(&log).unwrap();
+        let mut prev: Option<chrono::DateTime<chrono::FixedOffset>> = None;
+        let mut json_lines = 0;
+        for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+            let v: Value = serde_json::from_str(line).expect("every line is JSON");
+            let ts = v
+                .get("ts")
+                .and_then(|t| t.as_str())
+                .unwrap_or_else(|| panic!("line missing ts: {line}"));
+            let parsed = chrono::DateTime::parse_from_rfc3339(ts).expect("ts is RFC 3339");
+            if let Some(p) = prev {
+                assert!(parsed >= p, "timestamps non-decreasing");
+            }
+            prev = Some(parsed);
+            json_lines += 1;
+        }
+        assert_eq!(json_lines, 3, "all three emitted events are stamped");
     }
 
     /// CLAUDE-56: a populated event renders a collapsed, pretty-printed JSON
