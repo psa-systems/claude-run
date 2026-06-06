@@ -82,6 +82,21 @@ XDG-compliant; each path overridable by the matching env var.
 
 `workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-job workdirs live; defaults to `$DATA_DIR/workdirs/`. Supports `~`, `$VAR`, `${VAR}` expansion.
 
+## Logging
+
+Log verbosity is a [tracing `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives) directive string. Precedence is `CLAUDE_RUN_LOG` (env var) > `[daemon].log_filter` (config.toml) > the built-in default `info,claude_run=info,sqlx=warn`.
+
+```toml
+# config.toml
+[daemon]
+# Persistent log filter. Same syntax as the CLAUDE_RUN_LOG env var.
+log_filter = "info,claude_run=debug,sqlx=warn"
+```
+
+Set `[daemon].log_filter` for a persistent change (no systemd override needed); it is applied right after config load and logs a `log filter applied from config.toml` line. Set `CLAUDE_RUN_LOG=...` for one-shot debugging: when it is present it wins and the config field is ignored. An invalid `log_filter` value is not fatal: the daemon logs a warning naming the value and the parse error, and keeps running on the current filter.
+
+Known limitation: the handful of startup lines emitted before config load (e.g. the config-source line) are governed by the initial filter, not `[daemon].log_filter`; use `CLAUDE_RUN_LOG` when those specific lines are needed at `debug`.
+
 ## Self-update (release trains)
 
 `claude-run version {show,check,update}` self-updates the binary from the Forgejo Generic Package registry. CI publishes two channels ("trains"), and `[update].train` in `config.toml` picks the default; `--train <release|latest>` overrides it per invocation:

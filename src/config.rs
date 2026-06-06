@@ -249,6 +249,43 @@ pub struct DaemonConfig {
     pub nu_binary: Option<String>,
     /// Optional override for the claude binary. Default: "claude".
     pub claude_binary: Option<String>,
+    /// CLAUDE-62: persistent log filter, a tracing `EnvFilter` directive string
+    /// (e.g. `info,claude_run=debug,sqlx=warn`). Applied after config load via a
+    /// reload layer. Precedence: `CLAUDE_RUN_LOG` > this field > the built-in
+    /// default (`info,claude_run=info,sqlx=warn`); set `CLAUDE_RUN_LOG` for
+    /// one-shot debugging without editing the file. Directive syntax:
+    /// <https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives>.
+    /// Known limitation: the few startup lines emitted before config load (e.g.
+    /// the CLAUDE-57 config-source line) are governed by the initial filter, not
+    /// this one; use `CLAUDE_RUN_LOG` when those specific lines are needed at debug.
+    pub log_filter: Option<String>,
+}
+
+/// CLAUDE-62: precedence decision for the post-config-load log-filter swap,
+/// extracted as a pure function so the `CLAUDE_RUN_LOG` > `[daemon].log_filter`
+/// > default ordering is unit-testable without a live tracing subscriber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogFilterChoice {
+    /// `CLAUDE_RUN_LOG` is set; it already seeded the initial filter and wins.
+    /// Leave the reload layer untouched (today's behavior, byte-for-byte).
+    EnvWins,
+    /// No env var and no `[daemon].log_filter`; the built-in default stands.
+    KeepDefault,
+    /// No env var, `[daemon].log_filter` present; swap this directive in.
+    ApplyFile(String),
+}
+
+/// Pure precedence logic for CLAUDE-62. `env_set` is whether `CLAUDE_RUN_LOG` is
+/// present in the environment; `file_filter` is `[daemon].log_filter`.
+pub fn log_filter_choice(env_set: bool, file_filter: Option<&str>) -> LogFilterChoice {
+    if env_set {
+        LogFilterChoice::EnvWins
+    } else {
+        match file_filter {
+            Some(f) => LogFilterChoice::ApplyFile(f.to_string()),
+            None => LogFilterChoice::KeepDefault,
+        }
+    }
 }
 
 /// CLAUDE-57: where the effective [`OnDiskConfig`] came from, so `serve` can
@@ -337,6 +374,59 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.update.train, "latest");
         assert_eq!(parsed.update.token_ref.as_deref(), Some("registry-token"));
+    }
+
+    // CLAUDE-62: the new `[daemon].log_filter` parses when present and is `None`
+    // when absent (the field must stay optional so existing files keep loading).
+    #[test]
+    fn daemon_log_filter_parses_and_defaults_to_none() {
+        // Absent: the whole `[daemon]` block can be missing.
+        let parsed: OnDiskConfig = toml::from_str("").unwrap();
+        assert!(parsed.daemon.log_filter.is_none());
+
+        // Present: the directive string round-trips.
+        let parsed: OnDiskConfig = toml::from_str(
+            r#"
+            [daemon]
+            log_filter = "info,claude_run=debug,sqlx=warn"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.daemon.log_filter.as_deref(),
+            Some("info,claude_run=debug,sqlx=warn")
+        );
+    }
+
+    // CLAUDE-62: the precedence function covers all four input combinations of
+    // (env set?) x (file set?). Env always wins; otherwise the file applies when
+    // present, else the default is kept.
+    #[test]
+    fn log_filter_choice_precedence() {
+        // Env set wins regardless of the file.
+        assert_eq!(log_filter_choice(true, None), LogFilterChoice::EnvWins);
+        assert_eq!(
+            log_filter_choice(true, Some("info,claude_run=debug")),
+            LogFilterChoice::EnvWins
+        );
+        // No env, file present -> apply the file.
+        assert_eq!(
+            log_filter_choice(false, Some("info,claude_run=debug")),
+            LogFilterChoice::ApplyFile("info,claude_run=debug".to_string())
+        );
+        // Neither -> keep the built-in default.
+        assert_eq!(log_filter_choice(false, None), LogFilterChoice::KeepDefault);
+    }
+
+    // CLAUDE-62: an invalid directive must be rejected at parse time so the apply
+    // path can keep the active filter instead of aborting the daemon.
+    #[test]
+    fn invalid_log_filter_directive_fails_to_parse() {
+        use tracing_subscriber::EnvFilter;
+        // A bare `=` with no level/target is not a valid directive.
+        assert!(EnvFilter::try_new("claude_run=not_a_level").is_err());
+        // A valid one parses, confirming the negative test is meaningful.
+        assert!(EnvFilter::try_new("info,claude_run=debug,sqlx=warn").is_ok());
     }
 
     // CLAUDE-57: `load` reports whether `config.toml` was present so `serve` can
