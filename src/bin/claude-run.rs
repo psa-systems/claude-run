@@ -230,7 +230,7 @@ fn init_tracing() {
 
 async fn real_main(cli: Cli) -> claude_run::error::Result<i32> {
     let paths = cfg::Paths::resolve()?;
-    let on_disk = cfg::OnDiskConfig::load(&paths)?;
+    let (on_disk, config_source) = cfg::OnDiskConfig::load(&paths)?;
 
     let actions_dir = cli
         .actions_dir
@@ -240,7 +240,7 @@ async fn real_main(cli: Cli) -> claude_run::error::Result<i32> {
 
     match cli.cmd {
         Cmd::Run { action } => run_action(&action, &actions_dir, &paths, &on_disk).await,
-        Cmd::Serve { detach } => serve(detach, paths, on_disk).await,
+        Cmd::Serve { detach } => serve(detach, paths, on_disk, config_source).await,
         Cmd::Stop => stop(&paths).await,
         Cmd::Restart { detach } => restart(detach, cli.actions_dir.as_deref(), &paths).await,
         Cmd::Trigger { action } => trigger(&action, &paths).await,
@@ -383,7 +383,12 @@ async fn serve(
     _detach: bool, // already actioned in main() before the tokio runtime started
     paths: cfg::Paths,
     on_disk: cfg::OnDiskConfig,
+    config_source: cfg::ConfigSource,
 ) -> claude_run::error::Result<i32> {
+    // CLAUDE-57: one startup line recording which config file backed this run
+    // (or that defaults silently won), so `journalctl` alone answers why the
+    // web UI bound where it did.
+    config_source.log();
     let d = daemon::Daemon { paths, on_disk };
     d.run().await?;
     Ok(exit::OK)

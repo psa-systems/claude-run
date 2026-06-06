@@ -251,16 +251,52 @@ pub struct DaemonConfig {
     pub claude_binary: Option<String>,
 }
 
+/// CLAUDE-57: where the effective [`OnDiskConfig`] came from, so `serve` can
+/// log one startup line answering "was my config actually read?". The silent
+/// default-fallback under systemd (a different resolved config dir than the
+/// shell, so the file "does not exist" there and defaults win) is exactly the
+/// case this disambiguates.
+#[derive(Debug, Clone)]
+pub enum ConfigSource {
+    /// `config.toml` existed at this path and was parsed.
+    Loaded(PathBuf),
+    /// No file at this path; built-in defaults are in use.
+    Defaulted(PathBuf),
+}
+
+impl ConfigSource {
+    /// Emit the single config-source startup line. `info` when a file backed the
+    /// config, `warn` when defaults silently won: a missing file under systemd
+    /// while the shell shows one is the silent failure CLAUDE-57 is about.
+    pub fn log(&self) {
+        match self {
+            ConfigSource::Loaded(path) => {
+                tracing::info!(path = %path.display(), "config loaded");
+            }
+            ConfigSource::Defaulted(path) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "config.toml not found; built-in defaults in use (web bind 127.0.0.1:7321)"
+                );
+            }
+        }
+    }
+}
+
 impl OnDiskConfig {
-    pub fn load(paths: &Paths) -> Result<Self> {
+    /// Load `config.toml`, returning the parsed config alongside a
+    /// [`ConfigSource`] recording whether the file existed. A missing file is
+    /// not an error (built-in defaults apply); a present-but-invalid file aborts
+    /// loudly so it is never the silent case.
+    pub fn load(paths: &Paths) -> Result<(Self, ConfigSource)> {
         let f = paths.config_file();
         if !f.exists() {
-            return Ok(Self::default());
+            return Ok((Self::default(), ConfigSource::Defaulted(f)));
         }
         let raw = std::fs::read_to_string(&f)?;
         let cfg: Self =
             toml::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing {}: {}", f.display(), e))?;
-        Ok(cfg)
+        Ok((cfg, ConfigSource::Loaded(f)))
     }
 }
 
@@ -301,5 +337,30 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.update.train, "latest");
         assert_eq!(parsed.update.token_ref.as_deref(), Some("registry-token"));
+    }
+
+    // CLAUDE-57: `load` reports whether `config.toml` was present so `serve` can
+    // log the source. A missing file falls back to defaults (the silent case
+    // this issue surfaces); a present file is parsed.
+    #[test]
+    fn load_reports_config_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+
+        // Missing file -> Defaulted, defaults applied (web bind 127.0.0.1).
+        let (cfg, src) = OnDiskConfig::load(&paths).unwrap();
+        assert!(matches!(src, ConfigSource::Defaulted(_)));
+        assert_eq!(cfg.web.bind, "127.0.0.1");
+
+        // Present file -> Loaded, parsed value wins.
+        std::fs::write(paths.config_file(), "[web]\nbind = \"198.51.100.11\"\n").unwrap();
+        let (cfg, src) = OnDiskConfig::load(&paths).unwrap();
+        assert!(matches!(src, ConfigSource::Loaded(_)));
+        assert_eq!(cfg.web.bind, "198.51.100.11");
     }
 }
