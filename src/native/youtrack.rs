@@ -36,7 +36,7 @@ use tracing::{info, warn};
 use super::{HandlerFuture, NativeContext, NativeHandler};
 use crate::action::{NativeConfig, YoutrackSource};
 use crate::cancel::{CancellationToken, RegistryGuard};
-use crate::claude::{ClaudeInvoker, ClaudeResult};
+use crate::claude::{raw_event_details, ClaudeInvoker, ClaudeResult};
 use crate::concurrency::Executor;
 use crate::config::Paths;
 use crate::error::{Error, Result};
@@ -806,7 +806,7 @@ fn success_comment(r: &ClaudeResult, pr_url: &str) -> String {
 }
 
 fn pr_failure_comment(r: &ClaudeResult, err: &Error) -> String {
-    [
+    let mut body = [
         "Claude AI agent run completed but PR creation FAILED:".to_string(),
         String::new(),
         err.to_string(),
@@ -815,7 +815,9 @@ fn pr_failure_comment(r: &ClaudeResult, err: &Error) -> String {
         String::new(),
         format!("Cost: ${} USD", r.cost),
     ]
-    .join("\n")
+    .join("\n");
+    body.push_str(&raw_event_details(&r.raw));
+    body
 }
 
 /// CLAUDE-52: timeout-specific comment. Surfaces the ambiguity (the work may be
@@ -823,7 +825,7 @@ fn pr_failure_comment(r: &ClaudeResult, err: &Error) -> String {
 /// past the limit), states the runner did NOT mark the issue Failed, and points
 /// a human at the branch/PR and the run log (`r.error` carries the log path).
 fn timeout_comment(r: &ClaudeResult) -> String {
-    [
+    let mut body = [
         "Claude AI agent run TIMED OUT (the run hit its time limit and was killed):".to_string(),
         String::new(),
         format!("Details: {}", r.error),
@@ -836,18 +838,22 @@ fn timeout_comment(r: &ClaudeResult) -> String {
         String::new(),
         format!("Cost: ${} USD", r.cost),
     ]
-    .join("\n")
+    .join("\n");
+    body.push_str(&raw_event_details(&r.raw));
+    body
 }
 
 fn failure_comment(r: &ClaudeResult) -> String {
-    [
+    let mut body = [
         format!("Claude AI agent run FAILED ({}):", r.error),
         String::new(),
         r.summary.clone(),
         String::new(),
         format!("Cost: ${} USD", r.cost),
     ]
-    .join("\n")
+    .join("\n");
+    body.push_str(&raw_event_details(&r.raw));
+    body
 }
 
 /// Map a `ProcessedJob::Done` into the JSONL record + `job_outcomes` insert,
@@ -952,6 +958,39 @@ mod tests {
             transient: false,
             timed_out: true,
         }
+    }
+
+    /// CLAUDE-56: a failure with a populated `raw` event leads with the friendly
+    /// summary, preserves the first-line error and Cost line, and appends the
+    /// pretty-printed event in a collapsed `<details>` block.
+    #[test]
+    fn failure_comment_friendly_summary_and_collapsed_raw() {
+        let r = ClaudeResult {
+            ok: false,
+            summary: "API Error: 529 Overloaded.".into(),
+            cost: 0.01,
+            raw: serde_json::json!({"type":"result","is_error":true,"api_error_status":"529"}),
+            error: "claude exited 1, see stream.jsonl".into(),
+            transient: true,
+            timed_out: false,
+        };
+        let body = failure_comment(&r);
+        assert!(body.starts_with("Claude AI agent run FAILED (claude exited 1, see stream.jsonl):"));
+        assert!(body.contains("API Error: 529 Overloaded."));
+        assert!(body.contains("Cost: $0.01 USD"));
+        assert!(body.contains("<details>\n<summary>Raw result event</summary>"));
+        assert!(body.contains("```json"));
+        assert!(body.contains("\"api_error_status\": \"529\""));
+    }
+
+    /// CLAUDE-56: a synthesized failure (empty `raw`) omits the `<details>` block.
+    #[test]
+    fn failure_comment_omits_details_for_synthesized_raw() {
+        let r = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "pre step failed");
+        let body = failure_comment(&r);
+        assert!(body.contains("pre step failed"));
+        assert!(body.contains("Cost: $0 USD"));
+        assert!(!body.contains("<details>"));
     }
 
     #[test]
