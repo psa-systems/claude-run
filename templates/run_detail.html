@@ -98,7 +98,7 @@
   <table>
     <thead>
       <tr>
-        <th>Key</th><th>Attempt</th><th>OK</th><th>Claude</th><th>$</th><th>Counted</th><th>When</th><th>Duration</th><th>Stream</th>
+        <th>Key</th><th>Attempt</th><th>OK</th><th>Claude</th><th>$</th><th>Counted</th><th>When</th><th>Duration</th><th>Stream</th><th>Summary</th>
       </tr>
     </thead>
     <tbody>
@@ -134,6 +134,9 @@
             {% if o.claude_ran %}
               <a href="/runs/{{ run.id }}/jobs/{{ o.job_key }}/attempt/{{ o.attempt }}">view stream</a>
             {% else %}<span class="dim">-</span>{% endif %}
+          </td>
+          <td>
+            {% if let Some(sm) = o.summary %}{{ sm }}{% else %}<span class="dim">-</span>{% endif %}
           </td>
         </tr>
       {% endfor %}

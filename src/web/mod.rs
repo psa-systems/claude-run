@@ -43,10 +43,19 @@ const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
 pub struct WebState {
     pub api: Arc<AppState>,
     pub paths: Paths,
+    /// CLAUDE-61: whether the Forgejo webhook fast-path is configured
+    /// (`[webhook].secret_ref` set). When true the web layer injects a synthetic
+    /// read-only `webhook-fast-path` action so its runs are visible; when false
+    /// the entry is absent (historical runs stay queryable on the dashboard).
+    pub webhook_enabled: bool,
 }
 
-pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
-    let st = WebState { api, paths };
+pub fn router(api: Arc<AppState>, paths: Paths, webhook_enabled: bool) -> Router {
+    let st = WebState {
+        api,
+        paths,
+        webhook_enabled,
+    };
     Router::new()
         .route("/", get(dashboard))
         .route("/actions/new", get(action_new_page))
@@ -103,6 +112,10 @@ struct ActionView {
     parse_error: Option<String>,
     last_run_started: Option<String>,
     paused: Option<PauseInfo>,
+    /// CLAUDE-61: a synthetic, read-only, event-driven action (the
+    /// `webhook-fast-path` entry). The templates label it event-driven and hide
+    /// the edit / delete / trigger / pause controls, which do not apply.
+    synthetic: bool,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -170,6 +183,10 @@ struct JobOutcomeRow {
     /// Rendered with a distinct "timed out" badge instead of "fail", and
     /// excluded from the run's failed-job count.
     timed_out: bool,
+    /// CLAUDE-61: free-text outcome summary. Webhook fast-path runs have no
+    /// stream log, so this carries the triage bucket + mint result + redacted
+    /// log artifact reference; rendered on the run-detail outcomes table.
+    summary: Option<String>,
 }
 
 impl JobOutcomeRow {
@@ -324,9 +341,12 @@ fn build_duration_chart(series: &[(String, i64)]) -> DurationChart {
     }
 }
 
-async fn enriched_actions(pool: &SqlitePool) -> Result<Vec<ActionView>, WebError> {
+async fn enriched_actions(
+    pool: &SqlitePool,
+    webhook_enabled: bool,
+) -> Result<Vec<ActionView>, WebError> {
     let rows = state::action_index_list(pool).await?;
-    let mut out = Vec::with_capacity(rows.len());
+    let mut out = Vec::with_capacity(rows.len() + 1);
     for a in rows {
         let paused = state::action_pause_status(pool, &a.name)
             .await?
@@ -346,9 +366,59 @@ async fn enriched_actions(pool: &SqlitePool) -> Result<Vec<ActionView>, WebError
             parse_error: a.parse_error,
             last_run_started: last,
             paused,
+            synthetic: false,
         });
     }
+    // CLAUDE-61: surface the event-driven webhook fast-path as a synthetic
+    // read-only action when it is configured, so its runs get the same
+    // dashboard / action-detail surfaces other actions have. It has no backing
+    // YAML and is never indexed in the `actions` table; it lives only here.
+    if webhook_enabled {
+        out.push(synthetic_webhook_action(pool).await?);
+    }
     Ok(out)
+}
+
+/// CLAUDE-61: build the synthetic `webhook-fast-path` action view. Read-only and
+/// event-driven: no schedule, no file, always "enabled" (it fires on webhook
+/// deliveries, not a timer). Its `last_run_started` comes from the recorded
+/// webhook runs so the dashboard shows recency like any other action.
+async fn synthetic_webhook_action(pool: &SqlitePool) -> Result<ActionView, WebError> {
+    let name = webhooks::WEBHOOK_MINT_ACTION.to_string();
+    let last = state::action_last_run_started(pool, &name).await?;
+    Ok(ActionView {
+        name,
+        file_path: "(synthetic, event-driven; no file)".to_string(),
+        yaml_sha256: String::new(),
+        enabled: true,
+        schedule_kind: None,
+        schedule_spec: None,
+        last_seen_at: String::new(),
+        parse_error: None,
+        last_run_started: last,
+        paused: None,
+        synthetic: true,
+    })
+}
+
+/// CLAUDE-61: true for the reserved synthetic action name. Mutating endpoints
+/// (edit / export / delete) reject it: it has no backing YAML to operate on.
+fn is_synthetic_action(name: &str) -> bool {
+    name == webhooks::WEBHOOK_MINT_ACTION
+}
+
+/// CLAUDE-61: a 403 response rejecting a mutating operation on the synthetic
+/// action, or `None` when `name` is a normal action.
+fn reject_synthetic(name: &str) -> Option<Response> {
+    is_synthetic_action(name).then(|| {
+        (
+            StatusCode::FORBIDDEN,
+            format!(
+                "`{name}` is a synthetic event-driven action and cannot be edited, exported, or deleted"
+            ),
+        )
+            .into_response()
+    })
 }
 
 /// CLAUDE-35: when `show_empty` is false, finished runs that processed zero jobs
@@ -413,7 +483,7 @@ async fn dashboard(
             paused_at: a,
             reason: r,
         });
-    let actions = enriched_actions(pool).await?;
+    let actions = enriched_actions(pool, s.webhook_enabled).await?;
     let recent_runs = fetch_recent_runs(pool, 20, q.show_empty).await?;
 
     // Today totals: sum across all actions
@@ -472,7 +542,7 @@ async fn action_detail(
     Query(q): Query<ActionDetailQuery>,
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
-    let actions = enriched_actions(pool).await?;
+    let actions = enriched_actions(pool, s.webhook_enabled).await?;
     let Some(action) = actions.into_iter().find(|a| a.name == name) else {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
@@ -525,7 +595,10 @@ async fn action_durations(
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
     // 404 unknown actions cleanly; only names the daemon has indexed resolve.
-    if indexed_action_path(pool, &name).await?.is_none() {
+    // CLAUDE-61: the synthetic webhook action is not indexed but charts its
+    // recorded runs like any action, so accept it when webhook is configured.
+    let known_synthetic = s.webhook_enabled && is_synthetic_action(&name);
+    if !known_synthetic && indexed_action_path(pool, &name).await?.is_none() {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     }
     // Same recent window as the action-detail table (last 50 by start). The
@@ -653,6 +726,9 @@ async fn action_edit_page(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Response, WebError> {
+    if let Some(r) = reject_synthetic(&name) {
+        return Ok(r);
+    }
     let Some(path) = indexed_action_path(&s.api.pool, &name).await? else {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
@@ -682,6 +758,9 @@ async fn action_edit_save(
     AxumPath(name): AxumPath<String>,
     Form(form): Form<ActionForm>,
 ) -> Result<Response, WebError> {
+    if let Some(r) = reject_synthetic(&name) {
+        return Ok(r);
+    }
     let Some(path) = indexed_action_path(&s.api.pool, &name).await? else {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
@@ -748,6 +827,9 @@ async fn action_export(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Response, WebError> {
+    if let Some(r) = reject_synthetic(&name) {
+        return Ok(r);
+    }
     let Some(path) = indexed_action_path(&s.api.pool, &name).await? else {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
@@ -771,6 +853,9 @@ async fn action_delete(
     State(s): State<WebState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Response, WebError> {
+    if let Some(r) = reject_synthetic(&name) {
+        return Ok(r);
+    }
     if indexed_action_path(&s.api.pool, &name).await?.is_none() {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     }
@@ -1617,7 +1702,7 @@ async fn run_detail(
         return Ok((StatusCode::NOT_FOUND, format!("no run #{id}")).into_response());
     };
     let outcomes = sqlx::query_as::<_, JobOutcomeRow>(
-        "SELECT job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, attempt_counted, duration_ms, timed_out FROM job_outcomes WHERE run_id = ? ORDER BY id ASC",
+        "SELECT job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, attempt_counted, duration_ms, timed_out, summary FROM job_outcomes WHERE run_id = ? ORDER BY id ASC",
     )
     .bind(id)
     .fetch_all(pool)
@@ -1984,7 +2069,11 @@ mod tests {
                 state_dir: tmp.join("state"),
                 runtime_dir: tmp.join("runtime"),
             };
-            WebState { api, paths }
+            WebState {
+                api,
+                paths,
+                webhook_enabled: false,
+            }
         }
 
         /// Register an action in the index so `indexed_action_path` resolves it
@@ -2627,6 +2716,53 @@ mod tests {
             );
         }
 
+        // ---- synthetic webhook action (CLAUDE-61) -------------------------
+
+        #[tokio::test]
+        async fn action_list_includes_synthetic_only_when_webhook_enabled() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION;
+
+            // Webhook unconfigured: the synthetic entry is absent.
+            let without = super::super::enriched_actions(&s.api.pool, false)
+                .await
+                .unwrap();
+            assert!(
+                !without.iter().any(|a| a.name == synthetic),
+                "synthetic action present without webhook configured"
+            );
+
+            // Webhook configured: a single read-only synthetic entry appears.
+            let with = super::super::enriched_actions(&s.api.pool, true)
+                .await
+                .unwrap();
+            let entry = with
+                .iter()
+                .find(|a| a.name == synthetic)
+                .expect("synthetic action present when webhook enabled");
+            assert!(entry.synthetic, "entry flagged synthetic");
+            assert!(entry.enabled, "synthetic action shows as enabled");
+            assert!(entry.schedule_kind.is_none(), "event-driven: no schedule");
+        }
+
+        #[tokio::test]
+        async fn synthetic_action_rejects_mutations() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION.to_string();
+
+            // Export, edit, and delete all 403 the synthetic name (no YAML backs it).
+            let export = action_export(State(s.clone()), AxumPath(synthetic.clone()))
+                .await
+                .unwrap();
+            assert_eq!(export.status(), StatusCode::FORBIDDEN);
+            let del = action_delete(State(s.clone()), AxumPath(synthetic.clone()))
+                .await
+                .unwrap();
+            assert_eq!(del.status(), StatusCode::FORBIDDEN);
+        }
+
         #[tokio::test]
         async fn detail_route_not_shadowed_by_youtrack_create() {
             use tower::ServiceExt;
@@ -2642,7 +2778,7 @@ mod tests {
             std::fs::write(&file, "name: youtrack\nkind: youtrack\nnative: {}\n").unwrap();
             index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
 
-            let app = super::super::router(s.api.clone(), s.paths.clone());
+            let app = super::super::router(s.api.clone(), s.paths.clone(), s.webhook_enabled);
             let resp = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -2701,7 +2837,11 @@ mod tests {
                 state_dir: tmp.join("state"),
                 runtime_dir: tmp.join("runtime"),
             };
-            WebState { api, paths }
+            WebState {
+                api,
+                paths,
+                webhook_enabled: false,
+            }
         }
 
         async fn body_string(resp: axum::response::Response) -> String {
