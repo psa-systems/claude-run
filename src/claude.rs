@@ -172,10 +172,10 @@ impl ClaudeInvoker {
         // The exit-code / timeout path is reserved for runs where NO terminal
         // result was ever observed (a genuine hang or crash).
         if exit_code != 0 && !outcome.finalized_on_result {
-            let tail = read_tail(stream_log, 2000).unwrap_or_default();
+            let summary = friendly_failure_summary(&final_event, stream_log);
             return Ok(ClaudeResult {
                 ok: false,
-                summary: tail,
+                summary,
                 cost: final_event
                     .get("total_cost_usd")
                     .and_then(|v| v.as_f64())
@@ -189,10 +189,10 @@ impl ClaudeInvoker {
         }
 
         if final_event.get("type").and_then(|v| v.as_str()) != Some("result") {
-            let stream = read_full(stream_log).unwrap_or_default();
+            let summary = friendly_failure_summary(&final_event, stream_log);
             return Ok(ClaudeResult {
                 ok: false,
-                summary: stream,
+                summary,
                 cost: 0.0,
                 raw: final_event,
                 error: format!(
@@ -379,8 +379,88 @@ fn read_tail(p: &Path, max: usize) -> std::io::Result<String> {
     }
 }
 
-fn read_full(p: &Path) -> std::io::Result<String> {
-    std::fs::read_to_string(p)
+/// CLAUDE-56: Extract a short, human-readable failure summary from the stream
+/// log instead of pasting the raw NDJSON tail into failure comments. Preference
+/// order:
+/// 1. A terminal `result` event's `result` text (the message claude composed,
+///    e.g. `API Error: 529 Overloaded...`), falling back to its `error` string.
+/// 2. The concatenated text blocks of the last `assistant` message event, which
+///    captures the human-readable error text when no result event ever landed.
+/// 3. The bounded 2000-byte tail of the stream log (the prior behavior).
+fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -> String {
+    if final_event.get("type").and_then(|v| v.as_str()) == Some("result") {
+        let result = final_event
+            .get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !result.is_empty() {
+            return result.to_string();
+        }
+        let error = final_event
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !error.is_empty() {
+            return error.to_string();
+        }
+    }
+    if let Some(text) = last_assistant_text(stream_log) {
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    read_tail(stream_log, 2000).unwrap_or_default()
+}
+
+/// Scan the stream log backwards for the last `assistant` message event and
+/// concatenate the `text` of its text content blocks.
+fn last_assistant_text(stream_log: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(stream_log).ok()?;
+    for line in raw.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = event
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        let text: String = content
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        return Some(text);
+    }
+    None
+}
+
+/// CLAUDE-56: render the final result event as a collapsed, pretty-printed JSON
+/// block for failure comments (YouTrack and Forgejo both render Markdown + the
+/// `<details>` HTML element). Returns an empty string for synthesized results
+/// (`Value::Null` or an empty object) so callers can append it unconditionally.
+pub fn raw_event_details(raw: &Value) -> String {
+    match raw {
+        Value::Null => return String::new(),
+        Value::Object(obj) if obj.is_empty() => return String::new(),
+        _ => {}
+    }
+    let Ok(pretty) = serde_json::to_string_pretty(raw) else {
+        return String::new();
+    };
+    format!(
+        "\n\n<details>\n<summary>Raw result event</summary>\n\n```json\n{pretty}\n```\n\n</details>"
+    )
 }
 
 #[cfg(test)]
@@ -587,5 +667,135 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "cancel should terminate fast, took {elapsed:?}"
         );
+    }
+
+    /// CLAUDE-56: a terminal `result` event yields its human-readable `result`
+    /// text as the friendly summary.
+    #[test]
+    fn friendly_summary_prefers_result_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"ignored\"}]}}\n\
+             {\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 529 Overloaded.\"}\n",
+        )
+        .unwrap();
+        let final_event = parse_final_result(&log).unwrap();
+        assert_eq!(
+            friendly_failure_summary(&final_event, &log),
+            "API Error: 529 Overloaded."
+        );
+    }
+
+    /// CLAUDE-56: a `result` event with an empty `result` falls back to `error`.
+    #[test]
+    fn friendly_summary_falls_back_to_result_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"result\",\"is_error\":true,\"result\":\"\",\"error\":\"model overloaded\"}\n",
+        )
+        .unwrap();
+        let final_event = parse_final_result(&log).unwrap();
+        assert_eq!(
+            friendly_failure_summary(&final_event, &log),
+            "model overloaded"
+        );
+    }
+
+    /// CLAUDE-56: with no terminal `result` event, the concatenated text blocks
+    /// of the last `assistant` message become the summary.
+    #[test]
+    fn friendly_summary_uses_last_assistant_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"old\"}]}}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"API Error: \"},{\"type\":\"text\",\"text\":\"529 Overloaded.\"}]}}\n",
+        )
+        .unwrap();
+        // final_event here is the last assistant message, not a result event.
+        let final_event = parse_final_result(&log).unwrap();
+        assert_eq!(
+            friendly_failure_summary(&final_event, &log),
+            "API Error: 529 Overloaded."
+        );
+    }
+
+    /// CLAUDE-56: neither a result event nor an assistant message - fall back to
+    /// the bounded raw tail.
+    #[test]
+    fn friendly_summary_falls_back_to_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(&log, "{\"type\":\"system\",\"subtype\":\"init\"}\n").unwrap();
+        let final_event = parse_final_result(&log).unwrap();
+        assert_eq!(
+            friendly_failure_summary(&final_event, &log),
+            "{\"type\":\"system\",\"subtype\":\"init\"}\n"
+        );
+    }
+
+    /// CLAUDE-56: a non-zero exit whose stream ends with a `result` event makes
+    /// `summary` the friendly result text, not the raw JSON line.
+    #[test]
+    fn invoke_failure_summary_is_friendly_result_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        let line = r#"{"type":"result","is_error":true,"api_error_status":"529","result":"API Error: 529 Overloaded. Try again in a moment.","total_cost_usd":0.01}"#;
+        write_stub(
+            &stub,
+            &format!("#!/bin/sh\nprintf '%s\\n' '{line}'\nexit 1\n"),
+        );
+
+        let invoker = ClaudeInvoker {
+            binary: stub.to_str().unwrap().to_string(),
+            result_exit_grace: Duration::from_secs(30),
+        };
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let res = invoker
+            .invoke(
+                "hi",
+                &cfg,
+                Duration::from_secs(10),
+                dir.path(),
+                &log,
+                &cancel,
+            )
+            .unwrap();
+        assert!(!res.ok, "non-zero exit is a failure");
+        assert_eq!(
+            res.summary,
+            "API Error: 529 Overloaded. Try again in a moment."
+        );
+        assert!(
+            !res.summary.contains("\"type\":\"result\""),
+            "summary must not be the raw JSON line"
+        );
+        // raw still carries the parsed event for the comment builders.
+        assert_eq!(
+            res.raw.get("api_error_status").and_then(|v| v.as_str()),
+            Some("529")
+        );
+    }
+
+    /// CLAUDE-56: a populated event renders a collapsed, pretty-printed JSON
+    /// block; a synthesized (null / empty) event renders nothing.
+    #[test]
+    fn raw_event_details_collapses_or_omits() {
+        let populated = raw_event_details(&json!({"type":"result","is_error":true}));
+        assert!(populated.contains("<details>"));
+        assert!(populated.contains("<summary>Raw result event</summary>"));
+        assert!(populated.contains("```json"));
+        // pretty-printed: spans multiple lines.
+        assert!(populated.contains("\"type\": \"result\""));
+
+        assert_eq!(raw_event_details(&Value::Null), "");
+        assert_eq!(raw_event_details(&json!({})), "");
     }
 }

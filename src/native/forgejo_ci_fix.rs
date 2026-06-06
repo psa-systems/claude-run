@@ -38,7 +38,7 @@ use tracing::{info, warn};
 use super::{HandlerFuture, NativeContext, NativeHandler};
 use crate::action::{ForgejoCiFixConfig, NativeConfig};
 use crate::cancel::{CancellationToken, RegistryGuard};
-use crate::claude::{ClaudeInvoker, ClaudeResult};
+use crate::claude::{raw_event_details, ClaudeInvoker, ClaudeResult};
 use crate::error::{Error, Result};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
 use crate::provider::{self, Backend};
@@ -706,15 +706,18 @@ fn commit_message(job: &ForgejoCiFixJob, summary: &str, skip_marker: &str) -> St
 /// occurred so a failed push never reads as a successful fix.
 fn comment_body(decision: &Decision, claude: &ClaudeResult, push_err: Option<&str>) -> String {
     match decision {
-        Decision::ClaudeFailed => [
-            format!("**Claude run FAILED ({}).**", claude.error),
-            String::new(),
-            "Summary / stream log tail:".to_string(),
-            claude.summary.clone(),
-            String::new(),
-            "No changes were pushed. See the per-attempt stream log on the runner host for full context.".to_string(),
-        ]
-        .join("\n"),
+        Decision::ClaudeFailed => {
+            let mut body = [
+                format!("**Claude run FAILED ({}).**", claude.error),
+                String::new(),
+                claude.summary.clone(),
+                String::new(),
+                "No changes were pushed. See the per-attempt stream log on the runner host for full context.".to_string(),
+            ]
+            .join("\n");
+            body.push_str(&raw_event_details(&claude.raw));
+            body
+        }
         Decision::NoChanges => [
             "**Claude ran but made no changes.**".to_string(),
             String::new(),
@@ -970,6 +973,28 @@ mod tests {
         assert!(failed.contains("push FAILED"));
         assert!(failed.contains("git push exited 1"));
         assert!(!failed.contains("Claude pushed a fix."));
+    }
+
+    /// CLAUDE-56: the ClaudeFailed arm leads with the friendly summary and
+    /// appends the pretty-printed event in a collapsed `<details>` block when
+    /// `raw` is populated; a synthesized result omits the block.
+    #[test]
+    fn comment_body_claude_failed_collapses_raw() {
+        let mut failed = ok_result("API Error: 529 Overloaded.");
+        failed.ok = false;
+        failed.error = "claude exited 1, see stream.jsonl".into();
+        failed.raw = serde_json::json!({"type":"result","is_error":true,"api_error_status":"529"});
+        let body = comment_body(&Decision::ClaudeFailed, &failed, None);
+        assert!(body.contains("**Claude run FAILED (claude exited 1, see stream.jsonl).**"));
+        assert!(body.contains("API Error: 529 Overloaded."));
+        assert!(!body.contains("Summary / stream log tail"));
+        assert!(body.contains("<details>\n<summary>Raw result event</summary>"));
+        assert!(body.contains("\"api_error_status\": \"529\""));
+
+        let synth = ClaudeResult::synthesized("claude exited 1", "pre step failed");
+        let body = comment_body(&Decision::ClaudeFailed, &synth, None);
+        assert!(body.contains("pre step failed"));
+        assert!(!body.contains("<details>"));
     }
 
     // ---- gather -----------------------------------------------------------
