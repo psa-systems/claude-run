@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 use crate::exit;
+use crate::paint;
 
 /// Default registry host / owner / package, matching `build-binary.yml`.
 const DEFAULT_BASE: &str = "https://dev.a8n.run";
@@ -488,30 +489,45 @@ pub async fn check(
     let (cred, versions) = updater
         .list_versions(authorizer(&host, use_fj_token, configured_token))
         .await?;
-    println!("train:     {}", train.label());
+    anstream::println!("train:     {}", paint::paint(paint::VALUE, train.label()));
     match train {
         UpdateTrain::Release => {
             let current = current_version()?;
-            println!("current:   v{current}");
+            anstream::println!(
+                "current:   {}",
+                paint::paint(paint::VALUE, &format!("v{current}"))
+            );
             match select_newest(&versions) {
                 Some(newest) => {
-                    println!("available: v{newest}");
+                    anstream::println!(
+                        "available: {}",
+                        paint::paint(paint::VALUE, &format!("v{newest}"))
+                    );
                     match compare(&current, &newest) {
                         UpdateStatus::UpdateAvailable => {
-                            println!("update available; run `claude-run version update`");
+                            paint::notice("update available; run `claude-run version update`");
                         }
-                        UpdateStatus::UpToDate => println!("up to date"),
+                        UpdateStatus::UpToDate => paint::success("up to date"),
                         UpdateStatus::Ahead => {
-                            println!("running a newer build than the registry; nothing to do");
+                            paint::notice("running a newer build than the registry; nothing to do");
                         }
                     }
                 }
-                None => println!("available: (no vX.Y.Z releases found in registry)"),
+                None => anstream::println!(
+                    "available: {}",
+                    paint::paint(paint::VALUE, "(no vX.Y.Z releases found in registry)")
+                ),
             }
         }
         UpdateTrain::Latest => {
             if !versions.iter().any(|v| v == LATEST_TAG) {
-                println!("available: (no `{LATEST_TAG}` build published in registry)");
+                anstream::println!(
+                    "available: {}",
+                    paint::paint(
+                        paint::VALUE,
+                        &format!("(no `{LATEST_TAG}` build published in registry)")
+                    )
+                );
                 return Ok(exit::OK);
             }
             // The `latest` tag is moving and non-semver, so compare digests: the
@@ -521,15 +537,15 @@ pub async fn check(
                 anyhow::anyhow!("could not parse the published sha256 sidecar for `{LATEST_TAG}`")
             })?;
             let installed = current_exe_sha256()?;
-            println!("installed: {installed}");
-            println!("published: {published}");
+            anstream::println!("installed: {}", paint::paint(paint::VALUE, &installed));
+            anstream::println!("published: {}", paint::paint(paint::VALUE, &published));
             if installed.eq_ignore_ascii_case(&published) {
-                println!("up to date");
+                paint::success("up to date");
             } else {
-                println!(
+                paint::notice(&format!(
                     "update available; run `claude-run version update --train {}`",
                     UpdateTrain::Latest.label()
-                );
+                ));
             }
         }
     }
@@ -556,21 +572,21 @@ pub async fn update(
     let target = select_target(train, &versions, pin.as_deref())?;
 
     if !yes && std::io::stdin().is_terminal() && !confirm(&format!("Install {target}?")) {
-        println!("aborted");
+        paint::notice("aborted");
         return Ok(exit::OK);
     }
 
-    println!("downloading {target} ...");
+    paint::notice(&format!("downloading {target} ..."));
     let (bin, sidecar) = updater.download(&cred, &target).await?;
     let expected = parse_sha256_sidecar(&sidecar).ok_or_else(|| {
         anyhow::anyhow!("could not parse the published sha256 sidecar for {target}")
     })?;
     verify_sha256(&bin, &expected)?;
     let path = install_binary(&bin)?;
-    println!(
+    paint::success(&format!(
         "installed {target} to {} (checksum verified). Run `claude-run version show` to confirm.",
         path.display()
-    );
+    ));
     Ok(exit::OK)
 }
 

@@ -11,14 +11,38 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use claude_run::{
-    action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db, exit, lock,
-    migrate, secrets, snippet, state, update,
+    action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db, exit,
+    jsonfmt, lock, migrate, paint, secrets, snippet, state, update,
 };
+
+/// `--color` choices. Maps to both `anstream` (our own output) and clap's
+/// help/error rendering so they color together (CLAUDE-60).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ColorWhen {
+    /// Color only when stdout/stderr is a TTY; honors `NO_COLOR`.
+    Auto,
+    /// Always color, even through a pipe.
+    Always,
+    /// Never color (script-safe).
+    Never,
+}
+
+/// clap help/usage palette: headers bold yellow, literals (subcommand and flag
+/// names) bold green, placeholders cyan. Shades may be tuned in review; the
+/// structure stands (CLAUDE-60).
+fn help_styles() -> clap::builder::Styles {
+    use clap::builder::styling::AnsiColor;
+    clap::builder::Styles::styled()
+        .header(AnsiColor::Yellow.on_default().bold())
+        .usage(AnsiColor::Yellow.on_default().bold())
+        .literal(AnsiColor::Green.on_default().bold())
+        .placeholder(AnsiColor::Cyan.on_default())
+}
 
 #[derive(Parser)]
 #[command(
@@ -26,12 +50,17 @@ use claude_run::{
     version = claude_run::VERSION,
     about = "YAML-driven Claude Code runner",
     long_about = "Run actions defined in $CONFIG_DIR/actions/*.yml. Each action's input.command \
-                  emits a JSON array; one Claude invocation per job. See actions/SCHEMA.md."
+                  emits a JSON array; one Claude invocation per job. See actions/SCHEMA.md.",
+    styles = help_styles()
 )]
 struct Cli {
     /// Override the actions directory (default: $CONFIG_DIR/actions/).
     #[arg(long, env = "CLAUDE_RUN_ACTIONS_DIR", global = true)]
     actions_dir: Option<String>,
+
+    /// When to color output: auto (TTY-detect, honors NO_COLOR), always, never.
+    #[arg(long, value_enum, default_value_t = ColorWhen::Auto, global = true)]
+    color: ColorWhen,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -163,7 +192,17 @@ enum SecretCmd {
 
 fn main() -> ExitCode {
     init_tracing();
-    let cli = Cli::parse();
+
+    // Resolve the color choice BEFORE clap renders any help/error: clap
+    // colorizes its own output during parse, before we could read the parsed
+    // `--color` flag, so pre-scan argv for it (honoring NO_COLOR via anstream's
+    // auto detection). The flag is still defined on `Cli` for help/validation;
+    // this pre-scan only feeds clap's renderer and our global anstream choice.
+    let raw_args: Vec<String> = std::env::args().collect();
+    let color = resolve_color_choice(&raw_args);
+    anstream_choice(color).write_global();
+
+    let cli = parse_cli(color);
 
     // daemonize MUST happen before any tokio runtime exists. forking after
     // the runtime is constructed produces a child with corrupt scheduler
@@ -172,7 +211,7 @@ fn main() -> ExitCode {
     let maybe_detach = matches!(&cli.cmd, Cmd::Serve { detach: true });
     if maybe_detach {
         if let Err(e) = detach_now() {
-            eprintln!("detach failed: {e}");
+            paint::error(&format!("detach failed: {e}"));
             return ExitCode::from(exit::UNEXPECTED as u8);
         }
     }
@@ -183,7 +222,7 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("tokio runtime build failed: {e}");
+            paint::error(&format!("tokio runtime build failed: {e}"));
             return ExitCode::from(exit::UNEXPECTED as u8);
         }
     };
@@ -196,6 +235,60 @@ fn main() -> ExitCode {
             }
         }
     })
+}
+
+/// Parse the CLI with clap's help/error coloring forced to match `color`.
+/// Mirrors `Cli::parse()` but injects `.color(...)` (the derive can only set a
+/// static color), so `--color always|never` also governs help and usage errors.
+fn parse_cli(color: ColorWhen) -> Cli {
+    use clap::{CommandFactory, FromArgMatches};
+    let mut cmd = Cli::command().color(clap_choice(color));
+    let matches = cmd
+        .try_get_matches_from_mut(std::env::args_os())
+        .unwrap_or_else(|e| e.exit());
+    Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+}
+
+/// Best-effort scan of argv for `--color <v>` / `--color=<v>`, used only to seed
+/// the renderer before full parse. Invalid values fall back to `Auto` here and
+/// surface as a proper clap error during [`parse_cli`].
+fn resolve_color_choice(args: &[String]) -> ColorWhen {
+    let mut choice = ColorWhen::Auto;
+    let mut iter = args.iter().skip(1); // skip the program name
+    while let Some(arg) = iter.next() {
+        let value = if let Some(v) = arg.strip_prefix("--color=") {
+            Some(v.to_string())
+        } else if arg == "--color" {
+            iter.next().cloned()
+        } else {
+            None
+        };
+        if let Some(v) = value {
+            if let Ok(c) = <ColorWhen as ValueEnum>::from_str(&v, true) {
+                choice = c;
+            }
+        }
+    }
+    choice
+}
+
+/// Map to anstream's global choice for our own output. `Auto` honors `NO_COLOR`,
+/// `CLICOLOR_FORCE`, and TTY detection.
+fn anstream_choice(color: ColorWhen) -> anstream::ColorChoice {
+    match color {
+        ColorWhen::Auto => anstream::ColorChoice::Auto,
+        ColorWhen::Always => anstream::ColorChoice::Always,
+        ColorWhen::Never => anstream::ColorChoice::Never,
+    }
+}
+
+/// Map to clap's color choice for help/usage/error rendering.
+fn clap_choice(color: ColorWhen) -> clap::ColorChoice {
+    match color {
+        ColorWhen::Auto => clap::ColorChoice::Auto,
+        ColorWhen::Always => clap::ColorChoice::Always,
+        ColorWhen::Never => clap::ColorChoice::Never,
+    }
 }
 
 fn detach_now() -> claude_run::error::Result<()> {
@@ -450,19 +543,19 @@ async fn stop_daemon(paths: &cfg::Paths) -> claude_run::error::Result<StopOutcom
 async fn stop(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     match stop_daemon(paths).await? {
         StopOutcome::NotRunning => {
-            println!("daemon not running");
+            paint::notice("daemon not running");
             Ok(exit::OK)
         }
         StopOutcome::Stopped => {
-            println!("daemon stopped");
+            paint::success("daemon stopped");
             Ok(exit::OK)
         }
         StopOutcome::Timeout(pid) => {
-            eprintln!(
+            paint::error(&format!(
                 "daemon (pid {pid}) did not exit within {}s; not force-killing - \
                  stop it manually if it is truly stuck",
                 STOP_GRACE.as_secs()
-            );
+            ));
             Ok(exit::UNEXPECTED)
         }
     }
@@ -475,7 +568,9 @@ async fn restart(
 ) -> claude_run::error::Result<i32> {
     match stop_daemon(paths).await? {
         StopOutcome::Timeout(pid) => {
-            eprintln!("daemon (pid {pid}) did not exit within the grace window; not restarting");
+            paint::error(&format!(
+                "daemon (pid {pid}) did not exit within the grace window; not restarting"
+            ));
             return Ok(exit::UNEXPECTED);
         }
         StopOutcome::NotRunning => tracing::info!("no daemon running; starting fresh"),
@@ -512,7 +607,7 @@ async fn trigger(action: &str, paths: &cfg::Paths) -> claude_run::error::Result<
     let v: serde_json::Value = c
         .post(&format!("/actions/{}/trigger", action), None)
         .await?;
-    println!("{}", serde_json::to_string_pretty(&v)?);
+    jsonfmt::print_json(&v)?;
     Ok(exit::OK)
 }
 
@@ -528,7 +623,7 @@ async fn cancel_run(run_id: i64, paths: &cfg::Paths) -> claude_run::error::Resul
     }
     let c = DaemonClient::new(&sock);
     let v: serde_json::Value = c.post(&format!("/runs/{}/cancel", run_id), None).await?;
-    println!("{}", serde_json::to_string_pretty(&v)?);
+    jsonfmt::print_json(&v)?;
     Ok(exit::OK)
 }
 
@@ -547,14 +642,14 @@ async fn pause(
             None => "/pause".to_string(),
         };
         let v: serde_json::Value = c.post(&path, body.as_ref()).await?;
-        println!("{}", serde_json::to_string_pretty(&v)?);
+        jsonfmt::print_json(&v)?;
     } else {
         let pool = db::open(&paths.state_db()).await?;
         match action {
             Some(name) => state::action_pause_set(&pool, &name, reason.as_deref()).await?,
             None => state::global_pause_set(&pool, reason.as_deref()).await?,
         }
-        println!("ok");
+        paint::success("ok");
     }
     Ok(exit::OK)
 }
@@ -568,14 +663,14 @@ async fn resume(action: Option<String>, paths: &cfg::Paths) -> claude_run::error
             None => "/resume".to_string(),
         };
         let v: serde_json::Value = c.post(&path, None).await?;
-        println!("{}", serde_json::to_string_pretty(&v)?);
+        jsonfmt::print_json(&v)?;
     } else {
         let pool = db::open(&paths.state_db()).await?;
         match action {
             Some(name) => state::action_pause_clear(&pool, &name).await?,
             None => state::global_pause_clear(&pool).await?,
         }
-        println!("ok");
+        paint::success("ok");
     }
     Ok(exit::OK)
 }
@@ -585,7 +680,7 @@ async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     if DaemonClient::is_reachable(&sock) {
         let c = DaemonClient::new(&sock);
         let v: serde_json::Value = c.get("/status").await?;
-        println!("{}", serde_json::to_string_pretty(&v)?);
+        jsonfmt::print_json(&v)?;
         return Ok(exit::OK);
     }
     let pool = db::open(&paths.state_db()).await?;
@@ -597,7 +692,7 @@ async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
         "global_paused": global.map(|(a, r)| json!({"paused_at": a, "reason": r})),
         "actions": actions,
     });
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    jsonfmt::print_json(&report)?;
     Ok(exit::OK)
 }
 
@@ -616,14 +711,14 @@ async fn action_cmd(
     match cmd {
         ActionCmd::List => {
             let rows = state::action_index_list(&pool).await?;
-            println!("{}", serde_json::to_string_pretty(&rows)?);
+            jsonfmt::print_json(&rows)?;
         }
         ActionCmd::Show { name } => {
             let rows = state::action_index_list(&pool).await?;
             match rows.into_iter().find(|r| r.name == name) {
-                Some(r) => println!("{}", serde_json::to_string_pretty(&r)?),
+                Some(r) => jsonfmt::print_json(&r)?,
                 None => {
-                    eprintln!("no action `{name}` in index");
+                    paint::error(&format!("no action `{name}` in index"));
                     return Ok(exit::CONFIG_ERROR);
                 }
             }
@@ -639,34 +734,36 @@ async fn action_cmd(
                     .await?;
                 return match status {
                     200 => {
-                        println!("deleted `{name}`");
+                        paint::success(&format!("deleted `{name}`"));
                         Ok(exit::OK)
                     }
                     404 => {
-                        eprintln!("no action `{name}` in index");
+                        paint::error(&format!("no action `{name}` in index"));
                         Ok(exit::CONFIG_ERROR)
                     }
                     409 => {
-                        eprintln!(
+                        paint::error(&format!(
                             "action `{name}` has a run in flight; cancel or wait before deleting"
-                        );
+                        ));
                         Ok(exit::CONFLICT)
                     }
                     _ => {
-                        eprintln!("daemon returned {status}: {body}");
+                        paint::error(&format!("daemon returned {status}: {body}"));
                         Ok(exit::UNEXPECTED)
                     }
                 };
             }
             if state::action_has_active_run(&pool, &name).await? {
-                eprintln!("action `{name}` has a run in flight; cancel or wait before deleting");
+                paint::error(&format!(
+                    "action `{name}` has a run in flight; cancel or wait before deleting"
+                ));
                 return Ok(exit::CONFLICT);
             }
             if !api::delete_indexed_action(&pool, &name).await? {
-                eprintln!("no action `{name}` in index");
+                paint::error(&format!("no action `{name}` in index"));
                 return Ok(exit::CONFIG_ERROR);
             }
-            println!("deleted `{name}`");
+            paint::success(&format!("deleted `{name}`"));
         }
     }
     Ok(exit::OK)
@@ -685,12 +782,12 @@ async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Re
             let value: &str = if std::io::stdin().is_terminal() {
                 // TTY path: prompt twice with echo disabled. Double entry catches
                 // typos that masked input would otherwise hide (passwd convention).
-                eprintln!("input is hidden; you will be asked to re-enter to confirm");
+                paint::notice("input is hidden; you will be asked to re-enter to confirm");
                 let first =
                     rpassword::prompt_password(format!("Enter secret value for `{name}`: "))?;
                 let second = rpassword::prompt_password("Re-enter to confirm: ")?;
                 if first != second {
-                    eprintln!("entries do not match; nothing stored");
+                    paint::error("entries do not match; nothing stored");
                     return Ok(exit::CONFIG_ERROR);
                 }
                 owned = first;
@@ -700,7 +797,7 @@ async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Re
                 // scripts), then read to EOF. Strip a single trailing newline (echo
                 // / heredoc add one); multi-line secrets pass through otherwise.
                 use std::io::Read;
-                eprintln!("reading secret value from stdin");
+                paint::notice("reading secret value from stdin");
                 let mut buf = String::new();
                 std::io::stdin().read_to_string(&mut buf)?;
                 owned = buf
@@ -711,7 +808,7 @@ async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Re
                 &owned
             };
             if value.is_empty() {
-                eprintln!("refusing to store an empty secret `{name}`");
+                paint::error(&format!("refusing to store an empty secret `{name}`"));
                 return Ok(exit::CONFIG_ERROR);
             }
             // Encrypt under the age key (CLAUDE_RUN_SECRETS_KEY_FILE). A missing
@@ -720,32 +817,84 @@ async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Re
             let ciphertext = key.encrypt(value)?;
             if state::secret_exists(&pool, &name).await? {
                 state::secret_rotate(&pool, &name, &ciphertext).await?;
-                println!("rotated secret `{name}`");
+                paint::success(&format!("rotated secret `{name}`"));
             } else {
                 state::secret_create(&pool, &name, &ciphertext).await?;
-                println!("created secret `{name}`");
+                paint::success(&format!("created secret `{name}`"));
             }
             // The web-auth gate resolves its token once at daemon startup, so a
             // change to that secret needs a restart to take effect.
-            eprintln!(
+            paint::notice(
                 "note: if this is the web UI auth token, restart the daemon to apply it \
-                 (the auth gate resolves it at startup)"
+                 (the auth gate resolves it at startup)",
             );
             Ok(exit::OK)
         }
         SecretCmd::List => {
             let rows = state::secret_list(&pool).await?;
-            println!("{}", serde_json::to_string_pretty(&rows)?);
+            jsonfmt::print_json(&rows)?;
             Ok(exit::OK)
         }
         SecretCmd::Delete { name } => {
             if state::secret_delete(&pool, &name).await? {
-                println!("deleted secret `{name}`");
+                paint::success(&format!("deleted secret `{name}`"));
                 Ok(exit::OK)
             } else {
-                eprintln!("no secret named `{name}`");
+                paint::error(&format!("no secret named `{name}`"));
                 Ok(exit::CONFIG_ERROR)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn color_flag_defaults_to_auto() {
+        let cli = Cli::try_parse_from(["claude-run", "status"]).unwrap();
+        assert_eq!(cli.color, ColorWhen::Auto);
+    }
+
+    #[test]
+    fn color_flag_parses_all_three_values() {
+        for (arg, expected) in [
+            ("auto", ColorWhen::Auto),
+            ("always", ColorWhen::Always),
+            ("never", ColorWhen::Never),
+        ] {
+            let cli = Cli::try_parse_from(["claude-run", "--color", arg, "status"]).unwrap();
+            assert_eq!(cli.color, expected, "--color {arg}");
+            let cli_eq = Cli::try_parse_from(["claude-run", "status", &format!("--color={arg}")])
+                .expect("global flag accepted after the subcommand too");
+            assert_eq!(cli_eq.color, expected, "--color={arg}");
+        }
+    }
+
+    #[test]
+    fn color_flag_rejects_unknown_value() {
+        assert!(Cli::try_parse_from(["claude-run", "--color", "rainbow", "status"]).is_err());
+    }
+
+    #[test]
+    fn pre_scan_matches_parsed_value() {
+        // The argv pre-scan that seeds clap's renderer must agree with the
+        // value clap ultimately parses, for all three forms.
+        for (args, expected) in [
+            (vec!["claude-run", "status"], ColorWhen::Auto),
+            (
+                vec!["claude-run", "--color", "always", "status"],
+                ColorWhen::Always,
+            ),
+            (
+                vec!["claude-run", "status", "--color=never"],
+                ColorWhen::Never,
+            ),
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(resolve_color_choice(&owned), expected, "{args:?}");
         }
     }
 }

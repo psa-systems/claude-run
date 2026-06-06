@@ -494,6 +494,8 @@ name = "claude-run"
 version = "0.4.0"
 dependencies = [
  "age",
+ "anstream",
+ "anstyle",
  "anyhow",
  "askama",
  "async-stream",

@@ -16,6 +16,8 @@ path = "src/lib.rs"
 
 [dependencies]
 age = "0.11"
+anstream = "1"
+anstyle = "1"
 anyhow = "1"
 askama = "0.12"
 async-stream = "0.3"
