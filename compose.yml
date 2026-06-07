@@ -19,11 +19,15 @@ name: claude-bot
 services:
   claude-bot:
     container_name: claude-bot
-    build:
-      context: .
-      dockerfile: oci-build/Dockerfile
-      target: runtime
-    image: claude-run:runtime
+    # CLAUDE-88: published by .forgejo/workflows/build-binary.yml on every main
+    # push (`latest`) and release tag (`vX.Y.Z`). Pin a version tag in
+    # production. For local development, comment `image:` and uncomment
+    # the build block to build from the working tree instead.
+    image: dev.a8n.run/psa-systems/claude-run:latest
+    # build:
+    #   context: .
+    #   dockerfile: oci-build/Dockerfile
+    #   target: runtime
     restart: unless-stopped
     networks:
       claude-bot-private:
@@ -32,6 +36,12 @@ services:
       CLAUDE_RUN_DATA_DIR: /home/claudebot/.local/share/claude-run
       CLAUDE_RUN_STATE_DIR: /home/claudebot/.local/state/claude-run
       CLAUDE_RUN_RUNTIME_DIR: /home/claudebot/.runtime/claude-run
+      # CLAUDE-88: the env var carries the PATH to the secrets-store age key;
+      # the key material itself travels as a compose secret (file mount), never
+      # as an environment value (`docker inspect` / /proc leak surface).
+      CLAUDE_RUN_SECRETS_KEY_FILE: /run/secrets/claude-run-age-key
+    secrets:
+      - claude-run-age-key
     volumes:
       # Runner state, backed by named volumes.
       - type: volume
@@ -85,3 +95,11 @@ volumes:
     name: claude-bot-data
   claude-bot-state:
     name: claude-bot-state
+
+# CLAUDE-88: the age identity that decrypts the secrets store (web auth token,
+# webhook HMACs, registry token refs). Create it once before `compose up`:
+#   mkdir secrets; chmod 700 secrets
+#   age-keygen | save secrets/age-key.txt
+secrets:
+  claude-run-age-key:
+    file: ./secrets/age-key.txt

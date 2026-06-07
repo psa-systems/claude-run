@@ -7,6 +7,10 @@ Cargo.lock.bak
 # Compiled binaries
 output/
 
+# CLAUDE-88: compose secret material (the age key decrypting the secrets
+# store). Never commit key files; compose.yml reads them from ./secrets/.
+secrets/
+
 # =============================================================================
 # AI
 # =============================================================================
