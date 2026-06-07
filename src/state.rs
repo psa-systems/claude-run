@@ -130,6 +130,42 @@ pub async fn run_set_job_keys(pool: &SqlitePool, run_id: i64, keys: &[String]) -
     Ok(())
 }
 
+/// CLAUDE-93: record per-job outbound links for a run as a JSON object mapping
+/// job key to URL (`runs.job_links`). The webhook fast-path stores the failure
+/// event's `html_url` so the run-detail tables can link the job key straight
+/// to the Forgejo Actions run.
+pub async fn run_set_job_links(
+    pool: &SqlitePool,
+    run_id: i64,
+    links: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let payload = serde_json::to_string(links)?;
+    sqlx::query("UPDATE runs SET job_links = ? WHERE id = ?")
+        .bind(payload)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// CLAUDE-93: the per-job link map for a run. Empty for legacy rows (NULL
+/// column) and for runs that link via the action's `link_template` instead.
+pub async fn run_job_links(
+    pool: &SqlitePool,
+    run_id: i64,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT job_links FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?;
+    let json = row.and_then(|(j,)| j);
+    if let Some(j) = json {
+        Ok(serde_json::from_str(&j).unwrap_or_default())
+    } else {
+        Ok(Default::default())
+    }
+}
+
 /// CLAUDE-14: mark which planned job a run is currently processing, so the web
 /// UI can show exactly the one in-flight job as "running" instead of inferring
 /// it from gaps in `job_outcomes`. Pass `Some(key)` before processing a job;
@@ -602,6 +638,25 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_job_links_roundtrip_and_legacy_null() {
+        // CLAUDE-93: set + read the per-job link map; a legacy row (no write)
+        // reads back as an empty map, not an error.
+        let pool = mem_pool().await;
+        let run = run_begin(&pool, "act", "webhook").await.unwrap();
+        assert!(run_job_links(&pool, run).await.unwrap().is_empty());
+
+        let links = std::collections::BTreeMap::from([(
+            "owner/repo#7".to_string(),
+            "https://dev.a8n.run/owner/repo/actions/runs/7".to_string(),
+        )]);
+        run_set_job_links(&pool, run, &links).await.unwrap();
+        assert_eq!(run_job_links(&pool, run).await.unwrap(), links);
+
+        let legacy = run_begin(&pool, "act", "cli").await.unwrap();
+        assert!(run_job_links(&pool, legacy).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -289,7 +289,7 @@ pub async fn consume_events(
         // activity. `run_id` is `None` only if `run_begin` itself failed; the
         // pipeline still runs, it just goes unrecorded.
         let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
-        let run_id = begin_webhook_run(&pool, &job_key).await;
+        let run_id = begin_webhook_run(&pool, &job_key, &ev.html_url).await;
 
         // CLAUDE-85: Forgejo fires `action_run_failure` for every non-success
         // done status (`failure`, `cancelled`, `skipped`; bare `else` in
@@ -483,16 +483,23 @@ pub const STAGE_MINTING: &str = "minting issue";
 /// CLAUDE-61: open the `runs` row for one webhook fast-path event and stamp its
 /// single planned job key. CLAUDE-80: also registers the job in-flight (so the
 /// run-detail badge reads `running`, not `queued`, for the whole pipeline) and
-/// sets the initial stage. Returns the run id, or `None` when `run_begin`
-/// failed (the pipeline still runs, just unrecorded). Failures are logged, not
+/// sets the initial stage. CLAUDE-93: stores the event's `html_url` as the
+/// job's outbound link so the run-detail tables link the key straight to the
+/// Forgejo Actions run. Returns the run id, or `None` when `run_begin` failed
+/// (the pipeline still runs, just unrecorded). Failures are logged, not
 /// propagated: a DB hiccup must never strand the event consumer.
-async fn begin_webhook_run(pool: &SqlitePool, job_key: &str) -> Option<i64> {
+async fn begin_webhook_run(pool: &SqlitePool, job_key: &str, html_url: &str) -> Option<i64> {
     match state::run_begin(pool, WEBHOOK_MINT_ACTION, WEBHOOK_TRIGGERED_BY).await {
         Ok(id) => {
             if let Err(e) =
                 state::run_set_job_keys(pool, id, std::slice::from_ref(&job_key.to_string())).await
             {
                 warn!(error = %e, "recording webhook run job key failed");
+            }
+            let links =
+                std::collections::BTreeMap::from([(job_key.to_string(), html_url.to_string())]);
+            if let Err(e) = state::run_set_job_links(pool, id, &links).await {
+                warn!(error = %e, "recording webhook run job link failed");
             }
             if let Err(e) = state::run_inflight_add(pool, id, job_key).await {
                 warn!(error = %e, "registering webhook job in flight failed");
@@ -1845,6 +1852,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inflight, 0, "in-flight marker cleared on finish");
+
+        // CLAUDE-93: the event's html_url is recorded as the job's outbound
+        // link so the run-detail tables can link the key to the Forgejo run.
+        let run_id: i64 = sqlx::query_scalar("SELECT id FROM runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let links = state::run_job_links(&pool, run_id).await.unwrap();
+        assert_eq!(
+            links.get("fabrikam/forgejo-cli#7").map(String::as_str),
+            Some("https://dev.a8n.run/fabrikam/forgejo-cli/actions/runs/7"),
+            "{links:?}"
+        );
 
         // The outcome carries a summary; with no backend it is the log-only note,
         // and it references the redacted artifact that the ready fetch wrote.
