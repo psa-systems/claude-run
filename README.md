@@ -193,9 +193,10 @@ Triage sorts each verified failure into one of three buckets: a failing PR check
 [webhook]
 # Name of the stored secret (see CLAUDE-26 secrets) holding the Forgejo HMAC key.
 secret_ref = "forgejo-webhook-secret"
-# Pilot allow-list. Only failures from these repos are acted on; every other
-# authenticated delivery is acked and dropped. Pilot is forgejo-cli only;
-# expanding the list is gated on a separate decision.
+# Repo allow-list. Only failures from matching repos are acted on; every other
+# authenticated delivery is acked and dropped. Patterns: exact "owner/repo",
+# per-owner "owner/*", or "*" for every repo (pair "*" with a Forgejo SYSTEM
+# webhook so all repos deliver). Empty list denies all.
 allowed_repos = ["pandoras-box/forgejo-cli"]
 replay_window_secs = 300
 rate_limit_per_min = 60
