@@ -143,6 +143,19 @@ pub async fn run_set_current_job(pool: &SqlitePool, run_id: i64, key: Option<&st
     Ok(())
 }
 
+/// CLAUDE-80: set (or clear, with `None`) the live pipeline stage of a run, so
+/// the run-detail page can show what an in-flight run is doing (the webhook
+/// fast-path advances it through download / triage / classify / mint).
+/// `run_finish` clears it together with `current_job_key`.
+pub async fn run_stage_set(pool: &SqlitePool, run_id: i64, stage: Option<&str>) -> Result<()> {
+    sqlx::query("UPDATE runs SET stage = ? WHERE id = ?")
+        .bind(stage)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// CLAUDE-28: mark a job key as in flight for a run. Replaces the single
 /// `run_set_current_job` marker so a run with several jobs running in parallel
 /// badges all of them. Idempotent (`INSERT OR IGNORE`).
@@ -197,11 +210,12 @@ pub async fn run_finish(
     let now = now_iso();
     // CLAUDE-14: clear current_job_key atomically with the end state. A finished
     // run has no job in flight, so every break/finish path that reaches here
-    // also drops the stale "running" marker.
+    // also drops the stale "running" marker. CLAUDE-80: the live stage is
+    // cleared the same way so it never outlives its run.
     sqlx::query(
         r#"
         UPDATE runs
-        SET ended_at = ?, exit_code = ?, jobs_processed = ?, current_job_key = NULL
+        SET ended_at = ?, exit_code = ?, jobs_processed = ?, current_job_key = NULL, stage = NULL
         WHERE id = ?
         "#,
     )
@@ -230,11 +244,14 @@ pub async fn run_finish(
 /// gone, so there is no child to terminate or `post` phase to run.
 pub async fn cancel_orphaned_runs(pool: &SqlitePool) -> Result<u64> {
     let now = now_iso();
-    let result = sqlx::query("UPDATE runs SET ended_at = ?, exit_code = ? WHERE ended_at IS NULL")
-        .bind(&now)
-        .bind(crate::exit::CANCELLED as i64)
-        .execute(pool)
-        .await?;
+    // CLAUDE-80: a dead process reports no stage; clear it with the end state.
+    let result = sqlx::query(
+        "UPDATE runs SET ended_at = ?, exit_code = ?, stage = NULL WHERE ended_at IS NULL",
+    )
+    .bind(&now)
+    .bind(crate::exit::CANCELLED as i64)
+    .execute(pool)
+    .await?;
     // CLAUDE-28: at startup nothing is in flight, so any in-flight job markers
     // are leftovers from the dead process. Clear them all.
     sqlx::query("DELETE FROM run_inflight_jobs")
@@ -577,6 +594,42 @@ mod tests {
             .unwrap();
         MIGRATOR.run(&pool).await.unwrap();
         pool
+    }
+
+    async fn stage_of(pool: &SqlitePool, run_id: i64) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>("SELECT stage FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_stage_roundtrips_and_clears_on_finish() {
+        // CLAUDE-80: set, overwrite, explicit clear, and the run_finish clear.
+        let pool = mem_pool().await;
+        let run = run_begin(&pool, "act", "webhook").await.unwrap();
+        assert_eq!(stage_of(&pool, run).await, None);
+
+        run_stage_set(&pool, run, Some("downloading forgejo log"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stage_of(&pool, run).await.as_deref(),
+            Some("downloading forgejo log")
+        );
+
+        run_stage_set(&pool, run, Some("minting issue"))
+            .await
+            .unwrap();
+        assert_eq!(stage_of(&pool, run).await.as_deref(), Some("minting issue"));
+
+        run_stage_set(&pool, run, None).await.unwrap();
+        assert_eq!(stage_of(&pool, run).await, None);
+
+        run_stage_set(&pool, run, Some("triaging")).await.unwrap();
+        run_finish(&pool, run, 0, 1).await.unwrap();
+        assert_eq!(stage_of(&pool, run).await, None, "finish clears the stage");
     }
 
     async fn exit_code_of(pool: &SqlitePool, run_id: i64) -> Option<i64> {
