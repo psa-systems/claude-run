@@ -67,6 +67,20 @@
     .activity { font-family: var(--mono); }
     .activity.stale { color: var(--bad); font-weight: bold; }
     .activity.live { color: var(--ok); }
+    /* CLAUDE-89: run-detail summary column clamp + view-details dialog. */
+    td.summary-cell { max-width: 360px; }
+    .clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+    dialog.summary-dialog { background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 16px; max-width: 720px; width: 90vw; max-height: 80vh; overflow: auto; }
+    dialog.summary-dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+    .summary-dialog-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 12px; }
+    .md-body { font-size: 13px; line-height: 1.5; text-align: left; }
+    .md-body h1, .md-body h2, .md-body h3, .md-body h4 { font-size: 14px; text-transform: none; letter-spacing: normal; border-bottom: none; color: var(--fg); margin: 16px 0 8px; padding-bottom: 0; }
+    .md-body p { margin: 8px 0; }
+    .md-body ul, .md-body ol { margin: 8px 0; padding-left: 20px; }
+    .md-body code { font-family: var(--mono); font-size: 12px; background: var(--panel-2); padding: 1px 4px; border-radius: 3px; }
+    .md-body pre { background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; padding: 8px; overflow: auto; }
+    .md-body pre code { background: none; padding: 0; }
+    .md-body blockquote { border-left: 3px solid var(--border); margin: 8px 0; padding-left: 12px; color: var(--fg-dim); }
     .kv { display: grid; grid-template-columns: 140px 1fr; gap: 4px 12px; }
     .kv dt { color: var(--fg-dim); }
     .kv dd { margin: 0; font-family: var(--mono); font-size: 13px; }

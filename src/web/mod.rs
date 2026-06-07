@@ -202,6 +202,29 @@ impl JobOutcomeRow {
             None => "-".to_string(),
         }
     }
+
+    /// CLAUDE-89: full summary rendered from Markdown to HTML for the
+    /// view-details dialog on the run-detail page. The template injects this
+    /// with `|safe`, so the output must be trusted; see
+    /// [`render_summary_markdown`] for the raw-HTML escaping that makes it so.
+    fn summary_html(&self) -> Option<String> {
+        self.summary.as_deref().map(render_summary_markdown)
+    }
+}
+
+/// CLAUDE-89: convert a job-outcome summary from Markdown to HTML. Raw HTML
+/// events in the source are demoted to text (which `push_html` escapes), never
+/// passed through: summaries are model output and must not inject markup into
+/// the page.
+fn render_summary_markdown(md: &str) -> String {
+    use pulldown_cmark::{html, Event, Parser};
+    let parser = Parser::new(md).map(|ev| match ev {
+        Event::Html(s) | Event::InlineHtml(s) => Event::Text(s),
+        other => other,
+    });
+    let mut out = String::new();
+    html::push_html(&mut out, parser);
+    out
 }
 
 /// CLAUDE-20: render a millisecond span human-readably (`820ms`, `4s`,
@@ -2017,7 +2040,46 @@ impl IntoResponse for WebError {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_duration_chart, format_duration_ms, latest_attempt_on_disk};
+    use super::{
+        build_duration_chart, format_duration_ms, latest_attempt_on_disk, render_summary_markdown,
+    };
+
+    // ---- summary markdown rendering (CLAUDE-89) ----------------------------
+
+    /// Markdown structure in a summary renders as HTML elements.
+    #[test]
+    fn summary_markdown_renders_formatting() {
+        let html =
+            render_summary_markdown("## Summary\n\nDid **the thing** with `code`.\n\n- one\n- two");
+        assert!(html.contains("<h2>Summary</h2>"), "heading missing: {html}");
+        assert!(
+            html.contains("<strong>the thing</strong>"),
+            "bold missing: {html}"
+        );
+        assert!(
+            html.contains("<code>code</code>"),
+            "inline code missing: {html}"
+        );
+        assert!(html.contains("<li>one</li>"), "list missing: {html}");
+    }
+
+    /// Raw HTML in a summary is escaped to text, never emitted as markup. The
+    /// template injects the result with `|safe`, so this is the trust boundary
+    /// against model output scripting the page.
+    #[test]
+    fn summary_markdown_escapes_raw_html() {
+        let html =
+            render_summary_markdown("hi <script>alert(1)</script>\n\n<img src=x onerror=alert(2)>");
+        assert!(
+            !html.contains("<script>"),
+            "script tag passed through: {html}"
+        );
+        assert!(!html.contains("<img"), "img tag passed through: {html}");
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "script tag not escaped: {html}"
+        );
+    }
 
     // ---- action editor handlers (CLAUDE-34) -------------------------------
     //

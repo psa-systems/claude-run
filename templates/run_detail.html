@@ -5,10 +5,12 @@
 
 {# Run detail polls faster (2s) than the dashboard because a run in progress
    should feel live. The polling div re-fetches this same URL and swaps just
-   its own subtree via hx-select. #}
+   its own subtree via hx-select. CLAUDE-89: the poll is suppressed while a
+   summary dialog is open, because the swap would destroy it mid-read;
+   refreshNow stays unconditional (user-initiated via the cancel button). #}
 <div id="poll-region"
      hx-get="/runs/{{ run.id }}"
-     hx-trigger="every 2s, refreshNow from:body"
+     hx-trigger="every 2s [!document.querySelector('dialog[open]')], refreshNow from:body"
      hx-select="#poll-region"
      hx-swap="outerHTML">
 
@@ -150,8 +152,23 @@
               <a href="/runs/{{ run.id }}/jobs/{{ o.job_key }}/attempt/{{ o.attempt }}">view stream</a>
             {% else %}<span class="dim">-</span>{% endif %}
           </td>
-          <td>
-            {% if let Some(sm) = o.summary %}{{ sm }}{% else %}<span class="dim">-</span>{% endif %}
+          {# CLAUDE-89: clamp the summary to two lines in the cell; the full
+             text opens in a native <dialog> rendered from Markdown to HTML
+             server-side (raw HTML escaped, see render_summary_markdown). #}
+          <td class="summary-cell">
+            {% if let Some(sm) = o.summary %}
+              <div class="clamp-2">{{ sm }}</div>
+              <a href="#" onclick="this.nextElementSibling.showModal(); return false;">view details</a>
+              <dialog class="summary-dialog">
+                <div class="summary-dialog-head">
+                  <span class="mono">{{ o.job_key }} - attempt {{ o.attempt }}</span>
+                  <button class="btn" onclick="this.closest('dialog').close()">Close</button>
+                </div>
+                {% if let Some(sh) = o.summary_html() %}
+                  <div class="md-body">{{ sh|safe }}</div>
+                {% endif %}
+              </dialog>
+            {% else %}<span class="dim">-</span>{% endif %}
           </td>
         </tr>
       {% endfor %}
