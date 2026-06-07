@@ -19,6 +19,13 @@
     <dt>Started</dt>       <dd>{{ run.started_at }}</dd>
     <dt>Ended</dt>         <dd>{{ run.ended_at.as_deref().unwrap_or("running") }}</dd>
     <dt>Duration</dt>      <dd>{{ run.duration() }}</dd>
+    {# CLAUDE-80: live pipeline stage, present only while an in-flight run
+       reports one (webhook fast-path). Updates ride the 2s poll. #}
+    {% if run.ended_at.is_none() %}
+      {% if let Some(st) = run.stage %}
+        <dt>Stage</dt>     <dd><span class="badge warn">{{ st }}</span></dd>
+      {% endif %}
+    {% endif %}
     <dt>Triggered by</dt>  <dd>{{ run.triggered_by }}</dd>
     <dt>Jobs processed</dt><dd>{{ run.jobs_processed }}{% if run.failed_jobs > 0 %} <span style="color: var(--bad);">({{ run.failed_jobs }} failed)</span>{% endif %}</dd>
     <dt>Exit</dt>
@@ -80,6 +87,14 @@
             <td>
               {% if let Some(a) = p.watch_attempt %}
                 <a href="/runs/{{ run.id }}/jobs/{{ p.key }}/attempt/{{ a }}">watch live</a>
+              {% else if p.status == "running" %}
+                {# CLAUDE-80: no stream to watch (webhook fast-path), but the
+                   run's live stage says what the pipeline is doing right now. #}
+                {% if let Some(st) = run.stage %}
+                  <span class="dim">{{ st }}</span>
+                {% else %}
+                  <span class="dim">-</span>
+                {% endif %}
               {% else %}
                 <span class="dim">-</span>
               {% endif %}

@@ -311,7 +311,7 @@ pub async fn consume_events(
             continue;
         };
         let artifact = log_artifact.clone();
-        let result = triage_and_mint(ctx, &ev, log_text, log_available, log_artifact).await;
+        let result = triage_and_mint(ctx, run_id, &ev, log_text, log_available, log_artifact).await;
         finish_webhook_run(
             &pool,
             run_id,
@@ -324,8 +324,18 @@ pub async fn consume_events(
     }
 }
 
+/// CLAUDE-80: live stage labels for the webhook fast-path pipeline, surfaced on
+/// the run-detail page (Stage row + the running job's LIVE column) via
+/// `runs.stage`. `run_finish` clears the column, so no label outlives its run.
+pub const STAGE_DOWNLOADING_LOG: &str = "downloading forgejo log";
+pub const STAGE_TRIAGING: &str = "triaging";
+pub const STAGE_CLASSIFYING: &str = "classifying with claude";
+pub const STAGE_MINTING: &str = "minting issue";
+
 /// CLAUDE-61: open the `runs` row for one webhook fast-path event and stamp its
-/// single planned job key. Returns the run id, or `None` when `run_begin`
+/// single planned job key. CLAUDE-80: also registers the job in-flight (so the
+/// run-detail badge reads `running`, not `queued`, for the whole pipeline) and
+/// sets the initial stage. Returns the run id, or `None` when `run_begin`
 /// failed (the pipeline still runs, just unrecorded). Failures are logged, not
 /// propagated: a DB hiccup must never strand the event consumer.
 async fn begin_webhook_run(pool: &SqlitePool, job_key: &str) -> Option<i64> {
@@ -335,6 +345,12 @@ async fn begin_webhook_run(pool: &SqlitePool, job_key: &str) -> Option<i64> {
                 state::run_set_job_keys(pool, id, std::slice::from_ref(&job_key.to_string())).await
             {
                 warn!(error = %e, "recording webhook run job key failed");
+            }
+            if let Err(e) = state::run_inflight_add(pool, id, job_key).await {
+                warn!(error = %e, "registering webhook job in flight failed");
+            }
+            if let Err(e) = state::run_stage_set(pool, id, Some(STAGE_DOWNLOADING_LOG)).await {
+                warn!(error = %e, "setting webhook run stage failed");
             }
             Some(id)
         }
@@ -445,6 +461,7 @@ fn mint_summary(outcome: &MintOutcome) -> String {
 /// actually created. Logs the decision; never propagates an error to the loop.
 async fn triage_and_mint(
     ctx: &MintContext,
+    run_id: Option<i64>,
     ev: &VerifiedFailureEvent,
     log_text: String,
     log_available: bool,
@@ -469,11 +486,34 @@ async fn triage_and_mint(
         max_runs_per_day: ctx.defaults.max_runs_per_day,
     };
 
+    // CLAUDE-80: surface what the blocking pipeline is doing. The blocking
+    // thread cannot await the pool, so stage labels travel over an unbounded
+    // channel to a drainer task that performs the `runs.stage` UPDATEs. The
+    // sender drops with the closure when the blocking task ends, closing the
+    // channel; the drainer is awaited below so no stale stage write can land
+    // after `finish_webhook_run` clears the column.
+    let (stage_tx, mut stage_rx) = mpsc::unbounded_channel::<&'static str>();
+    let stage_drainer = {
+        let pool = ctx.pool.clone();
+        tokio::spawn(async move {
+            while let Some(stage) = stage_rx.recv().await {
+                let Some(id) = run_id else { continue };
+                if let Err(e) = state::run_stage_set(&pool, id, Some(stage)).await {
+                    warn!(error = %e, stage, "updating webhook run stage failed");
+                }
+            }
+        })
+    };
+
     let backend = ctx.backend.clone();
     let classifier = ctx.classifier.clone();
     let mint_cfg = ctx.mint_cfg.clone();
     let event = ev.clone();
     let outcome = tokio::task::spawn_blocking(move || {
+        let report_stage = move |stage: &'static str| {
+            let _ = stage_tx.send(stage);
+        };
+        report_stage(STAGE_TRIAGING);
         let has_open_pr = resolve_has_open_pr(backend.as_ref(), &event);
         decide_mint(
             classifier.as_ref(),
@@ -485,9 +525,11 @@ async fn triage_and_mint(
             log_available,
             log_artifact.as_deref(),
             has_open_pr,
+            &report_stage,
         )
     })
     .await;
+    let _ = stage_drainer.await;
 
     let (bucket, outcome) = match outcome {
         Ok(Ok(o)) => o,
@@ -533,6 +575,7 @@ fn decide_mint(
     log_available: bool,
     log_artifact: Option<&std::path::Path>,
     has_open_pr: bool,
+    report_stage: &(dyn Fn(&'static str) + Send + Sync),
 ) -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
     let input = TriageInput {
         repo: ev.repo.clone(),
@@ -543,7 +586,15 @@ fn decide_mint(
         log_available,
         has_open_pr,
     };
-    let verdict = triage::triage(&input, classifier);
+    // CLAUDE-80: the classify stage only exists when the deterministic rules
+    // abstain, so the label is reported from inside the classifier call rather
+    // than unconditionally - a rules short-circuit never shows it.
+    let reporting = ReportingClassifier {
+        inner: classifier,
+        report: report_stage,
+    };
+    let verdict = triage::triage(&input, &reporting);
+    report_stage(STAGE_MINTING);
     let req = MintRequest {
         repo: &ev.repo,
         index_in_repo: ev.index_in_repo,
@@ -556,6 +607,22 @@ fn decide_mint(
     };
     let outcome = mint::mint(tracker, mint_cfg, &req, caps)?;
     Ok((verdict.bucket, outcome))
+}
+
+/// CLAUDE-80: classifier decorator that reports the "classifying with claude"
+/// stage right before delegating, so the label appears exactly when (and only
+/// when) the LLM pass actually runs - the deterministic rules short-circuit
+/// never consults the classifier and therefore never shows it.
+struct ReportingClassifier<'a> {
+    inner: &'a dyn FailureClassifier,
+    report: &'a (dyn Fn(&'static str) + Send + Sync),
+}
+
+impl FailureClassifier for ReportingClassifier<'_> {
+    fn classify(&self, input: &TriageInput) -> crate::error::Result<crate::triage::Triage> {
+        (self.report)(STAGE_CLASSIFYING);
+        self.inner.classify(input)
+    }
 }
 
 /// Best-effort `has_open_pr` signal for the triage classifier: list the repo's
@@ -1222,6 +1289,7 @@ mod tests {
             false,
             None,
             false,
+            &|_| {},
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::Transient);
@@ -1245,6 +1313,7 @@ mod tests {
             true,
             None,
             true,
+            &|_| {},
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::Transient);
@@ -1268,6 +1337,7 @@ mod tests {
             true,
             None,
             true,
+            &|_| {},
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::CodeFix);
@@ -1307,6 +1377,7 @@ mod tests {
             true,
             None,
             false,
+            &|_| {},
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::HumanAction);
@@ -1406,15 +1477,30 @@ mod tests {
         .await;
 
         // One finished run, recorded under the synthetic action + webhook source.
-        let (action, triggered, jobs, exit): (String, String, i64, Option<i64>) =
-            sqlx::query_as("SELECT action_name, triggered_by, jobs_processed, exit_code FROM runs")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        // CLAUDE-80: the finished run carries no stage (cleared by run_finish)
+        // and no stale in-flight marker.
+        let (action, triggered, jobs, exit, stage): (
+            String,
+            String,
+            i64,
+            Option<i64>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT action_name, triggered_by, jobs_processed, exit_code, stage FROM runs",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(action, WEBHOOK_MINT_ACTION);
         assert_eq!(triggered, WEBHOOK_TRIGGERED_BY);
         assert_eq!(jobs, 1);
         assert_eq!(exit, Some(crate::exit::OK as i64));
+        assert_eq!(stage, None, "stage cleared on finish");
+        let inflight: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_inflight_jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(inflight, 0, "in-flight marker cleared on finish");
 
         // The outcome carries a summary; with no backend it is the log-only note,
         // and it references the redacted artifact that the ready fetch wrote.
@@ -1427,6 +1513,57 @@ mod tests {
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log-only"), "{summary}");
         assert!(summary.contains("log="), "artifact reference: {summary}");
+    }
+
+    #[test]
+    fn decide_mint_reports_stages_in_order_for_an_llm_classification() {
+        // CLAUDE-80: a non-transient log goes rules -> LLM -> mint, so the
+        // reporter sees the classify stage between triage and mint.
+        let classifier = StubClassifier::new(TriageBucket::CodeFix);
+        let tracker = StubTracker::new();
+        let stages = std::sync::Mutex::new(Vec::new());
+        let report = |s: &'static str| stages.lock().unwrap().push(s);
+        decide_mint(
+            &classifier,
+            &tracker,
+            &mint_cfg(),
+            &caps(),
+            &event(),
+            "assertion failed: expected 1 got 2".to_string(),
+            true,
+            None,
+            true,
+            &report,
+        )
+        .unwrap();
+        assert_eq!(
+            *stages.lock().unwrap(),
+            vec![STAGE_CLASSIFYING, STAGE_MINTING]
+        );
+    }
+
+    #[test]
+    fn decide_mint_skips_the_classify_stage_on_a_rules_short_circuit() {
+        // CLAUDE-80: a rules-bucketed event (transient signature) never runs
+        // the LLM, so "classifying with claude" must never be reported.
+        let classifier = StubClassifier::new(TriageBucket::CodeFix);
+        let tracker = StubTracker::new();
+        let stages = std::sync::Mutex::new(Vec::new());
+        let report = |s: &'static str| stages.lock().unwrap().push(s);
+        decide_mint(
+            &classifier,
+            &tracker,
+            &mint_cfg(),
+            &caps(),
+            &event(),
+            "error: no runner available for this job".to_string(),
+            true,
+            None,
+            true,
+            &report,
+        )
+        .unwrap();
+        assert_eq!(*stages.lock().unwrap(), vec![STAGE_MINTING]);
     }
 
     #[test]
