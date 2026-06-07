@@ -34,6 +34,7 @@
   const baseUrl = "/sse/runs/{{ run_id }}/jobs/{{ job_key }}/attempt/{{ attempt }}";
 
   let lastEventAt = null;        // wall-clock of the last rendered event
+  let firstEventTs = null;       // epoch ms of the first stamped event (run-start anchor for +offset)
   let lastId = null;             // last SSE event id, carried into reconnects to resume
   let finished = false;          // set true ONLY by the 'done' event (job actually complete)
   let source = null;             // current EventSource (re-created on manual reconnect)
@@ -48,10 +49,34 @@
     out.style.display = showRaw ? 'none' : '';
   });
 
-  function append(cls, text) {
+  // Format an elapsed-millisecond span as "Xm Ys", matching the run-detail
+  // duration wording.
+  function fmtOffset(ms) {
+    const total = Math.max(0, Math.round(ms / 1000));
+    return Math.floor(total / 60) + 'm ' + (total % 60) + 's';
+  }
+
+  // CLAUDE-63: render one event row. When the event carries a `ts` (RFC 3339
+  // arrival time stamped by the runner), prefix the row with a dim viewer-local
+  // HH:MM:SS and set a hover title to the full timestamp plus the +offset since
+  // the run's first stamped event. Events without `ts` (logs predating the
+  // stamping change) render exactly as before, no prefix.
+  function append(cls, text, ts) {
     const div = document.createElement('span');
     div.className = 'ev ' + cls;
-    div.textContent = text;
+    const d = ts ? new Date(ts) : null;
+    if (d && !isNaN(d.getTime())) {
+      if (firstEventTs === null) firstEventTs = d.getTime();
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      const stamp = document.createElement('span');
+      stamp.className = 'ev-ts';
+      stamp.textContent = hh + ':' + mm + ':' + ss + ' ';
+      div.appendChild(stamp);
+      div.title = ts + ', +' + fmtOffset(d.getTime() - firstEventTs);
+    }
+    div.appendChild(document.createTextNode(text));
     out.appendChild(div);
     out.scrollTop = out.scrollHeight;
   }
@@ -70,26 +95,29 @@
   }
 
   function render(j) {
+    // CLAUDE-63: j.ts (if present) is the runner-stamped arrival time; pass it
+    // to every row this event produces so each carries the dim time prefix.
+    const ts = j.ts;
     if (j.type === 'assistant' && j.message && Array.isArray(j.message.content)) {
       for (const block of j.message.content) {
         if (block.type === 'text' && block.text && block.text.trim()) {
-          append('ev-assistant', block.text.trim());
+          append('ev-assistant', block.text.trim(), ts);
         } else if (block.type === 'tool_use') {
           const summary = summarizeInput(block.input);
-          append('ev-tool', '→ ' + (block.name || 'tool') + (summary ? ': ' + summary : ''));
+          append('ev-tool', '→ ' + (block.name || 'tool') + (summary ? ': ' + summary : ''), ts);
         }
       }
     } else if (j.type === 'result') {
       const summary = (typeof j.result === 'string' && j.result) ? j.result : (j.subtype || '(no result text)');
       const cost = (typeof j.total_cost_usd === 'number') ? ' ($' + j.total_cost_usd.toFixed(4) + ')' : '';
-      append(j.is_error ? 'ev-result-err' : 'ev-result-ok', 'result: ' + summary + cost);
+      append(j.is_error ? 'ev-result-err' : 'ev-result-ok', 'result: ' + summary + cost, ts);
     } else if (j.type === 'system') {
       if (j.subtype === 'no-stream-yet') {
-        append('ev-system', 'No stream yet - the agent has not started writing.');
+        append('ev-system', 'No stream yet - the agent has not started writing.', ts);
       } else if (j.subtype === 'init') {
-        append('ev-system', 'session started' + (j.model ? ' (model ' + j.model + ')' : ''));
+        append('ev-system', 'session started' + (j.model ? ' (model ' + j.model + ')' : ''), ts);
       } else if (j.error) {
-        append('ev-system', 'system error: ' + j.error);
+        append('ev-system', 'system error: ' + j.error, ts);
       }
       // Other system events are noise in the readable view; they stay in raw.
     }
