@@ -254,7 +254,7 @@ Running the daemon on the host means every `claude` child it spawns inherits the
 
 **Image.** `oci-build/Dockerfile` has a `runtime` target built on the CI image (`dev.a8n.run/pandoras-box/rust-builder-musl`). It carries `claude-run` plus the pinned runtime toolchain: `nu`, the `claude` CLI, coreutils `timeout`, `git`, `yt` (youtrack-cli), and `fj` (forgejo-cli). Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VERSION`, `YT_VERSION`, `FJ_VERSION` / `FJ_URL`); override any one with `--build-arg`. The container runs as the non-root user `claudebot` with `$HOME=/home/claudebot`.
 
-**Published image (CLAUDE-88).** CI publishes the runtime image to the Forgejo OCI registry on every push to main (`:latest`) and every release tag (`:vX.Y.Z`), the same tag set as the binary's Generic Package. Pull it with:
+**Published image (CLAUDE-88).** CI publishes the runtime image to the Forgejo OCI registry on every push to main (`:latest`) and every release tag (`:vX.Y.Z`), the same tag set as the binary's Generic Package. The image publish runs in its own workflow, `.forgejo/workflows/build-image.yml` (split out of `build-binary.yml` in CLAUDE-94), so the binary and image publish independently. Pull it with:
 
 ```nu
 docker pull dev.a8n.run/psa-systems/claude-run:latest
