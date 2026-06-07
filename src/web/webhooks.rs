@@ -49,7 +49,7 @@ use tracing::{debug, info, warn};
 use crate::config::{MintConfig, WebhookConfig};
 use crate::forge_log::LogOutcome;
 use crate::job::RunnerDefaults;
-use crate::mint::{self, MintCaps, MintOutcome, MintRequest};
+use crate::mint::{self, MintCaps, MintOutcome, MintRequest, VcsRouteCache};
 use crate::provider::{Backend, ForgePullRequest};
 use crate::secrets::{self, SecretsKey};
 use crate::state;
@@ -211,6 +211,9 @@ pub struct MintContext {
     pub mint_cfg: MintConfig,
     /// Caps applied to the event-driven mint (per-key attempts + daily runs).
     pub defaults: RunnerDefaults,
+    /// CLAUDE-86: TTL-cached inverse VCS routing map (repo -> project), built
+    /// from YouTrack project VCS integrations and shared across mints.
+    pub route_cache: Arc<VcsRouteCache>,
 }
 
 /// Drain emitted events. For each verified failure this fetches the failing
@@ -549,6 +552,7 @@ async fn triage_and_mint(
     let backend = ctx.backend.clone();
     let classifier = ctx.classifier.clone();
     let mint_cfg = ctx.mint_cfg.clone();
+    let route_cache = ctx.route_cache.clone();
     let event = ev.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let report_stage = move |stage: &'static str| {
@@ -560,6 +564,7 @@ async fn triage_and_mint(
             classifier.as_ref(),
             backend.as_ref(),
             &mint_cfg,
+            route_cache.as_ref(),
             &caps,
             &event,
             log_text,
@@ -610,6 +615,7 @@ fn decide_mint(
     classifier: &dyn FailureClassifier,
     tracker: &dyn crate::provider::IssueTracker,
     mint_cfg: &MintConfig,
+    route_cache: &VcsRouteCache,
     caps: &MintCaps,
     ev: &VerifiedFailureEvent,
     log_text: String,
@@ -646,7 +652,7 @@ fn decide_mint(
         triage: &verdict,
         log_path: log_artifact,
     };
-    let outcome = mint::mint(tracker, mint_cfg, &req, caps)?;
+    let outcome = mint::mint(tracker, mint_cfg, route_cache, &req, caps)?;
     Ok((verdict.bucket, outcome))
 }
 
@@ -711,8 +717,9 @@ fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
             key,
             project,
             bucket,
+            source,
         } => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, %key, %project, bucket = %bucket, "minted YouTrack issue from verified failure")
+            info!(repo = %ev.repo, run = ev.index_in_repo, %key, %project, bucket = %bucket, routing = %source, "minted YouTrack issue from verified failure")
         }
         MintOutcome::SkippedTransient => {
             info!(repo = %ev.repo, run = ev.index_in_repo, "transient failure; minted nothing")
@@ -1268,6 +1275,11 @@ mod tests {
         ) -> crate::error::Result<crate::provider::VcsRepo> {
             unreachable!()
         }
+        fn vcs_repo_map(&self) -> crate::error::Result<Vec<crate::provider::VcsMapEntry>> {
+            // The webhook tests route via the explicit override, so the map is
+            // never consulted; return empty to keep the stub total.
+            Ok(Vec::new())
+        }
         fn create_issue(
             &self,
             project: &str,
@@ -1317,6 +1329,10 @@ mod tests {
         }
     }
 
+    fn route_cache() -> VcsRouteCache {
+        VcsRouteCache::new(std::time::Duration::from_secs(900))
+    }
+
     #[test]
     fn unavailable_log_short_circuits_to_transient_without_the_classifier() {
         // log_available = false -> the deterministic rules route to bucket 3, so
@@ -1327,6 +1343,7 @@ mod tests {
             &classifier,
             &tracker,
             &mint_cfg(),
+            &route_cache(),
             &caps(),
             &event(),
             String::new(),
@@ -1351,6 +1368,7 @@ mod tests {
             &classifier,
             &tracker,
             &mint_cfg(),
+            &route_cache(),
             &caps(),
             &event(),
             "error: no runner available for this job".to_string(),
@@ -1375,6 +1393,7 @@ mod tests {
             &classifier,
             &tracker,
             &mint_cfg(),
+            &route_cache(),
             &caps(),
             &event(),
             "assertion failed: expected 1 got 2".to_string(),
@@ -1391,6 +1410,7 @@ mod tests {
                 key: "CLAUDE-99".to_string(),
                 project: "FJ".to_string(),
                 bucket: TriageBucket::CodeFix,
+                source: crate::mint::RouteSource::Override,
             }
         );
         assert_eq!(*classifier.calls.lock().unwrap(), 1, "classifier ran once");
@@ -1415,6 +1435,7 @@ mod tests {
             &classifier,
             &tracker,
             &mint_cfg(),
+            &route_cache(),
             &caps(),
             &event(),
             "the release tag push to main failed".to_string(),
@@ -1642,6 +1663,7 @@ mod tests {
             &classifier,
             &tracker,
             &mint_cfg(),
+            &route_cache(),
             &caps(),
             &event(),
             "assertion failed: expected 1 got 2".to_string(),
@@ -1669,6 +1691,7 @@ mod tests {
             &classifier,
             &tracker,
             &mint_cfg(),
+            &route_cache(),
             &caps(),
             &event(),
             "error: no runner available for this job".to_string(),
@@ -1688,6 +1711,7 @@ mod tests {
                 key: "CLAUDE-99".to_string(),
                 project: "FJ".to_string(),
                 bucket: crate::triage::TriageBucket::CodeFix,
+                source: crate::mint::RouteSource::Override,
             }),
             "minted CLAUDE-99 in FJ"
         );

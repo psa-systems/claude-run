@@ -187,6 +187,8 @@ The daemon turns a Forgejo `action_run_failure` delivery into a triaged YouTrack
 
 Triage sorts each verified failure into one of three buckets: a failing PR check that a code change fixes (`code_fix`) mints an issue and sets `AI Agent = Queued` so `forgejo-ci-fix` opens the fix PR; a failure no PR fixes (`human_action`, e.g. a main-branch / tag / release / missing-secret failure) mints a human-assigned issue with no PR; a transient / infra / flaky failure (`transient`) mints nothing. A failing run triggered by the fix bot's own login mints nothing (loop safety), and the reused per-key + daily caps throttle a storm of failures.
 
+A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the primary mechanism: the repo-to-project binding already lives in YouTrack (each project's enabled `GiteaChangesProcessor` carries the forge `serverUrl` + `path`), so adding a repo to a project's VCS settings is the only step needed for routing to follow. There is no per-repo config to keep in sync. The inverse map is built from `yt project list --json` + `yt project vcs <KEY> --enabled-only --json` (non-archived projects only), cached for 15 minutes, and refreshed once on a lookup miss so a just-added integration is picked up without a daemon restart. Matching is case-insensitive on both host and path and ignores trailing slashes. When more than one project claims the same repo the first by short name (ascending) wins, with a warning naming all candidates; a single project's failing `vcs` call is logged and skipped rather than disabling routing. The mint journal line names the routing source (`override` / `vcs` / `fallback`) so a wrong destination is diagnosable.
+
 ```toml
 # config.toml
 
@@ -202,13 +204,17 @@ replay_window_secs = 300
 rate_limit_per_min = 60
 
 [mint]
-# Route the pilot repo's issues to its own YouTrack project; CLAUDE is the
-# fallback for any repo not listed.
+# Project for any repo no VCS integration claims. Routing is normally driven by
+# each YouTrack project's VCS settings, so this is only the last-resort default.
 fallback_project = "CLAUDE"
 # bot_logins defaults to ["claude-run"] (the fix bot's login); add others here.
 
+# repo_project_map is an OPTIONAL override, consulted before the VCS lookup. Add
+# an entry only to force a repo to a project that does not (or should not) own
+# the repo's VCS integration; otherwise leave it empty and let YouTrack's VCS
+# settings drive routing.
 [mint.repo_project_map]
-"pandoras-box/forgejo-cli" = "FJ"
+# "pandoras-box/forgejo-cli" = "FJ"
 ```
 
 The mint needs the `yt` (and, for the `has_open_pr` triage signal and the fix PR, `fj`) CLIs on the daemon host. With no usable backend the consumer still ingests and logs failures but mints nothing.

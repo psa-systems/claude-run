@@ -27,14 +27,22 @@
 //! integration step: this module delivers the engine and its types.
 
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::config::MintConfig;
 use crate::error::Result;
-use crate::provider::IssueTracker;
+use crate::provider::{IssueTracker, VcsMapEntry};
 use crate::triage::{Triage, TriageBucket};
+
+/// Default time-to-live for the cached inverse VCS routing map (CLAUDE-86): a
+/// just-added VCS integration is picked up within this window without a daemon
+/// restart, while steady-state mints reuse the cache and issue no extra `yt`
+/// calls. Refresh-on-miss shortens this for a genuinely new repo.
+pub const DEFAULT_VCS_MAP_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Everything the mint needs about one triaged failure: the
 /// `action_run_failure` metadata, the triage verdict, and the redacted log path.
@@ -82,6 +90,8 @@ pub enum MintOutcome {
         key: String,
         project: String,
         bucket: TriageBucket,
+        /// How `project` was chosen (override / vcs / fallback), for the journal.
+        source: RouteSource,
     },
     /// Bucket 3 (transient/infra): mint nothing.
     SkippedTransient,
@@ -129,13 +139,193 @@ pub fn is_bot_loop(trigger_user: &str, cfg: &MintConfig) -> bool {
     cfg.bot_logins.iter().any(|b| b == trigger_user)
 }
 
-/// Resolve the YouTrack project short name for `repo`: the per-repo mapping when
-/// present, else the configured fallback (CLAUDE).
-pub fn resolve_project(repo: &str, cfg: &MintConfig) -> String {
-    cfg.repo_project_map
-        .get(repo)
-        .cloned()
-        .unwrap_or_else(|| cfg.fallback_project.clone())
+/// How a mint's destination project was chosen, surfaced in the journal so a
+/// wrong destination is diagnosable (CLAUDE-86).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteSource {
+    /// An explicit `repo_project_map` entry (operator override).
+    Override,
+    /// A project's enabled VCS integration claimed the repo.
+    Vcs,
+    /// No override and no VCS claim: `fallback_project`.
+    Fallback,
+}
+
+impl std::fmt::Display for RouteSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            RouteSource::Override => "override",
+            RouteSource::Vcs => "vcs",
+            RouteSource::Fallback => "fallback",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Normalize a forge host or processor `serverUrl` for comparison: drop any
+/// scheme, trailing slash, and case. `https://dev.a8n.run/` and `dev.a8n.run`
+/// both become `dev.a8n.run`.
+fn norm_host(s: &str) -> String {
+    let after = s.split_once("://").map(|(_, rest)| rest).unwrap_or(s);
+    after.trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// The forge host (no scheme) of a run's `html_url`, e.g.
+/// `https://dev.a8n.run/owner/repo/...` -> `dev.a8n.run`. Empty when the URL has
+/// no host segment.
+fn forge_host(url: &str) -> String {
+    norm_host(url).split('/').next().unwrap_or("").to_string()
+}
+
+/// The inverse VCS routing map: forge `(host, repo path)` -> project short name,
+/// built from every non-archived project's enabled VCS processors. Lookups are
+/// case-insensitive on both host and path and ignore trailing slashes on the
+/// host (CLAUDE-86).
+#[derive(Debug, Clone, Default)]
+pub struct VcsRouteMap {
+    /// `(host_normalized, path_lowercased, project_key)`.
+    entries: Vec<(String, String, String)>,
+}
+
+impl VcsRouteMap {
+    /// Build a route map from the flattened `(server_url, path, project)` rows
+    /// the [`IssueTracker`] returns, normalizing host and path once up front.
+    pub fn from_entries(rows: Vec<VcsMapEntry>) -> Self {
+        let entries = rows
+            .into_iter()
+            .map(|e| {
+                (
+                    norm_host(&e.server_url),
+                    e.path.to_ascii_lowercase(),
+                    e.project_key,
+                )
+            })
+            .collect();
+        Self { entries }
+    }
+
+    /// The project that claims `repo` on `host`, or `None` when no enabled VCS
+    /// integration matches. When several projects claim the same repo, the match
+    /// is deterministic (first by project short name, ascending) and all
+    /// candidates are logged (CLAUDE-86 ambiguity rule).
+    pub fn lookup(&self, host: &str, repo: &str) -> Option<String> {
+        let host = norm_host(host);
+        let repo = repo.to_ascii_lowercase();
+        let mut claimants: Vec<&str> = self
+            .entries
+            .iter()
+            .filter(|(h, p, _)| *h == host && *p == repo)
+            .map(|(_, _, project)| project.as_str())
+            .collect();
+        claimants.sort_unstable();
+        claimants.dedup();
+        match claimants.as_slice() {
+            [] => None,
+            [only] => Some((*only).to_string()),
+            many => {
+                warn!(
+                    host = %host,
+                    repo = %repo,
+                    candidates = %many.join(", "),
+                    chosen = %many[0],
+                    "multiple projects claim this repo via VCS integration; routing to the first by short name"
+                );
+                Some(many[0].to_string())
+            }
+        }
+    }
+}
+
+/// Lazily-built, TTL-cached inverse VCS routing map shared across mints
+/// (CLAUDE-86). The map is built on first use and rebuilt when older than the
+/// TTL; a lookup miss triggers one immediate refresh before falling back, so a
+/// just-added VCS integration routes without waiting out the TTL. A rebuild
+/// failure keeps any prior map and degrades to the fallback rather than erroring.
+pub struct VcsRouteCache {
+    ttl: Duration,
+    inner: Mutex<Option<CachedMap>>,
+}
+
+struct CachedMap {
+    map: VcsRouteMap,
+    built_at: Instant,
+}
+
+impl VcsRouteCache {
+    /// Cache with the given TTL.
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            inner: Mutex::new(None),
+        }
+    }
+
+    /// Resolve the YouTrack project for `repo` on forge `host`, full order:
+    /// explicit `repo_project_map` override, then the cached VCS map (rebuilt if
+    /// stale, refreshed once on a miss), then `fallback_project`. Returns the
+    /// project short name and which rule chose it.
+    pub fn resolve_project(
+        &self,
+        tracker: &dyn IssueTracker,
+        cfg: &MintConfig,
+        repo: &str,
+        host: &str,
+    ) -> (String, RouteSource) {
+        // 1. Explicit override always wins and needs no VCS map.
+        if let Some(project) = cfg.repo_project_map.get(repo) {
+            return (project.clone(), RouteSource::Override);
+        }
+
+        // 2. VCS integration map.
+        let mut guard = self.inner.lock().unwrap();
+        let built_now = self.ensure(tracker, &mut guard, false);
+        if let Some(project) = guard.as_ref().and_then(|c| c.map.lookup(host, repo)) {
+            return (project, RouteSource::Vcs);
+        }
+        // Miss. Refresh once before falling back, unless the map was just built
+        // (a fresh build that already missed will not change on a re-fetch).
+        if !built_now {
+            self.ensure(tracker, &mut guard, true);
+            if let Some(project) = guard.as_ref().and_then(|c| c.map.lookup(host, repo)) {
+                return (project, RouteSource::Vcs);
+            }
+        }
+
+        // 3. Fallback for an unclaimed repo.
+        (cfg.fallback_project.clone(), RouteSource::Fallback)
+    }
+
+    /// Ensure the cached map is fresh enough, rebuilding it via `tracker` when it
+    /// is missing, older than the TTL, or `force`d. Returns whether this call
+    /// performed a (successful) rebuild. A rebuild error is logged and leaves any
+    /// prior map in place.
+    fn ensure(
+        &self,
+        tracker: &dyn IssueTracker,
+        guard: &mut Option<CachedMap>,
+        force: bool,
+    ) -> bool {
+        let stale = match guard.as_ref() {
+            None => true,
+            Some(c) => force || c.built_at.elapsed() >= self.ttl,
+        };
+        if !stale {
+            return false;
+        }
+        match tracker.vcs_repo_map() {
+            Ok(rows) => {
+                *guard = Some(CachedMap {
+                    map: VcsRouteMap::from_entries(rows),
+                    built_at: Instant::now(),
+                });
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "rebuilding the VCS routing map failed; routing via the prior map / fallback");
+                false
+            }
+        }
+    }
 }
 
 /// A stable, single-token full-text dedupe marker over `parts`. Hex-only so
@@ -166,6 +356,7 @@ fn secondary_marker(req: &MintRequest) -> String {
 pub fn mint(
     tracker: &dyn IssueTracker,
     cfg: &MintConfig,
+    route_cache: &VcsRouteCache,
     req: &MintRequest,
     caps: &MintCaps,
 ) -> Result<MintOutcome> {
@@ -203,7 +394,9 @@ pub fn mint(
     }
 
     // Create the issue in the mapped project, bucket 2 pre-assigned to a human.
-    let project = resolve_project(req.repo, cfg);
+    // Routing order: explicit override, the project's VCS integration, fallback.
+    let (project, source) =
+        route_cache.resolve_project(tracker, cfg, req.repo, &forge_host(req.html_url));
     let summary = build_summary(req);
     let description = build_description(req, &primary, &secondary);
     let assignee = if route.assign_human {
@@ -232,6 +425,7 @@ pub fn mint(
         key,
         project,
         bucket: req.triage.bucket,
+        source,
     })
 }
 
@@ -288,20 +482,22 @@ fn build_description(req: &MintRequest, primary: &str, secondary: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::VcsRepo;
+    use crate::provider::{VcsMapEntry, VcsRepo};
     use crate::triage::{ClassifiedBy, Triage};
     use serde_json::Value;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
 
     /// Stub [`IssueTracker`] recording every mutation and returning canned
-    /// `list_queued` responses keyed by query. Only the methods the mint calls
+    /// `list_queued` / `vcs_repo_map` responses. Only the methods the mint calls
     /// are meaningful; the rest are unreachable in these tests.
     struct StubTracker {
         /// query -> JSON array string the dedupe search should return.
         searches: HashMap<String, String>,
         /// idReadable handed back by `create_issue`.
         new_key: String,
+        /// Successive `vcs_repo_map` responses; the last is reused once drained.
+        vcs_responses: Mutex<VecDeque<Vec<VcsMapEntry>>>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -310,6 +506,7 @@ mod tests {
             Self {
                 searches: HashMap::new(),
                 new_key: "CLAUDE-99".to_string(),
+                vcs_responses: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -318,8 +515,27 @@ mod tests {
                 .insert(query.to_string(), json_array.to_string());
             self
         }
+        /// One canned `vcs_repo_map` result, reused for every call.
+        fn with_vcs(self, entries: Vec<VcsMapEntry>) -> Self {
+            self.vcs_responses.lock().unwrap().push_back(entries);
+            self
+        }
+        /// A sequence of `vcs_repo_map` results, one per successive call (the last
+        /// repeats once the queue drains). Drives the miss-then-refresh path.
+        fn with_vcs_sequence(self, seq: Vec<Vec<VcsMapEntry>>) -> Self {
+            *self.vcs_responses.lock().unwrap() = seq.into();
+            self
+        }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+        fn vcs_calls(&self) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.as_str() == "vcs_repo_map")
+                .count()
         }
     }
 
@@ -351,6 +567,15 @@ mod tests {
         }
         fn resolve_vcs(&self, _project_key: &str) -> Result<VcsRepo> {
             unreachable!("mint does not resolve vcs")
+        }
+        fn vcs_repo_map(&self) -> Result<Vec<VcsMapEntry>> {
+            self.calls.lock().unwrap().push("vcs_repo_map".to_string());
+            let mut q = self.vcs_responses.lock().unwrap();
+            Ok(if q.len() > 1 {
+                q.pop_front().unwrap()
+            } else {
+                q.front().cloned().unwrap_or_default()
+            })
         }
         fn create_issue(
             &self,
@@ -390,6 +615,19 @@ mod tests {
             max_attempts: 3,
             daily: 0,
             max_runs_per_day: 20,
+        }
+    }
+
+    /// A route cache with a long TTL (refresh-on-miss is exercised explicitly).
+    fn route_cache() -> VcsRouteCache {
+        VcsRouteCache::new(Duration::from_secs(900))
+    }
+
+    fn entry(server_url: &str, path: &str, project: &str) -> VcsMapEntry {
+        VcsMapEntry {
+            server_url: server_url.to_string(),
+            path: path.to_string(),
+            project_key: project.to_string(),
         }
     }
 
@@ -435,11 +673,120 @@ mod tests {
         assert_eq!(route(TriageBucket::Transient), None);
     }
 
+    // ---- CLAUDE-86: VCS-integration routing -------------------------------
+
     #[test]
-    fn resolve_project_uses_map_then_fallback() {
+    fn route_order_override_beats_vcs_beats_fallback() {
+        let c = cfg(); // override: fabrikam/forgejo-cli -> FJ
+        let tracker = StubTracker::new().with_vcs(vec![entry(
+            "https://dev.a8n.run",
+            "fabrikam/forgejo-cli",
+            "WRONG",
+        )]);
+        let r = route_cache();
+        // Override wins even when a VCS entry also claims the repo.
+        assert_eq!(
+            r.resolve_project(&tracker, &c, "fabrikam/forgejo-cli", "dev.a8n.run"),
+            ("FJ".to_string(), RouteSource::Override)
+        );
+        // No override -> VCS claim wins over the fallback.
+        let tracker = StubTracker::new().with_vcs(vec![entry(
+            "https://dev.a8n.run",
+            "fabrikam/gizmo",
+            "GIZMO",
+        )]);
+        assert_eq!(
+            route_cache().resolve_project(&tracker, &c, "fabrikam/gizmo", "dev.a8n.run"),
+            ("GIZMO".to_string(), RouteSource::Vcs)
+        );
+        // No override, no VCS claim -> fallback.
+        let tracker = StubTracker::new().with_vcs(vec![]);
+        assert_eq!(
+            route_cache().resolve_project(&tracker, &c, "who/knows", "dev.a8n.run"),
+            ("CLAUDE".to_string(), RouteSource::Fallback)
+        );
+    }
+
+    #[test]
+    fn vcs_lookup_is_case_and_trailing_slash_insensitive() {
+        // Processor path is lowercased and serverUrl carries a trailing slash;
+        // the payload carries case-preserved values: matching must ignore both.
+        let map = VcsRouteMap::from_entries(vec![entry(
+            "https://dev.a8n.run/",
+            "fabrikam/youtrack-mcp",
+            "YTMCP",
+        )]);
+        assert_eq!(
+            map.lookup("DEV.A8N.RUN", "Fabrikam/YouTrack-MCP"),
+            Some("YTMCP".to_string())
+        );
+        assert_eq!(
+            map.lookup("https://dev.a8n.run", "fabrikam/youtrack-mcp"),
+            Some("YTMCP".to_string())
+        );
+        // A different host with the same path does not match.
+        assert_eq!(
+            map.lookup("other.example", "fabrikam/youtrack-mcp"),
+            None
+        );
+    }
+
+    #[test]
+    fn ambiguous_claim_is_deterministic_first_by_short_name() {
+        // Two projects claim the same repo: pick the first short name ascending.
+        let map = VcsRouteMap::from_entries(vec![
+            entry("https://dev.a8n.run", "owner/repo", "ZED"),
+            entry("https://dev.a8n.run", "owner/repo", "ALPHA"),
+        ]);
+        assert_eq!(
+            map.lookup("dev.a8n.run", "owner/repo"),
+            Some("ALPHA".to_string())
+        );
+    }
+
+    #[test]
+    fn cached_map_serves_steady_state_without_extra_calls() {
         let c = cfg();
-        assert_eq!(resolve_project("fabrikam/forgejo-cli", &c), "FJ");
-        assert_eq!(resolve_project("contoso/claude-run", &c), "CLAUDE");
+        let tracker = StubTracker::new().with_vcs(vec![entry(
+            "https://dev.a8n.run",
+            "fabrikam/gizmo",
+            "GIZMO",
+        )]);
+        let r = route_cache();
+        // First resolve builds the map; the second reuses the cache.
+        assert_eq!(
+            r.resolve_project(&tracker, &c, "fabrikam/gizmo", "dev.a8n.run")
+                .0,
+            "GIZMO"
+        );
+        assert_eq!(
+            r.resolve_project(&tracker, &c, "fabrikam/gizmo", "dev.a8n.run")
+                .0,
+            "GIZMO"
+        );
+        assert_eq!(
+            tracker.vcs_calls(),
+            1,
+            "steady-state issues no extra rebuild"
+        );
+    }
+
+    #[test]
+    fn miss_refreshes_once_before_falling_back() {
+        let c = cfg();
+        // First build returns an empty map (repo not yet integrated); the
+        // refresh-on-miss rebuild returns the now-present claim.
+        let tracker = StubTracker::new().with_vcs_sequence(vec![
+            vec![],
+            vec![entry("https://dev.a8n.run", "fabrikam/gizmo", "GIZMO")],
+        ]);
+        // Pre-warm the cache so the lookup is served from cache (not a fresh
+        // build), which is what arms the refresh-on-miss.
+        let r = route_cache();
+        let _ = r.resolve_project(&tracker, &c, "fabrikam/gizmo", "dev.a8n.run");
+        let (project, source) =
+            r.resolve_project(&tracker, &c, "fabrikam/gizmo", "dev.a8n.run");
+        assert_eq!((project.as_str(), source), ("GIZMO", RouteSource::Vcs));
     }
 
     #[test]
@@ -461,7 +808,14 @@ mod tests {
     fn transient_bucket_mints_nothing() {
         let t = triage(TriageBucket::Transient);
         let tracker = StubTracker::new();
-        let out = mint(&tracker, &cfg(), &req("owner/repo", &t, "alice"), &caps()).unwrap();
+        let out = mint(
+            &tracker,
+            &cfg(),
+            &route_cache(),
+            &req("owner/repo", &t, "alice"),
+            &caps(),
+        )
+        .unwrap();
         assert_eq!(out, MintOutcome::SkippedTransient);
         assert!(tracker.calls().is_empty(), "no yt calls for a transient");
     }
@@ -475,6 +829,7 @@ mod tests {
         let out = mint(
             &tracker,
             &cfg(),
+            &route_cache(),
             &req("fabrikam/forgejo-cli", &t, "alice"),
             &caps(),
         )
@@ -485,6 +840,7 @@ mod tests {
                 key: "CLAUDE-99".to_string(),
                 project: "FJ".to_string(),
                 bucket: TriageBucket::CodeFix,
+                source: RouteSource::Override,
             }
         );
         let calls = tracker.calls();
@@ -515,6 +871,7 @@ mod tests {
         let out = mint(
             &tracker,
             &cfg(),
+            &route_cache(),
             &req("contoso/claude-run", &t, "alice"),
             &caps(),
         )
@@ -525,6 +882,7 @@ mod tests {
                 key: "CLAUDE-99".to_string(),
                 project: "CLAUDE".to_string(),
                 bucket: TriageBucket::HumanAction,
+                source: RouteSource::Fallback,
             }
         );
         let calls = tracker.calls();
@@ -549,7 +907,7 @@ mod tests {
         let mut r = req("contoso/claude-run", &t, "alice");
         let log = Path::new("/tmp/redacted.log");
         r.log_path = Some(log);
-        mint(&tracker, &cfg(), &r, &caps()).unwrap();
+        mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
         assert!(
             tracker
                 .calls()
@@ -571,6 +929,7 @@ mod tests {
         let out = mint(
             &tracker,
             &cfg(),
+            &route_cache(),
             &req("contoso/claude-run", &t, "claude-run"),
             &caps(),
         )
@@ -587,7 +946,14 @@ mod tests {
             attempts: 3,
             ..caps()
         };
-        let out = mint(&tracker, &cfg(), &req("owner/repo", &t, "alice"), &capped).unwrap();
+        let out = mint(
+            &tracker,
+            &cfg(),
+            &route_cache(),
+            &req("owner/repo", &t, "alice"),
+            &capped,
+        )
+        .unwrap();
         assert_eq!(out, MintOutcome::SkippedAttemptCap);
         assert!(tracker.calls().is_empty());
     }
@@ -602,7 +968,14 @@ mod tests {
             daily: 20,
             ..caps()
         };
-        let out = mint(&tracker, &cfg(), &req("owner/repo", &t, "alice"), &capped).unwrap();
+        let out = mint(
+            &tracker,
+            &cfg(),
+            &route_cache(),
+            &req("owner/repo", &t, "alice"),
+            &capped,
+        )
+        .unwrap();
         assert_eq!(out, MintOutcome::SkippedDailyCap);
         assert!(tracker.calls().is_empty());
     }
@@ -618,7 +991,7 @@ mod tests {
             &format!("{primary} #Unresolved"),
             r#"[{"idReadable":"CLAUDE-50","summary":"already open"}]"#,
         );
-        let out = mint(&tracker, &cfg(), &r, &caps()).unwrap();
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
         assert_eq!(
             out,
             MintOutcome::SkippedDuplicateOpen {
@@ -638,7 +1011,7 @@ mod tests {
             &format!("{primary} #Resolved"),
             r#"[{"idReadable":"CLAUDE-40","summary":"done last week"}]"#,
         );
-        let out = mint(&tracker, &cfg(), &r, &caps()).unwrap();
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
         assert_eq!(
             out,
             MintOutcome::SkippedResolved {
@@ -659,7 +1032,7 @@ mod tests {
             &format!("{secondary} #Unresolved"),
             r#"[{"idReadable":"CLAUDE-51"}]"#,
         );
-        let out = mint(&tracker, &cfg(), &r, &caps()).unwrap();
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
         assert_eq!(
             out,
             MintOutcome::SkippedDuplicateOpen {
