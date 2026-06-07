@@ -221,6 +221,33 @@ The mint needs the `yt` (and, for the `has_open_pr` triage signal and the fix PR
 
 Register the webhook on the pilot repo with **only** the Action Run Failure event (Forgejo: repo Settings -> Webhooks -> Add Webhook -> Forgejo), pointing at the daemon's `/webhooks/forgejo` URL, with the same HMAC secret stored under `secret_ref`. Selecting only the Failure event keeps `success` / `recover` deliveries off the wire entirely; any that do arrive are acked and dropped.
 
+## Containerized deployment
+
+Running the daemon on the host means every `claude` child it spawns inherits the operator's `$HOME`, so Claude Code loads the operator's interactive `~/.claude/CLAUDE.md` (which prescribes a full Git + YouTrack workflow) and contradicts the local-only agent contract. The container runtime (CLAUDE-37) fixes that: the whole daemon runs in a container with a clean `$HOME`, so each child inherits a slim, bot-specific user memory instead.
+
+**Image.** `oci-build/Dockerfile` has a `runtime` target built on the CI image (`dev.a8n.run/pandoras-box/rust-builder-musl`). It carries `claude-run` plus the pinned runtime toolchain: `nu`, the `claude` CLI, coreutils `timeout`, `git`, `yt` (youtrack-cli), and `fj` (forgejo-cli). Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VERSION`, `YT_VERSION`, `FJ_VERSION` / `FJ_URL`); override any one with `--build-arg`. The container runs as the non-root user `claudebot` with `$HOME=/home/claudebot`.
+
+**Slim bot CLAUDE.md.** `deploy/bot-CLAUDE.md` is versioned in this repo and `COPY`d to `/home/claudebot/.claude/CLAUDE.md`. It contains only the local-only agent contract (no push, no PR, no YouTrack writes; leave the feature branch as HEAD; the runner finalizes), the em-dash ban, the Nushell 0.112.2 note, and the simplest-solution preference. It has no Git/YouTrack workflow and no lifecycle section, so the agent is never told to push, open PRs, or transition issue state.
+
+**compose.yml.** App-prefixed names (service `claude-bot`, network `claude-bot-private`, volumes `claude-bot-{config,data,state}`; prefix each with `dev-` for a development stack). The named volumes back `CLAUDE_RUN_CONFIG_DIR` / `CLAUDE_RUN_DATA_DIR` / `CLAUDE_RUN_STATE_DIR`; `CLAUDE_RUN_RUNTIME_DIR` (the daemon's unix socket) is a tmpfs so a stale socket never survives a restart. The actions YAML is supplied read-only into the config dir from `./actions`.
+
+**Host auth (read-only mounts).** All host credentials are bound read-only:
+
+| Tool | Host path | Container path |
+|---|---|---|
+| Claude | `~/.claude/.credentials.json` | `/home/claudebot/.claude/.credentials.json` |
+| `yt` | `~/.config/youtrack-cli` | `/home/claudebot/.config/youtrack-cli` |
+| `fj` | `~/.local/share/forgejo-cli/keys.json` | `/home/claudebot/.local/share/forgejo-cli/keys.json` |
+| git | `~/.gitconfig` | `/home/claudebot/.gitconfig` |
+
+Only the single Claude credentials file is mounted, never the whole `~/.claude`. Mounting `~/.claude` wholesale would re-shadow the baked slim CLAUDE.md (the exact regression this removes). To use an API key instead of mounted credentials, drop that bind and set `ANTHROPIC_API_KEY` in the service `environment`.
+
+```nu
+docker compose build           # build the runtime image
+docker compose up --detach      # start the daemon
+docker compose logs --follow    # watch the scheduler
+```
+
 ## Development
 
 ```nu
