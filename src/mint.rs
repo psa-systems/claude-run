@@ -64,6 +64,10 @@ pub struct MintRequest<'a> {
     pub triage: &'a Triage,
     /// Redacted job-log artifact to attach; `None` when no log was available.
     pub log_path: Option<&'a Path>,
+    /// CLAUDE-92 `repository.private`. When set, repeated failures of the same
+    /// workflow group onto one open issue (CLAUDE-100) because there is no log
+    /// to tell two failures apart; public repos keep per-run minting.
+    pub private: bool,
 }
 
 /// The DEV-335 caps, reused (not re-derived) from the runner's existing
@@ -105,6 +109,9 @@ pub enum MintOutcome {
     SkippedDuplicateOpen { existing: String },
     /// A resolved issue exists for this key: never reopen.
     SkippedResolved { existing: String },
+    /// CLAUDE-100: a private-repo repeat of the same `(repo, workflow_id)`
+    /// commented onto the existing OPEN issue instead of minting a sibling.
+    AssociatedWithOpen { existing: String },
 }
 
 /// How a (non-transient) bucket routes once an issue is minted.
@@ -350,6 +357,13 @@ fn secondary_marker(req: &MintRequest) -> String {
     marker(&[req.repo, req.commit_sha, req.workflow_id])
 }
 
+/// CLAUDE-100 group marker: `(wf, repo, workflow_id)`, independent of the
+/// commit / run index so every failure of the same workflow in the same repo
+/// shares it. Used (private repos only) to group repeats onto one open issue.
+fn group_marker(req: &MintRequest) -> String {
+    marker(&["wf", req.repo, req.workflow_id])
+}
+
 /// Mint (or decline to mint) a YouTrack issue from a triaged failure. Pure
 /// decision flow over the [`IssueTracker`] trait; see the module docs for the
 /// ordering (route -> loop safety -> caps -> dedupe -> create).
@@ -393,12 +407,39 @@ pub fn mint(
         }
     }
 
+    // CLAUDE-100: private repos have no log to distinguish two failures of the
+    // same workflow, so a repeat of the same `(repo, workflow_id)` groups onto
+    // the existing OPEN issue instead of minting a sibling. The per-run checks
+    // above run FIRST, so a redelivery of an already-associated run resolves to
+    // `SkippedDuplicateOpen` before this group search. A failure after the
+    // grouped issue is resolved finds no open match here and mints a fresh
+    // issue below (a fixed-then-broken workflow is a new regression). Public
+    // repos keep their per-run logs and skip grouping until the post-v16
+    // signature key (CLAUDE-96 follow-up) lands.
+    let group = if req.private {
+        Some(group_marker(req))
+    } else {
+        None
+    };
+    if let Some(group) = &group {
+        if let Some(existing) = find_first(tracker, &format!("{group} #Unresolved"))? {
+            // Comment the new run onto the open issue, carrying this run's own
+            // per-run Dedupe-Key line so a redelivery of THIS run full-text
+            // matches and hits the per-run `SkippedDuplicateOpen` path above
+            // (no second comment). No issue is created, so the caps ledger does
+            // not advance (the caller only counts `Created`).
+            let body = build_association_comment(req, &primary, &secondary);
+            tracker.comment(&existing, &body)?;
+            return Ok(MintOutcome::AssociatedWithOpen { existing });
+        }
+    }
+
     // Create the issue in the mapped project, bucket 2 pre-assigned to a human.
     // Routing order: explicit override, the project's VCS integration, fallback.
     let (project, source) =
         route_cache.resolve_project(tracker, cfg, req.repo, &forge_host(req.html_url));
     let summary = build_summary(req);
-    let description = build_description(req, &primary, &secondary);
+    let description = build_description(req, &primary, &secondary, group.as_deref());
     let assignee = if route.assign_human {
         cfg.human_assignee.as_deref()
     } else {
@@ -448,13 +489,25 @@ fn build_summary(req: &MintRequest) -> String {
     )
 }
 
-/// Markdown issue body: the triage analysis, the run metadata, and the two
-/// hidden dedupe markers a later mint searches for.
-fn build_description(req: &MintRequest, primary: &str, secondary: &str) -> String {
+/// Markdown issue body: the triage analysis, the run metadata, and the hidden
+/// dedupe markers a later mint searches for. `group` is the CLAUDE-100 group
+/// marker, present only for private repos; when set it is appended to the
+/// `Dedupe-Key:` line so future repeats of the same workflow group onto this
+/// issue. Public repos omit it, keeping their body byte-for-byte unchanged.
+fn build_description(
+    req: &MintRequest,
+    primary: &str,
+    secondary: &str,
+    group: Option<&str>,
+) -> String {
     let attached = if req.log_path.is_some() {
         "The redacted failing-job log is attached to this issue."
     } else {
         "No job log was available (transient miss); none attached."
+    };
+    let dedupe_keys = match group {
+        Some(group) => format!("Dedupe-Key: {primary} {secondary} {group}"),
+        None => format!("Dedupe-Key: {primary} {secondary}"),
     };
     [
         "## Triage".to_string(),
@@ -472,6 +525,26 @@ fn build_description(req: &MintRequest, primary: &str, secondary: &str) -> Strin
         format!("- Run: {}", req.html_url),
         String::new(),
         attached.to_string(),
+        String::new(),
+        "<!-- claude-run dedupe markers; do not edit -->".to_string(),
+        dedupe_keys,
+    ]
+    .join("\n")
+}
+
+/// CLAUDE-100: the comment posted onto an existing open issue when a private
+/// repo's workflow fails again. Carries the new run's number, short SHA, and
+/// run link, plus this run's own per-run `Dedupe-Key:` line so a redelivery of
+/// THIS run full-text matches and hits the per-run duplicate path (no second
+/// comment).
+fn build_association_comment(req: &MintRequest, primary: &str, secondary: &str) -> String {
+    let short_sha = req.commit_sha.chars().take(8).collect::<String>();
+    [
+        format!(
+            "`{}` failed again on `{}` (run #{}, {}).",
+            req.workflow_id, req.repo, req.index_in_repo, short_sha
+        ),
+        format!("- Run: {}", req.html_url),
         String::new(),
         "<!-- claude-run dedupe markers; do not edit -->".to_string(),
         format!("Dedupe-Key: {primary} {secondary}"),
@@ -562,8 +635,12 @@ mod tests {
                 .push(format!("set_state {key} {state}"));
             Ok(())
         }
-        fn comment(&self, _key: &str, _body: &str) -> Result<()> {
-            unreachable!("mint does not comment")
+        fn comment(&self, key: &str, body: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("comment {key} | {body}"));
+            Ok(())
         }
         fn resolve_vcs(&self, _project_key: &str) -> Result<VcsRepo> {
             unreachable!("mint does not resolve vcs")
@@ -649,6 +726,7 @@ mod tests {
             trigger_user: user,
             triage: t,
             log_path: None,
+            private: false,
         }
     }
 
@@ -1039,5 +1117,118 @@ mod tests {
                 existing: "CLAUDE-51".to_string()
             }
         );
+    }
+
+    // ---- CLAUDE-100: group repeated private-repo failures -----------------
+
+    #[test]
+    fn private_repeat_groups_onto_the_open_issue_and_creates_nothing() {
+        // AC 1: a private-repo repeat of the same (repo, workflow_id) while the
+        // first issue is open comments onto it and mints nothing.
+        let t = triage(TriageBucket::CodeFix);
+        let mut r = req("owner/repo", &t, "alice");
+        r.private = true;
+        let group = group_marker(&r);
+        let tracker = StubTracker::new().with_search(
+            &format!("{group} #Unresolved"),
+            r#"[{"idReadable":"CLAUDE-60","summary":"check.yml failing"}]"#,
+        );
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert_eq!(
+            out,
+            MintOutcome::AssociatedWithOpen {
+                existing: "CLAUDE-60".to_string()
+            }
+        );
+        let calls = tracker.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create")),
+            "no issue minted: {calls:?}"
+        );
+        // The comment carries the new run's OWN per-run markers, so a redelivery
+        // of this run hits the per-run duplicate path (AC 2).
+        let primary = primary_marker(&r);
+        let secondary = secondary_marker(&r);
+        assert!(
+            calls.iter().any(|c| c.starts_with("comment CLAUDE-60 |")
+                && c.contains(&primary)
+                && c.contains(&secondary)),
+            "comment carries per-run Dedupe-Key: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn private_repeat_after_resolution_mints_a_new_issue() {
+        // AC 3: only a RESOLVED issue carries the group marker (the group search
+        // is #Unresolved only), so a failure after resolution finds no open
+        // match and mints a fresh issue (a new regression).
+        let t = triage(TriageBucket::HumanAction);
+        let mut r = req("contoso/claude-run", &t, "alice");
+        r.private = true;
+        // No open group match is canned -> the search misses and we create.
+        let tracker = StubTracker::new();
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert_eq!(
+            out,
+            MintOutcome::Created {
+                key: "CLAUDE-99".to_string(),
+                project: "CLAUDE".to_string(),
+                bucket: TriageBucket::HumanAction,
+                source: RouteSource::Fallback,
+            }
+        );
+        assert!(tracker.calls().iter().any(|c| c.starts_with("create")));
+    }
+
+    #[test]
+    fn public_repo_never_runs_the_group_search() {
+        // AC 4: a public repo (private = false) never searches the group marker
+        // and mints exactly as before.
+        let t = triage(TriageBucket::CodeFix);
+        let r = req("owner/repo", &t, "alice"); // private defaults to false
+        let group = group_marker(&r);
+        let tracker = StubTracker::new().with_search(
+            &format!("{group} #Unresolved"),
+            r#"[{"idReadable":"CLAUDE-60"}]"#,
+        );
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert!(matches!(out, MintOutcome::Created { .. }));
+        let calls = tracker.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains(&group)),
+            "group marker never searched for a public repo: {calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("comment")));
+    }
+
+    #[test]
+    fn per_run_dedupe_takes_precedence_over_group_association() {
+        // AC 2 ordering: an open per-run match short-circuits before the group
+        // search, so an exact-run redelivery never comments a second time.
+        let t = triage(TriageBucket::CodeFix);
+        let mut r = req("owner/repo", &t, "alice");
+        r.private = true;
+        let primary = primary_marker(&r);
+        let group = group_marker(&r);
+        let tracker = StubTracker::new()
+            .with_search(
+                &format!("{primary} #Unresolved"),
+                r#"[{"idReadable":"CLAUDE-50"}]"#,
+            )
+            .with_search(
+                &format!("{group} #Unresolved"),
+                r#"[{"idReadable":"CLAUDE-60"}]"#,
+            );
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert_eq!(
+            out,
+            MintOutcome::SkippedDuplicateOpen {
+                existing: "CLAUDE-50".to_string()
+            }
+        );
+        // Resolved to the per-run path: no comment, no create.
+        let calls = tracker.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("comment")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.starts_with("create")), "{calls:?}");
     }
 }
