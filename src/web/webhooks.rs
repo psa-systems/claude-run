@@ -136,6 +136,15 @@ impl TryFrom<ActionUserRaw> for ActionUser {
 pub struct Repository {
     /// `owner/repo`, matched against the configured allow-list.
     pub full_name: String,
+    /// CLAUDE-92: visibility from the payload (`modules/structs/repo.go:57`).
+    /// A private repo's logs cannot be fetched on this Forgejo version (the
+    /// internal web logs route authenticates via session cookie only:
+    /// `services/auth/{basic,oauth2}.go` `Verify` both bail on non-API paths,
+    /// and the v14 repo Actions API has no logs endpoint, FJ-22 pending), so
+    /// the consumer must not burn the retry budget discovering that. Serde
+    /// default keeps older/foreign payloads on the public path.
+    #[serde(default)]
+    pub private: bool,
 }
 
 /// The typed event emitted downstream for a verified, allow-listed failure.
@@ -156,6 +165,9 @@ pub struct VerifiedFailureEvent {
     /// whether anything actually failed. The consumer processes only
     /// [`RUN_STATUS_FAILURE`] and acks-and-skips the rest.
     pub status: String,
+    /// CLAUDE-92: `repository.private` from the payload; gates the log fetch
+    /// (see [`Repository::private`]).
+    pub private: bool,
 }
 
 /// CLAUDE-85: the one `run.status` the pipeline acts on. Forgejo's status enum
@@ -303,65 +315,114 @@ pub async fn consume_events(
             continue;
         }
 
-        let Some(target) =
-            crate::forge_log::LogTarget::for_run(&ev.html_url, &ev.repo, ev.index_in_repo)
-        else {
-            warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge origin from html_url; skipping log fetch");
-            finish_webhook_run(
-                &pool,
-                run_id,
-                &job_key,
-                "could not derive forge origin from html_url; log fetch skipped",
+        // CLAUDE-92: the payload already declares visibility, and the event
+        // always arrives AFTER the run completed, so a private repo is decided
+        // here with ZERO fetch requests: the deployed Forgejo authenticates the
+        // internal web logs route by session cookie only (Basic/OAuth2 `Verify`
+        // bail on non-API paths; no API logs endpoint until FJ-22), so the
+        // fetch cannot succeed and retrying would only burn the 60s budget.
+        // The failure still surfaces: the no-log triage rule routes it to a
+        // human (bucket 2) instead of silently dropping it as transient.
+        let (log_text, log_available, log_artifact, log_unavailable_reason) = if ev.private {
+            info!(
+                repo = %ev.repo,
+                run = ev.index_in_repo,
+                "private repository; log fetch skipped (no token auth exists for the internal logs route)"
+            );
+            if let Some(id) = run_id {
+                if let Err(e) =
+                    state::run_stage_set(&pool, id, Some(STAGE_PRIVATE_UNAUTHORIZED)).await
+                {
+                    warn!(error = %e, "setting webhook run stage failed");
+                }
+            }
+            (
+                String::new(),
                 false,
                 None,
+                Some(
+                    "private repo: unauthorized (Forgejo's internal logs route has no token auth; FJ-22 pending)"
+                        .to_string(),
+                ),
             )
+        } else {
+            let Some(target) =
+                crate::forge_log::LogTarget::for_run(&ev.html_url, &ev.repo, ev.index_in_repo)
+            else {
+                warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge origin from html_url; skipping log fetch");
+                finish_webhook_run(
+                    &pool,
+                    run_id,
+                    &job_key,
+                    "could not derive forge origin from html_url; log fetch skipped",
+                    false,
+                    None,
+                )
+                .await;
+                continue;
+            };
+
+            // The fetch is blocking (reqwest on a thread + backoff sleeps); run
+            // it off the async runtime. No service-injected secrets reach the CI
+            // run, so `known_secrets` is empty here and pattern redaction does
+            // the work.
+            let transport = transport.clone();
+            let fetch_cfg = cfg.clone();
+            let out_dir = out_dir.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::forge_log::fetch_failing_job_log(
+                    transport.as_ref(),
+                    &fetch_cfg,
+                    &target,
+                    &out_dir,
+                    &[],
+                    std::thread::sleep,
+                )
+            })
             .await;
-            continue;
-        };
 
-        // The fetch is blocking (reqwest on a thread + backoff sleeps); run it
-        // off the async runtime. No service-injected secrets reach the CI run,
-        // so `known_secrets` is empty here and pattern redaction does the work.
-        let transport = transport.clone();
-        let fetch_cfg = cfg.clone();
-        let out_dir = out_dir.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            crate::forge_log::fetch_failing_job_log(
-                transport.as_ref(),
-                &fetch_cfg,
-                &target,
-                &out_dir,
-                &[],
-                std::thread::sleep,
-            )
-        })
-        .await;
-
-        // Normalise the fetch result into the triage inputs. A `TransientMiss`,
-        // a fetch error, and a panicked task all collapse to "no log" - which is
-        // itself a bucket-3 signal - so a flaky fetch never blocks the pipeline.
-        let (log_text, log_available, log_artifact) = match outcome {
-            Ok(Ok(LogOutcome::Fetched(log))) => {
-                info!(
-                    repo = %ev.repo,
-                    run = ev.index_in_repo,
-                    bytes = log.text.len(),
-                    artifact = %log.artifact.display(),
-                    "fetched and redacted failing job log"
-                );
-                (log.text, true, Some(log.artifact))
-            }
-            Ok(Ok(LogOutcome::TransientMiss { reason })) => {
-                warn!(repo = %ev.repo, run = ev.index_in_repo, %reason, "failing job log not available (transient miss)");
-                (String::new(), false, None)
-            }
-            Ok(Err(e)) => {
-                warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch failed");
-                (String::new(), false, None)
-            }
-            Err(e) => {
-                warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch task panicked");
-                (String::new(), false, None)
+            // Normalise the fetch result into the triage inputs. A
+            // `TransientMiss`, a fetch error, and a panicked task all collapse
+            // to "no log" with the reason preserved; the no-log triage rule
+            // (CLAUDE-92) routes those to a human rather than dropping them.
+            match outcome {
+                Ok(Ok(LogOutcome::Fetched(log))) => {
+                    info!(
+                        repo = %ev.repo,
+                        run = ev.index_in_repo,
+                        bytes = log.text.len(),
+                        artifact = %log.artifact.display(),
+                        "fetched and redacted failing job log"
+                    );
+                    (log.text, true, Some(log.artifact), None)
+                }
+                Ok(Ok(LogOutcome::TransientMiss { reason })) => {
+                    warn!(repo = %ev.repo, run = ev.index_in_repo, %reason, "failing job log not available (transient miss)");
+                    (
+                        String::new(),
+                        false,
+                        None,
+                        Some(format!("log not available after retries: {reason}")),
+                    )
+                }
+                Ok(Err(e)) => {
+                    warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch failed");
+                    (
+                        String::new(),
+                        false,
+                        None,
+                        Some(format!("log fetch failed: {e}")),
+                    )
+                }
+                Err(e) => {
+                    warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch task panicked");
+                    (
+                        String::new(),
+                        false,
+                        None,
+                        Some(format!("log fetch task panicked: {e}")),
+                    )
+                }
             }
         };
 
@@ -385,7 +446,16 @@ pub async fn consume_events(
             continue;
         };
         let artifact = log_artifact.clone();
-        let result = triage_and_mint(ctx, run_id, &ev, log_text, log_available, log_artifact).await;
+        let result = triage_and_mint(
+            ctx,
+            run_id,
+            &ev,
+            log_text,
+            log_available,
+            log_artifact,
+            log_unavailable_reason,
+        )
+        .await;
         finish_webhook_run(
             &pool,
             run_id,
@@ -401,7 +471,11 @@ pub async fn consume_events(
 /// CLAUDE-80: live stage labels for the webhook fast-path pipeline, surfaced on
 /// the run-detail page (Stage row + the running job's LIVE column) via
 /// `runs.stage`. `run_finish` clears the column, so no label outlives its run.
-pub const STAGE_DOWNLOADING_LOG: &str = "downloading forgejo log";
+pub const STAGE_FETCHING_LOGS: &str = "fetching action logs";
+/// CLAUDE-92: shown while a private-repo event is decided (no fetch possible);
+/// the lasting record is the triage analysis and journal line, since the run
+/// finishes within milliseconds and `run_finish` clears the stage.
+pub const STAGE_PRIVATE_UNAUTHORIZED: &str = "private repo: unauthorized";
 pub const STAGE_TRIAGING: &str = "triaging";
 pub const STAGE_CLASSIFYING: &str = "classifying with claude";
 pub const STAGE_MINTING: &str = "minting issue";
@@ -430,7 +504,7 @@ async fn begin_webhook_run(pool: &SqlitePool, job_key: &str, html_url: &str) -> 
             if let Err(e) = state::run_inflight_add(pool, id, job_key).await {
                 warn!(error = %e, "registering webhook job in flight failed");
             }
-            if let Err(e) = state::run_stage_set(pool, id, Some(STAGE_DOWNLOADING_LOG)).await {
+            if let Err(e) = state::run_stage_set(pool, id, Some(STAGE_FETCHING_LOGS)).await {
                 warn!(error = %e, "setting webhook run stage failed");
             }
             Some(id)
@@ -547,6 +621,7 @@ async fn triage_and_mint(
     log_text: String,
     log_available: bool,
     log_artifact: Option<PathBuf>,
+    log_unavailable_reason: Option<String>,
 ) -> WebhookRunSummary {
     // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
     // run's (repo, index); the daily ledger is per synthetic action. The
@@ -607,6 +682,7 @@ async fn triage_and_mint(
             log_text,
             log_available,
             log_artifact.as_deref(),
+            log_unavailable_reason,
             has_open_pr,
             &report_stage,
         )
@@ -658,6 +734,7 @@ fn decide_mint(
     log_text: String,
     log_available: bool,
     log_artifact: Option<&std::path::Path>,
+    log_unavailable_reason: Option<String>,
     has_open_pr: bool,
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
 ) -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
@@ -668,6 +745,7 @@ fn decide_mint(
         html_url: ev.html_url.clone(),
         log: log_text,
         log_available,
+        log_unavailable_reason,
         has_open_pr,
     };
     // CLAUDE-80: the classify stage only exists when the deterministic rules
@@ -971,6 +1049,7 @@ pub fn verified_failure_event(
         index_in_repo: payload.run.index_in_repo,
         commit_sha: payload.run.commit_sha.clone(),
         workflow_id: payload.run.workflow_id.clone(),
+        private: payload.run.repository.private,
         trigger_user: payload.run.trigger_user.login.clone(),
         html_url: payload.run.html_url.clone(),
         status: payload.run.status.clone(),
@@ -1096,6 +1175,7 @@ mod tests {
                 index_in_repo: 7,
                 commit_sha: "abc123".to_string(),
                 workflow_id: "ci.yml".to_string(),
+                private: false,
                 trigger_user: "alice".to_string(),
                 html_url: "https://dev.a8n.run/contoso/claude-run/actions/runs/7".to_string(),
                 status: "failure".to_string(),
@@ -1362,6 +1442,7 @@ mod tests {
             index_in_repo: 7,
             commit_sha: "abc123def456".to_string(),
             workflow_id: "ci.yml".to_string(),
+            private: false,
             trigger_user: "alice".to_string(),
             html_url: "https://dev.a8n.run/fabrikam/forgejo-cli/actions/runs/7".to_string(),
             status: "failure".to_string(),
@@ -1392,9 +1473,11 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_log_short_circuits_to_transient_without_the_classifier() {
-        // log_available = false -> the deterministic rules route to bucket 3, so
-        // the LLM classifier must never run and nothing is minted.
+    fn unavailable_log_mints_a_human_action_issue_without_the_classifier() {
+        // CLAUDE-92: log_available = false -> the deterministic rules route to
+        // bucket 2 (a real failure must surface even without a log), the LLM
+        // classifier never runs, and an issue IS minted with the reason in the
+        // analysis.
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let (bucket, out) = decide_mint(
@@ -1407,14 +1490,28 @@ mod tests {
             String::new(),
             false,
             None,
+            Some("private repo: unauthorized".to_string()),
             false,
             &|_| {},
         )
         .unwrap();
-        assert_eq!(bucket, TriageBucket::Transient);
-        assert_eq!(out, MintOutcome::SkippedTransient);
+        assert_eq!(bucket, TriageBucket::HumanAction);
+        assert!(
+            matches!(
+                out,
+                MintOutcome::Created {
+                    bucket: TriageBucket::HumanAction,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
         assert_eq!(*classifier.calls.lock().unwrap(), 0, "rules short-circuit");
-        assert!(tracker.calls().is_empty());
+        assert!(
+            tracker.calls().iter().any(|c| c.starts_with("create")),
+            "{:?}",
+            tracker.calls()
+        );
     }
 
     #[test]
@@ -1431,6 +1528,7 @@ mod tests {
             &event(),
             "error: no runner available for this job".to_string(),
             true,
+            None,
             None,
             true,
             &|_| {},
@@ -1456,6 +1554,7 @@ mod tests {
             &event(),
             "assertion failed: expected 1 got 2".to_string(),
             true,
+            None,
             None,
             true,
             &|_| {},
@@ -1498,6 +1597,7 @@ mod tests {
             &event(),
             "the release tag push to main failed".to_string(),
             true,
+            None,
             None,
             false,
             &|_| {},
@@ -1651,6 +1751,63 @@ mod tests {
         assert_eq!(event.status, "skipped");
     }
 
+    #[test]
+    fn verified_failure_event_carries_repo_visibility() {
+        // CLAUDE-92: `repository.private` rides the payload onto the event; a
+        // payload without the field (older/foreign forge) defaults to public.
+        let body = failure_payload("contoso/claude-run").replace(
+            r#""repository":{"full_name":"contoso/claude-run"}"#,
+            r#""repository":{"full_name":"contoso/claude-run","private":true}"#,
+        );
+        let payload: ActionPayload = serde_json::from_str(&body).unwrap();
+        let allowed = vec!["contoso/claude-run".to_string()];
+        let event = verified_failure_event(&payload, &allowed).expect("emits event");
+        assert!(event.private, "private flag carried");
+
+        let payload: ActionPayload =
+            serde_json::from_str(&failure_payload("contoso/claude-run")).unwrap();
+        let event = verified_failure_event(&payload, &allowed).expect("emits event");
+        assert!(!event.private, "absent field defaults to public");
+    }
+
+    #[tokio::test]
+    async fn private_repo_event_never_touches_the_log_route() {
+        // CLAUDE-92: the payload says the repo is private and this Forgejo has
+        // no token auth for the internal logs route, so the consumer must make
+        // ZERO fetch requests (no 60s retry burn) and still record the run.
+        let pool = memory_pool().await;
+        let out_dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let mut ev = event();
+        ev.private = true;
+        tx.send(ev).await.unwrap();
+        drop(tx);
+
+        consume_events(
+            rx,
+            pool.clone(),
+            Arc::new(PanicTransport),
+            out_dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+
+        let (jobs, exit): (i64, Option<i64>) =
+            sqlx::query_as("SELECT jobs_processed, exit_code FROM runs")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(jobs, 1);
+        assert_eq!(exit, Some(crate::exit::OK as i64));
+
+        let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let summary = summary.expect("summary recorded");
+        assert!(summary.contains("log unavailable"), "{summary}");
+    }
+
     #[tokio::test]
     async fn consumed_event_records_a_webhook_run() {
         // Drive `consume_events` with one event and no mint context (log-only),
@@ -1740,6 +1897,7 @@ mod tests {
             "assertion failed: expected 1 got 2".to_string(),
             true,
             None,
+            None,
             true,
             &report,
         )
@@ -1767,6 +1925,7 @@ mod tests {
             &event(),
             "error: no runner available for this job".to_string(),
             true,
+            None,
             None,
             true,
             &report,

@@ -138,9 +138,13 @@ pub struct TriageInput {
     pub html_url: String,
     /// Redacted log text (empty when unavailable; see `log_available`).
     pub log: String,
-    /// False when the log could not be fetched (a `TransientMiss`): itself a
-    /// bucket-3 signal handled by [`triage_rules`].
+    /// False when the log could not be fetched. CLAUDE-92: a real failure with
+    /// no obtainable log routes to a HUMAN (bucket 2) so it can never be
+    /// silently dropped; `log_unavailable_reason` says why in the analysis.
     pub log_available: bool,
+    /// CLAUDE-92: why the log is missing (unauthorized private repo, exhausted
+    /// flush retries, fetch error). `None` when `log_available` is true.
+    pub log_unavailable_reason: Option<String>,
     /// Whether the failing branch has an open PR. Strong bucket-1-vs-2 signal
     /// passed to the classifier (bucket 1 needs a PR to fix).
     pub has_open_pr: bool,
@@ -179,11 +183,21 @@ const TRANSIENT_SIGNATURES: &[&str] = &[
 /// failure (bucket 3), so the caller skips the LLM; `None` for everything else,
 /// which the caller hands to the [`FailureClassifier`].
 pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
-    // A log we could not fetch (not-ready / pruned) is itself transient.
+    // CLAUDE-92: a real failure whose log could not be obtained routes to a
+    // HUMAN, never to the silent transient bucket. The original rule treated
+    // every miss as "not flushed yet, a retry will get it", which quietly
+    // swallowed failures on private repos (whose logs are unreadable on this
+    // Forgejo version) and any other permanently-unfetchable log. Non-failure
+    // statuses never reach triage at all (CLAUDE-85), so everything here IS a
+    // failure someone should see.
     if !input.log_available {
+        let why = input
+            .log_unavailable_reason
+            .as_deref()
+            .unwrap_or("log not available (no reason recorded)");
         return Some(Triage::rules(
-            TriageBucket::Transient,
-            "failing job log not available (not ready or pruned); transient infra miss",
+            TriageBucket::HumanAction,
+            format!("failing job log unavailable: {why}; routed to a human with no log attached"),
         ));
     }
 
@@ -436,6 +450,7 @@ mod tests {
             repo: "contoso/claude-run".to_string(),
             workflow_id: "ci.yml".to_string(),
             commit_sha: "abc123".to_string(),
+            log_unavailable_reason: None,
             html_url: "https://dev.a8n.run/contoso/claude-run/actions/runs/7".to_string(),
             log: log.to_string(),
             log_available: true,
@@ -480,12 +495,30 @@ mod tests {
     }
 
     #[test]
-    fn rules_classify_unavailable_log_as_transient() {
+    fn rules_route_unavailable_log_to_a_human() {
+        // CLAUDE-92: a real failure with no obtainable log must surface to a
+        // human (bucket 2), never silently drop as transient; the analysis
+        // names the recorded reason.
         let mut input = input_with_log("");
         input.log_available = false;
+        input.log_unavailable_reason = Some(
+            "private repo: unauthorized (Forgejo's internal logs route has no token auth)"
+                .to_string(),
+        );
         let verdict = triage_rules(&input).unwrap();
-        assert_eq!(verdict.bucket, TriageBucket::Transient);
+        assert_eq!(verdict.bucket, TriageBucket::HumanAction);
         assert_eq!(verdict.classified_by, ClassifiedBy::Rules);
+        assert!(
+            verdict.analysis.contains("private repo: unauthorized"),
+            "analysis names the reason: {}",
+            verdict.analysis
+        );
+
+        // No recorded reason still routes to a human with a generic analysis.
+        input.log_unavailable_reason = None;
+        let verdict = triage_rules(&input).unwrap();
+        assert_eq!(verdict.bucket, TriageBucket::HumanAction);
+        assert!(verdict.analysis.contains("no reason recorded"));
     }
 
     #[test]
