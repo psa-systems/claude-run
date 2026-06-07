@@ -44,6 +44,8 @@ tokio-util = "0.7"
 toml = "0.8"
 tower = "0.5"
 tracing = "0.1"
+# CLAUDE-96: unpack the Forgejo v16 REST run-logs archive (application/zip).
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dependencies.pulldown-cmark]
 version = "0.13.4"

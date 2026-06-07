@@ -209,6 +209,14 @@ secret_ref = "forgejo-hmac-contoso"
 allowed_repos = ["Contoso/*"]
 # Per-source rate limit (requests/min); defaults to 60 when omitted.
 # rate_limit_per_min = 60
+# Optional: name of a stored secret holding a Forgejo PAT (repository read
+# scope) used to fetch a PRIVATE repo's action logs through the v16 REST
+# endpoint (GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_id}/logs,
+# Forgejo PR 12666). Unset: a private failure mints a human-action issue with
+# no log attached. On a pre-v16 instance the endpoint 404s and the pipeline
+# degrades to that same outcome after exactly one request, so the field is
+# safe to configure before the Forgejo upgrade.
+# log_token_ref = "forgejo-logs-contoso"
 
 [webhook.sources.fabrikam]
 secret_ref = "forgejo-hmac-fabrikam"
