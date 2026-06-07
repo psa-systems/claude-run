@@ -393,7 +393,7 @@ mod tests {
     fn gated_router(secret: &str) -> Router {
         let app = Router::new()
             .route("/api/status", get(|| async { "ok" }))
-            .route("/webhooks/forgejo", get(|| async { "hook" }));
+            .route("/webhooks/forgejo/contoso", get(|| async { "hook" }));
         protect(app, TokenGate::new(secret.to_string()))
     }
 
@@ -449,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_route_is_exempt_from_the_gate() {
         let req = Request::builder()
-            .uri("/webhooks/forgejo")
+            .uri("/webhooks/forgejo/contoso")
             .body(Body::empty())
             .unwrap();
         // No Authorization header, yet the webhook passes through.

@@ -135,38 +135,102 @@ impl Default for WebConfig {
     }
 }
 
-/// CLAUDE-43: Forgejo webhook listener config. Lives in `config.toml` because
-/// the daemon needs it before it binds the TCP listener. The HMAC secret itself
-/// is never inlined here; `secret_ref` names a credential in the CLAUDE-26
-/// `secrets` table, resolved (and decrypted) at request time.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// CLAUDE-43 / CLAUDE-87: Forgejo webhook listener config. Lives in `config.toml`
+/// because the daemon needs it before it binds the TCP listener.
+///
+/// CLAUDE-87 makes the listener multi-source: each `[webhook.sources.<name>]`
+/// table is one webhook endpoint at `POST /webhooks/forgejo/<name>` with its own
+/// HMAC secret, allow-list, and rate-limit bucket. The replay window is shared
+/// across sources (`X-Forgejo-Delivery` ids are globally unique). An empty
+/// `sources` map disables the listener entirely (the old "no `secret_ref`"
+/// behaviour). The pre-CLAUDE-87 top-level `secret_ref` / `allowed_repos` /
+/// `rate_limit_per_min` keys are gone; `deny_unknown_fields` makes a config still
+/// carrying them fail to parse at serve start, naming the offending key, which is
+/// the intended migration signal.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookConfig {
-    /// Name of the secret (in the `secrets` table) holding the Forgejo webhook
-    /// HMAC secret. When unset, the `/webhooks/forgejo` endpoint fails closed
-    /// and rejects every request with 401.
-    pub secret_ref: Option<String>,
-    /// Allow-list of repo patterns. Only `action_run_failure` events from a
-    /// matching repo produce a verified-failure event; every other authenticated
-    /// request is acked (2xx) and dropped so Forgejo does not retry. Three
-    /// pattern forms (CLAUDE-79): exact `owner/repo`, per-owner `owner/*`, and
-    /// the global `*` (pair the latter with a Forgejo SYSTEM webhook). Matching
-    /// is case-sensitive; an empty list denies all (fail closed).
-    pub allowed_repos: Vec<String>,
-    /// Replay-protection window in seconds. A delivery whose `X-Forgejo-Delivery`
-    /// id was already seen inside this window is rejected with 409.
+    /// Replay-protection window in seconds, shared across all sources. A delivery
+    /// whose `X-Forgejo-Delivery` id was already seen inside this window is
+    /// rejected with 409 (a duplicate delivered to two sources is caught too).
     pub replay_window_secs: u64,
-    /// Fixed-window rate limit: max accepted requests per minute across the
-    /// endpoint. Excess requests get 429 before any crypto work.
-    pub rate_limit_per_min: u32,
+    /// Per-source webhook endpoints, keyed by source name. The key is used
+    /// verbatim as the `<name>` URL path segment in `/webhooks/forgejo/<name>`,
+    /// so a lowercase `[a-z0-9_-]` name needing no URL escaping is expected;
+    /// names with other characters are warned about at load. An empty map
+    /// disables the listener (no endpoints, fail-closed like an unset secret).
+    pub sources: BTreeMap<String, WebhookSource>,
 }
 
 impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
+            replay_window_secs: 300,
+            sources: BTreeMap::new(),
+        }
+    }
+}
+
+/// True when `name` is a clean source name (lowercase `[a-z0-9_-]`, non-empty)
+/// usable verbatim as a URL path segment with no escaping. Source names outside
+/// this set still work as map keys but produce an ambiguous / escaped URL, so
+/// [`WebhookConfig::warn_unusual_source_names`] flags them at load.
+fn source_name_is_clean(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+impl WebhookConfig {
+    /// CLAUDE-87: warn at load for any source name that is not lowercase
+    /// `[a-z0-9_-]`. The name is the `/webhooks/forgejo/<name>` path segment, so
+    /// an unusual name needs URL escaping in the Forgejo webhook URL and is a
+    /// likely typo; the source still loads (the map key is honored) but the
+    /// operator is told to expect an escaped URL.
+    pub fn warn_unusual_source_names(&self) {
+        for name in self.sources.keys() {
+            if !source_name_is_clean(name) {
+                tracing::warn!(
+                    source = %name,
+                    "webhook source name is not lowercase [a-z0-9_-]; the URL path segment will need escaping"
+                );
+            }
+        }
+    }
+}
+
+/// CLAUDE-87: one webhook source. Each source is an independent endpoint with its
+/// own HMAC secret and allow-list, so a leaked org secret can authenticate only
+/// that org's allow-listed payloads and one org's failure storm rate-starves only
+/// its own bucket. The HMAC secret itself is never inlined here; `secret_ref`
+/// names a credential in the CLAUDE-26 `secrets` table, resolved (and decrypted)
+/// at request time.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebhookSource {
+    /// Name of the secret (in the `secrets` table) holding this source's Forgejo
+    /// webhook HMAC secret. When unset, this source's endpoint fails closed and
+    /// rejects every request with 401.
+    pub secret_ref: Option<String>,
+    /// Allow-list of repo patterns for this source. Only `action_run_failure`
+    /// events from a matching repo produce a verified-failure event; every other
+    /// authenticated request is acked (2xx) and dropped so Forgejo does not
+    /// retry. Three pattern forms (CLAUDE-79): exact `owner/repo`, per-owner
+    /// `owner/*`, and the global `*`. Matching is case-sensitive; an empty list
+    /// denies all (fail closed).
+    pub allowed_repos: Vec<String>,
+    /// Fixed-window rate limit: max accepted requests per minute for this source.
+    /// Excess requests get 429 before any crypto work. Per-source, so one source
+    /// exhausting its budget never 429s another.
+    pub rate_limit_per_min: u32,
+}
+
+impl Default for WebhookSource {
+    fn default() -> Self {
+        Self {
             secret_ref: None,
             allowed_repos: Vec::new(),
-            replay_window_secs: 300,
             rate_limit_per_min: 60,
         }
     }
@@ -434,6 +498,99 @@ mod tests {
         assert!(EnvFilter::try_new("claude_run=not_a_level").is_err());
         // A valid one parses, confirming the negative test is meaningful.
         assert!(EnvFilter::try_new("info,claude_run=debug,sqlx=warn").is_ok());
+    }
+
+    // ---- CLAUDE-87: multi-source webhook config ---------------------------
+
+    #[test]
+    fn webhook_sources_map_parses() {
+        let parsed: OnDiskConfig = toml::from_str(
+            r#"
+            [webhook]
+            replay_window_secs = 600
+
+            [webhook.sources.contoso]
+            secret_ref = "forgejo-hmac-contoso"
+            allowed_repos = ["Contoso/*"]
+
+            [webhook.sources.fabrikam]
+            secret_ref = "forgejo-hmac-fabrikam"
+            allowed_repos = ["fabrikam/*"]
+            rate_limit_per_min = 120
+            "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.webhook.replay_window_secs, 600);
+        assert_eq!(parsed.webhook.sources.len(), 2);
+        let ng = &parsed.webhook.sources["contoso"];
+        assert_eq!(ng.secret_ref.as_deref(), Some("forgejo-hmac-contoso"));
+        assert_eq!(ng.allowed_repos, vec!["Contoso/*".to_string()]);
+        // Unset rate_limit_per_min falls back to the per-source default.
+        assert_eq!(ng.rate_limit_per_min, 60);
+        let pb = &parsed.webhook.sources["fabrikam"];
+        assert_eq!(pb.rate_limit_per_min, 120);
+    }
+
+    #[test]
+    fn empty_sources_map_disables_the_listener() {
+        // No `[webhook.sources.*]` table: the map is empty and the daemon treats
+        // the listener as disabled, exactly like the old unset `secret_ref`.
+        let parsed: OnDiskConfig = toml::from_str("").unwrap();
+        assert!(parsed.webhook.sources.is_empty());
+        assert_eq!(parsed.webhook, WebhookConfig::default());
+
+        // A bare `[webhook]` block with only the shared window is also empty.
+        let parsed: OnDiskConfig = toml::from_str(
+            r#"
+            [webhook]
+            replay_window_secs = 300
+            "#,
+        )
+        .unwrap();
+        assert!(parsed.webhook.sources.is_empty());
+    }
+
+    #[test]
+    fn old_top_level_webhook_keys_fail_to_parse() {
+        // CLAUDE-87 is a BREAKING config change: the pre-CLAUDE-87 top-level keys
+        // are gone, and `deny_unknown_fields` makes a config still carrying them
+        // fail to parse, naming the offending key as the migration signal.
+        for key in ["secret_ref", "allowed_repos", "rate_limit_per_min"] {
+            let toml = match key {
+                "allowed_repos" => "[webhook]\nallowed_repos = [\"*\"]\n".to_string(),
+                "rate_limit_per_min" => "[webhook]\nrate_limit_per_min = 60\n".to_string(),
+                _ => "[webhook]\nsecret_ref = \"x\"\n".to_string(),
+            };
+            let err = toml::from_str::<OnDiskConfig>(&toml).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(key), "error names `{key}`: {msg}");
+        }
+    }
+
+    #[test]
+    fn unknown_source_field_fails_to_parse() {
+        // `deny_unknown_fields` on the source table catches a typo'd field.
+        let err = toml::from_str::<OnDiskConfig>(
+            r#"
+            [webhook.sources.contoso]
+            secret = "oops-should-be-secret_ref"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn source_name_cleanliness() {
+        assert!(source_name_is_clean("contoso"));
+        assert!(source_name_is_clean("fabrikam"));
+        assert!(source_name_is_clean("globex_tools"));
+        assert!(source_name_is_clean("initech-1"));
+        // Uppercase, spaces, slashes, and emptiness all need escaping / are typos.
+        assert!(!source_name_is_clean("Contoso"));
+        assert!(!source_name_is_clean("a b"));
+        assert!(!source_name_is_clean("a/b"));
+        assert!(!source_name_is_clean(""));
     }
 
     // CLAUDE-57: `load` reports whether `config.toml` was present so `serve` can
