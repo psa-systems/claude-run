@@ -79,16 +79,14 @@ FROM dev.a8n.run/pandoras-box/rust-builder-musl:v1.0.0-rust1.94-alpine AS runtim
 ARG NU_VERSION=0.112.2
 ARG CLAUDE_CODE_VERSION=latest
 ARG YT_VERSION
-ARG FJ_VERSION=0.1.0
-# Full fj asset URL, overridable when the release naming changes.
-ARG FJ_URL=https://codeberg.org/forgejo-contrib/forgejo-cli/releases/download/v${FJ_VERSION}/fj-x86_64-unknown-linux-musl
+ARG FJ_VERSION=0.5.0
 
 # Runtime dependencies:
 #   coreutils -> the `timeout(1)` wall-clock wrapper src/claude.rs delegates to
 #   git       -> clone/branch/commit inside each job workdir
 #   nodejs/npm-> the `claude` CLI ships as the @anthropic-ai/claude-code package
 #   python3/pip-> the `yt` (youtrack-cli) CLI ships on PyPI
-#   curl/tar  -> fetch the pinned nu and fj release binaries
+#   curl/tar  -> fetch the pinned nu release binary
 RUN apk add --no-cache coreutils git nodejs npm python3 py3-pip curl tar
 
 # nu: pinned musl release tarball (apk's nushell version drifts from the
@@ -109,10 +107,15 @@ RUN pip install --no-cache-dir --break-system-packages \
     "youtrack-cli${YT_VERSION:+==${YT_VERSION}}" \
     && yt --version
 
-# fj: forgejo-cli, the pinned static musl release binary.
-RUN curl -fsSL "${FJ_URL}" -o /usr/local/bin/fj \
-    && chmod 0755 /usr/local/bin/fj \
-    && fj --version
+# fj: forgejo-cli, compiled musl-native from crates.io. CLAUDE-88: the
+# original pin (v0.1.0 bare binary) never existed as a release asset, and the
+# codeberg release tarballs are glibc-linked, so they cannot exec on this
+# musl/Alpine base. The runtime stage inherits the Rust toolchain from the
+# builder image, so a pinned `cargo install` is the cheapest correct source.
+# The smoke check is `--help`: fj has no `--version` flag.
+RUN cargo install forgejo-cli --version "${FJ_VERSION}" --locked --root /usr/local \
+    && rm -rf "${CARGO_HOME:-/usr/local/cargo}/registry" \
+    && fj --help >/dev/null
 
 # claude-run itself, from the builder stage above.
 COPY --from=builder /build/target/release/claude-run /usr/local/bin/claude-run

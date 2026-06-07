@@ -254,24 +254,54 @@ Running the daemon on the host means every `claude` child it spawns inherits the
 
 **Image.** `oci-build/Dockerfile` has a `runtime` target built on the CI image (`dev.a8n.run/pandoras-box/rust-builder-musl`). It carries `claude-run` plus the pinned runtime toolchain: `nu`, the `claude` CLI, coreutils `timeout`, `git`, `yt` (youtrack-cli), and `fj` (forgejo-cli). Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VERSION`, `YT_VERSION`, `FJ_VERSION` / `FJ_URL`); override any one with `--build-arg`. The container runs as the non-root user `claudebot` with `$HOME=/home/claudebot`.
 
+**Published image (CLAUDE-88).** CI publishes the runtime image to the Forgejo OCI registry on every push to main (`:latest`) and every release tag (`:vX.Y.Z`), the same tag set as the binary's Generic Package. Pull it with:
+
+```nu
+docker pull dev.a8n.run/psa-systems/claude-run:latest
+```
+
+Pin `:vX.Y.Z` in production; `:latest` tracks main. Container deployments update by pulling a newer tag and recreating the service; the binary's `claude-run version update` self-update does not apply inside a container:
+
+```nu
+docker compose pull
+docker compose up --detach
+```
+
 **Slim bot CLAUDE.md.** `deploy/bot-CLAUDE.md` is versioned in this repo and `COPY`d to `/home/claudebot/.claude/CLAUDE.md`. It contains only the local-only agent contract (no push, no PR, no YouTrack writes; leave the feature branch as HEAD; the runner finalizes), the em-dash ban, the Nushell 0.112.2 note, and the simplest-solution preference. It has no Git/YouTrack workflow and no lifecycle section, so the agent is never told to push, open PRs, or transition issue state.
 
-**compose.yml.** App-prefixed names (service `claude-bot`, network `claude-bot-private`, volumes `claude-bot-{config,data,state}`; prefix each with `dev-` for a development stack). The named volumes back `CLAUDE_RUN_CONFIG_DIR` / `CLAUDE_RUN_DATA_DIR` / `CLAUDE_RUN_STATE_DIR`; `CLAUDE_RUN_RUNTIME_DIR` (the daemon's unix socket) is a tmpfs so a stale socket never survives a restart. The actions YAML is supplied read-only into the config dir from `./actions`.
+**compose.yml.** Consumes the published image (`image: dev.a8n.run/psa-systems/claude-run:latest`; the local `build:` block stays as a commented development alternative). App-prefixed names (service `claude-bot`, network `claude-bot-private`, volumes `claude-bot-{config,data,state}`; prefix each with `dev-` for a development stack).
 
-**Host auth (read-only mounts).** All host credentials are bound read-only:
+**Mounts.** What each one is for:
 
-| Tool | Host path | Container path |
+| Mount | Container path | Purpose |
 |---|---|---|
-| Claude | `~/.claude/.credentials.json` | `/home/claudebot/.claude/.credentials.json` |
-| `yt` | `~/.config/youtrack-cli` | `/home/claudebot/.config/youtrack-cli` |
-| `fj` | `~/.local/share/forgejo-cli/keys.json` | `/home/claudebot/.local/share/forgejo-cli/keys.json` |
-| git | `~/.gitconfig` | `/home/claudebot/.gitconfig` |
+| volume `claude-bot-config` | `/home/claudebot/.config/claude-run` | `config.toml` and the actions dir (`CLAUDE_RUN_CONFIG_DIR`) |
+| volume `claude-bot-data` | `/home/claudebot/.local/share/claude-run` | `state.db` (runs, outcomes, encrypted secrets store) and per-job workdirs (`CLAUDE_RUN_DATA_DIR`) |
+| volume `claude-bot-state` | `/home/claudebot/.local/state/claude-run` | logs, per-attempt stream JSONL, webhook log artifacts (`CLAUDE_RUN_STATE_DIR`) |
+| bind `./actions` (ro) | `/home/claudebot/.config/claude-run/actions` | action YAML under version control |
+| bind `~/.claude/.credentials.json` (ro) | `/home/claudebot/.claude/.credentials.json` | Claude CLI auth (alternative: `ANTHROPIC_API_KEY` env) |
+| bind `~/.config/youtrack-cli` (ro) | `/home/claudebot/.config/youtrack-cli` | `yt` auth/config |
+| bind `~/.local/share/forgejo-cli/keys.json` (ro) | `/home/claudebot/.local/share/forgejo-cli/keys.json` | `fj` auth |
+| bind `~/.gitconfig` (ro) | `/home/claudebot/.gitconfig` | git identity for clones/commits |
+| secret `claude-run-age-key` | `/run/secrets/claude-run-age-key` | age identity decrypting the secrets store |
+| tmpfs | `/home/claudebot/.runtime/claude-run` | daemon unix socket (`CLAUDE_RUN_RUNTIME_DIR`); ephemeral so a stale socket never survives a restart |
 
 Only the single Claude credentials file is mounted, never the whole `~/.claude`. Mounting `~/.claude` wholesale would re-shadow the baked slim CLAUDE.md (the exact regression this removes). To use an API key instead of mounted credentials, drop that bind and set `ANTHROPIC_API_KEY` in the service `environment`.
 
+**Secrets.** The store itself (web auth token, webhook HMACs, registry token refs) lives encrypted inside `state.db` on the data volume; the only material the container needs injected is the age identity that decrypts it. It travels as a compose `secrets:` file mount, and `CLAUDE_RUN_SECRETS_KEY_FILE` in the `environment:` block points at `/run/secrets/claude-run-age-key`. The env var carries the PATH, never the key itself: key material in a plain environment variable is deliberately unsupported (visible to `docker inspect` and `/proc/<pid>/environ`). `ANTHROPIC_API_KEY` is the one secret that MAY go through plain env, as the Claude-auth alternative above. Before first start:
+
 ```nu
-docker compose build           # build the runtime image
-docker compose up --detach      # start the daemon
+mkdir secrets
+chmod 700 secrets
+# migrating from a host install: copy the EXISTING key instead of generating,
+# or the secrets already in state.db cannot be decrypted
+age-keygen | save secrets/age-key.txt
+```
+
+**Networking.** To expose the web UI / webhook listener, set `[web].bind` to a non-loopback address in the container's `config.toml` (e.g. `0.0.0.0`) and publish the port (`ports:` mapping or a reverse-proxy network). A non-loopback bind requires token auth: `web.auth_token_ref` must name a secret stored via `claude-run secret set` (see "Web UI / API auth").
+
+```nu
+docker compose up --detach      # start the daemon from the published image
 docker compose logs --follow    # watch the scheduler
 ```
 
