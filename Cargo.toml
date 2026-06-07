@@ -44,6 +44,7 @@ tokio-util = "0.7"
 toml = "0.8"
 tower = "0.5"
 tracing = "0.1"
+pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 
 [dependencies.axum]
 version = "0.7"
