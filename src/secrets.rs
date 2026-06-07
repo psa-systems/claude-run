@@ -27,6 +27,18 @@ use crate::state;
 /// Env var naming the file that holds the `age` X25519 secret key.
 pub const KEY_FILE_ENV: &str = "CLAUDE_RUN_SECRETS_KEY_FILE";
 
+/// Test-only serialization of the process-global [`KEY_FILE_ENV`] var. `cargo
+/// test` runs the lib tests in parallel, so any test that sets the env and then
+/// resolves a secret must hold this lock; otherwise a concurrent setter can swap
+/// the key file out between `set_var` and [`SecretsKey::load`], decrypting under
+/// the wrong key. Every such test acquires it, so they take turns. A tokio mutex
+/// (not `std`) so the guard can be held across the handler's `.await` points.
+#[cfg(test)]
+pub async fn key_file_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
+}
+
 /// The symmetric secrets key: an `age` X25519 identity loaded from a key file.
 pub struct SecretsKey {
     identity: age::x25519::Identity,

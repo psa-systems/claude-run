@@ -2853,6 +2853,9 @@ mod tests {
 
         #[tokio::test]
         async fn create_list_rotate_delete_is_write_only() {
+            // Serialize against the webhook auth-log tests, which also set the
+            // process-global key-file env (CLAUDE-64).
+            let _env = crate::secrets::key_file_env_lock().await;
             let tmp = tempfile::tempdir().unwrap();
             // Generate an age key and point the env at it for this test only.
             let key_path = tmp.path().join("key.txt");
