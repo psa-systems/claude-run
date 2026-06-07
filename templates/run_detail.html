@@ -122,10 +122,16 @@
       {% for o in outcomes %}
         <tr>
           <td class="mono">
-            {% if let Some(t) = link_template %}
-              <a href="{{ crate::action::render_link(t, o.job_key.as_str()) }}" target="_blank" rel="noopener">{{ o.job_key }}</a>
+            {# CLAUDE-93: a per-job link recorded on the run (webhook html_url)
+               wins over the action's link_template. #}
+            {% if let Some(u) = job_links.get(o.job_key.as_str()) %}
+              <a href="{{ u }}" target="_blank" rel="noopener">{{ o.job_key }}</a>
             {% else %}
-              {{ o.job_key }}
+              {% if let Some(t) = link_template %}
+                <a href="{{ crate::action::render_link(t, o.job_key.as_str()) }}" target="_blank" rel="noopener">{{ o.job_key }}</a>
+              {% else %}
+                {{ o.job_key }}
+              {% endif %}
             {% endif %}
           </td>
           <td class="mono">{{ o.attempt }}</td>

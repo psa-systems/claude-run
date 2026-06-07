@@ -1713,6 +1713,10 @@ struct RunDetailTpl {
     /// Per-job href builder for the outcomes table. Empty string when the
     /// action declares no `link_template`.
     link_template: Option<String>,
+    /// CLAUDE-93: per-job outbound links recorded on the run (webhook
+    /// fast-path stores the event's `html_url` here). Wins over
+    /// `link_template`; empty for legacy rows and scheduled actions.
+    job_links: std::collections::BTreeMap<String, String>,
 }
 
 async fn run_detail(
@@ -1745,6 +1749,10 @@ async fn run_detail(
             .flatten();
 
     let planned_keys = state::run_job_keys(pool, run.id).await.unwrap_or_default();
+    // CLAUDE-93: per-job links recorded on the run (the webhook fast-path
+    // stores the event's `html_url`). A map entry beats the action's
+    // link_template; scheduled actions have no entries and render as before.
+    let job_links = state::run_job_links(pool, run.id).await.unwrap_or_default();
     // Build a quick lookup: key -> overall ok flag from job_outcomes (latest
     // attempt wins, since outcomes are inserted in order).
     let mut outcome_by_key: std::collections::HashMap<&str, bool> =
@@ -1792,9 +1800,11 @@ async fn run_detail(
                 None if run_active => ("queued".to_string(), None),
                 None => ("skipped".to_string(), None),
             };
-            let href = link_template
-                .as_ref()
-                .map(|t| crate::action::render_link(t, &k));
+            let href = job_links.get(&k).cloned().or_else(|| {
+                link_template
+                    .as_ref()
+                    .map(|t| crate::action::render_link(t, &k))
+            });
             PlannedJob {
                 key: k,
                 href,
@@ -1810,6 +1820,7 @@ async fn run_detail(
         outcomes,
         planned_jobs,
         link_template,
+        job_links,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
