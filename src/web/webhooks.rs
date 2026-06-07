@@ -765,6 +765,21 @@ pub fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
     mac.verify_slice(&expected).is_ok()
 }
 
+/// True when `repo` (an `owner/repo` full name) matches one of the allow-list
+/// patterns (CLAUDE-79): exact `owner/repo`, per-owner `owner/*`, or the global
+/// `*`. Only these three literal forms - no general globbing - so a typo cannot
+/// silently widen what the issue-minting pipeline acts on. Matching is
+/// case-sensitive, like the original exact match. An empty list denies all.
+fn repo_allowed(allowed: &[String], repo: &str) -> bool {
+    allowed.iter().any(|pat| match pat.as_str() {
+        "*" => true,
+        p => match p.strip_suffix("/*") {
+            Some(owner) => repo.split_once('/').is_some_and(|(o, _)| o == owner),
+            None => p == repo,
+        },
+    })
+}
+
 /// Build a [`VerifiedFailureEvent`] when the payload is an `action_run_failure`
 /// for an allow-listed repo; `None` otherwise (caller acks and drops).
 pub fn verified_failure_event(
@@ -775,7 +790,7 @@ pub fn verified_failure_event(
         return None;
     }
     let repo = &payload.run.repository.full_name;
-    if !allowed_repos.iter().any(|r| r == repo) {
+    if !repo_allowed(allowed_repos, repo) {
         return None;
     }
     Some(VerifiedFailureEvent {
@@ -919,6 +934,57 @@ mod tests {
             serde_json::from_str(&failure_payload("someone/else")).unwrap();
         let allowed = vec!["contoso/claude-run".to_string()];
         assert!(verified_failure_event(&payload, &allowed).is_none());
+    }
+
+    // ---- CLAUDE-79: allow-list patterns (`*`, `owner/*`, exact) ------------
+
+    #[test]
+    fn repo_allowed_star_matches_every_repo() {
+        let allowed = vec!["*".to_string()];
+        assert!(repo_allowed(&allowed, "contoso/claude-run"));
+        assert!(repo_allowed(&allowed, "fabrikam/gizmo"));
+    }
+
+    #[test]
+    fn repo_allowed_owner_wildcard_matches_only_that_owner() {
+        let allowed = vec!["fabrikam/*".to_string()];
+        assert!(repo_allowed(&allowed, "fabrikam/forgejo-cli"));
+        assert!(repo_allowed(&allowed, "fabrikam/gizmo"));
+        assert!(!repo_allowed(&allowed, "contoso/claude-run"));
+        // The bare owner (no slash) and a prefixed owner must not match.
+        assert!(!repo_allowed(&allowed, "fabrikam"));
+        assert!(!repo_allowed(&allowed, "xfabrikam/repo"));
+    }
+
+    #[test]
+    fn repo_allowed_exact_and_empty_behave_as_before() {
+        let exact = vec!["contoso/claude-run".to_string()];
+        assert!(repo_allowed(&exact, "contoso/claude-run"));
+        assert!(!repo_allowed(&exact, "contoso/governance"));
+        // Case-sensitive, like the original exact match.
+        assert!(!repo_allowed(&exact, "Contoso/claude-run"));
+        // Empty list stays deny-all.
+        assert!(!repo_allowed(&[], "contoso/claude-run"));
+    }
+
+    #[test]
+    fn repo_allowed_mixed_list_takes_any_match() {
+        let allowed = vec![
+            "contoso/governance".to_string(),
+            "fabrikam/*".to_string(),
+        ];
+        assert!(repo_allowed(&allowed, "contoso/governance"));
+        assert!(repo_allowed(&allowed, "fabrikam/gizmo"));
+        assert!(!repo_allowed(&allowed, "contoso/claude-run"));
+    }
+
+    #[test]
+    fn failure_event_emitted_for_owner_wildcard() {
+        let payload: ActionPayload =
+            serde_json::from_str(&failure_payload("fabrikam/gizmo")).unwrap();
+        let allowed = vec!["fabrikam/*".to_string()];
+        let event = verified_failure_event(&payload, &allowed).expect("wildcard allows");
+        assert_eq!(event.repo, "fabrikam/gizmo");
     }
 
     #[test]

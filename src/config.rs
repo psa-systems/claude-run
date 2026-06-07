@@ -146,9 +146,12 @@ pub struct WebhookConfig {
     /// HMAC secret. When unset, the `/webhooks/forgejo` endpoint fails closed
     /// and rejects every request with 401.
     pub secret_ref: Option<String>,
-    /// Allow-list of `owner/repo` full names. Only `action_run_failure` events
-    /// from a repo on this list produce a verified-failure event; every other
-    /// authenticated request is acked (2xx) and dropped so Forgejo does not retry.
+    /// Allow-list of repo patterns. Only `action_run_failure` events from a
+    /// matching repo produce a verified-failure event; every other authenticated
+    /// request is acked (2xx) and dropped so Forgejo does not retry. Three
+    /// pattern forms (CLAUDE-79): exact `owner/repo`, per-owner `owner/*`, and
+    /// the global `*` (pair the latter with a Forgejo SYSTEM webhook). Matching
+    /// is case-sensitive; an empty list denies all (fail closed).
     pub allowed_repos: Vec<String>,
     /// Replay-protection window in seconds. A delivery whose `X-Forgejo-Delivery`
     /// id was already seen inside this window is rejected with 409.
