@@ -188,6 +188,22 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
     }
 
     let haystack = input.log.to_lowercase();
+
+    // A job the runner skipped (workflow `if` guard evaluated false) never ran:
+    // Forgejo still fires `action_run_failure` for the run, but there is nothing
+    // to fix and nothing for a human to act on. The runner emits
+    // `Skipping job '<name>' due to '<expr>'` only for the job it is skipping,
+    // and a job log carries only that job's output, so an executed-and-failed
+    // job cannot match. Dedicated branch (not a TRANSIENT_SIGNATURES entry)
+    // because the match needs both substrings and the analysis should name the
+    // skip semantics, not a generic infra signature.
+    if haystack.contains("skipping job '") && haystack.contains("' due to '") {
+        return Some(Triage::rules(
+            TriageBucket::Transient,
+            "job was skipped by its workflow condition ('Skipping job ... due to ...'); nothing ran, no issue needed",
+        ));
+    }
+
     if let Some(sig) = TRANSIENT_SIGNATURES
         .iter()
         .copied()
@@ -477,6 +493,45 @@ mod tests {
         let log =
             "running 12 tests\ntest auth::login ... FAILED\nassertion failed: left == right\n";
         assert!(triage_rules(&input_with_log(log)).is_none());
+    }
+
+    #[test]
+    fn rules_classify_a_condition_skipped_job_as_transient() {
+        // CLAUDE-78: the live CLAUDE-73 mis-mint shape; the job never ran, the
+        // runner skipped it because the workflow `if` guard evaluated false.
+        let log = "2026-06-07T03:21:19Z host-a(version:v12.6.4) received task 10721 of job create-release, be triggered by event: pull_request\n\
+            workflow prepared\n\
+            evaluating expression 'github.event.pull_request.merged == true'\n\
+            expression 'github.event.pull_request.merged == true' evaluated to 'false'\n\
+            Skipping job 'Create release from merged PR' due to 'github.event.pull_request.merged == true'\n";
+        let verdict = triage_rules(&input_with_log(log)).expect("skip log gets a rules verdict");
+        assert_eq!(verdict.bucket, TriageBucket::Transient);
+        assert_eq!(verdict.classified_by, ClassifiedBy::Rules);
+        assert!(
+            verdict
+                .analysis
+                .contains("skipped by its workflow condition"),
+            "analysis names the skip: {}",
+            verdict.analysis
+        );
+    }
+
+    #[test]
+    fn rules_abstain_when_a_failure_log_merely_mentions_skipped() {
+        // "skipped" alone (e.g. test harness output) must not match; the rule
+        // needs the runner's full `Skipping job '<name>' due to '<expr>'` shape.
+        let log = "running 12 tests\ntest auth::login ... FAILED\n3 tests skipped\n\
+            note: job skipping is configured elsewhere\n";
+        assert!(triage_rules(&input_with_log(log)).is_none());
+    }
+
+    #[test]
+    fn hybrid_short_circuits_a_skipped_job_without_calling_classifier() {
+        let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "unused"));
+        let log = "Skipping job 'release' due to 'startsWith(github.ref, refs/tags)'";
+        let verdict = triage(&input_with_log(log), &stub);
+        assert_eq!(verdict.bucket, TriageBucket::Transient);
+        assert_eq!(stub.calls(), 0, "classifier untouched");
     }
 
     // ---- AC 2/4: hybrid falls through to the (mockable) LLM ---------------
