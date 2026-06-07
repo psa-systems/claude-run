@@ -224,6 +224,15 @@ pub struct WebhookSource {
     /// Excess requests get 429 before any crypto work. Per-source, so one source
     /// exhausting its budget never 429s another.
     pub rate_limit_per_min: u32,
+    /// CLAUDE-96: name of the secret (in the `secrets` table) holding a Forgejo
+    /// PAT (repository read scope) used to fetch a PRIVATE repo's action logs
+    /// through the v16 REST endpoint
+    /// (`GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_id}/logs`, merged
+    /// upstream in Forgejo PR 12666). Unset keeps the CLAUDE-92 behavior: a
+    /// private failure mints a human-action issue with no log attached. On a
+    /// pre-v16 instance the endpoint 404s and the pipeline degrades to the same
+    /// outcome after exactly one request.
+    pub log_token_ref: Option<String>,
 }
 
 impl Default for WebhookSource {
@@ -232,6 +241,7 @@ impl Default for WebhookSource {
             secret_ref: None,
             allowed_repos: Vec::new(),
             rate_limit_per_min: 60,
+            log_token_ref: None,
         }
     }
 }

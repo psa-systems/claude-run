@@ -20,15 +20,18 @@
 //! This internal route stays off-limits to the `fj` CLI (FJ-22) until PR 12666
 //! ships a REST endpoint; it is sanctioned for this service only.
 //!
-//! ## Private-repo auth (AC: resolve or document)
+//! ## Private-repo auth (CLAUDE-92 / CLAUDE-96)
 //!
-//! The route needs no auth for a *public* repo. For a private repo an API token
-//! sent as `Authorization: token <t>` returned 404 on the internal web route in
-//! testing (the route appears to want a browser *session* cookie, not a token),
-//! so private-repo auth on this route is **unresolved and tracked as a
-//! follow-up**. [`LogTarget::token`] carries the token the day the constraint is
-//! lifted; until then it is left `None`. The pilot repo (`forgejo-cli`) is
-//! public, so this does not block the fast-path.
+//! The internal route needs no auth for a *public* repo and accepts ONLY a
+//! browser session for a private one: `services/auth/{basic,oauth2}.go`
+//! `Verify` both bail on non-API web paths (which is why an
+//! `Authorization: token` probe 404'd), so [`LogTarget::token`] stays `None`.
+//! Private repos are served by [`fetch_run_logs_api`] instead: the v16 REST
+//! endpoint (`/api/v1/.../actions/runs/{run_id}/logs`, Forgejo PR 12666, on
+//! the API router where PATs work), addressed by the run's GLOBAL id and
+//! authenticated with the webhook source's `log_token_ref`. On a pre-v16
+//! instance that endpoint 404s and the consumer degrades to the CLAUDE-92
+//! no-log human-action outcome after exactly one request.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -88,6 +91,19 @@ pub trait LogTransport: Send + Sync {
     /// failure (DNS, connect, TLS, ...). The retry loop treats a transport
     /// error the same as a not-ready body: retry, then surface as transient.
     fn get(&self, url: &str, token: Option<&str>) -> std::result::Result<HttpResponse, String>;
+
+    /// CLAUDE-96: GET returning raw bytes, for the v16 REST run-logs endpoint
+    /// (`application/zip`). The default impl adapts [`LogTransport::get`] so
+    /// text-only test stubs keep compiling; the real transport overrides it
+    /// with a binary-safe request.
+    fn get_bytes(
+        &self,
+        url: &str,
+        token: Option<&str>,
+    ) -> std::result::Result<(u16, Vec<u8>), String> {
+        self.get(url, token)
+            .map(|r| (r.status, r.body.into_bytes()))
+    }
 }
 
 /// Real transport: a blocking `reqwest` GET run on a dedicated thread so it
@@ -121,6 +137,36 @@ impl LogTransport for HttpLogTransport {
             let status = resp.status().as_u16();
             let body = resp.text().map_err(|e| format!("log response body: {e}"))?;
             Ok(HttpResponse { status, body })
+        })
+        .join()
+        .map_err(|_| "log transport thread panicked".to_string())?
+    }
+
+    /// Binary-safe variant for the v16 REST run-logs ZIP (CLAUDE-96).
+    fn get_bytes(
+        &self,
+        url: &str,
+        token: Option<&str>,
+    ) -> std::result::Result<(u16, Vec<u8>), String> {
+        let url = url.to_string();
+        let token = token.map(str::to_string);
+        std::thread::spawn(move || -> std::result::Result<(u16, Vec<u8>), String> {
+            let client = reqwest::blocking::Client::builder()
+                .build()
+                .map_err(|e| format!("log http client: {e}"))?;
+            let mut req = client.get(&url);
+            if let Some(t) = &token {
+                req = req.header("Authorization", format!("token {t}"));
+            }
+            let resp = req
+                .send()
+                .map_err(|e| format!("log request to {url}: {e}"))?;
+            let status = resp.status().as_u16();
+            let body = resp
+                .bytes()
+                .map_err(|e| format!("log response body: {e}"))?
+                .to_vec();
+            Ok((status, body))
         })
         .join()
         .map_err(|_| "log transport thread panicked".to_string())?
@@ -312,6 +358,160 @@ fn write_artifact(out_dir: &Path, target: &LogTarget, text: &str) -> Result<Path
     Ok(path)
 }
 
+/// CLAUDE-96: where to fetch a PRIVATE repo's action logs from - the v16 REST
+/// endpoint (`GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_id}/logs`,
+/// Forgejo PR 12666), which honors `Authorization: token <PAT>` because it
+/// lives on the API router (unlike the internal web route, which is
+/// session-only). `{run_id}` is the run's GLOBAL id (`GetRunByID` in the
+/// upstream handler), i.e. the payload's `run.id`, NOT `index_in_repo`.
+#[derive(Debug, Clone)]
+pub struct RunLogsApiTarget {
+    /// Forge origin, e.g. `https://dev.a8n.run`.
+    pub base_url: String,
+    /// `owner/repo`.
+    pub repo: String,
+    /// Run index within the repo; used only for the artifact filename so it
+    /// sorts next to the internal-route artifacts.
+    pub run_index: i64,
+    /// The run's global id from the payload (`run.id`).
+    pub run_global_id: i64,
+    /// PAT with repository read scope (resolved from the source's
+    /// `log_token_ref`).
+    pub token: String,
+}
+
+impl RunLogsApiTarget {
+    /// Build a target from the failure event, deriving the forge origin from
+    /// `html_url` like [`LogTarget::for_run`]. `None` when the origin cannot be
+    /// derived.
+    pub fn for_run(
+        html_url: &str,
+        repo: &str,
+        run_index: i64,
+        run_global_id: i64,
+        token: String,
+    ) -> Option<Self> {
+        let base_url = base_from_html_url(html_url, repo)?;
+        Some(Self {
+            base_url,
+            repo: repo.to_string(),
+            run_index,
+            run_global_id,
+            token,
+        })
+    }
+
+    /// The REST run-logs URL for this target.
+    pub fn logs_url(&self) -> String {
+        format!(
+            "{}/api/v1/repos/{}/actions/runs/{}/logs",
+            self.base_url.trim_end_matches('/'),
+            self.repo,
+            self.run_global_id,
+        )
+    }
+}
+
+/// CLAUDE-96: outcome of a REST run-logs fetch. Auth-class and not-found
+/// responses are terminal after ONE request (the event arrives after the run
+/// completed, so there is nothing to wait for); only transport errors and 5xx
+/// retry within the configured budget.
+#[derive(Debug, Clone)]
+pub enum ApiLogOutcome {
+    Fetched(RedactedLog),
+    /// 401/403: the token was rejected.
+    AuthDenied(u16),
+    /// 404: the endpoint is absent (Forgejo < 16) or the run was pruned.
+    NotFound,
+    /// Transport/5xx after the retry budget, or a corrupt archive.
+    Failed(String),
+}
+
+/// CLAUDE-96: fetch the run's logs through the v16 REST endpoint. The 200 body
+/// is a ZIP with one entry per job (`{job-name}-{job-id}-attempt-{N}.log`); the
+/// entries are concatenated (sorted by name, each under a `===== name =====`
+/// header), redacted, and written to one artifact. Exactly one request decides
+/// 200/401/403/404; only transport errors and other statuses retry.
+pub fn fetch_run_logs_api<S: FnMut(Duration)>(
+    transport: &dyn LogTransport,
+    cfg: &LogFetchConfig,
+    target: &RunLogsApiTarget,
+    out_dir: &Path,
+    known_secrets: &[String],
+    mut sleep: S,
+) -> Result<ApiLogOutcome> {
+    let url = target.logs_url();
+    let mut backoff = cfg.initial_backoff;
+    let mut last_reason = "no attempt made".to_string();
+
+    for attempt_no in 0..=cfg.max_retries {
+        match transport.get_bytes(&url, Some(&target.token)) {
+            Ok((200, bytes)) => {
+                let text = match unzip_run_logs(&bytes) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return Ok(ApiLogOutcome::Failed(format!(
+                            "unpacking run-logs archive: {e}"
+                        )))
+                    }
+                };
+                let text = redact(&text, known_secrets);
+                let artifact = write_api_artifact(out_dir, target, &text)?;
+                return Ok(ApiLogOutcome::Fetched(RedactedLog { text, artifact }));
+            }
+            Ok((status @ (401 | 403), _)) => return Ok(ApiLogOutcome::AuthDenied(status)),
+            Ok((404, _)) => return Ok(ApiLogOutcome::NotFound),
+            Ok((status, body)) => {
+                last_reason = format!("status {status}, {} body bytes", body.len());
+            }
+            Err(e) => last_reason = e,
+        }
+        if attempt_no < cfg.max_retries {
+            sleep(backoff);
+            backoff = (backoff * 2).min(cfg.max_backoff);
+        }
+    }
+
+    Ok(ApiLogOutcome::Failed(last_reason))
+}
+
+/// Concatenate every entry of the run-logs ZIP, sorted by entry name, each
+/// under a `===== name =====` header. Non-UTF-8 bytes are replaced rather than
+/// erroring: these are CI logs and a stray escape must not lose the archive.
+fn unzip_run_logs(bytes: &[u8]) -> std::result::Result<String, String> {
+    use std::io::Read;
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("zip open: {e}"))?;
+    let mut names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    names.sort();
+    let mut out = String::new();
+    for name in names {
+        let mut file = archive
+            .by_name(&name)
+            .map_err(|e| format!("zip entry {name}: {e}"))?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)
+            .map_err(|e| format!("zip entry {name}: {e}"))?;
+        out.push_str(&format!("===== {name} =====\n"));
+        out.push_str(&String::from_utf8_lossy(&raw));
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+/// Artifact path for an API-fetched run log: one file for ALL jobs of the run,
+/// named to sort next to the internal-route per-job artifacts.
+fn write_api_artifact(out_dir: &Path, target: &RunLogsApiTarget, text: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(out_dir)?;
+    let stem = target.repo.replace('/', "_");
+    let name = format!("{stem}-run{}-all-jobs.log", target.run_index);
+    let path = out_dir.join(name);
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
 /// Redact secrets from `input`: first mask each known secret value verbatim,
 /// then redact token *shapes* (known prefixes, and high-entropy values that
 /// follow an auth keyword). Pure; the unit of the AC's redaction test.
@@ -452,6 +652,174 @@ mod tests {
             attempt: 1,
             token: None,
         }
+    }
+
+    // ---- CLAUDE-96: v16 REST run-logs fetch -------------------------------
+
+    /// Scripted bytes transport for the API endpoint: one fixed response,
+    /// counting calls. `get` panics so a private fetch can never fall back to
+    /// the text route.
+    struct BytesTransport {
+        status: u16,
+        body: Vec<u8>,
+        calls: Mutex<u32>,
+    }
+
+    impl BytesTransport {
+        fn new(status: u16, body: Vec<u8>) -> Self {
+            Self {
+                status,
+                body,
+                calls: Mutex::new(0),
+            }
+        }
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl LogTransport for BytesTransport {
+        fn get(
+            &self,
+            url: &str,
+            _token: Option<&str>,
+        ) -> std::result::Result<HttpResponse, String> {
+            panic!("text route used for an API fetch: {url}");
+        }
+        fn get_bytes(
+            &self,
+            _url: &str,
+            token: Option<&str>,
+        ) -> std::result::Result<(u16, Vec<u8>), String> {
+            assert_eq!(token, Some("test-pat"), "API fetch must send the token");
+            *self.calls.lock().unwrap() += 1;
+            Ok((self.status, self.body.clone()))
+        }
+    }
+
+    fn api_target() -> RunLogsApiTarget {
+        RunLogsApiTarget {
+            base_url: "https://dev.a8n.run".to_string(),
+            repo: "Contoso/website".to_string(),
+            run_index: 39,
+            run_global_id: 4242,
+            token: "test-pat".to_string(),
+        }
+    }
+
+    fn zip_of(entries: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut w = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(body.as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn api_fetch_unpacks_sorted_entries_under_headers() {
+        // Entries land sorted by name, each under a ===== header, redacted and
+        // written to one artifact; exactly one request, zero sleeps.
+        let zip = zip_of(&[
+            ("b-build-9-attempt-1.log", "boom: assertion failed\n"),
+            ("a-check-8-attempt-1.log", "checking...\n"),
+        ]);
+        let transport = BytesTransport::new(200, zip);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sleeps = 0;
+        let out = fetch_run_logs_api(
+            &transport,
+            &LogFetchConfig::default(),
+            &api_target(),
+            tmp.path(),
+            &[],
+            |_| sleeps += 1,
+        )
+        .unwrap();
+        let ApiLogOutcome::Fetched(log) = out else {
+            panic!("expected Fetched, got {out:?}");
+        };
+        let a = log
+            .text
+            .find("===== a-check-8-attempt-1.log =====")
+            .unwrap();
+        let b = log
+            .text
+            .find("===== b-build-9-attempt-1.log =====")
+            .unwrap();
+        assert!(a < b, "entries sorted by name");
+        assert!(log.text.contains("boom: assertion failed"));
+        assert!(log.artifact.exists());
+        assert_eq!(transport.calls(), 1);
+        assert_eq!(sleeps, 0);
+    }
+
+    #[test]
+    fn api_fetch_auth_denied_decides_after_one_request() {
+        for status in [401_u16, 403] {
+            let transport = BytesTransport::new(status, Vec::new());
+            let tmp = tempfile::tempdir().unwrap();
+            let mut sleeps = 0;
+            let out = fetch_run_logs_api(
+                &transport,
+                &LogFetchConfig::default(),
+                &api_target(),
+                tmp.path(),
+                &[],
+                |_| sleeps += 1,
+            )
+            .unwrap();
+            assert!(
+                matches!(out, ApiLogOutcome::AuthDenied(s) if s == status),
+                "{out:?}"
+            );
+            assert_eq!(transport.calls(), 1, "exactly one request for {status}");
+            assert_eq!(sleeps, 0, "no backoff for auth-class responses");
+        }
+    }
+
+    #[test]
+    fn api_fetch_not_found_decides_after_one_request() {
+        // 404 = endpoint absent (Forgejo < 16) or run pruned; nothing to wait for.
+        let transport = BytesTransport::new(404, Vec::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sleeps = 0;
+        let out = fetch_run_logs_api(
+            &transport,
+            &LogFetchConfig::default(),
+            &api_target(),
+            tmp.path(),
+            &[],
+            |_| sleeps += 1,
+        )
+        .unwrap();
+        assert!(matches!(out, ApiLogOutcome::NotFound), "{out:?}");
+        assert_eq!(transport.calls(), 1);
+        assert_eq!(sleeps, 0);
+    }
+
+    #[test]
+    fn api_fetch_corrupt_archive_fails_with_reason() {
+        let transport = BytesTransport::new(200, b"this is not a zip".to_vec());
+        let tmp = tempfile::tempdir().unwrap();
+        let out = fetch_run_logs_api(
+            &transport,
+            &LogFetchConfig::default(),
+            &api_target(),
+            tmp.path(),
+            &[],
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            matches!(&out, ApiLogOutcome::Failed(r) if r.contains("archive")),
+            "{out:?}"
+        );
     }
 
     fn cfg() -> LogFetchConfig {

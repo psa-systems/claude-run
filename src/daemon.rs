@@ -187,6 +187,9 @@ impl Daemon {
             webhook_transport,
             webhook_log_dir,
             mint_ctx,
+            // CLAUDE-96: the consumer resolves each event source's
+            // `log_token_ref` for private-repo log fetches.
+            Arc::new(self.on_disk.webhook.clone()),
         ));
 
         let dispatch = Arc::new(Dispatcher {
