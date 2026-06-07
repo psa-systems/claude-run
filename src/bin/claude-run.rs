@@ -528,6 +528,9 @@ async fn serve(
     // (or that defaults silently won), so `journalctl` alone answers why the
     // web UI bound where it did.
     config_source.log();
+    // CLAUDE-87: flag any webhook source name that needs URL escaping (likely a
+    // typo) before the listener binds, so the warning sits next to the config line.
+    on_disk.webhook.warn_unusual_source_names();
     let d = daemon::Daemon { paths, on_disk };
     d.run().await?;
     Ok(exit::OK)

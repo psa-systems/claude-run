@@ -115,8 +115,9 @@ impl Daemon {
         // as the unix-socket flavor, just nested + sibling-mounted.
         let api_for_tcp = api::router((*api_state).clone());
         // CLAUDE-61: the web layer injects the synthetic `webhook-fast-path`
-        // action only when the webhook fast-path is configured (`secret_ref` set).
-        let webhook_enabled = self.on_disk.webhook.secret_ref.is_some();
+        // action only when the webhook fast-path is configured. CLAUDE-87: that
+        // is now any configured source (an empty `sources` map disables it).
+        let webhook_enabled = !self.on_disk.webhook.sources.is_empty();
         let web_router = crate::web::router(api_state.clone(), self.paths.clone(), webhook_enabled);
 
         // CLAUDE-43: Forgejo webhook listener. Verified `action_run_failure`

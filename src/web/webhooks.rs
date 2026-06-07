@@ -1,20 +1,30 @@
-//! Forgejo webhook listener (CLAUDE-43).
+//! Forgejo webhook listener (CLAUDE-43, multi-source CLAUDE-87).
 //!
-//! A single `POST /webhooks/forgejo` route on the daemon's TCP app receives
-//! Forgejo Action-run webhook deliveries. The pipeline, in order:
+//! `POST /webhooks/forgejo/{source}` routes on the daemon's TCP app receive
+//! Forgejo Action-run webhook deliveries. Each `{source}` names a configured
+//! [`crate::config::WebhookSource`] with its own HMAC secret, allow-list, and
+//! rate-limit bucket; the replay store is shared across sources (delivery ids are
+//! globally unique). The per-request pipeline, in order:
 //!
-//! 1. Rate limit (fixed window, before any crypto) -> 429 when exceeded.
-//! 2. Resolve the configured HMAC secret (CLAUDE-26 `secrets` table); a missing
+//! 0. Resolve `{source}` from the config sources map; an unknown source -> 404.
+//! 1. Per-source rate limit (fixed window, before any crypto) -> 429 when
+//!    exceeded. One source's storm never starves another's bucket.
+//! 2. Resolve that source's HMAC secret (CLAUDE-26 `secrets` table); a missing
 //!    `secret_ref` or unresolvable secret fails closed -> 401.
 //! 3. Verify the HMAC-SHA256 over the raw body against `X-Forgejo-Signature`
-//!    with a constant-time compare -> 401 on mismatch / missing signature.
-//! 4. Replay protection: reject a delivery whose `X-Forgejo-Delivery` id was
-//!    already seen inside the configured window -> 409. A missing id is a
-//!    malformed request -> 400.
+//!    with a constant-time compare -> 401 on mismatch / missing signature. The
+//!    secret is the source's own, so a payload signed for one source's secret
+//!    401s on a different source's path.
+//! 4. Replay protection (shared store): reject a delivery whose
+//!    `X-Forgejo-Delivery` id was already seen inside the configured window ->
+//!    409. A missing id is a malformed request -> 400.
 //! 5. Parse the `ActionPayload`. Keep only `action_run_failure` (payload
-//!    `action == "failure"`) for an allow-listed repo and emit a typed
-//!    [`VerifiedFailureEvent`] to [`consume_events`] -> 202. Every other
+//!    `action == "failure"`) for a repo in that source's allow-list and emit a
+//!    typed [`VerifiedFailureEvent`] to [`consume_events`] -> 202. Every other
 //!    authenticated event is acked -> 200 and dropped so Forgejo does not retry.
+//!
+//! Every per-request log line carries the `source` field so a rejection or ack
+//! is always attributable to its endpoint.
 //!
 //! CLAUDE-47 wires the fast-path end-to-end: [`consume_events`] composes the
 //! sibling subtasks - log fetch + redaction (CLAUDE-44), the hybrid triage
@@ -34,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -46,7 +56,7 @@ use sqlx::SqlitePool;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::config::{MintConfig, WebhookConfig};
+use crate::config::{MintConfig, WebhookConfig, WebhookSource};
 use crate::forge_log::LogOutcome;
 use crate::job::RunnerDefaults;
 use crate::mint::{self, MintCaps, MintOutcome, MintRequest, VcsRouteCache};
@@ -158,14 +168,17 @@ pub struct VerifiedFailureEvent {
 pub const RUN_STATUS_FAILURE: &str = "failure";
 
 /// State injected into the webhook handler. Cheap to clone (`SqlitePool` and
-/// `Sender` are `Arc`-shaped; the config is `Arc`-wrapped).
+/// `Sender` are `Arc`-shaped; the config and the rate-limiter map are
+/// `Arc`-wrapped). CLAUDE-87: one [`RateLimiter`] per source (built once at
+/// startup, keyed by source name) and a single shared [`SeenDeliveries`] replay
+/// store across all sources.
 #[derive(Clone)]
 pub struct WebhookState {
     pool: SqlitePool,
     config: Arc<WebhookConfig>,
     events: mpsc::Sender<VerifiedFailureEvent>,
     seen: Arc<Mutex<SeenDeliveries>>,
-    rate: Arc<Mutex<RateLimiter>>,
+    rate: Arc<HashMap<String, Mutex<RateLimiter>>>,
 }
 
 impl WebhookState {
@@ -175,21 +188,38 @@ impl WebhookState {
         events: mpsc::Sender<VerifiedFailureEvent>,
     ) -> Self {
         let seen = SeenDeliveries::new(Duration::from_secs(config.replay_window_secs));
-        let rate = RateLimiter::new(config.rate_limit_per_min, Duration::from_secs(60));
+        // One fixed-window limiter per source, so exhausting one source's budget
+        // never 429s another. Built from the same sources map the handler routes
+        // against, so every routable source has a limiter.
+        let rate = config
+            .sources
+            .iter()
+            .map(|(name, src)| {
+                (
+                    name.clone(),
+                    Mutex::new(RateLimiter::new(
+                        src.rate_limit_per_min,
+                        Duration::from_secs(60),
+                    )),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         Self {
             pool,
             config: Arc::new(config),
             events,
             seen: Arc::new(Mutex::new(seen)),
-            rate: Arc::new(Mutex::new(rate)),
+            rate: Arc::new(rate),
         }
     }
 }
 
-/// Router carrying the single webhook route, merged into the daemon's TCP app.
+/// Router carrying the per-source webhook route, merged into the daemon's TCP
+/// app. `{source}` is an axum path param resolved against the configured sources
+/// map (CLAUDE-87).
 pub fn router(state: WebhookState) -> Router {
     Router::new()
-        .route("/webhooks/forgejo", post(forgejo_webhook))
+        .route("/webhooks/forgejo/:source", post(forgejo_webhook))
         .with_state(state)
 }
 
@@ -744,24 +774,40 @@ fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
 
 async fn forgejo_webhook(
     State(st): State<WebhookState>,
+    Path(source): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let now = Instant::now();
 
-    // Rate limit first: cheapest check, shields the HMAC + secret-decrypt work
-    // from a request flood.
-    if !st.rate.lock().await.allow(now) {
-        warn!("forgejo webhook rate limited");
+    // Resolve the source from the path. An unknown source 404s (it is not a
+    // configured endpoint), logged so a misdirected webhook is diagnosable.
+    let Some(src_cfg) = st.config.sources.get(&source) else {
+        warn!(source = %source, "forgejo webhook rejected: unknown source");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    // Per-source rate limit first: cheapest check, shields the HMAC +
+    // secret-decrypt work from a request flood, and one source's storm never
+    // starves another's bucket. The limiter map is built from the same sources
+    // map, so a resolved source always has a limiter; a missing one is a bug.
+    let Some(limiter) = st.rate.get(&source) else {
+        warn!(source = %source, "forgejo webhook: no rate limiter for source (bug)");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if !limiter.lock().await.allow(now) {
+        warn!(source = %source, "forgejo webhook rate limited");
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
-    // Resolve the HMAC secret. Fail closed: an unset ref or an unresolvable
-    // secret means we cannot authenticate, so reject rather than accept.
-    let secret = match resolve_secret(&st).await {
+    // Resolve this source's HMAC secret. Fail closed: an unset ref or an
+    // unresolvable secret means we cannot authenticate, so reject rather than
+    // accept. The secret is hard-bound to the source, so a payload signed for a
+    // different source's secret cannot authenticate here.
+    let secret = match resolve_secret(&st, src_cfg).await {
         Ok(s) => s,
         Err(e) => {
-            warn!(error = %e, "forgejo webhook secret unavailable; rejecting");
+            warn!(source = %source, error = %e, "forgejo webhook secret unavailable; rejecting");
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
@@ -782,6 +828,7 @@ async fn forgejo_webhook(
     let signature = headers.get(SIGNATURE_HEADER).and_then(|v| v.to_str().ok());
     let Some(signature) = signature else {
         warn!(
+            source = %source,
             delivery = delivery_label,
             "forgejo webhook rejected: missing X-Forgejo-Signature header (is the webhook Secret set in Forgejo?)"
         );
@@ -789,6 +836,7 @@ async fn forgejo_webhook(
     };
     if !verify_signature(secret.as_bytes(), &body, signature) {
         warn!(
+            source = %source,
             delivery = delivery_label,
             body_bytes = body.len(),
             "forgejo webhook rejected: signature mismatch (stored secret and Forgejo webhook Secret differ?)"
@@ -796,20 +844,22 @@ async fn forgejo_webhook(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    // Replay protection on authenticated requests only. A missing delivery id
-    // is malformed; a previously-seen id inside the window is a replay.
+    // Replay protection on authenticated requests only, against the shared store.
+    // A missing delivery id is malformed; a previously-seen id inside the window
+    // is a replay (including the same delivery fanned out to two sources).
     if delivery.is_empty() {
-        warn!("forgejo webhook rejected: missing X-Forgejo-Delivery header");
+        warn!(source = %source, "forgejo webhook rejected: missing X-Forgejo-Delivery header");
         return StatusCode::BAD_REQUEST.into_response();
     }
     if !st.seen.lock().await.check_and_record(delivery, now) {
-        warn!(delivery, "forgejo webhook replay rejected");
+        warn!(source = %source, delivery, "forgejo webhook replay rejected");
         return StatusCode::CONFLICT.into_response();
     }
 
     // Authenticated and de-duplicated: trace the accepted delivery (id + body
     // length only) before parsing so the happy path is followable at debug.
     debug!(
+        source = %source,
         delivery,
         body_bytes = body.len(),
         "forgejo webhook authenticated"
@@ -819,15 +869,15 @@ async fn forgejo_webhook(
     let payload: ActionPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
-            warn!(error = %e, "forgejo webhook payload parse failed");
+            warn!(source = %source, error = %e, "forgejo webhook payload parse failed");
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
 
-    match verified_failure_event(&payload, &st.config.allowed_repos) {
+    match verified_failure_event(&payload, &src_cfg.allowed_repos) {
         Some(event) => {
             if st.events.send(event).await.is_err() {
-                warn!("forgejo webhook event channel closed; dropping event");
+                warn!(source = %source, "forgejo webhook event channel closed; dropping event");
             }
             StatusCode::ACCEPTED.into_response()
         }
@@ -842,6 +892,7 @@ async fn forgejo_webhook(
                 "repo not in allowed_repos"
             };
             info!(
+                source = %source,
                 delivery,
                 action = %payload.action,
                 repo = %payload.run.repository.full_name,
@@ -853,12 +904,12 @@ async fn forgejo_webhook(
     }
 }
 
-/// Resolve the configured webhook secret to plaintext, loading the age key from
-/// `CLAUDE_RUN_SECRETS_KEY_FILE`. Errors when no `secret_ref` is configured or
-/// the secret cannot be decrypted.
-async fn resolve_secret(st: &WebhookState) -> crate::error::Result<String> {
-    let name = st.config.secret_ref.as_deref().ok_or_else(|| {
-        crate::error::Error::Secret("webhook.secret_ref is not configured".to_string())
+/// Resolve a source's configured webhook secret to plaintext, loading the age key
+/// from `CLAUDE_RUN_SECRETS_KEY_FILE`. Errors when the source has no `secret_ref`
+/// or the secret cannot be decrypted.
+async fn resolve_secret(st: &WebhookState, src: &WebhookSource) -> crate::error::Result<String> {
+    let name = src.secret_ref.as_deref().ok_or_else(|| {
+        crate::error::Error::Secret("webhook source secret_ref is not configured".to_string())
     })?;
     let key = SecretsKey::load()?;
     secrets::resolve_secret(&st.pool, &key, name).await
@@ -1727,26 +1778,30 @@ mod tests {
         assert!(!WebhookRunSummary::error("boom".to_string()).ok);
     }
 
-    // ---- CLAUDE-64: every auth-rejection branch is reachable --------------
+    // ---- CLAUDE-64 / CLAUDE-87: every auth-rejection branch is reachable ----
     //
     // Drive `forgejo_webhook` directly so each rejection branch (and the
     // accepted path that emits the debug line) is exercised at the status-code
-    // level. These set the process-global key-file env, so they take the shared
-    // lock with the secrets-UI test in `web::mod`.
+    // level. CLAUDE-87 adds per-source secret isolation, unknown-source 404,
+    // and per-source rate buckets. These set the process-global key-file env, so
+    // they take the shared lock with the secrets-UI test in `web::mod`.
     mod handler_auth {
         use super::*;
         use age::secrecy::ExposeSecret;
         use axum::http::HeaderValue;
 
-        const HMAC_SECRET: &str = "forgejo-webhook-hmac-value";
+        // Two sources, each with its own secret and allow-list, exercise the
+        // CLAUDE-87 per-source isolation.
+        const SOURCE_A: &str = "contoso";
+        const SECRET_A: &str = "hmac-value-for-contoso";
+        const SOURCE_B: &str = "fabrikam";
+        const SECRET_B: &str = "hmac-value-for-fabrikam";
 
-        /// A [`WebhookState`] whose `secret_ref` resolves to [`HMAC_SECRET`].
-        /// Points the key-file env at a fresh key under `tmp`; the caller holds
+        /// Point the key-file env at a fresh key under `tmp` and store both
+        /// sources' HMAC secrets, returning the backing pool. The caller holds
         /// [`crate::secrets::key_file_env_lock`] so the env stays stable across
         /// the `resolve_secret` call inside the handler.
-        async fn state(
-            tmp: &std::path::Path,
-        ) -> (WebhookState, mpsc::Receiver<VerifiedFailureEvent>) {
+        async fn setup_pool(tmp: &std::path::Path) -> SqlitePool {
             let key_path = tmp.join("key.txt");
             let identity = age::x25519::Identity::generate();
             std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();
@@ -1754,19 +1809,51 @@ mod tests {
 
             let pool = memory_pool().await;
             let key = SecretsKey::load().unwrap();
-            let ciphertext = key.encrypt(HMAC_SECRET).unwrap();
-            state::secret_create(&pool, "forgejo-webhook-hmac", &ciphertext)
-                .await
-                .unwrap();
+            for (name, value) in [("hmac-contoso", SECRET_A), ("hmac-fabrikam", SECRET_B)] {
+                let ciphertext = key.encrypt(value).unwrap();
+                state::secret_create(&pool, name, &ciphertext)
+                    .await
+                    .unwrap();
+            }
+            pool
+        }
 
-            let config = WebhookConfig {
-                secret_ref: Some("forgejo-webhook-hmac".to_string()),
-                allowed_repos: vec!["contoso/claude-run".to_string()],
+        /// A two-source config: `contoso` (exact repo) and `fabrikam`
+        /// (owner wildcard), each rate-limited at `rate_per_min`.
+        fn two_source_config(rate_per_min: u32) -> WebhookConfig {
+            let sources = [
+                (
+                    SOURCE_A.to_string(),
+                    WebhookSource {
+                        secret_ref: Some("hmac-contoso".to_string()),
+                        allowed_repos: vec!["contoso/claude-run".to_string()],
+                        rate_limit_per_min: rate_per_min,
+                    },
+                ),
+                (
+                    SOURCE_B.to_string(),
+                    WebhookSource {
+                        secret_ref: Some("hmac-fabrikam".to_string()),
+                        allowed_repos: vec!["fabrikam/*".to_string()],
+                        rate_limit_per_min: rate_per_min,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect();
+            WebhookConfig {
                 replay_window_secs: 300,
-                rate_limit_per_min: 60,
-            };
+                sources,
+            }
+        }
+
+        /// A [`WebhookState`] over [`two_source_config`] at the default rate.
+        async fn state(
+            tmp: &std::path::Path,
+        ) -> (WebhookState, mpsc::Receiver<VerifiedFailureEvent>) {
+            let pool = setup_pool(tmp).await;
             let (tx, rx) = mpsc::channel(8);
-            (WebhookState::new(pool, config, tx), rx)
+            (WebhookState::new(pool, two_source_config(60), tx), rx)
         }
 
         fn headers(signature: Option<&str>, delivery: Option<&str>) -> HeaderMap {
@@ -1781,12 +1868,37 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn unknown_source_is_404() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx) = state(tmp.path()).await;
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            // A path segment that names no configured source short-circuits to 404
+            // before any rate / crypto work.
+            let resp = forgejo_webhook(
+                State(st),
+                Path("no-such-source".to_string()),
+                headers(Some(&sig), Some("d-0")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
         async fn missing_signature_header_is_401() {
             let _env = crate::secrets::key_file_env_lock().await;
             let tmp = tempfile::tempdir().unwrap();
             let (st, _rx) = state(tmp.path()).await;
             let body = Bytes::from(failure_payload("contoso/claude-run"));
-            let resp = forgejo_webhook(State(st), headers(None, Some("d-1")), body).await;
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers(None, Some("d-1")),
+                body,
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         }
 
@@ -1798,8 +1910,70 @@ mod tests {
             let body = Bytes::from(failure_payload("contoso/claude-run"));
             // Well-formed hex but the wrong MAC: the signature value never leaks
             // into a log; only the delivery id and body length are recorded.
-            let resp =
-                forgejo_webhook(State(st), headers(Some("deadbeef"), Some("d-2")), body).await;
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers(Some("deadbeef"), Some("d-2")),
+                body,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn cross_source_signature_is_401() {
+            // CLAUDE-87: a payload validly signed with source A's secret must NOT
+            // authenticate on source B's path. Source B verifies against its own
+            // secret only, so the otherwise-valid signature mismatches -> 401.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            let raw = failure_payload("fabrikam/gizmo");
+            // Sign with A's secret, deliver to B.
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_B.to_string()),
+                headers(Some(&sig), Some("x-1")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn unset_secret_ref_fails_closed_401() {
+            // CLAUDE-87: a source whose secret_ref is unset cannot authenticate;
+            // it must fail closed with 401, not accept.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = setup_pool(tmp.path()).await;
+            let sources = [(
+                "secretless".to_string(),
+                WebhookSource {
+                    secret_ref: None,
+                    allowed_repos: vec!["*".to_string()],
+                    rate_limit_per_min: 60,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let config = WebhookConfig {
+                replay_window_secs: 300,
+                sources,
+            };
+            let (tx, _rx) = mpsc::channel(8);
+            let st = WebhookState::new(pool, config, tx);
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path("secretless".to_string()),
+                headers(Some(&sig), Some("s-1")),
+                Bytes::from(raw),
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         }
 
@@ -1809,9 +1983,14 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let (st, _rx) = state(tmp.path()).await;
             let raw = failure_payload("contoso/claude-run");
-            let sig = sign(HMAC_SECRET.as_bytes(), raw.as_bytes());
-            let resp =
-                forgejo_webhook(State(st), headers(Some(&sig), None), Bytes::from(raw)).await;
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig), None),
+                Bytes::from(raw),
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         }
 
@@ -1821,9 +2000,10 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let (st, mut rx) = state(tmp.path()).await;
             let raw = failure_payload("contoso/claude-run");
-            let sig = sign(HMAC_SECRET.as_bytes(), raw.as_bytes());
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
+                Path(SOURCE_A.to_string()),
                 headers(Some(&sig), Some("d-3")),
                 Bytes::from(raw),
             )
@@ -1835,15 +2015,130 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn each_source_authenticates_on_its_own_path() {
+            // CLAUDE-87: both sources accept a delivery signed with their own
+            // secret and allow-listed for their own repos, proving four (here two)
+            // endpoints work independently off one daemon.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+
+            let raw_a = failure_payload("contoso/claude-run");
+            let sig_a = sign(SECRET_A.as_bytes(), raw_a.as_bytes());
+            let resp_a = forgejo_webhook(
+                State(st.clone()),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig_a), Some("a-1")),
+                Bytes::from(raw_a),
+            )
+            .await;
+            assert_eq!(resp_a.status(), StatusCode::ACCEPTED);
+
+            let raw_b = failure_payload("fabrikam/gizmo");
+            let sig_b = sign(SECRET_B.as_bytes(), raw_b.as_bytes());
+            let resp_b = forgejo_webhook(
+                State(st),
+                Path(SOURCE_B.to_string()),
+                headers(Some(&sig_b), Some("b-1")),
+                Bytes::from(raw_b),
+            )
+            .await;
+            assert_eq!(resp_b.status(), StatusCode::ACCEPTED);
+
+            assert_eq!(rx.recv().await.unwrap().repo, "contoso/claude-run");
+            assert_eq!(rx.recv().await.unwrap().repo, "fabrikam/gizmo");
+        }
+
+        #[tokio::test]
+        async fn rate_limit_is_per_source() {
+            // CLAUDE-87: exhausting source A's budget (rate=1) must not 429
+            // source B. A's second delivery is 429; B's first still 202.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = setup_pool(tmp.path()).await;
+            let (tx, _rx) = mpsc::channel(8);
+            let st = WebhookState::new(pool, two_source_config(1), tx);
+
+            let raw1 = failure_payload("contoso/claude-run");
+            let sig1 = sign(SECRET_A.as_bytes(), raw1.as_bytes());
+            let r1 = forgejo_webhook(
+                State(st.clone()),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig1), Some("r-1")),
+                Bytes::from(raw1),
+            )
+            .await;
+            assert_eq!(r1.status(), StatusCode::ACCEPTED);
+
+            // Source A's budget (1/min) is spent: the next A delivery is 429.
+            let raw2 = failure_payload("contoso/claude-run");
+            let sig2 = sign(SECRET_A.as_bytes(), raw2.as_bytes());
+            let r2 = forgejo_webhook(
+                State(st.clone()),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig2), Some("r-2")),
+                Bytes::from(raw2),
+            )
+            .await;
+            assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
+
+            // Source B's independent bucket is untouched: its first delivery 202s.
+            let raw3 = failure_payload("fabrikam/gizmo");
+            let sig3 = sign(SECRET_B.as_bytes(), raw3.as_bytes());
+            let r3 = forgejo_webhook(
+                State(st),
+                Path(SOURCE_B.to_string()),
+                headers(Some(&sig3), Some("r-3")),
+                Bytes::from(raw3),
+            )
+            .await;
+            assert_eq!(r3.status(), StatusCode::ACCEPTED);
+        }
+
+        #[tokio::test]
+        async fn replay_store_is_shared_across_sources() {
+            // CLAUDE-87: delivery ids are globally unique, so a replay of one
+            // source's delivery id on another source is rejected (409) by the
+            // shared store. The first delivery to A authenticates and records the
+            // id; the same id delivered to B (validly signed for B) is a replay.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx) = state(tmp.path()).await;
+
+            let raw_a = failure_payload("contoso/claude-run");
+            let sig_a = sign(SECRET_A.as_bytes(), raw_a.as_bytes());
+            let r1 = forgejo_webhook(
+                State(st.clone()),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig_a), Some("dup-1")),
+                Bytes::from(raw_a),
+            )
+            .await;
+            assert_eq!(r1.status(), StatusCode::ACCEPTED);
+
+            let raw_b = failure_payload("fabrikam/gizmo");
+            let sig_b = sign(SECRET_B.as_bytes(), raw_b.as_bytes());
+            let r2 = forgejo_webhook(
+                State(st),
+                Path(SOURCE_B.to_string()),
+                headers(Some(&sig_b), Some("dup-1")),
+                Bytes::from(raw_b),
+            )
+            .await;
+            assert_eq!(r2.status(), StatusCode::CONFLICT);
+        }
+
+        #[tokio::test]
         async fn non_failure_action_is_acked_and_dropped() {
             let _env = crate::secrets::key_file_env_lock().await;
             let tmp = tempfile::tempdir().unwrap();
             let (st, mut rx) = state(tmp.path()).await;
             let raw = failure_payload("contoso/claude-run")
                 .replace(r#""action":"failure""#, r#""action":"recover""#);
-            let sig = sign(HMAC_SECRET.as_bytes(), raw.as_bytes());
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
+                Path(SOURCE_A.to_string()),
                 headers(Some(&sig), Some("d-4")),
                 Bytes::from(raw),
             )
@@ -1856,13 +2151,16 @@ mod tests {
 
         #[tokio::test]
         async fn unlisted_repo_is_acked_and_dropped() {
+            // CLAUDE-87: source A's allow-list is `contoso/claude-run` only, so
+            // a validly signed delivery for a different repo is acked + dropped.
             let _env = crate::secrets::key_file_env_lock().await;
             let tmp = tempfile::tempdir().unwrap();
             let (st, mut rx) = state(tmp.path()).await;
             let raw = failure_payload("someone-else/other-repo");
-            let sig = sign(HMAC_SECRET.as_bytes(), raw.as_bytes());
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
+                Path(SOURCE_A.to_string()),
                 headers(Some(&sig), Some("d-5")),
                 Bytes::from(raw),
             )

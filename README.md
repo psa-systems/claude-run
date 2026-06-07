@@ -183,7 +183,9 @@ Auth (and every action `token_ref`) reads from an encrypted secrets store. Two t
 
 ## Webhook fast-path
 
-The daemon turns a Forgejo `action_run_failure` delivery into a triaged YouTrack issue in seconds, instead of waiting for the next scheduled poll. The pipeline is `POST /webhooks/forgejo` (HMAC-verified, replay-protected, rate-limited) -> internal-route log fetch + redaction -> hybrid triage -> issue mint, all inside the running daemon. The scheduled `youtrack` / `forgejo-ci-fix` actions remain the backstop and dedupe against webhook-minted issues through the same hidden markers, so a poll that races the webhook never files a second issue.
+The daemon turns a Forgejo `action_run_failure` delivery into a triaged YouTrack issue in seconds, instead of waiting for the next scheduled poll. The pipeline is `POST /webhooks/forgejo/<source>` (HMAC-verified, replay-protected, rate-limited) -> internal-route log fetch + redaction -> hybrid triage -> issue mint, all inside the running daemon. The scheduled `youtrack` / `forgejo-ci-fix` actions remain the backstop and dedupe against webhook-minted issues through the same hidden markers, so a poll that races the webhook never files a second issue.
+
+The listener is multi-source (CLAUDE-87): each `<source>` is a `[webhook.sources.<source>]` config block with its own HMAC secret and allow-list, served at its own URL path. One Forgejo org webhook per source means a leaked org secret authenticates only that org's allow-listed payloads, and each source has its own rate-limit bucket so one org's failure storm cannot rate-starve another's deliveries. The replay window is shared across sources (the `X-Forgejo-Delivery` id is globally unique, so a duplicate delivered to two sources is still caught). The source name is the URL path segment verbatim, so use lowercase `[a-z0-9_-]`; a name needing URL escaping is warned about at load.
 
 Triage sorts each verified failure into one of three buckets: a failing PR check that a code change fixes (`code_fix`) mints an issue and sets `AI Agent = Queued` so `forgejo-ci-fix` opens the fix PR; a failure no PR fixes (`human_action`, e.g. a main-branch / tag / release / missing-secret failure) mints a human-assigned issue with no PR; a transient / infra / flaky failure (`transient`) mints nothing. A failing run triggered by the fix bot's own login mints nothing (loop safety), and the reused per-key + daily caps throttle a storm of failures.
 
@@ -193,15 +195,32 @@ A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an exp
 # config.toml
 
 [webhook]
-# Name of the stored secret (see CLAUDE-26 secrets) holding the Forgejo HMAC key.
-secret_ref = "forgejo-webhook-secret"
-# Repo allow-list. Only failures from matching repos are acted on; every other
-# authenticated delivery is acked and dropped. Patterns: exact "owner/repo",
-# per-owner "owner/*", or "*" for every repo (pair "*" with a Forgejo SYSTEM
-# webhook so all repos deliver). Empty list denies all.
-allowed_repos = ["pandoras-box/forgejo-cli"]
+# Replay-protection window in seconds, shared across all sources.
 replay_window_secs = 300
-rate_limit_per_min = 60
+
+# One block per source. The block name is the URL path segment:
+# POST /webhooks/forgejo/contoso, /webhooks/forgejo/fabrikam, etc.
+[webhook.sources.contoso]
+# Name of the stored secret (see CLAUDE-26 secrets) holding this source's HMAC key.
+secret_ref = "forgejo-hmac-contoso"
+# Repo allow-list for this source. Only failures from matching repos are acted on;
+# every other authenticated delivery is acked and dropped. Patterns: exact
+# "owner/repo", per-owner "owner/*", or "*" for every repo. Empty list denies all.
+allowed_repos = ["Contoso/*"]
+# Per-source rate limit (requests/min); defaults to 60 when omitted.
+# rate_limit_per_min = 60
+
+[webhook.sources.fabrikam]
+secret_ref = "forgejo-hmac-fabrikam"
+allowed_repos = ["fabrikam/*"]
+
+[webhook.sources.globex]
+secret_ref = "forgejo-hmac-globex"
+allowed_repos = ["globex/*"]
+
+[webhook.sources.initech]
+secret_ref = "forgejo-hmac-initech"
+allowed_repos = ["initech/*"]
 
 [mint]
 # Project for any repo no VCS integration claims. Routing is normally driven by
@@ -217,9 +236,17 @@ fallback_project = "CLAUDE"
 # "pandoras-box/forgejo-cli" = "FJ"
 ```
 
-The mint needs the `yt` (and, for the `has_open_pr` triage signal and the fix PR, `fj`) CLIs on the daemon host. With no usable backend the consumer still ingests and logs failures but mints nothing.
+An empty / absent `sources` map disables the listener entirely (no endpoints), exactly like the pre-CLAUDE-87 unset `secret_ref`. The mint needs the `yt` (and, for the `has_open_pr` triage signal and the fix PR, `fj`) CLIs on the daemon host. With no usable backend the consumer still ingests and logs failures but mints nothing.
 
-Register the webhook on the pilot repo with **only** the Action Run Failure event (Forgejo: repo Settings -> Webhooks -> Add Webhook -> Forgejo), pointing at the daemon's `/webhooks/forgejo` URL, with the same HMAC secret stored under `secret_ref`. Selecting only the Failure event keeps `success` / `recover` deliveries off the wire entirely; any that do arrive are acked and dropped.
+### Migration from the single-source listener (CLAUDE-87)
+
+This is a **breaking config change**: the old top-level `webhook.secret_ref` / `webhook.allowed_repos` / `webhook.rate_limit_per_min` keys are gone, and `[webhook.sources.*]` is the only shape. A config still carrying an old key fails to parse at serve start with serde's unknown-field error naming the offending key. That is the intended migration signal. To switch from the single SITE-level system webhook to one ORG-level webhook per org:
+
+1. Generate and store one secret per org: `printf %s '<distinct-random-value>' | claude-run secret set forgejo-hmac-<org>` for each of `contoso`, `fabrikam`, `globex`, `initech`.
+2. In Forgejo, on each org's Settings -> Webhooks, add a **Forgejo** webhook with URL `https://<daemon-host>/webhooks/forgejo/<source>`, Secret set to that org's stored value, and **only** the Action Run Failure event selected. Selecting only the Failure event keeps `success` / `recover` deliveries off the wire entirely; any that do arrive are acked and dropped.
+3. Replace the old `[webhook]` block in `config.toml` with the sources shape above and restart the daemon. It refuses to start while any old key is present, naming it.
+4. Delete the SITE-level system webhook (and any old per-repo pilot webhook).
+5. Verify: one failing run per org produces a `verified action_run_failure received` log line carrying the right `source` field. The old shared secret can be deleted after a burn-in period.
 
 ## Containerized deployment
 
