@@ -11,8 +11,9 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use serde::Deserialize;
+use tracing::warn;
 
-use super::{Backend, Forge, IssueTracker, PullRequest, VcsRepo};
+use super::{Backend, Forge, IssueTracker, PullRequest, VcsMapEntry, VcsRepo};
 use crate::error::{Error, Result};
 
 /// Captured result of running an external command.
@@ -150,6 +151,16 @@ struct VcsProcessor {
     #[serde(rename = "serverUrl")]
     server_url: String,
     path: String,
+}
+
+/// One project as `yt project list --json` emits it. Only the short name and the
+/// archived flag are consumed; unknown fields are ignored.
+#[derive(Debug, Deserialize)]
+struct ProjectListEntry {
+    #[serde(rename = "shortName")]
+    short_name: String,
+    #[serde(default)]
+    archived: bool,
 }
 
 impl CliBackend {
@@ -304,6 +315,53 @@ impl IssueTracker for CliBackend {
             repo_path: first.path,
             clone_url,
         })
+    }
+
+    fn vcs_repo_map(&self) -> Result<Vec<VcsMapEntry>> {
+        let stdout = self.yt_ok(&["project", "list", "--json"])?;
+        let projects: Vec<ProjectListEntry> =
+            Self::parse_json(&self.yt, "yt project list --json", &stdout)?;
+        let mut entries = Vec::new();
+        for project in projects {
+            // Archived projects never own live routing; skip without a `vcs` call.
+            if project.archived {
+                continue;
+            }
+            // A single project's `vcs` call failing (or emitting malformed JSON)
+            // must not disable routing for every other project: log and skip it.
+            let raw = match self.yt_ok(&[
+                "project",
+                "vcs",
+                &project.short_name,
+                "--enabled-only",
+                "--json",
+            ]) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(project = %project.short_name, error = %e, "yt project vcs failed; skipping project for mint routing");
+                    continue;
+                }
+            };
+            let procs: Vec<VcsProcessor> = match Self::parse_json(
+                &self.yt,
+                "yt project vcs --json",
+                &raw,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(project = %project.short_name, error = %e, "yt project vcs returned unparseable JSON; skipping project for mint routing");
+                    continue;
+                }
+            };
+            for proc in procs {
+                entries.push(VcsMapEntry {
+                    server_url: proc.server_url,
+                    path: proc.path,
+                    project_key: project.short_name.clone(),
+                });
+            }
+        }
+        Ok(entries)
     }
 
     fn create_issue(
@@ -652,6 +710,48 @@ mod tests {
             Error::NoVcsIntegration(key) => assert_eq!(key, "MK"),
             other => panic!("expected NoVcsIntegration, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn vcs_repo_map_flattens_skips_archived_and_tolerates_a_failing_project() {
+        // CLAUDE-86: list projects, skip the archived one, flatten each live
+        // project's enabled processors, and degrade a failing per-project `vcs`
+        // call to a skip (not a hard error).
+        let projects = r#"[
+            {"shortName":"CLAUDE","archived":false},
+            {"shortName":"OLD","archived":true},
+            {"shortName":"FJ","archived":false},
+            {"shortName":"BROKEN","archived":false}
+        ]"#;
+        let runner = StubRunner::new()
+            .ok("yt", &["project", "list", "--json"], projects)
+            .ok(
+                "yt",
+                &["project", "vcs", "CLAUDE", "--enabled-only", "--json"],
+                r#"[{"serverUrl":"https://dev.a8n.run","path":"contoso/claude-run"}]"#,
+            )
+            .ok(
+                "yt",
+                &["project", "vcs", "FJ", "--enabled-only", "--json"],
+                r#"[{"serverUrl":"https://dev.a8n.run","path":"fabrikam/forgejo-cli"}]"#,
+            )
+            .fail(
+                "yt",
+                &["project", "vcs", "BROKEN", "--enabled-only", "--json"],
+                1,
+                "boom",
+            );
+        let b = backend(runner);
+        let map = b.vcs_repo_map().unwrap();
+        // The archived project is never queried; the broken one is skipped.
+        assert_eq!(map.len(), 2, "{map:?}");
+        assert!(map.iter().any(|e| e.project_key == "CLAUDE"
+            && e.path == "contoso/claude-run"
+            && e.server_url == "https://dev.a8n.run"));
+        assert!(map
+            .iter()
+            .any(|e| e.project_key == "FJ" && e.path == "fabrikam/forgejo-cli"));
+        assert!(!map.iter().any(|e| e.project_key == "BROKEN"));
     }
 
     #[test]

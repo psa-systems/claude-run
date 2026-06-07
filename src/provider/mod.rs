@@ -37,6 +37,20 @@ use crate::error::{Error, Result};
 pub use cli::{CliBackend, CmdOutput, CommandRunner, ProcessRunner};
 pub use github::{is_github_host, GithubForge, HttpMcpTransport, McpTransport};
 
+/// One project-to-repo binding flattened from a YouTrack project's enabled VCS
+/// integration, the row of the inverse routing map (CLAUDE-86). Each enabled
+/// `GiteaChangesProcessor` on a non-archived project contributes one entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VcsMapEntry {
+    /// Forge server URL as the processor stores it, e.g. `https://dev.a8n.run`.
+    pub server_url: String,
+    /// Repository path the processor watches, e.g. `contoso/claude-run`
+    /// (stored lowercased by YouTrack; match case-insensitively).
+    pub path: String,
+    /// Short name of the project that owns the processor, e.g. `CLAUDE`.
+    pub project_key: String,
+}
+
 /// A repository resolved from a YouTrack project's enabled VCS integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VcsRepo {
@@ -106,6 +120,13 @@ pub trait IssueTracker: Send + Sync {
     /// Resolve a project's enabled VCS integration to a clonable repo. Errors
     /// [`Error::NoVcsIntegration`] when the project has none.
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo>;
+
+    /// Build the inverse VCS routing map (repo -> project, CLAUDE-86): list every
+    /// non-archived project and flatten each one's enabled VCS processors into
+    /// `(server_url, path, project_key)` rows. A single project's `vcs` lookup
+    /// failing is logged and skipped, not propagated, so one broken project never
+    /// disables routing. Backs mint routing without a hand-kept repo map.
+    fn vcs_repo_map(&self) -> Result<Vec<VcsMapEntry>>;
 
     /// Create a new issue in `project` (short name, e.g. `CLAUDE`) with `summary`
     /// and a Markdown `description`, optionally pre-assigning `assignee` (a login).

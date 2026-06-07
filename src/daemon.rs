@@ -328,6 +328,9 @@ fn build_mint_context(
         backend,
         mint_cfg: mint_cfg.clone(),
         defaults: RunnerDefaults::default(),
+        route_cache: Arc::new(crate::mint::VcsRouteCache::new(
+            crate::mint::DEFAULT_VCS_MAP_TTL,
+        )),
     })
 }
 

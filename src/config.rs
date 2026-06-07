@@ -174,17 +174,21 @@ impl Default for WebhookConfig {
 
 /// CLAUDE-46: settings for minting (or updating) a YouTrack issue from a triaged
 /// failure. Lives in `config.toml` because the daemon's webhook consumer needs it
-/// at startup. The repo-to-project routing decision (2026-05-31) sends an issue to
-/// the repo's own YouTrack project, with `fallback_project` (CLAUDE) for any repo
-/// not in `repo_project_map`.
+/// at startup. Routing (CLAUDE-86) sends an issue to the project whose enabled VCS
+/// integration claims the failing repo; `repo_project_map` is an optional override
+/// consulted first, and `fallback_project` (CLAUDE) catches any unclaimed repo.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MintConfig {
-    /// Map of `owner/repo` full name to the YouTrack project short name the
-    /// minted issue should land in, e.g. `fabrikam/forgejo-cli` -> `FJ`.
-    /// A repo absent from this map falls back to [`MintConfig::fallback_project`].
+    /// Optional override map of `owner/repo` full name to the YouTrack project
+    /// short name the minted issue should land in, e.g.
+    /// `fabrikam/forgejo-cli` -> `FJ`. Consulted *before* the VCS-integration
+    /// lookup (CLAUDE-86); leave empty to let each project's VCS settings drive
+    /// routing. A repo claimed by neither falls back to
+    /// [`MintConfig::fallback_project`].
     pub repo_project_map: BTreeMap<String, String>,
-    /// Project short name used for any repo not in `repo_project_map`.
+    /// Project short name used for any repo no override and no VCS integration
+    /// claims.
     pub fallback_project: String,
     /// Loop-safety allow-list of trigger-user logins whose failing runs never
     /// mint a task. The CI-fix bot pushes fixes as itself, so a failing fix-PR
