@@ -138,7 +138,18 @@ pub struct VerifiedFailureEvent {
     pub workflow_id: String,
     pub trigger_user: String,
     pub html_url: String,
+    /// CLAUDE-85: the run's own status from the payload (`failure`, `skipped`,
+    /// ...). Forgejo fires `action_run_failure` even for a run it skipped
+    /// server-side (workflow condition false, no runner task); such a run has
+    /// no log to fetch, ever, and the consumer short-circuits on `skipped`
+    /// instead of burning the 60s log-fetch retry budget.
+    pub status: String,
 }
+
+/// CLAUDE-85: `run.status` value of a server-side-skipped run (verified against
+/// the recorded delivery for `globex/chat` run #1595). The consumer
+/// matches this literal exactly; any other status takes the full pipeline.
+pub const RUN_STATUS_SKIPPED: &str = "skipped";
 
 /// State injected into the webhook handler. Cheap to clone (`SqlitePool` and
 /// `Sender` are `Arc`-shaped; the config is `Arc`-wrapped).
@@ -228,6 +239,30 @@ pub async fn consume_events(
         // pipeline still runs, it just goes unrecorded.
         let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
         let run_id = begin_webhook_run(&pool, &job_key).await;
+
+        // CLAUDE-85: a run Forgejo skipped server-side (workflow condition
+        // false, no runner task) never has a log; the internal route would
+        // answer `resource does not exist` for the entire 60s retry budget.
+        // The payload already told us, so finish in ~0s with no fetch, no
+        // triage, no mint. Any status other than the `skipped` literal takes
+        // the full pipeline (fail-safe toward doing the work).
+        if ev.status == RUN_STATUS_SKIPPED {
+            info!(
+                repo = %ev.repo,
+                run = ev.index_in_repo,
+                "run status is skipped (no job ran); log fetch and triage skipped"
+            );
+            finish_webhook_run(
+                &pool,
+                run_id,
+                &job_key,
+                "run status is 'skipped' (no job ran); log fetch and triage skipped; no issue",
+                true,
+                None,
+            )
+            .await;
+            continue;
+        }
 
         let Some(target) =
             crate::forge_log::LogTarget::for_run(&ev.html_url, &ev.repo, ev.index_in_repo)
@@ -867,6 +902,7 @@ pub fn verified_failure_event(
         workflow_id: payload.run.workflow_id.clone(),
         trigger_user: payload.run.trigger_user.login.clone(),
         html_url: payload.run.html_url.clone(),
+        status: payload.run.status.clone(),
     })
 }
 
@@ -991,6 +1027,7 @@ mod tests {
                 workflow_id: "ci.yml".to_string(),
                 trigger_user: "alice".to_string(),
                 html_url: "https://dev.a8n.run/contoso/claude-run/actions/runs/7".to_string(),
+                status: "failure".to_string(),
             }
         );
     }
@@ -1251,6 +1288,7 @@ mod tests {
             workflow_id: "ci.yml".to_string(),
             trigger_user: "alice".to_string(),
             html_url: "https://dev.a8n.run/fabrikam/forgejo-cli/actions/runs/7".to_string(),
+            status: "failure".to_string(),
         }
     }
 
@@ -1455,6 +1493,72 @@ mod tests {
             .unwrap();
         crate::db::MIGRATOR.run(&pool).await.unwrap();
         pool
+    }
+
+    /// CLAUDE-85: a transport that fails the test on any GET, proving the
+    /// skipped-run short-circuit never attempts a log fetch.
+    struct PanicTransport;
+    impl crate::forge_log::LogTransport for PanicTransport {
+        fn get(
+            &self,
+            url: &str,
+            _token: Option<&str>,
+        ) -> std::result::Result<crate::forge_log::HttpResponse, String> {
+            panic!("log fetch attempted for a skipped run: {url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_run_finishes_without_a_log_fetch() {
+        // CLAUDE-85: `run.status == "skipped"` (server-side skip, no runner
+        // task) bypasses the fetch + triage entirely instead of burning the
+        // 60s retry budget on a log that can never exist.
+        let pool = memory_pool().await;
+        let out_dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let mut ev = event();
+        ev.status = RUN_STATUS_SKIPPED.to_string();
+        tx.send(ev).await.unwrap();
+        drop(tx);
+
+        consume_events(
+            rx,
+            pool.clone(),
+            Arc::new(PanicTransport),
+            out_dir.path().to_path_buf(),
+            None,
+        )
+        .await;
+
+        let (jobs, exit): (i64, Option<i64>) =
+            sqlx::query_as("SELECT jobs_processed, exit_code FROM runs")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(jobs, 1);
+        assert_eq!(exit, Some(crate::exit::OK as i64));
+
+        let (ok, summary): (bool, Option<String>) =
+            sqlx::query_as("SELECT ok, summary FROM job_outcomes")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(ok);
+        let summary = summary.expect("summary recorded");
+        assert!(summary.contains("skipped"), "{summary}");
+        assert!(summary.contains("no issue"), "{summary}");
+    }
+
+    #[test]
+    fn verified_failure_event_carries_the_run_status() {
+        // CLAUDE-85: a delivery with action=failure but a skipped run status
+        // (the server-side-skip flavor) surfaces that status on the event.
+        let body = failure_payload("contoso/claude-run")
+            .replace(r#""status":"failure""#, r#""status":"skipped""#);
+        let payload: ActionPayload = serde_json::from_str(&body).unwrap();
+        let allowed = vec!["contoso/claude-run".to_string()];
+        let event = verified_failure_event(&payload, &allowed).expect("emits event");
+        assert_eq!(event.status, RUN_STATUS_SKIPPED);
     }
 
     #[tokio::test]
