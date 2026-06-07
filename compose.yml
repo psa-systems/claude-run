@@ -1,0 +1,87 @@
+# claude-run daemon, containerized (CLAUDE-37).
+#
+# The whole daemon runs in this container, so every `claude` child it spawns
+# inherits the container's clean $HOME and loads only the slim bot CLAUDE.md
+# baked into the image (deploy/bot-CLAUDE.md), never the operator's interactive
+# ~/.claude/CLAUDE.md.
+#
+# Host tool auth reaches the container through read-only bind mounts. The
+# operator's ~/.claude is NOT mounted wholesale: only ~/.claude/.credentials.json
+# is bound, so the baked slim CLAUDE.md is never shadowed. (To use an API key
+# instead, drop that bind and set ANTHROPIC_API_KEY in the environment block.)
+#
+# Names are app-prefixed per house convention. For a development stack, prefix
+# each name with `dev-` (service dev-claude-bot, network dev-claude-bot-private,
+# volumes dev-claude-bot-{config,data,state}).
+
+name: claude-bot
+
+services:
+  claude-bot:
+    container_name: claude-bot
+    build:
+      context: .
+      dockerfile: oci-build/Dockerfile
+      target: runtime
+    image: claude-run:runtime
+    restart: unless-stopped
+    networks:
+      claude-bot-private:
+    environment:
+      CLAUDE_RUN_CONFIG_DIR: /home/claudebot/.config/claude-run
+      CLAUDE_RUN_DATA_DIR: /home/claudebot/.local/share/claude-run
+      CLAUDE_RUN_STATE_DIR: /home/claudebot/.local/state/claude-run
+      CLAUDE_RUN_RUNTIME_DIR: /home/claudebot/.runtime/claude-run
+    volumes:
+      # Runner state, backed by named volumes.
+      - type: volume
+        source: claude-bot-config
+        target: /home/claudebot/.config/claude-run
+      - type: volume
+        source: claude-bot-data
+        target: /home/claudebot/.local/share/claude-run
+      - type: volume
+        source: claude-bot-state
+        target: /home/claudebot/.local/state/claude-run
+      # Actions YAML, supplied read-only into the config dir.
+      - type: bind
+        source: ./actions
+        target: /home/claudebot/.config/claude-run/actions
+        read_only: true
+      # Claude auth: ONLY the credentials file, never the whole ~/.claude (which
+      # would shadow the baked slim CLAUDE.md).
+      - type: bind
+        source: ${HOME}/.claude/.credentials.json
+        target: /home/claudebot/.claude/.credentials.json
+        read_only: true
+      # yt (youtrack-cli) config.
+      - type: bind
+        source: ${HOME}/.config/youtrack-cli
+        target: /home/claudebot/.config/youtrack-cli
+        read_only: true
+      # fj (forgejo-cli) keys.
+      - type: bind
+        source: ${HOME}/.local/share/forgejo-cli/keys.json
+        target: /home/claudebot/.local/share/forgejo-cli/keys.json
+        read_only: true
+      # git identity.
+      - type: bind
+        source: ${HOME}/.gitconfig
+        target: /home/claudebot/.gitconfig
+        read_only: true
+    # The daemon's unix socket lives here; ephemeral per container so a stale
+    # socket never survives a restart.
+    tmpfs:
+      - /home/claudebot/.runtime/claude-run
+
+networks:
+  claude-bot-private:
+    name: claude-bot-private
+
+volumes:
+  claude-bot-config:
+    name: claude-bot-config
+  claude-bot-data:
+    name: claude-bot-data
+  claude-bot-state:
+    name: claude-bot-state

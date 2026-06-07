@@ -14,7 +14,7 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 ## Conventions
 
 - Governance lives at `niceguyit/governance`. `CHECKLIST.md`, `CI.md`, `PRE_COMMIT.md`, `FORGEJO_ORGS.md`, `GIT_WORKFLOW.md` are the source of truth; this file documents only claude-run-specific deviations.
-- Builder image: `dev.a8n.run/pandoras-box/rust-builder-musl:v1.0.0-rust1.94-alpine`. No runtime image - the binary ships as a Generic Package only. Users install `nu` + `claude` themselves.
+- Builder image: `dev.a8n.run/pandoras-box/rust-builder-musl:v1.0.0-rust1.94-alpine`. The binary still ships as a Generic Package for host installs. There is also a runtime image (CLAUDE-37): `oci-build/Dockerfile --target runtime` builds the daemon plus its pinned toolchain (`nu`, `claude`, `yt`, `fj`, `timeout`, `git`) on the builder image, and `compose.yml` runs it. The container user's `~/.claude/CLAUDE.md` is the slim bot file `deploy/bot-CLAUDE.md`, so the agent never inherits the operator's interactive global CLAUDE.md. Host auth reaches the container through read-only bind mounts; `~/.claude` is never mounted wholesale. See README "Containerized deployment".
 - Compose files, `.env.example`, HOST_IP/PORT, port assignments do NOT apply. The daemon binds a unix socket by default (Phase 2); the TCP web UI is Phase 3 and will be reachable on `127.0.0.1:7321` by default.
 - Action schema is documented in `actions/SCHEMA.md`. Authoritative; changes here ripple to both the runner and the doc.
 
@@ -30,6 +30,8 @@ The Rust port is rolling out in phases against the plan agreed in PR review:
 | 4 | Action edit / import / export through the API | TBD |
 | 5 | Token auth for non-loopback binds | TBD |
 | 6 | Retention policy enforcement on `job_outcomes`, polish | TBD |
+
+Cross-cutting (not a numbered phase): a container runtime (CLAUDE-37) runs the daemon and its spawned `claude` children in an isolated `$HOME` with a slim bot CLAUDE.md, decoupled from the host's operator config. See `oci-build/Dockerfile` (`runtime` target), `compose.yml`, and `deploy/bot-CLAUDE.md`.
 
 ## Working on this repo
 
