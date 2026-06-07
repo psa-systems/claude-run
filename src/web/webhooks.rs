@@ -717,8 +717,24 @@ async fn forgejo_webhook(
             StatusCode::ACCEPTED.into_response()
         }
         // Authenticated but not an allow-listed failure: ack + drop so Forgejo
-        // marks the delivery delivered and does not retry.
-        None => StatusCode::OK.into_response(),
+        // marks the delivery delivered and does not retry. Log which of the two
+        // drop conditions fired so a 200-ack drop is never silent (the rest of
+        // the handler logs every other branch).
+        None => {
+            let reason = if payload.action != "failure" {
+                "non-failure action"
+            } else {
+                "repo not in allowed_repos"
+            };
+            info!(
+                delivery,
+                action = %payload.action,
+                repo = %payload.run.repository.full_name,
+                reason,
+                "forgejo webhook event dropped"
+            );
+            StatusCode::OK.into_response()
+        }
     }
 }
 
@@ -1474,6 +1490,44 @@ mod tests {
             // verified failure reaches the event channel.
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
             assert!(rx.try_recv().is_ok());
+        }
+
+        #[tokio::test]
+        async fn non_failure_action_is_acked_and_dropped() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            let raw = failure_payload("contoso/claude-run")
+                .replace(r#""action":"failure""#, r#""action":"recover""#);
+            let sig = sign(HMAC_SECRET.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                headers(Some(&sig), Some("d-4")),
+                Bytes::from(raw),
+            )
+            .await;
+            // Drop path ("non-failure action"): 200 so Forgejo does not retry,
+            // the info "event dropped" line fires, nothing reaches the channel.
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn unlisted_repo_is_acked_and_dropped() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            let raw = failure_payload("someone-else/other-repo");
+            let sig = sign(HMAC_SECRET.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                headers(Some(&sig), Some("d-5")),
+                Bytes::from(raw),
+            )
+            .await;
+            // Drop path ("repo not in allowed_repos"): same 200 ack, no event.
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(rx.try_recv().is_err());
         }
     }
 }
