@@ -769,6 +769,9 @@ fn mint_summary(outcome: &MintOutcome) -> String {
         MintOutcome::SkippedResolved { existing } => {
             format!("no issue (resolved {existing} not reopened)")
         }
+        MintOutcome::AssociatedWithOpen { existing } => {
+            format!("associated with open {existing}")
+        }
     }
 }
 
@@ -929,6 +932,7 @@ fn decide_mint(
         trigger_user: &ev.trigger_user,
         triage: &verdict,
         log_path: log_artifact,
+        private: ev.private,
     };
     let outcome = mint::mint(tracker, mint_cfg, route_cache, &req, caps)?;
     Ok((verdict.bucket, outcome))
@@ -1016,6 +1020,9 @@ fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
         }
         MintOutcome::SkippedResolved { existing } => {
             info!(repo = %ev.repo, run = ev.index_in_repo, %existing, "resolved issue exists; not reopening")
+        }
+        MintOutcome::AssociatedWithOpen { existing } => {
+            info!(repo = %ev.repo, run = ev.index_in_repo, %existing, "grouped onto existing open issue; minted nothing")
         }
     }
 }
