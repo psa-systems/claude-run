@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{MintConfig, WebhookConfig};
 use crate::forge_log::LogOutcome;
@@ -651,28 +651,54 @@ async fn forgejo_webhook(
         }
     };
 
-    // Verify the signature over the RAW body before any parsing.
+    // Read the delivery id up front so the rejection logs below can name it. The
+    // value is untrusted until the signature verifies: logging it before auth is
+    // fine, acting on it is not, so it is only recorded in the replay store after
+    // authentication succeeds.
+    let delivery = headers
+        .get(DELIVERY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let delivery_label = if delivery.is_empty() { "-" } else { delivery };
+
+    // Verify the signature over the RAW body before any parsing. Both rejection
+    // branches log the reason (never the signature value, the computed MAC, or
+    // the body) so a silent 401 is always explained by the journal.
     let signature = headers.get(SIGNATURE_HEADER).and_then(|v| v.to_str().ok());
     let Some(signature) = signature else {
+        warn!(
+            delivery = delivery_label,
+            "forgejo webhook rejected: missing X-Forgejo-Signature header (is the webhook Secret set in Forgejo?)"
+        );
         return StatusCode::UNAUTHORIZED.into_response();
     };
     if !verify_signature(secret.as_bytes(), &body, signature) {
+        warn!(
+            delivery = delivery_label,
+            body_bytes = body.len(),
+            "forgejo webhook rejected: signature mismatch (stored secret and Forgejo webhook Secret differ?)"
+        );
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
     // Replay protection on authenticated requests only. A missing delivery id
     // is malformed; a previously-seen id inside the window is a replay.
-    let delivery = headers
-        .get(DELIVERY_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
     if delivery.is_empty() {
+        warn!("forgejo webhook rejected: missing X-Forgejo-Delivery header");
         return StatusCode::BAD_REQUEST.into_response();
     }
     if !st.seen.lock().await.check_and_record(delivery, now) {
         warn!(delivery, "forgejo webhook replay rejected");
         return StatusCode::CONFLICT.into_response();
     }
+
+    // Authenticated and de-duplicated: trace the accepted delivery (id + body
+    // length only) before parsing so the happy path is followable at debug.
+    debug!(
+        delivery,
+        body_bytes = body.len(),
+        "forgejo webhook authenticated"
+    );
 
     // Parse only after the request is authenticated and de-duplicated.
     let payload: ActionPayload = match serde_json::from_slice(&body) {
@@ -1341,5 +1367,113 @@ mod tests {
         assert!(s.ok);
         assert!(s.text.contains("triage=transient"));
         assert!(!WebhookRunSummary::error("boom".to_string()).ok);
+    }
+
+    // ---- CLAUDE-64: every auth-rejection branch is reachable --------------
+    //
+    // Drive `forgejo_webhook` directly so each rejection branch (and the
+    // accepted path that emits the debug line) is exercised at the status-code
+    // level. These set the process-global key-file env, so they take the shared
+    // lock with the secrets-UI test in `web::mod`.
+    mod handler_auth {
+        use super::*;
+        use age::secrecy::ExposeSecret;
+        use axum::http::HeaderValue;
+
+        const HMAC_SECRET: &str = "forgejo-webhook-hmac-value";
+
+        /// A [`WebhookState`] whose `secret_ref` resolves to [`HMAC_SECRET`].
+        /// Points the key-file env at a fresh key under `tmp`; the caller holds
+        /// [`crate::secrets::key_file_env_lock`] so the env stays stable across
+        /// the `resolve_secret` call inside the handler.
+        async fn state(
+            tmp: &std::path::Path,
+        ) -> (WebhookState, mpsc::Receiver<VerifiedFailureEvent>) {
+            let key_path = tmp.join("key.txt");
+            let identity = age::x25519::Identity::generate();
+            std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();
+            std::env::set_var(crate::secrets::KEY_FILE_ENV, &key_path);
+
+            let pool = memory_pool().await;
+            let key = SecretsKey::load().unwrap();
+            let ciphertext = key.encrypt(HMAC_SECRET).unwrap();
+            state::secret_create(&pool, "forgejo-webhook-hmac", &ciphertext)
+                .await
+                .unwrap();
+
+            let config = WebhookConfig {
+                secret_ref: Some("forgejo-webhook-hmac".to_string()),
+                allowed_repos: vec!["contoso/claude-run".to_string()],
+                replay_window_secs: 300,
+                rate_limit_per_min: 60,
+            };
+            let (tx, rx) = mpsc::channel(8);
+            (WebhookState::new(pool, config, tx), rx)
+        }
+
+        fn headers(signature: Option<&str>, delivery: Option<&str>) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            if let Some(s) = signature {
+                h.insert(SIGNATURE_HEADER, HeaderValue::from_str(s).unwrap());
+            }
+            if let Some(d) = delivery {
+                h.insert(DELIVERY_HEADER, HeaderValue::from_str(d).unwrap());
+            }
+            h
+        }
+
+        #[tokio::test]
+        async fn missing_signature_header_is_401() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx) = state(tmp.path()).await;
+            let body = Bytes::from(failure_payload("contoso/claude-run"));
+            let resp = forgejo_webhook(State(st), headers(None, Some("d-1")), body).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn bad_signature_is_401() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx) = state(tmp.path()).await;
+            let body = Bytes::from(failure_payload("contoso/claude-run"));
+            // Well-formed hex but the wrong MAC: the signature value never leaks
+            // into a log; only the delivery id and body length are recorded.
+            let resp =
+                forgejo_webhook(State(st), headers(Some("deadbeef"), Some("d-2")), body).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn missing_delivery_id_is_400() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx) = state(tmp.path()).await;
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(HMAC_SECRET.as_bytes(), raw.as_bytes());
+            let resp =
+                forgejo_webhook(State(st), headers(Some(&sig), None), Bytes::from(raw)).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn authenticated_delivery_is_accepted() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(HMAC_SECRET.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                headers(Some(&sig), Some("d-3")),
+                Bytes::from(raw),
+            )
+            .await;
+            // Accepted path: the debug "authenticated" line fires here and the
+            // verified failure reaches the event channel.
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            assert!(rx.try_recv().is_ok());
+        }
     }
 }
