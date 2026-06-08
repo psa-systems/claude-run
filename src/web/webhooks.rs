@@ -53,7 +53,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use sqlx::SqlitePool;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::config::{MintConfig, WebhookConfig, WebhookSource};
@@ -199,41 +199,72 @@ pub const RUN_STATUS_FAILURE: &str = "failure";
 #[derive(Clone)]
 pub struct WebhookState {
     pool: SqlitePool,
-    config: Arc<WebhookConfig>,
+    /// CLAUDE-101: live webhook config, shared with [`crate::settings::LiveSettings`]
+    /// so a Settings save (new/edited source, allow-list, rate limit, secret refs)
+    /// is routable on the next request without a restart.
+    config: Arc<RwLock<WebhookConfig>>,
     events: mpsc::Sender<VerifiedFailureEvent>,
     seen: Arc<Mutex<SeenDeliveries>>,
-    rate: Arc<HashMap<String, Mutex<RateLimiter>>>,
+    /// CLAUDE-101: live per-source limiter map, rebuilt by `LiveSettings` on save.
+    rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
+}
+
+/// CLAUDE-87/101: build one fixed-window rate limiter per source, so exhausting
+/// one source's budget never 429s another. Shared by [`WebhookState`] startup and
+/// the live-apply rebuild in [`crate::settings::LiveSettings`], keeping the
+/// limiter map and the routed source map in lock-step.
+pub fn build_rate_map(config: &WebhookConfig) -> HashMap<String, Mutex<RateLimiter>> {
+    config
+        .sources
+        .iter()
+        .map(|(name, src)| {
+            (
+                name.clone(),
+                Mutex::new(RateLimiter::new(
+                    src.rate_limit_per_min,
+                    Duration::from_secs(60),
+                )),
+            )
+        })
+        .collect()
 }
 
 impl WebhookState {
+    /// Standalone constructor (tests, single-source callers): owns fresh shared
+    /// handles built from `config`.
     pub fn new(
         pool: SqlitePool,
         config: WebhookConfig,
         events: mpsc::Sender<VerifiedFailureEvent>,
     ) -> Self {
         let seen = SeenDeliveries::new(Duration::from_secs(config.replay_window_secs));
-        // One fixed-window limiter per source, so exhausting one source's budget
-        // never 429s another. Built from the same sources map the handler routes
-        // against, so every routable source has a limiter.
-        let rate = config
-            .sources
-            .iter()
-            .map(|(name, src)| {
-                (
-                    name.clone(),
-                    Mutex::new(RateLimiter::new(
-                        src.rate_limit_per_min,
-                        Duration::from_secs(60),
-                    )),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let rate = build_rate_map(&config);
         Self {
             pool,
-            config: Arc::new(config),
+            config: Arc::new(RwLock::new(config)),
             events,
             seen: Arc::new(Mutex::new(seen)),
-            rate: Arc::new(rate),
+            rate: Arc::new(RwLock::new(rate)),
+        }
+    }
+
+    /// CLAUDE-101: build from handles shared with [`crate::settings::LiveSettings`]
+    /// so a save swaps the routed config + limiters live. The replay store is
+    /// built once here from `replay_window_secs` (restart-only by design).
+    pub fn from_shared(
+        pool: SqlitePool,
+        config: Arc<RwLock<WebhookConfig>>,
+        rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
+        replay_window_secs: u64,
+        events: mpsc::Sender<VerifiedFailureEvent>,
+    ) -> Self {
+        let seen = SeenDeliveries::new(Duration::from_secs(replay_window_secs));
+        Self {
+            pool,
+            config,
+            events,
+            seen: Arc::new(Mutex::new(seen)),
+            rate,
         }
     }
 }
@@ -262,7 +293,10 @@ pub struct MintContext {
     /// `Forge` the `has_open_pr` signal is read from.
     pub backend: Arc<dyn Backend>,
     /// Repo-to-project routing, loop-safety bot logins, bucket-2 assignee, etc.
-    pub mint_cfg: MintConfig,
+    /// CLAUDE-101: a live handle shared with [`crate::settings::LiveSettings`],
+    /// read per event so a Settings save is honored by the next mint without a
+    /// restart.
+    pub mint_cfg: Arc<RwLock<MintConfig>>,
     /// Caps applied to the event-driven mint (per-key attempts + daily runs).
     pub defaults: RunnerDefaults,
     /// CLAUDE-86: TTL-cached inverse VCS routing map (repo -> project), built
@@ -283,10 +317,14 @@ pub async fn consume_events(
     transport: Arc<dyn crate::forge_log::LogTransport>,
     out_dir: PathBuf,
     mint: Option<MintContext>,
-    webhook_cfg: Arc<WebhookConfig>,
+    webhook_cfg: Arc<RwLock<WebhookConfig>>,
 ) {
     let cfg = crate::forge_log::LogFetchConfig::default();
     while let Some(ev) = rx.recv().await {
+        // CLAUDE-101: snapshot the live webhook config for this event so a
+        // Settings save (e.g. a source's `log_token_ref`) is picked up by the
+        // next event without a restart.
+        let webhook_cfg = webhook_cfg.read().await.clone();
         info!(
             repo = %ev.repo,
             run = ev.index_in_repo,
@@ -829,7 +867,9 @@ async fn triage_and_mint(
 
     let backend = ctx.backend.clone();
     let classifier = ctx.classifier.clone();
-    let mint_cfg = ctx.mint_cfg.clone();
+    // CLAUDE-101: snapshot the live mint config for this event; the next event
+    // re-reads, so a Settings save in between is honored without a restart.
+    let mint_cfg = ctx.mint_cfg.read().await.clone();
     let route_cache = ctx.route_cache.clone();
     let event = ev.clone();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -1035,31 +1075,43 @@ async fn forgejo_webhook(
 ) -> Response {
     let now = Instant::now();
 
-    // Resolve the source from the path. An unknown source 404s (it is not a
-    // configured endpoint), logged so a misdirected webhook is diagnosable.
-    let Some(src_cfg) = st.config.sources.get(&source) else {
-        warn!(source = %source, "forgejo webhook rejected: unknown source");
-        return StatusCode::NOT_FOUND.into_response();
+    // Resolve the source from the live config (CLAUDE-101). An unknown source
+    // 404s (it is not a configured endpoint), logged so a misdirected webhook is
+    // diagnosable. Clone the source out so no read guard is held across the
+    // secret-decrypt / channel-send awaits below.
+    let src_cfg = {
+        let cfg = st.config.read().await;
+        match cfg.sources.get(&source) {
+            Some(s) => s.clone(),
+            None => {
+                warn!(source = %source, "forgejo webhook rejected: unknown source");
+                return StatusCode::NOT_FOUND.into_response();
+            }
+        }
     };
 
     // Per-source rate limit first: cheapest check, shields the HMAC +
     // secret-decrypt work from a request flood, and one source's storm never
-    // starves another's bucket. The limiter map is built from the same sources
-    // map, so a resolved source always has a limiter; a missing one is a bug.
-    let Some(limiter) = st.rate.get(&source) else {
-        warn!(source = %source, "forgejo webhook: no rate limiter for source (bug)");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    if !limiter.lock().await.allow(now) {
-        warn!(source = %source, "forgejo webhook rate limited");
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    // starves another's bucket. The limiter map is rebuilt in lock-step with the
+    // sources map (CLAUDE-101), so a resolved source always has a limiter; a
+    // missing one is a bug.
+    {
+        let rate = st.rate.read().await;
+        let Some(limiter) = rate.get(&source) else {
+            warn!(source = %source, "forgejo webhook: no rate limiter for source (bug)");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        if !limiter.lock().await.allow(now) {
+            warn!(source = %source, "forgejo webhook rate limited");
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
     }
 
     // Resolve this source's HMAC secret. Fail closed: an unset ref or an
     // unresolvable secret means we cannot authenticate, so reject rather than
     // accept. The secret is hard-bound to the source, so a payload signed for a
     // different source's secret cannot authenticate here.
-    let secret = match resolve_secret(&st, src_cfg).await {
+    let secret = match resolve_secret(&st, &src_cfg).await {
         Ok(s) => s,
         Err(e) => {
             warn!(source = %source, error = %e, "forgejo webhook secret unavailable; rejecting");
@@ -1893,7 +1945,7 @@ mod tests {
                 Arc::new(PanicTransport),
                 out_dir.path().to_path_buf(),
                 None,
-                Arc::new(WebhookConfig::default()),
+                Arc::new(RwLock::new(WebhookConfig::default())),
             )
             .await;
 
@@ -1968,7 +2020,7 @@ mod tests {
             Arc::new(PanicTransport),
             out_dir.path().to_path_buf(),
             None,
-            Arc::new(WebhookConfig::default()),
+            Arc::new(RwLock::new(WebhookConfig::default())),
         )
         .await;
 
@@ -2033,7 +2085,7 @@ mod tests {
     /// Shared scaffolding for the private+token consume tests: age key file,
     /// stored `log-token` secret, and a webhook config whose `test-source`
     /// (the `event()` fixture's source) carries the `log_token_ref`.
-    async fn log_token_setup(tmp: &std::path::Path) -> (SqlitePool, Arc<WebhookConfig>) {
+    async fn log_token_setup(tmp: &std::path::Path) -> (SqlitePool, Arc<RwLock<WebhookConfig>>) {
         use age::secrecy::ExposeSecret;
         let key_path = tmp.join("key.txt");
         let identity = age::x25519::Identity::generate();
@@ -2055,7 +2107,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        (pool, Arc::new(cfg))
+        (pool, Arc::new(RwLock::new(cfg)))
     }
 
     fn run_logs_zip() -> Vec<u8> {
@@ -2157,7 +2209,7 @@ mod tests {
             Arc::new(ReadyTransport),
             out_dir.path().to_path_buf(),
             None,
-            Arc::new(WebhookConfig::default()),
+            Arc::new(RwLock::new(WebhookConfig::default())),
         )
         .await;
 

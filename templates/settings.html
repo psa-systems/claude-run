@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Settings - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><span class="current">Settings</span>{% endblock %}
+{% block main %}
+
+<h2>Settings</h2>
+
+<div class="card" style="margin-bottom: 16px;">
+  <span class="dim">Runtime configuration moved out of <code>config.toml</code> (CLAUDE-101).
+  Each section is validated against the same config struct the file parser uses
+  (unknown fields are rejected) and stored in the database. <code>config.toml</code>
+  keeps only bootstrap keys (<code>[web]</code>, <code>[daemon]</code> binary
+  overrides). Secret values are never shown or stored here: fields ending in
+  <code>_ref</code> name a credential on the
+  <a href="/secrets">Secrets</a> page. The <span class="badge neutral">live</span> /
+  <span class="badge neutral">next event</span> /
+  <span class="badge neutral">restart</span> badge on each section (and field) is
+  when an edit takes effect.</span>
+</div>
+
+{% if let Some(s) = saved %}
+<div class="card" style="border-color: var(--ok); margin-bottom: 16px;">
+  <strong style="color: var(--ok);">Saved {{ s }} settings.</strong>
+</div>
+{% endif %}
+
+{% for sec in sections %}
+<div class="card" style="margin-bottom: 16px;" id="section-{{ sec.path }}">
+  <h3>{{ sec.title }} <span class="badge neutral">apply: {{ sec.apply_badge }}</span></h3>
+  {% if let Some(e) = sec.error %}
+  <div class="card" style="border-color: var(--bad); margin-bottom: 12px;">
+    <strong style="color: var(--bad);">Rejected (nothing saved):</strong>
+    <pre class="stream" style="max-height: 160px; margin: 8px 0 0;">{{ e }}</pre>
+  </div>
+  {% endif %}
+  {% if !sec.fields.is_empty() %}
+  <table style="margin-bottom: 12px;">
+    <thead><tr><th>Field</th><th>Apply</th><th>Notes</th></tr></thead>
+    <tbody>
+      {% for f in sec.fields %}
+      <tr>
+        <td class="mono">{{ f.name }}</td>
+        <td><span class="badge neutral">{{ f.badge }}</span></td>
+        <td class="dim">{{ f.note }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  <form method="post" action="/settings/{{ sec.path }}">
+    <textarea name="json" rows="12" spellcheck="false"
+              style="width: 100%; background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 10px; font-family: var(--mono); font-size: 12px; line-height: 1.4;">{{ sec.json }}</textarea>
+    <div style="margin-top: 8px;">
+      <button class="btn" type="submit">Save {{ sec.title }}</button>
+    </div>
+  </form>
+</div>
+{% endfor %}
+
+{% endblock %}

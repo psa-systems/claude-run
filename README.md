@@ -82,33 +82,35 @@ XDG-compliant; each path overridable by the matching env var.
 
 `workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-job workdirs live; defaults to `$DATA_DIR/workdirs/`. Supports `~`, `$VAR`, `${VAR}` expansion.
 
+## Settings: bootstrap file vs the Settings page (CLAUDE-101)
+
+Configuration splits in two. `config.toml` is the **bootstrap** file: only what the daemon must know before it can open the DB and bind the listener, namely `[web]` (bind / port / `auth_token_ref` / login) and `[daemon]` binary overrides (`nu_binary`, `claude_binary`). Everything runtime-tunable, namely issue minting (`[mint]`), the update train (`[update]`), the webhook sources (`[webhook]`), and the log filter (`[daemon].log_filter`), now lives in the database and is edited in the app on the **Settings** page (`/settings`, in the nav next to Dashboard), behind the same auth gate as the rest of the web UI. A `config.toml` containing only `[web]` and `[daemon]` binary overrides is a complete, valid configuration.
+
+Each section is one JSON document validated against the same serde struct the file parser used (`deny_unknown_fields`), so an invalid edit is rejected inline with the parser's own error and nothing is persisted. Secret values are never shown or stored on the page: fields ending in `_ref` (`auth_token_ref`, a webhook source's `secret_ref` / `log_token_ref`, `[update].token_ref`) name a credential in the Secrets store and are rendered as that name only. Each section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit, secret refs, adding a source), `next event` / `next invocation` for mint / update, and `restart` for the webhook `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at `GET` / `PUT /api/settings/{mint,update,webhook,log_filter}`.
+
+**One-time import, then breaking.** The first daemon start after upgrading imports any of the four moved sections still present in `config.toml` into the database and logs a warning naming each one and telling you to remove it from the file. After that, remove the migrated sections from `config.toml`: a later start that finds a section in **both** the file and the database refuses to run, naming the section, so there is never silent drift between two sources of truth (the same breaking-migration signal CLAUDE-87 used). A `config.toml` with no moved sections starts cleanly with the database as the only source.
+
 ## Logging
 
-Log verbosity is a [tracing `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives) directive string. Precedence is `CLAUDE_RUN_LOG` (env var) > `[daemon].log_filter` (config.toml) > the built-in default `info,claude_run=info,sqlx=warn`.
+Log verbosity is a [tracing `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives) directive string. Precedence is `CLAUDE_RUN_LOG` (env var) > the stored log filter (Settings page, formerly `[daemon].log_filter`) > the built-in default `info,claude_run=info,sqlx=warn`.
 
-```toml
-# config.toml
-[daemon]
-# Persistent log filter. Same syntax as the CLAUDE_RUN_LOG env var.
-log_filter = "info,claude_run=debug,sqlx=warn"
-```
+The persistent filter is now edited on the **Settings** page (the `Log filter` section, or `PUT /api/settings/log_filter` with `{"filter": "info,claude_run=debug,sqlx=warn"}`). Saving applies it live: the daemon swaps the active filter through the tracing reload handle and logs a `log filter applied from settings` line, no restart needed. Set `CLAUDE_RUN_LOG=...` for one-shot debugging: when it is present it wins, and a saved filter persists but is not applied for that run. An invalid filter is rejected inline (and at startup logs a warning naming the value and the parse error, keeping the current filter rather than aborting).
 
-Set `[daemon].log_filter` for a persistent change (no systemd override needed); it is applied right after config load and logs a `log filter applied from config.toml` line. Set `CLAUDE_RUN_LOG=...` for one-shot debugging: when it is present it wins and the config field is ignored. An invalid `log_filter` value is not fatal: the daemon logs a warning naming the value and the parse error, and keeps running on the current filter.
-
-Known limitation: the handful of startup lines emitted before config load (e.g. the config-source line) are governed by the initial filter, not `[daemon].log_filter`; use `CLAUDE_RUN_LOG` when those specific lines are needed at `debug`.
+Known limitation: the handful of startup lines emitted before the stored filter is applied (e.g. the config-source line) are governed by the initial filter, not the saved one; use `CLAUDE_RUN_LOG` when those specific lines are needed at `debug`.
 
 ## Self-update (release trains)
 
-`claude-run version {show,check,update}` self-updates the binary from the Forgejo Generic Package registry. CI publishes two channels ("trains"), and `[update].train` in `config.toml` picks the default; `--train <release|latest>` overrides it per invocation:
+`claude-run version {show,check,update}` self-updates the binary from the Forgejo Generic Package registry. CI publishes two channels ("trains"), and the stored update settings pick the default; `--train <release|latest>` overrides it per invocation. The `train` and `token_ref` are edited on the **Settings** page (`Update train` section, formerly `[update]` in `config.toml`), or over the API:
 
-```toml
-# config.toml
-[update]
-# Default channel: "release" (newest semver vX.Y.Z, the default) or "latest" (moving main build).
-train = "release"
-# Optional: name of a stored secret (see "Secrets store") holding the registry token,
-# used for private packages. Unset stays anonymous-first.
-token_ref = "registry-token"
+```json
+// PUT /api/settings/update
+{
+  // Default channel: "release" (newest semver vX.Y.Z, the default) or "latest" (moving main build).
+  "train": "release",
+  // Optional: name of a stored secret (see "Secrets store") holding the registry
+  // token, used for private packages. null stays anonymous-first.
+  "token_ref": "registry-token"
+}
 ```
 
 - **`release`** resolves the newest semver `vX.Y.Z` package, ignoring the moving `latest` tag. `check` compares it against the running version by semver.
@@ -191,57 +193,50 @@ Triage sorts each verified failure into one of three buckets: a failing PR check
 
 A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the primary mechanism: the repo-to-project binding already lives in YouTrack (each project's enabled `GiteaChangesProcessor` carries the forge `serverUrl` + `path`), so adding a repo to a project's VCS settings is the only step needed for routing to follow. There is no per-repo config to keep in sync. The inverse map is built from `yt project list --json` + `yt project vcs <KEY> --enabled-only --json` (non-archived projects only), cached for 15 minutes, and refreshed once on a lookup miss so a just-added integration is picked up without a daemon restart. Matching is case-insensitive on both host and path and ignores trailing slashes. When more than one project claims the same repo the first by short name (ascending) wins, with a warning naming all candidates; a single project's failing `vcs` call is logged and skipped rather than disabling routing. The mint journal line names the routing source (`override` / `vcs` / `fallback`) so a wrong destination is diagnosable.
 
-```toml
-# config.toml
+The webhook sources and the mint routing are edited on the **Settings** page (the `Webhook sources` and `Issue minting` sections, formerly `[webhook]` and `[mint]` in `config.toml`; CLAUDE-101), or over the API. Adding / editing a source (allow-list, rate limit, `secret_ref`, `log_token_ref`) takes effect live; `replay_window_secs` applies on restart. A mint edit is honored by the next event.
 
-[webhook]
-# Replay-protection window in seconds, shared across all sources.
-replay_window_secs = 300
+```json
+// PUT /api/settings/webhook
+{
+  // Replay-protection window in seconds, shared across all sources (restart to apply).
+  "replay_window_secs": 300,
+  // One entry per source. The key is the URL path segment:
+  // POST /webhooks/forgejo/contoso, /webhooks/forgejo/fabrikam, etc.
+  "sources": {
+    "contoso": {
+      // Name of the stored secret (Secrets store) holding this source's HMAC key.
+      "secret_ref": "forgejo-hmac-contoso",
+      // Repo allow-list. Only failures from matching repos are acted on; every
+      // other authenticated delivery is acked and dropped. Patterns: exact
+      // "owner/repo", per-owner "owner/*", or "*" for every repo. Empty denies all.
+      "allowed_repos": ["Contoso/*"],
+      // Per-source rate limit (requests/min); defaults to 60 when omitted.
+      "rate_limit_per_min": 60,
+      // Optional: name of a stored secret holding a Forgejo PAT (repository read
+      // scope) used to fetch a PRIVATE repo's action logs through the v16 REST
+      // endpoint (GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_id}/logs,
+      // Forgejo PR 12666). null: a private failure mints a human-action issue with
+      // no log attached; on a pre-v16 instance the endpoint 404s and the pipeline
+      // degrades to that same outcome after exactly one request.
+      "log_token_ref": null
+    },
+    "fabrikam": { "secret_ref": "forgejo-hmac-fabrikam", "allowed_repos": ["fabrikam/*"] }
+  }
+}
+```
 
-# One block per source. The block name is the URL path segment:
-# POST /webhooks/forgejo/contoso, /webhooks/forgejo/fabrikam, etc.
-[webhook.sources.contoso]
-# Name of the stored secret (see CLAUDE-26 secrets) holding this source's HMAC key.
-secret_ref = "forgejo-hmac-contoso"
-# Repo allow-list for this source. Only failures from matching repos are acted on;
-# every other authenticated delivery is acked and dropped. Patterns: exact
-# "owner/repo", per-owner "owner/*", or "*" for every repo. Empty list denies all.
-allowed_repos = ["Contoso/*"]
-# Per-source rate limit (requests/min); defaults to 60 when omitted.
-# rate_limit_per_min = 60
-# Optional: name of a stored secret holding a Forgejo PAT (repository read
-# scope) used to fetch a PRIVATE repo's action logs through the v16 REST
-# endpoint (GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_id}/logs,
-# Forgejo PR 12666). Unset: a private failure mints a human-action issue with
-# no log attached. On a pre-v16 instance the endpoint 404s and the pipeline
-# degrades to that same outcome after exactly one request, so the field is
-# safe to configure before the Forgejo upgrade.
-# log_token_ref = "forgejo-logs-contoso"
-
-[webhook.sources.fabrikam]
-secret_ref = "forgejo-hmac-fabrikam"
-allowed_repos = ["fabrikam/*"]
-
-[webhook.sources.globex]
-secret_ref = "forgejo-hmac-globex"
-allowed_repos = ["globex/*"]
-
-[webhook.sources.initech]
-secret_ref = "forgejo-hmac-initech"
-allowed_repos = ["initech/*"]
-
-[mint]
-# Project for any repo no VCS integration claims. Routing is normally driven by
-# each YouTrack project's VCS settings, so this is only the last-resort default.
-fallback_project = "CLAUDE"
-# bot_logins defaults to ["claude-run"] (the fix bot's login); add others here.
-
-# repo_project_map is an OPTIONAL override, consulted before the VCS lookup. Add
-# an entry only to force a repo to a project that does not (or should not) own
-# the repo's VCS integration; otherwise leave it empty and let YouTrack's VCS
-# settings drive routing.
-[mint.repo_project_map]
-# "pandoras-box/forgejo-cli" = "FJ"
+```json
+// PUT /api/settings/mint
+{
+  // Project for any repo no VCS integration claims. Routing is normally driven by
+  // each YouTrack project's VCS settings, so this is only the last-resort default.
+  "fallback_project": "CLAUDE",
+  // Defaults to ["claude-run"] (the fix bot's login); add others to suppress their failures.
+  "bot_logins": ["claude-run"],
+  // OPTIONAL override map, consulted before the VCS lookup. Add an entry only to
+  // force a repo to a project that does not own the repo's VCS integration.
+  "repo_project_map": {}
+}
 ```
 
 An empty / absent `sources` map disables the listener entirely (no endpoints), exactly like the pre-CLAUDE-87 unset `secret_ref`. The mint needs the `yt` (and, for the `has_open_pr` triage signal and the fix PR, `fj`) CLIs on the daemon host. With no usable backend the consumer still ingests and logs failures but mints nothing.

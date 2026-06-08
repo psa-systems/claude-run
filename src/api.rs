@@ -61,6 +61,9 @@ pub struct AppState {
     /// CLAUDE-40: shared with the dispatcher so the delete handler can refuse a
     /// delete for an action whose run is dispatched but not yet in `runs`.
     pub in_flight: InFlight,
+    /// CLAUDE-101: live runtime settings (mint/update/webhook/log_filter) backing
+    /// the Settings page and the `/api/settings/<section>` endpoints.
+    pub settings: Arc<crate::settings::LiveSettings>,
 }
 
 /// JSON API router. Phase 2 mounted it at root over the unix socket;
@@ -77,6 +80,13 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/:id/cancel", post(cancel_run))
         .route("/pause", post(global_pause_handler))
         .route("/resume", post(global_resume_handler))
+        // CLAUDE-101: JSON settings round-trip, one section per request. Mounted
+        // under `/api` over TCP (behind the CLAUDE-48 auth gate) and at root over
+        // the unix socket. `<section>` is mint|update|webhook|log_filter.
+        .route(
+            "/settings/:section",
+            get(get_settings_section).put(put_settings_section),
+        )
         .with_state(Arc::new(state))
 }
 
@@ -323,6 +333,55 @@ async fn global_resume_handler(
     }))
 }
 
+/// CLAUDE-101: resolve the URL path segment into a settings section or 404.
+fn parse_section(section: &str) -> Result<crate::settings::Section, AppError> {
+    crate::settings::Section::from_path(section).ok_or_else(|| AppError {
+        status: StatusCode::NOT_FOUND,
+        message: format!("unknown settings section `{section}`"),
+    })
+}
+
+/// `GET /api/settings/<section>` returns the section's current JSON document.
+/// Secrets appear as their `*_ref` names only.
+async fn get_settings_section(
+    State(s): State<Arc<AppState>>,
+    AxumPath(section): AxumPath<String>,
+) -> Result<axum::response::Response, AppError> {
+    let section = parse_section(&section)?;
+    let json = s.settings.section_json(section).await;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        json,
+    )
+        .into_response())
+}
+
+/// `PUT /api/settings/<section>` validates the JSON body against the section's
+/// config struct, persists it, and applies it live. A serde error 400s with the
+/// message; nothing is persisted on rejection.
+async fn put_settings_section(
+    State(s): State<Arc<AppState>>,
+    AxumPath(section): AxumPath<String>,
+    body: String,
+) -> Result<Json<AckResponse>, AppError> {
+    let section = parse_section(&section)?;
+    match s.settings.save_section(section, &body).await {
+        Ok(()) => Ok(Json(AckResponse {
+            ok: true,
+            message: format!("saved `{}` settings", section.as_path()),
+        })),
+        Err(crate::settings::SaveError::Invalid(m)) => Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            message: m,
+        }),
+        Err(crate::settings::SaveError::Db(e)) => Err(AppError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: e.to_string(),
+        }),
+    }
+}
+
 #[derive(Debug)]
 struct AppError {
     status: StatusCode,
@@ -368,12 +427,48 @@ mod tests {
         MIGRATOR.run(&pool).await.unwrap();
         let (trigger_tx, _rx) = mpsc::channel(8);
         Arc::new(AppState {
-            pool,
+            pool: pool.clone(),
             trigger_tx,
             version: "test",
             runs: Arc::new(RunRegistry::new()),
             in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
         })
+    }
+
+    /// CLAUDE-101: an unknown section path 404s; a valid one round-trips JSON
+    /// through the same `LiveSettings` save path the web page uses.
+    #[tokio::test]
+    async fn settings_section_get_and_put_round_trip() {
+        let s = app_state().await;
+        // Unknown section -> 404.
+        let err = get_settings_section(State(s.clone()), AxumPath("bogus".into()))
+            .await
+            .expect_err("unknown section must 404");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+
+        // Valid PUT persists; subsequent GET reflects it.
+        let _ = put_settings_section(
+            State(s.clone()),
+            AxumPath("update".into()),
+            r#"{"train":"latest"}"#.to_string(),
+        )
+        .await
+        .expect("valid put");
+        let resp = get_settings_section(State(s.clone()), AxumPath("update".into()))
+            .await
+            .expect("get");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Invalid PUT (unknown field) -> 400, persists nothing.
+        let err = put_settings_section(
+            State(s.clone()),
+            AxumPath("update".into()),
+            r#"{"train":"latest","nope":true}"#.to_string(),
+        )
+        .await
+        .expect_err("invalid put must 400");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     /// CLAUDE-61: the event-driven synthetic action cannot be triggered.
