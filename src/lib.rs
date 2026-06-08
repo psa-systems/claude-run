@@ -37,6 +37,7 @@ pub mod paint;
 pub mod provider;
 pub mod scheduler;
 pub mod secrets;
+pub mod settings;
 pub mod snippet;
 pub mod state;
 pub mod triage;

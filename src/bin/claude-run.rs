@@ -17,7 +17,7 @@ use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
 use claude_run::{
     action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db, exit,
-    jsonfmt, lock, migrate, paint, secrets, snippet, state, update,
+    jsonfmt, lock, migrate, paint, secrets, settings, snippet, state, update,
 };
 
 /// `--color` choices. Maps to both `anstream` (our own output) and clap's
@@ -379,7 +379,7 @@ async fn real_main(
 
     match cli.cmd {
         Cmd::Run { action } => run_action(&action, &actions_dir, &paths, &on_disk).await,
-        Cmd::Serve { detach } => serve(detach, paths, on_disk, config_source).await,
+        Cmd::Serve { detach } => serve(detach, paths, on_disk, config_source, log_reload).await,
         Cmd::Stop => stop(&paths).await,
         Cmd::Restart { detach } => restart(detach, cli.actions_dir.as_deref(), &paths).await,
         Cmd::Trigger { action } => trigger(&action, &paths).await,
@@ -423,8 +423,12 @@ async fn version_cmd(
             train,
             use_fj_token,
         } => {
-            let train = resolve_train(train, &on_disk.update.train)?;
-            let token = resolve_update_token(paths, on_disk).await?;
+            // CLAUDE-101: the update config is DB-backed; read the effective value
+            // (DB wins, file is the fallback before any serve migrated it).
+            let pool = db::open(&paths.state_db()).await?;
+            let update_cfg = settings::effective_update(&pool, on_disk).await?;
+            let train = resolve_train(train, &update_cfg.train)?;
+            let token = resolve_update_token(&pool, &update_cfg).await?;
             update::check(train, use_fj_token, token).await
         }
         VersionCmd::Update {
@@ -433,8 +437,10 @@ async fn version_cmd(
             use_fj_token,
             yes,
         } => {
-            let train = resolve_train(train, &on_disk.update.train)?;
-            let token = resolve_update_token(paths, on_disk).await?;
+            let pool = db::open(&paths.state_db()).await?;
+            let update_cfg = settings::effective_update(&pool, on_disk).await?;
+            let train = resolve_train(train, &update_cfg.train)?;
+            let token = resolve_update_token(&pool, &update_cfg).await?;
             update::update(train, version, use_fj_token, token, yes).await
         }
     }
@@ -455,15 +461,14 @@ fn resolve_train(
 /// no `token_ref` is configured (the anonymous-first path). When set, the secret
 /// is decrypted from the store; a missing secret or key file surfaces an error.
 async fn resolve_update_token(
-    paths: &cfg::Paths,
-    on_disk: &cfg::OnDiskConfig,
+    pool: &sqlx::SqlitePool,
+    update_cfg: &cfg::UpdateConfig,
 ) -> claude_run::error::Result<Option<String>> {
-    let Some(name) = on_disk.update.token_ref.as_deref() else {
+    let Some(name) = update_cfg.token_ref.as_deref() else {
         return Ok(None);
     };
-    let pool = db::open(&paths.state_db()).await?;
     let key = secrets::SecretsKey::load()?;
-    let token = secrets::resolve_secret(&pool, &key, name).await?;
+    let token = secrets::resolve_secret(pool, &key, name).await?;
     Ok(Some(token))
 }
 
@@ -523,6 +528,7 @@ async fn serve(
     paths: cfg::Paths,
     on_disk: cfg::OnDiskConfig,
     config_source: cfg::ConfigSource,
+    log_reload: reload::Handle<EnvFilter, Registry>,
 ) -> claude_run::error::Result<i32> {
     // CLAUDE-57: one startup line recording which config file backed this run
     // (or that defaults silently won), so `journalctl` alone answers why the
@@ -531,7 +537,25 @@ async fn serve(
     // CLAUDE-87: flag any webhook source name that needs URL escaping (likely a
     // typo) before the listener binds, so the warning sits next to the config line.
     on_disk.webhook.warn_unusual_source_names();
-    let d = daemon::Daemon { paths, on_disk };
+    // CLAUDE-101: hand the daemon a live log-filter reload hook so a Settings
+    // save applies immediately. When `CLAUDE_RUN_LOG` is set the env var wins
+    // (CLAUDE-62), so the hook is `None`: a saved filter persists but is not
+    // applied this run.
+    let log_apply: Option<settings::LogFilterApply> =
+        if std::env::var_os("CLAUDE_RUN_LOG").is_some() {
+            None
+        } else {
+            let handle = log_reload;
+            Some(Arc::new(move |directive: &str| {
+                let filter = EnvFilter::try_new(directive).map_err(|e| e.to_string())?;
+                handle.reload(filter).map_err(|e| e.to_string())
+            }) as settings::LogFilterApply)
+        };
+    let d = daemon::Daemon {
+        paths,
+        on_disk,
+        log_apply,
+    };
     d.run().await?;
     Ok(exit::OK)
 }

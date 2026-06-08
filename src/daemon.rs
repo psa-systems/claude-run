@@ -45,10 +45,14 @@ const WEB_BIND_RETRY_LOG_EVERY: u64 = 12;
 pub struct Daemon {
     pub paths: Paths,
     pub on_disk: OnDiskConfig,
+    /// CLAUDE-101: live tracing log-filter reload hook, wired from the CLI's
+    /// reload handle. `None` when `CLAUDE_RUN_LOG` is set (env wins) or no handle
+    /// is available, in which case a saved filter persists but is not applied.
+    pub log_apply: Option<crate::settings::LogFilterApply>,
 }
 
 impl Daemon {
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         std::fs::create_dir_all(&self.paths.runtime_dir)?;
         std::fs::create_dir_all(&self.paths.data_dir)?;
 
@@ -58,6 +62,21 @@ impl Daemon {
         let _pid_lock = pidfile_lock(&pidfile)?;
 
         let pool = crate::db::open(&self.paths.state_db()).await?;
+
+        // CLAUDE-101: import any runtime config section still living in
+        // config.toml into the DB (once), or refuse to start if a section is
+        // present in BOTH the file and the DB. Then resolve the effective
+        // runtime config (DB wins, file is the bootstrap fallback) and hold it
+        // behind shared RwLocks so Settings-page saves apply live.
+        crate::settings::migrate_config_file(&pool, &self.paths).await?;
+        let effective = crate::settings::effective(&pool, &self.on_disk).await?;
+        let webhook_enabled = !effective.webhook.sources.is_empty();
+        let replay_window_secs = effective.webhook.replay_window_secs;
+        let settings = Arc::new(crate::settings::LiveSettings::new(
+            pool.clone(),
+            effective,
+            self.log_apply.take(),
+        ));
 
         // CLAUDE-10: a freshly started daemon cannot have any run still
         // executing, so any run with no end state is orphaned from a dead
@@ -104,6 +123,7 @@ impl Daemon {
             version: VERSION,
             runs: runs.clone(),
             in_flight: in_flight.clone(),
+            settings: settings.clone(),
         });
 
         // Unix-socket router: bare paths (`/status`, `/actions`, ...). CLI
@@ -117,7 +137,8 @@ impl Daemon {
         // CLAUDE-61: the web layer injects the synthetic `webhook-fast-path`
         // action only when the webhook fast-path is configured. CLAUDE-87: that
         // is now any configured source (an empty `sources` map disables it).
-        let webhook_enabled = !self.on_disk.webhook.sources.is_empty();
+        // CLAUDE-101: `webhook_enabled` reflects the effective (DB-resolved)
+        // config at start.
         let web_router = crate::web::router(api_state.clone(), self.paths.clone(), webhook_enabled);
 
         // CLAUDE-43: Forgejo webhook listener. Verified `action_run_failure`
@@ -126,9 +147,13 @@ impl Daemon {
         // YouTrack issue.
         let (webhook_tx, webhook_rx) =
             mpsc::channel::<crate::web::webhooks::VerifiedFailureEvent>(64);
-        let webhook_state = crate::web::webhooks::WebhookState::new(
+        // CLAUDE-101: the listener routes against the live config + limiter map
+        // shared with LiveSettings, so a Settings save is routable immediately.
+        let webhook_state = crate::web::webhooks::WebhookState::from_shared(
             pool.clone(),
-            self.on_disk.webhook.clone(),
+            settings.webhook_handle(),
+            settings.webhook_rate_handle(),
+            replay_window_secs,
             webhook_tx,
         );
         let webhook_router = crate::web::webhooks::router(webhook_state);
@@ -180,7 +205,7 @@ impl Daemon {
         let webhook_log_dir = self.paths.state_dir.join("webhook-logs");
         let webhook_transport: Arc<dyn crate::forge_log::LogTransport> =
             Arc::new(crate::forge_log::HttpLogTransport::new());
-        let mint_ctx = build_mint_context(&pool, &self.on_disk.mint, &claude, &webhook_log_dir);
+        let mint_ctx = build_mint_context(&pool, settings.mint_handle(), &claude, &webhook_log_dir);
         let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(
             webhook_rx,
             pool.clone(),
@@ -188,8 +213,9 @@ impl Daemon {
             webhook_log_dir,
             mint_ctx,
             // CLAUDE-96: the consumer resolves each event source's
-            // `log_token_ref` for private-repo log fetches.
-            Arc::new(self.on_disk.webhook.clone()),
+            // `log_token_ref` for private-repo log fetches. CLAUDE-101: the live
+            // handle so a Settings save is picked up by the next event.
+            settings.webhook_handle(),
         ));
 
         let dispatch = Arc::new(Dispatcher {
@@ -287,7 +313,7 @@ impl Daemon {
 /// so a daemon on a host without the forge CLIs still ingests and logs failures.
 fn build_mint_context(
     pool: &SqlitePool,
-    mint_cfg: &crate::config::MintConfig,
+    mint_cfg: Arc<tokio::sync::RwLock<crate::config::MintConfig>>,
     claude: &Arc<ClaudeInvoker>,
     webhook_log_dir: &Path,
 ) -> Option<crate::web::webhooks::MintContext> {
@@ -330,7 +356,7 @@ fn build_mint_context(
         pool: pool.clone(),
         classifier,
         backend,
-        mint_cfg: mint_cfg.clone(),
+        mint_cfg,
         defaults: RunnerDefaults::default(),
         route_cache: Arc::new(crate::mint::VcsRouteCache::new(
             crate::mint::DEFAULT_VCS_MAP_TTL,

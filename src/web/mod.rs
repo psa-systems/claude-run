@@ -82,6 +82,11 @@ pub fn router(api: Arc<AppState>, paths: Paths, webhook_enabled: bool) -> Router
         .route("/secrets", get(secrets_page).post(secret_create))
         .route("/secrets/:name/rotate", post(secret_rotate))
         .route("/secrets/:name/delete", post(secret_delete))
+        // CLAUDE-101: runtime settings page. GET renders all sections; POST saves
+        // one section (re-rendering inline serde errors on rejection). Behind the
+        // CLAUDE-48 auth gate like every other TCP route.
+        .route("/settings", get(settings_page))
+        .route("/settings/:section", post(settings_save))
         .route("/runs/:id", get(run_detail))
         .route("/runs/:id/jobs/:key/attempt/:attempt", get(job_stream_page))
         .route(
@@ -1654,6 +1659,171 @@ async fn secret_delete(
     Ok(Redirect::to("/secrets").into_response())
 }
 
+// ---- CLAUDE-101: Settings page -------------------------------------------
+
+#[derive(Template)]
+#[template(path = "settings.html")]
+struct SettingsTpl {
+    version: &'static str,
+    sections: Vec<SettingsSectionView>,
+    saved: Option<String>,
+}
+
+struct SettingsSectionView {
+    path: &'static str,
+    title: &'static str,
+    apply_badge: &'static str,
+    json: String,
+    error: Option<String>,
+    fields: Vec<FieldDoc>,
+}
+
+struct FieldDoc {
+    name: &'static str,
+    badge: &'static str,
+    note: &'static str,
+}
+
+#[derive(Deserialize)]
+struct SettingsForm {
+    json: String,
+}
+
+/// Static per-field apply-semantics reference shown on each section card.
+fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
+    use crate::settings::Section::*;
+    match section {
+        Mint => vec![
+            FieldDoc {
+                name: "repo_project_map",
+                badge: "next event",
+                note: "owner/repo -> YouTrack project override.",
+            },
+            FieldDoc {
+                name: "fallback_project",
+                badge: "next event",
+                note: "project for unclaimed repos.",
+            },
+            FieldDoc {
+                name: "bot_logins",
+                badge: "next event",
+                note: "trigger logins that never mint (loop safety).",
+            },
+            FieldDoc {
+                name: "human_assignee",
+                badge: "next event",
+                note: "bucket-2 assignee login; null leaves unassigned.",
+            },
+            FieldDoc {
+                name: "target_state",
+                badge: "next event",
+                note: "State set on a minted issue.",
+            },
+            FieldDoc {
+                name: "ai_agent_field",
+                badge: "next event",
+                note: "AI Agent custom-field name.",
+            },
+            FieldDoc {
+                name: "queued_value",
+                badge: "next event",
+                note: "AI Agent value for a code-fix issue.",
+            },
+        ],
+        Update => vec![
+            FieldDoc {
+                name: "train",
+                badge: "next invocation",
+                note: "release | latest.",
+            },
+            FieldDoc {
+                name: "token_ref",
+                badge: "next invocation",
+                note: "secret name for the registry token; null = anonymous-first.",
+            },
+        ],
+        Webhook => vec![
+            FieldDoc {
+                name: "replay_window_secs",
+                badge: "restart",
+                note: "shared replay window; the replay store is built once at start.",
+            },
+            FieldDoc {
+                name: "sources",
+                badge: "live",
+                note: "per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref.",
+            },
+        ],
+        LogFilter => vec![FieldDoc {
+            name: "filter",
+            badge: "live",
+            note: "tracing EnvFilter directive; CLAUDE_RUN_LOG still wins this run.",
+        }],
+    }
+}
+
+/// Build the full settings view. `flash` carries a just-saved section name or a
+/// just-rejected section's submitted-but-invalid JSON + serde error.
+async fn render_settings(
+    s: &WebState,
+    status: StatusCode,
+    saved: Option<String>,
+    rejected: Option<(crate::settings::Section, String, String)>,
+) -> Result<Response, WebError> {
+    let mut sections = Vec::with_capacity(crate::settings::Section::ALL.len());
+    for section in crate::settings::Section::ALL {
+        let (json, error) = match &rejected {
+            Some((sec, submitted, msg)) if *sec == section => {
+                (submitted.clone(), Some(msg.clone()))
+            }
+            _ => (s.api.settings.section_json(section).await, None),
+        };
+        sections.push(SettingsSectionView {
+            path: section.as_path(),
+            title: section.title(),
+            apply_badge: section.apply_badge(),
+            json,
+            error,
+            fields: section_fields(section),
+        });
+    }
+    let tpl = SettingsTpl {
+        version: s.api.version,
+        sections,
+        saved,
+    };
+    Ok((status, Html(tpl.render()?)).into_response())
+}
+
+async fn settings_page(State(s): State<WebState>) -> Result<Response, WebError> {
+    render_settings(&s, StatusCode::OK, None, None).await
+}
+
+async fn settings_save(
+    State(s): State<WebState>,
+    AxumPath(section): AxumPath<String>,
+    Form(form): Form<SettingsForm>,
+) -> Result<Response, WebError> {
+    let Some(sec) = crate::settings::Section::from_path(&section) else {
+        return Err(WebError::not_found(format!(
+            "unknown settings section `{section}`"
+        )));
+    };
+    match s.api.settings.save_section(sec, &form.json).await {
+        Ok(()) => Ok(Redirect::to("/settings").into_response()),
+        Err(crate::settings::SaveError::Invalid(msg)) => {
+            render_settings(
+                &s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+                Some((sec, form.json, msg)),
+            )
+            .await
+        }
+        Err(crate::settings::SaveError::Db(e)) => Err(e.into()),
+    }
+}
+
 #[derive(Serialize)]
 pub struct PlannedJob {
     pub key: String,
@@ -2134,11 +2304,12 @@ mod tests {
             MIGRATOR.run(&pool).await.unwrap();
             let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
             let api = Arc::new(AppState {
-                pool,
+                pool: pool.clone(),
                 trigger_tx,
                 version: "test",
                 runs: Arc::new(RunRegistry::new()),
                 in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+                settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
             });
             let paths = Paths {
                 config_dir: tmp.join("config"),
@@ -2902,11 +3073,12 @@ mod tests {
             MIGRATOR.run(&pool).await.unwrap();
             let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
             let api = Arc::new(AppState {
-                pool,
+                pool: pool.clone(),
                 trigger_tx,
                 version: "test",
                 runs: Arc::new(RunRegistry::new()),
                 in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+                settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
             });
             let paths = Paths {
                 config_dir: tmp.join("config"),
