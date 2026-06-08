@@ -441,6 +441,9 @@ async fn process_job(
         }
     }
 
+    // CLAUDE-102: a preserved workdir from a failed finalize (unpushed commits)
+    // must not be clobbered by this attempt's clone; move it aside first.
+    preserve_aside(&workdir_path);
     std::fs::create_dir_all(&workdir_path)?;
 
     // ---- pre: mark Working / In Progress, then clone ----
@@ -503,7 +506,7 @@ async fn process_job(
     // Transient claude error: no finalize, no attempt counted, no daily count.
     if claude_result.transient {
         info!(action = %action.name, key = %key, error = %claude_result.error, "transient claude error, not counting attempt");
-        cleanup_workdir(&workdir_path);
+        cleanup_or_preserve(&workdir_path, &action.name, key);
         return Ok(ProcessedJob::Transient { key: key.clone() });
     }
 
@@ -554,7 +557,16 @@ async fn process_job(
         state::daily_count_increment(pool, &action.name).await?;
     }
 
-    cleanup_workdir(&workdir_path);
+    // CLAUDE-102: a finalize failure can cost a retry, never the work. Only a
+    // successfully opened PR makes deletion unconditional (the AGit push leaves
+    // no remote-tracking ref, so the unpushed check cannot clear it); every
+    // other outcome deletes only when no unpushed commits would be lost. A
+    // panic anywhere above preserves trivially: deletion only ever happens
+    // here, explicitly.
+    match &finalize_res {
+        Ok(Finalized::CodeReview { .. }) => cleanup_workdir(&workdir_path),
+        _ => cleanup_or_preserve(&workdir_path, &action.name, key),
+    }
 
     Ok(ProcessedJob::Done {
         key: key.clone(),
@@ -716,7 +728,12 @@ fn finalize(
                 Ok(Finalized::CodeReview { pr_url: url })
             }
             Err(e) => {
-                let body = pr_failure_comment(claude_result, &e);
+                // CLAUDE-102: the error reaches the journal here (the run loop
+                // only records `outcome: Failed`), and the comment names the
+                // preserved workdir so the committed branch is recoverable.
+                warn!(key = %job.key, error = %e, "PR creation failed; finalizing as Failed");
+                let preserved = has_unpushed_commits(workdir).then_some(workdir);
+                let body = pr_failure_comment(claude_result, &e, preserved);
                 comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
                 Ok(Finalized::Failed)
             }
@@ -805,11 +822,22 @@ fn success_comment(r: &ClaudeResult, pr_url: &str) -> String {
     .join("\n")
 }
 
-fn pr_failure_comment(r: &ClaudeResult, err: &Error) -> String {
+fn pr_failure_comment(r: &ClaudeResult, err: &Error, preserved_at: Option<&Path>) -> String {
+    // CLAUDE-102: when the workdir holds unpushed commits it is preserved (not
+    // cleaned), and this comment is the recovery pointer to the branch.
+    let preserved_line = match preserved_at {
+        Some(p) => format!(
+            "The committed branch is PRESERVED on the daemon host at: `{}` (push it manually or re-run after the PR path is fixed).",
+            p.display()
+        ),
+        None => "No local commits were found to preserve.".to_string(),
+    };
     let mut body = [
         "Claude AI agent run completed but PR creation FAILED:".to_string(),
         String::new(),
         err.to_string(),
+        String::new(),
+        preserved_line,
         String::new(),
         r.summary.clone(),
         String::new(),
@@ -911,6 +939,83 @@ fn cleanup_workdir(workdir: &Path) {
         if let Err(e) = std::fs::remove_dir_all(workdir) {
             warn!(workdir = %workdir.display(), error = %e, "workdir cleanup failed (continuing)");
         }
+    }
+}
+
+/// CLAUDE-102: true when any local branch in `workdir` carries commits absent
+/// from every remote-tracking ref - exactly the work deleting the directory
+/// would destroy. Any git failure errs toward `true`: preserving costs disk, a
+/// wrong delete costs the run.
+fn has_unpushed_commits(workdir: &Path) -> bool {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args([
+            "log",
+            "--branches",
+            "--not",
+            "--remotes",
+            "--oneline",
+            "-n",
+            "1",
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => !o.stdout.is_empty(),
+        _ => true,
+    }
+}
+
+/// CLAUDE-102: delete the workdir unless it holds unpushed commits. The
+/// preserve branch is the data-loss guard from the CLAUDE-101 incident, where
+/// a failed `create_pr` plus an unconditional cleanup destroyed the run's only
+/// copy of the committed work.
+fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
+    if !workdir.exists() {
+        return;
+    }
+    if has_unpushed_commits(workdir) {
+        warn!(
+            action = %action,
+            key = %key,
+            workdir = %workdir.display(),
+            "workdir preserved: it holds unpushed commits and no PR was opened"
+        );
+    } else {
+        cleanup_workdir(workdir);
+    }
+}
+
+/// CLAUDE-102: move a leftover (preserved) workdir out of the way of a fresh
+/// attempt's clone, to the first free `<dir>.kept-<n>` sibling. An empty
+/// leftover directory is left in place (the clone tolerates it).
+fn preserve_aside(workdir: &Path) {
+    let occupied = std::fs::read_dir(workdir)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if !occupied {
+        return;
+    }
+    for n in 1u32.. {
+        let aside = workdir.with_file_name(format!(
+            "{}.kept-{n}",
+            workdir
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "workdir".to_string())
+        ));
+        if aside.exists() {
+            continue;
+        }
+        match std::fs::rename(workdir, &aside) {
+            Ok(()) => {
+                warn!(from = %workdir.display(), to = %aside.display(), "leftover workdir moved aside before fresh clone");
+            }
+            Err(e) => {
+                warn!(workdir = %workdir.display(), error = %e, "moving leftover workdir aside failed; clone may fail");
+            }
+        }
+        return;
     }
 }
 
@@ -1134,6 +1239,125 @@ mod tests {
                 .iter()
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Code Review"),
             "{calls:?}"
+        );
+    }
+
+    // ---- CLAUDE-102: workdir preservation -------------------------------
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn repo_with_commit(dir: &Path) {
+        git_in(dir, &["init"]);
+        git_in(dir, &["config", "user.email", "test@test"]);
+        git_in(dir, &["config", "user.name", "test"]);
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        git_in(dir, &["add", "."]);
+        git_in(dir, &["commit", "-m", "feat: x"]);
+    }
+
+    #[test]
+    fn workdir_with_unpushed_commits_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        assert!(has_unpushed_commits(dir.path()));
+        cleanup_or_preserve(dir.path(), "YouTrack", "MK-16");
+        assert!(dir.path().exists(), "unpushed commits must survive cleanup");
+    }
+
+    #[test]
+    fn clean_clone_is_still_removed() {
+        // A clone whose HEAD is covered by remote-tracking refs holds nothing
+        // unpushed; cleanup proceeds exactly as before CLAUDE-102.
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        repo_with_commit(&origin);
+        let clone = base.path().join("clone");
+        git_in(
+            base.path(),
+            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        assert!(!has_unpushed_commits(&clone));
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        assert!(
+            !clone.exists(),
+            "a workdir with no unpushed work is removed"
+        );
+    }
+
+    #[test]
+    fn preserve_aside_moves_a_leftover_workdir() {
+        let base = tempfile::tempdir().unwrap();
+        let wd = base.path().join("MK-16");
+        std::fs::create_dir_all(&wd).unwrap();
+        std::fs::write(wd.join("leftover.txt"), "kept work").unwrap();
+        preserve_aside(&wd);
+        assert!(!wd.exists(), "original path freed for the fresh clone");
+        let aside = base.path().join("MK-16.kept-1");
+        assert!(aside.join("leftover.txt").exists(), "content moved aside");
+
+        // An empty leftover is left in place (the clone tolerates it).
+        std::fs::create_dir_all(&wd).unwrap();
+        preserve_aside(&wd);
+        assert!(wd.exists());
+    }
+
+    #[test]
+    fn finalize_pr_failure_preserves_and_names_the_workdir() {
+        // The CLAUDE-101 incident shape: claude succeeded, both PR strategies
+        // fail; finalize must mark Failed AND point at the preserved workdir in
+        // the comment instead of letting the commits be destroyed.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
+                    1,
+                    "there is no TLS stream available; class=Ssl (16)",
+                )
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "HEAD"],
+                    128,
+                    "no upstream",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(&backend, &backend, &src(), &job(), dir.path(), &ok_result()).unwrap();
+        assert_eq!(res, Finalized::Failed);
+        assert!(dir.path().exists(), "workdir survives the failed finalize");
+        let calls = runner.calls.lock().unwrap();
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .expect("failure comment posted");
+        assert!(comment.contains("PRESERVED"), "{comment}");
+        assert!(
+            comment.contains(&dir.path().display().to_string()),
+            "comment names the preserved path: {comment}"
+        );
+        assert!(
+            comment.contains("no TLS stream") && comment.contains("no upstream"),
+            "comment carries both strategy errors: {comment}"
         );
     }
 

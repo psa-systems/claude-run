@@ -224,6 +224,66 @@ impl CliBackend {
             .collect()
     }
 
+    /// Parse `fj pr create` stdout (a line containing `pull request #<n>`)
+    /// into a [`PullRequest`]. Shared by the AGit and fallback paths.
+    fn created_pr(stdout: &str) -> PullRequest {
+        let trimmed = stdout.trim();
+        let number = trimmed.split_once('#').and_then(|(_, rest)| {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u64>().ok()
+        });
+        PullRequest {
+            number,
+            url: trimmed.to_string(),
+        }
+    }
+
+    /// CLAUDE-102: PR creation without AGit. Push the working branch with the
+    /// git CLI (`--set-upstream origin HEAD`, same-name remote branch), then
+    /// open the PR over the Forgejo API with `fj pr create`, deriving the title
+    /// and body from the head commit exactly like AGit autofill would (the body
+    /// carries the bare `#<KEY>-N` reference, so YouTrack still links the PR).
+    /// The body travels via a file (fj convention for long bodies), written
+    /// under the workdir with a RELATIVE path so the runner key stays
+    /// deterministic; removed best-effort afterwards.
+    fn create_pr_fallback(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
+        let push_args = ["push", "--set-upstream", "origin", "HEAD"];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &push_args, &[])?;
+        Self::checked("git", out, &push_args)?;
+
+        let title_args = ["log", "-1", "--format=%s"];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &title_args, &[])?;
+        let title = Self::checked("git", out, &title_args)?.trim().to_string();
+
+        let body_args = ["log", "-1", "--format=%b"];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &body_args, &[])?;
+        let body = Self::checked("git", out, &body_args)?.trim().to_string();
+
+        const BODY_FILE: &str = ".claude-run-pr-body.md";
+        std::fs::write(workdir.join(BODY_FILE), &body)?;
+        let create_args = [
+            "--host",
+            host,
+            "pr",
+            "create",
+            title.as_str(),
+            "--body-file",
+            BODY_FILE,
+        ];
+        let res = self
+            .runner
+            .run_in_env(Some(workdir), &self.fj, &create_args, &self.fj_envs())
+            .and_then(|out| Self::checked(&self.fj, out, &create_args));
+        let _ = std::fs::remove_file(workdir.join(BODY_FILE));
+        Ok(Self::created_pr(&res?))
+    }
+
     /// Probe that both CLIs are invokable (`<bin> --version`). Used by the
     /// factory to decide whether this backend is usable. A missing binary
     /// surfaces as [`Error::CliNotFound`].
@@ -416,20 +476,28 @@ impl Forge for CliBackend {
         // Runner-side agit + autofill: fj derives the title/body from the local
         // commit messages, which already carry the bare #<KEY>-N reference.
         let args = ["--host", host, "pr", "create", "-aA"];
-        let out = self
+        let agit_err = match self
             .runner
-            .run_in_env(Some(workdir), &self.fj, &args, &self.fj_envs())?;
-        let stdout = Self::checked(&self.fj, out, &args)?;
-        let trimmed = stdout.trim();
-        // fj prints a line containing `pull request #<n>`; pull the number out.
-        let number = trimmed.split_once('#').and_then(|(_, rest)| {
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            digits.parse::<u64>().ok()
-        });
-        Ok(PullRequest {
-            number,
-            url: trimmed.to_string(),
-        })
+            .run_in_env(Some(workdir), &self.fj, &args, &self.fj_envs())
+            .and_then(|out| Self::checked(&self.fj, out, &args))
+        {
+            Ok(stdout) => return Ok(Self::created_pr(&stdout)),
+            Err(e) => e,
+        };
+
+        // CLAUDE-102: the AGit push runs through fj's bundled libgit2; a build
+        // without TLS support (FJ-38) cannot push over https at all, and the
+        // lone strategy turned that into a lost run. Fall back to the git CLI
+        // (proven https-capable: it performed the clone minutes earlier) plus
+        // the API-side `fj pr create` (reqwest stack, independent of libgit2).
+        warn!(error = %agit_err, "fj AGit PR create failed; falling back to git push + API create");
+        match self.create_pr_fallback(workdir, host) {
+            Ok(pr) => Ok(pr),
+            Err(fallback_err) => Err(Error::PrCreateFailed {
+                agit: agit_err.to_string(),
+                fallback: fallback_err.to_string(),
+            }),
+        }
     }
 
     fn list_open_prs(&self, host: &str, repo: &str) -> Result<Vec<super::ForgePullRequest>> {
@@ -767,17 +835,76 @@ mod tests {
     }
 
     #[test]
-    fn create_pr_failure_is_typed() {
-        let b = backend(StubRunner::new().fail(
-            "fj",
-            &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-            1,
-            "no commits",
-        ));
+    fn create_pr_failure_reports_both_strategies() {
+        // CLAUDE-102: an AGit failure now falls back to git push + API create;
+        // when the push also fails, the typed error carries BOTH causes.
+        let b = backend(
+            StubRunner::new()
+                .fail(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
+                    1,
+                    "there is no TLS stream available; class=Ssl (16)",
+                )
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "HEAD"],
+                    128,
+                    "could not read Username",
+                ),
+        );
         match b.create_pr(Path::new("/tmp/x"), "dev.a8n.run").unwrap_err() {
-            Error::CliFailed { binary, .. } => assert_eq!(binary, "fj"),
-            other => panic!("expected CliFailed, got {other:?}"),
+            Error::PrCreateFailed { agit, fallback } => {
+                assert!(agit.contains("no TLS stream"), "{agit}");
+                assert!(fallback.contains("could not read Username"), "{fallback}");
+            }
+            other => panic!("expected PrCreateFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_pr_falls_back_to_git_push_and_api_create() {
+        // CLAUDE-102: AGit fails (TLS-less libgit2, FJ-38); the fallback pushes
+        // with the git CLI and opens the PR over the API, deriving title/body
+        // from the head commit. The body travels via a workdir-relative file.
+        let wd = tempfile::tempdir().unwrap();
+        let b = backend(
+            StubRunner::new()
+                .fail(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
+                    1,
+                    "there is no TLS stream available; class=Ssl (16)",
+                )
+                .ok("git", &["push", "--set-upstream", "origin", "HEAD"], "")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%s"],
+                    "feat(x): do the thing\n",
+                )
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b"],
+                    "Body of the commit.\n\n#MK-16\n",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "feat(x): do the thing",
+                        "--body-file",
+                        ".claude-run-pr-body.md",
+                    ],
+                    "Created pull request #77\n",
+                ),
+        );
+        let pr = b.create_pr(wd.path(), "dev.a8n.run").unwrap();
+        assert_eq!(pr.number, Some(77));
+        // The body file is cleaned up after the create.
+        assert!(!wd.path().join(".claude-run-pr-body.md").exists());
     }
 
     #[test]
