@@ -35,8 +35,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::action::ClaudeBlock;
+use crate::autofix::{self, AutoFix};
 use crate::cancel::CancellationToken;
 use crate::claude::ClaudeInvoker;
+use crate::config::AutoFixConfig;
 use crate::error::Result;
 
 /// Default cap (bytes) for the log text inlined into the classifier prompt.
@@ -53,6 +55,12 @@ pub enum TriageBucket {
     HumanAction,
     /// Bucket 3: transient / infra / flaky; a retry may simply succeed.
     Transient,
+    /// CLAUDE-104: a mechanically-fixable verification failure (cargo fmt, a
+    /// failing checks workflow). Routes like [`TriageBucket::CodeFix`] (mint a
+    /// queued issue so the runner opens a corrective PR) but applies even when
+    /// there is no open PR and the run is a push to a protected/main branch.
+    /// Set only by the deterministic [`autofix`] detectors, never the LLM.
+    AutoFix,
 }
 
 impl TriageBucket {
@@ -62,6 +70,7 @@ impl TriageBucket {
             TriageBucket::CodeFix => "code_fix",
             TriageBucket::HumanAction => "human_action",
             TriageBucket::Transient => "transient",
+            TriageBucket::AutoFix => "auto_fix",
         }
     }
 }
@@ -80,6 +89,7 @@ impl FromStr for TriageBucket {
             "code_fix" => Ok(TriageBucket::CodeFix),
             "human_action" => Ok(TriageBucket::HumanAction),
             "transient" => Ok(TriageBucket::Transient),
+            "auto_fix" => Ok(TriageBucket::AutoFix),
             other => Err(format!("unknown triage bucket: {other}")),
         }
     }
@@ -104,6 +114,11 @@ pub struct Triage {
     pub analysis: String,
     /// Which pass produced the verdict.
     pub classified_by: ClassifiedBy,
+    /// CLAUDE-104: the auto-fix detail when `bucket == AutoFix`, carried through
+    /// to the mint so the issue summary / description name the concrete problem
+    /// and fix command. `None` for every other bucket.
+    #[serde(default)]
+    pub auto_fix: Option<AutoFix>,
 }
 
 impl Triage {
@@ -112,6 +127,7 @@ impl Triage {
             bucket,
             analysis: analysis.into(),
             classified_by: ClassifiedBy::Rules,
+            auto_fix: None,
         }
     }
 
@@ -120,6 +136,19 @@ impl Triage {
             bucket,
             analysis: analysis.into(),
             classified_by: ClassifiedBy::Llm,
+            auto_fix: None,
+        }
+    }
+
+    /// CLAUDE-104: a deterministic auto-fix verdict carrying its detector detail.
+    /// The analysis mirrors the detector's problem statement so existing
+    /// analysis renderers stay coherent.
+    fn auto_fix(detail: AutoFix) -> Self {
+        Self {
+            bucket: TriageBucket::AutoFix,
+            analysis: detail.problem.clone(),
+            classified_by: ClassifiedBy::Rules,
+            auto_fix: Some(detail),
         }
     }
 }
@@ -241,12 +270,27 @@ pub trait FailureClassifier: Send + Sync {
     fn classify(&self, input: &TriageInput) -> Result<Triage>;
 }
 
-/// Hybrid triage: deterministic rules first, the `classifier` only for the
-/// residue. A classifier error degrades to [`TriageBucket::HumanAction`] (a human
-/// looks) rather than failing the pipeline.
-pub fn triage(input: &TriageInput, classifier: &dyn FailureClassifier) -> Triage {
+/// Hybrid triage: deterministic rules first, then the deterministic auto-fix
+/// detectors, and only then the `classifier` for the residue. A classifier error
+/// degrades to [`TriageBucket::HumanAction`] (a human looks) rather than failing
+/// the pipeline.
+///
+/// CLAUDE-104: the [`autofix`] detectors run AFTER the transient/no-log rules
+/// (so a flaky run of a checks workflow is still classed transient, never
+/// auto-fixed) but BEFORE the LLM. A match short-circuits to
+/// [`TriageBucket::AutoFix`] regardless of `has_open_pr` or push-to-main, so a
+/// mechanically-fixable failure never reaches the classifier prompt that would
+/// label a push-to-main failure `human_action`.
+pub fn triage(
+    input: &TriageInput,
+    classifier: &dyn FailureClassifier,
+    autofix_cfg: &AutoFixConfig,
+) -> Triage {
     if let Some(verdict) = triage_rules(input) {
         return verdict;
+    }
+    if let Some(detail) = autofix::detect(input, autofix_cfg) {
+        return Triage::auto_fix(detail);
     }
     match classifier.classify(input) {
         Ok(verdict) => verdict,
@@ -458,6 +502,14 @@ mod tests {
         }
     }
 
+    /// Default auto-fix config for the hybrid-triage tests. The cargo-fmt
+    /// detector is signature-driven and the checks-workflow list defaults to
+    /// `["check.yml"]`; `input_with_log` uses `ci.yml`, so the existing
+    /// non-auto-fix cases fall through to the classifier unchanged.
+    fn autofix_cfg() -> AutoFixConfig {
+        AutoFixConfig::default()
+    }
+
     // ---- bucket string round-trip ----------------------------------------
 
     #[test]
@@ -466,6 +518,7 @@ mod tests {
             (TriageBucket::CodeFix, "code_fix"),
             (TriageBucket::HumanAction, "human_action"),
             (TriageBucket::Transient, "transient"),
+            (TriageBucket::AutoFix, "auto_fix"),
         ] {
             assert_eq!(bucket.to_string(), s);
             assert_eq!(s.parse::<TriageBucket>().unwrap(), bucket);
@@ -562,7 +615,7 @@ mod tests {
     fn hybrid_short_circuits_a_skipped_job_without_calling_classifier() {
         let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "unused"));
         let log = "Skipping job 'release' due to 'startsWith(github.ref, refs/tags)'";
-        let verdict = triage(&input_with_log(log), &stub);
+        let verdict = triage(&input_with_log(log), &stub, &autofix_cfg());
         assert_eq!(verdict.bucket, TriageBucket::Transient);
         assert_eq!(stub.calls(), 0, "classifier untouched");
     }
@@ -575,7 +628,11 @@ mod tests {
             TriageBucket::CodeFix,
             "the unit test on the PR branch is failing; fix the assertion",
         ));
-        let verdict = triage(&input_with_log("test foo ... FAILED"), &stub);
+        let verdict = triage(
+            &input_with_log("test foo ... FAILED"),
+            &stub,
+            &autofix_cfg(),
+        );
         assert_eq!(verdict.bucket, TriageBucket::CodeFix);
         assert_eq!(verdict.classified_by, ClassifiedBy::Llm);
         assert!(!verdict.analysis.is_empty());
@@ -585,10 +642,88 @@ mod tests {
     #[test]
     fn hybrid_short_circuits_rules_without_calling_classifier() {
         let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "unused"));
-        let verdict = triage(&input_with_log("fatal: connection reset by peer"), &stub);
+        let verdict = triage(
+            &input_with_log("fatal: connection reset by peer"),
+            &stub,
+            &autofix_cfg(),
+        );
         assert_eq!(verdict.bucket, TriageBucket::Transient);
         assert_eq!(verdict.classified_by, ClassifiedBy::Rules);
         assert_eq!(stub.calls(), 0, "the classifier must NOT be consulted");
+    }
+
+    // ---- CLAUDE-104: deterministic auto-fix routing -----------------------
+
+    #[test]
+    fn cargo_fmt_failure_on_push_to_main_routes_to_auto_fix_not_human() {
+        // AC 1 + AC 3: a check.yml run, NO open PR (push to main), failing on
+        // `cargo fmt --check` is routed deterministically to the auto-fix bucket
+        // with no LLM call - it never reaches the classifier that would label a
+        // push-to-main failure human_action.
+        let stub = StubClassifier::new(Triage::llm(TriageBucket::HumanAction, "would be wrong"));
+        let mut input = input_with_log(
+            "Run cargo fmt --check\nDiff in /build/src/main.rs at line 9:\n-let a=1;\n+let a = 1;\n",
+        );
+        input.workflow_id = "check.yml".to_string();
+        input.has_open_pr = false;
+        let verdict = triage(&input, &stub, &autofix_cfg());
+        assert_eq!(verdict.bucket, TriageBucket::AutoFix);
+        assert_eq!(verdict.classified_by, ClassifiedBy::Rules);
+        assert_eq!(stub.calls(), 0, "auto-fix short-circuits before the LLM");
+        let detail = verdict.auto_fix.expect("auto-fix detail carried");
+        assert_eq!(detail.kind, "cargo-fmt");
+        assert_eq!(detail.fix_commands, vec!["cargo fmt --all".to_string()]);
+    }
+
+    #[test]
+    fn check_yml_failure_routes_to_auto_fix_regardless_of_open_pr() {
+        // AC 3: the checks-workflow detector fires for a non-fmt check.yml
+        // failure too, and the routing is identical whether or not a PR is open.
+        let log = "##[group]Clippy\nerror: unused variable\n##[error]the step has failed\n";
+        for has_open_pr in [true, false] {
+            let stub = StubClassifier::new(Triage::llm(TriageBucket::HumanAction, "unused"));
+            let mut input = input_with_log(log);
+            input.workflow_id = "check.yml".to_string();
+            input.has_open_pr = has_open_pr;
+            let verdict = triage(&input, &stub, &autofix_cfg());
+            assert_eq!(
+                verdict.bucket,
+                TriageBucket::AutoFix,
+                "open_pr={has_open_pr}"
+            );
+            assert_eq!(verdict.auto_fix.unwrap().kind, "checks-workflow");
+            assert_eq!(stub.calls(), 0);
+        }
+    }
+
+    #[test]
+    fn transient_check_yml_failure_stays_transient_not_auto_fix() {
+        // A flaky check.yml run (runner offline) must stay transient: the
+        // transient rules run before the auto-fix detectors, so the checks-
+        // workflow detector never claims an infra blip.
+        let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "unused"));
+        let mut input = input_with_log("Error: No runner is available for this job");
+        input.workflow_id = "check.yml".to_string();
+        let verdict = triage(&input, &stub, &autofix_cfg());
+        assert_eq!(verdict.bucket, TriageBucket::Transient);
+        assert!(verdict.auto_fix.is_none());
+        assert_eq!(stub.calls(), 0);
+    }
+
+    #[test]
+    fn disabled_auto_fix_falls_through_to_classifier() {
+        // With the framework off, a cargo-fmt failure is handed to the LLM like
+        // any other non-transient failure (today's behavior).
+        let disabled = AutoFixConfig {
+            enabled: false,
+            ..AutoFixConfig::default()
+        };
+        let stub = StubClassifier::new(Triage::llm(TriageBucket::HumanAction, "human"));
+        let mut input = input_with_log("Run cargo fmt --check\nDiff in src/main.rs at line 1:\n");
+        input.workflow_id = "check.yml".to_string();
+        let verdict = triage(&input, &stub, &disabled);
+        assert_eq!(verdict.bucket, TriageBucket::HumanAction);
+        assert_eq!(stub.calls(), 1, "classifier consulted when auto-fix is off");
     }
 
     // ---- AC 3: log bounding before the LLM call --------------------------

@@ -278,6 +278,13 @@ pub struct MintConfig {
     /// `AI Agent` value set on a bucket-1 (code-fix) issue so the existing
     /// forgejo-ci-fix pickup logic (CLAUDE-29) opens the fix PR. Default `Queued`.
     pub queued_value: String,
+    /// CLAUDE-104: auto-fix framework settings. A nested `[mint]` subsection (so
+    /// it rides the existing DB-backed mint section per CLAUDE-101 rather than
+    /// adding a whole new settings section). When enabled, mechanically-fixable
+    /// CI failures (cargo fmt, a failing checks workflow) are routed
+    /// deterministically to the auto-fix bucket (queued for a corrective PR)
+    /// instead of to a human.
+    pub auto_fix: AutoFixConfig,
 }
 
 impl Default for MintConfig {
@@ -290,6 +297,36 @@ impl Default for MintConfig {
             target_state: "To do".to_string(),
             ai_agent_field: "AI Agent".to_string(),
             queued_value: "Queued".to_string(),
+            auto_fix: AutoFixConfig::default(),
+        }
+    }
+}
+
+/// CLAUDE-104: auto-fix framework configuration, nested under [`MintConfig`].
+///
+/// Detectors in [`crate::autofix`] turn a verification-only CI failure into a
+/// deterministic auto-fix verdict (no LLM call). The `cargo-fmt` detector is
+/// signature-driven and always on while the framework is `enabled`; the
+/// `checks-workflow` detector matches the run's `workflow_id` against
+/// [`AutoFixConfig::checks_workflows`].
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoFixConfig {
+    /// Master enable toggle. When `false`, no detector runs and every failure
+    /// follows the prior transient / code_fix / human_action triage path.
+    pub enabled: bool,
+    /// Workflow filenames whose failures are verification-only (they check code
+    /// rather than produce it) and are therefore mechanically auto-fixable.
+    /// Matched case-insensitively against the run's `workflow_id`. Default
+    /// `["check.yml"]`.
+    pub checks_workflows: Vec<String>,
+}
+
+impl Default for AutoFixConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            checks_workflows: vec!["check.yml".to_string()],
         }
     }
 }
