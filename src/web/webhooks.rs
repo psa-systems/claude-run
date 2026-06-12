@@ -961,7 +961,7 @@ fn decide_mint(
         inner: classifier,
         report: report_stage,
     };
-    let verdict = triage::triage(&input, &reporting);
+    let verdict = triage::triage(&input, &reporting, &mint_cfg.auto_fix);
     report_stage(STAGE_MINTING);
     let req = MintRequest {
         repo: &ev.repo,
@@ -1589,6 +1589,7 @@ mod tests {
                 bucket: self.bucket,
                 analysis: "stub analysis".to_string(),
                 classified_by: ClassifiedBy::Llm,
+                auto_fix: None,
             })
         }
     }
@@ -1847,6 +1848,61 @@ mod tests {
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.contains("AI Agent")), "{calls:?}");
+    }
+
+    #[test]
+    fn cargo_fmt_push_to_main_routes_to_auto_fix_and_queues_without_the_llm() {
+        // CLAUDE-104 end-to-end through decide_mint: a check.yml run with NO open
+        // PR (push to main) failing on `cargo fmt --check` is routed
+        // deterministically to the auto-fix bucket - queued for the runner, no
+        // human assignee - and the LLM classifier (which would say human_action)
+        // is never consulted.
+        let classifier = StubClassifier::new(TriageBucket::HumanAction);
+        let tracker = StubTracker::new();
+        let mut ev = event();
+        ev.workflow_id = "check.yml".to_string();
+        let (bucket, out) = decide_mint(
+            &classifier,
+            &tracker,
+            &mint_cfg(),
+            &route_cache(),
+            &caps(),
+            &ev,
+            "Run cargo fmt --check\nDiff in /build/src/main.rs at line 1:\n".to_string(),
+            true,
+            None,
+            None,
+            false, // has_open_pr: push to main, no PR
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(bucket, TriageBucket::AutoFix);
+        assert!(
+            matches!(
+                out,
+                MintOutcome::Created {
+                    bucket: TriageBucket::AutoFix,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert_eq!(
+            *classifier.calls.lock().unwrap(),
+            0,
+            "auto-fix short-circuits the LLM"
+        );
+        let calls = tracker.calls();
+        assert!(
+            calls.iter().any(|c| c == "create FJ assignee=-"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+            "{calls:?}"
+        );
     }
 
     #[test]

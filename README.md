@@ -235,11 +235,29 @@ The webhook sources and the mint routing are edited on the **Settings** page (th
   "bot_logins": ["claude-run"],
   // OPTIONAL override map, consulted before the VCS lookup. Add an entry only to
   // force a repo to a project that does not own the repo's VCS integration.
-  "repo_project_map": {}
+  "repo_project_map": {},
+  // CLAUDE-104: auto-fix framework. Mechanically-fixable verification failures
+  // (cargo fmt, a failing checks workflow) are routed deterministically to a
+  // corrective PR instead of a human, even on a push to main with no open PR.
+  "auto_fix": {
+    // Master toggle. false disables every detector (failures follow the prior
+    // transient / code_fix / human_action triage).
+    "enabled": true,
+    // Workflow filenames whose failures verify rather than produce code, matched
+    // case-insensitively against the run's workflow_id. The cargo-fmt detector is
+    // signature-driven and always on while enabled, regardless of this list.
+    "checks_workflows": ["check.yml"]
+  }
 }
 ```
 
 An empty / absent `sources` map disables the listener entirely (no endpoints), exactly like the pre-CLAUDE-87 unset `secret_ref`. The mint needs the `yt` (and, for the `has_open_pr` triage signal and the fix PR, `fj`) CLIs on the daemon host. With no usable backend the consumer still ingests and logs failures but mints nothing.
+
+### Auto-fix for mechanically-fixable failures (CLAUDE-104)
+
+Some CI failures are verification-only and have a known, judgement-free fix. The canonical case is `cargo fmt --check`: the fix is `cargo fmt --all`. The general case is any failure of a configured checks workflow (default `check.yml`), whose steps (fmt, clippy, build, tests) check code rather than produce it. The old triage classified a `cargo fmt --check` failure on a push to `main` (no open PR) as `human_action` with a "human must commit the result directly to main" analysis. That is backwards: it manufactures manual toil for a mechanical fix.
+
+The auto-fix framework (the `auto_fix` block in the `mint` settings) adds a deterministic detector layer that runs inside triage AFTER the transient/no-log rules (so a flaky run of a checks workflow stays transient, never auto-fixed) but BEFORE the LLM classifier. Two detectors ship: `cargo-fmt` (matches the rustfmt `Diff in ...` signature, fix `cargo fmt --all`) and `checks-workflow` (matches `workflow_id` against `checks_workflows`, handing the runner the failing step). A match short-circuits to the `auto_fix` triage bucket, which routes exactly like `code_fix` (mint a queued issue, `AI Agent=Queued`, no human assignee) but applies regardless of `has_open_pr` and on a push to a protected/main branch, so it never reaches the classifier prompt that would label it `human_action`. The minted issue's summary (`Auto-fix: cargo fmt on <repo> (run #N, <sha>)`) and description name the concrete problem, the fix command, and the delivery instruction: commit on a fresh `chore/<kind>-<short-sha>` branch and open a PR against `main` via the configured PR strategy (CLAUDE-103), never a direct push to main. The existing `has_open_pr == true` flow is untouched: forgejo-ci-fix (CLAUDE-29) still pushes a corrective commit onto the PR branch. Dedupe markers are unchanged, so repeats of the same `(repo, workflow_id, commit_sha)` still group.
 
 ### Migration from the single-source listener (CLAUDE-87)
 

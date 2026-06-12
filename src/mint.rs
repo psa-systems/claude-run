@@ -127,7 +127,10 @@ struct Route {
 /// `Some` for the two actionable buckets.
 fn route(bucket: TriageBucket) -> Option<Route> {
     match bucket {
-        TriageBucket::CodeFix => Some(Route {
+        // CLAUDE-104: an auto-fix routes exactly like a code-fix - queue for the
+        // runner, no human assignee - but reaches this point even with no open
+        // PR and on a push to main.
+        TriageBucket::CodeFix | TriageBucket::AutoFix => Some(Route {
             queue_for_fix: true,
             assign_human: false,
         }),
@@ -481,12 +484,38 @@ fn find_first(tracker: &dyn IssueTracker, query: &str) -> Result<Option<String>>
 }
 
 /// Short issue summary. The bare run metadata; the body carries the analysis.
+/// CLAUDE-104: an auto-fix failure gets a directive summary naming the concrete
+/// problem (`Auto-fix: cargo fmt on ...`) instead of the generic `CI failure`.
 fn build_summary(req: &MintRequest) -> String {
-    let short_sha = req.commit_sha.chars().take(8).collect::<String>();
-    format!(
-        "CI failure: {} on {} (run #{}, {})",
-        req.workflow_id, req.repo, req.index_in_repo, short_sha
-    )
+    let short_sha = short_sha(req.commit_sha);
+    match &req.triage.auto_fix {
+        Some(detail) => {
+            let label = autofix_label(detail, req.workflow_id);
+            format!(
+                "Auto-fix: {} on {} (run #{}, {})",
+                label, req.repo, req.index_in_repo, short_sha
+            )
+        }
+        None => format!(
+            "CI failure: {} on {} (run #{}, {})",
+            req.workflow_id, req.repo, req.index_in_repo, short_sha
+        ),
+    }
+}
+
+/// First 8 chars of a commit SHA, the short form used throughout the issue body.
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(8).collect()
+}
+
+/// Human label for an auto-fix in the summary: the precise `cargo fmt` for the
+/// cargo-fmt detector, else the failing workflow filename.
+fn autofix_label<'a>(detail: &'a crate::autofix::AutoFix, workflow_id: &'a str) -> &'a str {
+    if detail.kind == "cargo-fmt" {
+        "cargo fmt"
+    } else {
+        workflow_id
+    }
 }
 
 /// Markdown issue body: the triage analysis, the run metadata, and the hidden
@@ -500,6 +529,12 @@ fn build_description(
     secondary: &str,
     group: Option<&str>,
 ) -> String {
+    // CLAUDE-104: an auto-fix failure gets an implementation-spec body (concrete
+    // problem, fix command, new-branch + PR-vs-main delivery instruction) with
+    // no "human must commit directly to main" wording.
+    if let Some(detail) = &req.triage.auto_fix {
+        return build_auto_fix_description(req, detail, primary, secondary, group);
+    }
     let attached = if req.log_path.is_some() {
         "The redacted failing-job log is attached to this issue."
     } else {
@@ -530,6 +565,80 @@ fn build_description(
         dedupe_keys,
     ]
     .join("\n")
+}
+
+/// CLAUDE-104: the implementation-spec body for an auto-fixable failure. Names
+/// the concrete problem and the fix command(s), instructs the runner to deliver
+/// the fix on a fresh `chore/<kind>-<short-sha>` branch via a PR against `main`
+/// (never a direct push to main), and carries the same dedupe markers as the
+/// generic body so repeats still group.
+fn build_auto_fix_description(
+    req: &MintRequest,
+    detail: &crate::autofix::AutoFix,
+    primary: &str,
+    secondary: &str,
+    group: Option<&str>,
+) -> String {
+    let short = short_sha(req.commit_sha);
+    let branch = format!("chore/{}-{}", detail.kind, short);
+    let attached = if req.log_path.is_some() {
+        "The redacted failing-job log is attached to this issue."
+    } else {
+        "No job log was attached."
+    };
+    let dedupe_keys = match group {
+        Some(group) => format!("Dedupe-Key: {primary} {secondary} {group}"),
+        None => format!("Dedupe-Key: {primary} {secondary}"),
+    };
+
+    // Fix step: the concrete command(s) when the detector knows them, else a
+    // reproduce-and-fix instruction for the generic checks-workflow case.
+    let fix_lines: Vec<String> = if detail.fix_commands.is_empty() {
+        vec![format!(
+            "- Reproduce the `{}` checks locally and fix every issue it reports.",
+            req.workflow_id
+        )]
+    } else {
+        detail
+            .fix_commands
+            .iter()
+            .map(|c| format!("- Run `{c}`."))
+            .collect()
+    };
+
+    let mut lines = vec![
+        "## Auto-fix".to_string(),
+        format!(
+            "This is a mechanically-fixable verification failure (detector `{}`); it is auto-worked into a corrective PR rather than routed to a human.",
+            detail.kind
+        ),
+        String::new(),
+        "## Problem".to_string(),
+        detail.problem.clone(),
+    ];
+    if let Some(scope) = &detail.scope {
+        lines.push(format!("Failing step: `{scope}`."));
+    }
+    lines.push(String::new());
+    lines.push("## Fix".to_string());
+    lines.extend(fix_lines);
+    lines.push(String::new());
+    lines.push("## Delivery".to_string());
+    lines.push(format!(
+        "Commit the fix on a fresh branch named `{branch}` and open a pull request against `main` using the configured PR strategy. Do not push to `main` directly."
+    ));
+    lines.push(String::new());
+    lines.push("## Failure".to_string());
+    lines.push(format!("- Repo: `{}`", req.repo));
+    lines.push(format!("- Workflow: `{}`", req.workflow_id));
+    lines.push(format!("- Commit: `{}`", req.commit_sha));
+    lines.push(format!("- Run: {}", req.html_url));
+    lines.push(String::new());
+    lines.push(attached.to_string());
+    lines.push(String::new());
+    lines.push("<!-- claude-run dedupe markers; do not edit -->".to_string());
+    lines.push(dedupe_keys);
+    lines.join("\n")
 }
 
 /// CLAUDE-100: the comment posted onto an existing open issue when a private
@@ -713,6 +822,27 @@ mod tests {
             bucket,
             analysis: "root cause and next step".to_string(),
             classified_by: ClassifiedBy::Llm,
+            auto_fix: None,
+        }
+    }
+
+    /// CLAUDE-104: an auto-fix triage verdict carrying detector detail.
+    fn auto_fix_triage(detail: crate::autofix::AutoFix) -> Triage {
+        Triage {
+            bucket: TriageBucket::AutoFix,
+            analysis: detail.problem.clone(),
+            classified_by: ClassifiedBy::Rules,
+            auto_fix: Some(detail),
+        }
+    }
+
+    fn cargo_fmt_detail() -> crate::autofix::AutoFix {
+        crate::autofix::AutoFix {
+            kind: "cargo-fmt".to_string(),
+            problem: "rustfmt found unformatted code: `cargo fmt --check` reported diffs."
+                .to_string(),
+            fix_commands: vec!["cargo fmt --all".to_string()],
+            scope: None,
         }
     }
 
@@ -746,6 +876,14 @@ mod tests {
             Some(Route {
                 queue_for_fix: false,
                 assign_human: true
+            })
+        );
+        // CLAUDE-104: an auto-fix routes like a code-fix (queued, no human).
+        assert_eq!(
+            route(TriageBucket::AutoFix),
+            Some(Route {
+                queue_for_fix: true,
+                assign_human: false
             })
         );
         assert_eq!(route(TriageBucket::Transient), None);
@@ -1230,5 +1368,109 @@ mod tests {
         let calls = tracker.calls();
         assert!(!calls.iter().any(|c| c.starts_with("comment")), "{calls:?}");
         assert!(!calls.iter().any(|c| c.starts_with("create")), "{calls:?}");
+    }
+
+    // ---- CLAUDE-104: auto-fix minting -------------------------------------
+
+    #[test]
+    fn auto_fix_creates_a_queued_issue_with_no_human_assignee() {
+        // The auto-fix bucket mints and queues for the runner exactly like a
+        // code-fix, even though the canonical case has no open PR / is a push to
+        // main; no human is assigned.
+        let t = auto_fix_triage(cargo_fmt_detail());
+        let tracker = StubTracker::new();
+        let out = mint(
+            &tracker,
+            &cfg(),
+            &route_cache(),
+            &req("fabrikam/forgejo-cli", &t, "alice"),
+            &caps(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            MintOutcome::Created {
+                key: "CLAUDE-99".to_string(),
+                project: "FJ".to_string(),
+                bucket: TriageBucket::AutoFix,
+                source: RouteSource::Override,
+            }
+        );
+        let calls = tracker.calls();
+        assert!(calls.iter().any(|c| c.contains("assignee=-")), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn auto_fix_summary_names_the_concrete_problem() {
+        // AC 4: an `Auto-fix: cargo fmt on ...` summary, not the generic
+        // `CI failure` template.
+        let t = auto_fix_triage(cargo_fmt_detail());
+        let r = req("contoso/claude-run", &t, "alice");
+        let summary = build_summary(&r);
+        assert_eq!(
+            summary,
+            "Auto-fix: cargo fmt on contoso/claude-run (run #7, abc123de)"
+        );
+        // A non-auto-fix bucket keeps the generic summary.
+        let plain = triage(TriageBucket::CodeFix);
+        let pr = req("contoso/claude-run", &plain, "alice");
+        assert!(build_summary(&pr).starts_with("CI failure: ci.yml"));
+    }
+
+    #[test]
+    fn auto_fix_description_states_fix_command_and_pr_delivery() {
+        // AC 4: the body names the fix command and the open-a-PR-vs-main
+        // delivery, on a `chore/cargo-fmt-<short-sha>` branch, with no
+        // "human must commit directly to main" wording.
+        let t = auto_fix_triage(cargo_fmt_detail());
+        let r = req("contoso/claude-run", &t, "alice");
+        let primary = primary_marker(&r);
+        let secondary = secondary_marker(&r);
+        let body = build_description(&r, &primary, &secondary, None);
+        assert!(body.contains("cargo fmt --all"), "fix command: {body}");
+        assert!(
+            body.contains("chore/cargo-fmt-abc123de"),
+            "branch name: {body}"
+        );
+        assert!(
+            body.contains("open a pull request against `main`"),
+            "PR delivery: {body}"
+        );
+        assert!(
+            body.contains("Do not push to `main` directly."),
+            "no-direct-push: {body}"
+        );
+        assert!(
+            !body.to_lowercase().contains("human must commit"),
+            "no human-must-commit wording: {body}"
+        );
+        // The dedupe markers still ride the body so repeats group (AC 7).
+        assert!(body.contains(&primary) && body.contains(&secondary));
+    }
+
+    #[test]
+    fn auto_fix_description_handles_a_checks_workflow_without_fix_commands() {
+        // The generic checks-workflow detector carries no fix command, so the
+        // body instructs a reproduce-and-fix and uses the workflow-kind branch.
+        let detail = crate::autofix::AutoFix {
+            kind: "checks-workflow".to_string(),
+            problem: "the `check.yml` checks workflow failed at step `Clippy`; ...".to_string(),
+            fix_commands: Vec::new(),
+            scope: Some("Clippy".to_string()),
+        };
+        let t = auto_fix_triage(detail);
+        let r = req("contoso/claude-run", &t, "alice");
+        let primary = primary_marker(&r);
+        let secondary = secondary_marker(&r);
+        let body = build_description(&r, &primary, &secondary, None);
+        assert!(body.contains("Reproduce the `ci.yml` checks"), "{body}");
+        assert!(body.contains("chore/checks-workflow-abc123de"), "{body}");
+        assert!(body.contains("Failing step: `Clippy`."), "{body}");
     }
 }
