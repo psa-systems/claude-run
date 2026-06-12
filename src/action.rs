@@ -230,6 +230,49 @@ impl Default for YoutrackStates {
     }
 }
 
+/// How the runner opens the PR for a worked Forgejo issue (CLAUDE-103).
+///
+/// `Branch` (the default) pushes a real server branch with the git CLI
+/// (`git push --set-upstream origin HEAD`) and opens the PR over the API, so
+/// Forgejo can always offer "Update Branch" and the PR stays mergeable.
+/// `Agit` runs `fj pr create -aA`, which creates a branchless PR whose head
+/// lives only at `refs/pull/<N>/head`; such a PR loses its merge button the
+/// moment it falls behind a base that requires an up-to-date branch. AGit is
+/// kept as an explicit opt-in, never a silent fallback (the selected strategy
+/// is authoritative).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrStrategy {
+    /// Push a real server branch, open the PR over the API. Always mergeable
+    /// and updatable. The safe default.
+    #[default]
+    Branch,
+    /// `fj pr create -aA`: branchless AGit PR. Opt-in; see the type docs for
+    /// the merge-button footgun.
+    Agit,
+}
+
+impl PrStrategy {
+    /// The kebab-case wire / web-form value (`"branch"` / `"agit"`), matching
+    /// the serde `rename_all` encoding.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PrStrategy::Branch => "branch",
+            PrStrategy::Agit => "agit",
+        }
+    }
+
+    /// Parse a web-form value into a strategy. An empty or unrecognized value
+    /// falls back to the safe default ([`PrStrategy::Branch`]), so a malformed
+    /// POST can never silently select the AGit footgun.
+    pub fn from_form_value(s: &str) -> Self {
+        match s {
+            "agit" => PrStrategy::Agit,
+            _ => PrStrategy::Branch,
+        }
+    }
+}
+
 /// Forgejo-side settings for the native handler.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -241,6 +284,10 @@ pub struct ForgejoTarget {
     /// `None` uses host `fj` auth. The raw token is never stored here; it is
     /// resolved from the [`crate::secrets`] store and injected at run time.
     pub token_ref: Option<String>,
+    /// PR-creation strategy (CLAUDE-103). Omitted deserializes to
+    /// [`PrStrategy::Branch`], so existing action files get the safe,
+    /// always-mergeable behavior with no migration.
+    pub pr_strategy: PrStrategy,
 }
 
 /// GitHub-side settings for the native handler (CLAUDE-50). A job whose
@@ -550,6 +597,9 @@ post:
         assert!(cfg.youtrack.token_ref.is_none());
         assert!(cfg.forgejo.base_url.is_none());
         assert!(cfg.forgejo.token_ref.is_none());
+        // CLAUDE-103: an omitted pr_strategy deserializes to the safe,
+        // always-mergeable branch-backed strategy, so no migration is needed.
+        assert_eq!(cfg.forgejo.pr_strategy, PrStrategy::Branch);
         // CLAUDE-50: the github block defaults to the hosted MCP endpoint, no
         // extra hosts, and host gh auth (no token_ref).
         assert!(cfg.github.hosts.is_empty());
@@ -558,6 +608,31 @@ post:
             "https://api.githubcopilot.com/mcp/"
         );
         assert!(cfg.github.token_ref.is_none());
+    }
+
+    #[test]
+    fn native_config_parses_forgejo_pr_strategy() {
+        // CLAUDE-103: an explicit `pr_strategy: agit` selects the AGit strategy;
+        // the kebab-case value matches the serde encoding, and an unknown value
+        // is rejected by `deny_unknown_fields` semantics on the enum.
+        let raw = "\
+name: yt
+kind: youtrack
+native:
+  forgejo:
+    pr_strategy: agit
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert_eq!(cfg.forgejo.pr_strategy, PrStrategy::Agit);
+
+        let bogus = raw.replace("agit", "rebase-magic");
+        assert!(matches!(
+            validate_str(&bogus, "<candidate>").unwrap_err(),
+            Error::Yaml(_)
+        ));
     }
 
     #[test]

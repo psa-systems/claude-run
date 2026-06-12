@@ -72,12 +72,6 @@ pub enum Error {
         source: serde_json::Error,
     },
 
-    /// CLAUDE-102: both PR-creation strategies failed; carries both errors so
-    /// the finalize comment and journal name the AGit attempt and the
-    /// git-push fallback.
-    #[error("PR creation failed: AGit attempt: {agit}; git-push fallback: {fallback}")]
-    PrCreateFailed { agit: String, fallback: String },
-
     #[error("no enabled VCS integration for project `{0}`")]
     NoVcsIntegration(String),
 

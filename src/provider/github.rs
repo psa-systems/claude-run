@@ -334,8 +334,15 @@ impl GithubForge {
 }
 
 impl Forge for GithubForge {
-    fn create_pr(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
-        // GitHub has no AGit equivalent: push the branch before opening the PR.
+    fn create_pr(
+        &self,
+        workdir: &Path,
+        host: &str,
+        _strategy: crate::action::PrStrategy,
+    ) -> Result<PullRequest> {
+        // GitHub has no AGit equivalent: PRs are always branch-backed, so the
+        // CLAUDE-103 strategy selector does not apply here and is ignored.
+        // Push the branch before opening the PR.
         let repo = parse_owner_repo(&self.git(workdir, &["remote", "get-url", "origin"])?)
             .ok_or_else(|| {
                 Error::Other(anyhow::anyhow!(
@@ -633,7 +640,13 @@ mod tests {
             "https://api.githubcopilot.com/mcp/".into(),
             None,
         );
-        let pr = forge.create_pr(Path::new("/tmp/wd"), "github.com").unwrap();
+        let pr = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
         assert_eq!(pr.number, Some(11));
         assert_eq!(pr.url, "https://github.com/octo/widget/pull/11");
         let tcalls = transport.calls.lock().unwrap();
@@ -679,7 +692,13 @@ mod tests {
             "https://api.githubcopilot.com/mcp/".into(),
             None,
         );
-        let pr = forge.create_pr(Path::new("/tmp/wd"), "github.com").unwrap();
+        let pr = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
         assert_eq!(pr.number, Some(5));
         assert_eq!(pr.url, "https://github.com/octo/widget/pull/5");
         let calls = runner.calls.lock().unwrap();
@@ -701,7 +720,11 @@ mod tests {
             None,
         );
         match forge
-            .create_pr(Path::new("/tmp/wd"), "github.com")
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
             .unwrap_err()
         {
             Error::NoBackend(tried) => {
@@ -727,7 +750,13 @@ mod tests {
             "https://api.githubcopilot.com/mcp/".into(),
             Some("ghp_secret".into()),
         );
-        forge.create_pr(Path::new("/tmp/wd"), "github.com").unwrap();
+        forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls.iter().any(|c| c

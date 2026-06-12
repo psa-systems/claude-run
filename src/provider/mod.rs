@@ -147,10 +147,18 @@ pub trait IssueTracker: Send + Sync {
 
 /// The Forgejo-side operations native handlers need.
 pub trait Forge: Send + Sync {
-    /// Open a PR from the local commits in `workdir` against `host`, the
-    /// runner-side `fj --host <host> pr create -aA` (agit + autofill). Returns
-    /// the parsed PR number and URL.
-    fn create_pr(&self, workdir: &std::path::Path, host: &str) -> Result<PullRequest>;
+    /// Open a PR from the local commits in `workdir` against `host`. `strategy`
+    /// (CLAUDE-103) selects branch-backed (push a real server branch, open via
+    /// the API) or AGit (`fj --host <host> pr create -aA`); the selected
+    /// strategy is authoritative, with no silent cross-strategy fallback that
+    /// changes whether a server branch is produced. Returns the parsed PR
+    /// number and URL.
+    fn create_pr(
+        &self,
+        workdir: &std::path::Path,
+        host: &str,
+        strategy: crate::action::PrStrategy,
+    ) -> Result<PullRequest>;
 
     /// Resolve an authenticated clone URL for `repo` on `host` using the forge
     /// CLI's stored credentials (no token in YAML or env). `repo` is the

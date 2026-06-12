@@ -95,6 +95,10 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         }
     };
 
+    // CLAUDE-103: capture the configured PR-creation strategy before the inner
+    // loop shadows `forge` with the resolved `&dyn Forge`. `PrStrategy` is Copy.
+    let pr_strategy = forge.pr_strategy;
+
     let defaults = RunnerDefaults::default();
     let limits = job::effective_limits(&defaults, loaded);
 
@@ -242,6 +246,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 &limits,
                 &job_cancel,
                 &job,
+                pr_strategy,
             )
             .await;
             if let Err(e) = state::run_inflight_remove(&pool, run_id, &job.key).await {
@@ -407,6 +412,7 @@ async fn process_job(
     limits: &EffectiveLimits,
     cancel: &CancellationToken,
     job: &YoutrackJob,
+    pr_strategy: crate::action::PrStrategy,
 ) -> Result<ProcessedJob> {
     let started = Instant::now();
     let action = &loaded.action;
@@ -515,7 +521,15 @@ async fn process_job(
     }
 
     // ---- finalize (the native "post"): every external mutation lives here ----
-    let finalize_res = finalize(backend, forge, src, job, &workdir_path, &claude_result);
+    let finalize_res = finalize(
+        backend,
+        forge,
+        src,
+        job,
+        &workdir_path,
+        &claude_result,
+        pr_strategy,
+    );
     let post_failed = match &finalize_res {
         Ok(Finalized::CodeReview { pr_url }) => {
             info!(action = %action.name, key = %key, pr_url = %pr_url, "finalized: Code Review");
@@ -700,6 +714,7 @@ fn finalize(
     job: &YoutrackJob,
     workdir: &Path,
     claude_result: &ClaudeResult,
+    pr_strategy: crate::action::PrStrategy,
 ) -> Result<Finalized> {
     let needs_review = workdir.join(NEEDS_REVIEW_MARKER);
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
@@ -720,7 +735,7 @@ fn finalize(
         // from the commit messages, which already carry the bare #<KEY>-N
         // reference.
         let host = host_only(&job.repo_host);
-        match forge.create_pr(workdir, &host) {
+        match forge.create_pr(workdir, &host, pr_strategy) {
             Ok(pr) => {
                 let url = pr_url(job, &pr);
                 let body = success_comment(claude_result, &url);
@@ -1022,6 +1037,7 @@ fn preserve_aside(workdir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::PrStrategy;
     use crate::provider::cli::testutil::StubRunner;
     use crate::provider::CliBackend;
     use serde_json::Value;
@@ -1187,6 +1203,7 @@ mod tests {
             &job(),
             wd,
             &ClaudeResult::synthesized("e", "s"),
+            PrStrategy::Branch,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -1204,7 +1221,73 @@ mod tests {
     }
 
     #[test]
-    fn finalize_success_creates_pr_and_sets_code_review() {
+    fn finalize_success_branch_strategy_creates_pr_and_sets_code_review() {
+        // CLAUDE-103 default: the branch strategy pushes a real server branch and
+        // opens the PR via the API; `-aA` is never invoked.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("git", &["push", "--set-upstream", "origin", "HEAD"], "")
+                .ok("git", &["log", "-1", "--format=%s"], "feat: x\n")
+                .ok("git", &["log", "-1", "--format=%b"], "body\n\n#MK-16\n")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "feat: x",
+                        "--body-file",
+                        ".claude-run-pr-body.md",
+                    ],
+                    "Created pull request #7",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into()
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin HEAD"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("-aA")),
+            "branch strategy must never invoke -aA: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Code Review"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_success_agit_strategy_creates_pr_and_sets_code_review() {
+        // CLAUDE-103 opt-in: the AGit strategy invokes `fj pr create -aA`.
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(
             StubRunner::new()
@@ -1220,7 +1303,16 @@ mod tests {
                 ),
         );
         let backend = CliBackend::new(runner.clone());
-        let res = finalize(&backend, &backend, &src(), &job(), dir.path(), &ok_result()).unwrap();
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Agit,
+        )
+        .unwrap();
         assert_eq!(
             res,
             Finalized::CodeReview {
@@ -1233,6 +1325,10 @@ mod tests {
                 .iter()
                 .any(|c| c == "fj --host dev.a8n.run pr create -aA"),
             "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "agit must not push a branch: {calls:?}"
         );
         assert!(
             calls
@@ -1316,19 +1412,15 @@ mod tests {
 
     #[test]
     fn finalize_pr_failure_preserves_and_names_the_workdir() {
-        // The CLAUDE-101 incident shape: claude succeeded, both PR strategies
-        // fail; finalize must mark Failed AND point at the preserved workdir in
-        // the comment instead of letting the commits be destroyed.
+        // The CLAUDE-101 incident shape: claude succeeded, the selected (branch)
+        // strategy fails; finalize must mark Failed, error loudly with the
+        // underlying git-push error, and point at the preserved workdir in the
+        // comment instead of letting the commits be destroyed. CLAUDE-103: no
+        // silent fallback to AGit.
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
         let runner = Arc::new(
             StubRunner::new()
-                .fail(
-                    "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-                    1,
-                    "there is no TLS stream available; class=Ssl (16)",
-                )
                 .fail(
                     "git",
                     &["push", "--set-upstream", "origin", "HEAD"],
@@ -1342,7 +1434,16 @@ mod tests {
                 ),
         );
         let backend = CliBackend::new(runner.clone());
-        let res = finalize(&backend, &backend, &src(), &job(), dir.path(), &ok_result()).unwrap();
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+        )
+        .unwrap();
         assert_eq!(res, Finalized::Failed);
         assert!(dir.path().exists(), "workdir survives the failed finalize");
         let calls = runner.calls.lock().unwrap();
@@ -1356,8 +1457,13 @@ mod tests {
             "comment names the preserved path: {comment}"
         );
         assert!(
-            comment.contains("no TLS stream") && comment.contains("no upstream"),
-            "comment carries both strategy errors: {comment}"
+            comment.contains("no upstream"),
+            "comment carries the underlying push error: {comment}"
+        );
+        // No silent fallback to AGit.
+        assert!(
+            !calls.iter().any(|c| c.contains("-aA")),
+            "branch failure must not fall back to AGit: {calls:?}"
         );
     }
 
@@ -1432,7 +1538,16 @@ mod tests {
             None,
         );
         let dir = tempfile::tempdir().unwrap();
-        let res = finalize(&tracker, &forge, &src(), &gh_job, dir.path(), &ok_result()).unwrap();
+        let res = finalize(
+            &tracker,
+            &forge,
+            &src(),
+            &gh_job,
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+        )
+        .unwrap();
         assert_eq!(
             res,
             Finalized::CodeReview {
@@ -1483,7 +1598,16 @@ mod tests {
                 ),
         );
         let backend = CliBackend::new(runner.clone());
-        let res = finalize(&backend, &backend, &s, &job(), dir.path(), &ok_result()).unwrap();
+        let res = finalize(
+            &backend,
+            &backend,
+            &s,
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Agit,
+        )
+        .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
         let calls = runner.calls.lock().unwrap();
         assert!(
@@ -1496,6 +1620,7 @@ mod tests {
 
     #[test]
     fn finalize_pr_create_failure_sets_failed() {
+        // AGit strategy whose `fj pr create -aA` fails finalizes as Failed.
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(
             StubRunner::new()
@@ -1512,7 +1637,16 @@ mod tests {
                 ),
         );
         let backend = CliBackend::new(runner.clone());
-        let res = finalize(&backend, &backend, &src(), &job(), dir.path(), &ok_result()).unwrap();
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Agit,
+        )
+        .unwrap();
         assert_eq!(res, Finalized::Failed);
         let calls = runner.calls.lock().unwrap();
         assert!(
@@ -1534,7 +1668,16 @@ mod tests {
         let backend = CliBackend::new(runner.clone());
         // FJMCP-6 case: claude errored on the job.
         let claude = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "error tail");
-        let res = finalize(&backend, &backend, &src(), &job(), dir.path(), &claude).unwrap();
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &claude,
+            PrStrategy::Branch,
+        )
+        .unwrap();
         assert_eq!(res, Finalized::Failed);
         let calls = runner.calls.lock().unwrap();
         assert!(
@@ -1572,6 +1715,7 @@ mod tests {
             &job(),
             dir.path(),
             &timed_out_result(),
+            PrStrategy::Branch,
         )
         .unwrap();
         assert_eq!(res, Finalized::TimedOut);
@@ -1611,6 +1755,7 @@ mod tests {
             &job(),
             dir.path(),
             &timed_out_result(),
+            PrStrategy::Branch,
         )
         .unwrap();
         assert_eq!(res, Finalized::TimedOut);

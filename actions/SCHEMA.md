@@ -136,6 +136,7 @@ native:
   forgejo:
     base_url: https://forge.example       # optional; default derives host per issue VCS
     token_ref: fj-prod                    # optional; name of an encrypted secret
+    pr_strategy: branch                   # optional; branch (default) | agit
   github:                                 # optional; all fields default
     hosts:                                # extra GitHub hosts beyond github.com (GHE)
       - ghe.example.com
@@ -152,6 +153,7 @@ native:
 | `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value.                                    |
 | `forgejo.base_url`      | per-issue VCS host                 | Forgejo base URL.                                                                                   |
 | `forgejo.token_ref`     | none                               | Name of an encrypted secret holding the Forgejo API token (CLAUDE-26). `None` uses host `fj` auth.  |
+| `forgejo.pr_strategy`   | `branch`                           | PR-creation strategy (CLAUDE-103). `branch`: push a real server branch (`git push --set-upstream origin HEAD`) and open the PR over the API, so the PR stays mergeable and updatable. `agit`: `fj pr create -aA`, a branchless PR whose head lives only at `refs/pull/<N>/head` and loses its merge button if it falls behind an up-to-date base. The selected strategy is authoritative (no silent cross-strategy fallback). |
 | `github.hosts`          | empty                              | Extra GitHub host(s) beyond `github.com` to treat as GitHub (e.g. GitHub Enterprise). Bare hosts.   |
 | `github.mcp_endpoint`   | `https://api.githubcopilot.com/mcp/` | Remote GitHub MCP endpoint used to open the PR (no local server to install).                      |
 | `github.token_ref`      | none                               | Name of an encrypted secret holding the GitHub PAT (CLAUDE-26). `None` uses host `gh` auth / `GH_TOKEN`. |
