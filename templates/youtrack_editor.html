@@ -105,7 +105,15 @@
     <div class="grid2">
       {% call textfield("Base URL", "fj_base_url", form.fj_base_url, "blank = derive from each issue's VCS") %}
       {% call tokenfield("Token secret", "fj_token_ref", form.fj_token_ref) %}
+      <label class="fld">
+        <span>PR strategy</span>
+        <select name="fj_pr_strategy">
+          <option value="branch"{% if form.fj_pr_strategy.as_str() != "agit" %} selected{% endif %}>branch-backed (recommended)</option>
+          <option value="agit"{% if form.fj_pr_strategy.as_str() == "agit" %} selected{% endif %}>AGit (branchless)</option>
+        </select>
+      </label>
     </div>
+    <p class="hint dim">Branch-backed pushes a real server branch and opens the PR via the API, so Forgejo can always offer "Update Branch" and the PR stays mergeable. AGit creates PRs with no server branch: if such a PR falls behind a base that requires an up-to-date branch, Forgejo cannot offer "Update Branch" and the merge button disappears. Prefer branch-backed.</p>
   </div>
 
   <div class="card">

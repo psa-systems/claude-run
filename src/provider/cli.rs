@@ -238,15 +238,16 @@ impl CliBackend {
         }
     }
 
-    /// CLAUDE-102: PR creation without AGit. Push the working branch with the
-    /// git CLI (`--set-upstream origin HEAD`, same-name remote branch), then
-    /// open the PR over the Forgejo API with `fj pr create`, deriving the title
-    /// and body from the head commit exactly like AGit autofill would (the body
-    /// carries the bare `#<KEY>-N` reference, so YouTrack still links the PR).
-    /// The body travels via a file (fj convention for long bodies), written
-    /// under the workdir with a RELATIVE path so the runner key stays
-    /// deterministic; removed best-effort afterwards.
-    fn create_pr_fallback(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
+    /// Branch-backed PR creation (CLAUDE-103 default, originally the CLAUDE-102
+    /// fallback). Push the working branch with the git CLI (`--set-upstream
+    /// origin HEAD`, same-name remote branch), then open the PR over the Forgejo
+    /// API with `fj pr create`, deriving the title and body from the head commit
+    /// exactly like AGit autofill would (the body carries the bare `#<KEY>-N`
+    /// reference, so YouTrack still links the PR). The body travels via a file
+    /// (fj convention for long bodies), written under the workdir with a
+    /// RELATIVE path so the runner key stays deterministic; removed best-effort
+    /// afterwards. The head is `refs/heads/<branch>`, never `refs/pull/<N>/head`.
+    fn create_pr_branch(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
         let push_args = ["push", "--set-upstream", "origin", "HEAD"];
         let out = self
             .runner
@@ -282,6 +283,20 @@ impl CliBackend {
             .and_then(|out| Self::checked(&self.fj, out, &create_args));
         let _ = std::fs::remove_file(workdir.join(BODY_FILE));
         Ok(Self::created_pr(&res?))
+    }
+
+    /// CLAUDE-103 opt-in: AGit + autofill (`fj --host <host> pr create -aA`).
+    /// fj pushes the local commits to `refs/for/<base>` and opens a branchless
+    /// PR (head at `refs/pull/<N>/head`), deriving the title/body from the
+    /// commit messages. No server branch is produced. A failure errors loudly;
+    /// there is no silent switch to the branch path.
+    fn create_pr_agit(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
+        let args = ["--host", host, "pr", "create", "-aA"];
+        let stdout = self
+            .runner
+            .run_in_env(Some(workdir), &self.fj, &args, &self.fj_envs())
+            .and_then(|out| Self::checked(&self.fj, out, &args))?;
+        Ok(Self::created_pr(&stdout))
     }
 
     /// Probe that both CLIs are invokable (`<bin> --version`). Used by the
@@ -472,31 +487,26 @@ impl IssueTracker for CliBackend {
 }
 
 impl Forge for CliBackend {
-    fn create_pr(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
-        // Runner-side agit + autofill: fj derives the title/body from the local
-        // commit messages, which already carry the bare #<KEY>-N reference.
-        let args = ["--host", host, "pr", "create", "-aA"];
-        let agit_err = match self
-            .runner
-            .run_in_env(Some(workdir), &self.fj, &args, &self.fj_envs())
-            .and_then(|out| Self::checked(&self.fj, out, &args))
-        {
-            Ok(stdout) => return Ok(Self::created_pr(&stdout)),
-            Err(e) => e,
-        };
-
-        // CLAUDE-102: the AGit push runs through fj's bundled libgit2; a build
-        // without TLS support (FJ-38) cannot push over https at all, and the
-        // lone strategy turned that into a lost run. Fall back to the git CLI
-        // (proven https-capable: it performed the clone minutes earlier) plus
-        // the API-side `fj pr create` (reqwest stack, independent of libgit2).
-        warn!(error = %agit_err, "fj AGit PR create failed; falling back to git push + API create");
-        match self.create_pr_fallback(workdir, host) {
-            Ok(pr) => Ok(pr),
-            Err(fallback_err) => Err(Error::PrCreateFailed {
-                agit: agit_err.to_string(),
-                fallback: fallback_err.to_string(),
-            }),
+    fn create_pr(
+        &self,
+        workdir: &Path,
+        host: &str,
+        strategy: crate::action::PrStrategy,
+    ) -> Result<PullRequest> {
+        use crate::action::PrStrategy;
+        match strategy {
+            // CLAUDE-103 default: push a real server branch with the git CLI
+            // (proven https-capable, it performed the clone) and open the PR
+            // over the API. The resulting head is `refs/heads/<branch>`, so
+            // Forgejo can always "Update Branch" and the PR stays mergeable.
+            // The selected strategy is authoritative: a failure errors loudly
+            // (the finalize step preserves the workdir) rather than silently
+            // emitting a branchless AGit PR.
+            PrStrategy::Branch => self.create_pr_branch(workdir, host),
+            // Opt-in AGit + autofill: fj derives the title/body from the local
+            // commit messages, which already carry the bare #<KEY>-N reference.
+            // No server branch (head lives only at `refs/pull/<N>/head`).
+            PrStrategy::Agit => self.create_pr_agit(workdir, host),
         }
     }
 
@@ -676,6 +686,7 @@ pub mod testutil {
 mod tests {
     use super::testutil::StubRunner;
     use super::*;
+    use crate::action::PrStrategy;
 
     fn backend(runner: StubRunner) -> CliBackend {
         CliBackend::new(Arc::new(runner))
@@ -823,59 +834,41 @@ mod tests {
     }
 
     #[test]
-    fn create_pr_parses_number() {
-        let b = backend(StubRunner::new().ok(
+    fn create_pr_agit_strategy_parses_number() {
+        // CLAUDE-103: `pr_strategy: agit` invokes `fj pr create -aA` as before.
+        let runner = Arc::new(StubRunner::new().ok(
             "fj",
             &["--host", "dev.a8n.run", "pr", "create", "-aA"],
             "Created pull request #42\n",
         ));
-        let pr = b.create_pr(Path::new("/tmp/x"), "dev.a8n.run").unwrap();
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(Path::new("/tmp/x"), "dev.a8n.run", PrStrategy::Agit)
+            .unwrap();
         assert_eq!(pr.number, Some(42));
         assert_eq!(pr.url, "Created pull request #42");
-    }
-
-    #[test]
-    fn create_pr_failure_reports_both_strategies() {
-        // CLAUDE-102: an AGit failure now falls back to git push + API create;
-        // when the push also fails, the typed error carries BOTH causes.
-        let b = backend(
-            StubRunner::new()
-                .fail(
-                    "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-                    1,
-                    "there is no TLS stream available; class=Ssl (16)",
-                )
-                .fail(
-                    "git",
-                    &["push", "--set-upstream", "origin", "HEAD"],
-                    128,
-                    "could not read Username",
-                ),
+        // The AGit path issues `-aA` and never pushes a branch.
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "fj --host dev.a8n.run pr create -aA"),
+            "{calls:?}"
         );
-        match b.create_pr(Path::new("/tmp/x"), "dev.a8n.run").unwrap_err() {
-            Error::PrCreateFailed { agit, fallback } => {
-                assert!(agit.contains("no TLS stream"), "{agit}");
-                assert!(fallback.contains("could not read Username"), "{fallback}");
-            }
-            other => panic!("expected PrCreateFailed, got {other:?}"),
-        }
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "agit must not push a branch: {calls:?}"
+        );
     }
 
     #[test]
-    fn create_pr_falls_back_to_git_push_and_api_create() {
-        // CLAUDE-102: AGit fails (TLS-less libgit2, FJ-38); the fallback pushes
+    fn create_pr_branch_strategy_pushes_branch_and_creates_via_api() {
+        // CLAUDE-103 default: `pr_strategy: branch` pushes a real server branch
         // with the git CLI and opens the PR over the API, deriving title/body
-        // from the head commit. The body travels via a workdir-relative file.
+        // from the head commit. `-aA` is never invoked.
         let wd = tempfile::tempdir().unwrap();
-        let b = backend(
+        let runner = Arc::new(
             StubRunner::new()
-                .fail(
-                    "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-                    1,
-                    "there is no TLS stream available; class=Ssl (16)",
-                )
                 .ok("git", &["push", "--set-upstream", "origin", "HEAD"], "")
                 .ok(
                     "git",
@@ -901,10 +894,55 @@ mod tests {
                     "Created pull request #77\n",
                 ),
         );
-        let pr = b.create_pr(wd.path(), "dev.a8n.run").unwrap();
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
         assert_eq!(pr.number, Some(77));
         // The body file is cleaned up after the create.
         assert!(!wd.path().join(".claude-run-pr-body.md").exists());
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin HEAD"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("-aA")),
+            "branch strategy must never invoke -aA: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_strategy_errors_loudly_on_push_failure() {
+        // CLAUDE-103: a failure of the selected (branch) strategy surfaces the
+        // underlying CLI error directly. There is NO silent switch to AGit that
+        // would emit a branchless PR.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = Arc::new(StubRunner::new().fail(
+            "git",
+            &["push", "--set-upstream", "origin", "HEAD"],
+            128,
+            "could not read Username",
+        ));
+        let b = CliBackend::new(runner.clone());
+        match b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap_err()
+        {
+            Error::CliFailed { binary, stderr, .. } => {
+                assert_eq!(binary, "git");
+                assert!(stderr.contains("could not read Username"), "{stderr}");
+            }
+            other => panic!("expected CliFailed, got {other:?}"),
+        }
+        // No fallback to AGit was attempted.
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("-aA")),
+            "branch failure must not fall back to AGit: {calls:?}"
+        );
     }
 
     #[test]
@@ -1032,7 +1070,7 @@ mod tests {
 
         backend.get_field("MK-16", "AI Agent").unwrap();
         backend
-            .create_pr(Path::new("/tmp/x"), "dev.a8n.run")
+            .create_pr(Path::new("/tmp/x"), "dev.a8n.run", PrStrategy::Agit)
             .unwrap();
 
         let envs = runner.envs.lock().unwrap();

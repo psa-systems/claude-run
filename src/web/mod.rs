@@ -956,6 +956,8 @@ struct YoutrackEditForm {
     state_in_progress: String,
     fj_base_url: String,
     fj_token_ref: String,
+    /// PR-creation strategy (CLAUDE-103): `"branch"` (default) or `"agit"`.
+    fj_pr_strategy: String,
     /// GitHub PAT secret name (CLAUDE-54). The form exposes only `token_ref`;
     /// `github.hosts` / `github.mcp_endpoint` stay raw-YAML-only and are
     /// preserved on save.
@@ -1005,6 +1007,7 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
         state_in_progress: c.youtrack.states.in_progress,
         concurrency_max_parallel: conc.max_parallel.to_string(),
         concurrency_key: conc.key.join(", "),
+        fj_pr_strategy: c.forgejo.pr_strategy.as_str().to_string(),
         ..Default::default()
     }
 }
@@ -1032,6 +1035,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         state_in_progress: yt.youtrack.states.in_progress.clone(),
         fj_base_url: s(&yt.forgejo.base_url),
         fj_token_ref: s(&yt.forgejo.token_ref),
+        fj_pr_strategy: yt.forgejo.pr_strategy.as_str().to_string(),
         github_token_ref: s(&yt.github.token_ref),
         workdir_base: s(&a.workdir_base),
         link_template: s(&a.link_template),
@@ -1169,6 +1173,7 @@ fn youtrack_form_to_yaml(
         forgejo: ForgejoTarget {
             base_url: opt(&form.fj_base_url),
             token_ref: opt(&form.fj_token_ref),
+            pr_strategy: crate::action::PrStrategy::from_form_value(&form.fj_pr_strategy),
         },
         github,
     };
