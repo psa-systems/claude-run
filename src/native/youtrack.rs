@@ -159,6 +159,23 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         warn!(error = %e, "run_set_job_keys failed (non-fatal)");
     }
 
+    // CLAUDE-108: the canonical YouTrack issue URL is fully determined by the
+    // source `base_url` and each job's `idReadable` key, so persist per-job
+    // `job_links` (the same mechanism the Forgejo webhook uses) to light up the
+    // key hyperlinks in the web UI with zero operator config. When `base_url`
+    // is None (host `yt` default, instance host unknown) skip, so keys degrade
+    // to plain text rather than a broken link.
+    if let Some(base) = src.base_url.as_deref() {
+        let base = base.trim_end_matches('/');
+        let links: std::collections::BTreeMap<String, String> = jobs
+            .iter()
+            .map(|j| (j.key.clone(), format!("{}/issue/{}", base, j.key)))
+            .collect();
+        if let Err(e) = state::run_set_job_links(pool, run_id, &links).await {
+            warn!(error = %e, "run_set_job_links failed (non-fatal)");
+        }
+    }
+
     // CLAUDE-28: keyed, bounded-parallel execution. Distinct repos (the
     // concurrency key) run in parallel; jobs against the same repo serialize so
     // they never collide on the clone dir / branch / PR. `max_parallel: 1`
@@ -966,7 +983,7 @@ fn cleanup_workdir(workdir: &Path) {
 /// was to save unpushed work, not preserve every feature-branch run). Any git
 /// or network failure errs toward `true`: preserving costs disk, a wrong delete
 /// costs the run.
-fn has_unpushed_commits(workdir: &Path) -> bool {
+pub(crate) fn has_unpushed_commits(workdir: &Path) -> bool {
     fn git(workdir: &Path, args: &[&str]) -> Option<String> {
         let out = Command::new("git")
             .arg("-C")

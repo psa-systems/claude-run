@@ -1764,6 +1764,23 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             badge: "live",
             note: "tracing EnvFilter directive; CLAUDE_RUN_LOG still wins this run.",
         }],
+        WorkdirGc => vec![
+            FieldDoc {
+                name: "enabled",
+                badge: "next sweep",
+                note: "master toggle; false parks the sweeper without losing the windows.",
+            },
+            FieldDoc {
+                name: "retention_days",
+                badge: "next sweep",
+                note: "age past which a preserved / aside workdir is deleted.",
+            },
+            FieldDoc {
+                name: "unpushed_hard_cap_days",
+                badge: "next sweep",
+                note: "longer age past which even unpushed-commit workdirs are deleted.",
+            },
+        ],
     }
 }
 
@@ -2264,6 +2281,63 @@ mod tests {
         assert!(
             html.contains("&lt;script&gt;"),
             "script tag not escaped: {html}"
+        );
+    }
+
+    // ---- run-detail modal heading link (CLAUDE-108) -----------------------
+
+    /// The summary/details modal heading links the job key when the run has a
+    /// populated `job_links` map, with `- attempt N` left outside the anchor and
+    /// opening in a new tab. Covers both YouTrack (which now populates
+    /// `job_links`) and Forgejo runs.
+    #[test]
+    fn modal_heading_links_job_key_from_job_links() {
+        use super::{JobOutcomeRow, RunDetailTpl, RunRow};
+        use askama::Template;
+
+        let run = RunRow {
+            id: 1,
+            action_name: "YouTrack".to_string(),
+            started_at: "2026-06-13T00:00:00Z".to_string(),
+            ended_at: Some("2026-06-13T00:01:00Z".to_string()),
+            exit_code: Some(0),
+            jobs_processed: 1,
+            triggered_by: "schedule".to_string(),
+            current_job_key: None,
+            stage: None,
+            failed_jobs: 0,
+        };
+        let outcome = JobOutcomeRow {
+            job_key: "CLAUDE-108".to_string(),
+            attempt: 2,
+            ts: "2026-06-13T00:00:30Z".to_string(),
+            ok: true,
+            claude_ran: true,
+            claude_ok: true,
+            claude_cost_usd: 0.0,
+            attempt_counted: true,
+            duration_ms: Some(1000),
+            timed_out: false,
+            summary: Some("did the thing".to_string()),
+        };
+        let job_links = std::collections::BTreeMap::from([(
+            "CLAUDE-108".to_string(),
+            "https://example.myjetbrains.com/issue/CLAUDE-108".to_string(),
+        )]);
+        let tpl = RunDetailTpl {
+            version: "test",
+            run,
+            outcomes: vec![outcome],
+            planned_jobs: vec![],
+            link_template: None,
+            job_links,
+        };
+        let html = tpl.render().expect("render run_detail");
+        assert!(
+            html.contains(
+                "<a href=\"https://example.myjetbrains.com/issue/CLAUDE-108\" target=\"_blank\" rel=\"noopener\">CLAUDE-108</a> - attempt 2"
+            ),
+            "modal heading should link the key with attempt outside the anchor: {html}"
         );
     }
 

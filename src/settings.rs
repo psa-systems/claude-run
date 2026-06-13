@@ -30,7 +30,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::{MintConfig, OnDiskConfig, Paths, UpdateConfig, WebhookConfig};
+use crate::config::{
+    MintConfig, OnDiskConfig, Paths, UpdateConfig, WebhookConfig, WorkdirGcConfig,
+};
 use crate::error::Result;
 use crate::state::now_iso;
 use crate::web::webhooks::{build_rate_map, RateLimiter};
@@ -42,15 +44,18 @@ pub enum Section {
     Update,
     Webhook,
     LogFilter,
+    /// CLAUDE-106: preserved / aside workdir GC retention windows.
+    WorkdirGc,
 }
 
 impl Section {
     /// Every section, in display order (used by the Settings page).
-    pub const ALL: [Section; 4] = [
+    pub const ALL: [Section; 5] = [
         Section::Mint,
         Section::Update,
         Section::Webhook,
         Section::LogFilter,
+        Section::WorkdirGc,
     ];
 
     /// `settings` table primary key for this section's JSON document.
@@ -60,6 +65,7 @@ impl Section {
             Section::Update => "config.update",
             Section::Webhook => "config.webhook",
             Section::LogFilter => "config.log_filter",
+            Section::WorkdirGc => "config.workdir_gc",
         }
     }
 
@@ -70,6 +76,7 @@ impl Section {
             Section::Update => "update",
             Section::Webhook => "webhook",
             Section::LogFilter => "log_filter",
+            Section::WorkdirGc => "workdir_gc",
         }
     }
 
@@ -85,6 +92,7 @@ impl Section {
             Section::Update => "Update train",
             Section::Webhook => "Webhook sources",
             Section::LogFilter => "Log filter",
+            Section::WorkdirGc => "Workdir GC",
         }
     }
 
@@ -94,6 +102,7 @@ impl Section {
             Section::Mint | Section::Update => "next event",
             Section::Webhook => "live (replay window: restart)",
             Section::LogFilter => "live",
+            Section::WorkdirGc => "next sweep",
         }
     }
 }
@@ -160,6 +169,10 @@ pub struct EffectiveRuntime {
     pub update: UpdateConfig,
     pub webhook: WebhookConfig,
     pub log_filter: Option<String>,
+    /// CLAUDE-106: preserved / aside workdir GC windows. Brand-new section (never
+    /// in `config.toml`), so there is no file fallback: the DB value or the
+    /// built-in default.
+    pub workdir_gc: WorkdirGcConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
@@ -178,11 +191,15 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
         Some(doc) => doc.filter,
         None => file.daemon.log_filter.clone(),
     };
+    let workdir_gc = get_json::<WorkdirGcConfig>(pool, Section::WorkdirGc.key())
+        .await?
+        .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
         update,
         webhook,
         log_filter,
+        workdir_gc,
     })
 }
 
@@ -342,6 +359,7 @@ pub struct LiveSettings {
     webhook_rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
     log_filter: Arc<RwLock<Option<String>>>,
     log_apply: Option<LogFilterApply>,
+    workdir_gc: Arc<RwLock<WorkdirGcConfig>>,
 }
 
 impl LiveSettings {
@@ -358,6 +376,7 @@ impl LiveSettings {
             webhook_rate: Arc::new(RwLock::new(webhook_rate)),
             log_filter: Arc::new(RwLock::new(eff.log_filter.clone())),
             log_apply,
+            workdir_gc: Arc::new(RwLock::new(eff.workdir_gc)),
         };
         if let (Some(apply), Some(filter)) = (s.log_apply.as_ref(), eff.log_filter.as_ref()) {
             match apply(filter) {
@@ -391,6 +410,12 @@ impl LiveSettings {
         self.webhook_rate.clone()
     }
 
+    /// CLAUDE-106: shared handle to the live workdir-GC config, read by the
+    /// sweeper on each tick so a Settings save applies on the next sweep.
+    pub fn workdir_gc_handle(&self) -> Arc<RwLock<WorkdirGcConfig>> {
+        self.workdir_gc.clone()
+    }
+
     /// Current value of `section` as a pretty JSON document (secrets appear as
     /// their `*_ref` names only - no secret material is stored or rendered).
     pub async fn section_json(&self, section: Section) -> String {
@@ -401,6 +426,7 @@ impl LiveSettings {
             Section::LogFilter => to_pretty(&LogFilterDoc {
                 filter: self.log_filter.read().await.clone(),
             }),
+            Section::WorkdirGc => to_pretty(&*self.workdir_gc.read().await),
         }
     }
 
@@ -447,6 +473,11 @@ impl LiveSettings {
                     }
                 }
             }
+            Section::WorkdirGc => {
+                let v: WorkdirGcConfig = parse(json)?;
+                set_json(&self.pool, section.key(), &v).await?;
+                *self.workdir_gc.write().await = v;
+            }
         }
         Ok(())
     }
@@ -482,6 +513,7 @@ mod tests {
             update: UpdateConfig::default(),
             webhook: WebhookConfig::default(),
             log_filter: None,
+            workdir_gc: WorkdirGcConfig::default(),
         }
     }
 
