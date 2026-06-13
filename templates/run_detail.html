@@ -167,7 +167,11 @@
               <a href="#" onclick="this.nextElementSibling.showModal(); return false;">view details</a>
               <dialog class="summary-dialog">
                 <div class="summary-dialog-head">
-                  <span class="mono">{{ o.job_key }} - attempt {{ o.attempt }}</span>
+                  {# CLAUDE-108: link the job key in the modal heading, reusing
+                     the outcomes-table precedence: job_links > link_template >
+                     plain text. Only the key is wrapped; "- attempt N" stays
+                     outside the anchor. #}
+                  <span class="mono">{% if let Some(u) = job_links.get(o.job_key.as_str()) %}<a href="{{ u }}" target="_blank" rel="noopener">{{ o.job_key }}</a>{% else if let Some(t) = link_template %}<a href="{{ crate::action::render_link(t, o.job_key.as_str()) }}" target="_blank" rel="noopener">{{ o.job_key }}</a>{% else %}{{ o.job_key }}{% endif %} - attempt {{ o.attempt }}</span>
                   <button class="btn" onclick="this.closest('dialog').close()">Close</button>
                 </div>
                 {% if let Some(sh) = o.summary_html() %}
