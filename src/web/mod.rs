@@ -1764,6 +1764,23 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             badge: "live",
             note: "tracing EnvFilter directive; CLAUDE_RUN_LOG still wins this run.",
         }],
+        WorkdirGc => vec![
+            FieldDoc {
+                name: "enabled",
+                badge: "next sweep",
+                note: "master toggle; false parks the sweeper without losing the windows.",
+            },
+            FieldDoc {
+                name: "retention_days",
+                badge: "next sweep",
+                note: "age past which a preserved / aside workdir is deleted.",
+            },
+            FieldDoc {
+                name: "unpushed_hard_cap_days",
+                badge: "next sweep",
+                note: "longer age past which even unpushed-commit workdirs are deleted.",
+            },
+        ],
     }
 }
 
