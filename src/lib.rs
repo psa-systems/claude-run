@@ -28,6 +28,7 @@ pub mod daemon;
 pub mod db;
 pub mod error;
 pub mod forge_log;
+pub mod gc;
 pub mod job;
 pub mod jsonfmt;
 pub mod lock;

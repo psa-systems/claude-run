@@ -961,7 +961,7 @@ fn cleanup_workdir(workdir: &Path) {
 /// from every remote-tracking ref - exactly the work deleting the directory
 /// would destroy. Any git failure errs toward `true`: preserving costs disk, a
 /// wrong delete costs the run.
-fn has_unpushed_commits(workdir: &Path) -> bool {
+pub(crate) fn has_unpushed_commits(workdir: &Path) -> bool {
     let out = Command::new("git")
         .arg("-C")
         .arg(workdir)
