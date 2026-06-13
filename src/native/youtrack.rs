@@ -1435,10 +1435,18 @@ mod tests {
         );
     }
 
-    fn repo_with_commit(dir: &Path) {
-        git_in(dir, &["init"]);
+    // CLAUDE-113: set a local git identity. `git clone` does not copy the
+    // origin's local `user.*`, and CI's container has no global or
+    // auto-detectable identity, so every repo that commits must set its own or
+    // `git commit` fails with "Author identity unknown".
+    fn set_identity(dir: &Path) {
         git_in(dir, &["config", "user.email", "test@test"]);
         git_in(dir, &["config", "user.name", "test"]);
+    }
+
+    fn repo_with_commit(dir: &Path) {
+        git_in(dir, &["init"]);
+        set_identity(dir);
         std::fs::write(dir.join("f.txt"), "x").unwrap();
         git_in(dir, &["add", "."]);
         git_in(dir, &["commit", "-m", "feat: x"]);
@@ -1491,6 +1499,9 @@ mod tests {
                 clone.to_str().unwrap(),
             ],
         );
+        // CLAUDE-113: the clone inherits none of the origin's local `user.*`, so
+        // tests that commit in the clone need their own identity.
+        set_identity(&clone);
         clone
     }
 
