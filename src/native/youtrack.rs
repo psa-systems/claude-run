@@ -957,27 +957,86 @@ fn cleanup_workdir(workdir: &Path) {
     }
 }
 
-/// CLAUDE-102: true when any local branch in `workdir` carries commits absent
-/// from every remote-tracking ref - exactly the work deleting the directory
-/// would destroy. Any git failure errs toward `true`: preserving costs disk, a
-/// wrong delete costs the run.
+/// CLAUDE-105: true when any local branch tip in `workdir` is absent from the
+/// live remote as reported by `git ls-remote origin` - exactly the work
+/// deleting the directory would destroy. This asks the source of truth rather
+/// than trusting remote-tracking refs: a `--depth` clone is `--single-branch`,
+/// so its only tracking ref is `origin/main` and the old `--not --remotes`
+/// heuristic false-positived on every non-`main` branch (CLAUDE-102's intent
+/// was to save unpushed work, not preserve every feature-branch run). Any git
+/// or network failure errs toward `true`: preserving costs disk, a wrong delete
+/// costs the run.
 fn has_unpushed_commits(workdir: &Path) -> bool {
+    fn git(workdir: &Path, args: &[&str]) -> Option<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    // Local branch tips. No branches means nothing local to lose -> delete.
+    let branches = match git(
+        workdir,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    ) {
+        Some(s) => s,
+        None => return true,
+    };
+    let branches: Vec<&str> = branches
+        .lines()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .collect();
+    if branches.is_empty() {
+        return false;
+    }
+
+    // The live remote's advertised SHAs (first column of each ls-remote line).
+    let remote = match git(workdir, &["ls-remote", "origin"]) {
+        Some(s) => s,
+        None => return true,
+    };
+    let remote_shas: std::collections::HashSet<&str> =
+        remote.split_whitespace().step_by(2).collect();
+
+    for branch in branches {
+        let tip = match git(workdir, &["rev-parse", branch]) {
+            Some(s) => s.trim().to_string(),
+            None => return true,
+        };
+        if !remote_shas.contains(tip.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// CLAUDE-105: remove gitignored build artifacts from a workdir about to be
+/// preserved. `git clean -fdX` deletes only ignored files and directories; a
+/// failure is logged and tolerated (the directory is still preserved).
+fn prune_ignored_artifacts(workdir: &Path) {
     let out = Command::new("git")
         .arg("-C")
         .arg(workdir)
-        .args([
-            "log",
-            "--branches",
-            "--not",
-            "--remotes",
-            "--oneline",
-            "-n",
-            "1",
-        ])
+        .args(["clean", "-fdX"])
         .output();
     match out {
-        Ok(o) if o.status.success() => !o.stdout.is_empty(),
-        _ => true,
+        Err(e) => {
+            warn!(workdir = %workdir.display(), error = %e, "pruning gitignored artifacts failed (preserving anyway)");
+        }
+        Ok(o) if !o.status.success() => {
+            warn!(
+                workdir = %workdir.display(),
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "git clean -fdX failed (preserving anyway)"
+            );
+        }
+        Ok(_) => {}
     }
 }
 
@@ -990,6 +1049,11 @@ fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
         return;
     }
     if has_unpushed_commits(workdir) {
+        // CLAUDE-105: the guard only protects committed work in `.git`, so drop
+        // regenerable gitignored output (`target/`, `node_modules/`, ...) before
+        // keeping the directory. `-X` touches only ignored files, leaving source,
+        // `.git`, unpushed commits, and uncommitted tracked changes intact.
+        prune_ignored_artifacts(workdir);
         warn!(
             action = %action,
             key = %key,
@@ -1391,6 +1455,91 @@ mod tests {
             !clone.exists(),
             "a workdir with no unpushed work is removed"
         );
+    }
+
+    // CLAUDE-105: build an origin + single-branch clone, mimicking the shallow
+    // (`--depth` => `--single-branch`) clone the runner makes. Returns the
+    // clone path.
+    fn origin_and_single_branch_clone(base: &Path) -> std::path::PathBuf {
+        let origin = base.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        repo_with_commit(&origin);
+        let clone = base.join("clone");
+        git_in(
+            base,
+            &[
+                "clone",
+                "--single-branch",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        clone
+    }
+
+    #[test]
+    fn feature_branch_tip_on_remote_is_deleted() {
+        // GAMMA-174 shape: the agent checked a branch out but left its tip at a
+        // commit already on the remote. The old `--not --remotes` heuristic
+        // false-positived (only `origin/main` is tracked); the live-remote
+        // check sees the tip present and deletes.
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(&clone, &["checkout", "-b", "feat/x"]);
+        git_in(&clone, &["push", "origin", "feat/x"]);
+        assert!(!has_unpushed_commits(&clone));
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        assert!(!clone.exists(), "tip present on remote must be deleted");
+    }
+
+    #[test]
+    fn feature_branch_commit_absent_from_remote_is_preserved() {
+        // GAMMA-258 shape: the agent committed work that never reached the remote.
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(&clone, &["checkout", "-b", "feat/y"]);
+        std::fs::write(clone.join("new.txt"), "work").unwrap();
+        git_in(&clone, &["add", "."]);
+        git_in(&clone, &["commit", "-m", "feat: y"]);
+        assert!(has_unpushed_commits(&clone));
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        assert!(clone.exists(), "an unpushed commit must survive cleanup");
+    }
+
+    #[test]
+    fn ls_remote_failure_errs_toward_preserve() {
+        // A reachable local branch but an unreachable remote: the live-remote
+        // query fails and the guard preserves rather than risk a wrong delete.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        git_in(
+            dir.path(),
+            &["remote", "add", "origin", "/nonexistent/repo.git"],
+        );
+        assert!(has_unpushed_commits(dir.path()));
+    }
+
+    #[test]
+    fn preserved_workdir_has_gitignored_artifacts_pruned() {
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(&clone, &["checkout", "-b", "feat/z"]);
+        std::fs::write(clone.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(clone.join("target")).unwrap();
+        std::fs::write(clone.join("target/build.o"), "binary").unwrap();
+        std::fs::write(clone.join("src.txt"), "source").unwrap();
+        git_in(&clone, &["add", ".gitignore", "src.txt"]);
+        git_in(&clone, &["commit", "-m", "feat: z"]);
+
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+
+        assert!(clone.exists(), "unpushed work must be preserved");
+        assert!(
+            !clone.join("target").exists(),
+            "gitignored artifacts must be pruned"
+        );
+        assert!(clone.join("src.txt").exists(), "source must remain");
+        assert!(clone.join(".git").exists(), ".git must remain");
     }
 
     #[test]
