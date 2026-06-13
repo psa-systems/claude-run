@@ -60,9 +60,9 @@ watch:
 
 # ── Checks ───────────────────────────────────────────────────────────────────
 
-# Umbrella check: fmt + clippy + build + builder-stage docker compile.
+# Umbrella check: fmt + clippy + build + tests + builder-stage docker compile.
 [group: 'checks']
-check: check-fmt check-clippy check-build check-docker
+check: check-fmt check-clippy check-build check-test check-docker
 
 # Cargo fmt in check mode.
 [group: 'checks']
@@ -78,6 +78,11 @@ check-clippy:
 [group: 'checks']
 check-build:
     cargo build --all-targets
+
+# Cargo test (matches check.yml "Unit tests" step).
+[group: 'checks']
+check-test:
+    cargo test
 
 # Builder-stage docker compile (no final image produced).
 [group: 'checks']
