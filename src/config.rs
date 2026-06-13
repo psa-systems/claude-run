@@ -360,6 +360,44 @@ impl Default for UpdateConfig {
     }
 }
 
+/// CLAUDE-106: time-based GC sweeper for preserved / aside workdirs. A
+/// DB-backed runtime setting (settings key `config.workdir_gc`, editable on the
+/// web Settings page) per the CLAUDE-101 bootstrap-vs-runtime split, so it is
+/// NOT a `config.toml` key. The sweeper ([`crate::gc`]) runs on `serve` start
+/// and on a periodic tick, deleting workdirs under `$CLAUDE_RUN_DATA_DIR/
+/// workdirs/<source>/<key>` (including `.kept-<n>` aside dirs) older than
+/// `retention_days`. A workdir that still holds unpushed commits is respected
+/// until the longer `unpushed_hard_cap_days`, so genuine un-saved work is not
+/// discarded the moment the window passes.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkdirGcConfig {
+    /// Master enable toggle. When `false`, no sweep deletes anything (the walk
+    /// short-circuits), so an operator can park the feature without losing the
+    /// configured windows.
+    pub enabled: bool,
+    /// Age, in days, past which a preserved / aside workdir is deleted. Measured
+    /// from the directory's last-modified time. Conservative default of 14 days
+    /// (revise if operational data shows otherwise, per the issue).
+    pub retention_days: u64,
+    /// Longer age, in days, past which even a workdir that still holds unpushed
+    /// commits is deleted. Between `retention_days` and this cap an unpushed
+    /// workdir is kept; beyond it the disk cost wins. Assumed 60 days; revise if
+    /// validation shows otherwise. Must exceed `retention_days` to have any
+    /// effect (a smaller value just deletes unpushed dirs at the normal window).
+    pub unpushed_hard_cap_days: u64,
+}
+
+impl Default for WorkdirGcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: 14,
+            unpushed_hard_cap_days: 60,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {

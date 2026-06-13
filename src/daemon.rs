@@ -29,6 +29,10 @@ use crate::state::{self, ActionIndexRow};
 
 const VERSION: &str = crate::VERSION;
 const TICK_SECS: u64 = 5;
+/// CLAUDE-106: how often the workdir GC sweeper runs after the startup sweep.
+/// Hourly is far finer than the day-scale retention windows it enforces while
+/// staying cheap (one stat per workdir, a git check only for past-window dirs).
+const GC_TICK_SECS: u64 = 3600;
 /// CLAUDE-11: how long shutdown waits for cancelled in-flight runs to finalize
 /// before force-finalizing their DB rows and exiting. Bounds a wedged claude
 /// child so it cannot hang the daemon forever. Assumed 30s; revise after
@@ -234,6 +238,12 @@ impl Daemon {
         let scheduler_task = tokio::spawn(scheduler_loop(dispatch.clone(), trigger_tx.clone()));
         let trigger_task = tokio::spawn(trigger_consumer(dispatch.clone(), trigger_rx));
 
+        // CLAUDE-106: sweep preserved / aside workdirs older than the configured
+        // retention window. The first tick fires immediately, so a sweep runs on
+        // serve start; subsequent ticks fire hourly. Reads the live GC config off
+        // the shared handle so a Settings save applies on the next sweep.
+        let gc_task = tokio::spawn(gc_loop(self.paths.clone(), settings.workdir_gc_handle()));
+
         // Graceful shutdown on SIGINT (Ctrl-C), SIGTERM (service managers,
         // `claude-run stop`), or SIGQUIT. All fall through to the same cleanup
         // below.
@@ -260,6 +270,7 @@ impl Daemon {
         // the runs that are already in flight.
         scheduler_task.abort();
         trigger_task.abort();
+        gc_task.abort();
 
         // CLAUDE-11: cancel in-flight runs through the CLAUDE-9 path (child
         // terminated, `post` run with a synthesized cancelled result,
@@ -926,6 +937,43 @@ pub async fn run_action_inner(
 async fn wait_for_runs_drain(runs: &RunRegistry) {
     while !runs.is_empty() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// CLAUDE-106: periodic workdir GC. The `tokio::time::interval` fires its first
+/// tick immediately, so this both performs the serve-start sweep and the hourly
+/// sweeps thereafter. The sweep is blocking filesystem work (a recursive walk
+/// plus `remove_dir_all`), so it runs on a blocking thread; the live config is
+/// snapshotted per tick off the shared handle.
+async fn gc_loop(paths: Paths, cfg: Arc<tokio::sync::RwLock<crate::config::WorkdirGcConfig>>) {
+    let base = paths.workdirs_dir();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(GC_TICK_SECS));
+    loop {
+        ticker.tick().await;
+        let snapshot = cfg.read().await.clone();
+        if !snapshot.enabled {
+            continue;
+        }
+        let base = base.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::gc::sweep(
+                &base,
+                &snapshot,
+                std::time::SystemTime::now(),
+                crate::native::youtrack::has_unpushed_commits,
+            )
+        })
+        .await;
+        match result {
+            Ok(stats) if stats.deleted > 0 => info!(
+                deleted = stats.deleted,
+                kept = stats.kept,
+                bytes_reclaimed = stats.bytes_reclaimed,
+                "workdir GC sweep complete"
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "workdir GC sweep task failed"),
+        }
     }
 }
 
