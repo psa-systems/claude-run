@@ -100,8 +100,8 @@ impl ClaudeInvoker {
 
     /// Spawn claude, relay its stdout to `stream_log` stamping each JSON event
     /// line with an arrival-time `ts` (stderr is a direct, unstamped redirect to
-    /// the same file), wait, then parse the last NDJSON line for the final
-    /// result event.
+    /// the same file), wait, then scan the stream for the terminal `result`
+    /// event by type (CLAUDE-107: not by line position).
     ///
     /// CLAUDE-9: the child is spawned in its own process group and the wait is
     /// cancellable. When `cancel` trips, the whole group (the `timeout`
@@ -343,17 +343,14 @@ fn wait_or_cancel(
     }
 }
 
-/// Whether the last complete JSON line in the stream log is a terminal `result`
-/// event. A partial trailing write fails to parse and reads as "not yet", so the
-/// grace timer only starts once the full event has landed.
+/// Whether the stream log contains a terminal `result` event. CLAUDE-107:
+/// `parse_final_result` selects the result event by `type` regardless of
+/// position, so a result event followed by trailing `system` events still reads
+/// as "terminal result observed" here. A partial trailing write fails to parse
+/// and is skipped, so the grace timer only starts once a full `result` event has
+/// landed.
 fn stream_has_terminal_result(stream_log: &Path) -> bool {
-    parse_final_result(stream_log)
-        .and_then(|v| {
-            v.get("type")
-                .and_then(|t| t.as_str())
-                .map(|s| s == "result")
-        })
-        .unwrap_or(false)
+    parse_final_result(stream_log).is_some()
 }
 
 /// Terminate the child's process group: SIGTERM, a short grace window, then
@@ -449,12 +446,20 @@ fn stamp_line(raw: &[u8]) -> Vec<u8> {
     }
 }
 
+/// CLAUDE-107: select the authoritative terminal `result` event by event type,
+/// not by line position. Claude Code may emit trailing `system` events
+/// (`task_updated`, `task_notification`, or any future post-result event) after
+/// the `result` event, so the last non-empty line is not reliably the result.
+/// Scan the stream backward and return the last line that parses as a JSON
+/// object with `type == "result"`, skipping any non-`result` trailing lines.
+/// Returns `None` only when the stream contains no `result` event anywhere
+/// (the genuine no-terminal-result case the `:228` guard catches).
 fn parse_final_result(stream_log: &Path) -> Option<Value> {
     let raw = std::fs::read_to_string(stream_log).ok()?;
     raw.lines()
         .rev()
-        .find(|l| !l.trim().is_empty())
-        .and_then(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))
 }
 
 fn read_tail(p: &Path, max: usize) -> std::io::Result<String> {
@@ -708,6 +713,52 @@ mod tests {
         );
     }
 
+    /// CLAUDE-107: claude emits its terminal `result/success` event and then
+    /// trailing `system` events (`task_updated`, `task_notification`) before
+    /// exiting 0 - the real PMS-258 stream shape. The run must classify as a
+    /// success (`ok = true`) by selecting the result event by type, not by line
+    /// position, so a successful run is not misread as a failure.
+    #[test]
+    fn invoke_result_then_trailing_system_events_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' '{RESULT_LINE}'\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"task_updated\"}}'\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"task_notification\"}}'\n\
+                 exit 0\n"
+            ),
+        );
+
+        let invoker = ClaudeInvoker {
+            binary: stub.to_str().unwrap().to_string(),
+            result_exit_grace: Duration::from_secs(30),
+        };
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let res = invoker
+            .invoke(
+                "hi",
+                &cfg,
+                Duration::from_secs(10),
+                dir.path(),
+                &log,
+                &cancel,
+            )
+            .unwrap();
+        assert!(
+            res.ok,
+            "result/success followed by trailing system events finalizes as ok"
+        );
+        assert_eq!(res.summary, "done");
+        assert_eq!(res.cost, 0.42);
+        assert!(res.error.is_empty(), "no error on a success run");
+    }
+
     /// CLAUDE-9: tripping the token mid-run terminates the child's process
     /// group, so `invoke` returns long before the (30s) stub/timeout would.
     #[test]
@@ -804,8 +855,10 @@ mod tests {
              {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"API Error: \"},{\"type\":\"text\",\"text\":\"529 Overloaded.\"}]}}\n",
         )
         .unwrap();
-        // final_event here is the last assistant message, not a result event.
-        let final_event = parse_final_result(&log).unwrap();
+        // CLAUDE-107: no result event in the stream, so `parse_final_result`
+        // returns None and the caller falls back to `Value::Null` (mirrors the
+        // production call at the `invoke` site).
+        let final_event = parse_final_result(&log).unwrap_or(Value::Null);
         assert_eq!(
             friendly_failure_summary(&final_event, &log),
             "API Error: 529 Overloaded."
@@ -819,7 +872,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("stream.jsonl");
         std::fs::write(&log, "{\"type\":\"system\",\"subtype\":\"init\"}\n").unwrap();
-        let final_event = parse_final_result(&log).unwrap();
+        // CLAUDE-107: no result event, so the caller falls back to `Value::Null`.
+        let final_event = parse_final_result(&log).unwrap_or(Value::Null);
         assert_eq!(
             friendly_failure_summary(&final_event, &log),
             "{\"type\":\"system\",\"subtype\":\"init\"}\n"
@@ -930,6 +984,56 @@ mod tests {
         assert!(
             final_event.get("ts").is_some(),
             "stamped result keeps its ts"
+        );
+    }
+
+    /// CLAUDE-107: Claude Code emits trailing `system` events (`task_updated`,
+    /// `task_notification`) after the terminal `result` event. The result event
+    /// must be selected by `type`, not by line position, so these trailing lines
+    /// cannot flip a successful run into a recorded failure.
+    #[test]
+    fn parse_final_result_skips_trailing_system_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            format!(
+                "{RESULT_LINE}\n\
+                 {{\"type\":\"system\",\"subtype\":\"task_updated\"}}\n\
+                 {{\"type\":\"system\",\"subtype\":\"task_notification\"}}\n"
+            ),
+        )
+        .unwrap();
+        let final_event =
+            parse_final_result(&log).expect("result event selected past trailing system events");
+        assert_eq!(
+            final_event.get("type").and_then(|t| t.as_str()),
+            Some("result"),
+            "the result event is selected, not the last system line"
+        );
+        assert_eq!(
+            final_event.get("is_error").and_then(|v| v.as_bool()),
+            Some(false),
+            "the selected result reports success"
+        );
+    }
+
+    /// CLAUDE-107: a stream with no `result` event anywhere yields `None`, so the
+    /// genuine no-terminal-result case keeps its existing failure handling.
+    #[test]
+    fn parse_final_result_none_without_result_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"system\",\"subtype\":\"init\"}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[]}}\n\
+             {\"type\":\"system\",\"subtype\":\"task_notification\"}\n",
+        )
+        .unwrap();
+        assert!(
+            parse_final_result(&log).is_none(),
+            "no result event anywhere yields None"
         );
     }
 
