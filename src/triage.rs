@@ -57,9 +57,11 @@ pub enum TriageBucket {
     Transient,
     /// CLAUDE-104: a mechanically-fixable verification failure (cargo fmt, a
     /// failing checks workflow). Routes like [`TriageBucket::CodeFix`] (mint a
-    /// queued issue so the runner opens a corrective PR) but applies even when
-    /// there is no open PR and the run is a push to a protected/main branch.
-    /// Set only by the deterministic [`autofix`] detectors, never the LLM.
+    /// queued issue so the runner opens a corrective PR). CLAUDE-115: applies
+    /// only when the failing branch has no open PR (the canonical case is a push
+    /// to a protected/main branch); a failing check on an open, unmerged PR
+    /// falls through to the classifier instead. Set only by the deterministic
+    /// [`autofix`] detectors, never the LLM.
     AutoFix,
 }
 
@@ -277,10 +279,13 @@ pub trait FailureClassifier: Send + Sync {
 ///
 /// CLAUDE-104: the [`autofix`] detectors run AFTER the transient/no-log rules
 /// (so a flaky run of a checks workflow is still classed transient, never
-/// auto-fixed) but BEFORE the LLM. A match short-circuits to
-/// [`TriageBucket::AutoFix`] regardless of `has_open_pr` or push-to-main, so a
-/// mechanically-fixable failure never reaches the classifier prompt that would
-/// label a push-to-main failure `human_action`.
+/// auto-fixed) but BEFORE the LLM. CLAUDE-115: they run only when the failing
+/// branch has no open PR (the canonical case is a push to a protected/main
+/// branch); a failing check on an open, unmerged PR skips auto-fix and falls
+/// through to the classifier, so the runner never opens a *new* corrective PR
+/// against an unmerged PR. When the detectors do run, a match short-circuits to
+/// [`TriageBucket::AutoFix`], so a mechanically-fixable push-to-main failure
+/// never reaches the classifier prompt that would label it `human_action`.
 pub fn triage(
     input: &TriageInput,
     classifier: &dyn FailureClassifier,
@@ -289,8 +294,14 @@ pub fn triage(
     if let Some(verdict) = triage_rules(input) {
         return verdict;
     }
-    if let Some(detail) = autofix::detect(input, autofix_cfg) {
-        return Triage::auto_fix(detail);
+    // CLAUDE-115: auto-fix only failures on a branch with no open PR. A failing
+    // check on an open, unmerged PR is that PR's own concern; minting a queued
+    // issue here would open a new corrective PR against the unmerged PR, which
+    // causes more confusion than it fixes.
+    if !input.has_open_pr {
+        if let Some(detail) = autofix::detect(input, autofix_cfg) {
+            return Triage::auto_fix(detail);
+        }
     }
     match classifier.classify(input) {
         Ok(verdict) => verdict,
@@ -676,24 +687,55 @@ mod tests {
     }
 
     #[test]
-    fn check_yml_failure_routes_to_auto_fix_regardless_of_open_pr() {
-        // AC 3: the checks-workflow detector fires for a non-fmt check.yml
-        // failure too, and the routing is identical whether or not a PR is open.
+    fn check_yml_failure_routes_to_auto_fix_only_without_an_open_pr() {
+        // AC 3 + CLAUDE-115: the checks-workflow detector fires for a non-fmt
+        // check.yml failure, but ONLY when the failing branch has no open PR.
+        // With an open PR the failure is that PR's own concern, so triage skips
+        // auto-fix and hands it to the classifier instead of opening a new
+        // corrective PR against the unmerged PR.
         let log = "##[group]Clippy\nerror: unused variable\n##[error]the step has failed\n";
-        for has_open_pr in [true, false] {
-            let stub = StubClassifier::new(Triage::llm(TriageBucket::HumanAction, "unused"));
-            let mut input = input_with_log(log);
-            input.workflow_id = "check.yml".to_string();
-            input.has_open_pr = has_open_pr;
-            let verdict = triage(&input, &stub, &autofix_cfg());
-            assert_eq!(
-                verdict.bucket,
-                TriageBucket::AutoFix,
-                "open_pr={has_open_pr}"
-            );
-            assert_eq!(verdict.auto_fix.unwrap().kind, "checks-workflow");
-            assert_eq!(stub.calls(), 0);
-        }
+
+        // No open PR (push to main): routed to auto-fix, no LLM call.
+        let stub = StubClassifier::new(Triage::llm(TriageBucket::HumanAction, "unused"));
+        let mut input = input_with_log(log);
+        input.workflow_id = "check.yml".to_string();
+        input.has_open_pr = false;
+        let verdict = triage(&input, &stub, &autofix_cfg());
+        assert_eq!(verdict.bucket, TriageBucket::AutoFix);
+        assert_eq!(verdict.auto_fix.unwrap().kind, "checks-workflow");
+        assert_eq!(stub.calls(), 0, "auto-fix short-circuits before the LLM");
+
+        // Open PR: auto-fix is skipped and the classifier decides instead.
+        let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "fix the PR branch"));
+        let mut input = input_with_log(log);
+        input.workflow_id = "check.yml".to_string();
+        input.has_open_pr = true;
+        let verdict = triage(&input, &stub, &autofix_cfg());
+        assert_eq!(verdict.bucket, TriageBucket::CodeFix);
+        assert!(verdict.auto_fix.is_none());
+        assert_eq!(
+            stub.calls(),
+            1,
+            "the classifier is consulted for an open-PR failure"
+        );
+    }
+
+    #[test]
+    fn cargo_fmt_failure_on_an_open_pr_skips_auto_fix() {
+        // CLAUDE-115: even the signature-driven cargo-fmt detector is gated on
+        // has_open_pr. A fmt failure on an open, unmerged PR is left to that PR
+        // (the classifier routes it), never auto-fixed via a new corrective PR.
+        let stub = StubClassifier::new(Triage::llm(
+            TriageBucket::CodeFix,
+            "run cargo fmt on the PR",
+        ));
+        let mut input = input_with_log("Run cargo fmt --check\nDiff in src/main.rs at line 1:\n");
+        input.workflow_id = "check.yml".to_string();
+        input.has_open_pr = true;
+        let verdict = triage(&input, &stub, &autofix_cfg());
+        assert_eq!(verdict.bucket, TriageBucket::CodeFix);
+        assert!(verdict.auto_fix.is_none());
+        assert_eq!(stub.calls(), 1);
     }
 
     #[test]
