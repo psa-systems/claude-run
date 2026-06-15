@@ -246,7 +246,9 @@ The webhook sources and the mint routing are edited on the **Settings** page (th
   "repo_project_map": {},
   // CLAUDE-104: auto-fix framework. Mechanically-fixable verification failures
   // (cargo fmt, a failing checks workflow) are routed deterministically to a
-  // corrective PR instead of a human, even on a push to main with no open PR.
+  // corrective PR instead of a human. CLAUDE-115: only when the failing branch
+  // has no open PR (the canonical case is a push to main); a failing check on an
+  // open, unmerged PR is left to that PR rather than triggering a new fix PR.
   "auto_fix": {
     // Master toggle. false disables every detector (failures follow the prior
     // transient / code_fix / human_action triage).
