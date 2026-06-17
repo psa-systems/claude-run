@@ -140,23 +140,41 @@ mod tests {
 
     #[test]
     fn snippet_sees_job_binding() {
+        // Use `sh` (guaranteed present, including in the minimal alpine/musl dev
+        // image used by `just pre-commit`) instead of `nu`, which is a host
+        // runtime dependency not installed in that image. For non-nu shells each
+        // binding arrives as an env var holding the compact-JSON value, so the
+        // snippet echoes `$job` and we assert on the serialized form.
         let dir = tempdir().unwrap();
         let runner = SnippetRunner::new(None);
         let mut b = Bindings::new();
         b.insert("job", json!({"id": "hello"}));
         let out = runner
-            .run(r#"print $job.id"#, &b, dir.path(), "test", None)
+            .run(r#"printf '%s' "$job""#, &b, dir.path(), "test", Some("sh"))
             .unwrap();
         assert!(out.ok, "stderr: {}", out.stderr);
-        assert!(out.stdout.trim() == "hello", "got {:?}", out.stdout);
+        assert_eq!(
+            out.stdout.trim(),
+            r#"{"id":"hello"}"#,
+            "got {:?}",
+            out.stdout
+        );
     }
 
     #[test]
     fn snippet_exit_code_propagates() {
+        // `sh` rather than `nu`: see `snippet_sees_job_binding` for why. Exit-code
+        // propagation is shell-agnostic, so this also covers the nu path.
         let dir = tempdir().unwrap();
         let runner = SnippetRunner::new(None);
         let out = runner
-            .run(r#"exit 7"#, &Bindings::new(), dir.path(), "fail", None)
+            .run(
+                r#"exit 7"#,
+                &Bindings::new(),
+                dir.path(),
+                "fail",
+                Some("sh"),
+            )
             .unwrap();
         assert!(!out.ok);
         assert_eq!(out.exit_code, 7);
