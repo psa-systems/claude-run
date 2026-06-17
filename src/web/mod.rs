@@ -87,6 +87,10 @@ pub fn router(api: Arc<AppState>, paths: Paths, webhook_enabled: bool) -> Router
         // CLAUDE-48 auth gate like every other TCP route.
         .route("/settings", get(settings_page))
         .route("/settings/:section", post(settings_save))
+        // CLAUDE-117: historical reporting page (spend / runs / time-of-day /
+        // day-of-week). Global by default; `action` + `range` query params narrow
+        // it. The shared aggregations live in `crate::report`.
+        .route("/reports", get(reports_page))
         .route("/runs/:id", get(run_detail))
         .route("/runs/:id/jobs/:key/attempt/:attempt", get(job_stream_page))
         .route(
@@ -655,6 +659,169 @@ async fn action_durations(
         chart,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
+// ---- reports page (CLAUDE-117) --------------------------------------------
+//
+// Historical spend / runs / time-of-day / day-of-week, rendered off the shared
+// `crate::report` aggregations. Spend is the primary metric and renders first.
+// Bars are CSS-width divs (no charting library, no divide-by-zero on empty
+// windows); the percentage per row is precomputed against the series max here.
+
+/// One daily spend row with a precomputed bar width (0-100, relative to the
+/// window's busiest day).
+#[derive(Serialize)]
+struct DailyBar {
+    date: String,
+    cost: f64,
+    runs: i64,
+    pct: u32,
+}
+
+#[derive(Serialize)]
+struct WeeklyBar {
+    week: String,
+    cost: f64,
+    runs: i64,
+    pct: u32,
+}
+
+#[derive(Serialize)]
+struct HourBar {
+    /// Zero-padded local hour, `"00".."23"`.
+    hour: String,
+    cost: f64,
+    jobs: i64,
+    runs: i64,
+    pct: u32,
+}
+
+#[derive(Serialize)]
+struct WeekdayBar {
+    day: String,
+    cost: f64,
+    runs: i64,
+    minutes: f64,
+    pct: u32,
+}
+
+#[derive(Template)]
+#[template(path = "reports.html")]
+struct ReportsTpl {
+    version: &'static str,
+    /// Selected range param (`all` / `30d` / `90d`), for the selector state.
+    range: String,
+    /// Selected action filter, or `None` for global totals.
+    action: Option<String>,
+    /// Action names offered in the filter dropdown.
+    actions: Vec<String>,
+    summary: crate::report::Summary,
+    daily: Vec<DailyBar>,
+    weekly: Vec<WeeklyBar>,
+    /// Always 24 buckets, `00..23`.
+    hours: Vec<HourBar>,
+    /// Always 7 buckets, Sunday first.
+    weekdays: Vec<WeekdayBar>,
+}
+
+/// Query params for `/reports`: `range` (default all-time) and an optional
+/// `action` filter (empty string = all actions).
+#[derive(Deserialize, Default)]
+struct ReportsQuery {
+    #[serde(default)]
+    range: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+}
+
+/// Bar width as a percentage of the series max, guarded against an all-zero
+/// series so an empty window renders flat rather than dividing by zero.
+fn bar_pct(value: f64, max: f64) -> u32 {
+    if max <= 0.0 {
+        0
+    } else {
+        ((value / max) * 100.0).round() as u32
+    }
+}
+
+async fn reports_page(
+    State(s): State<WebState>,
+    Query(q): Query<ReportsQuery>,
+) -> Result<Html<String>, WebError> {
+    let pool = &s.api.pool;
+    let range = crate::report::Range::from_param(q.range.as_deref().unwrap_or("all"));
+    let action_filter = q.action.as_deref().filter(|a| !a.is_empty());
+
+    let summary = crate::report::summary(pool, range, action_filter).await?;
+    let daily_pts = crate::report::daily(pool, range, action_filter).await?;
+    let weekly_pts = crate::report::weekly(pool, range, action_filter).await?;
+    let hour_pts = crate::report::by_hour(pool, range, action_filter).await?;
+    let weekday_pts = crate::report::by_weekday(pool, range, action_filter).await?;
+
+    let daily_max = daily_pts.iter().map(|d| d.cost_usd).fold(0.0, f64::max);
+    let daily = daily_pts
+        .iter()
+        .map(|d| DailyBar {
+            date: d.date.clone(),
+            cost: d.cost_usd,
+            runs: d.run_count,
+            pct: bar_pct(d.cost_usd, daily_max),
+        })
+        .collect();
+
+    let weekly_max = weekly_pts.iter().map(|w| w.cost_usd).fold(0.0, f64::max);
+    let weekly = weekly_pts
+        .iter()
+        .map(|w| WeeklyBar {
+            week: w.week.clone(),
+            cost: w.cost_usd,
+            runs: w.run_count,
+            pct: bar_pct(w.cost_usd, weekly_max),
+        })
+        .collect();
+
+    let hour_max = hour_pts.iter().map(|h| h.cost_usd).fold(0.0, f64::max);
+    let hours = hour_pts
+        .iter()
+        .map(|h| HourBar {
+            hour: format!("{:02}", h.hour),
+            cost: h.cost_usd,
+            jobs: h.job_count,
+            runs: h.run_starts,
+            pct: bar_pct(h.cost_usd, hour_max),
+        })
+        .collect();
+
+    let wd_max = weekday_pts.iter().map(|d| d.cost_usd).fold(0.0, f64::max);
+    let weekdays = weekday_pts
+        .iter()
+        .map(|d| WeekdayBar {
+            day: d.label.clone(),
+            cost: d.cost_usd,
+            runs: d.run_count,
+            minutes: d.run_minutes,
+            pct: bar_pct(d.cost_usd, wd_max),
+        })
+        .collect();
+
+    let actions = state::action_index_list(pool)
+        .await?
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
+
+    let tpl = ReportsTpl {
+        version: s.api.version,
+        range: range.as_param().to_string(),
+        action: action_filter.map(str::to_string),
+        actions,
+        summary,
+        daily,
+        weekly,
+        hours,
+        weekdays,
+    };
+    Ok(Html(tpl.render().map_err(WebError::from)?))
 }
 
 // ---- action editor / import / export (CLAUDE-7) ---------------------------

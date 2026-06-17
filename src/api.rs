@@ -15,6 +15,7 @@
 //! | POST | `/runs/<id>/cancel` | cancel an in-flight run |
 //! | POST | `/pause` | global pause |
 //! | POST | `/resume` | global resume |
+//! | GET | `/report/{summary,daily,weekly,by-weekday,by-hour}` | historical aggregations (CLAUDE-117) |
 //!
 //! `POST /actions/<name>/delete` removes the YAML file, the `actions` index
 //! row, and the action's control state (`paused_actions`, `attempt_counters`,
@@ -26,7 +27,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -87,6 +88,14 @@ pub fn router(state: AppState) -> Router {
             "/settings/:section",
             get(get_settings_section).put(put_settings_section),
         )
+        // CLAUDE-117: reporting aggregations. Each accepts `range` (30d|90d|all,
+        // default all) and an optional `action` filter, returning the series the
+        // `/reports` page also renders. Mounted under `/api` over TCP.
+        .route("/report/summary", get(report_summary))
+        .route("/report/daily", get(report_daily))
+        .route("/report/weekly", get(report_weekly))
+        .route("/report/by-weekday", get(report_by_weekday))
+        .route("/report/by-hour", get(report_by_hour))
         .with_state(Arc::new(state))
 }
 
@@ -380,6 +389,76 @@ async fn put_settings_section(
             message: e.to_string(),
         }),
     }
+}
+
+// ---- CLAUDE-117: reporting endpoints --------------------------------------
+
+/// Query params shared by every `/api/report/*` endpoint. Both fields are
+/// optional: `range` defaults to all-time, an empty / absent `action` means
+/// global totals across all actions.
+#[derive(Debug, Deserialize, Default)]
+struct ReportQuery {
+    #[serde(default)]
+    range: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+}
+
+impl ReportQuery {
+    fn range(&self) -> crate::report::Range {
+        crate::report::Range::from_param(self.range.as_deref().unwrap_or("all"))
+    }
+
+    /// The action filter, treating an empty string (the "All actions" form
+    /// option) as no filter.
+    fn action(&self) -> Option<&str> {
+        self.action.as_deref().filter(|a| !a.is_empty())
+    }
+}
+
+async fn report_summary(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<crate::report::Summary>, AppError> {
+    Ok(Json(
+        crate::report::summary(&s.pool, q.range(), q.action()).await?,
+    ))
+}
+
+async fn report_daily(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<Vec<crate::report::DailyPoint>>, AppError> {
+    Ok(Json(
+        crate::report::daily(&s.pool, q.range(), q.action()).await?,
+    ))
+}
+
+async fn report_weekly(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<Vec<crate::report::WeeklyPoint>>, AppError> {
+    Ok(Json(
+        crate::report::weekly(&s.pool, q.range(), q.action()).await?,
+    ))
+}
+
+async fn report_by_weekday(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<Vec<crate::report::WeekdayBucket>>, AppError> {
+    Ok(Json(
+        crate::report::by_weekday(&s.pool, q.range(), q.action()).await?,
+    ))
+}
+
+async fn report_by_hour(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ReportQuery>,
+) -> Result<Json<Vec<crate::report::HourBucket>>, AppError> {
+    Ok(Json(
+        crate::report::by_hour(&s.pool, q.range(), q.action()).await?,
+    ))
 }
 
 #[derive(Debug)]
