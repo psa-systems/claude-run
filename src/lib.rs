@@ -37,6 +37,7 @@ pub mod mint;
 pub mod native;
 pub mod paint;
 pub mod provider;
+pub mod report;
 pub mod scheduler;
 pub mod secrets;
 pub mod settings;
