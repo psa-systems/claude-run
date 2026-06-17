@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}Reports - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><span class="current">Reports</span>{% endblock %}
+{% block main %}
+
+{# CLAUDE-117: historical reporting. Spend is the primary metric and renders
+   first. Bars are server-computed CSS widths; the GET form drives the range +
+   action filter (no HTMX needed, the page is a plain reload). #}
+
+<h2>Reports</h2>
+<form method="get" action="/reports" style="display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 8px;">
+  <label style="display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--fg-dim);">
+    Range
+    <select name="range" class="btn">
+      <option value="all" {% if range == "all" %}selected{% endif %}>All time</option>
+      <option value="30d" {% if range == "30d" %}selected{% endif %}>Last 30 days</option>
+      <option value="90d" {% if range == "90d" %}selected{% endif %}>Last 90 days</option>
+    </select>
+  </label>
+  <label style="display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--fg-dim);">
+    Action
+    <select name="action" class="btn">
+      <option value="" {% if action.is_none() %}selected{% endif %}>All actions</option>
+      {% for a in actions %}
+        <option value="{{ a }}" {% if let Some(sel) = action %}{% if sel == a %}selected{% endif %}{% endif %}>{{ a }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button class="btn" type="submit">Apply</button>
+</form>
+
+<h2>Spend</h2>
+<div class="grid">
+  <div class="card">
+    <h3>Total spend</h3>
+    <div style="font-size: 28px; font-family: var(--mono);">${{ "{:.4}"|format(summary.total_cost_usd) }}</div>
+    <div class="meta">USD over {{ range }}{% if let Some(a) = action %} - {{ a }}{% endif %}</div>
+  </div>
+  <div class="card">
+    <h3>Total runs</h3>
+    <div style="font-size: 28px; font-family: var(--mono);">{{ summary.total_runs }}</div>
+    <div class="meta">runs over {{ range }}</div>
+  </div>
+  <div class="card">
+    <h3>Run minutes</h3>
+    <div style="font-size: 28px; font-family: var(--mono);">{{ "{:.1}"|format(summary.total_run_minutes) }}</div>
+    <div class="meta">wall-clock minutes (finished runs)</div>
+  </div>
+</div>
+
+<h2>Daily spend</h2>
+{% if daily.is_empty() %}
+  <div class="card"><span class="dim">No spend recorded in this window.</span></div>
+{% else %}
+  <table>
+    <thead><tr><th>Date</th><th>Spend</th><th style="width: 40%;"></th><th>Runs</th></tr></thead>
+    <tbody>
+      {% for d in daily %}
+        <tr>
+          <td class="mono dim">{{ d.date }}</td>
+          <td class="mono">${{ "{:.4}"|format(d.cost) }}</td>
+          <td><div style="background: var(--accent); height: 8px; border-radius: 2px; width: {{ d.pct }}%;"></div></td>
+          <td class="mono">{{ d.runs }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+<h2>Weekly spend (ISO week)</h2>
+{% if weekly.is_empty() %}
+  <div class="card"><span class="dim">No spend recorded in this window.</span></div>
+{% else %}
+  <table>
+    <thead><tr><th>Week</th><th>Spend</th><th style="width: 40%;"></th><th>Runs</th></tr></thead>
+    <tbody>
+      {% for w in weekly %}
+        <tr>
+          <td class="mono dim">{{ w.week }}</td>
+          <td class="mono">${{ "{:.4}"|format(w.cost) }}</td>
+          <td><div style="background: var(--accent); height: 8px; border-radius: 2px; width: {{ w.pct }}%;"></div></td>
+          <td class="mono">{{ w.runs }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+<h2>Time of day (local hour)</h2>
+<table>
+  <thead><tr><th>Hour</th><th>Spend</th><th style="width: 40%;"></th><th>Jobs</th><th>Run starts</th></tr></thead>
+  <tbody>
+    {% for h in hours %}
+      <tr>
+        <td class="mono dim">{{ h.hour }}:00</td>
+        <td class="mono">${{ "{:.4}"|format(h.cost) }}</td>
+        <td><div style="background: var(--accent); height: 8px; border-radius: 2px; width: {{ h.pct }}%;"></div></td>
+        <td class="mono">{{ h.jobs }}</td>
+        <td class="mono">{{ h.runs }}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h2>Day of week (all Sundays, all Mondays, ...)</h2>
+<table>
+  <thead><tr><th>Day</th><th>Spend</th><th style="width: 40%;"></th><th>Runs</th><th>Run minutes</th></tr></thead>
+  <tbody>
+    {% for d in weekdays %}
+      <tr>
+        <td class="dim">{{ d.day }}</td>
+        <td class="mono">${{ "{:.4}"|format(d.cost) }}</td>
+        <td><div style="background: var(--accent); height: 8px; border-radius: 2px; width: {{ d.pct }}%;"></div></td>
+        <td class="mono">{{ d.runs }}</td>
+        <td class="mono">{{ "{:.1}"|format(d.minutes) }}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% endblock %}
