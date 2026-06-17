@@ -587,10 +587,82 @@ mod tests {
     /// CLAUDE-52: a `claude` that outlives the wall-clock budget is SIGKILLed by
     /// the `timeout(1)` wrapper (exit 124). The result carries `timed_out = true`
     /// alongside `ok = false`, distinguishing a timeout from a hard failure.
+    /// Ensure a coreutils-faithful `timeout` is first on PATH for the test
+    /// process. Production resolves `timeout` via PATH and relies on its
+    /// exit-124-on-timeout contract (a documented coreutils host dependency).
+    /// The pre-commit dev image (`rust-builder-musl:*-alpine`) ships only
+    /// busybox `timeout`, which exits 143 (SIGTERM) instead of 124 on timeout,
+    /// so a test that asserts the 124 contract is non-deterministic across hosts.
+    /// We install a tiny POSIX-sh shim that reproduces coreutils' behaviour
+    /// (TERM after N seconds, exit 124 if it had to kill) and prepend it to PATH
+    /// once, so the exit-code contract is exercised deterministically regardless
+    /// of which `timeout` the host happens to ship. For non-timeout runs the shim
+    /// forwards the child's own exit status, so other `invoke` tests are
+    /// unaffected.
+    fn ensure_coreutils_timeout_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::OnceLock;
+
+        static SHIM_DIR: OnceLock<PathBuf> = OnceLock::new();
+        let dir = SHIM_DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join("claude-run-test-timeout-shim");
+            std::fs::create_dir_all(&dir).unwrap();
+            let shim = dir.join("timeout");
+            // Parse a leading `<N>s` (or bare `<N>`) duration like coreutils, run
+            // the command in the background, and SIGTERM it after the budget. A
+            // marker file records that the watchdog fired: exit 124 when it did
+            // (the run was killed for exceeding the budget), otherwise forward the
+            // child's own exit status. This reproduces coreutils' contract that
+            // the only `invoke` test asserting on it (`invoke_timeout_sets_timed_out`)
+            // depends on.
+            let body = r#"#!/bin/sh
+secs=$1; shift
+secs=${secs%s}
+fired="$(mktemp)"
+rm -f "$fired"
+"$@" &
+child=$!
+( sleep "$secs"; : > "$fired"; kill -TERM "$child" 2>/dev/null; sleep 1; kill -KILL "$child" 2>/dev/null ) &
+watcher=$!
+wait "$child"
+code=$?
+kill "$watcher" 2>/dev/null
+wait "$watcher" 2>/dev/null
+if [ -e "$fired" ]; then
+    rm -f "$fired"
+    exit 124
+fi
+rm -f "$fired"
+exit "$code"
+"#;
+            std::fs::write(&shim, body).unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        });
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        let prefix = dir.as_os_str().to_owned();
+        // Idempotent: only prepend if our shim dir is not already leading.
+        let already = std::env::split_paths(&current).next().map(|p| p == *dir);
+        if already != Some(true) {
+            let mut paths = vec![dir.clone()];
+            paths.extend(std::env::split_paths(&current));
+            let joined = std::env::join_paths(paths).unwrap();
+            // Safe under edition 2021; the init is effectively single-shot and
+            // only ever prepends the same shim dir.
+            std::env::set_var("PATH", &joined);
+            let _ = prefix;
+        }
+    }
+
     #[test]
     fn invoke_timeout_sets_timed_out() {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
+
+        // Pin a coreutils-faithful `timeout` (exit 124 on timeout) so the assertion
+        // holds even on hosts whose `timeout` is busybox (exits 143). See the
+        // helper for the full rationale.
+        ensure_coreutils_timeout_on_path();
 
         let dir = tempfile::tempdir().unwrap();
         // Stub "claude": sleep well past the 1s budget so the wrapper kills it.
