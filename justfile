@@ -33,7 +33,13 @@ pre-commit:
         --rm
         --volume $"($env.PWD):/build"
         --workdir /build
-        --volume $"($vol_target):/build/target"
+        # Mount the cargo target cache OUTSIDE the /build bind mount and point
+        # cargo at it with CARGO_TARGET_DIR. Nesting a named volume at
+        # /build/target makes the Docker daemon create a root-owned target/ on
+        # the host that needs sudo to remove (DEV-371). The cache still persists
+        # in the named volume; only its mount path moves off the bind mount.
+        --volume $"($vol_target):/cargo-target"
+        --env CARGO_TARGET_DIR=/cargo-target
         --volume $"($vol_reg):/usr/local/cargo/registry"
     ]
     print "\n[pre-commit] cargo fmt --check"
