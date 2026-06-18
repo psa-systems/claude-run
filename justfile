@@ -36,6 +36,11 @@ pre-commit:
         --volume $"($vol_target):/build/target"
         --volume $"($vol_reg):/usr/local/cargo/registry"
     ]
+    # Pre-create ./target host-owned. The cargo-target named volume mounts at
+    # /build/target (a subpath of the $PWD bind mount); with no existing dir the
+    # Docker daemon creates the host mountpoint as root, leaving a root-owned
+    # ./target that needs sudo to remove (DEV-371). nu's mkdir is idempotent.
+    mkdir target
     print "\n[pre-commit] cargo fmt --check"
     ^docker run ...$docker_args $img cargo fmt --check
     print "\n[pre-commit] cargo clippy --all-targets -- -D warnings"
