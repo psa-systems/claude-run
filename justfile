@@ -33,14 +33,15 @@ pre-commit:
         --rm
         --volume $"($env.PWD):/build"
         --workdir /build
-        --volume $"($vol_target):/build/target"
+        # Mount the cargo target cache OUTSIDE the /build bind mount and point
+        # cargo at it with CARGO_TARGET_DIR. Nesting a named volume at
+        # /build/target makes the Docker daemon create a root-owned target/ on
+        # the host that needs sudo to remove (DEV-371). The cache still persists
+        # in the named volume; only its mount path moves off the bind mount.
+        --volume $"($vol_target):/cargo-target"
+        --env CARGO_TARGET_DIR=/cargo-target
         --volume $"($vol_reg):/usr/local/cargo/registry"
     ]
-    # Pre-create ./target host-owned. The cargo-target named volume mounts at
-    # /build/target (a subpath of the $PWD bind mount); with no existing dir the
-    # Docker daemon creates the host mountpoint as root, leaving a root-owned
-    # ./target that needs sudo to remove (DEV-371). nu's mkdir is idempotent.
-    mkdir target
     print "\n[pre-commit] cargo fmt --check"
     ^docker run ...$docker_args $img cargo fmt --check
     print "\n[pre-commit] cargo clippy --all-targets -- -D warnings"
