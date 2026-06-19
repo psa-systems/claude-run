@@ -43,12 +43,40 @@ jobs:
         with:
           fetch-depth: 0
 
+      # CLAUDE-122: a release commit is pushed to `main` and tagged `v*` at the
+      # same commit, firing both the branch-push and the tag-push run of this
+      # workflow. Two concurrent runs then publish the identical artifact to the
+      # identical destination, racing the binary's DELETE-then-PUT and producing
+      # a `409 package file already exists`. Suppress the redundant branch-push
+      # run when HEAD is also an exact tag, leaving the tag-push run as the sole
+      # publisher. `git describe --exact-match` needs the tags, which the
+      # `fetch-depth: 0` checkout above provides.
+      - name: Decide whether to publish
+        id: guard
+        shell: nu {0}
+        run: |
+          let ref_type = "${{ github.ref_type }}"
+          let ref = "${{ github.ref }}"
+          # Prefer github.ref_type; fall back to the refs/heads/ prefix if the
+          # runner does not populate ref_type.
+          let is_branch = ($ref_type == "branch") or ($ref | str starts-with "refs/heads/")
+          let is_tagged = ((^git describe --tags --exact-match HEAD | complete | get exit_code) == 0)
+          let skip = ($is_branch and $is_tagged)
+          $"skip=($skip)\n" | save --append $env.GITHUB_OUTPUT
+          if $skip {
+            print "HEAD is a tagged release commit pushed to a branch; the tag-push run is the sole publisher. Skipping build + publish."
+          } else {
+            print $"Proceeding: is_branch=($is_branch) is_tagged=($is_tagged)"
+          }
+
       - name: Verify Docker availability
+        if: steps.guard.outputs.skip != 'true'
         run: |
           docker version
           docker buildx version
 
       - name: Set environment variables
+        if: steps.guard.outputs.skip != 'true'
         shell: nu {0}
         run: |
           let owner = $env.REGISTRY_OWNER
@@ -56,6 +84,7 @@ jobs:
 
       - name: Get artifact tags
         id: get-tags
+        if: steps.guard.outputs.skip != 'true'
         shell: nu {0}
         run: |
           let tags = (^nu oci-build/get-tags.nu --joined)
@@ -63,6 +92,7 @@ jobs:
 
       - name: Compute build metadata
         id: build-meta
+        if: steps.guard.outputs.skip != 'true'
         shell: nu {0}
         run: |
           let git_hash = (^git rev-parse --short=12 HEAD | str trim)
@@ -73,6 +103,7 @@ jobs:
           print $"build_date=($build_date)"
 
       - name: Build binary
+        if: steps.guard.outputs.skip != 'true'
         shell: nu {0}
         run: |
           let git_hash = "${{ steps.build-meta.outputs.git_hash }}"
@@ -94,6 +125,7 @@ jobs:
           print (open --raw claude-run-linux-x86_64.sha256)
 
       - name: Publish binary as Generic Package
+        if: steps.guard.outputs.skip != 'true'
         shell: nu {0}
         run: |
           let tags_str = "${{ steps.get-tags.outputs.tags }}"
@@ -127,6 +159,7 @@ jobs:
           }
 
       - name: Print published URLs
+        if: steps.guard.outputs.skip != 'true'
         shell: nu {0}
         run: |
           let tags_str = "${{ steps.get-tags.outputs.tags }}"
