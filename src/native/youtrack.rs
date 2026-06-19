@@ -26,7 +26,7 @@
 //! local engineering work (no push, no PR, no YouTrack write).
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -630,7 +630,54 @@ fn run_pre(
         .set_state(&job.key, &src.states.in_progress)
         .map_err(|e| format!("set State={}: {e}", src.states.in_progress))?;
     clone_repo(&job.clone_url, workdir).map_err(|e| format!("git clone: {e}"))?;
+    install_hooks(workdir);
     Ok(())
+}
+
+/// CLAUDE-120: install the repo's git pre-commit hook on a fresh clone so a
+/// commit that fails the repo's local checks is blocked locally instead of only
+/// being caught by CI (the gap that produced A8N-69). Detects a `just
+/// install-hooks` recipe and, when present, runs it; the recipe is idempotent
+/// (it rewrites `.git/hooks/pre-commit`), so running it on every clone is safe.
+///
+/// Non-fatal by contract: this is an additional local backstop, not a hard
+/// gate. A repo with no `install-hooks` recipe, or a host without `just`, is
+/// left unchanged and the bootstrap continues - failing the job here would be
+/// strictly worse than the CI-only status quo.
+fn install_hooks(workdir: &Path) {
+    // `just --show <recipe>` exits non-zero when the recipe (or the justfile
+    // itself) is absent, so it doubles as the presence probe with no output
+    // parsing. A spawn error means `just` is not installed: nothing to do.
+    match Command::new("just")
+        .current_dir(workdir)
+        .arg("--show")
+        .arg("install-hooks")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(_) => return, // no install-hooks recipe; leave the clone unchanged
+        Err(e) => {
+            info!(error = %e, "just not available; skipping pre-commit hook install");
+            return;
+        }
+    }
+    match Command::new("just")
+        .current_dir(workdir)
+        .arg("install-hooks")
+        .status()
+    {
+        Ok(s) if s.success() => info!("installed repo pre-commit hook on fresh clone"),
+        Ok(s) => warn!(
+            code = s.code(),
+            "just install-hooks failed; continuing without local pre-commit hook"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            "running just install-hooks failed; continuing without local pre-commit hook"
+        ),
+    }
 }
 
 /// Shallow-clone `clone_url` into `workdir` (already created, empty). Host git
@@ -1480,6 +1527,78 @@ mod tests {
             !clone.exists(),
             "a workdir with no unpushed work is removed"
         );
+    }
+
+    // ---- CLAUDE-120: post-clone pre-commit hook install -----------------
+
+    fn just_available() -> bool {
+        Command::new("just")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn install_hooks_writes_executable_hook_when_recipe_present() {
+        if !just_available() {
+            eprintln!("skipping: `just` not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init"]);
+        // A minimal, portable install-hooks recipe (sh, no nu) mirroring the
+        // real one: it rewrites .git/hooks/pre-commit and marks it executable.
+        std::fs::write(
+            dir.path().join("justfile"),
+            "install-hooks:\n    #!/usr/bin/env sh\n    printf '#!/usr/bin/env sh\\nexec just pre-commit\\n' > .git/hooks/pre-commit\n    chmod +x .git/hooks/pre-commit\n",
+        )
+        .unwrap();
+
+        install_hooks(dir.path());
+
+        let hook = dir.path().join(".git/hooks/pre-commit");
+        assert!(hook.exists(), "hook must be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&hook).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "hook must be executable, got {mode:o}");
+        }
+    }
+
+    #[test]
+    fn install_hooks_is_a_noop_without_a_recipe() {
+        // A repo with no justfile (so no install-hooks recipe) must not gain a
+        // hook and must not fail the bootstrap. Environment-independent: holds
+        // whether or not `just` is installed.
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init"]);
+        install_hooks(dir.path());
+        assert!(
+            !dir.path().join(".git/hooks/pre-commit").exists(),
+            "no recipe means no hook"
+        );
+    }
+
+    #[test]
+    fn install_hooks_is_idempotent() {
+        if !just_available() {
+            eprintln!("skipping: `just` not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init"]);
+        std::fs::write(
+            dir.path().join("justfile"),
+            "install-hooks:\n    #!/usr/bin/env sh\n    printf '#!/usr/bin/env sh\\nexec just pre-commit\\n' > .git/hooks/pre-commit\n    chmod +x .git/hooks/pre-commit\n",
+        )
+        .unwrap();
+        install_hooks(dir.path());
+        install_hooks(dir.path());
+        assert!(dir.path().join(".git/hooks/pre-commit").exists());
     }
 
     // CLAUDE-105: build an origin + single-branch clone, mimicking the shallow
