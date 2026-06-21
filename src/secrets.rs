@@ -238,8 +238,13 @@ impl JobCredentials {
             std::fs::set_permissions(&fj_dir, std::fs::Permissions::from_mode(0o700))?;
             let keys_path = fj_dir.join("keys.json");
 
-            let mut host_obj = serde_json::Map::new();
-            host_obj.insert("token".into(), serde_json::Value::String(token.clone()));
+            // CLAUDE-123: the current `fj` (`forgejo-cli`) deserializes each host
+            // entry with required `type`/`name` fields, so a `token`-only entry
+            // fails to parse (`missing field \`type\``) before `fj` ever contacts
+            // the server, breaking `fj pr create` for every branch-strategy job.
+            // Build a complete entry, cloning the operator's real store entry when
+            // present so we never re-derive `fj`'s schema by hand.
+            let host_obj = fj_host_entry(&operator_fj_keys_path(), host, token);
             let mut hosts = serde_json::Map::new();
             hosts.insert(host.to_string(), serde_json::Value::Object(host_obj));
             let payload = serde_json::json!({ "hosts": hosts });
@@ -280,6 +285,66 @@ fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
         .open(path)?;
     f.write_all(bytes)?;
     Ok(())
+}
+
+/// Path to the operator's real `fj` key store
+/// (`~/.local/share/forgejo-cli/keys.json`), the same store `CliBackend::new`
+/// reads. Used as the template source for a per-job entry.
+fn operator_fj_keys_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("forgejo-cli")
+        .join("keys.json")
+}
+
+/// Build the per-job `fj` host entry for `host`, carrying `token`.
+///
+/// Preferred (CLAUDE-123): clone the operator's real key-store entry for `host`
+/// from `operator_keys_path`, so whatever non-token fields the installed `fj`
+/// requires (`type`, `name`, and any future additions) carry over verbatim, and
+/// overwrite only `token` with the per-job decrypted value. This avoids
+/// re-encoding `fj`'s store schema in claude-run (Tooling Gap Discipline).
+///
+/// Fallback (no operator store, e.g. the container runtime where host auth
+/// arrives via read-only bind mounts and the store may be absent): a complete
+/// synthetic entry mirroring what `fj auth add-key` writes. `type =
+/// "Application"`, `name = "claude-run"`. `fj` accepts a host entry of exactly
+/// `{type, name, token}` with no top-level `aliases`/`default_ssh` (both carry
+/// serde defaults), verified against the pinned `forgejo-cli`.
+fn fj_host_entry(
+    operator_keys_path: &Path,
+    host: &str,
+    token: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut host_obj = operator_fj_host_entry(operator_keys_path, host).unwrap_or_else(|| {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "type".into(),
+            serde_json::Value::String("Application".into()),
+        );
+        m.insert(
+            "name".into(),
+            serde_json::Value::String("claude-run".into()),
+        );
+        m
+    });
+    // Always substitute the per-job token; the operator template's token (if
+    // any) must never leak into a per-job store.
+    host_obj.insert("token".into(), serde_json::Value::String(token.to_string()));
+    host_obj
+}
+
+/// Read the operator's key store and return a clone of its host entry for
+/// `host`, or `None` when the store is missing, unparseable, or has no entry for
+/// `host`. Best-effort: any failure falls back to the synthetic entry.
+fn operator_fj_host_entry(
+    path: &Path,
+    host: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let entry = parsed.get("hosts")?.get(host)?.as_object()?;
+    Some(entry.clone())
 }
 
 #[cfg(test)]
@@ -355,6 +420,25 @@ mod tests {
             let keys = std::fs::read_to_string(&keys_path).unwrap();
             assert!(keys.contains("dev.a8n.run"));
             assert!(keys.contains("fj-token"));
+            // CLAUDE-123: the host entry must deserialize under `fj`'s schema,
+            // which requires `type` and `name` (a `token`-only entry fails to
+            // parse with `missing field \`type\``). Mirror that schema here so a
+            // regression to a token-only entry fails CI.
+            #[derive(serde::Deserialize)]
+            struct FjStore {
+                hosts: std::collections::BTreeMap<String, FjHostKey>,
+            }
+            #[derive(serde::Deserialize)]
+            struct FjHostKey {
+                r#type: String,
+                name: String,
+                token: String,
+            }
+            let store: FjStore = serde_json::from_str(&keys).unwrap();
+            let entry = store.hosts.get("dev.a8n.run").unwrap();
+            assert!(!entry.r#type.is_empty());
+            assert!(!entry.name.is_empty());
+            assert_eq!(entry.token, "fj-token");
             assert_eq!(
                 std::fs::metadata(&keys_path).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -374,6 +458,65 @@ mod tests {
         assert!(!job_dir.exists());
         assert!(!cfg_path.exists());
         assert!(!keys_path.exists());
+    }
+
+    #[test]
+    fn fj_host_entry_falls_back_to_complete_synthetic_entry() {
+        // CLAUDE-123: with no operator store, a complete entry is synthesized so
+        // `fj` parses it (it requires `type`/`name`, not just `token`).
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-store.json");
+        let entry = fj_host_entry(&missing, "dev.a8n.run", "per-job-token");
+        assert_eq!(
+            entry.get("type").and_then(|v| v.as_str()),
+            Some("Application")
+        );
+        assert_eq!(
+            entry.get("name").and_then(|v| v.as_str()),
+            Some("claude-run")
+        );
+        assert_eq!(
+            entry.get("token").and_then(|v| v.as_str()),
+            Some("per-job-token")
+        );
+    }
+
+    #[test]
+    fn fj_host_entry_clones_operator_template_and_swaps_token() {
+        // CLAUDE-123: when the operator store has the host, reuse its non-token
+        // fields (including any beyond type/name) and substitute only the token,
+        // so the operator's own token never leaks into the per-job store.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("keys.json");
+        std::fs::write(
+            &store,
+            r#"{"hosts":{"dev.a8n.run":{"type":"Application","name":"operator-label","token":"operator-token","extra":"keep-me"}},"aliases":{},"default_ssh":[]}"#,
+        )
+        .unwrap();
+
+        let entry = fj_host_entry(&store, "dev.a8n.run", "per-job-token");
+        // Non-token fields come from the operator template verbatim...
+        assert_eq!(
+            entry.get("type").and_then(|v| v.as_str()),
+            Some("Application")
+        );
+        assert_eq!(
+            entry.get("name").and_then(|v| v.as_str()),
+            Some("operator-label")
+        );
+        assert_eq!(entry.get("extra").and_then(|v| v.as_str()), Some("keep-me"));
+        // ...but the token is the per-job one, never the operator's.
+        assert_eq!(
+            entry.get("token").and_then(|v| v.as_str()),
+            Some("per-job-token")
+        );
+
+        // A host with no operator entry falls back to the synthetic shape.
+        let other = fj_host_entry(&store, "other.host", "per-job-token");
+        assert_eq!(
+            other.get("name").and_then(|v| v.as_str()),
+            Some("claude-run")
+        );
     }
 
     #[test]
