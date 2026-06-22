@@ -376,9 +376,19 @@ impl IssueTracker for CliBackend {
     }
 
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo> {
-        let stdout = self.yt_ok(&["project", "vcs", project_key, "--enabled-only", "--json"])?;
+        // `vcs` is a command group; `list` is the subcommand that takes the
+        // project short-name positional. Omitting it makes the project land in
+        // the `<COMMAND>` slot and `yt` exits 2 (CLAUDE-124).
+        let stdout = self.yt_ok(&[
+            "project",
+            "vcs",
+            "list",
+            project_key,
+            "--enabled-only",
+            "--json",
+        ])?;
         let procs: Vec<VcsProcessor> =
-            Self::parse_json(&self.yt, "yt project vcs --json", &stdout)?;
+            Self::parse_json(&self.yt, "yt project vcs list --json", &stdout)?;
         let first = procs
             .into_iter()
             .next()
@@ -407,19 +417,20 @@ impl IssueTracker for CliBackend {
             let raw = match self.yt_ok(&[
                 "project",
                 "vcs",
+                "list",
                 &project.short_name,
                 "--enabled-only",
                 "--json",
             ]) {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!(project = %project.short_name, error = %e, "yt project vcs failed; skipping project for mint routing");
+                    warn!(project = %project.short_name, error = %e, "yt project vcs list failed; skipping project for mint routing");
                     continue;
                 }
             };
             let procs: Vec<VcsProcessor> = match Self::parse_json(
                 &self.yt,
-                "yt project vcs --json",
+                "yt project vcs list --json",
                 &raw,
             ) {
                 Ok(p) => p,
@@ -766,7 +777,7 @@ mod tests {
         let json = r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#;
         let b = backend(StubRunner::new().ok(
             "yt",
-            &["project", "vcs", "MK", "--enabled-only", "--json"],
+            &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
             json,
         ));
         let repo = b.resolve_vcs("MK").unwrap();
@@ -782,7 +793,7 @@ mod tests {
     fn resolve_vcs_empty_is_no_integration() {
         let b = backend(StubRunner::new().ok(
             "yt",
-            &["project", "vcs", "MK", "--enabled-only", "--json"],
+            &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
             "[]",
         ));
         match b.resolve_vcs("MK").unwrap_err() {
@@ -806,17 +817,31 @@ mod tests {
             .ok("yt", &["project", "list", "--json"], projects)
             .ok(
                 "yt",
-                &["project", "vcs", "CLAUDE", "--enabled-only", "--json"],
+                &[
+                    "project",
+                    "vcs",
+                    "list",
+                    "CLAUDE",
+                    "--enabled-only",
+                    "--json",
+                ],
                 r#"[{"serverUrl":"https://dev.a8n.run","path":"contoso/claude-run"}]"#,
             )
             .ok(
                 "yt",
-                &["project", "vcs", "FJ", "--enabled-only", "--json"],
+                &["project", "vcs", "list", "FJ", "--enabled-only", "--json"],
                 r#"[{"serverUrl":"https://dev.a8n.run","path":"fabrikam/forgejo-cli"}]"#,
             )
             .fail(
                 "yt",
-                &["project", "vcs", "BROKEN", "--enabled-only", "--json"],
+                &[
+                    "project",
+                    "vcs",
+                    "list",
+                    "BROKEN",
+                    "--enabled-only",
+                    "--json",
+                ],
                 1,
                 "boom",
             );
