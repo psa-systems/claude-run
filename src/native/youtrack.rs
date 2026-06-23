@@ -375,8 +375,18 @@ fn gather(backend: &dyn Backend, query: &str) -> Result<Vec<YoutrackJob>> {
         if !vcs_cache.contains_key(&project) {
             let resolved = match backend.resolve_vcs(&project) {
                 Ok(r) => Some(r),
+                // Project genuinely has no enabled VCS processor (empty
+                // `list --json`): the legitimate drop path.
+                Err(Error::NoVcsIntegration(_)) => {
+                    info!(project = %project, "dropping issues: no usable VCS integration");
+                    None
+                }
+                // A probe tool error (e.g. `yt` exit 2) is NOT the same as
+                // "no integration": the project may well have one and the
+                // probe failed. Surface it as a provider-CLI error rather
+                // than silently collapsing it into the drop path (CLAUDE-124).
                 Err(e) => {
-                    info!(project = %project, error = %e, "dropping issues: no usable VCS integration");
+                    warn!(project = %project, error = %e, "VCS probe failed (provider-CLI error); skipping project this poll, not treating as missing integration");
                     None
                 }
             };
@@ -1293,13 +1303,13 @@ mod tests {
             )
             .ok(
                 "yt",
-                &["project", "vcs", "MK", "--enabled-only", "--json"],
+                &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
                 r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#,
             )
             // ZZ has no enabled VCS -> its issue is dropped.
             .ok(
                 "yt",
-                &["project", "vcs", "ZZ", "--enabled-only", "--json"],
+                &["project", "vcs", "list", "ZZ", "--enabled-only", "--json"],
                 "[]",
             );
         let backend = CliBackend::new(Arc::new(runner));
@@ -1311,6 +1321,38 @@ mod tests {
             jobs[0].clone_url,
             "https://dev.a8n.run/contoso/claude-run.git"
         );
+    }
+
+    #[test]
+    fn gather_skips_project_whose_vcs_probe_errors() {
+        // CLAUDE-124: a probe tool error (e.g. `yt` exit 2) is not the same as
+        // "no integration". The issue is skipped this poll, but via the
+        // provider-CLI-error path rather than the silent drop path. The good
+        // project's issue is unaffected.
+        let issues =
+            r#"[{"idReadable":"MK-16","summary":"a"},{"idReadable":"ZZ-1","summary":"b"}]"#;
+        let runner = StubRunner::new()
+            .ok(
+                "yt",
+                &["list", "--query=-Resolved AI Agent: Queued", "--json"],
+                issues,
+            )
+            .ok(
+                "yt",
+                &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
+                r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#,
+            )
+            // ZZ's probe errors (mirrors the malformed-argv exit-2 symptom).
+            .fail(
+                "yt",
+                &["project", "vcs", "list", "ZZ", "--enabled-only", "--json"],
+                2,
+                "unrecognized subcommand",
+            );
+        let backend = CliBackend::new(Arc::new(runner));
+        let jobs = gather(&backend, &src().query).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].key, "MK-16");
     }
 
     #[test]
