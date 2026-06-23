@@ -1,5 +1,5 @@
-# claude-run - Task Runner.
-#
+# General Task Runner
+
 # Conventions per `niceguyit/governance` CHECKLIST.md. Recipes are grouped
 # (`just --list` clusters them by `[group: '...']`) and use the rust-builder
 # image both for the pre-commit hook and for `check-docker`, so the
@@ -7,16 +7,19 @@
 
 dev_image := "dev.a8n.run/pandoras-box/rust-builder-musl:v1.0.0-rust1.94-alpine"
 
+# List available recipes
 default:
     @just --list
 
-# ── Hooks ────────────────────────────────────────────────────────────────────
+# -- Hooks --------------------------------------------------------------------
 
 # Install the git pre-commit hook (run once per fresh clone). Writes a stub at .git/hooks/pre-commit that execs `just pre-commit`. Bypass with `git commit --no-verify`.
 [group: 'hooks']
 install-hooks:
     #!/usr/bin/env nu
     let hook = ".git/hooks/pre-commit"
+    # Remove first so a leftover symlink from an older install does not get
+    # written through to its target file. `try` swallows the not-found case.
     try { rm $hook }
     "#!/usr/bin/env sh\nexec just pre-commit\n" | save $hook
     ^chmod +x $hook
@@ -52,19 +55,7 @@ pre-commit:
     ^docker run ...$docker_args $img cargo test
     print "\n[pre-commit] all checks passed"
 
-# ── Development ──────────────────────────────────────────────────────────────
-
-# Run the CLI with arguments (e.g. just run status, just run trigger youtrack).
-[group: 'dev']
-run *args:
-    cargo run -- {{ args }}
-
-# cargo-watch loop for continuous compilation.
-[group: 'dev']
-watch:
-    cargo watch --clear
-
-# ── Checks ───────────────────────────────────────────────────────────────────
+# -- Checks -------------------------------------------------------------------
 
 # Umbrella check: fmt + clippy + build + tests + builder-stage docker compile.
 [group: 'checks']
@@ -100,7 +91,19 @@ check-docker:
 typecheck:
     cargo check --all-targets
 
-# ── Single-step shortcuts ────────────────────────────────────────────────────
+# -- Development --------------------------------------------------------------
+
+# Run the CLI with arguments (e.g. just run status, just run trigger youtrack).
+[group: 'dev']
+run *args:
+    cargo run -- {{ args }}
+
+# cargo-watch loop for continuous compilation.
+[group: 'dev']
+watch:
+    cargo watch --clear
+
+# -- Single-step shortcuts ----------------------------------------------------
 
 # Cargo fmt in write mode.
 [group: 'single-step']
@@ -116,7 +119,7 @@ lint: check-clippy
 test:
     cargo test
 
-# ── Build ────────────────────────────────────────────────────────────────────
+# -- Build --------------------------------------------------------------------
 
 # Build release binary (debug profile is just `cargo build`).
 [group: 'build']
@@ -140,7 +143,7 @@ build-docker-export:
     ^docker buildx build --target binary --output type=local,dest=./output -f oci-build/Dockerfile .
     print $"Wrote ./output/claude-run"
 
-# ── Migrations ───────────────────────────────────────────────────────────────
+# -- Migrations ---------------------------------------------------------------
 
 # Apply pending sqlx migrations against the local state.db (uses the same XDG paths the binary uses at runtime).
 [group: 'migrations']
@@ -152,7 +155,7 @@ migrate:
 migrate-revert:
     @echo "no-op: schema-only migrations are forward-only via sqlx::migrate!; use a fresh state.db if you need to revert."
 
-# ── Release ──────────────────────────────────────────────────────────────────
+# -- Release ------------------------------------------------------------------
 
 # Create a release: bump major (vx.0.0), minor (v0.x.0), or hotfix (v0.0.x), push branch, and open the PR via fj. After the PR merges, .forgejo/workflows/create-release.yml tags and publishes.
 [group: 'release']
@@ -199,8 +202,8 @@ create-release bump:
     # Push release branch
     git push --set-upstream origin $release_branch
 
-    # Open the release PR via fj. Body lives in a tempfile so a future
-    # changelog can grow without inline escaping pain.
+    # Open the release PR via fj. Body lives in a tempfile so the
+    # changelog can grow later without inline escaping pain.
     let body_file = (mktemp --tmpdir --suffix .md)
     [
         $"Automated release PR for ($tag)."
@@ -215,6 +218,9 @@ create-release bump:
         exit 1
     }
 
+    # `fj pr create` prints `created pull request #N: <title>` on success.
+    # Parse the number out and build the PR URL from `origin` so the user
+    # gets a clickable link instead of just the fj line.
     let pr_num = (
         $fj_result.stdout
         | str trim
@@ -231,6 +237,8 @@ create-release bump:
     if ($pr_num | is-not-empty) {
         print $"PR: ($base_url)/pulls/($pr_num)"
     } else {
+        # fj output format drifted; fall back to whatever it said.
         print $"fj output: ($fj_result.stdout | str trim)"
     }
     print $"After merging, the create-release workflow will tag and release ($tag) automatically."
+
