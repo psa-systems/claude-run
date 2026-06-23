@@ -1,6 +1,7 @@
 ---
 
-# Validate code on every push and pull request: fmt, clippy, build, tests.
+# Validate code on every push and pull request by running 'just check'
+# Mirrors the local `just check` + `just test` recipes (which use ./dev/cargo).
 name: Check
 
 on:
@@ -19,13 +20,15 @@ jobs:
     steps:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          fetch-depth: 1
 
       - name: Cap build parallelism
         # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
