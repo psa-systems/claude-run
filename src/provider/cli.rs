@@ -533,6 +533,11 @@ impl Forge for CliBackend {
     }
 
     fn pr_ci_state(&self, host: &str, repo: &str, pr_number: u64) -> Result<String> {
+        // Combined CI status is one field of the full status snapshot.
+        Ok(self.pr_status(host, repo, pr_number)?.state)
+    }
+
+    fn pr_status(&self, host: &str, repo: &str, pr_number: u64) -> Result<super::PrStatus> {
         // Address the PR as `owner/repo#n` so `fj` resolves the repo without a
         // local checkout (gather runs before any clone).
         let id = format!("{repo}#{pr_number}");
@@ -544,9 +549,59 @@ impl Forge for CliBackend {
         #[derive(Deserialize)]
         struct Status {
             state: String,
+            // A `fj` predating CLAUDE-126's field, or a PR with no verdict yet,
+            // is treated as not-mergeable so automerge updates the branch rather
+            // than racing a premature merge.
+            #[serde(default)]
+            mergeable: bool,
         }
         let status: Status = Self::parse_json(&self.fj, "fj pr status --json", &stdout)?;
-        Ok(status.state)
+        Ok(super::PrStatus {
+            state: status.state,
+            mergeable: status.mergeable,
+        })
+    }
+
+    fn merge_pr(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
+        // Merge-commit (`--method merge`), never squash/rebase: every PR from
+        // the native action is a single commit carrying the bare `#<KEY>`
+        // reference, and only a merge-commit preserves it in history (CLAUDE-126).
+        let id = format!("{repo}#{pr_number}");
+        let args = ["--host", host, "pr", "merge", &id, "--method", "merge"];
+        let out = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        Self::checked(&self.fj, out, &args)?;
+        Ok(())
+    }
+
+    fn update_branch(&self, workdir: &Path) -> Result<()> {
+        // CLAUDE-126: `fj` exposes no `pr update-branch` subcommand, so perform
+        // the Forgejo "Update Branch" with the git CLI (the same binary that
+        // cloned and pushed the branch) instead of the REST API: refresh the
+        // remote, merge the base branch into the PR head, and push. The push
+        // retriggers CI, which the caller then re-polls.
+        let fetch = ["fetch", "origin"];
+        let out = self.runner.run_in_env(Some(workdir), "git", &fetch, &[])?;
+        Self::checked("git", out, &fetch)?;
+
+        // The base branch is whatever `origin/HEAD` points at, e.g. `origin/main`.
+        let base_args = ["rev-parse", "--abbrev-ref", "origin/HEAD"];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &base_args, &[])?;
+        let base = Self::checked("git", out, &base_args)?.trim().to_string();
+
+        let merge_args = ["merge", "--no-edit", base.as_str()];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &merge_args, &[])?;
+        Self::checked("git", out, &merge_args)?;
+
+        let push = ["push", "origin", "HEAD"];
+        let out = self.runner.run_in_env(Some(workdir), "git", &push, &[])?;
+        Self::checked("git", out, &push)?;
+        Ok(())
     }
 
     fn pr_comment(&self, host: &str, repo: &str, pr_number: u64, body_file: &Path) -> Result<()> {
@@ -1031,6 +1086,87 @@ mod tests {
             b.pr_ci_state("dev.a8n.run", "contoso/claude-run", 52)
                 .unwrap(),
             "failure"
+        );
+    }
+
+    #[test]
+    fn pr_status_extracts_state_and_mergeable() {
+        // CLAUDE-126: pr_status surfaces both the combined CI state and the
+        // mergeability verdict from the same `fj pr status --json`.
+        let json = r#"{"pr":52,"head_sha":"abc","state":"success","statuses":[],"mergeable":true,"merged":false}"#;
+        let b = backend(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "status",
+                "contoso/claude-run#52",
+                "--json",
+            ],
+            json,
+        ));
+        let st = b
+            .pr_status("dev.a8n.run", "contoso/claude-run", 52)
+            .unwrap();
+        assert_eq!(st.state, "success");
+        assert!(st.mergeable);
+    }
+
+    #[test]
+    fn merge_pr_invokes_fj_merge_with_merge_method() {
+        // CLAUDE-126: merge-commit method, addressed as owner/repo#n.
+        let runner = std::sync::Arc::new(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "merge",
+                "contoso/claude-run#52",
+                "--method",
+                "merge",
+            ],
+            "",
+        ));
+        let b = CliBackend::new(runner.clone());
+        b.merge_pr("dev.a8n.run", "contoso/claude-run", 52)
+            .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c
+                    == "fj --host dev.a8n.run pr merge contoso/claude-run#52 --method merge"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn update_branch_merges_base_into_head_and_pushes() {
+        // CLAUDE-126: the git-based "Update Branch" fetches, resolves the base
+        // from origin/HEAD, merges it into the PR head, and pushes.
+        let runner = std::sync::Arc::new(
+            StubRunner::new()
+                .ok("git", &["fetch", "origin"], "")
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main\n",
+                )
+                .ok("git", &["merge", "--no-edit", "origin/main"], "")
+                .ok("git", &["push", "origin", "HEAD"], ""),
+        );
+        let b = CliBackend::new(runner.clone());
+        b.update_branch(Path::new("/tmp/wd")).unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c == "git merge --no-edit origin/main"),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "git push origin HEAD"),
+            "{calls:?}"
         );
     }
 
