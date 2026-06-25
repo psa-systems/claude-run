@@ -113,8 +113,11 @@ impl ActionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum NativeConfig {
-    /// YouTrack built-in handler config.
-    Youtrack(YoutrackConfig),
+    /// YouTrack built-in handler config. Boxed (CLAUDE-125): adding the optional
+    /// `prompt` override grew this variant past the other, so the box keeps the
+    /// enum's variants size-balanced (`clippy::large_enum_variant`). `Box<T>` is
+    /// serde- and `PartialEq`-transparent, and field access auto-derefs.
+    Youtrack(Box<YoutrackConfig>),
     /// Forgejo CI-fix built-in handler config (CLAUDE-29).
     ForgejoCiFix(ForgejoCiFixConfig),
 }
@@ -176,6 +179,12 @@ pub struct YoutrackSource {
     pub custom_field: String,
     /// Labels of the AI Agent / State machine the handler drives.
     pub states: YoutrackStates,
+    /// Full-replacement prompt override (CLAUDE-125). `None` uses the built-in
+    /// `DEFAULT_YOUTRACK_PROMPT` from [`crate::native::youtrack`]. When set, the
+    /// text fully replaces the default and is rendered with the documented
+    /// `{{...}}` placeholders (`{{key}}`, `{{summary}}`, `{{clone_url}}`,
+    /// `{{workdir}}`, `{{needs_review_marker}}`, `{{skip_attempt_marker}}`).
+    pub prompt: Option<String>,
 }
 
 impl Default for YoutrackSource {
@@ -186,6 +195,7 @@ impl Default for YoutrackSource {
             query: default_query(),
             custom_field: default_custom_field(),
             states: YoutrackStates::default(),
+            prompt: None,
         }
     }
 }
@@ -574,7 +584,7 @@ post:
         // A bare `native: {}` resolves every field to its default.
         assert_eq!(
             loaded.action.native,
-            Some(NativeConfig::Youtrack(YoutrackConfig::default()))
+            Some(NativeConfig::Youtrack(Box::default()))
         );
     }
 
@@ -593,6 +603,8 @@ post:
         assert_eq!(cfg.youtrack.states.needs_review, "Needs Review");
         assert_eq!(cfg.youtrack.states.failed, "Failed");
         assert_eq!(cfg.youtrack.states.in_progress, "In Progress");
+        // CLAUDE-125: no prompt override by default; the built-in prompt is used.
+        assert!(cfg.youtrack.prompt.is_none());
         assert!(cfg.youtrack.base_url.is_none());
         assert!(cfg.youtrack.token_ref.is_none());
         assert!(cfg.forgejo.base_url.is_none());
@@ -633,6 +645,29 @@ native:
             validate_str(&bogus, "<candidate>").unwrap_err(),
             Error::Yaml(_)
         ));
+    }
+
+    #[test]
+    fn native_config_parses_youtrack_prompt_override() {
+        // CLAUDE-125: an explicit `prompt` is a full-replacement override that
+        // round-trips through the loader (block scalar keeps its trailing
+        // newline).
+        let raw = "\
+name: yt
+kind: youtrack
+native:
+  youtrack:
+    prompt: |
+      Work {{key}}: {{summary}}
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert_eq!(
+            cfg.youtrack.prompt.as_deref(),
+            Some("Work {{key}}: {{summary}}\n")
+        );
     }
 
     #[test]

@@ -45,6 +45,11 @@
   .yt-form .card { margin-bottom: 16px; }
   .yt-form .card h3 { color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.05em; font-size: 12px; }
   .yt-form .hint { font-size: 12px; margin: 8px 0 0; }
+  .yt-form textarea {
+    background: #0a0c10; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 8px 10px; font-family: var(--mono); font-size: 13px;
+    width: 100%; min-height: 360px; resize: vertical; box-sizing: border-box; line-height: 1.5;
+  }
 </style>
 
 <h2>{{ heading }}</h2>
@@ -97,6 +102,19 @@
       {% call textfield("Needs review", "state_needs_review", form.state_needs_review, "Needs Review") %}
       {% call textfield("Failed", "state_failed", form.state_failed, "Failed") %}
       {% call textfield("In progress (State field)", "state_in_progress", form.state_in_progress, "In Progress") %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Agent prompt</h3>
+    <label class="fld">
+      <span>Prompt (full replacement of the built-in default)</span>
+      <textarea name="yt_prompt" spellcheck="false" autocapitalize="off">{{ form.yt_prompt }}</textarea>
+    </label>
+    <p class="hint dim">The complete instruction text sent to the agent for each issue. Edit any part of it. Placeholders (double-brace) substituted per job: <code>&#123;&#123;key&#125;&#125;</code>, <code>&#123;&#123;summary&#125;&#125;</code>, <code>&#123;&#123;clone_url&#125;&#125;</code>, <code>&#123;&#123;workdir&#125;&#125;</code>, <code>&#123;&#123;needs_review_marker&#125;&#125;</code>, <code>&#123;&#123;skip_attempt_marker&#125;&#125;</code>. An unknown placeholder is left literal. Saving text equal to the default (or an empty box) stores no override, so future default improvements still apply.</p>
+    <div class="row-actions" style="margin-top: 8px;">
+      <button type="button" class="btn"
+              onclick="this.closest('.card').querySelector('textarea').value='';">Reset to default</button>
     </div>
   </div>
 

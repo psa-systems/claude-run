@@ -126,6 +126,9 @@ native:
     token_ref: yt-prod                    # optional; name of an encrypted secret
     query: "-Resolved AI Agent: Queued"   # issues to pick up
     custom_field: "AI Agent"              # field holding the state machine
+    prompt: |                             # optional; full replacement of the built-in agent prompt
+      Work issue {{key}}: {{summary}}
+      Repo cloned at {{workdir}} ({{clone_url}}).
     states: # AI Agent / State labels the handler drives
       queued: Queued
       working: Working
@@ -150,6 +153,7 @@ native:
 | `youtrack.token_ref`    | none                               | Name of an encrypted secret holding the YouTrack API token (CLAUDE-26). `None` uses host `yt` auth. |
 | `youtrack.query`        | `-Resolved AI Agent: Queued`       | Issue query selecting the jobs this action picks up.                                                |
 | `youtrack.custom_field` | `AI Agent`                         | Custom field holding the AI Agent state machine.                                                    |
+| `youtrack.prompt`       | built-in default                   | Full-replacement agent prompt (CLAUDE-125). When unset, the built-in CLAUDE-24 prompt is used. When set, the text fully replaces it (so the operator owns the runner contract: bare `#<KEY>` commit reference, the `.claude-run-needs-review` / `.claude-run-skip-attempt` blocker markers, no push / no PR / no YouTrack write). Editable in the structured web form. See the placeholders below. |
 | `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value.                                    |
 | `forgejo.base_url`      | per-issue VCS host                 | Forgejo base URL.                                                                                   |
 | `forgejo.token_ref`     | none                               | Name of an encrypted secret holding the Forgejo API token (CLAUDE-26). `None` uses host `fj` auth.  |
@@ -157,6 +161,20 @@ native:
 | `github.hosts`          | empty                              | Extra GitHub host(s) beyond `github.com` to treat as GitHub (e.g. GitHub Enterprise). Bare hosts.   |
 | `github.mcp_endpoint`   | `https://api.githubcopilot.com/mcp/` | Remote GitHub MCP endpoint used to open the PR (no local server to install).                      |
 | `github.token_ref`      | none                               | Name of an encrypted secret holding the GitHub PAT (CLAUDE-26). `None` uses host `gh` auth / `GH_TOKEN`. |
+
+##### Prompt placeholders (CLAUDE-125)
+
+`youtrack.prompt` is a template. These `{{...}}` placeholders are substituted with each job's values before the
+prompt is sent to the agent; an unknown placeholder (or an unterminated `{{`) is left literal and logged at warn:
+
+| Placeholder              | Substituted with                                                              |
+|--------------------------|-------------------------------------------------------------------------------|
+| `{{key}}`                | Issue id (`idReadable`, e.g. `MK-16`).                                         |
+| `{{summary}}`            | Issue summary.                                                                 |
+| `{{clone_url}}`          | Full clone URL of the resolved repo.                                          |
+| `{{workdir}}`            | Absolute path of the per-job working directory (the repo is cloned here).     |
+| `{{needs_review_marker}}`| The `.claude-run-needs-review` marker filename.                               |
+| `{{skip_attempt_marker}}`| The `.claude-run-skip-attempt` marker filename.                               |
 
 ##### Forge auto-routing by host (CLAUDE-50)
 

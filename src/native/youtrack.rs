@@ -499,7 +499,7 @@ async fn process_job(
             )
         }
         Ok(()) => {
-            let prompt = build_prompt(job, &workdir_path);
+            let prompt = build_prompt(src, job, &workdir_path);
             let stream_log =
                 ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1);
             info!(action = %action.name, key = %key, stream_log = %stream_log.display(), "invoking claude");
@@ -710,40 +710,92 @@ fn clone_repo(clone_url: &str, workdir: &Path) -> Result<()> {
     }
 }
 
-/// Build the agent's instruction text. Local-only work: no push, no PR, no
-/// YouTrack write. Matches the merged CLAUDE-24 prompt from the scripted
-/// `actions/youtrack.yml`.
-fn build_prompt(job: &YoutrackJob, workdir: &Path) -> String {
-    let key = &job.key;
-    let wd = workdir.display();
+/// The built-in YouTrack agent prompt as a placeholder template (CLAUDE-125).
+/// Returns the default instruction text - local-only work: no push, no PR, no
+/// YouTrack write, matching the merged CLAUDE-24 prompt from the scripted
+/// `actions/youtrack.yml` - with the documented `{{...}}` placeholders that
+/// [`render_prompt_template`] substitutes per job. Exposed crate-wide so the web
+/// form can prefill the prompt editor with the live default.
+pub(crate) fn default_youtrack_prompt() -> String {
     [
-        "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.".to_string(),
-        String::new(),
-        format!("Issue: {key}: {}", job.summary),
-        format!("Repo: {}", job.clone_url),
-        format!("Working directory: {wd} - the repo is already cloned here, you are inside it."),
-        String::new(),
-        "Do ONLY local engineering work. Do NOT push, do NOT open a PR, and do NOT touch YouTrack (no 'yt issue set-field', no 'yt issue set-state', no comments). The runner finalizes the issue after you exit: it opens the PR from your local commits and sets the AI Agent field based on the run outcome.".to_string(),
-        String::new(),
-        "Steps:".to_string(),
-        format!("1. Run 'yt issue inspect {key}' to read the full description and acceptance criteria."),
-        "2. Create a feature branch off the default branch per the Git workflow in CLAUDE.md.".to_string(),
-        "3. Make the minimum change required to satisfy the acceptance criteria.".to_string(),
-        format!("4. Commit with a message that references the issue on its own line as '#{key}' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR."),
-        "5. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop.".to_string(),
-        "6. Stop. Do not push, do not open a PR, do not touch YouTrack. The runner opens the PR from your commits and transitions the issue.".to_string(),
-        String::new(),
-        "If you CANNOT safely complete the issue - missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue:".to_string(),
-        "  a. Do NOT change any code.".to_string(),
-        "  b. Write the human-facing explanation of exactly what information or decision you need to proceed to this file (the file contents are the reason, posted verbatim as the issue comment by the runner):".to_string(),
-        format!("       {wd}/{NEEDS_REVIEW_MARKER}"),
-        "  c. Touch this marker file so the runner does NOT count this attempt toward the per-key cap (the job is parked pending human input, not failed):".to_string(),
-        format!("       {wd}/{SKIP_ATTEMPT_MARKER}"),
-        "  d. Do NOT touch YouTrack yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.".to_string(),
-        String::new(),
-        "When you finish, summarize what you did in plain text. Do not include a PR URL - the runner creates the PR.".to_string(),
+        "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.",
+        "",
+        "Issue: {{key}}: {{summary}}",
+        "Repo: {{clone_url}}",
+        "Working directory: {{workdir}} - the repo is already cloned here, you are inside it.",
+        "",
+        "Do ONLY local engineering work. Do NOT push, do NOT open a PR, and do NOT touch YouTrack (no 'yt issue set-field', no 'yt issue set-state', no comments). The runner finalizes the issue after you exit: it opens the PR from your local commits and sets the AI Agent field based on the run outcome.",
+        "",
+        "Steps:",
+        "1. Run 'yt issue inspect {{key}}' to read the full description and acceptance criteria.",
+        "2. Create a feature branch off the default branch per the Git workflow in CLAUDE.md.",
+        "3. Make the minimum change required to satisfy the acceptance criteria.",
+        "4. Commit with a message that references the issue on its own line as '#{{key}}' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
+        "5. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop.",
+        "6. Stop. Do not push, do not open a PR, do not touch YouTrack. The runner opens the PR from your commits and transitions the issue.",
+        "",
+        "If you CANNOT safely complete the issue - missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue:",
+        "  a. Do NOT change any code.",
+        "  b. Write the human-facing explanation of exactly what information or decision you need to proceed to this file (the file contents are the reason, posted verbatim as the issue comment by the runner):",
+        "       {{workdir}}/{{needs_review_marker}}",
+        "  c. Touch this marker file so the runner does NOT count this attempt toward the per-key cap (the job is parked pending human input, not failed):",
+        "       {{workdir}}/{{skip_attempt_marker}}",
+        "  d. Do NOT touch YouTrack yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.",
+        "",
+        "When you finish, summarize what you did in plain text. Do not include a PR URL - the runner creates the PR.",
     ]
     .join("\n")
+}
+
+/// Build the agent's instruction text for `job`. Uses the action's full-override
+/// prompt (`native.youtrack.prompt`, CLAUDE-125) when set, otherwise the
+/// built-in [`default_youtrack_prompt`]; either way the `{{...}}` placeholders
+/// are substituted with this job's values.
+fn build_prompt(src: &YoutrackSource, job: &YoutrackJob, workdir: &Path) -> String {
+    let template = src.prompt.clone().unwrap_or_else(default_youtrack_prompt);
+    render_prompt_template(&template, job, workdir)
+}
+
+/// Substitute the documented `{{...}}` placeholders in `template` with this
+/// job's values. An unknown `{{name}}` is left literal and logged at warn
+/// (forgiving per CLAUDE-125), as is an unterminated `{{`.
+fn render_prompt_template(template: &str, job: &YoutrackJob, workdir: &Path) -> String {
+    let workdir = workdir.display().to_string();
+    let vars: [(&str, &str); 6] = [
+        ("key", job.key.as_str()),
+        ("summary", job.summary.as_str()),
+        ("clone_url", job.clone_url.as_str()),
+        ("workdir", workdir.as_str()),
+        ("needs_review_marker", NEEDS_REVIEW_MARKER),
+        ("skip_attempt_marker", SKIP_ATTEMPT_MARKER),
+    ];
+
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            // No closing `}}`: copy the remainder verbatim and stop.
+            warn!("unterminated '{{{{' in prompt template left literal");
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let name = after[..end].trim();
+        match vars.iter().find(|(k, _)| *k == name) {
+            Some((_, val)) => out.push_str(val),
+            None => {
+                warn!(
+                    placeholder = name,
+                    "unknown prompt placeholder left literal"
+                );
+                out.push_str(&rest[start..start + 2 + end + 2]);
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Outcome of [`finalize`]: which AI Agent transition was applied. Carried into
@@ -1250,6 +1302,58 @@ mod tests {
         assert!(body.contains("pre step failed"));
         assert!(body.contains("Cost: $0 USD"));
         assert!(!body.contains("<details>"));
+    }
+
+    #[test]
+    fn build_prompt_default_substitutes_job_fields() {
+        // CLAUDE-125 regression: the built-in default renders every placeholder
+        // and leaves no `{{...}}` behind, preserving the CLAUDE-24 contract lines.
+        let wd = std::path::Path::new("/tmp/wd");
+        let p = build_prompt(&src(), &job(), wd);
+        assert!(p.starts_with(
+            "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md."
+        ));
+        assert!(p.contains("Issue: MK-16: Do the thing"));
+        assert!(p.contains("Repo: https://dev.a8n.run/contoso/claude-run.git"));
+        assert!(p.contains("Working directory: /tmp/wd - the repo is already cloned here"));
+        assert!(p.contains("yt issue inspect MK-16"));
+        assert!(p.contains("references the issue on its own line as '#MK-16'"));
+        assert!(p.contains("/tmp/wd/.claude-run-needs-review"));
+        assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"));
+        assert!(!p.contains("{{"), "unresolved placeholder:\n{p}");
+    }
+
+    #[test]
+    fn build_prompt_uses_override_when_set() {
+        // CLAUDE-125: a set prompt fully replaces the default and still gets its
+        // placeholders substituted.
+        let mut s = src();
+        s.prompt = Some("Do {{key}}: {{summary}} in {{workdir}}".to_string());
+        let p = build_prompt(&s, &job(), std::path::Path::new("/tmp/wd"));
+        assert_eq!(p, "Do MK-16: Do the thing in /tmp/wd");
+        assert!(!p.contains("You are working a YouTrack issue"));
+    }
+
+    #[test]
+    fn render_substitutes_all_documented_placeholders() {
+        let t = "{{key}}|{{summary}}|{{clone_url}}|{{workdir}}|{{needs_review_marker}}|{{skip_attempt_marker}}";
+        let p = render_prompt_template(t, &job(), std::path::Path::new("/wd"));
+        assert_eq!(
+            p,
+            "MK-16|Do the thing|https://dev.a8n.run/contoso/claude-run.git|/wd|.claude-run-needs-review|.claude-run-skip-attempt"
+        );
+    }
+
+    #[test]
+    fn render_leaves_unknown_and_unterminated_literal() {
+        // CLAUDE-125: an unknown placeholder and an unterminated `{{` survive
+        // verbatim; known ones still substitute.
+        let p = render_prompt_template(
+            "{{key}} {{bogus}} {{oops",
+            &job(),
+            std::path::Path::new("/wd"),
+        );
+        assert_eq!(p, "MK-16 {{bogus}} {{oops");
     }
 
     #[test]
