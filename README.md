@@ -214,32 +214,6 @@ an unauthenticated surface. Run the daemon behind a TLS-terminating reverse prox
 credentials and must not cross the network in plaintext. The `/webhooks/` route keeps its own HMAC verification and is
 exempt from the token gate.
 
-### Non-loopback bind and the boot race
-
-A non-loopback `web.bind` (e.g. `198.51.100.11`) can only bind once the kernel has assigned that IP to an interface. At
-boot the daemon frequently starts before the NIC is up, so the first bind fails with `EADDRNOTAVAIL`. The daemon
-classifies this case and retries the bind every 5s indefinitely (logging a warn on the first failure and a throttled
-progress line about once per minute) until the address is available, then logs `web UI listening`; the unix-socket API
-and scheduler run normally the whole time. Other bind failures are not a transient race, so they are not retried:
-`AddrInUse` (another process holds the port) and `PermissionDenied` (privileged port) log a classified reason with a
-hint and leave the web UI disabled for that run while the rest of the daemon keeps running.
-
-The retry loop is the in-process safety net; the proper fix is to order the unit after the network is up. For any
-non-loopback `web.bind`, add the network-online ordering to the systemd unit so the IP is assigned before the daemon
-starts:
-
-```ini
-[Unit]
-After=network-online.target
-Wants=network-online.target
-```
-
-Every startup also logs which config file was read: an `info` line `config loaded path=<file>` when `config.toml` was
-found, or a `warn` line `config.toml not found; built-in defaults in use (web bind 127.0.0.1:7321)` when it was absent (
-under systemd this commonly means the resolved `CLAUDE_RUN_CONFIG_DIR` / `XDG_CONFIG_HOME` / `HOME` differs from your
-shell, so the file the shell sees is not the one the service loads). The effective bind is logged before the attempt, so
-`journalctl` alone answers where the listening address came from.
-
 ### Browser login (for password managers)
 
 A bearer header is awkward in a browser (a password manager such as Bitwarden fills a username/password form, not an
