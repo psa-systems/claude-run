@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}About - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><span class="current">About</span>{% endblock %}
+{% block main %}
+
+<h2>About</h2>
+
+<div class="card" style="margin-bottom: 16px;">
+  <dl class="kv">
+    <dt>Version</dt>
+    <dd>{{ version }}</dd>
+    <dt>Update train</dt>
+    <dd>{{ train }} <span class="dim">(changed on the <a href="/settings">Settings</a> page)</span></dd>
+    <dt>Registry token</dt>
+    <dd>{% if token_ref_set %}configured{% else %}anonymous-first{% endif %}</dd>
+  </dl>
+</div>
+
+<h2>Updates</h2>
+
+<div class="card" style="margin-bottom: 16px;">
+  <span class="dim">Check the registry for a newer build on the configured train, then download,
+  verify, and atomically replace this binary. Applying an update does <strong>not</strong> restart the
+  service: after a successful apply, restart Claude Run yourself (systemd, container, nohup, ...) to run
+  the new version. A failed apply (checksum mismatch, unwritable binary path, registry unreachable)
+  leaves the running binary untouched.</span>
+</div>
+
+{% if let Some(tag) = applied %}
+<div class="card" style="border-color: var(--ok); margin-bottom: 16px;">
+  <strong style="color: var(--ok);">Update applied ({{ tag }}).</strong>
+  Restart Claude Run service to use the new version.
+</div>
+{% endif %}
+
+{% if let Some(e) = error %}
+<div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
+  <strong style="color: var(--bad);">Update action failed:</strong>
+  <pre class="stream" style="max-height: 160px; margin: 8px 0 0;">{{ e }}</pre>
+</div>
+{% endif %}
+
+{% if let Some(c) = check %}
+<div class="card" style="margin-bottom: 16px; {% if c.update_available %}border-color: var(--warn);{% else %}border-color: var(--ok);{% endif %}">
+  <h3>
+    Check result
+    {% if c.update_available %}<span class="badge warn">update available</span>{% else %}<span class="badge ok">up to date</span>{% endif %}
+  </h3>
+  <dl class="kv">
+    <dt>Train</dt>
+    <dd>{{ c.train }}</dd>
+    {% if c.digest %}
+    <dt>Installed</dt>
+    <dd>{{ c.current }}</dd>
+    <dt>Published</dt>
+    <dd>{{ c.available }}</dd>
+    {% else %}
+    <dt>Current</dt>
+    <dd>{{ c.current }}</dd>
+    <dt>Available</dt>
+    <dd>{{ c.available }}</dd>
+    {% endif %}
+  </dl>
+  <p class="dim" style="margin: 8px 0 0;">{{ c.message }}</p>
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="row-actions">
+    <form method="post" action="/about/check">
+      <button class="btn" type="submit">Check for updates</button>
+    </form>
+    <form method="post" action="/about/update"
+          onsubmit="return confirm('Download and apply the newest build on the {{ train }} train? The service will NOT restart automatically.');">
+      <button class="btn" type="submit">Update now</button>
+    </form>
+  </div>
+</div>
+
+{% endblock %}
