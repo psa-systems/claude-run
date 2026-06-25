@@ -27,7 +27,7 @@ use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::action::{
-    Action, ClaudeBlock, Concurrency, ForgejoTarget, GithubTarget, Limits, NativeConfig,
+    Action, Automerge, ClaudeBlock, Concurrency, ForgejoTarget, GithubTarget, Limits, NativeConfig,
     YoutrackConfig, YoutrackSource,
 };
 use crate::api::AppState;
@@ -1134,6 +1134,18 @@ struct YoutrackEditForm {
     state_needs_review: String,
     state_failed: String,
     state_in_progress: String,
+    /// AI Agent `done` label written after a successful automerge (CLAUDE-126).
+    state_done: String,
+    /// Standard `State` field value written after automerge (CLAUDE-126).
+    state_state_done: String,
+    /// Present ("on") when the automerge checkbox is checked (CLAUDE-126).
+    automerge_enabled: Option<String>,
+    /// Max total seconds to wait for the PR's checks (number-as-text). Blank ->
+    /// the `Automerge` default (1800).
+    automerge_wait_seconds: String,
+    /// Seconds between CI status polls (number-as-text). Blank -> the `Automerge`
+    /// default (30).
+    automerge_check_interval_seconds: String,
     fj_base_url: String,
     fj_token_ref: String,
     /// PR-creation strategy (CLAUDE-103): `"branch"` (default) or `"agit"`.
@@ -1168,6 +1180,12 @@ impl YoutrackEditForm {
     fn is_enabled(&self) -> bool {
         self.enabled.is_some()
     }
+
+    /// Whether the automerge checkbox was ticked (CLAUDE-126). Like
+    /// [`Self::is_enabled`], absence means the box was unchecked.
+    fn is_automerge_enabled(&self) -> bool {
+        self.automerge_enabled.is_some()
+    }
 }
 
 /// Field defaults for a brand-new YouTrack action: blank identity, but the
@@ -1186,6 +1204,10 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
         state_needs_review: c.youtrack.states.needs_review,
         state_failed: c.youtrack.states.failed,
         state_in_progress: c.youtrack.states.in_progress,
+        state_done: c.youtrack.states.done,
+        state_state_done: c.youtrack.states.state_done,
+        automerge_wait_seconds: c.youtrack.automerge.wait_seconds.to_string(),
+        automerge_check_interval_seconds: c.youtrack.automerge.check_interval_seconds.to_string(),
         concurrency_max_parallel: conc.max_parallel.to_string(),
         concurrency_key: conc.key.join(", "),
         fj_pr_strategy: c.forgejo.pr_strategy.as_str().to_string(),
@@ -1220,6 +1242,11 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         state_needs_review: yt.youtrack.states.needs_review.clone(),
         state_failed: yt.youtrack.states.failed.clone(),
         state_in_progress: yt.youtrack.states.in_progress.clone(),
+        state_done: yt.youtrack.states.done.clone(),
+        state_state_done: yt.youtrack.states.state_done.clone(),
+        automerge_enabled: yt.youtrack.automerge.enabled.then(|| "on".to_string()),
+        automerge_wait_seconds: yt.youtrack.automerge.wait_seconds.to_string(),
+        automerge_check_interval_seconds: yt.youtrack.automerge.check_interval_seconds.to_string(),
         fj_base_url: s(&yt.forgejo.base_url),
         fj_token_ref: s(&yt.forgejo.token_ref),
         fj_pr_strategy: yt.forgejo.pr_strategy.as_str().to_string(),
@@ -1355,29 +1382,39 @@ fn youtrack_form_to_yaml(
     if let Some(v) = opt(&form.state_in_progress) {
         states.in_progress = v;
     }
-    // CLAUDE-126: the form exposes neither the automerge block nor the `done` /
-    // `state_done` labels it uses, so preserve any hand-written values across a
-    // form save (mirrors the github-block preservation below). Read them off the
-    // parsed on-disk action before the `native` key is overwritten; prune_yaml
-    // still drops an all-default automerge block so untouched actions write none.
-    let disk_youtrack = map.get("native").and_then(|n| n.get("youtrack")).cloned();
-    if let Some(am) = disk_youtrack
-        .as_ref()
-        .and_then(|y| y.get("automerge"))
-        .cloned()
-        .and_then(|a| serde_yaml::from_value::<crate::action::Automerge>(a).ok())
-    {
-        youtrack.automerge = am;
+    // CLAUDE-133: the form now owns the `done` / `state_done` labels and the
+    // automerge block; a blank label falls back to its default.
+    if let Some(v) = opt(&form.state_done) {
+        states.done = v;
     }
-    if let Some(disk_states) = disk_youtrack
-        .as_ref()
-        .and_then(|y| y.get("states"))
-        .cloned()
-        .and_then(|s| serde_yaml::from_value::<crate::action::YoutrackStates>(s).ok())
-    {
-        youtrack.states.done = disk_states.done;
-        youtrack.states.state_done = disk_states.state_done;
+    if let Some(v) = opt(&form.state_state_done) {
+        states.state_done = v;
     }
+    // CLAUDE-133: automerge comes from the form. A blank timing falls back to the
+    // `Automerge` default; prune_yaml still drops an all-default block so an
+    // untouched action writes no `automerge`.
+    let am_default = Automerge::default();
+    let pu64 = |label: &str, raw: &str, default: u64| -> Result<u64, String> {
+        match raw.trim() {
+            "" => Ok(default),
+            t => t
+                .parse::<u64>()
+                .map_err(|_| format!("{label} must be a whole number (got `{t}`)")),
+        }
+    };
+    youtrack.automerge = Automerge {
+        enabled: form.is_automerge_enabled(),
+        wait_seconds: pu64(
+            "Automerge wait (seconds)",
+            &form.automerge_wait_seconds,
+            am_default.wait_seconds,
+        )?,
+        check_interval_seconds: pu64(
+            "Automerge check interval (seconds)",
+            &form.automerge_check_interval_seconds,
+            am_default.check_interval_seconds,
+        )?,
+    };
     // CLAUDE-54: preserve a hand-written `github` block. The form exposes only
     // `token_ref`, so read the existing `native.github` sub-block off the parsed
     // on-disk action (before we overwrite the `native` key below) to carry its
@@ -3257,6 +3294,95 @@ mod tests {
             assert_eq!(yt.github.token_ref.as_deref(), Some("gh-new"));
             assert_eq!(yt.github.hosts, vec!["ghe.example.com".to_string()]);
             assert_eq!(yt.github.mcp_endpoint, "https://ghe.example.com/mcp/");
+        }
+
+        #[test]
+        fn automerge_round_trips_from_form() {
+            // CLAUDE-133: enabling automerge and tuning the timings serializes to
+            // `native.youtrack.automerge` and reloads into the same form.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.automerge_enabled = Some("on".to_string());
+            f.automerge_wait_seconds = "600".to_string();
+            f.automerge_check_interval_seconds = "15".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.as_ref().unwrap()
+            else {
+                panic!("expected youtrack native config");
+            };
+            assert!(yt.youtrack.automerge.enabled);
+            assert_eq!(yt.youtrack.automerge.wait_seconds, 600);
+            assert_eq!(yt.youtrack.automerge.check_interval_seconds, 15);
+
+            // And the loaded action prefills the form fields it came from.
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            assert_eq!(form.automerge_enabled.as_deref(), Some("on"));
+            assert_eq!(form.automerge_wait_seconds, "600");
+            assert_eq!(form.automerge_check_interval_seconds, "15");
+        }
+
+        #[test]
+        fn automerge_default_omits_block() {
+            // CLAUDE-133: a form left at automerge defaults (disabled, default
+            // timings) writes no `automerge` block, so untouched actions are
+            // unchanged.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            assert!(!yaml.contains("automerge"), "automerge leaked:\n{yaml}");
+        }
+
+        #[test]
+        fn automerge_blank_timings_fall_back_to_defaults() {
+            // CLAUDE-133: blank timing inputs fall back to the Automerge defaults
+            // (1800 / 30) rather than erroring or blanking.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.automerge_enabled = Some("on".to_string());
+            f.automerge_wait_seconds = String::new();
+            f.automerge_check_interval_seconds = "  ".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert!(yt.youtrack.automerge.enabled);
+            assert_eq!(yt.youtrack.automerge.wait_seconds, 1800);
+            assert_eq!(yt.youtrack.automerge.check_interval_seconds, 30);
+        }
+
+        #[test]
+        fn automerge_rejects_non_numeric_timing() {
+            // CLAUDE-133: a non-numeric (non-blank) timing is an inline error,
+            // matching the limits / concurrency fields.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.automerge_wait_seconds = "soon".to_string();
+            let err = youtrack_form_to_yaml(empty_base(), &f).unwrap_err();
+            assert!(err.contains("Automerge wait"), "{err}");
+        }
+
+        #[test]
+        fn done_labels_round_trip_from_form() {
+            // CLAUDE-133: the done / state_done labels are owned by the form;
+            // non-default values serialize and reload.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.state_done = "Merged".to_string();
+            f.state_state_done = "Resolved".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.as_ref().unwrap()
+            else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(yt.youtrack.states.done, "Merged");
+            assert_eq!(yt.youtrack.states.state_done, "Resolved");
+
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            assert_eq!(form.state_done, "Merged");
+            assert_eq!(form.state_state_done, "Resolved");
         }
 
         #[test]
