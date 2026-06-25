@@ -104,7 +104,22 @@
       {% call textfield("Needs review", "state_needs_review", form.state_needs_review, "Needs Review") %}
       {% call textfield("Failed", "state_failed", form.state_failed, "Failed") %}
       {% call textfield("In progress (State field)", "state_in_progress", form.state_in_progress, "In Progress") %}
+      {% call textfield("Done", "state_done", form.state_done, "Done") %}
+      {% call textfield("Done (State field)", "state_state_done", form.state_state_done, "Done") %}
     </div>
+  </div>
+
+  <div class="card">
+    <h3>Automerge</h3>
+    <label class="fld-inline">
+      <input type="checkbox" name="automerge_enabled"{% if form.is_automerge_enabled() %} checked{% endif %}>
+      <span>Enabled (wait for the PR's CI to go green, then merge and advance the issue to Done)</span>
+    </label>
+    <div class="grid2" style="margin-top: 8px;">
+      {% call numfield("Wait (seconds)", "automerge_wait_seconds", form.automerge_wait_seconds, "1800", "1") %}
+      {% call numfield("Check interval (seconds)", "automerge_check_interval_seconds", form.automerge_check_interval_seconds, "30", "1") %}
+    </div>
+    <p class="hint dim">When enabled, finalize polls the opened PR's combined CI status every <em>check interval</em> seconds, up to <em>wait</em> seconds total. On green (with an up-to-date branch) it merges the PR and sets the AI Agent / State to the Done labels above. Disabled (the default) leaves finalize stopping at Code Review. Blank timings fall back to 1800 / 30.</p>
   </div>
 
   <div class="card">
