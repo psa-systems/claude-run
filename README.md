@@ -39,9 +39,6 @@ Runtime dependencies (host-installed, not bundled):
 ## Use
 
 ```nu
-# One-shot manual run (cli-driven; standalone). Same exit codes as the old nu script.
-claude-run run youtrack
-
 # Long-running daemon: scheduler + unix-socket API. --detach forks into the background.
 claude-run serve --detach
 
@@ -63,9 +60,6 @@ claude-run action show youtrack
 printf %s $token | claude-run secret set web-ui-token
 claude-run secret list
 claude-run secret delete web-ui-token
-
-# Import legacy ~/.local/share/claude-run/state/*.json into SQLite (one-time migration off the nu runner).
-claude-run migrate
 
 # Self-update. `check` reports whether a newer build is published; `update` swaps the binary in place.
 claude-run version                         # print the build-stamped banner (same as `version show`)
@@ -178,9 +172,21 @@ in `config.toml`), or over the API:
   `latest.sha256` sidecar rather than by semver.
 - `--version <tag>` pins an exact published tag and is independent of the train.
 
-Auth is anonymous-first. When `[update].token_ref` is set, the named secret is decrypted from the store (same mechanism as `web.auth_token_ref` and action `token_ref`s; the raw token never appears in `config.toml`) and used for the registry requests. When it is unset, a private registry still falls back to the host `fj` token on a 401/403 with `claude-run version check --use-fj-token` (the interactive `fj`-token escalation is CLI-only). The download is always verified against the published SHA-256 sidecar before the binary is atomically swapped in place.
+Auth is anonymous-first. When `[update].token_ref` is set, the named secret is decrypted from the store (same mechanism
+as `web.auth_token_ref` and action `token_ref`s; the raw token never appears in `config.toml`) and used for the registry
+requests. When it is unset, a private registry still falls back to the host `fj` token on a 401/403 with
+`claude-run version check --use-fj-token` (the interactive `fj`-token escalation is CLI-only). The download is always
+verified against the published SHA-256 sidecar before the binary is atomically swapped in place.
 
-The same check / apply is available from the browser on the **About** page (linked in the nav). "Check for updates" runs the on-demand registry check (anonymous-first, escalating only to the configured `token_ref`) and shows current vs newest with whether an update is available; a registry/network failure is surfaced as a non-fatal message rather than an error page. "Update now" downloads the newest build on the configured train, verifies its SHA-256, and atomically replaces the binary. It does **not** restart the daemon: after a successful apply the page shows the applied tag and "Restart Claude Run service to use the new version", which you do yourself (systemd, container, nohup, ...). A failed apply (checksum mismatch, unwritable binary path, registry unreachable) leaves the running binary untouched. Version pinning (`--version <tag>`) stays a CLI-only option; the web applies the newest build on the configured train. There is no background or periodic update check; checks happen only on demand.
+The same check / apply is available from the browser on the **About** page (linked in the nav). "Check for updates" runs
+the on-demand registry check (anonymous-first, escalating only to the configured `token_ref`) and shows current vs
+newest with whether an update is available; a registry/network failure is surfaced as a non-fatal message rather than an
+error page. "Update now" downloads the newest build on the configured train, verifies its SHA-256, and atomically
+replaces the binary. It does **not** restart the daemon: after a successful apply the page shows the applied tag and "
+Restart Claude Run service to use the new version", which you do yourself (systemd, container, nohup, ...). A failed
+apply (checksum mismatch, unwritable binary path, registry unreachable) leaves the running binary untouched. Version
+pinning (`--version <tag>`) stays a CLI-only option; the web applies the newest build on the configured train. There is
+no background or periodic update check; checks happen only on demand.
 
 ## Web UI / API auth
 
