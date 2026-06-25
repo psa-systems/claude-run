@@ -16,6 +16,18 @@ use tracing::warn;
 use super::{Backend, Forge, IssueTracker, PullRequest, VcsMapEntry, VcsRepo};
 use crate::error::{Error, Result};
 
+/// CLAUDE-136: derive a PR number from a forge PR URL's trailing
+/// `/pulls/<n>` (Forgejo) or `/pull/<n>` (GitHub-style) segment. Used only as a
+/// fallback when `fj pr create --json` omits the `number` field.
+fn number_from_pr_url(url: &str) -> Option<u64> {
+    let rest = url
+        .rsplit_once("/pulls/")
+        .or_else(|| url.rsplit_once("/pull/"))?
+        .1;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().ok()
+}
+
 /// Captured result of running an external command.
 #[derive(Debug, Clone)]
 pub struct CmdOutput {
@@ -224,18 +236,35 @@ impl CliBackend {
             .collect()
     }
 
-    /// Parse `fj pr create` stdout (a line containing `pull request #<n>`)
-    /// into a [`PullRequest`]. Shared by the AGit and fallback paths.
-    fn created_pr(stdout: &str) -> PullRequest {
-        let trimmed = stdout.trim();
-        let number = trimmed.split_once('#').and_then(|(_, rest)| {
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            digits.parse::<u64>().ok()
-        });
-        PullRequest {
-            number,
-            url: trimmed.to_string(),
+    /// Parse `fj pr create --json` stdout into a [`PullRequest`]. CLAUDE-136:
+    /// the human `text` line carries only the PR URL (`.../pulls/<n>`) and no
+    /// `#<n>` token, so the old `#`-splitting heuristic always lost the number
+    /// (or split on the body's `#<KEY>-N` reference and read zero digits),
+    /// which silently disabled automerge. `--json` returns the number and URL
+    /// directly; consume that. Shared by the AGit and branch paths.
+    fn created_pr(&self, stdout: &str) -> Result<PullRequest> {
+        /// The created PR as `fj pr create --json` reports it. Field names
+        /// mirror `fj pr search --json` ([`super::ForgePullRequest`]); `url` is
+        /// accepted as an alias so a differing field name still binds. Unknown
+        /// fields are ignored.
+        #[derive(Deserialize)]
+        struct Created {
+            #[serde(default)]
+            number: Option<u64>,
+            #[serde(default, alias = "url")]
+            html_url: String,
         }
+        let created: Created = Self::parse_json(&self.fj, "fj pr create --json", stdout.trim())?;
+        // On the normal success path the JSON carries `number`; if a future fj
+        // omits it, fall back to the URL's trailing `/pulls/<n>` (or `/pull/<n>`)
+        // segment rather than the discarded `#` heuristic.
+        let number = created
+            .number
+            .or_else(|| number_from_pr_url(&created.html_url));
+        Ok(PullRequest {
+            number,
+            url: created.html_url,
+        })
     }
 
     /// Branch-backed PR creation (CLAUDE-103 default, originally the CLAUDE-102
@@ -276,13 +305,14 @@ impl CliBackend {
             title.as_str(),
             "--body-file",
             BODY_FILE,
+            "--json",
         ];
         let res = self
             .runner
             .run_in_env(Some(workdir), &self.fj, &create_args, &self.fj_envs())
             .and_then(|out| Self::checked(&self.fj, out, &create_args));
         let _ = std::fs::remove_file(workdir.join(BODY_FILE));
-        Ok(Self::created_pr(&res?))
+        self.created_pr(&res?)
     }
 
     /// CLAUDE-103 opt-in: AGit + autofill (`fj --host <host> pr create -aA`).
@@ -291,12 +321,12 @@ impl CliBackend {
     /// commit messages. No server branch is produced. A failure errors loudly;
     /// there is no silent switch to the branch path.
     fn create_pr_agit(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
-        let args = ["--host", host, "pr", "create", "-aA"];
+        let args = ["--host", host, "pr", "create", "-aA", "--json"];
         let stdout = self
             .runner
             .run_in_env(Some(workdir), &self.fj, &args, &self.fj_envs())
             .and_then(|out| Self::checked(&self.fj, out, &args))?;
-        Ok(Self::created_pr(&stdout))
+        self.created_pr(&stdout)
     }
 
     /// Probe that both CLIs are invokable (`<bin> --version`). Used by the
@@ -926,21 +956,21 @@ mod tests {
         // CLAUDE-103: `pr_strategy: agit` invokes `fj pr create -aA` as before.
         let runner = Arc::new(StubRunner::new().ok(
             "fj",
-            &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-            "Created pull request #42\n",
+            &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+            r#"{"number":42,"html_url":"https://dev.a8n.run/n/c/pulls/42"}"#,
         ));
         let b = CliBackend::new(runner.clone());
         let pr = b
             .create_pr(Path::new("/tmp/x"), "dev.a8n.run", PrStrategy::Agit)
             .unwrap();
         assert_eq!(pr.number, Some(42));
-        assert_eq!(pr.url, "Created pull request #42");
-        // The AGit path issues `-aA` and never pushes a branch.
+        assert_eq!(pr.url, "https://dev.a8n.run/n/c/pulls/42");
+        // The AGit path issues `-aA --json` and never pushes a branch.
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls
                 .iter()
-                .any(|c| c == "fj --host dev.a8n.run pr create -aA"),
+                .any(|c| c == "fj --host dev.a8n.run pr create -aA --json"),
             "{calls:?}"
         );
         assert!(
@@ -978,8 +1008,9 @@ mod tests {
                         "feat(x): do the thing",
                         "--body-file",
                         ".claude-run-pr-body.md",
+                        "--json",
                     ],
-                    "Created pull request #77\n",
+                    r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
                 ),
         );
         let b = CliBackend::new(runner.clone());
@@ -987,6 +1018,7 @@ mod tests {
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
             .unwrap();
         assert_eq!(pr.number, Some(77));
+        assert_eq!(pr.url, "https://dev.a8n.run/n/c/pulls/77");
         // The body file is cleaned up after the create.
         assert!(!wd.path().join(".claude-run-pr-body.md").exists());
         let calls = runner.calls.lock().unwrap();
@@ -1000,6 +1032,30 @@ mod tests {
             !calls.iter().any(|c| c.contains("-aA")),
             "branch strategy must never invoke -aA: {calls:?}"
         );
+    }
+
+    #[test]
+    fn created_pr_falls_back_to_url_when_number_field_absent() {
+        // CLAUDE-136: a future fj that omits `number` from the JSON still yields
+        // a number, derived from the URL's trailing `/pulls/<n>` segment, so
+        // automerge keeps working rather than silently disabling.
+        let b = CliBackend::new(Arc::new(StubRunner::new()));
+        let pr = b
+            .created_pr(r#"{"html_url":"https://dev.a8n.run/fabrikam/gizmo/pulls/26"}"#)
+            .unwrap();
+        assert_eq!(pr.number, Some(26));
+        assert_eq!(pr.url, "https://dev.a8n.run/fabrikam/gizmo/pulls/26");
+    }
+
+    #[test]
+    fn number_from_pr_url_handles_both_path_shapes() {
+        // CLAUDE-136: Forgejo emits `/pulls/<n>`, GitHub-style `/pull/<n>`.
+        assert_eq!(
+            number_from_pr_url("https://dev.a8n.run/n/c/pulls/52"),
+            Some(52)
+        );
+        assert_eq!(number_from_pr_url("https://github.com/o/r/pull/7"), Some(7));
+        assert_eq!(number_from_pr_url("https://dev.a8n.run/n/c/issues/3"), None);
     }
 
     #[test]
@@ -1223,8 +1279,8 @@ mod tests {
                 )
                 .ok(
                     "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-                    "Created pull request #7",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/n/c/pulls/7"}"#,
                 ),
         );
         let backend = CliBackend::new(runner.clone())

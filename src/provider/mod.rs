@@ -104,10 +104,10 @@ pub struct PrStatus {
 /// A pull request opened by a [`Forge`] backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
-    /// PR number parsed from the forge CLI output, when present.
+    /// PR number from the forge CLI's JSON envelope, when present (CLAUDE-136).
     pub number: Option<u64>,
-    /// PR location as the forge CLI reported it: the trimmed `fj pr create`
-    /// stdout line (which contains the PR URL / `#<n>` reference).
+    /// PR web URL as the forge CLI reported it (the `html_url` field of
+    /// `fj pr create --json`).
     pub url: String,
 }
 
