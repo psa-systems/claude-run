@@ -214,17 +214,6 @@ an unauthenticated surface. Run the daemon behind a TLS-terminating reverse prox
 credentials and must not cross the network in plaintext. The `/webhooks/` route keeps its own HMAC verification and is
 exempt from the token gate.
 
-### Browser login (for password managers)
-
-A bearer header is awkward in a browser (a password manager such as Bitwarden fills a username/password form, not an
-`Authorization` header). Set `web.auth_username` to enable a form login: an unauthenticated browser request (a GET that
-accepts HTML) is redirected to `/login`, where the configured **username** plus the **`auth_token_ref` secret value as
-the password** mint a session cookie (`HttpOnly`, `Secure`, `SameSite=Lax`, 12-hour lifetime). `GET /logout` clears it.
-The session is an HMAC over the token, so rotating the secret invalidates every outstanding session.
-`Authorization: Bearer <token>` continues to work for API clients regardless of `auth_username`. Because the cookie is
-`Secure`, the login flow only works over HTTPS, i.e. behind the reverse proxy (which is the only context where the
-surface is exposed anyway).
-
 ### Secrets store
 
 Auth (and every action `token_ref`) reads from an encrypted secrets store. Two things are required before
