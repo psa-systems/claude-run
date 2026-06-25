@@ -644,6 +644,14 @@ fn run_pre(
     backend
         .set_state(&job.key, &src.states.in_progress)
         .map_err(|e| format!("set State={}: {e}", src.states.in_progress))?;
+    // CLAUDE-131: optionally assign the issue before cloning, so an assignee
+    // failure aborts pickup before any repo work (same contract as the field /
+    // state writes above). Unset leaves the Assignee untouched.
+    if let Some(login) = &src.assignee {
+        backend
+            .set_assignee(&job.key, login)
+            .map_err(|e| format!("set Assignee={login}: {e}"))?;
+    }
     clone_repo(&job.clone_url, workdir).map_err(|e| format!("git clone: {e}"))?;
     install_hooks(workdir);
     Ok(())
@@ -1659,6 +1667,101 @@ mod tests {
         let jobs = gather(&backend, &src().query).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, "MK-16");
+    }
+
+    /// CLAUDE-131: a configured assignee is written via `yt issue update
+    /// <key> --assignee <login>` during the pre step, after the field / state
+    /// writes and before the clone. The clone targets a bogus local path so it
+    /// fails fast offline; the pre-clone YouTrack writes are still recorded.
+    #[test]
+    fn run_pre_sets_assignee_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path().join("clone");
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    "",
+                )
+                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], "")
+                .ok(
+                    "yt",
+                    &["issue", "update", "MK-16", "--assignee", "octocat"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let mut s = src();
+        s.assignee = Some("octocat".into());
+        let mut j = job();
+        // Bogus local path: `git clone` fails immediately with no network.
+        j.clone_url = "/nonexistent/claude-run-131.git".into();
+        let _ = run_pre(&backend, &s, &j, &wd);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue update MK-16 --assignee octocat"),
+            "{calls:?}"
+        );
+    }
+
+    /// CLAUDE-131: with no assignee configured (the default), pickup issues no
+    /// `yt issue update ... --assignee` write at all.
+    #[test]
+    fn run_pre_skips_assignee_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path().join("clone");
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    "",
+                )
+                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], ""),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let s = src(); // assignee defaults to None
+        assert!(s.assignee.is_none());
+        let mut j = job();
+        j.clone_url = "/nonexistent/claude-run-131.git".into();
+        let _ = run_pre(&backend, &s, &j, &wd);
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("--assignee")), "{calls:?}");
+    }
+
+    /// CLAUDE-131: an assignee write failure aborts pickup with a failure reason,
+    /// consistent with the existing set_field / set_state failure handling.
+    #[test]
+    fn run_pre_assignee_failure_aborts_pickup() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path().join("clone");
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    "",
+                )
+                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], "")
+                .fail(
+                    "yt",
+                    &["issue", "update", "MK-16", "--assignee", "octocat"],
+                    1,
+                    "no such user",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let mut s = src();
+        s.assignee = Some("octocat".into());
+        let mut j = job();
+        j.clone_url = "/nonexistent/claude-run-131.git".into();
+        let err = run_pre(&backend, &s, &j, &wd).unwrap_err();
+        assert!(err.starts_with("set Assignee=octocat:"), "{err}");
+        // The clone is never attempted: the workdir stays absent.
+        assert!(!wd.exists(), "clone must not run after an assignee failure");
     }
 
     #[test]

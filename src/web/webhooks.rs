@@ -1633,6 +1633,13 @@ mod tests {
                 .push(format!("set_state {key} {state}"));
             Ok(())
         }
+        fn set_assignee(&self, key: &str, login: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_assignee {key} {login}"));
+            Ok(())
+        }
         fn comment(&self, _key: &str, _body: &str) -> crate::error::Result<()> {
             unreachable!()
         }
