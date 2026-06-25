@@ -1115,6 +1115,10 @@ struct YoutrackEditForm {
     yt_token_ref: String,
     yt_query: String,
     yt_custom_field: String,
+    /// Full-replacement agent prompt (CLAUDE-125). Prefilled with the saved
+    /// override or, when none, the built-in default template (placeholders
+    /// literal). Cleared or left equal to the default -> no `prompt` key saved.
+    yt_prompt: String,
     state_queued: String,
     state_working: String,
     state_code_review: String,
@@ -1166,6 +1170,7 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
     YoutrackEditForm {
         yt_query: c.youtrack.query,
         yt_custom_field: c.youtrack.custom_field,
+        yt_prompt: crate::native::youtrack::default_youtrack_prompt(),
         state_queued: c.youtrack.states.queued,
         state_working: c.youtrack.states.working,
         state_code_review: c.youtrack.states.code_review,
@@ -1194,6 +1199,11 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         yt_token_ref: s(&yt.youtrack.token_ref),
         yt_query: yt.youtrack.query.clone(),
         yt_custom_field: yt.youtrack.custom_field.clone(),
+        yt_prompt: yt
+            .youtrack
+            .prompt
+            .clone()
+            .unwrap_or_else(crate::native::youtrack::default_youtrack_prompt),
         state_queued: yt.youtrack.states.queued.clone(),
         state_working: yt.youtrack.states.working.clone(),
         state_code_review: yt.youtrack.states.code_review.clone(),
@@ -1303,6 +1313,16 @@ fn youtrack_form_to_yaml(
     if let Some(c) = opt(&form.yt_custom_field) {
         youtrack.custom_field = c;
     }
+    // CLAUDE-125: store the prompt only as a real override. Normalize browser
+    // CRLF to LF, trim, and compare to the built-in default: an empty box or one
+    // left equal to the default writes no `prompt` key (stay on the built-in so
+    // future default improvements flow through); anything else is persisted
+    // verbatim as a full-replacement override.
+    let prompt_norm = form.yt_prompt.replace("\r\n", "\n");
+    let prompt_trim = prompt_norm.trim();
+    youtrack.prompt = (!prompt_trim.is_empty()
+        && prompt_trim != crate::native::youtrack::default_youtrack_prompt().trim())
+    .then(|| prompt_trim.to_string());
     let states = &mut youtrack.states;
     if let Some(v) = opt(&form.state_queued) {
         states.queued = v;
@@ -3020,6 +3040,65 @@ mod tests {
             assert_eq!(yt.github.token_ref.as_deref(), Some("gh-new"));
             assert_eq!(yt.github.hosts, vec!["ghe.example.com".to_string()]);
             assert_eq!(yt.github.mcp_endpoint, "https://ghe.example.com/mcp/");
+        }
+
+        #[test]
+        fn prompt_default_writes_no_override() {
+            // CLAUDE-125: a prompt left equal to the built-in default (the value
+            // the form prefills) stores no `prompt` key, so the action keeps
+            // tracking the built-in default.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            assert!(!yaml.contains("prompt:"), "prompt key leaked:\n{yaml}");
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert!(yt.youtrack.prompt.is_none());
+        }
+
+        #[test]
+        fn prompt_override_persists_verbatim() {
+            // CLAUDE-125: an edited prompt is stored as a full-replacement
+            // override; browser CRLF is normalized and surrounding whitespace
+            // trimmed.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.yt_prompt = "  Work {{key}}: {{summary}}\r\nin {{workdir}}.  ".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(
+                yt.youtrack.prompt.as_deref(),
+                Some("Work {{key}}: {{summary}}\nin {{workdir}}.")
+            );
+        }
+
+        #[test]
+        fn prompt_prefills_from_saved_override() {
+            // CLAUDE-125: a loaded action with a prompt override prefills the form
+            // textarea with that override, not the default.
+            let yaml =
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    prompt: custom {{key}}\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            assert_eq!(form.yt_prompt, "custom {{key}}");
+        }
+
+        #[test]
+        fn prompt_prefills_default_when_unset() {
+            // CLAUDE-125: with no override, the form shows the built-in default so
+            // the operator edits the real prompt rather than a blank box.
+            let yaml = "name: yt\nkind: youtrack\nnative: {}\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            assert_eq!(
+                form.yt_prompt,
+                crate::native::youtrack::default_youtrack_prompt()
+            );
         }
 
         #[test]
