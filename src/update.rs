@@ -180,6 +180,40 @@ pub enum UpdateStatus {
     Ahead,
 }
 
+/// CLAUDE-129: the resolved state of an on-demand check, covering both trains.
+/// `Ahead` only arises on the `release` train (semver comparison); `NoneFound`
+/// covers an empty `release` registry or an absent `latest` build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckState {
+    UpToDate,
+    UpdateAvailable,
+    /// Running a newer build than the registry (release train only).
+    Ahead,
+    /// Nothing comparable is published (no `vX.Y.Z` release / no `latest` build).
+    NoneFound,
+}
+
+/// CLAUDE-129: structured, printing-free result of a registry check. Shared by
+/// the CLI `version check` (which formats it for the terminal) and the web
+/// About page (which renders `current` / `available` / `state`). For the
+/// `release` train `current`/`available` are `vX.Y.Z` strings; for `latest`
+/// they are the installed / published SHA-256 digests (the moving tag is
+/// non-semver, so availability is decided by digest).
+#[derive(Debug, Clone)]
+pub struct CheckOutcome {
+    pub train: UpdateTrain,
+    pub current: String,
+    pub available: Option<String>,
+    pub state: CheckState,
+}
+
+impl CheckOutcome {
+    /// Whether a newer build is installable.
+    pub fn update_available(&self) -> bool {
+        matches!(self.state, CheckState::UpdateAvailable)
+    }
+}
+
 /// Outbound registry client over the existing tokio runtime.
 pub struct Updater {
     client: reqwest::Client,
@@ -472,6 +506,129 @@ fn install_err(current: &Path, dir: &Path, e: std::io::Error) -> Error {
 }
 
 // ---------------------------------------------------------------------------
+// Non-interactive core (CLAUDE-129)
+//
+// These functions do no printing and no prompting, returning structured
+// results so both the CLI commands below and the web About handlers call the
+// same logic. The web path is anonymous-first, escalating only to the
+// configured `[update].token_ref`; the interactive `--use-fj-token` escalation
+// stays CLI-only (see `authorizer`).
+// ---------------------------------------------------------------------------
+
+/// Resolve the check outcome from an already-listed registry. `updater`/`cred`
+/// are reused for the `latest`-train sidecar fetch. Does no printing.
+pub async fn check_core(
+    train: UpdateTrain,
+    updater: &Updater,
+    cred: &Cred,
+    versions: &[String],
+) -> Result<CheckOutcome> {
+    match train {
+        UpdateTrain::Release => {
+            let current = current_version()?;
+            match select_newest(versions) {
+                Some(newest) => {
+                    let state = match compare(&current, &newest) {
+                        UpdateStatus::UpdateAvailable => CheckState::UpdateAvailable,
+                        UpdateStatus::UpToDate => CheckState::UpToDate,
+                        UpdateStatus::Ahead => CheckState::Ahead,
+                    };
+                    Ok(CheckOutcome {
+                        train,
+                        current: format!("v{current}"),
+                        available: Some(format!("v{newest}")),
+                        state,
+                    })
+                }
+                None => Ok(CheckOutcome {
+                    train,
+                    current: format!("v{current}"),
+                    available: None,
+                    state: CheckState::NoneFound,
+                }),
+            }
+        }
+        UpdateTrain::Latest => {
+            let installed = current_exe_sha256()?;
+            if !versions.iter().any(|v| v == LATEST_TAG) {
+                return Ok(CheckOutcome {
+                    train,
+                    current: installed,
+                    available: None,
+                    state: CheckState::NoneFound,
+                });
+            }
+            // The `latest` tag is moving and non-semver, so compare digests: the
+            // running binary's SHA-256 vs the published `latest.sha256` sidecar.
+            let sidecar = updater.fetch_sidecar(cred, LATEST_TAG).await?;
+            let published = parse_sha256_sidecar(&sidecar).ok_or_else(|| {
+                anyhow::anyhow!("could not parse the published sha256 sidecar for `{LATEST_TAG}`")
+            })?;
+            let state = if installed.eq_ignore_ascii_case(&published) {
+                CheckState::UpToDate
+            } else {
+                CheckState::UpdateAvailable
+            };
+            Ok(CheckOutcome {
+                train,
+                current: installed,
+                available: Some(published),
+                state,
+            })
+        }
+    }
+}
+
+/// Download the newest build on `target`, verify its SHA-256 against the
+/// published sidecar, and atomically install it. Returns the installed path.
+/// On a checksum mismatch the swap never runs, so the live binary is untouched.
+async fn download_verify_install(updater: &Updater, cred: &Cred, target: &str) -> Result<PathBuf> {
+    let (bin, sidecar) = updater.download(cred, target).await?;
+    let expected = parse_sha256_sidecar(&sidecar).ok_or_else(|| {
+        anyhow::anyhow!("could not parse the published sha256 sidecar for {target}")
+    })?;
+    verify_sha256(&bin, &expected)?;
+    install_binary(&bin)
+}
+
+/// Apply the newest build on `train` from an already-listed registry: resolve
+/// the target tag, download, verify, and atomically install. Returns the
+/// applied tag. No confirmation prompt, no version pinning, and no restart (the
+/// web button click is the confirmation; the operator restarts the service).
+pub async fn apply_core(
+    train: UpdateTrain,
+    updater: &Updater,
+    cred: &Cred,
+    versions: &[String],
+) -> Result<String> {
+    let target = select_target(train, versions, None)?;
+    download_verify_install(updater, cred, &target).await?;
+    Ok(target)
+}
+
+/// CLAUDE-129: web entry for the on-demand check. Builds the updater from env,
+/// lists versions anonymous-first (escalating only to `configured_token`), and
+/// returns the structured outcome. Used by `POST /about/check`.
+pub async fn web_check(
+    train: UpdateTrain,
+    configured_token: Option<String>,
+) -> Result<CheckOutcome> {
+    let updater = Updater::new()?;
+    let (cred, versions) = updater.list_versions(move || configured_token).await?;
+    check_core(train, &updater, &cred, &versions).await
+}
+
+/// CLAUDE-129: web entry for the apply action. Builds the updater from env,
+/// lists versions anonymous-first (escalating only to `configured_token`),
+/// and applies the newest build on `train`. Returns the applied tag. Does NOT
+/// restart the daemon. Used by `POST /about/update`.
+pub async fn web_update(train: UpdateTrain, configured_token: Option<String>) -> Result<String> {
+    let updater = Updater::new()?;
+    let (cred, versions) = updater.list_versions(move || configured_token).await?;
+    apply_core(train, &updater, &cred, &versions).await
+}
+
+// ---------------------------------------------------------------------------
 // CLI orchestration
 // ---------------------------------------------------------------------------
 
@@ -489,28 +646,30 @@ pub async fn check(
     let (cred, versions) = updater
         .list_versions(authorizer(&host, use_fj_token, configured_token))
         .await?;
-    anstream::println!("train:     {}", paint::paint(paint::VALUE, train.label()));
-    match train {
+    let outcome = check_core(train, &updater, &cred, &versions).await?;
+    print_check_outcome(&outcome);
+    Ok(exit::OK)
+}
+
+/// Format a [`CheckOutcome`] for the terminal, preserving the original CLI
+/// output (labels and update-hint text differ per train).
+fn print_check_outcome(o: &CheckOutcome) {
+    anstream::println!("train:     {}", paint::paint(paint::VALUE, o.train.label()));
+    match o.train {
         UpdateTrain::Release => {
-            let current = current_version()?;
-            anstream::println!(
-                "current:   {}",
-                paint::paint(paint::VALUE, &format!("v{current}"))
-            );
-            match select_newest(&versions) {
-                Some(newest) => {
-                    anstream::println!(
-                        "available: {}",
-                        paint::paint(paint::VALUE, &format!("v{newest}"))
-                    );
-                    match compare(&current, &newest) {
-                        UpdateStatus::UpdateAvailable => {
+            anstream::println!("current:   {}", paint::paint(paint::VALUE, &o.current));
+            match &o.available {
+                Some(a) => {
+                    anstream::println!("available: {}", paint::paint(paint::VALUE, a));
+                    match o.state {
+                        CheckState::UpdateAvailable => {
                             paint::notice("update available; run `claude-run version update`");
                         }
-                        UpdateStatus::UpToDate => paint::success("up to date"),
-                        UpdateStatus::Ahead => {
+                        CheckState::UpToDate => paint::success("up to date"),
+                        CheckState::Ahead => {
                             paint::notice("running a newer build than the registry; nothing to do");
                         }
+                        CheckState::NoneFound => {}
                     }
                 }
                 None => anstream::println!(
@@ -520,7 +679,7 @@ pub async fn check(
             }
         }
         UpdateTrain::Latest => {
-            if !versions.iter().any(|v| v == LATEST_TAG) {
+            if o.available.is_none() {
                 anstream::println!(
                     "available: {}",
                     paint::paint(
@@ -528,28 +687,22 @@ pub async fn check(
                         &format!("(no `{LATEST_TAG}` build published in registry)")
                     )
                 );
-                return Ok(exit::OK);
+                return;
             }
-            // The `latest` tag is moving and non-semver, so compare digests: the
-            // running binary's SHA-256 vs the published `latest.sha256` sidecar.
-            let sidecar = updater.fetch_sidecar(&cred, LATEST_TAG).await?;
-            let published = parse_sha256_sidecar(&sidecar).ok_or_else(|| {
-                anyhow::anyhow!("could not parse the published sha256 sidecar for `{LATEST_TAG}`")
-            })?;
-            let installed = current_exe_sha256()?;
-            anstream::println!("installed: {}", paint::paint(paint::VALUE, &installed));
-            anstream::println!("published: {}", paint::paint(paint::VALUE, &published));
-            if installed.eq_ignore_ascii_case(&published) {
-                paint::success("up to date");
-            } else {
+            anstream::println!("installed: {}", paint::paint(paint::VALUE, &o.current));
+            if let Some(published) = &o.available {
+                anstream::println!("published: {}", paint::paint(paint::VALUE, published));
+            }
+            if o.update_available() {
                 paint::notice(&format!(
                     "update available; run `claude-run version update --train {}`",
                     UpdateTrain::Latest.label()
                 ));
+            } else {
+                paint::success("up to date");
             }
         }
     }
-    Ok(exit::OK)
 }
 
 /// `claude-run version update [--train <release|latest>] [--version <tag>]`.
@@ -577,12 +730,7 @@ pub async fn update(
     }
 
     paint::notice(&format!("downloading {target} ..."));
-    let (bin, sidecar) = updater.download(&cred, &target).await?;
-    let expected = parse_sha256_sidecar(&sidecar).ok_or_else(|| {
-        anyhow::anyhow!("could not parse the published sha256 sidecar for {target}")
-    })?;
-    verify_sha256(&bin, &expected)?;
-    let path = install_binary(&bin)?;
+    let path = download_verify_install(&updater, &cred, &target).await?;
     paint::success(&format!(
         "installed {target} to {} (checksum verified). Run `claude-run version show` to confirm.",
         path.display()
@@ -820,6 +968,22 @@ mod tests {
         (StatusCode::OK, Json(body))
     }
 
+    /// The asset bytes the stub serves for any tag (CLAUDE-129 apply path).
+    const STUB_ASSET: &[u8] = b"fake-claude-run-binary";
+    /// A well-formed but deliberately non-matching sha256 sidecar: it is neither
+    /// the digest of [`STUB_ASSET`] nor of the running test binary, so the apply
+    /// path fails verification before install and the `latest` check reports an
+    /// update available.
+    const STUB_BAD_SIDECAR: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  claude-run-linux-x86_64\n";
+
+    async fn asset_handler() -> Vec<u8> {
+        STUB_ASSET.to_vec()
+    }
+
+    async fn sidecar_handler() -> &'static str {
+        STUB_BAD_SIDECAR
+    }
+
     /// Spin up a stub on an ephemeral port; returns its base URL and a shutdown
     /// guard (the JoinHandle is detached via the returned task).
     async fn spawn_stub(require_auth: bool) -> (String, tokio::task::JoinHandle<()>) {
@@ -829,6 +993,17 @@ mod tests {
         });
         let app = Router::new()
             .route("/api/v1/packages/Contoso", get(list_handler))
+            // Asset + sidecar for any tag (CLAUDE-129 check/apply cores). The
+            // `.sha256` route is registered first so it is not shadowed by the
+            // bare-asset route's `:tag` capture for the sibling segment.
+            .route(
+                "/api/packages/Contoso/generic/claude-run/:tag/claude-run-linux-x86_64.sha256",
+                get(sidecar_handler),
+            )
+            .route(
+                "/api/packages/Contoso/generic/claude-run/:tag/claude-run-linux-x86_64",
+                get(asset_handler),
+            )
             .with_state(stub);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -892,5 +1067,60 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("rejected the fj token"));
+    }
+
+    // ---- non-interactive cores (CLAUDE-129) --------------------------------
+
+    /// `check_core` on the `release` train reports the newest published semver
+    /// as `available` and the running build as `current`, with no printing.
+    #[tokio::test]
+    async fn check_core_release_reports_newest() {
+        let (base, _h) = spawn_stub(false).await;
+        let updater = Updater::with_registry(registry_for(&base)).unwrap();
+        let (cred, versions) = updater.list_versions(|| None).await.unwrap();
+        let outcome = check_core(UpdateTrain::Release, &updater, &cred, &versions)
+            .await
+            .unwrap();
+        assert_eq!(outcome.train, UpdateTrain::Release);
+        // Newest semver in the stub list, ignoring the moving `latest` tag.
+        assert_eq!(outcome.available.as_deref(), Some("v0.2.0"));
+        assert_eq!(outcome.current, format!("v{}", current_version().unwrap()));
+        // The running build is at/after v0.2.0, so no update is offered.
+        assert!(!outcome.update_available());
+    }
+
+    /// `check_core` on the `latest` train compares the running exe digest against
+    /// the published `latest.sha256`. The stub serves a non-matching digest, so
+    /// an update is reported available with both digests surfaced.
+    #[tokio::test]
+    async fn check_core_latest_compares_digests() {
+        let (base, _h) = spawn_stub(false).await;
+        let updater = Updater::with_registry(registry_for(&base)).unwrap();
+        let (cred, versions) = updater.list_versions(|| None).await.unwrap();
+        let outcome = check_core(UpdateTrain::Latest, &updater, &cred, &versions)
+            .await
+            .unwrap();
+        assert_eq!(outcome.train, UpdateTrain::Latest);
+        assert_eq!(outcome.current, current_exe_sha256().unwrap());
+        assert_eq!(outcome.available.as_deref(), Some(&"f".repeat(64)[..]));
+        assert!(outcome.update_available());
+    }
+
+    /// `apply_core` verifies the downloaded build against the published sidecar
+    /// BEFORE swapping the binary. The stub's sidecar does not match the asset,
+    /// so apply fails with a checksum-mismatch error and never calls
+    /// `install_binary`, leaving the running binary untouched.
+    #[tokio::test]
+    async fn apply_core_refuses_on_checksum_mismatch() {
+        let (base, _h) = spawn_stub(false).await;
+        let updater = Updater::with_registry(registry_for(&base)).unwrap();
+        let (cred, versions) = updater.list_versions(|| None).await.unwrap();
+        let err = apply_core(UpdateTrain::Release, &updater, &cred, &versions)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "expected a checksum-mismatch error, got: {err}"
+        );
     }
 }
