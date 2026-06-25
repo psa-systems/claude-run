@@ -135,7 +135,13 @@ native:
       code_review: Code Review
       needs_review: Needs Review
       failed: Failed
+      done: Done                          # AI Agent value set when automerge merges the PR
       in_progress: In Progress            # the standard State field value set in pre
+      state_done: Done                    # the standard State value set when automerge merges the PR
+    automerge:                            # optional; CI-gated automerge of the opened PR (CLAUDE-126)
+      enabled: false                      # off by default; finalize stops at Code Review
+      wait_seconds: 1800                  # max total seconds to wait for checks to go green
+      check_interval_seconds: 30          # seconds between CI status polls
   forgejo:
     base_url: https://forge.example       # optional; default derives host per issue VCS
     token_ref: fj-prod                    # optional; name of an encrypted secret
@@ -154,7 +160,10 @@ native:
 | `youtrack.query`        | `-Resolved AI Agent: Queued`       | Issue query selecting the jobs this action picks up.                                                |
 | `youtrack.custom_field` | `AI Agent`                         | Custom field holding the AI Agent state machine.                                                    |
 | `youtrack.prompt`       | built-in default                   | Full-replacement agent prompt (CLAUDE-125). When unset, the built-in CLAUDE-24 prompt is used. When set, the text fully replaces it (so the operator owns the runner contract: bare `#<KEY>` commit reference, the `.claude-run-needs-review` / `.claude-run-skip-attempt` blocker markers, no push / no PR / no YouTrack write). Editable in the structured web form. See the placeholders below. |
-| `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value.                                    |
+| `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value. `done` (AI Agent) and `state_done` (State) are set only when automerge merges the PR (CLAUDE-126). |
+| `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge (CLAUDE-126). When `false`, finalize stops at Code Review with no CI wait and no merge (unchanged behavior). |
+| `youtrack.automerge.wait_seconds` | `1800`                   | Maximum total seconds to wait for the PR's checks to go green (and the branch to be up to date) before giving up and leaving the PR open. |
+| `youtrack.automerge.check_interval_seconds` | `30`           | Seconds between combined-CI-status polls.                                                            |
 | `forgejo.base_url`      | per-issue VCS host                 | Forgejo base URL.                                                                                   |
 | `forgejo.token_ref`     | none                               | Name of an encrypted secret holding the Forgejo API token (CLAUDE-26). `None` uses host `fj` auth.  |
 | `forgejo.pr_strategy`   | `branch`                           | PR-creation strategy (CLAUDE-103). `branch`: push a real server branch (`git push --set-upstream origin HEAD`) and open the PR over the API, so the PR stays mergeable and updatable. `agit`: `fj pr create -aA`, a branchless PR whose head lives only at `refs/pull/<N>/head` and loses its merge button if it falls behind an up-to-date base. The selected strategy is authoritative (no silent cross-strategy fallback). |
@@ -186,6 +195,28 @@ The GitHub backend prefers GitHub's remote MCP (`create_pull_request`) and falls
 endpoint is unreachable; with neither available it errors. Unlike Forgejo's AGit flow (`fj -aA`), GitHub has no AGit
 equivalent, so the backend pushes the working branch before opening the PR. The PAT supplied via `github.token_ref`
 must carry the **`repo`** and **`pull_request`** scopes (used for the authenticated push, the MCP call, and `gh`).
+
+##### CI-gated automerge (CLAUDE-126)
+
+By default a successful run opens the PR, sets AI Agent to `code_review`, and stops; the issue stays In Progress until a
+human merges. Setting `youtrack.automerge.enabled: true` opts each successful run into merging the PR itself once its CI
+checks pass. After the PR is opened, finalize polls the PR's combined CI status (`fj pr status`) every
+`check_interval_seconds` up to a total budget of `wait_seconds`, honoring the run's cancel token so a `claude-run stop`
+never hangs on a long wait. The outcomes:
+
+- **Green and up to date:** the PR is merged as a **merge-commit** (never squash/rebase, so the single commit's bare
+  `#<KEY>` reference survives in history), State is set to `state_done` and AI Agent to `done`, and a "runner merged"
+  comment is posted. The run's outcome is `Merged`.
+- **Branch behind base:** if the checks are green but the forge reports the PR as not mergeable (its branch is behind a
+  base that requires an up-to-date branch), the runner performs the Forgejo "Update Branch" step once (it merges the base
+  into the head with the git CLI and pushes, retriggering CI) and keeps polling within the same budget. `fj` exposes no
+  `pr update-branch` subcommand, so this is done with git rather than the REST API. A branch that stays unmergeable after
+  one update is left open for a human.
+- **CI failure:** no merge; the PR is left open at Code Review and a failure comment is posted.
+- **Budget exhausted while still pending:** no merge; the PR is left open at Code Review and a timeout comment is posted.
+
+Automerge is currently implemented for the Forgejo (`fj`) backend only; a GitHub-hosted job with automerge enabled logs
+the unsupported merge and leaves the PR at Code Review (GitHub automerge is a follow-up).
 
 #### Credential injection (CLAUDE-26)
 

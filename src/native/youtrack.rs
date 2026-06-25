@@ -28,7 +28,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
 use tracing::{info, warn};
@@ -556,6 +556,7 @@ async fn process_job(
         &workdir_path,
         &claude_result,
         pr_strategy,
+        cancel,
     );
     let post_failed = match &finalize_res {
         Ok(Finalized::CodeReview { pr_url }) => {
@@ -605,7 +606,11 @@ async fn process_job(
     // panic anywhere above preserves trivially: deletion only ever happens
     // here, explicitly.
     match &finalize_res {
-        Ok(Finalized::CodeReview { .. }) => cleanup_workdir(&workdir_path),
+        // A merged PR (CLAUDE-126) is as safe to delete as a Code Review PR: the
+        // work reached the server and, for Merged, was merged into the base.
+        Ok(Finalized::CodeReview { .. }) | Ok(Finalized::Merged { .. }) => {
+            cleanup_workdir(&workdir_path)
+        }
         _ => cleanup_or_preserve(&workdir_path, &action.name, key),
     }
 
@@ -806,6 +811,9 @@ enum Finalized {
     NeedsReview,
     /// Success: PR opened; AI Agent=Code Review.
     CodeReview { pr_url: String },
+    /// CLAUDE-126: automerge succeeded - the PR's checks went green, the branch
+    /// was up to date, and the runner merged it; State=Done, AI Agent=Done.
+    Merged { pr_url: String },
     /// Hard failure (claude error, pre failure, or PR-create failure);
     /// AI Agent=Failed, no PR (or a failed PR).
     Failed,
@@ -822,6 +830,7 @@ impl Finalized {
         match self {
             Finalized::NeedsReview => "Needs Review",
             Finalized::CodeReview { .. } => "Code Review",
+            Finalized::Merged { .. } => "Merged",
             Finalized::Failed => "Failed",
             Finalized::TimedOut => "Timed Out",
         }
@@ -831,8 +840,10 @@ impl Finalized {
 /// The finalize state machine (the native "post"). Runs on every path. Mirrors
 /// the single finalize `post` step in `actions/youtrack.yml`: the comment is
 /// best-effort (a comment failure cannot strand the AI Agent field on Working),
-/// and the AI Agent write is the authoritative, last operation. State is never
-/// set to Done; it stays In Progress until a human merges the PR.
+/// and the AI Agent write is the authoritative, last operation. State stays In
+/// Progress until a human merges the PR, except when CLAUDE-126 automerge is
+/// enabled and the runner merges the PR itself (then State / AI Agent go Done).
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     backend: &dyn Backend,
     forge: &dyn Forge,
@@ -841,6 +852,7 @@ fn finalize(
     workdir: &Path,
     claude_result: &ClaudeResult,
     pr_strategy: crate::action::PrStrategy,
+    cancel: &CancellationToken,
 ) -> Result<Finalized> {
     let needs_review = workdir.join(NEEDS_REVIEW_MARKER);
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
@@ -866,6 +878,33 @@ fn finalize(
                 let url = pr_url(job, &pr);
                 let body = success_comment(claude_result, &url);
                 comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
+                // CLAUDE-126: optional, CI-gated automerge. Off by default, so
+                // the issue stays at Code Review exactly as before. When enabled
+                // and the PR number is known, poll the checks and merge on green.
+                if src.automerge.enabled {
+                    match pr.number {
+                        Some(pr_number) => {
+                            match automerge(
+                                backend, forge, src, job, workdir, &url, pr_number, cancel,
+                            ) {
+                                Ok(Some(merged)) => return Ok(merged),
+                                // Failure / timeout / cancel: the PR is left open
+                                // at Code Review and the reason was already
+                                // commented inside `automerge`.
+                                Ok(None) => {}
+                                // A forge error during the merge attempt must not
+                                // strand the issue: it already sits at Code Review
+                                // for a human, so log and leave it there.
+                                Err(e) => {
+                                    warn!(key = %job.key, error = %e, "automerge failed; leaving PR at Code Review");
+                                }
+                            }
+                        }
+                        None => {
+                            warn!(key = %job.key, "automerge enabled but PR number is unknown; leaving at Code Review");
+                        }
+                    }
+                }
                 Ok(Finalized::CodeReview { pr_url: url })
             }
             Err(e) => {
@@ -905,6 +944,169 @@ fn finalize(
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
         Ok(Finalized::Failed)
     }
+}
+
+/// CLAUDE-126: the automerge poll loop. Runs only when `automerge.enabled` and
+/// a PR number is known. Polls the PR's combined CI status every
+/// `check_interval_seconds` up to a total budget of `wait_seconds`, honoring the
+/// run's cancel token. Returns:
+///
+/// - `Ok(Some(Finalized::Merged))` on green + up-to-date: the PR is merged as a
+///   merge-commit, State=Done and AI Agent=Done are set, and a "runner merged"
+///   comment is posted.
+/// - `Ok(None)` when the PR is left open at Code Review (checks failed, the
+///   budget was exhausted while still pending, the branch could not be brought
+///   up to date, or the run was cancelled); the reason is commented (except on
+///   cancel, where the run is being torn down).
+/// - `Err` only on a forge/tracker call error, which the caller logs while
+///   leaving the issue at Code Review.
+///
+/// Before merging, a green-but-unmergeable PR (its branch behind the base) is
+/// brought up to date once via [`Forge::update_branch`] (retriggering CI), and
+/// the subsequent checks are awaited within the same budget; a branch that
+/// stays unmergeable after one update is left for a human.
+#[allow(clippy::too_many_arguments)]
+fn automerge(
+    backend: &dyn Backend,
+    forge: &dyn Forge,
+    src: &YoutrackSource,
+    job: &YoutrackJob,
+    workdir: &Path,
+    pr_url: &str,
+    pr_number: u64,
+    cancel: &CancellationToken,
+) -> Result<Option<Finalized>> {
+    let host = host_only(&job.repo_host);
+    let repo = job.repo_path.as_str();
+    let cfg = &src.automerge;
+    let budget = Duration::from_secs(cfg.wait_seconds);
+    let start = Instant::now();
+    // Bound the "behind base" recovery to a single Update Branch so a branch
+    // that stays unmergeable (e.g. a merge conflict) cannot spin until the
+    // deadline.
+    let mut updated = false;
+
+    info!(key = %job.key, pr = pr_number, wait_seconds = cfg.wait_seconds, "automerge: waiting for CI checks");
+    loop {
+        if cancel.is_cancelled() {
+            info!(key = %job.key, "automerge: run cancelled; leaving PR at Code Review");
+            return Ok(None);
+        }
+        let status = forge.pr_status(&host, repo, pr_number)?;
+        match status.state.trim() {
+            "failure" | "error" => {
+                let body = automerge_failure_comment(pr_url);
+                if let Err(e) = backend.comment(&job.key, &body) {
+                    warn!(key = %job.key, error = %e, "automerge failure comment failed (continuing)");
+                }
+                info!(key = %job.key, pr = pr_number, "automerge: checks failed; leaving PR at Code Review");
+                return Ok(None);
+            }
+            "success" if status.mergeable => {
+                // Green and up to date: merge as a merge-commit, then advance the
+                // issue. State=Done first, then comment + AI Agent=Done as the
+                // authoritative last write (mirrors comment_then_field).
+                forge.merge_pr(&host, repo, pr_number)?;
+                backend.set_state(&job.key, &src.states.state_done)?;
+                let body = merged_comment(pr_url);
+                comment_then_field(backend, src, &job.key, &body, &src.states.done)?;
+                info!(key = %job.key, pr = pr_number, "automerge: merged PR and advanced issue to Done");
+                return Ok(Some(Finalized::Merged {
+                    pr_url: pr_url.to_string(),
+                }));
+            }
+            "success" => {
+                // Green but not mergeable: the branch is behind its base. Update
+                // it once (which retriggers CI) and keep polling; if it is still
+                // not mergeable after that, leave it for a human.
+                if updated {
+                    let body = automerge_not_mergeable_comment(pr_url);
+                    if let Err(e) = backend.comment(&job.key, &body) {
+                        warn!(key = %job.key, error = %e, "automerge not-mergeable comment failed (continuing)");
+                    }
+                    info!(key = %job.key, pr = pr_number, "automerge: still not mergeable after Update Branch; leaving PR at Code Review");
+                    return Ok(None);
+                }
+                info!(key = %job.key, pr = pr_number, "automerge: branch behind base; running Update Branch");
+                forge.update_branch(workdir)?;
+                updated = true;
+            }
+            // "pending" (or any other transient state): keep waiting.
+            _ => {}
+        }
+
+        if start.elapsed() >= budget {
+            let body = automerge_timeout_comment(pr_url, cfg.wait_seconds);
+            if let Err(e) = backend.comment(&job.key, &body) {
+                warn!(key = %job.key, error = %e, "automerge timeout comment failed (continuing)");
+            }
+            info!(key = %job.key, pr = pr_number, "automerge: timed out waiting for green checks; leaving PR at Code Review");
+            return Ok(None);
+        }
+        sleep_with_cancel(cfg.check_interval_seconds, cancel);
+    }
+}
+
+/// Sleep up to `secs` seconds, waking early (in <=500ms) if the run is
+/// cancelled so a `claude-run stop` never hangs on a long `check_interval`.
+fn sleep_with_cancel(secs: u64, cancel: &CancellationToken) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(Duration::from_millis(500)));
+    }
+}
+
+fn merged_comment(pr_url: &str) -> String {
+    [
+        "The runner merged this PR after its CI checks passed (automerge).".to_string(),
+        String::new(),
+        format!("PR: {pr_url}"),
+        String::new(),
+        "The issue has been advanced to Done.".to_string(),
+    ]
+    .join("\n")
+}
+
+fn automerge_failure_comment(pr_url: &str) -> String {
+    [
+        "Automerge did NOT merge this PR: its CI checks reported a failure.".to_string(),
+        String::new(),
+        format!("PR: {pr_url}"),
+        String::new(),
+        "The PR is left open for a human to resolve; AI Agent stays at Code Review.".to_string(),
+    ]
+    .join("\n")
+}
+
+fn automerge_timeout_comment(pr_url: &str, wait_seconds: u64) -> String {
+    [
+        format!(
+            "Automerge timed out after {wait_seconds}s waiting for the PR's CI checks to pass."
+        ),
+        String::new(),
+        format!("PR: {pr_url}"),
+        String::new(),
+        "The PR is left open for a human to review and merge; AI Agent stays at Code Review."
+            .to_string(),
+    ]
+    .join("\n")
+}
+
+fn automerge_not_mergeable_comment(pr_url: &str) -> String {
+    [
+        "Automerge could not bring the PR branch up to date with its base, so it was not merged."
+            .to_string(),
+        String::new(),
+        format!("PR: {pr_url}"),
+        String::new(),
+        "The PR is left open for a human to update and merge; AI Agent stays at Code Review."
+            .to_string(),
+    ]
+    .join("\n")
 }
 
 /// Comment first (best-effort), then set AI Agent last as the authoritative
@@ -1478,6 +1680,7 @@ mod tests {
             wd,
             &ClaudeResult::synthesized("e", "s"),
             PrStrategy::Branch,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -1532,6 +1735,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Branch,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1585,6 +1789,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1884,6 +2089,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Branch,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -1988,6 +2194,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Branch,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(
@@ -2048,6 +2255,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
@@ -2087,6 +2295,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -2118,6 +2327,7 @@ mod tests {
             dir.path(),
             &claude,
             PrStrategy::Branch,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -2158,6 +2368,7 @@ mod tests {
             dir.path(),
             &timed_out_result(),
             PrStrategy::Branch,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(res, Finalized::TimedOut);
@@ -2198,6 +2409,7 @@ mod tests {
             dir.path(),
             &timed_out_result(),
             PrStrategy::Branch,
+            &CancellationToken::new(),
         )
         .unwrap();
         assert_eq!(res, Finalized::TimedOut);
@@ -2211,5 +2423,256 @@ mod tests {
         );
         assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    // ---- CLAUDE-126: automerge finalize branches ------------------------
+
+    /// A YoutrackSource with automerge enabled and a zero inter-poll interval so
+    /// the tests never sleep.
+    fn src_automerge(wait_seconds: u64) -> YoutrackSource {
+        YoutrackSource {
+            automerge: crate::action::Automerge {
+                enabled: true,
+                wait_seconds,
+                check_interval_seconds: 0,
+            },
+            ..YoutrackSource::default()
+        }
+    }
+
+    #[test]
+    fn finalize_automerge_merges_on_green_and_sets_done() {
+        // CLAUDE-126: with automerge enabled, a PR whose checks are green and
+        // whose branch is up to date is merged as a merge-commit; the issue is
+        // advanced to State=Done + AI Agent=Done and the outcome is Merged.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
+                    "Created pull request #7",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "status",
+                        "contoso/claude-run#7",
+                        "--json",
+                    ],
+                    r#"{"pr":7,"state":"success","mergeable":true,"merged":false}"#,
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "merge",
+                        "contoso/claude-run#7",
+                        "--method",
+                        "merge",
+                    ],
+                    "",
+                )
+                .ok("yt", &["issue", "set-state", "MK-16", "Done"], "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Done"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src_automerge(600),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Agit,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::Merged {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into()
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(
+                |c| c == "fj --host dev.a8n.run pr merge contoso/claude-run#7 --method merge"
+            ),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "yt issue set-state MK-16 Done"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Done"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_automerge_leaves_code_review_on_check_failure() {
+        // CLAUDE-126: a CI failure means no merge; the PR stays open and the
+        // issue stays at Code Review (the create-time state).
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
+                    "Created pull request #7",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "status",
+                        "contoso/claude-run#7",
+                        "--json",
+                    ],
+                    r#"{"pr":7,"state":"failure","mergeable":false,"merged":false}"#,
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src_automerge(600),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Agit,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into()
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        // No merge, and the issue was never advanced to Done.
+        assert!(!calls.iter().any(|c| c.contains("pr merge")), "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c.contains("AI Agent Done")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_automerge_leaves_code_review_on_timeout() {
+        // CLAUDE-126: checks still pending when the budget is exhausted means no
+        // merge; the PR stays open at Code Review. `wait_seconds: 0` exhausts the
+        // budget after the first (pending) poll.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
+                    "Created pull request #7",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "status",
+                        "contoso/claude-run#7",
+                        "--json",
+                    ],
+                    r#"{"pr":7,"state":"pending","mergeable":false,"merged":false}"#,
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src_automerge(0),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Agit,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into()
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("pr merge")), "{calls:?}");
+    }
+
+    #[test]
+    fn finalize_automerge_disabled_leaves_code_review() {
+        // CLAUDE-126: the default (disabled) automerge never polls or merges; the
+        // success path is exactly the pre-CLAUDE-126 Code Review behavior.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
+                    "Created pull request #7",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Agit,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(matches!(res, Finalized::CodeReview { .. }));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr status")),
+            "disabled automerge must not poll: {calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("pr merge")), "{calls:?}");
     }
 }
