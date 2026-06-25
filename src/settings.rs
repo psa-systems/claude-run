@@ -416,6 +416,12 @@ impl LiveSettings {
         self.workdir_gc.clone()
     }
 
+    /// CLAUDE-129: a snapshot of the live update config (train + token_ref), read
+    /// by the About page handlers to drive the on-demand check / apply.
+    pub async fn update_config(&self) -> UpdateConfig {
+        self.update.read().await.clone()
+    }
+
     /// Current value of `section` as a pretty JSON document (secrets appear as
     /// their `*_ref` names only - no secret material is stored or rendered).
     pub async fn section_json(&self, section: Section) -> String {
