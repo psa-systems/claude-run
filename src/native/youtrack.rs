@@ -1146,10 +1146,10 @@ fn host_only(repo_host: &str) -> String {
         .to_string()
 }
 
-/// PR URL for the issue comment. When the forge returned a real HTTP URL (the
-/// GitHub backend reports the PR `html_url`), use it verbatim. Otherwise (the
-/// `fj` backend reports a `Created pull request #<n>` line, not a URL) render the
-/// parsed number against the Forgejo `pulls` path, falling back to the raw line.
+/// PR URL for the issue comment. When the forge returned a real HTTP URL (both
+/// the GitHub backend and `fj pr create --json` report the PR `html_url`), use
+/// it verbatim. Otherwise render the parsed number against the Forgejo `pulls`
+/// path, falling back to the raw line.
 fn pr_url(job: &YoutrackJob, pr: &PullRequest) -> String {
     if pr.url.starts_with("https://") || pr.url.starts_with("http://") {
         return pr.url.clone();
@@ -1820,8 +1820,9 @@ mod tests {
                         "feat: x",
                         "--body-file",
                         ".claude-run-pr-body.md",
+                        "--json",
                     ],
-                    "Created pull request #7",
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok(
                     "yt",
@@ -1874,8 +1875,8 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-                    "Created pull request #7",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok(
                     "yt",
@@ -1905,7 +1906,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "fj --host dev.a8n.run pr create -aA"),
+                .any(|c| c == "fj --host dev.a8n.run pr create -aA --json"),
             "{calls:?}"
         );
         assert!(
@@ -2334,8 +2335,8 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-                    "Created pull request #7",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok(
                     "yt",
@@ -2379,7 +2380,7 @@ mod tests {
             StubRunner::new()
                 .fail(
                     "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     1,
                     "no commits to push",
                 )
@@ -2553,8 +2554,8 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-                    "Created pull request #7",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok(
                     "yt",
@@ -2639,8 +2640,8 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-                    "Created pull request #7",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok(
                     "yt",
@@ -2697,8 +2698,8 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-                    "Created pull request #7",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok(
                     "yt",
@@ -2749,8 +2750,8 @@ mod tests {
             StubRunner::new()
                 .ok(
                     "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA"],
-                    "Created pull request #7",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
                 .ok(
                     "yt",
