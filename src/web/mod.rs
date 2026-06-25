@@ -1342,6 +1342,29 @@ fn youtrack_form_to_yaml(
     if let Some(v) = opt(&form.state_in_progress) {
         states.in_progress = v;
     }
+    // CLAUDE-126: the form exposes neither the automerge block nor the `done` /
+    // `state_done` labels it uses, so preserve any hand-written values across a
+    // form save (mirrors the github-block preservation below). Read them off the
+    // parsed on-disk action before the `native` key is overwritten; prune_yaml
+    // still drops an all-default automerge block so untouched actions write none.
+    let disk_youtrack = map.get("native").and_then(|n| n.get("youtrack")).cloned();
+    if let Some(am) = disk_youtrack
+        .as_ref()
+        .and_then(|y| y.get("automerge"))
+        .cloned()
+        .and_then(|a| serde_yaml::from_value::<crate::action::Automerge>(a).ok())
+    {
+        youtrack.automerge = am;
+    }
+    if let Some(disk_states) = disk_youtrack
+        .as_ref()
+        .and_then(|y| y.get("states"))
+        .cloned()
+        .and_then(|s| serde_yaml::from_value::<crate::action::YoutrackStates>(s).ok())
+    {
+        youtrack.states.done = disk_states.done;
+        youtrack.states.state_done = disk_states.state_done;
+    }
     // CLAUDE-54: preserve a hand-written `github` block. The form exposes only
     // `token_ref`, so read the existing `native.github` sub-block off the parsed
     // on-disk action (before we overwrite the `native` key below) to carry its

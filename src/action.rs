@@ -185,6 +185,11 @@ pub struct YoutrackSource {
     /// `{{...}}` placeholders (`{{key}}`, `{{summary}}`, `{{clone_url}}`,
     /// `{{workdir}}`, `{{needs_review_marker}}`, `{{skip_attempt_marker}}`).
     pub prompt: Option<String>,
+    /// Optional CI-gated automerge of the opened PR (CLAUDE-126). Disabled by
+    /// default, so finalize stops at Code Review exactly as before; when enabled
+    /// the runner waits for the PR's checks to go green and merges it.
+    #[serde(skip_serializing_if = "Automerge::is_default")]
+    pub automerge: Automerge,
 }
 
 impl Default for YoutrackSource {
@@ -196,7 +201,45 @@ impl Default for YoutrackSource {
             custom_field: default_custom_field(),
             states: YoutrackStates::default(),
             prompt: None,
+            automerge: Automerge::default(),
         }
+    }
+}
+
+/// Opt-in, CI-gated automerge of the PR the runner opens after a successful
+/// native YouTrack run (CLAUDE-126). When `enabled`, finalize polls the PR's
+/// combined CI status every `check_interval_seconds` up to `wait_seconds`, and
+/// on green (with an up-to-date branch) merges the PR as a merge-commit and
+/// advances the issue to Done. Disabled by default, leaving the existing
+/// stop-at-Code-Review behavior unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Automerge {
+    /// Master switch. `false` (the default) keeps finalize stopping at Code
+    /// Review with no CI wait and no merge.
+    pub enabled: bool,
+    /// Maximum total seconds to wait for the PR's checks to go green (and the
+    /// branch to be up to date) before giving up and leaving the PR open.
+    pub wait_seconds: u64,
+    /// Seconds between CI status polls.
+    pub check_interval_seconds: u64,
+}
+
+impl Default for Automerge {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            wait_seconds: 1800,
+            check_interval_seconds: 30,
+        }
+    }
+}
+
+impl Automerge {
+    /// True when every field is at its default. Used to skip serializing an
+    /// untouched `automerge` block so existing action YAML stays unchanged.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -223,8 +266,13 @@ pub struct YoutrackStates {
     pub needs_review: String,
     /// AI Agent value set on a hard failure.
     pub failed: String,
+    /// AI Agent value set after the runner automerges the PR (CLAUDE-126).
+    pub done: String,
     /// Standard `State` field value set in the pre step.
     pub in_progress: String,
+    /// Standard `State` field value set after the runner automerges the PR
+    /// (CLAUDE-126).
+    pub state_done: String,
 }
 
 impl Default for YoutrackStates {
@@ -235,7 +283,9 @@ impl Default for YoutrackStates {
             code_review: "Code Review".to_string(),
             needs_review: "Needs Review".to_string(),
             failed: "Failed".to_string(),
+            done: "Done".to_string(),
             in_progress: "In Progress".to_string(),
+            state_done: "Done".to_string(),
         }
     }
 }
@@ -668,6 +718,57 @@ native:
             cfg.youtrack.prompt.as_deref(),
             Some("Work {{key}}: {{summary}}\n")
         );
+    }
+
+    #[test]
+    fn youtrack_automerge_defaults_to_disabled_when_absent() {
+        // CLAUDE-126: a youtrack config with no `automerge` block deserializes to
+        // the disabled defaults, so the existing finalize behavior is unchanged.
+        let raw = "name: yt\nkind: youtrack\nnative:\n  youtrack: {}\n";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert_eq!(cfg.youtrack.automerge, Automerge::default());
+        assert!(!cfg.youtrack.automerge.enabled);
+        assert_eq!(cfg.youtrack.automerge.wait_seconds, 1800);
+        assert_eq!(cfg.youtrack.automerge.check_interval_seconds, 30);
+    }
+
+    #[test]
+    fn youtrack_automerge_round_trips_through_yaml() {
+        // CLAUDE-126: an explicit `automerge` block parses its fields and survives
+        // a serialize -> deserialize round-trip unchanged.
+        let raw = "\
+name: yt
+kind: youtrack
+native:
+  youtrack:
+    automerge:
+      enabled: true
+      wait_seconds: 600
+      check_interval_seconds: 15
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        let am = &cfg.youtrack.automerge;
+        assert!(am.enabled);
+        assert_eq!(am.wait_seconds, 600);
+        assert_eq!(am.check_interval_seconds, 15);
+
+        // Round-trip: serializing then re-parsing yields the same struct.
+        let yaml = serde_yaml::to_string(am).unwrap();
+        let back: Automerge = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(*am, back);
+
+        // An unknown key inside the block is rejected (deny_unknown_fields).
+        let bogus = raw.replace("wait_seconds: 600", "wait_secondz: 600");
+        assert!(matches!(
+            validate_str(&bogus, "<candidate>").unwrap_err(),
+            Error::Yaml(_)
+        ));
     }
 
     #[test]

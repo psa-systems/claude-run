@@ -88,6 +88,19 @@ pub struct ForgePullRequest {
     pub updated_at: String,
 }
 
+/// The mergeability snapshot of a PR as `fj pr status --json` reports it
+/// (CLAUDE-126). `state` is the combined CI status (`"success"` / `"failure"` /
+/// `"pending"`); `mergeable` is the forge's verdict on whether the PR can be
+/// merged right now (false when behind a base that requires an up-to-date
+/// branch). Only the fields automerge consumes are modelled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrStatus {
+    /// Combined CI status: `"success"` / `"failure"` / `"pending"`.
+    pub state: String,
+    /// Whether the forge will merge the PR as-is (false when behind base).
+    pub mergeable: bool,
+}
+
 /// A pull request opened by a [`Forge`] backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
@@ -184,6 +197,42 @@ pub trait Forge: Send + Sync {
         pr_number: u64,
         body_file: &std::path::Path,
     ) -> Result<()>;
+
+    /// CLAUDE-126: combined CI status plus mergeability of PR `pr_number` in
+    /// `repo` on `host` (`fj pr status <repo>#<n> --json`). Backs the automerge
+    /// poll, which needs both the CI verdict and whether the branch is up to
+    /// date in a single query. The default errors so a backend that has not
+    /// implemented automerge (the GitHub `Forge`, a follow-up) reports clearly
+    /// rather than silently succeeding.
+    fn pr_status(&self, host: &str, repo: &str, pr_number: u64) -> Result<PrStatus> {
+        let _ = (host, repo, pr_number);
+        Err(Error::Other(anyhow::anyhow!(
+            "pr_status (automerge) not supported by this forge backend"
+        )))
+    }
+
+    /// CLAUDE-126: merge PR `pr_number` in `repo` on `host` as a merge-commit
+    /// (never squash/rebase, so the single commit's bare `#<KEY>` reference
+    /// survives in history). The default errors for backends without automerge.
+    fn merge_pr(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
+        let _ = (host, repo, pr_number);
+        Err(Error::Other(anyhow::anyhow!(
+            "merge_pr (automerge) not supported by this forge backend"
+        )))
+    }
+
+    /// CLAUDE-126: bring the PR branch checked out in `workdir` up to date with
+    /// its base (the Forgejo "Update Branch" step), retriggering CI. `fj`
+    /// exposes no `pr update-branch` subcommand, so the Forgejo backend performs
+    /// it with the git CLI (merge the base into the head and push) rather than
+    /// hitting the REST API directly. The default errors for backends without
+    /// automerge.
+    fn update_branch(&self, workdir: &std::path::Path) -> Result<()> {
+        let _ = workdir;
+        Err(Error::Other(anyhow::anyhow!(
+            "update_branch (automerge) not supported by this forge backend"
+        )))
+    }
 }
 
 /// A backend implementing the full provider surface. Marker super-trait so the
