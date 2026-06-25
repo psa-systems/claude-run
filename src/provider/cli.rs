@@ -370,6 +370,14 @@ impl IssueTracker for CliBackend {
         Ok(())
     }
 
+    fn set_assignee(&self, key: &str, login: &str) -> Result<()> {
+        // `yt issue update <key> --assignee <login>` is the purpose-built write
+        // for the user-type Assignee field (CLAUDE-131); `login` may be a login,
+        // `me`, or `unassigned`.
+        self.yt_ok(&["issue", "update", key, "--assignee", login])?;
+        Ok(())
+    }
+
     fn comment(&self, key: &str, body: &str) -> Result<()> {
         self.yt_ok(&["issue", "comment", key, body])?;
         Ok(())

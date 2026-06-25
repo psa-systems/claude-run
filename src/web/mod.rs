@@ -1121,6 +1121,9 @@ struct YoutrackEditForm {
     yt_token_ref: String,
     yt_query: String,
     yt_custom_field: String,
+    /// Optional Assignee set on the issue at pickup (CLAUDE-131). Empty string
+    /// maps to `None` (Assignee left untouched). A login, `me`, or `unassigned`.
+    yt_assignee: String,
     /// Full-replacement agent prompt (CLAUDE-125). Prefilled with the saved
     /// override or, when none, the built-in default template (placeholders
     /// literal). Cleared or left equal to the default -> no `prompt` key saved.
@@ -1205,6 +1208,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         yt_token_ref: s(&yt.youtrack.token_ref),
         yt_query: yt.youtrack.query.clone(),
         yt_custom_field: yt.youtrack.custom_field.clone(),
+        yt_assignee: s(&yt.youtrack.assignee),
         yt_prompt: yt
             .youtrack
             .prompt
@@ -1319,6 +1323,9 @@ fn youtrack_form_to_yaml(
     if let Some(c) = opt(&form.yt_custom_field) {
         youtrack.custom_field = c;
     }
+    // CLAUDE-131: blank Assignee box -> no `assignee` key (Assignee untouched);
+    // any value is persisted as a literal `yt` assignee argument.
+    youtrack.assignee = opt(&form.yt_assignee);
     // CLAUDE-125: store the prompt only as a real override. Normalize browser
     // CRLF to LF, trim, and compare to the built-in default: an empty box or one
     // left equal to the default writes no `prompt` key (stay on the built-in so
@@ -3070,6 +3077,32 @@ mod tests {
             assert!(!yaml.contains("null"), "unexpected null in:\n{yaml}");
             assert!(!yaml.contains("token_ref"), "blank token leaked:\n{yaml}");
             assert!(!yaml.contains("schedule"), "no schedule expected:\n{yaml}");
+        }
+
+        #[test]
+        fn form_assignee_round_trips_and_clears() {
+            // CLAUDE-131: a filled Assignee box serializes to `assignee` and
+            // loads back; a blank box emits no `assignee` key (field cleared).
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.yt_assignee = "octocat".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            assert!(yaml.contains("assignee: octocat"), "{yaml}");
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(yt.youtrack.assignee.as_deref(), Some("octocat"));
+
+            // Clearing the box drops the key entirely (no `assignee: null`).
+            f.yt_assignee = String::new();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            assert!(!yaml.contains("assignee"), "assignee leaked:\n{yaml}");
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert!(yt.youtrack.assignee.is_none());
         }
 
         #[test]
