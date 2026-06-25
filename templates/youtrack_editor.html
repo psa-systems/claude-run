@@ -90,7 +90,9 @@
       {% call tokenfield("Token secret", "yt_token_ref", form.yt_token_ref) %}
       {% call textfield("Issue query", "yt_query", form.yt_query, "-Resolved AI Agent: Queued") %}
       {% call textfield("Custom field", "yt_custom_field", form.yt_custom_field, "AI Agent") %}
+      {% call textfield("Assignee (optional)", "yt_assignee", form.yt_assignee, "login, me, or unassigned (blank = leave Assignee untouched)") %}
     </div>
+    <p class="hint dim">When set, the issue is assigned to this user during pickup. A literal <code>yt</code> assignee argument: a login, <code>me</code>, or <code>unassigned</code>. Leave blank to never touch the Assignee.</p>
   </div>
 
   <div class="card">

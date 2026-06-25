@@ -744,6 +744,13 @@ mod tests {
                 .push(format!("set_state {key} {state}"));
             Ok(())
         }
+        fn set_assignee(&self, key: &str, login: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_assignee {key} {login}"));
+            Ok(())
+        }
         fn comment(&self, key: &str, body: &str) -> Result<()> {
             self.calls
                 .lock()
