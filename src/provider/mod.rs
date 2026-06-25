@@ -127,6 +127,11 @@ pub trait IssueTracker: Send + Sync {
     /// Set the standard `State` field, e.g. `("MK-16", "In Progress")`.
     fn set_state(&self, key: &str, state: &str) -> Result<()>;
 
+    /// Set the issue Assignee, e.g. `("MK-16", "octocat")`. `login` is passed
+    /// straight to the backend; `me` and `unassigned` are valid values. Backs the
+    /// optional assignee-on-pickup write (CLAUDE-131).
+    fn set_assignee(&self, key: &str, login: &str) -> Result<()>;
+
     /// Add a comment to an issue.
     fn comment(&self, key: &str, body: &str) -> Result<()>;
 

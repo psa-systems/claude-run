@@ -126,6 +126,7 @@ native:
     token_ref: yt-prod                    # optional; name of an encrypted secret
     query: "-Resolved AI Agent: Queued"   # issues to pick up
     custom_field: "AI Agent"              # field holding the state machine
+    assignee: octocat                     # optional; assign the issue on pickup (login, me, or unassigned)
     prompt: |                             # optional; full replacement of the built-in agent prompt
       Work issue {{key}}: {{summary}}
       Repo cloned at {{workdir}} ({{clone_url}}).
@@ -159,6 +160,7 @@ native:
 | `youtrack.token_ref`    | none                               | Name of an encrypted secret holding the YouTrack API token (CLAUDE-26). `None` uses host `yt` auth. |
 | `youtrack.query`        | `-Resolved AI Agent: Queued`       | Issue query selecting the jobs this action picks up.                                                |
 | `youtrack.custom_field` | `AI Agent`                         | Custom field holding the AI Agent state machine.                                                    |
+| `youtrack.assignee`     | none                               | Optional Assignee set on the issue during pickup (CLAUDE-131). A literal `yt` assignee argument: a login, `me`, or `unassigned`. When unset (default), the Assignee is never touched. An assignee write failure aborts pickup before the clone. Editable in the structured web form. |
 | `youtrack.prompt`       | built-in default                   | Full-replacement agent prompt (CLAUDE-125). When unset, the built-in CLAUDE-24 prompt is used. When set, the text fully replaces it (so the operator owns the runner contract: bare `#<KEY>` commit reference, the `.claude-run-needs-review` / `.claude-run-skip-attempt` blocker markers, no push / no PR / no YouTrack write). Editable in the structured web form. See the placeholders below. |
 | `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value. `done` (AI Agent) and `state_done` (State) are set only when automerge merges the PR (CLAUDE-126). |
 | `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge (CLAUDE-126). When `false`, finalize stops at Code Review with no CI wait and no merge (unchanged behavior). |

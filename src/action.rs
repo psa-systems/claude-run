@@ -190,6 +190,10 @@ pub struct YoutrackSource {
     /// the runner waits for the PR's checks to go green and merges it.
     #[serde(skip_serializing_if = "Automerge::is_default")]
     pub automerge: Automerge,
+    /// Optional Assignee to set on the issue during pickup (CLAUDE-131). A literal
+    /// `yt` assignee argument (a login, `me`, or `unassigned`). `None` (the
+    /// default) leaves the Assignee untouched, exactly as before.
+    pub assignee: Option<String>,
 }
 
 impl Default for YoutrackSource {
@@ -202,6 +206,7 @@ impl Default for YoutrackSource {
             states: YoutrackStates::default(),
             prompt: None,
             automerge: Automerge::default(),
+            assignee: None,
         }
     }
 }
