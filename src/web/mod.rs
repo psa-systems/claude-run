@@ -38,6 +38,9 @@ use crate::state;
 pub mod webhooks;
 
 const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
+// CLAUDE-139: idiomorph + its htmx extension, vendored so the live poll can
+// morph the DOM in place instead of replacing it (preserves selection/scroll).
+const IDIOMORPH_JS: &[u8] = include_bytes!("../../assets/idiomorph-ext.min.js");
 
 #[derive(Clone)]
 pub struct WebState {
@@ -104,6 +107,7 @@ pub fn router(api: Arc<AppState>, paths: Paths, webhook_enabled: bool) -> Router
             get(job_stream_sse),
         )
         .route("/static/htmx.min.js", get(htmx_handler))
+        .route("/static/idiomorph-ext.min.js", get(idiomorph_handler))
         .with_state(st)
 }
 
@@ -2586,6 +2590,19 @@ async fn job_stream_sse(
 
 async fn htmx_handler() -> Response {
     let mut resp = Response::new(Body::from(HTMX_JS));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/javascript"),
+    );
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    resp
+}
+
+async fn idiomorph_handler() -> Response {
+    let mut resp = Response::new(Body::from(IDIOMORPH_JS));
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/javascript"),

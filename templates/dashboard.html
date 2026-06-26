@@ -7,7 +7,9 @@
      hx-get="/?show_empty={{ show_empty }}"
      hx-trigger="every 5s, refreshNow from:body"
      hx-select="#poll-region"
-     hx-swap="outerHTML">
+     {# CLAUDE-139: morph in place (idiomorph) instead of replacing the subtree,
+        so the poll does not wipe text selection / scroll / focus. #}
+     hx-swap="morph:outerHTML">
 
 {% if let Some(g) = global_pause %}
   <h2>Globally paused</h2>
@@ -106,7 +108,9 @@
            hx-vals="js:{show_empty: event.target.checked}"
            hx-target="#poll-region"
            hx-select="#poll-region"
-           hx-swap="outerHTML"
+           {# CLAUDE-139: morph the same poll-region in place so the toggle
+              shares the non-destructive swap path. #}
+           hx-swap="morph:outerHTML"
            hx-trigger="change">
     Show empty runs
   </label>
