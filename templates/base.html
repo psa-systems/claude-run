@@ -87,8 +87,13 @@
     footer { color: var(--fg-dim); font-size: 11px; padding: 24px; text-align: center; }
   </style>
   <script src="/static/htmx.min.js"></script>
+  <!-- CLAUDE-139: idiomorph htmx extension; registers the `morph` swap so the
+       live poll patches the DOM in place instead of replacing it. -->
+  <script src="/static/idiomorph-ext.min.js"></script>
 </head>
-<body>
+<!-- CLAUDE-139: enable the idiomorph `morph` swap extension for all descendants
+     (poll regions opt in per-element via hx-swap="morph:..."). -->
+<body hx-ext="morph">
   <header>
     <h1><a href="/" style="color: var(--fg);">claude-run</a></h1>
     <nav>

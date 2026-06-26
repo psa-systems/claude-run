@@ -12,7 +12,9 @@
      hx-get="/runs/{{ run.id }}"
      hx-trigger="every 2s [!document.querySelector('dialog[open]')], refreshNow from:body"
      hx-select="#poll-region"
-     hx-swap="outerHTML">
+     {# CLAUDE-139: morph in place (idiomorph) instead of replacing the subtree,
+        so the poll does not wipe text selection / scroll / focus. #}
+     hx-swap="morph:outerHTML">
 
 <h2>Run #{{ run.id }} - {{ run.action_name }}</h2>
 
