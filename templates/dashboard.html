@@ -4,7 +4,11 @@
 {% block main %}
 
 <div id="poll-region"
-     hx-get="/?show_empty={{ show_empty }}"
+     hx-get="/"
+     {# CLAUDE-143: pull the live search state (q / in_stream / show_empty) from
+        the search form so the 5s morph poll preserves an active search instead
+        of wiping it back to the plain runs view. #}
+     hx-include="#search-form"
      hx-trigger="every 5s, refreshNow from:body"
      hx-select="#poll-region"
      {# CLAUDE-139: morph in place (idiomorph) instead of replacing the subtree,
@@ -100,12 +104,32 @@
   {% endif %}
 </div>
 
-<h2>Recent runs
-  <label style="float: right; font-size: 11px; text-transform: none; letter-spacing: 0; font-weight: normal; cursor: pointer;">
-    <input type="checkbox"
+<h2>{% if search.is_some() %}Search results{% else %}Recent runs{% endif %}</h2>
+
+{# CLAUDE-143: content search over job summaries, with an opt-in checkbox to
+   also grep the per-attempt stream logs. Submitting morph-swaps the poll-region
+   so the search composes with the live refresh and the show-empty toggle. #}
+<form id="search-form"
+      hx-get="/"
+      hx-target="#poll-region"
+      hx-select="#poll-region"
+      hx-swap="morph:outerHTML"
+      hx-trigger="submit"
+      style="margin: 4px 0 14px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+  <input type="search" name="q" value="{{ search_q }}"
+         placeholder="Search run summaries..." autocomplete="off"
+         style="flex: 1 1 260px; min-width: 160px;">
+  <label style="font-size: 12px; text-transform: none; letter-spacing: 0; font-weight: normal; cursor: pointer;">
+    <input type="checkbox" name="in_stream" value="true" {% if in_stream %}checked{% endif %}>
+    grep stream logs
+  </label>
+  <button class="btn" type="submit">Search</button>
+  {% if search.is_some() %}<a class="btn" href="/">Clear</a>{% endif %}
+  <label style="font-size: 11px; text-transform: none; letter-spacing: 0; font-weight: normal; cursor: pointer; margin-left: auto;">
+    <input type="checkbox" name="show_empty" value="true"
            {% if show_empty %}checked{% endif %}
            hx-get="/"
-           hx-vals="js:{show_empty: event.target.checked}"
+           hx-include="#search-form"
            hx-target="#poll-region"
            hx-select="#poll-region"
            {# CLAUDE-139: morph the same poll-region in place so the toggle
@@ -114,42 +138,77 @@
            hx-trigger="change">
     Show empty runs
   </label>
-</h2>
-{% if recent_runs.is_empty() %}
-  <div class="card"><span class="dim">No runs yet.</span></div>
+</form>
+
+{% if let Some(sr) = search %}
+  {% if sr.in_stream %}
+    <p class="meta">Searched summaries and the stream logs of {{ sr.files_searched }} failed-job attempt(s){% if sr.capped %}; capped at {{ sr.max_files }} files, older streams were not searched{% endif %}.</p>
+  {% endif %}
+  {% if sr.hits.is_empty() %}
+    <div class="card"><span class="dim">No jobs match "{{ sr.q }}".</span></div>
+  {% else %}
+    <table>
+      <thead><tr><th>Run</th><th>Action</th><th>Job</th><th>Attempt</th><th>When</th><th>Status</th><th>Match</th><th>Snippet</th></tr></thead>
+      <tbody>
+        {% for h in sr.hits %}
+          <tr>
+            <td class="mono"><a href="/runs/{{ h.run_id }}">#{{ h.run_id }}</a></td>
+            <td>{{ h.action_name }}</td>
+            <td class="mono"><a href="/runs/{{ h.run_id }}/jobs/{{ h.job_key }}/attempt/{{ h.attempt }}">{{ h.job_key }}</a></td>
+            <td class="mono">{{ h.attempt }}</td>
+            <td class="mono dim">{{ h.ts }}</td>
+            <td class="mono">
+              {% if h.timed_out %}<span class="badge warn">timed out</span>
+              {% else if h.ok %}<span class="badge ok">ok</span>
+              {% else %}<span class="badge bad">fail</span>{% endif %}
+            </td>
+            <td>
+              {% if h.matched_summary %}<span class="badge neutral">summary</span>{% endif %}
+              {% if h.matched_stream %}<span class="badge neutral">stream</span>{% endif %}
+            </td>
+            <td class="dim" style="font-family: var(--mono); font-size: 11px;">{{ h.snippet }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
 {% else %}
-  <table>
-    <thead><tr><th>Run</th><th>Action</th><th>Started</th><th>Ended</th><th>Duration</th><th>Triggered</th><th>Jobs</th><th>Exit</th></tr></thead>
-    <tbody>
-      {% for r in recent_runs %}
-        <tr>
-          <td class="mono"><a href="/runs/{{ r.id }}">#{{ r.id }}</a></td>
-          <td>{{ r.action_name }}</td>
-          <td class="mono dim">{{ r.started_at }}</td>
-          <td class="mono dim">{{ r.ended_at.as_deref().unwrap_or("-") }}</td>
-          <td class="mono">{{ r.duration() }}</td>
-          <td class="dim">{{ r.triggered_by }}</td>
-          <td class="mono">{{ r.jobs_processed }}{% if r.failed_jobs > 0 %} <span style="color: var(--bad);">({{ r.failed_jobs }} failed)</span>{% endif %}</td>
-          <td class="mono">
-            {% match r.exit_code %}
-              {% when Some(0) %}<span class="badge ok">0</span>
-              {% when Some(130) %}<span class="badge cancel">cancelled</span>
-              {% when Some(c) %}<span class="badge bad">{{ c }}</span>
-              {% when None %}
-                <span class="badge warn">running</span>
-                <form hx-post="/api/runs/{{ r.id }}/cancel"
-                      hx-swap="none"
-                      hx-disabled-elt="find button"
-                      hx-on::after-request="htmx.trigger('body', 'refreshNow')"
-                      style="display:inline; margin-left: 6px;">
-                  <button class="btn">Cancel</button>
-                </form>
-            {% endmatch %}
-          </td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  {% if recent_runs.is_empty() %}
+    <div class="card"><span class="dim">No runs yet.</span></div>
+  {% else %}
+    <table>
+      <thead><tr><th>Run</th><th>Action</th><th>Started</th><th>Ended</th><th>Duration</th><th>Triggered</th><th>Jobs</th><th>Exit</th></tr></thead>
+      <tbody>
+        {% for r in recent_runs %}
+          <tr>
+            <td class="mono"><a href="/runs/{{ r.id }}">#{{ r.id }}</a></td>
+            <td>{{ r.action_name }}</td>
+            <td class="mono dim">{{ r.started_at }}</td>
+            <td class="mono dim">{{ r.ended_at.as_deref().unwrap_or("-") }}</td>
+            <td class="mono">{{ r.duration() }}</td>
+            <td class="dim">{{ r.triggered_by }}</td>
+            <td class="mono">{{ r.jobs_processed }}{% if r.failed_jobs > 0 %} <span style="color: var(--bad);">({{ r.failed_jobs }} failed)</span>{% endif %}</td>
+            <td class="mono">
+              {% match r.exit_code %}
+                {% when Some(0) %}<span class="badge ok">0</span>
+                {% when Some(130) %}<span class="badge cancel">cancelled</span>
+                {% when Some(c) %}<span class="badge bad">{{ c }}</span>
+                {% when None %}
+                  <span class="badge warn">running</span>
+                  <form hx-post="/api/runs/{{ r.id }}/cancel"
+                        hx-swap="none"
+                        hx-disabled-elt="find button"
+                        hx-on::after-request="htmx.trigger('body', 'refreshNow')"
+                        style="display:inline; margin-left: 6px;">
+                    <button class="btn">Cancel</button>
+                  </form>
+              {% endmatch %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
 {% endif %}
 
 </div><!-- /#poll-region -->

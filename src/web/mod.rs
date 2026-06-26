@@ -493,6 +493,271 @@ async fn fetch_recent_runs(
     Ok(rows)
 }
 
+// ---- run search (CLAUDE-143) ----------------------------------------------
+//
+// The Runs screen search finds jobs by content. The `summary` is always
+// searched (cheap, indexed-free LIKE/instr over `job_outcomes`). When the
+// opt-in `in_stream` toggle is set, the per-attempt stream `.jsonl` logs are
+// also grepped server-side, so a failure whose only evidence is in the stream
+// (the motivating "No space left on device" case) is findable. Matching is a
+// case-insensitive ASCII substring for both, per the issue assumptions.
+
+/// CLAUDE-143: cap on how many summary matches the search returns.
+const SEARCH_SUMMARY_LIMIT: i64 = 200;
+/// CLAUDE-143: max stream `.jsonl` files grepped when stream search is enabled.
+/// Bounds the opt-in scan: only the most recent failed-job attempts (which carry
+/// a `stream_log_path`) are searched, newest first, up to this many files.
+const SEARCH_STREAM_MAX_FILES: usize = 200;
+/// CLAUDE-143: max bytes read from a single stream file before giving up, so one
+/// pathologically large log cannot stall the whole search.
+const SEARCH_STREAM_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(sqlx::FromRow)]
+struct JobSearchRow {
+    run_id: i64,
+    action_name: String,
+    job_key: String,
+    attempt: i64,
+    ts: String,
+    ok: bool,
+    timed_out: bool,
+    summary: Option<String>,
+    stream_log_path: Option<String>,
+}
+
+/// CLAUDE-143: one matching job attempt in the search results. Keyed in the
+/// builder by `(run_id, job_key, attempt)` so a job matched in both its summary
+/// and its stream collapses to a single row carrying both badges.
+#[derive(Serialize)]
+struct JobSearchHit {
+    run_id: i64,
+    action_name: String,
+    job_key: String,
+    attempt: i64,
+    ts: String,
+    ok: bool,
+    timed_out: bool,
+    matched_summary: bool,
+    matched_stream: bool,
+    /// A short, single-line context window around the first match.
+    snippet: String,
+}
+
+/// CLAUDE-143: rendered search state threaded into the dashboard template.
+#[derive(Serialize)]
+struct SearchView {
+    q: String,
+    in_stream: bool,
+    hits: Vec<JobSearchHit>,
+    /// Stream search hit the file cap; older streams were not searched. Surfaced
+    /// in the UI so results are never silently truncated.
+    capped: bool,
+    /// Number of stream files actually opened and grepped (missing files are
+    /// skipped and not counted).
+    files_searched: usize,
+    /// The file cap (`SEARCH_STREAM_MAX_FILES`), surfaced for the capped note.
+    max_files: usize,
+}
+
+/// CLAUDE-143: outcome of grepping a single stream log file.
+enum StreamGrep {
+    /// File absent or unreadable (path recorded but rotated/deleted) - skipped,
+    /// not counted toward `files_searched`.
+    Missing,
+    /// File was opened and scanned; `Some(snippet)` on the first matching line.
+    Searched(Option<String>),
+}
+
+/// CLAUDE-143: read a stream `.jsonl` log line-by-line (as `job_stream_sse`
+/// does) looking for the first line containing `needle` (already ASCII
+/// lowercased). Reads at most `max_bytes` before giving up so a huge log cannot
+/// stall the search. A missing/unreadable file returns [`StreamGrep::Missing`].
+async fn stream_match_snippet(path: &std::path::Path, needle: &str, max_bytes: u64) -> StreamGrep {
+    let Ok(file) = tokio::fs::File::open(path).await else {
+        return StreamGrep::Missing;
+    };
+    let mut reader = BufReader::new(file).lines();
+    let mut read: u64 = 0;
+    loop {
+        match reader.next_line().await {
+            Ok(Some(line)) => {
+                if line.to_ascii_lowercase().contains(needle) {
+                    return StreamGrep::Searched(Some(match_snippet(&line, needle)));
+                }
+                read += line.len() as u64 + 1;
+                if read >= max_bytes {
+                    return StreamGrep::Searched(None);
+                }
+            }
+            Ok(None) | Err(_) => return StreamGrep::Searched(None),
+        }
+    }
+}
+
+/// CLAUDE-143: a short, single-line context window around the first
+/// case-insensitive (ASCII) match of `needle` in `haystack`. `needle` is already
+/// ASCII-lowercased. Control characters are flattened to spaces so a snippet
+/// from a JSON log line stays on one row. Falls back to the leading chars when
+/// no match is found (e.g. the SQL matched a field this view does not show).
+fn match_snippet(haystack: &str, needle: &str) -> String {
+    const BEFORE: usize = 40;
+    const AFTER: usize = 100;
+    let flat: String = haystack
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    // ASCII-lowercasing is length-preserving, so byte offsets in `lower` map
+    // 1:1 onto `flat`.
+    let lower = flat.to_ascii_lowercase();
+    let Some(pos) = lower.find(needle) else {
+        return truncate_chars(flat.trim(), BEFORE + AFTER);
+    };
+    let mut start = pos.saturating_sub(BEFORE);
+    while start > 0 && !flat.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (pos + needle.len() + AFTER).min(flat.len());
+    while end < flat.len() && !flat.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut out = String::new();
+    if start > 0 {
+        out.push('\u{2026}');
+    }
+    out.push_str(flat[start..end].trim());
+    if end < flat.len() {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+/// CLAUDE-143: first `max` chars of `s`, with a trailing ellipsis when truncated.
+fn truncate_chars(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+/// CLAUDE-143: find jobs whose `summary` (always) - and, when `in_stream`, whose
+/// per-attempt stream `.jsonl` log - contains `q` (case-insensitive ASCII
+/// substring). Stream search is bounded to the most recent failed-job attempts
+/// (`SEARCH_STREAM_MAX_FILES`, reading at most `SEARCH_STREAM_MAX_BYTES` each);
+/// missing/rotated files are skipped without error, and `capped` reports when
+/// the file cap was reached so the UI never silently truncates.
+async fn search_jobs(pool: &SqlitePool, q: &str, in_stream: bool) -> Result<SearchView, WebError> {
+    let needle = q.to_ascii_lowercase();
+
+    // Summary search (always on). `instr(lower(...), needle)` is a plain
+    // substring test, so query text containing LIKE metacharacters (% _) needs
+    // no escaping. SQLite `lower()` is ASCII-only, matching the ASCII needle.
+    let summary_rows = sqlx::query_as::<_, JobSearchRow>(
+        "SELECT run_id, action_name, job_key, attempt, ts, ok, timed_out, summary, stream_log_path \
+         FROM job_outcomes \
+         WHERE summary IS NOT NULL AND instr(lower(summary), ?) > 0 \
+         ORDER BY id DESC LIMIT ?",
+    )
+    .bind(&needle)
+    .bind(SEARCH_SUMMARY_LIMIT)
+    .fetch_all(pool)
+    .await?;
+
+    // Keyed by (run_id, job_key, attempt) so a job matched in both summary and
+    // stream collapses to one row carrying both badges.
+    let mut hits: std::collections::BTreeMap<(i64, String, i64), JobSearchHit> =
+        std::collections::BTreeMap::new();
+
+    for r in summary_rows {
+        let snippet = r
+            .summary
+            .as_deref()
+            .map(|s| match_snippet(s, &needle))
+            .unwrap_or_default();
+        let key = (r.run_id, r.job_key.clone(), r.attempt);
+        hits.insert(
+            key,
+            JobSearchHit {
+                run_id: r.run_id,
+                action_name: r.action_name,
+                job_key: r.job_key,
+                attempt: r.attempt,
+                ts: r.ts,
+                ok: r.ok,
+                timed_out: r.timed_out,
+                matched_summary: true,
+                matched_stream: false,
+                snippet,
+            },
+        );
+    }
+
+    let mut files_searched = 0usize;
+    let mut capped = false;
+
+    if in_stream {
+        // Scope: the most recent failed-job attempts that recorded a stream log
+        // path. Fetch one past the cap to detect truncation.
+        let mut candidates = sqlx::query_as::<_, JobSearchRow>(
+            "SELECT run_id, action_name, job_key, attempt, ts, ok, timed_out, summary, stream_log_path \
+             FROM job_outcomes \
+             WHERE ok = 0 AND stream_log_path IS NOT NULL \
+             ORDER BY id DESC LIMIT ?",
+        )
+        .bind(SEARCH_STREAM_MAX_FILES as i64 + 1)
+        .fetch_all(pool)
+        .await?;
+
+        if candidates.len() > SEARCH_STREAM_MAX_FILES {
+            capped = true;
+            candidates.truncate(SEARCH_STREAM_MAX_FILES);
+        }
+
+        for r in candidates {
+            let Some(path) = r.stream_log_path.as_deref() else {
+                continue;
+            };
+            match stream_match_snippet(std::path::Path::new(path), &needle, SEARCH_STREAM_MAX_BYTES)
+                .await
+            {
+                StreamGrep::Missing => continue,
+                StreamGrep::Searched(found) => {
+                    files_searched += 1;
+                    let Some(snippet) = found else { continue };
+                    let key = (r.run_id, r.job_key.clone(), r.attempt);
+                    hits.entry(key)
+                        .and_modify(|h| h.matched_stream = true)
+                        .or_insert_with(move || JobSearchHit {
+                            run_id: r.run_id,
+                            action_name: r.action_name,
+                            job_key: r.job_key,
+                            attempt: r.attempt,
+                            ts: r.ts,
+                            ok: r.ok,
+                            timed_out: r.timed_out,
+                            matched_summary: false,
+                            matched_stream: true,
+                            snippet,
+                        });
+                }
+            }
+        }
+    }
+
+    // Newest first by timestamp (ties broken by run id) for a stable order.
+    let mut hits: Vec<JobSearchHit> = hits.into_values().collect();
+    hits.sort_by(|a, b| b.ts.cmp(&a.ts).then(b.run_id.cmp(&a.run_id)));
+
+    Ok(SearchView {
+        q: q.to_string(),
+        in_stream,
+        hits,
+        capped,
+        files_searched,
+        max_files: SEARCH_STREAM_MAX_FILES,
+    })
+}
+
 // ---- templates ------------------------------------------------------------
 
 #[derive(Template)]
@@ -508,6 +773,15 @@ struct DashboardTpl {
     /// CLAUDE-35: current state of the "Show empty runs" toggle. Threaded into
     /// the poll-region `hx-get` so the choice survives the 5s self-refresh.
     show_empty: bool,
+    /// CLAUDE-143: current search text, echoed into the search box so it
+    /// survives the morph poll. Empty when no search is active.
+    search_q: String,
+    /// CLAUDE-143: current state of the "grep stream logs" toggle, echoed back
+    /// into the checkbox.
+    in_stream: bool,
+    /// CLAUDE-143: `Some` when a search is active; the template then renders the
+    /// matching jobs in place of the Recent runs table.
+    search: Option<SearchView>,
 }
 
 /// CLAUDE-35: query params for the dashboard. `show_empty` defaults to `false`
@@ -516,6 +790,12 @@ struct DashboardTpl {
 struct DashboardQuery {
     #[serde(default)]
     show_empty: bool,
+    /// CLAUDE-143: search text. Empty/absent leaves the normal runs view.
+    #[serde(default)]
+    q: String,
+    /// CLAUDE-143: also grep the per-attempt stream logs (opt-in checkbox).
+    #[serde(default)]
+    in_stream: bool,
 }
 
 async fn dashboard(
@@ -531,6 +811,16 @@ async fn dashboard(
         });
     let actions = enriched_actions(pool, s.webhook_enabled).await?;
     let recent_runs = fetch_recent_runs(pool, 20, q.show_empty).await?;
+
+    // CLAUDE-143: run the content search when the box is non-empty. The result
+    // region morph-swaps in place (poll-region) so the search composes with the
+    // live refresh and the "Show empty runs" toggle without a refresh-wipe.
+    let search_q = q.q.trim().to_string();
+    let search = if search_q.is_empty() {
+        None
+    } else {
+        Some(search_jobs(pool, &search_q, q.in_stream).await?)
+    };
 
     // Today totals: sum across all actions
     let today = state::today_local().to_string();
@@ -557,6 +847,9 @@ async fn dashboard(
         actions,
         recent_runs,
         show_empty: q.show_empty,
+        search_q,
+        in_stream: q.in_stream,
+        search,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
@@ -4066,6 +4359,210 @@ mod tests {
             let body = body_string(resp).await;
             assert!(body.contains("invalid"), "expected train error: {body}");
             assert!(body.contains("nightly"), "{body}");
+        }
+    }
+
+    // ---- runs search (CLAUDE-143) -----------------------------------------
+
+    /// `search_jobs` finds jobs by summary (always) and, opt-in, by grepping the
+    /// per-attempt stream `.jsonl` logs. The motivating case is a failure whose
+    /// only evidence ("No space left on device") lives in the stream, not the
+    /// summary; with stream search on it must surface, and a missing/rotated
+    /// stream file must not error.
+    mod search {
+        use super::super::{match_snippet, search_jobs};
+        use crate::db::MIGRATOR;
+        use sqlx::sqlite::SqlitePoolOptions;
+        use sqlx::SqlitePool;
+
+        async fn pool() -> SqlitePool {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            MIGRATOR.run(&pool).await.unwrap();
+            pool
+        }
+
+        async fn seed_run(pool: &SqlitePool, id: i64) {
+            sqlx::query(
+                "INSERT INTO runs (id, action_name, started_at, triggered_by) \
+                 VALUES (?, 'act', '2026-06-26T00:00:00+00:00', 'schedule')",
+            )
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn seed_job(
+            pool: &SqlitePool,
+            run_id: i64,
+            job_key: &str,
+            attempt: i64,
+            ok: bool,
+            ts: &str,
+            summary: Option<&str>,
+            stream_log_path: Option<&str>,
+        ) {
+            sqlx::query(
+                "INSERT INTO job_outcomes \
+                 (run_id, action_name, job_key, attempt, ts, ok, claude_ran, claude_ok, summary, stream_log_path) \
+                 VALUES (?, 'act', ?, ?, ?, ?, 1, ?, ?, ?)",
+            )
+            .bind(run_id)
+            .bind(job_key)
+            .bind(attempt)
+            .bind(ts)
+            .bind(ok)
+            .bind(ok)
+            .bind(summary)
+            .bind(stream_log_path)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        /// Summary search is case-insensitive substring and always on; stream
+        /// search stays off here.
+        #[tokio::test]
+        async fn summary_match_is_case_insensitive_substring() {
+            let pool = pool().await;
+            seed_run(&pool, 1).await;
+            seed_job(
+                &pool,
+                1,
+                "CLAUDE-1",
+                1,
+                true,
+                "2026-06-26T00:01:00+00:00",
+                Some("Implemented the WIDGET refactor"),
+                None,
+            )
+            .await;
+            seed_job(
+                &pool,
+                1,
+                "CLAUDE-2",
+                1,
+                true,
+                "2026-06-26T00:02:00+00:00",
+                Some("Unrelated work"),
+                None,
+            )
+            .await;
+
+            let view = search_jobs(&pool, "widget", false).await.unwrap();
+            assert_eq!(view.hits.len(), 1);
+            assert_eq!(view.hits[0].job_key, "CLAUDE-1");
+            assert!(view.hits[0].matched_summary);
+            assert!(!view.hits[0].matched_stream);
+        }
+
+        /// The disk-space scenario: a failed job whose summary does NOT mention
+        /// the cause but whose stream log does. Summary-only search misses it;
+        /// enabling stream search surfaces it with a snippet and the stream
+        /// badge.
+        #[tokio::test]
+        async fn stream_search_finds_disk_space_failure() {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = tmp.path().join("CLAUDE-9-attempt-1.jsonl");
+            std::fs::write(
+                &log,
+                "{\"type\":\"system\",\"subtype\":\"init\"}\n\
+                 {\"type\":\"result\",\"result\":\"write failed: No space left on device\"}\n",
+            )
+            .unwrap();
+
+            let pool = pool().await;
+            seed_run(&pool, 1).await;
+            seed_job(
+                &pool,
+                1,
+                "CLAUDE-9",
+                1,
+                false,
+                "2026-06-26T00:01:00+00:00",
+                Some("Run failed"),
+                Some(log.to_str().unwrap()),
+            )
+            .await;
+
+            // Summary-only: the cause is invisible.
+            let summary_only = search_jobs(&pool, "No space left on device", false)
+                .await
+                .unwrap();
+            assert!(summary_only.hits.is_empty());
+
+            // With stream search: found, with a snippet and the stream badge.
+            let view = search_jobs(&pool, "No space left on device", true)
+                .await
+                .unwrap();
+            assert_eq!(view.hits.len(), 1);
+            assert_eq!(view.hits[0].job_key, "CLAUDE-9");
+            assert!(view.hits[0].matched_stream);
+            assert!(view.hits[0].snippet.contains("No space left on device"));
+            assert_eq!(view.files_searched, 1);
+            assert!(!view.capped);
+        }
+
+        /// A stream search whose summary AND stream both match collapses to one
+        /// hit carrying both badges, and a candidate whose recorded stream file
+        /// is missing (rotated/deleted) is skipped without error.
+        #[tokio::test]
+        async fn missing_stream_file_is_skipped_and_badges_merge() {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = tmp.path().join("CLAUDE-3-attempt-1.jsonl");
+            std::fs::write(&log, "{\"result\":\"boom token here\"}\n").unwrap();
+            let gone = tmp.path().join("CLAUDE-4-attempt-1.jsonl");
+
+            let pool = pool().await;
+            seed_run(&pool, 1).await;
+            // Summary and stream both mention "token".
+            seed_job(
+                &pool,
+                1,
+                "CLAUDE-3",
+                1,
+                false,
+                "2026-06-26T00:02:00+00:00",
+                Some("failed: token mismatch"),
+                Some(log.to_str().unwrap()),
+            )
+            .await;
+            // Failed job whose recorded stream file does not exist on disk.
+            seed_job(
+                &pool,
+                1,
+                "CLAUDE-4",
+                1,
+                false,
+                "2026-06-26T00:01:00+00:00",
+                Some("no match here"),
+                Some(gone.to_str().unwrap()),
+            )
+            .await;
+
+            let view = search_jobs(&pool, "token", true).await.unwrap();
+            assert_eq!(view.hits.len(), 1);
+            let hit = &view.hits[0];
+            assert_eq!(hit.job_key, "CLAUDE-3");
+            assert!(hit.matched_summary && hit.matched_stream);
+            // The missing file was not opened, so it is not counted.
+            assert_eq!(view.files_searched, 1);
+        }
+
+        /// The snippet centers a single-line window on the match and flattens
+        /// control characters, falling back to the leading text when the match
+        /// is not in the shown haystack.
+        #[test]
+        fn snippet_windows_around_match() {
+            let line = "{\"type\":\"result\",\"result\":\"oops: No space left on device\"}";
+            let s = match_snippet(line, "no space left on device");
+            assert!(s.contains("No space left on device"));
+            assert!(!s.contains('\n'));
         }
     }
 }
