@@ -9,7 +9,10 @@
    summary dialog is open, because the swap would destroy it mid-read;
    refreshNow stays unconditional (user-initiated via the cancel button). #}
 <div id="poll-region"
-     hx-get="/runs/{{ run.id }}"
+     {# CLAUDE-140: carry the current sort/filter selections through the poll so
+        each 2s morph refresh re-renders the chosen view instead of resetting to
+        the default ordering. #}
+     hx-get="/runs/{{ run.id }}?{{ sort.poll_query() }}"
      hx-trigger="every 2s [!document.querySelector('dialog[open]')], refreshNow from:body"
      hx-select="#poll-region"
      {# CLAUDE-139: morph in place (idiomorph) instead of replacing the subtree,
@@ -58,12 +61,42 @@
    = in flight (stream log present, run still active) and carries a watch-live
    link; "queued" = waiting its turn; "skipped" = the run ended before this
    job produced an outcome; "ok" / "fail" once an outcome lands. #}
-{% if !planned_jobs.is_empty() %}
+{% if has_planned %}
   <h2>Jobs in this batch</h2>
   <div class="card">
     <table>
-      <thead><tr><th>Job</th><th>State</th><th>Live</th></tr></thead>
+      {# CLAUDE-140: Job and State headers sort server-side (toggling asc/desc),
+         and State carries a filter dropdown over the runner's actual job-state
+         set. Each control re-requests this region with the sort/filter encoded
+         in namespaced query params and morph-swaps it in place. #}
+      <thead><tr>
+        <th><a href="#" class="sort-link"
+               hx-get="/runs/{{ run.id }}?{{ sort.jobs_sort_query("job") }}"
+               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+               >Job{{ sort.jobs_arrow("job") }}</a></th>
+        <th>
+          <a href="#" class="sort-link"
+             hx-get="/runs/{{ run.id }}?{{ sort.jobs_sort_query("state") }}"
+             hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+             >State{{ sort.jobs_arrow("state") }}</a>
+          <select name="jobs_state" hx-trigger="change"
+                  hx-get="/runs/{{ run.id }}?{{ sort.query_without("jobs_state") }}"
+                  hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+            <option value=""{% if sort.jobs_state.is_empty() %} selected{% endif %}>all</option>
+            <option value="ok"{% if sort.jobs_state == "ok" %} selected{% endif %}>done</option>
+            <option value="running"{% if sort.jobs_state == "running" %} selected{% endif %}>running</option>
+            <option value="queued"{% if sort.jobs_state == "queued" %} selected{% endif %}>queued</option>
+            <option value="fail"{% if sort.jobs_state == "fail" %} selected{% endif %}>failed</option>
+            <option value="timed_out"{% if sort.jobs_state == "timed_out" %} selected{% endif %}>timed out</option>
+            <option value="skipped"{% if sort.jobs_state == "skipped" %} selected{% endif %}>not started</option>
+          </select>
+        </th>
+        <th>Live</th>
+      </tr></thead>
       <tbody>
+        {% if planned_jobs.is_empty() %}
+          <tr><td colspan="3"><span class="dim">No jobs match the filter.</span></td></tr>
+        {% endif %}
         {% for p in planned_jobs %}
           <tr>
             <td class="mono">
@@ -111,16 +144,83 @@
 {% endif %}
 
 <h2>Job outcomes</h2>
-{% if outcomes.is_empty() %}
+{% if !has_outcomes %}
   <div class="card"><span class="dim">No jobs yet.</span></div>
 {% else %}
+  {# CLAUDE-140: every header sorts server-side (toggling asc/desc); OK, Claude
+     and Counted also carry filter dropdowns. Controls re-request this region
+     with the selection encoded in `out_*` query params and morph-swap in
+     place, so the choice survives the 2s poll. #}
   <table>
     <thead>
       <tr>
-        <th>Key</th><th>Attempt</th><th>OK</th><th>Claude</th><th>$</th><th>Counted</th><th>When</th><th>Duration</th><th>Stream</th><th>Summary</th>
+        <th><a href="#" class="sort-link"
+               hx-get="/runs/{{ run.id }}?{{ sort.out_sort_query("key") }}"
+               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+               >Key{{ sort.out_arrow("key") }}</a></th>
+        <th><a href="#" class="sort-link"
+               hx-get="/runs/{{ run.id }}?{{ sort.out_sort_query("attempt") }}"
+               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+               >Attempt{{ sort.out_arrow("attempt") }}</a></th>
+        <th>
+          <a href="#" class="sort-link"
+             hx-get="/runs/{{ run.id }}?{{ sort.out_sort_query("ok") }}"
+             hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+             >OK{{ sort.out_arrow("ok") }}</a>
+          <select name="out_ok" hx-trigger="change"
+                  hx-get="/runs/{{ run.id }}?{{ sort.query_without("out_ok") }}"
+                  hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+            <option value=""{% if sort.out_ok.is_empty() %} selected{% endif %}>all</option>
+            <option value="true"{% if sort.out_ok == "true" %} selected{% endif %}>ok</option>
+            <option value="false"{% if sort.out_ok == "false" %} selected{% endif %}>fail</option>
+          </select>
+        </th>
+        <th>
+          <a href="#" class="sort-link"
+             hx-get="/runs/{{ run.id }}?{{ sort.out_sort_query("claude") }}"
+             hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+             >Claude{{ sort.out_arrow("claude") }}</a>
+          <select name="out_claude" hx-trigger="change"
+                  hx-get="/runs/{{ run.id }}?{{ sort.query_without("out_claude") }}"
+                  hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+            <option value=""{% if sort.out_claude.is_empty() %} selected{% endif %}>all</option>
+            <option value="ran_ok"{% if sort.out_claude == "ran_ok" %} selected{% endif %}>ran</option>
+            <option value="ran_err"{% if sort.out_claude == "ran_err" %} selected{% endif %}>err</option>
+            <option value="skip"{% if sort.out_claude == "skip" %} selected{% endif %}>skip</option>
+          </select>
+        </th>
+        <th><a href="#" class="sort-link"
+               hx-get="/runs/{{ run.id }}?{{ sort.out_sort_query("cost") }}"
+               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+               >${{ sort.out_arrow("cost") }}</a></th>
+        <th>
+          <a href="#" class="sort-link"
+             hx-get="/runs/{{ run.id }}?{{ sort.out_sort_query("counted") }}"
+             hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+             >Counted{{ sort.out_arrow("counted") }}</a>
+          <select name="out_counted" hx-trigger="change"
+                  hx-get="/runs/{{ run.id }}?{{ sort.query_without("out_counted") }}"
+                  hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+            <option value=""{% if sort.out_counted.is_empty() %} selected{% endif %}>all</option>
+            <option value="true"{% if sort.out_counted == "true" %} selected{% endif %}>counted</option>
+            <option value="false"{% if sort.out_counted == "false" %} selected{% endif %}>parked</option>
+          </select>
+        </th>
+        <th><a href="#" class="sort-link"
+               hx-get="/runs/{{ run.id }}?{{ sort.out_sort_query("when") }}"
+               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+               >When{{ sort.out_arrow("when") }}</a></th>
+        <th><a href="#" class="sort-link"
+               hx-get="/runs/{{ run.id }}?{{ sort.out_sort_query("duration") }}"
+               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+               >Duration{{ sort.out_arrow("duration") }}</a></th>
+        <th>Stream</th><th>Summary</th>
       </tr>
     </thead>
     <tbody>
+      {% if outcomes.is_empty() %}
+        <tr><td colspan="10"><span class="dim">No jobs match the filter.</span></td></tr>
+      {% endif %}
       {% for o in outcomes %}
         <tr>
           <td class="mono">

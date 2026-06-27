@@ -2694,11 +2694,206 @@ struct RunDetailTpl {
     /// fast-path stores the event's `html_url` here). Wins over
     /// `link_template`; empty for legacy rows and scheduled actions.
     job_links: std::collections::BTreeMap<String, String>,
+    /// CLAUDE-140: sanitized sort/filter selections, echoed back into the
+    /// poll URL and the header controls so the chosen view survives the 2s
+    /// morph poll. Each field is already whitelisted in the handler, so the
+    /// template can interpolate them into query strings verbatim.
+    sort: RunDetailSort,
+    /// CLAUDE-140: whether the run has any planned jobs / outcomes at all,
+    /// captured before the filters run. Lets an over-tight filter render an
+    /// empty table whose dropdowns stay reachable, instead of hiding the
+    /// whole section (which would strip the controls needed to reset it).
+    has_planned: bool,
+    has_outcomes: bool,
+}
+
+/// CLAUDE-140: whitelisted sort/filter state for the two run-detail tables.
+/// Every value is validated against a fixed allow-list in [`run_detail`]
+/// before it lands here, so nothing user-controlled reaches a SQL `ORDER BY`
+/// (the sort/filter run in-memory) or gets echoed unescaped into the page.
+#[derive(Default)]
+struct RunDetailSort {
+    jobs_sort: String,
+    jobs_dir: String,
+    jobs_state: String,
+    out_sort: String,
+    out_dir: String,
+    out_ok: String,
+    out_claude: String,
+    out_counted: String,
+}
+
+impl RunDetailSort {
+    /// Direction the Jobs-in-batch `col` header should request next: flip to
+    /// `desc` when that column is already the ascending sort, otherwise `asc`.
+    fn jobs_dir_for(&self, col: &str) -> &'static str {
+        if self.jobs_sort == col && self.jobs_dir == "asc" {
+            "desc"
+        } else {
+            "asc"
+        }
+    }
+
+    /// Sort-direction glyph for a Jobs-in-batch header, empty when the table
+    /// is not currently sorted by `col`.
+    fn jobs_arrow(&self, col: &str) -> &'static str {
+        arrow(&self.jobs_sort, &self.jobs_dir, col)
+    }
+
+    /// Direction the Job-outcomes `col` header should request next.
+    fn out_dir_for(&self, col: &str) -> &'static str {
+        if self.out_sort == col && self.out_dir == "asc" {
+            "desc"
+        } else {
+            "asc"
+        }
+    }
+
+    /// Sort-direction glyph for a Job-outcomes header.
+    fn out_arrow(&self, col: &str) -> &'static str {
+        arrow(&self.out_sort, &self.out_dir, col)
+    }
+
+    /// Full eight-param query string for the live poll, so each 2s morph
+    /// refresh re-requests the current view. Values are pre-whitelisted; the
+    /// `&` joiners are HTML-escaped by askama to `&amp;` and decoded back by
+    /// the browser, so the request carries the literal `&`.
+    fn poll_query(&self) -> String {
+        self.query_with(
+            &self.jobs_sort,
+            &self.jobs_dir,
+            &self.out_sort,
+            &self.out_dir,
+        )
+    }
+
+    /// Poll query with the Jobs-in-batch sort set to `col` and its toggled
+    /// direction: the target a Jobs header link points at.
+    fn jobs_sort_query(&self, col: &str) -> String {
+        self.query_with(col, self.jobs_dir_for(col), &self.out_sort, &self.out_dir)
+    }
+
+    /// Poll query with the Job-outcomes sort set to `col` and its toggled
+    /// direction.
+    fn out_sort_query(&self, col: &str) -> String {
+        self.query_with(&self.jobs_sort, &self.jobs_dir, col, self.out_dir_for(col))
+    }
+
+    fn query_with(&self, js: &str, jd: &str, os: &str, od: &str) -> String {
+        format!(
+            "jobs_sort={js}&jobs_dir={jd}&jobs_state={}&out_sort={os}&out_dir={od}&out_ok={}&out_claude={}&out_counted={}",
+            self.jobs_state, self.out_ok, self.out_claude, self.out_counted,
+        )
+    }
+
+    /// Every param except `omit`, for a filter `<select name="omit">` whose own
+    /// value supplies the omitted param. Keeping it out of the URL avoids a
+    /// duplicate query key (which axum's `Query` would reject).
+    fn query_without(&self, omit: &str) -> String {
+        [
+            ("jobs_sort", self.jobs_sort.as_str()),
+            ("jobs_dir", self.jobs_dir.as_str()),
+            ("jobs_state", self.jobs_state.as_str()),
+            ("out_sort", self.out_sort.as_str()),
+            ("out_dir", self.out_dir.as_str()),
+            ("out_ok", self.out_ok.as_str()),
+            ("out_claude", self.out_claude.as_str()),
+            ("out_counted", self.out_counted.as_str()),
+        ]
+        .iter()
+        .filter(|(k, _)| *k != omit)
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+    }
+}
+
+/// Up/down triangle for the column `col` given the active `sort`/`dir`, or the
+/// empty string when `col` is not the sorted column (CLAUDE-140).
+fn arrow(sort: &str, dir: &str, col: &str) -> &'static str {
+    if sort != col {
+        ""
+    } else if dir == "desc" {
+        " \u{25BC}"
+    } else {
+        " \u{25B2}"
+    }
+}
+
+/// CLAUDE-140: keep `v` only when it is in `allowed`, else return the empty
+/// string (the "no selection" sentinel). This is the whitelist that stops raw
+/// query input from reaching the in-memory `ORDER BY`/`WHERE` equivalents.
+fn whitelisted(v: &str, allowed: &[&str]) -> String {
+    if allowed.contains(&v) {
+        v.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// CLAUDE-140: claude-column rank used to sort the Job-outcomes "Claude"
+/// column: did-not-run < ran-and-failed < ran-and-ok.
+fn claude_rank(o: &JobOutcomeRow) -> u8 {
+    if !o.claude_ran {
+        0
+    } else if o.claude_ok {
+        2
+    } else {
+        1
+    }
+}
+
+/// CLAUDE-140: compare two outcomes by a whitelisted column. Unknown columns
+/// compare equal (the caller only sorts when the column passed the whitelist).
+fn out_cmp(a: &JobOutcomeRow, b: &JobOutcomeRow, col: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match col {
+        "key" => a.job_key.cmp(&b.job_key),
+        "attempt" => a.attempt.cmp(&b.attempt),
+        "ok" => a.ok.cmp(&b.ok),
+        "claude" => claude_rank(a).cmp(&claude_rank(b)),
+        "cost" => a
+            .claude_cost_usd
+            .partial_cmp(&b.claude_cost_usd)
+            .unwrap_or(Ordering::Equal),
+        "counted" => a.attempt_counted.cmp(&b.attempt_counted),
+        "when" => a.ts.cmp(&b.ts),
+        "duration" => a
+            .duration_ms
+            .unwrap_or(-1)
+            .cmp(&b.duration_ms.unwrap_or(-1)),
+        _ => Ordering::Equal,
+    }
+}
+
+/// CLAUDE-140: query params for the run-detail page. The two tables are
+/// namespaced (`jobs_*` vs `out_*`) so they sort/filter independently. Every
+/// field defaults to empty (the page's pre-CLAUDE-140 behavior) and is
+/// whitelisted in the handler before use.
+#[derive(Deserialize, Default)]
+struct RunDetailQuery {
+    #[serde(default)]
+    jobs_sort: String,
+    #[serde(default)]
+    jobs_dir: String,
+    #[serde(default)]
+    jobs_state: String,
+    #[serde(default)]
+    out_sort: String,
+    #[serde(default)]
+    out_dir: String,
+    #[serde(default)]
+    out_ok: String,
+    #[serde(default)]
+    out_claude: String,
+    #[serde(default)]
+    out_counted: String,
 }
 
 async fn run_detail(
     State(s): State<WebState>,
     AxumPath(id): AxumPath<i64>,
+    Query(q): Query<RunDetailQuery>,
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
     let Some(run): Option<RunRow> = sqlx::query_as::<_, RunRow>(
@@ -2759,7 +2954,7 @@ async fn run_detail(
         .into_iter()
         .collect();
     let logs_dir = s.paths.logs_dir();
-    let planned_jobs: Vec<PlannedJob> = planned_keys
+    let mut planned_jobs: Vec<PlannedJob> = planned_keys
         .into_iter()
         .map(|k| {
             let (status, watch_attempt) = match outcome_by_key.get(k.as_str()) {
@@ -2791,6 +2986,75 @@ async fn run_detail(
         })
         .collect();
 
+    // CLAUDE-140: whitelist the sort/filter selections, then apply them
+    // in-memory. The two tables share this handler but are namespaced
+    // (`jobs_*` vs `out_*`) so they sort/filter independently. Sorting and
+    // filtering happen on the already-loaded Vecs, never as interpolated SQL,
+    // so no raw query input can reach an `ORDER BY`/`WHERE`. `planned_jobs` is
+    // built from the full outcome set above, so trimming it here does not
+    // disturb the per-key status derivation.
+    let sort = RunDetailSort {
+        jobs_sort: whitelisted(&q.jobs_sort, &["job", "state"]),
+        jobs_dir: if q.jobs_dir == "desc" { "desc" } else { "asc" }.to_string(),
+        jobs_state: whitelisted(
+            &q.jobs_state,
+            &["ok", "timed_out", "fail", "running", "queued", "skipped"],
+        ),
+        out_sort: whitelisted(
+            &q.out_sort,
+            &[
+                "key", "attempt", "ok", "claude", "cost", "counted", "when", "duration",
+            ],
+        ),
+        out_dir: if q.out_dir == "desc" { "desc" } else { "asc" }.to_string(),
+        out_ok: whitelisted(&q.out_ok, &["true", "false"]),
+        out_claude: whitelisted(&q.out_claude, &["ran_ok", "ran_err", "skip"]),
+        out_counted: whitelisted(&q.out_counted, &["true", "false"]),
+    };
+
+    // Jobs-in-batch: filter by the derived status, then sort by the chosen
+    // column. Default (no `jobs_sort`) keeps the planned order. `has_planned`
+    // is captured before the filter so an over-tight State filter still shows
+    // the section (and its dropdown) rather than hiding it.
+    let has_planned = !planned_jobs.is_empty();
+    if !sort.jobs_state.is_empty() {
+        planned_jobs.retain(|p| p.status == sort.jobs_state);
+    }
+    match sort.jobs_sort.as_str() {
+        "job" => planned_jobs.sort_by(|a, b| a.key.cmp(&b.key)),
+        "state" => planned_jobs.sort_by(|a, b| a.status.cmp(&b.status)),
+        _ => {}
+    }
+    if sort.jobs_dir == "desc" && !sort.jobs_sort.is_empty() {
+        planned_jobs.reverse();
+    }
+
+    // Job outcomes: filter on the OK / Claude / Counted dropdowns, then sort by
+    // the chosen column. Default (no `out_sort`) keeps the `id ASC` order from
+    // the query above.
+    let mut outcomes = outcomes;
+    let has_outcomes = !outcomes.is_empty();
+    if !sort.out_ok.is_empty() {
+        let want = sort.out_ok == "true";
+        outcomes.retain(|o| o.ok == want);
+    }
+    match sort.out_claude.as_str() {
+        "ran_ok" => outcomes.retain(|o| o.claude_ran && o.claude_ok),
+        "ran_err" => outcomes.retain(|o| o.claude_ran && !o.claude_ok),
+        "skip" => outcomes.retain(|o| !o.claude_ran),
+        _ => {}
+    }
+    if !sort.out_counted.is_empty() {
+        let want = sort.out_counted == "true";
+        outcomes.retain(|o| o.attempt_counted == want);
+    }
+    if !sort.out_sort.is_empty() {
+        outcomes.sort_by(|a, b| out_cmp(a, b, &sort.out_sort));
+        if sort.out_dir == "desc" {
+            outcomes.reverse();
+        }
+    }
+
     let tpl = RunDetailTpl {
         version: s.api.version,
         run,
@@ -2798,6 +3062,9 @@ async fn run_detail(
         planned_jobs,
         link_template,
         job_links,
+        sort,
+        has_planned,
+        has_outcomes,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
@@ -3129,6 +3396,9 @@ mod tests {
             planned_jobs: vec![],
             link_template: None,
             job_links,
+            sort: super::RunDetailSort::default(),
+            has_planned: false,
+            has_outcomes: true,
         };
         let html = tpl.render().expect("render run_detail");
         assert!(
@@ -3136,6 +3406,109 @@ mod tests {
                 "<a href=\"https://example.myjetbrains.com/issue/CLAUDE-108\" target=\"_blank\" rel=\"noopener\">CLAUDE-108</a> - attempt 2"
             ),
             "modal heading should link the key with attempt outside the anchor: {html}"
+        );
+    }
+
+    // ---- run-detail sort/filter (CLAUDE-140) ------------------------------
+
+    /// Unknown sort columns and filter values are rejected by the whitelist,
+    /// so nothing user-controlled reaches the in-memory `ORDER BY`/`WHERE`.
+    #[test]
+    fn whitelist_rejects_unknown_values() {
+        use super::whitelisted;
+        assert_eq!(whitelisted("state", &["job", "state"]), "state");
+        assert_eq!(whitelisted("job; DROP TABLE", &["job", "state"]), "");
+        assert_eq!(whitelisted("", &["true", "false"]), "");
+    }
+
+    /// The Claude column ranks did-not-run < ran-and-failed < ran-and-ok, and
+    /// `out_cmp` orders outcomes by the chosen whitelisted column.
+    #[test]
+    fn out_cmp_orders_by_column() {
+        use super::{out_cmp, JobOutcomeRow};
+        use std::cmp::Ordering;
+        let row = |attempt: i64, ran: bool, ok: bool| JobOutcomeRow {
+            job_key: "K".to_string(),
+            attempt,
+            ts: "t".to_string(),
+            ok: true,
+            claude_ran: ran,
+            claude_ok: ok,
+            claude_cost_usd: 0.0,
+            attempt_counted: true,
+            duration_ms: Some(1),
+            timed_out: false,
+            summary: None,
+        };
+        let skip = row(1, false, false);
+        let ran_err = row(2, true, false);
+        let ran_ok = row(3, true, true);
+        assert_eq!(out_cmp(&skip, &ran_err, "claude"), Ordering::Less);
+        assert_eq!(out_cmp(&ran_ok, &ran_err, "claude"), Ordering::Greater);
+        assert_eq!(out_cmp(&skip, &ran_ok, "attempt"), Ordering::Less);
+        assert_eq!(out_cmp(&skip, &ran_ok, "bogus"), Ordering::Equal);
+    }
+
+    /// The sort/filter selection round-trips into the poll URL (so the 2s morph
+    /// poll keeps the view) and renders the header sort links + filter
+    /// dropdowns with the active option marked selected.
+    #[test]
+    fn run_detail_renders_sort_filter_controls() {
+        use super::{RunDetailSort, RunDetailTpl, RunRow};
+        use askama::Template;
+
+        let run = RunRow {
+            id: 7,
+            action_name: "YouTrack".to_string(),
+            started_at: "2026-06-27T00:00:00Z".to_string(),
+            ended_at: None,
+            exit_code: None,
+            jobs_processed: 0,
+            triggered_by: "schedule".to_string(),
+            current_job_key: None,
+            stage: None,
+            failed_jobs: 0,
+        };
+        let sort = RunDetailSort {
+            out_sort: "cost".to_string(),
+            out_dir: "desc".to_string(),
+            out_ok: "true".to_string(),
+            ..RunDetailSort::default()
+        };
+        let tpl = RunDetailTpl {
+            version: "test",
+            run,
+            outcomes: vec![],
+            planned_jobs: vec![],
+            link_template: None,
+            job_links: std::collections::BTreeMap::new(),
+            sort,
+            has_planned: false,
+            has_outcomes: true,
+        };
+        let html = tpl.render().expect("render run_detail");
+        // Poll URL carries the active selection (askama escapes `&` to `&amp;`).
+        assert!(
+            html.contains("out_sort=cost&amp;out_dir=desc"),
+            "poll URL should carry the active sort: {html}"
+        );
+        // Header sort links exist and the sorted column shows a direction glyph.
+        assert!(
+            html.contains("class=\"sort-link\""),
+            "sort links missing: {html}"
+        );
+        assert!(
+            html.contains("$ \u{25BC}"),
+            "descending arrow on the cost column missing: {html}"
+        );
+        // The OK filter dropdown marks the active value selected.
+        assert!(
+            html.contains("name=\"out_ok\""),
+            "OK filter dropdown missing: {html}"
+        );
+        assert!(
+            html.contains("value=\"true\" selected"),
+            "active OK filter option not selected: {html}"
         );
     }
 
