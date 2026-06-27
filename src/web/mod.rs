@@ -470,27 +470,46 @@ fn reject_synthetic(name: &str) -> Option<Response> {
 /// CLAUDE-35: when `show_empty` is false, finished runs that processed zero jobs
 /// are hidden. In-progress runs (`exit_code IS NULL`) are always kept so a
 /// just-started run never momentarily vanishes (it can legitimately sit at
-/// `jobs_processed = 0` before its first job lands). The `LIMIT` applies after
-/// the filter, so up to `limit` matching runs are returned, not `limit` minus
-/// the hidden rows.
+/// `jobs_processed = 0` before its first job lands). The filter applies before
+/// the `LIMIT`/`OFFSET`, so up to `limit` matching runs are returned per page,
+/// not `limit` minus the hidden rows.
+///
+/// CLAUDE-142: `limit`/`offset` drive `?page=` pagination on the dashboard.
 async fn fetch_recent_runs(
     pool: &SqlitePool,
     limit: i64,
+    offset: i64,
     show_empty: bool,
 ) -> Result<Vec<RunRow>, WebError> {
-    let where_clause = if show_empty {
-        ""
-    } else {
-        " WHERE jobs_processed > 0 OR exit_code IS NULL"
-    };
+    let where_clause = runs_where_clause(show_empty);
     let sql = format!(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, stage, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs{where_clause} ORDER BY started_at DESC LIMIT ?"
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, stage, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs{where_clause} ORDER BY started_at DESC LIMIT ? OFFSET ?"
     );
     let rows = sqlx::query_as::<_, RunRow>(&sql)
         .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+/// CLAUDE-142: the `WHERE` shared by the dashboard run listing and its
+/// `COUNT(*)`, so the total used to size page controls matches exactly the rows
+/// the listing pages over.
+fn runs_where_clause(show_empty: bool) -> &'static str {
+    if show_empty {
+        ""
+    } else {
+        " WHERE jobs_processed > 0 OR exit_code IS NULL"
+    }
+}
+
+/// CLAUDE-142: total number of dashboard runs under the active `show_empty`
+/// filter, used to render the "X-Y of N" indicator and the last-page boundary.
+async fn count_recent_runs(pool: &SqlitePool, show_empty: bool) -> Result<i64, WebError> {
+    let sql = format!("SELECT COUNT(*) FROM runs{}", runs_where_clause(show_empty));
+    let total = sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await?;
+    Ok(total)
 }
 
 // ---- run search (CLAUDE-143) ----------------------------------------------
@@ -782,6 +801,27 @@ struct DashboardTpl {
     /// CLAUDE-143: `Some` when a search is active; the template then renders the
     /// matching jobs in place of the Recent runs table.
     search: Option<SearchView>,
+    /// CLAUDE-142: pagination state for the Recent runs table (page number,
+    /// bounds, and the "X-Y of N" indicator). Computed even while a search is
+    /// active so the hidden `page` input keeps the morph poll on the right page.
+    page: PageNav,
+}
+
+/// CLAUDE-142: rendered pagination state for the dashboard Recent runs table.
+struct PageNav {
+    /// Current 1-based page (already clamped to `[1, total_pages]`).
+    page: i64,
+    /// Total number of pages (at least 1, even when there are no runs).
+    total_pages: i64,
+    /// Total matching runs under the active filter.
+    total: i64,
+    /// 1-based index of the first row on this page (0 when there are no rows).
+    start: i64,
+    /// 1-based index of the last row on this page (0 when there are no rows).
+    end: i64,
+    /// Whether a previous / next page exists (drives the disabled controls).
+    has_prev: bool,
+    has_next: bool,
 }
 
 /// CLAUDE-35: query params for the dashboard. `show_empty` defaults to `false`
@@ -796,7 +836,16 @@ struct DashboardQuery {
     /// CLAUDE-143: also grep the per-attempt stream logs (opt-in checkbox).
     #[serde(default)]
     in_stream: bool,
+    /// CLAUDE-142: 1-based page for the Recent runs table. Absent/invalid falls
+    /// back to page 1, preserving the pre-pagination first-page behavior. The
+    /// value is clamped to the valid range in the handler.
+    #[serde(default)]
+    page: Option<i64>,
 }
+
+/// CLAUDE-142: rows per page on the dashboard Recent runs table. Matches the
+/// previous hardcoded `LIMIT 20` so page 1 shows exactly the rows it did before.
+const DASHBOARD_PAGE_SIZE: i64 = 20;
 
 async fn dashboard(
     State(s): State<WebState>,
@@ -810,7 +859,30 @@ async fn dashboard(
             reason: r,
         });
     let actions = enriched_actions(pool, s.webhook_enabled).await?;
-    let recent_runs = fetch_recent_runs(pool, 20, q.show_empty).await?;
+
+    // CLAUDE-142: page the Recent runs table. `total` is a COUNT over the same
+    // `WHERE` as the listing, so the page bounds and the "X-Y of N" indicator
+    // line up with the rows actually returned. The page is clamped to the valid
+    // range so a stale/oversized `?page=` lands on the last page rather than an
+    // empty one.
+    let total = count_recent_runs(pool, q.show_empty).await?;
+    let total_pages = ((total + DASHBOARD_PAGE_SIZE - 1) / DASHBOARD_PAGE_SIZE).max(1);
+    let page = q.page.unwrap_or(1).clamp(1, total_pages);
+    let offset = (page - 1) * DASHBOARD_PAGE_SIZE;
+    let recent_runs = fetch_recent_runs(pool, DASHBOARD_PAGE_SIZE, offset, q.show_empty).await?;
+    let page_nav = PageNav {
+        page,
+        total_pages,
+        total,
+        start: if recent_runs.is_empty() {
+            0
+        } else {
+            offset + 1
+        },
+        end: offset + recent_runs.len() as i64,
+        has_prev: page > 1,
+        has_next: page < total_pages,
+    };
 
     // CLAUDE-143: run the content search when the box is non-empty. The result
     // region morph-swaps in place (poll-region) so the search composes with the
@@ -850,6 +922,7 @@ async fn dashboard(
         search_q,
         in_stream: q.in_stream,
         search,
+        page: page_nav,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
