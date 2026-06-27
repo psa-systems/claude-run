@@ -9,6 +9,11 @@
         the search form so the 5s morph poll preserves an active search instead
         of wiping it back to the plain runs view. #}
      hx-include="#search-form"
+     {# CLAUDE-142: carry the current Recent-runs page through the poll. It is
+        re-rendered on every morph swap, so paging via Prev/Next sticks instead
+        of being reset to page 1 by the next 5s refresh. Kept out of the search
+        form so it stays orthogonal to the search / filter params. #}
+     hx-vals='{"page": {{ page.page }}}'
      hx-trigger="every 5s, refreshNow from:body"
      hx-select="#poll-region"
      {# CLAUDE-139: morph in place (idiomorph) instead of replacing the subtree,
@@ -208,6 +213,28 @@
         {% endfor %}
       </tbody>
     </table>
+    {# CLAUDE-142: pagination controls. Prev/Next morph-swap the poll-region with
+       a new ?page=, overriding only `page` while hx-include carries the active
+       search/filter params from the search form, so paging keeps them. Disabled
+       edges render as inert spans. The "X-Y of N" indicator is computed from a
+       COUNT over the same filter as the listing. #}
+    <div class="pagination" style="display: flex; gap: 12px; align-items: center; margin: 12px 0; font-size: 12px;">
+      {% if page.has_prev %}
+        <a class="btn" hx-get="/" hx-include="#search-form"
+           hx-vals='{"page": {{ page.page - 1 }}}'
+           hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">Prev</a>
+      {% else %}
+        <span class="btn" aria-disabled="true" style="opacity: 0.4; pointer-events: none;">Prev</span>
+      {% endif %}
+      <span class="meta">{{ page.start }}-{{ page.end }} of {{ page.total }} (page {{ page.page }} of {{ page.total_pages }})</span>
+      {% if page.has_next %}
+        <a class="btn" hx-get="/" hx-include="#search-form"
+           hx-vals='{"page": {{ page.page + 1 }}}'
+           hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">Next</a>
+      {% else %}
+        <span class="btn" aria-disabled="true" style="opacity: 0.4; pointer-events: none;">Next</span>
+      {% endif %}
+    </div>
   {% endif %}
 {% endif %}
 
