@@ -4,7 +4,10 @@
 {% block main %}
 
 <div id="poll-region"
-     hx-get="/"
+     {# CLAUDE-141: carry the active sort/filter selection through the poll so the
+        5s morph refresh re-requests the current view instead of resetting to the
+        default started-at-desc order. #}
+     hx-get="/?{{ view.poll_query() }}"
      {# CLAUDE-143: pull the live search state (q / in_stream / show_empty) from
         the search form so the 5s morph poll preserves an active search instead
         of wiping it back to the plain runs view. #}
@@ -182,7 +185,74 @@
     <div class="card"><span class="dim">No runs yet.</span></div>
   {% else %}
     <table>
-      <thead><tr><th>Run</th><th>Action</th><th>Started</th><th>Ended</th><th>Duration</th><th>Triggered</th><th>Jobs</th><th>Exit</th></tr></thead>
+      {# CLAUDE-141: sortable headers set ?sort=<col>&dir=<asc|desc> (whitelisted
+         server-side into an ORDER BY); Action / Triggered / Exit also carry a
+         filter dropdown adding a bound WHERE clause. Every control re-requests
+         the poll-region with the selection encoded in the URL and morph-swaps in
+         place. hx-include pulls the search/show-empty state from the search form;
+         page is intentionally omitted so changing sort/filter resets to page 1. #}
+      <thead><tr>
+        <th><a href="#" class="sort-link"
+               hx-get="/?{{ view.sort_query("run") }}" hx-include="#search-form"
+               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+               >Run{{ view.arrow("run") }}</a></th>
+        <th>
+          <a href="#" class="sort-link"
+             hx-get="/?{{ view.sort_query("action") }}" hx-include="#search-form"
+             hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+             >Action{{ view.arrow("action") }}</a>
+          <select name="action" hx-trigger="change"
+                  hx-get="/?{{ view.query_without("action") }}" hx-include="#search-form"
+                  hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+            <option value=""{% if view.action.is_empty() %} selected{% endif %}>all</option>
+            {% for a in action_options %}
+              <option value="{{ a }}"{% if view.action.as_str() == a.as_str() %} selected{% endif %}>{{ a }}</option>
+            {% endfor %}
+          </select>
+        </th>
+        <th><a href="#" class="sort-link"
+               hx-get="/?{{ view.sort_query("started") }}" hx-include="#search-form"
+               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+               >Started{{ view.arrow("started") }}</a></th>
+        <th><a href="#" class="sort-link"
+               hx-get="/?{{ view.sort_query("ended") }}" hx-include="#search-form"
+               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+               >Ended{{ view.arrow("ended") }}</a></th>
+        <th><a href="#" class="sort-link"
+               hx-get="/?{{ view.sort_query("duration") }}" hx-include="#search-form"
+               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+               >Duration{{ view.arrow("duration") }}</a></th>
+        <th>
+          Triggered
+          <select name="triggered" hx-trigger="change"
+                  hx-get="/?{{ view.query_without("triggered") }}" hx-include="#search-form"
+                  hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+            <option value=""{% if view.triggered.is_empty() %} selected{% endif %}>all</option>
+            {% for t in triggered_options %}
+              <option value="{{ t }}"{% if view.triggered.as_str() == t.as_str() %} selected{% endif %}>{{ t }}</option>
+            {% endfor %}
+          </select>
+        </th>
+        <th><a href="#" class="sort-link"
+               hx-get="/?{{ view.sort_query("jobs") }}" hx-include="#search-form"
+               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+               >Jobs{{ view.arrow("jobs") }}</a></th>
+        <th>
+          <a href="#" class="sort-link"
+             hx-get="/?{{ view.sort_query("exit") }}" hx-include="#search-form"
+             hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+             >Exit{{ view.arrow("exit") }}</a>
+          <select name="exit" hx-trigger="change"
+                  hx-get="/?{{ view.query_without("exit") }}" hx-include="#search-form"
+                  hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+            <option value=""{% if view.exit.is_empty() %} selected{% endif %}>all</option>
+            <option value="success"{% if view.exit == "success" %} selected{% endif %}>success</option>
+            <option value="failed"{% if view.exit == "failed" %} selected{% endif %}>failed</option>
+            <option value="cancelled"{% if view.exit == "cancelled" %} selected{% endif %}>cancelled</option>
+            <option value="running"{% if view.exit == "running" %} selected{% endif %}>running</option>
+          </select>
+        </th>
+      </tr></thead>
       <tbody>
         {% for r in recent_runs %}
           <tr>
@@ -220,7 +290,7 @@
        COUNT over the same filter as the listing. #}
     <div class="pagination" style="display: flex; gap: 12px; align-items: center; margin: 12px 0; font-size: 12px;">
       {% if page.has_prev %}
-        <a class="btn" hx-get="/" hx-include="#search-form"
+        <a class="btn" hx-get="/?{{ view.poll_query() }}" hx-include="#search-form"
            hx-vals='{"page": {{ page.page - 1 }}}'
            hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">Prev</a>
       {% else %}
@@ -228,7 +298,7 @@
       {% endif %}
       <span class="meta">{{ page.start }}-{{ page.end }} of {{ page.total }} (page {{ page.page }} of {{ page.total_pages }})</span>
       {% if page.has_next %}
-        <a class="btn" hx-get="/" hx-include="#search-form"
+        <a class="btn" hx-get="/?{{ view.poll_query() }}" hx-include="#search-form"
            hx-vals='{"page": {{ page.page + 1 }}}'
            hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">Next</a>
       {% else %}
