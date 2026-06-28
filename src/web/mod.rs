@@ -475,41 +475,72 @@ fn reject_synthetic(name: &str) -> Option<Response> {
 /// not `limit` minus the hidden rows.
 ///
 /// CLAUDE-142: `limit`/`offset` drive `?page=` pagination on the dashboard.
+///
+/// CLAUDE-141: `view` carries the whitelisted sort + filter selection. Its
+/// `ORDER BY` is built from a fixed column allow-list (no raw input reaches the
+/// clause) and its filter values are passed as bound parameters.
 async fn fetch_recent_runs(
     pool: &SqlitePool,
     limit: i64,
     offset: i64,
     show_empty: bool,
+    view: &RunsView,
 ) -> Result<Vec<RunRow>, WebError> {
-    let where_clause = runs_where_clause(show_empty);
+    let (where_clause, binds) = view.where_clause(show_empty);
+    let order_by = view.order_by();
     let sql = format!(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, stage, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs{where_clause} ORDER BY started_at DESC LIMIT ? OFFSET ?"
+        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, stage, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs{where_clause} {order_by} LIMIT ? OFFSET ?"
     );
-    let rows = sqlx::query_as::<_, RunRow>(&sql)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+    let mut q = sqlx::query_as::<_, RunRow>(&sql);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let rows = q.bind(limit).bind(offset).fetch_all(pool).await?;
     Ok(rows)
 }
 
-/// CLAUDE-142: the `WHERE` shared by the dashboard run listing and its
-/// `COUNT(*)`, so the total used to size page controls matches exactly the rows
-/// the listing pages over.
-fn runs_where_clause(show_empty: bool) -> &'static str {
-    if show_empty {
-        ""
-    } else {
-        " WHERE jobs_processed > 0 OR exit_code IS NULL"
+/// CLAUDE-142 / CLAUDE-141: total number of dashboard runs under the active
+/// `show_empty` toggle and sort/filter `view`, used to render the "X-Y of N"
+/// indicator and the last-page boundary. Uses the same `WHERE` (and the same
+/// bound filter values) as the listing so the count matches the paged rows.
+async fn count_recent_runs(
+    pool: &SqlitePool,
+    show_empty: bool,
+    view: &RunsView,
+) -> Result<i64, WebError> {
+    let (where_clause, binds) = view.where_clause(show_empty);
+    let sql = format!("SELECT COUNT(*) FROM runs{where_clause}");
+    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+    for b in &binds {
+        q = q.bind(b);
     }
+    let total = q.fetch_one(pool).await?;
+    Ok(total)
 }
 
-/// CLAUDE-142: total number of dashboard runs under the active `show_empty`
-/// filter, used to render the "X-Y of N" indicator and the last-page boundary.
-async fn count_recent_runs(pool: &SqlitePool, show_empty: bool) -> Result<i64, WebError> {
-    let sql = format!("SELECT COUNT(*) FROM runs{}", runs_where_clause(show_empty));
-    let total = sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await?;
-    Ok(total)
+/// CLAUDE-141: distinct `action_name` values that appear in the `runs` table,
+/// alphabetically. Drives the dashboard Action filter dropdown so it only offers
+/// actions that actually have runs (not every indexed action), and serves as the
+/// allow-list that whitelists the incoming `?action=` value.
+async fn distinct_run_actions(pool: &SqlitePool) -> Result<Vec<String>, WebError> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT action_name FROM runs ORDER BY action_name",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// CLAUDE-141: distinct `triggered_by` values present in the `runs` table,
+/// alphabetically. Drives the dashboard Triggered filter dropdown and whitelists
+/// the incoming `?triggered=` value.
+async fn distinct_triggered_by(pool: &SqlitePool) -> Result<Vec<String>, WebError> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT triggered_by FROM runs ORDER BY triggered_by",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 // ---- run search (CLAUDE-143) ----------------------------------------------
@@ -805,6 +836,16 @@ struct DashboardTpl {
     /// bounds, and the "X-Y of N" indicator). Computed even while a search is
     /// active so the hidden `page` input keeps the morph poll on the right page.
     page: PageNav,
+    /// CLAUDE-141: whitelisted sort + filter selection, echoed into the header
+    /// sort links, filter dropdowns, poll URL, and pagination links so the
+    /// chosen view survives the morph poll.
+    view: RunsView,
+    /// CLAUDE-141: distinct `action_name` values present in `runs`, for the
+    /// Action filter dropdown options.
+    action_options: Vec<String>,
+    /// CLAUDE-141: distinct `triggered_by` values present in `runs`, for the
+    /// Triggered filter dropdown options.
+    triggered_options: Vec<String>,
 }
 
 /// CLAUDE-142: rendered pagination state for the dashboard Recent runs table.
@@ -824,12 +865,168 @@ struct PageNav {
     has_next: bool,
 }
 
+/// CLAUDE-141: whitelisted sort + filter selection for the dashboard recent-runs
+/// table. Every field is validated in [`dashboard`] before it lands here:
+/// `sort`/`dir`/`exit` against fixed allow-lists, `action`/`triggered` against
+/// the actual distinct DB values. So nothing user-controlled reaches the SQL
+/// `ORDER BY`, the filter values are bound as parameters, and the strings echoed
+/// back into query strings and the page are all known-safe.
+#[derive(Default, Clone)]
+struct RunsView {
+    /// Whitelisted sort column key (`run`/`action`/`started`/`ended`/
+    /// `duration`/`jobs`/`exit`), or empty for the default `started_at DESC`.
+    sort: String,
+    /// `asc` or `desc`; empty (the default) sorts descending.
+    dir: String,
+    /// Exact `action_name` to filter to, or empty for all actions.
+    action: String,
+    /// Exact `triggered_by` to filter to, or empty for all.
+    triggered: String,
+    /// Derived exit/outcome filter: `success`/`failed`/`cancelled`/`running`,
+    /// or empty for all.
+    exit: String,
+}
+
+impl RunsView {
+    /// SQL `ORDER BY` built from the whitelisted `sort`/`dir`. Defaults to
+    /// `started_at DESC` (the pre-CLAUDE-141 order) when no column is selected.
+    /// A trailing `id DESC` tiebreaker keeps paging stable when the primary key
+    /// has ties. The column is chosen from a fixed `match`, so no user input
+    /// ever reaches the clause text.
+    fn order_by(&self) -> String {
+        let col = match self.sort.as_str() {
+            "run" => "id",
+            "action" => "action_name",
+            "ended" => "ended_at",
+            // SQLite has no duration column; derive it from the timestamps.
+            "duration" => "(julianday(ended_at) - julianday(started_at))",
+            "jobs" => "jobs_processed",
+            "exit" => "exit_code",
+            // "started" and any unknown/empty value fall back to the default.
+            _ => "started_at",
+        };
+        let dir = if self.dir == "asc" { "ASC" } else { "DESC" };
+        if col == "id" {
+            format!("ORDER BY {col} {dir}")
+        } else {
+            format!("ORDER BY {col} {dir}, id DESC")
+        }
+    }
+
+    /// SQL `WHERE` clause (empty or leading ` WHERE ...`) shared by the listing
+    /// and its `COUNT(*)`, with `?` placeholders for the value filters, plus the
+    /// ordered bind values. `show_empty=false` keeps the CLAUDE-35 hide-empty
+    /// rule and composes with the new filters via `AND`.
+    fn where_clause(&self, show_empty: bool) -> (String, Vec<String>) {
+        let mut conds: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        if !show_empty {
+            conds.push("(jobs_processed > 0 OR exit_code IS NULL)".to_string());
+        }
+        if !self.action.is_empty() {
+            conds.push("action_name = ?".to_string());
+            binds.push(self.action.clone());
+        }
+        if !self.triggered.is_empty() {
+            conds.push("triggered_by = ?".to_string());
+            binds.push(self.triggered.clone());
+        }
+        // Derived outcome states, mirroring the Exit-column badges: 0 = success,
+        // 130 = cancelled, any other non-NULL = failed, NULL = still running.
+        match self.exit.as_str() {
+            "success" => conds.push("exit_code = 0".to_string()),
+            "cancelled" => conds.push("exit_code = 130".to_string()),
+            "failed" => {
+                conds.push("exit_code IS NOT NULL AND exit_code NOT IN (0, 130)".to_string())
+            }
+            "running" => conds.push("exit_code IS NULL".to_string()),
+            _ => {}
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conds.join(" AND "))
+        };
+        (where_clause, binds)
+    }
+
+    /// Direction the `col` header should request next: flip to `desc` when that
+    /// column is already the ascending sort, otherwise `asc`.
+    fn dir_for(&self, col: &str) -> &'static str {
+        if self.sort == col && self.dir == "asc" {
+            "desc"
+        } else {
+            "asc"
+        }
+    }
+
+    /// Sort-direction glyph for the `col` header, empty when not sorted by it.
+    fn arrow(&self, col: &str) -> &'static str {
+        arrow(&self.sort, &self.dir, col)
+    }
+
+    /// Full sort/filter query string for the live poll and pagination links, so
+    /// each morph refresh and Prev/Next re-requests the current view. The
+    /// search/show-empty params are carried separately via `hx-include` of the
+    /// search form, and `page` via `hx-vals`; this carries only the CLAUDE-141
+    /// params. Values are pre-whitelisted; askama escapes the `&` joiners.
+    fn poll_query(&self) -> String {
+        self.query_with(&self.sort, &self.dir)
+    }
+
+    /// Poll query with the sort set to `col` and its toggled direction: the
+    /// target a header sort link points at.
+    fn sort_query(&self, col: &str) -> String {
+        self.query_with(col, self.dir_for(col))
+    }
+
+    fn query_with(&self, sort: &str, dir: &str) -> String {
+        format!(
+            "sort={sort}&dir={dir}&action={}&triggered={}&exit={}",
+            self.action, self.triggered, self.exit,
+        )
+    }
+
+    /// Every param except `omit`, for a filter `<select name="omit">` whose own
+    /// value supplies the omitted param. Keeping it out of the URL avoids a
+    /// duplicate query key (which axum's `Query` would reject).
+    fn query_without(&self, omit: &str) -> String {
+        [
+            ("sort", self.sort.as_str()),
+            ("dir", self.dir.as_str()),
+            ("action", self.action.as_str()),
+            ("triggered", self.triggered.as_str()),
+            ("exit", self.exit.as_str()),
+        ]
+        .iter()
+        .filter(|(k, _)| *k != omit)
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+    }
+}
+
 /// CLAUDE-35: query params for the dashboard. `show_empty` defaults to `false`
 /// when the param is absent, so the page loads with 0-job finished runs hidden.
 #[derive(Deserialize, Default)]
 struct DashboardQuery {
     #[serde(default)]
     show_empty: bool,
+    /// CLAUDE-141: whitelisted sort column key for the Recent runs table.
+    #[serde(default)]
+    sort: String,
+    /// CLAUDE-141: sort direction (`asc`/`desc`).
+    #[serde(default)]
+    dir: String,
+    /// CLAUDE-141: Action filter (exact `action_name`), empty for all.
+    #[serde(default)]
+    action: String,
+    /// CLAUDE-141: Triggered filter (exact `triggered_by`), empty for all.
+    #[serde(default)]
+    triggered: String,
+    /// CLAUDE-141: derived Exit/outcome filter, empty for all.
+    #[serde(default)]
+    exit: String,
     /// CLAUDE-143: search text. Empty/absent leaves the normal runs view.
     #[serde(default)]
     q: String,
@@ -860,16 +1057,37 @@ async fn dashboard(
         });
     let actions = enriched_actions(pool, s.webhook_enabled).await?;
 
+    // CLAUDE-141: whitelist the sort/filter selections before they reach SQL or
+    // the page. `sort`/`dir`/`exit` are checked against fixed allow-lists; the
+    // Action/Triggered values are kept only when they match an actual distinct
+    // value in `runs` (the same lists that populate the dropdowns), so a stale
+    // or hand-edited param drops to "all" instead of echoing arbitrary input.
+    let action_options = distinct_run_actions(pool).await?;
+    let triggered_options = distinct_triggered_by(pool).await?;
+    let view = RunsView {
+        sort: whitelisted(
+            &q.sort,
+            &[
+                "run", "action", "started", "ended", "duration", "jobs", "exit",
+            ],
+        ),
+        dir: if q.dir == "asc" { "asc" } else { "desc" }.to_string(),
+        action: whitelist_member(&q.action, &action_options),
+        triggered: whitelist_member(&q.triggered, &triggered_options),
+        exit: whitelisted(&q.exit, &["success", "failed", "cancelled", "running"]),
+    };
+
     // CLAUDE-142: page the Recent runs table. `total` is a COUNT over the same
-    // `WHERE` as the listing, so the page bounds and the "X-Y of N" indicator
-    // line up with the rows actually returned. The page is clamped to the valid
-    // range so a stale/oversized `?page=` lands on the last page rather than an
-    // empty one.
-    let total = count_recent_runs(pool, q.show_empty).await?;
+    // `WHERE` (CLAUDE-141 sort/filter included) as the listing, so the page
+    // bounds and the "X-Y of N" indicator line up with the rows actually
+    // returned. The page is clamped to the valid range so a stale/oversized
+    // `?page=` lands on the last page rather than an empty one.
+    let total = count_recent_runs(pool, q.show_empty, &view).await?;
     let total_pages = ((total + DASHBOARD_PAGE_SIZE - 1) / DASHBOARD_PAGE_SIZE).max(1);
     let page = q.page.unwrap_or(1).clamp(1, total_pages);
     let offset = (page - 1) * DASHBOARD_PAGE_SIZE;
-    let recent_runs = fetch_recent_runs(pool, DASHBOARD_PAGE_SIZE, offset, q.show_empty).await?;
+    let recent_runs =
+        fetch_recent_runs(pool, DASHBOARD_PAGE_SIZE, offset, q.show_empty, &view).await?;
     let page_nav = PageNav {
         page,
         total_pages,
@@ -923,6 +1141,9 @@ async fn dashboard(
         in_stream: q.in_stream,
         search,
         page: page_nav,
+        view,
+        action_options,
+        triggered_options,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
@@ -2831,6 +3052,18 @@ fn whitelisted(v: &str, allowed: &[&str]) -> String {
     }
 }
 
+/// CLAUDE-141: keep `v` only when it appears in `allowed` (an owned allow-list
+/// built from actual DB values, e.g. the distinct action / triggered_by sets),
+/// else the empty "no selection" sentinel. The `&[String]` sibling of
+/// [`whitelisted`] for filters whose legal values come from the data.
+fn whitelist_member(v: &str, allowed: &[String]) -> String {
+    if allowed.iter().any(|a| a == v) {
+        v.to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// CLAUDE-140: claude-column rank used to sort the Job-outcomes "Claude"
 /// column: did-not-run < ran-and-failed < ran-and-ok.
 fn claude_rank(o: &JobOutcomeRow) -> u8 {
@@ -3509,6 +3742,179 @@ mod tests {
         assert!(
             html.contains("value=\"true\" selected"),
             "active OK filter option not selected: {html}"
+        );
+    }
+
+    // ---- dashboard sort/filter (CLAUDE-141) -------------------------------
+
+    /// `order_by` maps each whitelisted column to its SQL expression, defaults
+    /// unknown/empty `sort` to `started_at DESC`, and never interpolates raw
+    /// input (the column comes from a fixed `match`).
+    #[test]
+    fn runs_view_order_by_whitelists_column() {
+        use super::RunsView;
+        let v = |sort: &str, dir: &str| RunsView {
+            sort: sort.to_string(),
+            dir: dir.to_string(),
+            ..RunsView::default()
+        };
+        assert_eq!(v("run", "asc").order_by(), "ORDER BY id ASC");
+        assert_eq!(
+            v("action", "desc").order_by(),
+            "ORDER BY action_name DESC, id DESC"
+        );
+        assert_eq!(
+            v("duration", "asc").order_by(),
+            "ORDER BY (julianday(ended_at) - julianday(started_at)) ASC, id DESC"
+        );
+        // Empty / unknown sort falls back to the pre-CLAUDE-141 default.
+        assert_eq!(v("", "").order_by(), "ORDER BY started_at DESC, id DESC");
+        assert_eq!(
+            v("bogus; DROP", "asc").order_by(),
+            "ORDER BY started_at ASC, id DESC"
+        );
+    }
+
+    /// `where_clause` composes the CLAUDE-35 hide-empty rule with the Action /
+    /// Triggered / Exit filters, emitting `?` placeholders and ordered binds for
+    /// the value filters (so nothing user-controlled is interpolated).
+    #[test]
+    fn runs_view_where_clause_composes_filters() {
+        use super::RunsView;
+        // No filters, show_empty true -> no WHERE at all.
+        let empty = RunsView::default();
+        let (w, b) = empty.where_clause(true);
+        assert_eq!(w, "");
+        assert!(b.is_empty());
+
+        // Hide-empty off plus all three filters, AND-composed, binds in order.
+        let v = RunsView {
+            action: "YouTrack".to_string(),
+            triggered: "schedule".to_string(),
+            exit: "failed".to_string(),
+            ..RunsView::default()
+        };
+        let (w, b) = v.where_clause(false);
+        assert_eq!(
+            w,
+            " WHERE (jobs_processed > 0 OR exit_code IS NULL) AND action_name = ? AND triggered_by = ? AND exit_code IS NOT NULL AND exit_code NOT IN (0, 130)"
+        );
+        assert_eq!(b, vec!["YouTrack".to_string(), "schedule".to_string()]);
+
+        // The derived exit states map to the matching predicates.
+        let success = RunsView {
+            exit: "success".to_string(),
+            ..RunsView::default()
+        };
+        assert_eq!(success.where_clause(true).0, " WHERE exit_code = 0");
+        let running = RunsView {
+            exit: "running".to_string(),
+            ..RunsView::default()
+        };
+        assert_eq!(running.where_clause(true).0, " WHERE exit_code IS NULL");
+    }
+
+    /// `whitelist_member` keeps only values present in the data-derived list.
+    #[test]
+    fn whitelist_member_rejects_unknown_values() {
+        use super::whitelist_member;
+        let allowed = vec!["YouTrack".to_string(), "forgejo".to_string()];
+        assert_eq!(whitelist_member("YouTrack", &allowed), "YouTrack");
+        assert_eq!(whitelist_member("nope", &allowed), "");
+        assert_eq!(whitelist_member("", &allowed), "");
+    }
+
+    /// The dashboard sort/filter selection round-trips into the poll URL,
+    /// pagination links, header sort links, and filter dropdowns (with the
+    /// active option marked selected and data-derived options rendered).
+    #[test]
+    fn dashboard_renders_sort_filter_controls() {
+        use super::{DashboardTpl, PageNav, RunRow, RunsView};
+        use askama::Template;
+
+        let run = RunRow {
+            id: 7,
+            action_name: "YouTrack".to_string(),
+            started_at: "2026-06-27T00:00:00Z".to_string(),
+            ended_at: None,
+            exit_code: None,
+            jobs_processed: 0,
+            triggered_by: "schedule".to_string(),
+            current_job_key: None,
+            stage: None,
+            failed_jobs: 0,
+        };
+        let view = RunsView {
+            sort: "duration".to_string(),
+            dir: "desc".to_string(),
+            action: "YouTrack".to_string(),
+            exit: "running".to_string(),
+            ..RunsView::default()
+        };
+        let tpl = DashboardTpl {
+            version: "test",
+            global_pause: None,
+            today_runs: 0,
+            today_actions: 0,
+            today_cost: 0.0,
+            actions: vec![],
+            recent_runs: vec![run],
+            show_empty: false,
+            search_q: String::new(),
+            in_stream: false,
+            search: None,
+            page: PageNav {
+                page: 1,
+                total_pages: 1,
+                total: 1,
+                start: 1,
+                end: 1,
+                has_prev: false,
+                has_next: false,
+            },
+            view,
+            action_options: vec!["YouTrack".to_string(), "forgejo".to_string()],
+            triggered_options: vec!["schedule".to_string(), "webhook".to_string()],
+        };
+        let html = tpl.render().expect("render dashboard");
+        // Poll URL carries the active sort/filter (askama escapes `&` to `&amp;`).
+        assert!(
+            html.contains("sort=duration&amp;dir=desc"),
+            "poll URL should carry the active sort: {html}"
+        );
+        // Header sort links exist and the sorted column shows a direction glyph.
+        assert!(
+            html.contains("class=\"sort-link\""),
+            "sort links missing: {html}"
+        );
+        assert!(
+            html.contains("Duration \u{25BC}"),
+            "descending arrow on the duration column missing: {html}"
+        );
+        // Filter dropdowns render with data-derived options and active selection.
+        assert!(
+            html.contains("name=\"action\""),
+            "Action filter dropdown missing: {html}"
+        );
+        assert!(
+            html.contains("value=\"YouTrack\" selected"),
+            "active Action filter option not selected: {html}"
+        );
+        assert!(
+            html.contains("name=\"triggered\""),
+            "Triggered filter dropdown missing: {html}"
+        );
+        assert!(
+            html.contains("value=\"webhook\""),
+            "data-derived Triggered option missing: {html}"
+        );
+        assert!(
+            html.contains("name=\"exit\""),
+            "Exit filter dropdown missing: {html}"
+        );
+        assert!(
+            html.contains("value=\"running\" selected"),
+            "active Exit filter option not selected: {html}"
         );
     }
 
