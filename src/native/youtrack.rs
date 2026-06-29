@@ -2586,6 +2586,7 @@ mod tests {
                         "contoso/claude-run#7",
                         "--method",
                         "merge",
+                        "--delete",
                     ],
                     "",
                 )
@@ -2616,9 +2617,8 @@ mod tests {
         );
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls.iter().any(
-                |c| c == "fj --host dev.a8n.run pr merge contoso/claude-run#7 --method merge"
-            ),
+            calls.iter().any(|c| c
+                == "fj --host dev.a8n.run pr merge contoso/claude-run#7 --method merge --delete"),
             "{calls:?}"
         );
         assert!(
