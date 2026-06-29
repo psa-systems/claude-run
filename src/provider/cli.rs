@@ -605,7 +605,13 @@ impl Forge for CliBackend {
         // the native action is a single commit carrying the bare `#<KEY>`
         // reference, and only a merge-commit preserves it in history (CLAUDE-126).
         let id = format!("{repo}#{pr_number}");
-        let args = ["--host", host, "pr", "merge", &id, "--method", "merge"];
+        // `--delete` removes the PR head branch after merge, matching the
+        // Forgejo web UI's "Delete branch after merge" behavior so automerged
+        // PRs don't leave stale merged branches behind (CLAUDE-145). It is a
+        // no-op when the branch is already gone or is a protected base.
+        let args = [
+            "--host", host, "pr", "merge", &id, "--method", "merge", "--delete",
+        ];
         let out = self
             .runner
             .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
@@ -1178,8 +1184,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_pr_invokes_fj_merge_with_merge_method() {
+    fn merge_pr_invokes_fj_merge_with_merge_method_and_deletes_branch() {
         // CLAUDE-126: merge-commit method, addressed as owner/repo#n.
+        // CLAUDE-145: `--delete` removes the PR head branch after merge.
         let runner = std::sync::Arc::new(StubRunner::new().ok(
             "fj",
             &[
@@ -1190,6 +1197,7 @@ mod tests {
                 "contoso/claude-run#52",
                 "--method",
                 "merge",
+                "--delete",
             ],
             "",
         ));
@@ -1198,10 +1206,10 @@ mod tests {
             .unwrap();
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls
-                .iter()
-                .any(|c| c
-                    == "fj --host dev.a8n.run pr merge contoso/claude-run#52 --method merge"),
+            calls.iter().any(|c| {
+                c
+                == "fj --host dev.a8n.run pr merge contoso/claude-run#52 --method merge --delete"
+            }),
             "{calls:?}"
         );
     }
