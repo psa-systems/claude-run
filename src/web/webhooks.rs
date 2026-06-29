@@ -649,9 +649,17 @@ async fn fetch_private_log(
         }
         Ok(Ok(ApiLogOutcome::AuthDenied(status))) => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, status, "private repository; log token rejected");
-            PrivateLogOutcome::Unavailable(format!(
-                "private repo: unauthorized (log token rejected, HTTP {status})"
-            ))
+            // CLAUDE-146: Forgejo distinguishes 401 from 403, so name the
+            // actionable cause. 401 = the credential was not accepted (the log
+            // token is not a valid Forgejo user PAT: wrong value, expired, or
+            // not a `token`-scheme PAT). 403 = the token is valid but lacks
+            // `read:repository` scope or Actions read access on this repo.
+            let detail = if status == 401 {
+                "HTTP 401: the log token is not a valid Forgejo user PAT (wrong value, expired, or not a token-scheme PAT)"
+            } else {
+                "HTTP 403: the log token is valid but lacks read:repository scope or Actions read access on this repo"
+            };
+            PrivateLogOutcome::Unavailable(format!("private repo: log token rejected ({detail})"))
         }
         Ok(Ok(ApiLogOutcome::NotFound)) => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, "private repository; logs API returned 404 (Forgejo < 16, or run pruned)");
@@ -678,7 +686,10 @@ async fn fetch_private_log(
 /// mechanism as the HMAC refs).
 async fn resolve_log_token(pool: &SqlitePool, name: &str) -> crate::error::Result<String> {
     let key = SecretsKey::load()?;
-    secrets::resolve_secret(pool, &key, name).await
+    // CLAUDE-146: trim the decrypted token. A stored trailing space or CR
+    // survives as a valid header character and yields a spurious HTTP 401.
+    let token = secrets::resolve_secret(pool, &key, name).await?;
+    Ok(token.trim().to_string())
 }
 
 /// CLAUDE-61: open the `runs` row for one webhook fast-path event and stamp its
