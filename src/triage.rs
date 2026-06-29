@@ -457,11 +457,32 @@ impl FailureClassifier for ClaudeClassifier {
             &cancel,
         )?;
         if !result.ok {
+            // CLAUDE-146: surface the reason claude actually reported
+            // (`result.summary`, built by `friendly_failure_summary`) instead
+            // of the opaque `claude exited N`, so the minted issue names the
+            // real cause. Fall back to `result.error` only when the summary is
+            // empty. Note whether the failing job log is attached, and flag a
+            // transient claude error (rate / usage limit) so the reader knows a
+            // re-run may classify cleanly rather than treating it as a CI bug.
+            let reason = if result.summary.trim().is_empty() {
+                result.error.trim().to_string()
+            } else {
+                result.summary.trim().to_string()
+            };
+            let log_note = if input.log_available {
+                "the failing job log is attached below for diagnosis"
+            } else {
+                "no failing job log was available"
+            };
+            let transient_note = if result.transient {
+                " This looks like a transient claude error (e.g. rate / usage limit), not a CI problem; re-running triage may classify it cleanly."
+            } else {
+                ""
+            };
             return Ok(Triage::llm(
                 TriageBucket::HumanAction,
                 format!(
-                    "claude classification did not complete ({}); routing to a human",
-                    result.error
+                    "Automated classification did not complete ({reason}); routing to a human. For diagnosis, {log_note}.{transient_note}"
                 ),
             ));
         }
