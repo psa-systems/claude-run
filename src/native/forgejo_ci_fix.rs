@@ -274,8 +274,17 @@ async fn process_job(
     let pr_key = format!("pr:{}#{}", job.repo, job.pr_number);
     let pr_attempts = state::attempts_get(ctx.pool, &action.name, &pr_key).await?;
     if pr_ceiling_reached(pr_attempts, cfg.max_pr_attempts) {
-        info!(action = %action.name, key = %key, pr = job.pr_number, pr_attempts, "per-PR fix ceiling reached; flagging Needs Review");
-        flag_needs_review(ctx, backend, cfg, job).await;
+        // Flag Needs Review exactly once per PR. The comment / label bump the
+        // PR's updated_at, so it stays in the gather window and is re-picked every
+        // tick; a separate marker stops the re-flag from re-commenting each time.
+        let review_key = format!("review:{}#{}", job.repo, job.pr_number);
+        if state::attempts_get(ctx.pool, &action.name, &review_key).await? == 0 {
+            info!(action = %action.name, key = %key, pr = job.pr_number, pr_attempts, "per-PR fix ceiling reached; flagging Needs Review");
+            flag_needs_review(ctx, backend, cfg, job).await;
+            state::attempts_increment(ctx.pool, &action.name, &review_key).await?;
+        } else {
+            info!(action = %action.name, key = %key, pr = job.pr_number, "per-PR ceiling already flagged Needs Review; not re-flagging");
+        }
         return Ok(ProcessedJob::NeedsReview { key: key.clone() });
     }
 
