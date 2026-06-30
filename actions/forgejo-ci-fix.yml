@@ -1,17 +1,26 @@
 ---
-# Unattended Claude Code fix for failing CI on Forgejo PRs.
+# Unattended Claude Code fix for failing CI on the bot's OWN Forgejo PRs.
 #
 # Native action (CLAUDE-29, supersedes DEV-330): `kind: forgejo-ci-fix` routes
 # to the built-in Rust handler in `src/native/forgejo_ci_fix.rs` instead of the
 # generic nu-snippet pipeline. This file is config only and carries no
 # script-bearing fields (input.command / filter / pre / prompt / post).
 #
+# CLAUDE-149: the handler only auto-fixes the BOT's own failing PRs (those
+# authored by `bot_author`). A human's failing PR is left to its author. The bot
+# iterates corrective pushes on its own PR until CI passes, and after
+# `max_pr_attempts` distinct fix pushes it stops and flags the PR Needs Review.
+#
 # Pipeline (all in typed Rust):
 #   gather  -> per allow-listed repo, list open PRs (fj pr search --json) and
 #              read head-commit CI status (fj pr status --json); keep PRs whose
 #              combined CI state is `failure` and that were updated within
 #              window_minutes. The dedup / attempt key is the PR head SHA.
-#   filter  -> skip PRs authored by `bot_author` (anti-feedback-loop).
+#   filter  -> keep ONLY PRs authored by `bot_author` (the bot's own PRs);
+#              everyone else's PR is left to its author.
+#   ceiling -> if this PR already had `max_pr_attempts` fix pushes, flag it
+#              Needs Review (PR comment + `needs_review_label` label + the
+#              source issue set to `needs_review_state`) and stop.
 #   pre     -> git clone --branch <head_ref> --depth 50 (token auth from fj's
 #              credential store; the clone stays a git subprocess).
 #   claude  -> the action's `claude` block fixes the failing CI locally only.
@@ -34,10 +43,9 @@ kind: forgejo-ci-fix
 # Typed config for the native handler. Every field defaults; `repos` is the
 # allow-list of repositories to scan (empty means scan nothing).
 native:
-  # CLAUDE-149: master enable toggle, default false. While false the handler is
-  # a no-op: a failing open PR is left to its author rather than auto-fixed by a
-  # bot push onto the PR branch. Set true to opt back in.
-  enabled: false
+  # CLAUDE-149: master kill switch, default true. Set false to turn the handler
+  # off entirely. While on, only the bot's own failing PRs are auto-fixed.
+  enabled: true
   host: dev.a8n.run
   repos:
     - contoso/claude-fix-sandbox
@@ -46,13 +54,25 @@ native:
   # Decision gate: a diff over either cap is too large for an unattended push.
   max_files: 10
   max_lines: 300
-  # Anti-feedback-loop: PRs authored by this login are skipped. Also the git
-  # author identity used for the fix commit.
+  # CLAUDE-149: ONLY PRs authored by this login are auto-fixed (the bot's own
+  # PRs); every other author's PR is left alone. Also the git author identity
+  # used for the fix commit.
   bot_author: claude-run
   bot_email: claude-run@a8n.run
   # Appended to the fix commit message so the bot's own push does not
   # re-trigger this action.
   skip_marker: "[skip claude]"
+  # CLAUDE-149: per-PR fix-push ceiling. The bot keeps pushing to its own PR
+  # until CI passes; after this many distinct fix pushes it flags Needs Review.
+  max_pr_attempts: 3
+  # Forgejo label added to a PR when the ceiling is reached.
+  needs_review_label: needs-review
+  # YouTrack State set on the PR's source issue (when the PR body references one)
+  # at the ceiling, best-effort.
+  needs_review_state: "Needs Review"
+  # Optional YouTrack login assigned to the source issue at the ceiling; omit to
+  # skip the assignee step.
+  # review_assignee: nate
   # token: inline plaintext placeholder for CLAUDE-26 (encrypted secrets); the
   # CLI backend uses fj's credential store today and ignores it.
 

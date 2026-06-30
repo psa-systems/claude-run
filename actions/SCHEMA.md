@@ -235,50 +235,65 @@ scripted action did.
 #### `kind: forgejo-ci-fix`
 
 A single flat config record (no sub-records). The handler scans `repos` on `host` for open PRs whose head-commit
-combined CI state is `failure` and that were updated within `window_minutes`, skips PRs authored by `bot_author`, clones
-the PR branch, runs Claude to fix the failing CI, applies a diff-size decision gate, commits as the bot identity with
-`skip_marker` and pushes on `push`, and posts a PR comment on every outcome path. The dedup / attempt key is the PR head
-SHA (a per-commit attempt cap). The generic blocks (`workdir_base`, `claude`, `limits`, `schedule`, `output`) stay at
-the top level of the action, not inside `native`.
+combined CI state is `failure` and that were updated within `window_minutes`, keeps ONLY PRs authored by `bot_author`
+(the bot's own PRs), clones the PR branch, runs Claude to fix the failing CI, applies a diff-size decision gate, commits
+as the bot identity with `skip_marker` and pushes on `push`, and posts a PR comment on every outcome path. The dedup /
+attempt key is the PR head SHA (a per-commit attempt cap). The generic blocks (`workdir_base`, `claude`, `limits`,
+`schedule`, `output`) stay at the top level of the action, not inside `native`.
 
-**CLAUDE-149: disabled by default.** `enabled` defaults to `false`, so the handler is a no-op (it logs and returns
-before any gather or push) unless an operator explicitly opts in. A failing open PR is the author's to fix; auto-pushing
-a corrective commit onto the PR branch is opt-in. The same change suppresses the webhook mint's queued auto-fix route for
-any failure that already has an open PR (a `human_action` failure on an open PR still mints).
+**CLAUDE-149: only the bot's own PRs, iterate then flag Needs Review.** The author filter is inverted from the old
+anti-feedback-loop skip: a human's failing PR is left to its author (the bot never pushes onto someone else's branch),
+and only PRs authored by `bot_author` (the PRs the bot opened working a queued issue) are worked. The bot keeps pushing
+corrective commits to its own PR until CI passes; because the per-commit cap resets on every new head SHA, a separate
+per-PR counter bounds the iteration. After `max_pr_attempts` distinct fix pushes on one PR the handler stops and flags it
+Needs Review: it posts a PR comment, adds the `needs_review_label` Forgejo label (`fj pr edit <repo>#<n> labels --add`),
+and, when the PR body references a `#<KEY>-N` issue, best-effort sets that source issue's State to `needs_review_state`
+and assigns `review_assignee` (when set). `enabled` defaults to `true` and is a master kill switch. The complementary
+webhook-side change suppresses the mint's queued auto-fix route for any failure that already has an open PR (a
+`human_action` failure on an open PR still mints).
 
 ```yaml
 kind: forgejo-ci-fix
 native:
-  enabled: false                      # CLAUDE-149 master toggle; off => handler no-ops
+  enabled: true                       # CLAUDE-149 master kill switch (default on)
   host: dev.a8n.run                   # forge host passed to `fj --host`
   repos: # allow-list of owner/name repos to scan
     - contoso/claude-fix-sandbox
   window_minutes: 45                  # only PRs updated this recently
   max_files: 10                       # decision gate: too_big over this many files
   max_lines: 300                      # decision gate: too_big over this many lines
-  bot_author: claude-run              # skipped author + git commit author name
+  bot_author: claude-run              # ONLY this author's PRs are fixed + git commit author name
   bot_email: claude-run@a8n.run       # git commit author email
   skip_marker: "[skip claude]"        # appended to the fix commit message
+  max_pr_attempts: 3                  # per-PR fix-push ceiling, then Needs Review
+  needs_review_label: needs-review    # label added at the ceiling
+  needs_review_state: "Needs Review"  # source-issue State set at the ceiling (best-effort)
+  review_assignee: nate               # optional source-issue assignee at the ceiling
   token: <token>                      # optional; inline plaintext (CLAUDE-26 encrypts)
 ```
 
-| Key              | Default              | Meaning                                                           |
-|------------------|----------------------|-------------------------------------------------------------------|
-| `enabled`        | `false`              | CLAUDE-149 master toggle. While false the handler no-ops.         |
-| `host`           | `dev.a8n.run`        | Forgejo host (bare, no scheme) passed to `fj --host`.             |
-| `repos`          | `[]`                 | Allow-list of `owner/name` repos to scan. Empty means scan none.  |
-| `window_minutes` | `45`                 | Only consider PRs updated within this many minutes of the run.    |
-| `max_files`      | `10`                 | Decision gate: a diff touching more files is `too_big`.           |
-| `max_lines`      | `300`                | Decision gate: a diff changing more lines is `too_big`.           |
-| `bot_author`     | `claude-run`         | Author login skipped (anti-feedback-loop) + git commit author.    |
-| `bot_email`      | `claude-run@a8n.run` | Git commit author email.                                          |
-| `skip_marker`    | `[skip claude]`      | Appended to the fix commit so the bot's push does not re-trigger. |
-| `token`          | none                 | API token, inline plaintext for now (CLAUDE-26 encrypts).         |
+| Key                  | Default              | Meaning                                                              |
+|----------------------|----------------------|----------------------------------------------------------------------|
+| `enabled`            | `true`               | CLAUDE-149 master kill switch. While false the handler no-ops.       |
+| `host`               | `dev.a8n.run`        | Forgejo host (bare, no scheme) passed to `fj --host`.                |
+| `repos`              | `[]`                 | Allow-list of `owner/name` repos to scan. Empty means scan none.     |
+| `window_minutes`     | `45`                 | Only consider PRs updated within this many minutes of the run.       |
+| `max_files`          | `10`                 | Decision gate: a diff touching more files is `too_big`.              |
+| `max_lines`          | `300`                | Decision gate: a diff changing more lines is `too_big`.              |
+| `bot_author`         | `claude-run`         | ONLY this author's PRs are auto-fixed (CLAUDE-149) + git commit author. |
+| `bot_email`          | `claude-run@a8n.run` | Git commit author email.                                             |
+| `skip_marker`        | `[skip claude]`      | Appended to the fix commit so the bot's push does not re-trigger.    |
+| `max_pr_attempts`    | `3`                  | Per-PR fix-push ceiling before the PR is flagged Needs Review.       |
+| `needs_review_label` | `needs-review`       | Forgejo label added to the PR at the ceiling.                        |
+| `needs_review_state` | `Needs Review`       | YouTrack State set on the PR's source issue at the ceiling (best-effort). |
+| `review_assignee`    | none                 | Optional YouTrack login assigned to the source issue at the ceiling. |
+| `token`              | none                 | API token, inline plaintext for now (CLAUDE-26 encrypts).            |
 
-All Forgejo reads (open PRs, head-commit CI status) and the comment write go through the `fj` CLI (no raw REST); clone /
-push auth comes from `fj`'s own credential store. **Deployment prerequisite:** the runner's `fj` must be a build that
-exposes `--json` on `pr search` (FJ-1) and `pr status` (FJ-2). An older `fj` without `--json` cannot drive the gather
-reads.
+All Forgejo reads (open PRs, head-commit CI status, the PR body for the source-issue link) and the comment / label writes
+go through the `fj` CLI (no raw REST); clone / push auth comes from `fj`'s own credential store. **Deployment
+prerequisite:** the runner's `fj` must be a build that exposes `--json` on `pr search` (FJ-1), `pr status` (FJ-2), and
+`pr view`, plus `pr edit <PR> labels --add`. An older `fj` without these cannot drive the gather reads or the Needs
+Review flag.
 
 ### `workdir_base` (string, optional)
 

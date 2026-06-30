@@ -238,6 +238,33 @@ pub trait Forge: Send + Sync {
             "update_branch (automerge) not supported by this forge backend"
         )))
     }
+
+    /// CLAUDE-149: add Forgejo labels to PR `pr_number` in `repo` on `host`
+    /// (`fj pr edit <repo>#<n> labels --add <label>`). Used to flag a PR Needs
+    /// Review when the per-PR auto-fix ceiling is reached. The default errors so
+    /// a backend without label support reports clearly.
+    fn pr_add_labels(
+        &self,
+        host: &str,
+        repo: &str,
+        pr_number: u64,
+        labels: &[String],
+    ) -> Result<()> {
+        let _ = (host, repo, pr_number, labels);
+        Err(Error::Other(anyhow::anyhow!(
+            "pr_add_labels not supported by this forge backend"
+        )))
+    }
+
+    /// CLAUDE-149: the issue keys (`#<KEY>-N` references) found in PR
+    /// `pr_number`'s body (`fj pr view <repo>#<n> --json`). Used to flag the
+    /// source issue Needs Review when the per-PR auto-fix ceiling is reached. The
+    /// default returns an empty list (no linkage), so a backend without PR-body
+    /// access degrades to the PR-side flag only.
+    fn pr_referenced_issues(&self, host: &str, repo: &str, pr_number: u64) -> Result<Vec<String>> {
+        let _ = (host, repo, pr_number);
+        Ok(Vec::new())
+    }
 }
 
 /// A backend implementing the full provider surface. Marker super-trait so the
