@@ -127,7 +127,12 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
 
     // gather (before run_begin: a gather failure is a no-op run, same as the
     // scripted path). gather only invokes `yt`, so its credentials are yt-only.
-    let jobs = {
+    // CLAUDE-147: stamp the poll once so the input-phase events recorded now
+    // (before the run row exists) can be backfilled onto the run after
+    // `run_begin`, and so a zero-job poll still associates its events with this
+    // timestamp on the action page.
+    let poll_ts = state::now_iso();
+    let (jobs, input_events) = {
         let (gather_backend, _gather_guard) = if creds.is_empty() {
             (CliBackend::new(runner.clone()), None)
         } else {
@@ -138,9 +143,24 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         };
         gather(&gather_backend, &src.query)?
     };
+    // CLAUDE-147: persist input-phase diagnostics before `run_begin` so they
+    // survive even if no run row is ever created. Non-fatal: a bookkeeping
+    // failure must not abort the poll.
+    if !input_events.is_empty() {
+        if let Err(e) = state::run_events_record(pool, &action.name, &poll_ts, &input_events).await
+        {
+            warn!(error = %e, "run_events_record failed (non-fatal)");
+        }
+    }
     info!(action = %action.name, count = jobs.len(), "youtrack jobs gathered");
 
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
+    // CLAUDE-147: backfill this poll's input-phase events onto the new run row.
+    if !input_events.is_empty() {
+        if let Err(e) = state::run_events_attach(pool, run_id, &action.name, &poll_ts).await {
+            warn!(error = %e, "run_events_attach failed (non-fatal)");
+        }
+    }
 
     // CLAUDE-9: register a cancellation token and ensure it is unregistered on
     // every exit path (including the `?` early returns below).
@@ -361,11 +381,19 @@ fn sanitize_key(key: &str) -> String {
 /// gather: list queued issues, resolve each project's VCS once (cached), and
 /// drop issues whose project has no usable VCS integration. Mirrors the
 /// scripted `input.command`.
-fn gather(backend: &dyn Backend, query: &str) -> Result<Vec<YoutrackJob>> {
+///
+/// Returns the eligible jobs plus the CLAUDE-147 input-phase events (the
+/// per-project probe failures and no-VCS drops) that the caller persists to
+/// `run_events` so they surface in the web UI rather than only in the journal.
+fn gather(
+    backend: &dyn Backend,
+    query: &str,
+) -> Result<(Vec<YoutrackJob>, Vec<state::InputEvent>)> {
     let issues = backend.list_queued(query)?;
     let mut vcs_cache: std::collections::HashMap<String, Option<provider::VcsRepo>> =
         std::collections::HashMap::new();
     let mut jobs = Vec::new();
+    let mut events: Vec<state::InputEvent> = Vec::new();
     for issue in &issues {
         let Some(key) = issue.get("idReadable").and_then(|v| v.as_str()) else {
             warn!("skipping issue with no idReadable");
@@ -379,6 +407,13 @@ fn gather(backend: &dyn Backend, query: &str) -> Result<Vec<YoutrackJob>> {
                 // `list --json`): the legitimate drop path.
                 Err(Error::NoVcsIntegration(_)) => {
                     info!(project = %project, "dropping issues: no usable VCS integration");
+                    // CLAUDE-147: surface the drop so an operator can see why a
+                    // project's issues never became jobs.
+                    events.push(state::InputEvent {
+                        level: "info".into(),
+                        context: Some(project.clone()),
+                        message: "issues skipped: project has no enabled VCS integration".into(),
+                    });
                     None
                 }
                 // A probe tool error (e.g. `yt` exit 2) is NOT the same as
@@ -387,6 +422,15 @@ fn gather(backend: &dyn Backend, query: &str) -> Result<Vec<YoutrackJob>> {
                 // than silently collapsing it into the drop path (CLAUDE-124).
                 Err(e) => {
                     warn!(project = %project, error = %e, "VCS probe failed (provider-CLI error); skipping project this poll, not treating as missing integration");
+                    // CLAUDE-147: persist the probe failure so it is visible in
+                    // the web UI, not only in the daemon journal.
+                    events.push(state::InputEvent {
+                        level: "warn".into(),
+                        context: Some(project.clone()),
+                        message: format!(
+                            "VCS probe failed (provider-CLI error); issues skipped this poll: {e}"
+                        ),
+                    });
                     None
                 }
             };
@@ -409,7 +453,7 @@ fn gather(backend: &dyn Backend, query: &str) -> Result<Vec<YoutrackJob>> {
             clone_url: repo.clone_url,
         });
     }
-    Ok(jobs)
+    Ok((jobs, events))
 }
 
 /// Project key prefix of an issue id (`MK-16` -> `MK`).
@@ -1629,7 +1673,7 @@ mod tests {
                 "[]",
             );
         let backend = CliBackend::new(Arc::new(runner));
-        let jobs = gather(&backend, &src().query).unwrap();
+        let (jobs, events) = gather(&backend, &src().query).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, "MK-16");
         assert_eq!(jobs[0].summary, "a");
@@ -1637,6 +1681,11 @@ mod tests {
             jobs[0].clone_url,
             "https://dev.a8n.run/contoso/claude-run.git"
         );
+        // CLAUDE-147: the empty-VCS drop is recorded as an info event so the
+        // skipped project is visible in the web UI.
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, "info");
+        assert_eq!(events[0].context.as_deref(), Some("ZZ"));
     }
 
     #[test]
@@ -1666,9 +1715,15 @@ mod tests {
                 "unrecognized subcommand",
             );
         let backend = CliBackend::new(Arc::new(runner));
-        let jobs = gather(&backend, &src().query).unwrap();
+        let (jobs, events) = gather(&backend, &src().query).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, "MK-16");
+        // CLAUDE-147: the probe failure is recorded as a warn event (not the
+        // silent no-integration drop) so it surfaces in the web UI.
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, "warn");
+        assert_eq!(events[0].context.as_deref(), Some("ZZ"));
+        assert!(events[0].message.contains("VCS probe failed"));
     }
 
     /// CLAUDE-131: a configured assignee is written via `yt issue update
