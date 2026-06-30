@@ -1155,6 +1155,10 @@ struct ActionDetailTpl {
     action: ActionView,
     paused: Option<PauseInfo>,
     runs: Vec<RunRow>,
+    /// CLAUDE-147: input/poll-phase diagnostics for this action (probe failures,
+    /// no-VCS drops), newest first. Rendered in an "Input errors / warnings"
+    /// region; errors are styled with `var(--bad)`.
+    events: Vec<state::RunEventRecord>,
     /// CLAUDE-42: current state of the "Show empty runs" toggle. Threaded into
     /// the poll-region `hx-get` so the choice survives the 5s self-refresh.
     show_empty: bool,
@@ -1201,11 +1205,16 @@ async fn action_detail(
         .bind(&name)
         .fetch_all(pool)
         .await?;
+    // CLAUDE-147: input/poll-phase diagnostics (VCS probe failures, no-VCS
+    // drops) recorded by `gather()`. Queried by action name independent of any
+    // run row, so a zero-job poll's events are surfaced too.
+    let events = state::run_events_for_action(pool, &name, 50).await?;
     let tpl = ActionDetailTpl {
         version: s.api.version,
         action,
         paused,
         runs,
+        events,
         show_empty: q.show_empty,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
@@ -3928,15 +3937,17 @@ mod tests {
     // actions directory.
     mod editor {
         use super::super::{
-            action_create, action_delete, action_edit_save, action_export, action_to_youtrack_form,
-            youtrack_create, youtrack_edit_page, youtrack_edit_save, youtrack_form_to_yaml,
-            youtrack_new_page, ActionForm, WebState, YoutrackEditForm,
+            action_create, action_delete, action_detail, action_edit_save, action_export,
+            action_to_youtrack_form, youtrack_create, youtrack_edit_page, youtrack_edit_save,
+            youtrack_form_to_yaml, youtrack_new_page, ActionDetailQuery, ActionForm, WebState,
+            YoutrackEditForm,
         };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
         use crate::config::Paths;
         use crate::db::MIGRATOR;
         use crate::state;
+        use axum::extract::Query;
         use axum::extract::{Form, Path as AxumPath, State};
         use axum::http::StatusCode;
         use axum::response::{IntoResponse, Response};
@@ -4006,6 +4017,51 @@ mod tests {
                 .await
                 .unwrap();
             String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn action_detail_renders_input_events_region() {
+            // CLAUDE-147: a recorded probe-failure event is rendered on the
+            // action-detail page (message + var(--bad) styling), surfacing the
+            // poll/input-phase error that has no per-job outcome row. Covers the
+            // zero-job-poll case: the event has a NULL run_id and still shows.
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("youtrack.yml");
+            std::fs::write(&file, NATIVE_MINIMAL).unwrap();
+            index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
+
+            let poll_ts = state::now_iso();
+            state::run_events_record(
+                &s.api.pool,
+                "youtrack",
+                &poll_ts,
+                &[state::InputEvent {
+                    level: "warn".into(),
+                    context: Some("VS".into()),
+                    message: "VCS probe failed (provider-CLI error); issues skipped this poll: project 'VS' not found".into(),
+                }],
+            )
+            .await
+            .unwrap();
+
+            let resp = action_detail(
+                State(s.clone()),
+                AxumPath("youtrack".to_string()),
+                Query(ActionDetailQuery::default()),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            assert!(body.contains("Input errors / warnings"));
+            assert!(body.contains("VCS probe failed"));
+            assert!(body.contains("VS"));
+            // The warn level renders with the bad badge / var(--bad) styling.
+            assert!(body.contains("var(--bad)"));
         }
 
         #[tokio::test]
