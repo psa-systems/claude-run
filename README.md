@@ -270,10 +270,16 @@ is globally unique, so a duplicate delivered to two sources is still caught). Th
 verbatim, so use lowercase `[a-z0-9_-]`; a name needing URL escaping is warned about at load.
 
 Triage sorts each verified failure into one of three buckets: a failing PR check that a code change fixes (`code_fix`)
-mints an issue and sets `AI Agent = Queued` so `forgejo-ci-fix` opens the fix PR; a failure no PR fixes (`human_action`,
+mints an issue and sets `AI Agent = Queued` so the runner opens the fix PR; a failure no PR fixes (`human_action`,
 e.g. a main-branch / tag / release / missing-secret failure) mints a human-assigned issue with no PR; a transient /
 infra / flaky failure (`transient`) mints nothing. A failing run triggered by the fix bot's own login mints nothing (
 loop safety), and the reused per-key + daily caps throttle a storm of failures.
+
+**CLAUDE-149: a failing open PR is left to its author.** When the failing run already has an open PR, the `code_fix`
+(queue-for-fix) route is suppressed: no issue is minted and no fix is queued, because the PR author owns the red CI on
+their own branch. A `human_action` failure on an open PR still mints (it needs a human, not the bot). Separately, the
+`forgejo-ci-fix` action that pushed a corrective commit onto a failing PR branch is now disabled by default (its
+`enabled` toggle defaults to `false`); set it `true` to opt back in.
 
 A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then
 the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the
@@ -309,9 +315,10 @@ queued issue, `AI Agent=Queued`, no human assignee) but applies regardless of `h
 protected/main branch, so it never reaches the classifier prompt that would label it `human_action`. The minted issue's
 summary (`Auto-fix: cargo fmt on <repo> (run #N, <sha>)`) and description name the concrete problem, the fix command,
 and the delivery instruction: commit on a fresh `chore/<kind>-<short-sha>` branch and open a PR against `main` via the
-configured PR strategy (CLAUDE-103), never a direct push to main. The existing `has_open_pr == true` flow is untouched:
-forgejo-ci-fix (CLAUDE-29) still pushes a corrective commit onto the PR branch. Dedupe markers are unchanged, so repeats
-of the same `(repo, workflow_id, commit_sha)` still group.
+configured PR strategy (CLAUDE-103), never a direct push to main. The `has_open_pr == true` case is handled by CLAUDE-149
+instead: an open PR's failure is left to its author (the `code_fix` route is suppressed and the `forgejo-ci-fix`
+corrective-push handler is disabled by default), so the auto-fix path above applies only when there is no open PR. Dedupe
+markers are unchanged, so repeats of the same `(repo, workflow_id, commit_sha)` still group.
 
 ### Migration from the single-source listener (CLAUDE-87)
 

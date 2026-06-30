@@ -34,6 +34,10 @@ kind: forgejo-ci-fix
 # Typed config for the native handler. Every field defaults; `repos` is the
 # allow-list of repositories to scan (empty means scan nothing).
 native:
+  # CLAUDE-149: master enable toggle, default false. While false the handler is
+  # a no-op: a failing open PR is left to its author rather than auto-fixed by a
+  # bot push onto the PR branch. Set true to opt back in.
+  enabled: false
   host: dev.a8n.run
   repos:
     - contoso/claude-fix-sandbox

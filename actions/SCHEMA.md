@@ -241,9 +241,15 @@ the PR branch, runs Claude to fix the failing CI, applies a diff-size decision g
 SHA (a per-commit attempt cap). The generic blocks (`workdir_base`, `claude`, `limits`, `schedule`, `output`) stay at
 the top level of the action, not inside `native`.
 
+**CLAUDE-149: disabled by default.** `enabled` defaults to `false`, so the handler is a no-op (it logs and returns
+before any gather or push) unless an operator explicitly opts in. A failing open PR is the author's to fix; auto-pushing
+a corrective commit onto the PR branch is opt-in. The same change suppresses the webhook mint's queued auto-fix route for
+any failure that already has an open PR (a `human_action` failure on an open PR still mints).
+
 ```yaml
 kind: forgejo-ci-fix
 native:
+  enabled: false                      # CLAUDE-149 master toggle; off => handler no-ops
   host: dev.a8n.run                   # forge host passed to `fj --host`
   repos: # allow-list of owner/name repos to scan
     - contoso/claude-fix-sandbox
@@ -258,6 +264,7 @@ native:
 
 | Key              | Default              | Meaning                                                           |
 |------------------|----------------------|-------------------------------------------------------------------|
+| `enabled`        | `false`              | CLAUDE-149 master toggle. While false the handler no-ops.         |
 | `host`           | `dev.a8n.run`        | Forgejo host (bare, no scheme) passed to `fj --host`.             |
 | `repos`          | `[]`                 | Allow-list of `owner/name` repos to scan. Empty means scan none.  |
 | `window_minutes` | `45`                 | Only consider PRs updated within this many minutes of the run.    |

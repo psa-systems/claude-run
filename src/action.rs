@@ -426,6 +426,11 @@ pub fn default_github_mcp_endpoint() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ForgejoCiFixConfig {
+    /// CLAUDE-149: master enable toggle. Defaults to `false`, so the handler is
+    /// a no-op unless an operator explicitly opts in. A failing open PR is the
+    /// author's to fix; auto-pushing a corrective commit onto the PR branch is
+    /// off by default.
+    pub enabled: bool,
     /// Forgejo host, e.g. `dev.a8n.run` (bare host, no scheme), passed to
     /// `fj --host`.
     pub host: String,
@@ -454,6 +459,7 @@ pub struct ForgejoCiFixConfig {
 impl Default for ForgejoCiFixConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             host: "dev.a8n.run".to_string(),
             repos: Vec::new(),
             window_minutes: 45,

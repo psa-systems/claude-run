@@ -810,6 +810,7 @@ fn mint_summary(outcome: &MintOutcome) -> String {
         MintOutcome::Created { key, project, .. } => format!("minted {key} in {project}"),
         MintOutcome::SkippedTransient => "no issue (transient)".to_string(),
         MintOutcome::SkippedBotLoop => "no issue (bot-loop guard)".to_string(),
+        MintOutcome::SkippedOpenPr => "no issue (open PR; left to author)".to_string(),
         MintOutcome::SkippedAttemptCap => "no issue (per-key attempt cap)".to_string(),
         MintOutcome::SkippedDailyCap => "no issue (daily run cap)".to_string(),
         MintOutcome::SkippedDuplicateOpen { existing } => {
@@ -984,6 +985,7 @@ fn decide_mint(
         triage: &verdict,
         log_path: log_artifact,
         private: ev.private,
+        has_open_pr,
     };
     let outcome = mint::mint(tracker, mint_cfg, route_cache, &req, caps)?;
     Ok((verdict.bucket, outcome))
@@ -1059,6 +1061,9 @@ fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
         }
         MintOutcome::SkippedBotLoop => {
             info!(repo = %ev.repo, run = ev.index_in_repo, trigger_user = %ev.trigger_user, "bot-loop guard; minted nothing")
+        }
+        MintOutcome::SkippedOpenPr => {
+            info!(repo = %ev.repo, run = ev.index_in_repo, "open PR for this run; auto-fix suppressed (CLAUDE-149), minted nothing")
         }
         MintOutcome::SkippedAttemptCap => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, "per-key attempt cap reached; minted nothing")
@@ -1790,8 +1795,10 @@ mod tests {
 
     #[test]
     fn code_fix_classification_mints_and_queues() {
-        // A non-transient log + a code_fix verdict -> issue in the mapped project,
-        // queued for the fix bot, no human assignee.
+        // A non-transient log + a code_fix verdict with NO open PR -> issue in the
+        // mapped project, queued for the fix bot, no human assignee. (With an open
+        // PR the code_fix route is suppressed per CLAUDE-149; see
+        // `open_pr_code_fix_is_left_to_the_author_and_mints_nothing`.)
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let (bucket, out) = decide_mint(
@@ -1805,7 +1812,7 @@ mod tests {
             true,
             None,
             None,
-            true,
+            false, // has_open_pr: no PR, so the code_fix route still queues
             &|_| {},
         )
         .unwrap();
@@ -1920,6 +1927,43 @@ mod tests {
                 .iter()
                 .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
             "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn open_pr_code_fix_is_left_to_the_author_and_mints_nothing() {
+        // CLAUDE-149 end-to-end through decide_mint: a failure WITH an open PR
+        // that the classifier calls code_fix is the author's to fix. The
+        // queue-for-fix route is suppressed, so no issue is minted and the fix
+        // bot is never queued.
+        let classifier = StubClassifier::new(TriageBucket::CodeFix);
+        let tracker = StubTracker::new();
+        let ev = event();
+        let (bucket, out) = decide_mint(
+            &classifier,
+            &tracker,
+            &mint_cfg(),
+            &route_cache(),
+            &caps(),
+            &ev,
+            "error[E0308]: mismatched types".to_string(),
+            true,
+            None,
+            None,
+            true, // has_open_pr: a failing open PR
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(bucket, TriageBucket::CodeFix);
+        assert_eq!(out, MintOutcome::SkippedOpenPr);
+        let calls = tracker.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create")),
+            "no issue minted for an open-PR failure: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("AI Agent")),
+            "fix bot never queued: {calls:?}"
         );
     }
 
