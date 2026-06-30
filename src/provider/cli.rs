@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use serde::Deserialize;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::{Backend, Forge, IssueTracker, PullRequest, VcsMapEntry, VcsRepo};
 use crate::error::{Error, Result};
@@ -338,13 +338,150 @@ impl CliBackend {
         Ok(())
     }
 
+    /// CLAUDE-148: the value of the injected `YOUTRACK_CLI_CONFIG`, if any. The
+    /// PATH only is returned, never the file contents (which hold the token).
+    /// `None` means host-auth fallback (no injected config).
+    fn yt_config_path(&self) -> Option<&str> {
+        self.yt_env
+            .iter()
+            .find(|(k, _)| k == "YOUTRACK_CLI_CONFIG")
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// CLAUDE-148: the YouTrack base URL the injected config targets, read from
+    /// the single-file `yt` config's `url:` line (see
+    /// [`crate::secrets::JobCredentials::materialize`], which writes
+    /// `url: <url>\ntoken: <token>\n`). The `token:` line is never read or
+    /// returned. Returns `None` on host-auth fallback (no injected config) or if
+    /// the file is unreadable / has no `url:` line, so the base URL can be logged
+    /// in a diagnostic without ever exposing the secret.
+    fn yt_base_url(&self) -> Option<String> {
+        let path = self.yt_config_path()?;
+        let contents = std::fs::read_to_string(path).ok()?;
+        contents
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("url:"))
+            .map(|v| v.trim().to_string())
+    }
+
     /// Run `yt args...`, returning trimmed stdout on success or
     /// [`Error::CliFailed`] on a non-zero exit.
+    ///
+    /// CLAUDE-148: logs the non-secret execution context at `debug` for every
+    /// call (resolved binary, injected env KEY names, whether
+    /// `YOUTRACK_CLI_CONFIG` is set vs host-auth fallback) and, on a non-zero
+    /// exit, a `warn` carrying the config presence and the YouTrack base URL in
+    /// effect, so a failure's auth/config context is in the journal. No secret
+    /// value (token, decrypted config contents) is ever logged.
     fn yt_ok(&self, args: &[&str]) -> Result<String> {
+        let env_keys: Vec<&str> = self.yt_env.iter().map(|(k, _)| k.as_str()).collect();
+        let config_present = self.yt_config_path().is_some();
+        debug!(
+            binary = %self.yt,
+            args = %args.join(" "),
+            env_keys = ?env_keys,
+            youtrack_cli_config_present = config_present,
+            "invoking yt"
+        );
         let out = self
             .runner
             .run_in_env(None, &self.yt, args, &self.yt_envs())?;
+        if !out.ok {
+            warn!(
+                binary = %self.yt,
+                args = %args.join(" "),
+                exit_code = out.exit_code,
+                youtrack_cli_config_present = config_present,
+                base_url = %self.yt_base_url().as_deref().unwrap_or("<host-auth or unknown>"),
+                "yt invocation failed"
+            );
+        }
         Self::checked(&self.yt, out, args)
+    }
+
+    /// CLAUDE-148: one-shot identity probe run when a VCS probe (`yt project vcs
+    /// list <PROJECT>`) fails. Re-runs `yt` with the SAME injected env as the
+    /// failing call to log the authenticated identity (`yt user me`, the
+    /// current-user subcommand the installed `yt` exposes) and the project keys
+    /// that token can read (`yt project list --json`). Together these separate a
+    /// permissions gap (target project absent from the visible list) from a
+    /// wrong instance (unexpected base URL) from a host-auth fallback (no
+    /// injected config) directly from the journal, without reproducing by hand.
+    /// Best-effort: each sub-probe failing is itself logged, never propagated.
+    /// No REST (Tooling Gap Discipline) and no secret is ever logged.
+    fn log_vcs_probe_identity(&self, project_key: &str) {
+        let config_present = self.yt_config_path().is_some();
+        let base_url = self.yt_base_url();
+        let base = base_url.as_deref().unwrap_or("<host-auth or unknown>");
+
+        match self
+            .runner
+            .run_in_env(None, &self.yt, &["user", "me"], &self.yt_envs())
+        {
+            Ok(out) if out.ok => warn!(
+                project = %project_key,
+                identity = %out.stdout.trim(),
+                youtrack_cli_config_present = config_present,
+                base_url = %base,
+                "VCS probe failed: daemon's yt authenticated identity"
+            ),
+            Ok(out) => warn!(
+                project = %project_key,
+                exit_code = out.exit_code,
+                stderr = %out.stderr.trim(),
+                youtrack_cli_config_present = config_present,
+                base_url = %base,
+                "VCS probe failed: `yt user me` also failed (cannot determine identity)"
+            ),
+            Err(e) => warn!(
+                project = %project_key,
+                error = %e,
+                "VCS probe failed: `yt user me` could not run"
+            ),
+        }
+
+        match self.runner.run_in_env(
+            None,
+            &self.yt,
+            &["project", "list", "--json"],
+            &self.yt_envs(),
+        ) {
+            Ok(out) if out.ok => {
+                match Self::parse_json::<Vec<ProjectListEntry>>(
+                    &self.yt,
+                    "yt project list --json",
+                    out.stdout.trim(),
+                ) {
+                    Ok(projects) => {
+                        let keys: Vec<&str> =
+                            projects.iter().map(|p| p.short_name.as_str()).collect();
+                        let target_visible = keys.contains(&project_key);
+                        warn!(
+                            project = %project_key,
+                            target_visible,
+                            visible_projects = ?keys,
+                            "VCS probe failed: project keys this yt token can read"
+                        );
+                    }
+                    Err(e) => warn!(
+                        project = %project_key,
+                        error = %e,
+                        "VCS probe failed: `yt project list --json` returned unparseable JSON"
+                    ),
+                }
+            }
+            Ok(out) => warn!(
+                project = %project_key,
+                exit_code = out.exit_code,
+                stderr = %out.stderr.trim(),
+                "VCS probe failed: `yt project list --json` also failed (cannot list visible projects)"
+            ),
+            Err(e) => warn!(
+                project = %project_key,
+                error = %e,
+                "VCS probe failed: `yt project list --json` could not run"
+            ),
+        }
     }
 
     /// Convert a [`CmdOutput`] into trimmed stdout or a typed [`Error::CliFailed`].
@@ -417,14 +554,26 @@ impl IssueTracker for CliBackend {
         // `vcs` is a command group; `list` is the subcommand that takes the
         // project short-name positional. Omitting it makes the project land in
         // the `<COMMAND>` slot and `yt` exits 2 (CLAUDE-124).
-        let stdout = self.yt_ok(&[
+        // CLAUDE-148: on a probe tool failure (e.g. `project 'VS' not found`,
+        // which YouTrack also returns for a project the token cannot READ), run
+        // the one-shot identity probe before propagating, so the journal records
+        // which yt user/instance the daemon used and whether the project was
+        // visible to that token. The error is unchanged; only diagnostics are
+        // added.
+        let stdout = match self.yt_ok(&[
             "project",
             "vcs",
             "list",
             project_key,
             "--enabled-only",
             "--json",
-        ])?;
+        ]) {
+            Ok(s) => s,
+            Err(e) => {
+                self.log_vcs_probe_identity(project_key);
+                return Err(e);
+            }
+        };
         let procs: Vec<VcsProcessor> =
             Self::parse_json(&self.yt, "yt project vcs list --json", &stdout)?;
         let first = procs
@@ -899,6 +1048,128 @@ mod tests {
             Error::NoVcsIntegration(key) => assert_eq!(key, "MK"),
             other => panic!("expected NoVcsIntegration, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_vcs_failure_runs_identity_diagnostics() {
+        // CLAUDE-148: a VCS probe failure (the `project 'VS' not found` shape)
+        // triggers the one-shot identity probe: `yt user me` and `yt project
+        // list --json`, both with the same injected env, so the journal can
+        // separate a permissions gap from a wrong instance. The original
+        // CliFailed is still propagated unchanged.
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail(
+                    "yt",
+                    &["project", "vcs", "list", "VS", "--enabled-only", "--json"],
+                    1,
+                    "project 'VS' not found",
+                )
+                .ok("yt", &["user", "me"], "minted-bot @ https://yt.example.com")
+                .ok(
+                    "yt",
+                    &["project", "list", "--json"],
+                    r#"[{"shortName":"CLAUDE","archived":false},{"shortName":"FJ","archived":false}]"#,
+                ),
+        );
+        let b = CliBackend::new(runner.clone());
+        match b.resolve_vcs("VS").unwrap_err() {
+            Error::CliFailed { binary, stderr, .. } => {
+                assert_eq!(binary, "yt");
+                assert!(stderr.contains("not found"), "{stderr}");
+            }
+            other => panic!("expected CliFailed, got {other:?}"),
+        }
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c == "yt user me"),
+            "identity probe must run `yt user me`: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "yt project list --json"),
+            "identity probe must list visible projects: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_vcs_success_skips_identity_diagnostics() {
+        // The identity probe is a failure-only diagnostic: a successful probe
+        // must not spend two extra `yt` calls.
+        let json = r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#;
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
+            json,
+        ));
+        let b = CliBackend::new(runner.clone());
+        b.resolve_vcs("MK").unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c == "yt user me"),
+            "no identity probe on success: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c == "yt project list --json"),
+            "no identity probe on success: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn identity_probe_reuses_injected_yt_env() {
+        // CLAUDE-148: the diagnostic sub-probes must carry the SAME injected env
+        // as the failing call, so the logged identity belongs to the daemon's
+        // minted token, not host auth.
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail(
+                    "yt",
+                    &["project", "vcs", "list", "VS", "--enabled-only", "--json"],
+                    1,
+                    "project 'VS' not found",
+                )
+                .ok("yt", &["user", "me"], "bot")
+                .ok("yt", &["project", "list", "--json"], "[]"),
+        );
+        let b = CliBackend::new(runner.clone()).with_yt_env(vec![(
+            "YOUTRACK_CLI_CONFIG".to_string(),
+            "/tmp/creds/yt-config.yml".to_string(),
+        )]);
+        let _ = b.resolve_vcs("VS").unwrap_err();
+        let envs = runner.envs.lock().unwrap();
+        // Every recorded yt invocation (probe + both sub-probes) saw the config.
+        let yt_calls: Vec<_> = envs.iter().filter(|(bin, _)| bin == "yt").collect();
+        assert_eq!(yt_calls.len(), 3, "{yt_calls:?}");
+        for (_, env) in yt_calls {
+            assert!(
+                env.iter()
+                    .any(|(k, v)| k == "YOUTRACK_CLI_CONFIG" && v == "/tmp/creds/yt-config.yml"),
+                "sub-probe lost the injected env: {env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn yt_base_url_reads_url_never_token() {
+        // CLAUDE-148: base URL is extracted from the config's `url:` line only;
+        // the `token:` line is never read into the returned value, so the
+        // failure-path log can carry the base URL without exposing the secret.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("yt-config.yml");
+        std::fs::write(
+            &cfg,
+            "url: https://yt.example.com\ntoken: perm:SUPER-SECRET\n",
+        )
+        .unwrap();
+        let b = CliBackend::new(Arc::new(StubRunner::new())).with_yt_env(vec![(
+            "YOUTRACK_CLI_CONFIG".to_string(),
+            cfg.to_string_lossy().into_owned(),
+        )]);
+        assert_eq!(b.yt_base_url().as_deref(), Some("https://yt.example.com"));
+        assert_eq!(b.yt_config_path(), Some(cfg.to_string_lossy().as_ref()));
+        // Host-auth fallback (no injected config) yields no base URL.
+        let host_auth = CliBackend::new(Arc::new(StubRunner::new()));
+        assert_eq!(host_auth.yt_base_url(), None);
+        assert_eq!(host_auth.yt_config_path(), None);
     }
 
     #[test]
