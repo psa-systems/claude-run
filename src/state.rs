@@ -237,6 +237,108 @@ pub async fn run_job_keys(pool: &SqlitePool, run_id: i64) -> Result<Vec<String>>
     }
 }
 
+/// CLAUDE-147: an input/poll-phase diagnostic emitted by `gather()` before any
+/// run row exists (e.g. a VCS probe failure, or a "no VCS integration" drop).
+/// Collected during gather and persisted to `run_events`, then surfaced in the
+/// web UI so the skipped issues and their reason are visible without reading the
+/// daemon journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputEvent {
+    /// `warn` / `error` / `info`. Errors are rendered visually distinct.
+    pub level: String,
+    /// Free-form context, typically the project key whose issues were skipped.
+    pub context: Option<String>,
+    pub message: String,
+}
+
+/// CLAUDE-147: one persisted `run_events` row, as read back for the web UI.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct RunEventRecord {
+    /// The run this event was attached to, or `None` for a poll whose events
+    /// were never backfilled (e.g. a zero-job poll with no run row).
+    pub run_id: Option<i64>,
+    pub ts: String,
+    pub level: String,
+    pub context: Option<String>,
+    pub message: String,
+}
+
+/// CLAUDE-147: persist this poll's input-phase events keyed by `action_name` +
+/// `poll_ts`, with a NULL `run_id` (the run row does not exist yet, since
+/// `gather()` runs before `run_begin`). [`run_events_attach`] backfills the run
+/// id once it is created. Called before `run_begin` so the events survive even
+/// if the run row is never created.
+pub async fn run_events_record(
+    pool: &SqlitePool,
+    action: &str,
+    poll_ts: &str,
+    events: &[InputEvent],
+) -> Result<()> {
+    for e in events {
+        sqlx::query(
+            r#"
+            INSERT INTO run_events (run_id, action_name, ts, level, context, message)
+            VALUES (NULL, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(action)
+        .bind(poll_ts)
+        .bind(&e.level)
+        .bind(&e.context)
+        .bind(&e.message)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// CLAUDE-147: backfill `run_id` onto this poll's still-unattached events once
+/// `run_begin` has created the run row, so the run-detail / action pages can tie
+/// them to the run. Matches on `action_name` + the poll `ts` used at record
+/// time; a zero-job poll that never reaches here keeps its events with a NULL
+/// `run_id`, and they still surface on the action page under that timestamp.
+pub async fn run_events_attach(
+    pool: &SqlitePool,
+    run_id: i64,
+    action: &str,
+    poll_ts: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE run_events SET run_id = ? WHERE action_name = ? AND ts = ? AND run_id IS NULL",
+    )
+    .bind(run_id)
+    .bind(action)
+    .bind(poll_ts)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// CLAUDE-147: the most recent input-phase events for an action, newest first,
+/// for the action-detail "Input errors / warnings" region. Queried by
+/// `action_name` independent of any run row, so a zero-job poll's events (NULL
+/// `run_id`) are returned too. Bounds display with `limit`.
+pub async fn run_events_for_action(
+    pool: &SqlitePool,
+    action: &str,
+    limit: i64,
+) -> Result<Vec<RunEventRecord>> {
+    let rows = sqlx::query_as::<_, RunEventRecord>(
+        r#"
+        SELECT run_id, ts, level, context, message
+        FROM run_events
+        WHERE action_name = ?
+        ORDER BY ts DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(action)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 pub async fn run_finish(
     pool: &SqlitePool,
     run_id: i64,
@@ -638,6 +740,56 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_events_probe_failure_persists_and_web_read_returns_it() {
+        // CLAUDE-147: a VCS probe failure recorded by gather() is persisted via
+        // run_events_record and returned by the web read path
+        // (run_events_for_action), proving the error is no longer log-only.
+        let pool = mem_pool().await;
+        let poll_ts = now_iso();
+        let events = vec![
+            InputEvent {
+                level: "warn".into(),
+                context: Some("VS".into()),
+                message: "VCS probe failed (provider-CLI error); issues skipped this poll: project 'VS' not found".into(),
+            },
+            InputEvent {
+                level: "info".into(),
+                context: Some("ZZ".into()),
+                message: "issues skipped: project has no enabled VCS integration".into(),
+            },
+        ];
+        run_events_record(&pool, "youtrack", &poll_ts, &events)
+            .await
+            .unwrap();
+
+        // The web read path returns both events, newest-first, with a NULL
+        // run_id until backfilled (the zero-job / pre-run_begin state).
+        let read = run_events_for_action(&pool, "youtrack", 50).await.unwrap();
+        assert_eq!(read.len(), 2);
+        let warn = read
+            .iter()
+            .find(|e| e.level == "warn")
+            .expect("probe-failure warn event present");
+        assert_eq!(warn.context.as_deref(), Some("VS"));
+        assert!(warn.message.contains("VCS probe failed"));
+        assert!(warn.run_id.is_none());
+
+        // A different action does not see these events.
+        assert!(run_events_for_action(&pool, "other", 50)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // After run_begin, the poll's events backfill onto the run row.
+        let run = run_begin(&pool, "youtrack", "cli").await.unwrap();
+        run_events_attach(&pool, run, "youtrack", &poll_ts)
+            .await
+            .unwrap();
+        let read = run_events_for_action(&pool, "youtrack", 50).await.unwrap();
+        assert!(read.iter().all(|e| e.run_id == Some(run)));
     }
 
     #[tokio::test]
