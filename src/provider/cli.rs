@@ -28,6 +28,50 @@ fn number_from_pr_url(url: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
+/// CLAUDE-149: extract bare `#<KEY>-N` issue references from `text` (e.g.
+/// `#CLAUDE-149`), returning the keys without the leading `#`, deduped in
+/// first-seen order. A key matches `[A-Z][A-Z0-9]*-[0-9]+` (the bare reference
+/// the bot's commit / PR body carries per the commit convention). Only ASCII
+/// bytes are matched, so the slice boundaries stay on char boundaries.
+fn parse_issue_refs(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'#' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        // KEY: an uppercase letter then uppercase letters / digits.
+        if j < bytes.len() && bytes[j].is_ascii_uppercase() {
+            j += 1;
+            while j < bytes.len() && (bytes[j].is_ascii_uppercase() || bytes[j].is_ascii_digit()) {
+                j += 1;
+            }
+            // `-` then one or more digits.
+            if j < bytes.len() && bytes[j] == b'-' {
+                j += 1;
+                let digits_start = j;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > digits_start {
+                    let key = text[start..j].to_string();
+                    if !out.contains(&key) {
+                        out.push(key);
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Captured result of running an external command.
 #[derive(Debug, Clone)]
 pub struct CmdOutput {
@@ -808,6 +852,46 @@ impl Forge for CliBackend {
         Ok(())
     }
 
+    fn pr_add_labels(
+        &self,
+        host: &str,
+        repo: &str,
+        pr_number: u64,
+        labels: &[String],
+    ) -> Result<()> {
+        // CLAUDE-149: `fj pr edit <repo>#<n> labels --add <label>`. fj's `--add`
+        // takes one label, so add each in its own call; addressing the PR as
+        // `owner/repo#n` resolves the repo with no local checkout.
+        let id = format!("{repo}#{pr_number}");
+        for label in labels {
+            let args = ["--host", host, "pr", "edit", &id, "labels", "--add", label];
+            let out = self
+                .runner
+                .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+            Self::checked(&self.fj, out, &args)?;
+        }
+        Ok(())
+    }
+
+    fn pr_referenced_issues(&self, host: &str, repo: &str, pr_number: u64) -> Result<Vec<String>> {
+        // CLAUDE-149: read the PR body and extract the bare `#<KEY>-N` references
+        // the bot's commit / PR body carries, so the source issue can be flagged
+        // Needs Review. Addressed as `owner/repo#n` (no checkout needed).
+        let id = format!("{repo}#{pr_number}");
+        let args = ["--host", host, "pr", "view", &id, "--json"];
+        let out = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        let stdout = Self::checked(&self.fj, out, &args)?;
+        #[derive(Deserialize)]
+        struct View {
+            #[serde(default)]
+            body: String,
+        }
+        let view: View = Self::parse_json(&self.fj, "fj pr view --json", &stdout)?;
+        Ok(parse_issue_refs(&view.body))
+    }
+
     fn clone_url(&self, host: &str, repo: &str) -> Result<String> {
         // fj exposes no command to emit an authenticated clone URL, so read its
         // own key store (the same store `fj` writes). No token in YAML or env.
@@ -1542,6 +1626,122 @@ mod tests {
                 == "fj --host dev.a8n.run pr comment contoso/claude-run#52 --body-file /tmp/body.md"),
             "{calls:?}"
         );
+    }
+
+    #[test]
+    fn pr_add_labels_edits_each_label_addressed_by_owner_repo_hash() {
+        // CLAUDE-149: `fj pr edit <repo>#<n> labels --add <label>`, one call per
+        // label.
+        let runner = std::sync::Arc::new(
+            StubRunner::new()
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "edit",
+                        "contoso/claude-run#52",
+                        "labels",
+                        "--add",
+                        "needs-review",
+                    ],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "edit",
+                        "contoso/claude-run#52",
+                        "labels",
+                        "--add",
+                        "blocked",
+                    ],
+                    "",
+                ),
+        );
+        let b = CliBackend::new(runner.clone());
+        b.pr_add_labels(
+            "dev.a8n.run",
+            "contoso/claude-run",
+            52,
+            &["needs-review".to_string(), "blocked".to_string()],
+        )
+        .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| {
+                c
+                == "fj --host dev.a8n.run pr edit contoso/claude-run#52 labels --add needs-review"
+            }),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c
+                == "fj --host dev.a8n.run pr edit contoso/claude-run#52 labels --add blocked"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn pr_referenced_issues_extracts_keys_from_the_pr_body() {
+        // CLAUDE-149: the PR body carries the bare `#<KEY>-N` reference; read it
+        // back via `fj pr view --json` and return the issue keys.
+        let view =
+            r#"{"number":52,"body":"Implements the fix.\n\n#CLAUDE-149\n\nCo-Authored-By: x"}"#;
+        let b = backend(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "view",
+                "contoso/claude-run#52",
+                "--json",
+            ],
+            view,
+        ));
+        let keys = b
+            .pr_referenced_issues("dev.a8n.run", "contoso/claude-run", 52)
+            .unwrap();
+        assert_eq!(keys, vec!["CLAUDE-149".to_string()]);
+    }
+
+    #[test]
+    fn pr_referenced_issues_empty_when_body_has_no_ref() {
+        let b = backend(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "view",
+                "contoso/claude-run#52",
+                "--json",
+            ],
+            r#"{"number":52,"body":"no references here"}"#,
+        ));
+        assert!(b
+            .pr_referenced_issues("dev.a8n.run", "contoso/claude-run", 52)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn parse_issue_refs_finds_dedupes_and_ignores_non_refs() {
+        assert_eq!(parse_issue_refs("fixes #CLAUDE-149"), vec!["CLAUDE-149"]);
+        // Multiple refs, deduped in first-seen order.
+        assert_eq!(
+            parse_issue_refs("#DELTA-200\n#YT-1\n#DELTA-200"),
+            vec!["DELTA-200".to_string(), "YT-1".to_string()]
+        );
+        // A bare `#` or a `#word` with no `-N` is not a ref.
+        assert!(parse_issue_refs("# heading\n#notakey\n#lower-1").is_empty());
+        // A key needs at least one trailing digit.
+        assert!(parse_issue_refs("#CLAUDE-").is_empty());
     }
 
     #[test]

@@ -270,10 +270,19 @@ is globally unique, so a duplicate delivered to two sources is still caught). Th
 verbatim, so use lowercase `[a-z0-9_-]`; a name needing URL escaping is warned about at load.
 
 Triage sorts each verified failure into one of three buckets: a failing PR check that a code change fixes (`code_fix`)
-mints an issue and sets `AI Agent = Queued` so `forgejo-ci-fix` opens the fix PR; a failure no PR fixes (`human_action`,
+mints an issue and sets `AI Agent = Queued` so the runner opens the fix PR; a failure no PR fixes (`human_action`,
 e.g. a main-branch / tag / release / missing-secret failure) mints a human-assigned issue with no PR; a transient /
 infra / flaky failure (`transient`) mints nothing. A failing run triggered by the fix bot's own login mints nothing (
 loop safety), and the reused per-key + daily caps throttle a storm of failures.
+
+**CLAUDE-149: a human's failing PR is left to its author; the bot only fixes its own.** When the failing run already has
+an open PR, the webhook `code_fix` (queue-for-fix) route is suppressed: no issue is minted and no fix is queued, because
+the author owns the red CI on their own branch. A `human_action` failure on an open PR still mints (it needs a human, not
+the bot). The `forgejo-ci-fix` action is retargeted to match: it now auto-fixes ONLY the bot's own failing PRs (those
+authored by `bot_author`, the PRs the bot opened working a queued issue) and skips everyone else's. On its own PR the bot
+keeps pushing corrective commits until CI passes; after `max_pr_attempts` distinct fix pushes it stops and flags the PR
+Needs Review (a PR comment, the `needs-review` label, and best-effort sets the source issue's State and assignee). The
+`enabled` toggle defaults to `true` and is a master kill switch.
 
 A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then
 the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the
@@ -309,9 +318,11 @@ queued issue, `AI Agent=Queued`, no human assignee) but applies regardless of `h
 protected/main branch, so it never reaches the classifier prompt that would label it `human_action`. The minted issue's
 summary (`Auto-fix: cargo fmt on <repo> (run #N, <sha>)`) and description name the concrete problem, the fix command,
 and the delivery instruction: commit on a fresh `chore/<kind>-<short-sha>` branch and open a PR against `main` via the
-configured PR strategy (CLAUDE-103), never a direct push to main. The existing `has_open_pr == true` flow is untouched:
-forgejo-ci-fix (CLAUDE-29) still pushes a corrective commit onto the PR branch. Dedupe markers are unchanged, so repeats
-of the same `(repo, workflow_id, commit_sha)` still group.
+configured PR strategy (CLAUDE-103), never a direct push to main. The `has_open_pr == true` case is handled by CLAUDE-149
+instead: this auto-fix path applies only when there is no open PR. When a PR is already open the webhook `code_fix` route
+is suppressed (a human's PR is left to its author), and `forgejo-ci-fix` separately fixes the bot's own failing PRs,
+iterating until green or flagging Needs Review. Dedupe markers are unchanged, so repeats of the same
+`(repo, workflow_id, commit_sha)` still group.
 
 ### Migration from the single-source listener (CLAUDE-87)
 
