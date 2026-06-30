@@ -428,6 +428,10 @@ pub enum ProcessedJob {
     Filtered { key: String },
     /// Attempt cap reached for this job; job was skipped without invocation.
     CapHit { key: String },
+    /// CLAUDE-149: the per-PR fix-push ceiling was reached, so the job was
+    /// flagged Needs Review (PR comment + label, source issue updated) instead of
+    /// being auto-fixed again.
+    NeedsReview { key: String },
     /// Transient claude error - job will be retried next firing.
     Transient { key: String },
     /// Job reached at least pre steps; outcome record is meaningful.

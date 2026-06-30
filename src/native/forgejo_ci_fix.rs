@@ -90,13 +90,20 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
     // Typed config. Validation guarantees a matching `native` block for
     // `kind: forgejo-ci-fix`, so anything else is a misrouted action.
     let cfg = match &action.native {
-        Some(NativeConfig::ForgejoCiFix(cfg)) => cfg.clone(),
+        Some(NativeConfig::ForgejoCiFix(cfg)) => (**cfg).clone(),
         _ => {
             return Err(Error::NativeUnimplemented {
                 kind: action.kind.as_str().to_string(),
             })
         }
     };
+
+    // CLAUDE-149: master kill switch (default on). The handler only auto-fixes
+    // the bot's own failing PRs; set `enabled: false` to turn it off entirely.
+    if !cfg.enabled {
+        info!(action = %action.name, "forgejo-ci-fix is disabled; skipping run");
+        return Ok(());
+    }
 
     let defaults = RunnerDefaults::default();
     let limits = job::effective_limits(&defaults, loaded);
@@ -249,19 +256,44 @@ async fn process_job(
     let started = Instant::now();
     let action = &ctx.action.action;
     let key = &job.key;
-    let attempts = state::attempts_get(ctx.pool, &action.name, key).await?;
 
+    // ---- filter: only the bot's OWN failing PRs are auto-fixed (CLAUDE-149) ----
+    // A human's failing PR is left to its author; the bot never pushes a
+    // corrective commit onto someone else's branch. Only PRs authored by
+    // `bot_author` (the PRs the bot opened working a queued issue) are worked.
+    if !is_own_pr(&job.author, &cfg.bot_author) {
+        info!(action = %action.name, key = %key, pr = job.pr_number, author = %job.author, "skipping PR not authored by the bot");
+        return Ok(ProcessedJob::Filtered { key: key.clone() });
+    }
+
+    // ---- per-PR ceiling (CLAUDE-149) ----
+    // The bot keeps pushing corrective commits to its own PR until CI passes.
+    // The per-commit cap below resets on every new head SHA, so a separate
+    // PR-scoped counter bounds the iteration: after `max_pr_attempts` distinct
+    // fix pushes on this PR, stop auto-fixing and flag it Needs Review.
+    let pr_key = format!("pr:{}#{}", job.repo, job.pr_number);
+    let pr_attempts = state::attempts_get(ctx.pool, &action.name, &pr_key).await?;
+    if pr_ceiling_reached(pr_attempts, cfg.max_pr_attempts) {
+        // Flag Needs Review exactly once per PR. The comment / label bump the
+        // PR's updated_at, so it stays in the gather window and is re-picked every
+        // tick; a separate marker stops the re-flag from re-commenting each time.
+        let review_key = format!("review:{}#{}", job.repo, job.pr_number);
+        if state::attempts_get(ctx.pool, &action.name, &review_key).await? == 0 {
+            info!(action = %action.name, key = %key, pr = job.pr_number, pr_attempts, "per-PR fix ceiling reached; flagging Needs Review");
+            flag_needs_review(ctx, backend, cfg, job).await;
+            state::attempts_increment(ctx.pool, &action.name, &review_key).await?;
+        } else {
+            info!(action = %action.name, key = %key, pr = job.pr_number, "per-PR ceiling already flagged Needs Review; not re-flagging");
+        }
+        return Ok(ProcessedJob::NeedsReview { key: key.clone() });
+    }
+
+    let attempts = state::attempts_get(ctx.pool, &action.name, key).await?;
     // CI-fix jobs always carry a stable key (the head SHA), so the per-commit
     // attempt cap always applies.
     if attempts >= limits.max_attempts_per_key {
         info!(action = %action.name, key = %key, attempts, "skipping job, attempt cap reached");
         return Ok(ProcessedJob::CapHit { key: key.clone() });
-    }
-
-    // ---- filter: skip the bot's own PRs (anti-feedback-loop) ----
-    if job.author == cfg.bot_author {
-        info!(action = %action.name, key = %key, pr = job.pr_number, author = %job.author, "skipping bot-authored PR");
-        return Ok(ProcessedJob::Filtered { key: key.clone() });
     }
 
     info!(action = %action.name, key = %key, pr = job.pr_number, attempt = attempts + 1, "processing job");
@@ -351,6 +383,17 @@ async fn process_job(
             true
         }
     };
+
+    // CLAUDE-149: a successful fix push counts toward the per-PR ceiling. Only an
+    // actual push (within the diff caps, not failed) advances it, so no-change /
+    // too-big / claude-failed rounds do not burn the budget.
+    let pushed = matches!(
+        &finalize_res,
+        Ok(f) if matches!(f.decision, Decision::Push { .. }) && !f.push_failed
+    );
+    if pushed {
+        state::attempts_increment(ctx.pool, &action.name, &pr_key).await?;
+    }
 
     // ---- skip-attempt marker (parked) or cancel ----
     let skip_marker = workdir_path.join(SKIP_ATTEMPT_MARKER);
@@ -808,6 +851,101 @@ async fn record_outcome(
     Ok(())
 }
 
+/// CLAUDE-149: a PR is auto-fixed only when the bot authored it; any other
+/// author's PR is left to its author.
+fn is_own_pr(author: &str, bot_author: &str) -> bool {
+    author == bot_author
+}
+
+/// CLAUDE-149: true once the PR has already had `max_pr_attempts` distinct fix
+/// pushes, at which point it is flagged Needs Review instead of fixed again.
+fn pr_ceiling_reached(pr_attempts: u32, max_pr_attempts: u64) -> bool {
+    u64::from(pr_attempts) >= max_pr_attempts
+}
+
+/// CLAUDE-149: flag a PR Needs Review once the per-PR fix ceiling is reached.
+/// Three best-effort steps (a failure in one is logged and does not block the
+/// others): post a PR comment, add the `needs_review_label` Forgejo label, and
+/// set the source YouTrack issue (parsed from the PR body) to
+/// `needs_review_state`, optionally assigning `review_assignee`. The source-issue
+/// step is skipped silently when the PR body references no issue.
+async fn flag_needs_review(
+    ctx: &NativeContext<'_>,
+    backend: &dyn Backend,
+    cfg: &ForgejoCiFixConfig,
+    job: &ForgejoCiFixJob,
+) {
+    let action = &ctx.action.action;
+
+    // 1. PR comment (best-effort), body written to a short-lived workdir.
+    let wb_base = workdir::resolve_workdir_base(action.workdir_base.as_deref(), ctx.paths);
+    let workdir_path = workdir::job_workdir(&wb_base, &action.name, &format!("review-{}", job.key));
+    match std::fs::create_dir_all(&workdir_path) {
+        Ok(()) => {
+            let body = needs_review_comment(cfg.max_pr_attempts, job);
+            let body_file = workdir_path.join(PR_COMMENT_FILE);
+            match std::fs::write(&body_file, body) {
+                Ok(()) => {
+                    if let Err(e) =
+                        backend.pr_comment(&job.host, &job.repo, job.pr_number, &body_file)
+                    {
+                        warn!(pr = job.pr_number, error = %e, "needs-review: PR comment failed (continuing)");
+                    }
+                }
+                Err(e) => {
+                    warn!(pr = job.pr_number, error = %e, "needs-review: writing comment body failed (skipping comment)")
+                }
+            }
+            cleanup_workdir(&workdir_path);
+        }
+        Err(e) => {
+            warn!(pr = job.pr_number, error = %e, "needs-review: workdir create failed (skipping comment)")
+        }
+    }
+
+    // 2. PR label (best-effort).
+    if let Err(e) = backend.pr_add_labels(
+        &job.host,
+        &job.repo,
+        job.pr_number,
+        std::slice::from_ref(&cfg.needs_review_label),
+    ) {
+        warn!(pr = job.pr_number, label = %cfg.needs_review_label, error = %e, "needs-review: adding label failed (continuing)");
+    }
+
+    // 3. Source issue (best-effort): set State and optionally assign a human.
+    match backend.pr_referenced_issues(&job.host, &job.repo, job.pr_number) {
+        Ok(keys) => {
+            for issue in keys {
+                if let Err(e) = backend.set_state(&issue, &cfg.needs_review_state) {
+                    warn!(issue = %issue, error = %e, "needs-review: set_state failed (continuing)");
+                }
+                if let Some(assignee) = &cfg.review_assignee {
+                    if let Err(e) = backend.set_assignee(&issue, assignee) {
+                        warn!(issue = %issue, error = %e, "needs-review: set_assignee failed (continuing)");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!(pr = job.pr_number, error = %e, "needs-review: reading referenced issues failed (continuing)")
+        }
+    }
+}
+
+/// The PR comment posted when the per-PR fix ceiling is reached (CLAUDE-149).
+fn needs_review_comment(max_pr_attempts: u64, job: &ForgejoCiFixJob) -> String {
+    [
+        format!(
+            "**Auto-fix flagged for review.** Claude pushed corrective commits to this PR {max_pr_attempts} time(s) without bringing CI green, so it has stopped auto-fixing and flagged the PR for human review."
+        ),
+        String::new(),
+        format!("PR #{} ({})", job.pr_number, job.branch),
+        "A human should take it from here.".to_string(),
+    ]
+    .join("\n")
+}
+
 fn cleanup_workdir(workdir: &Path) {
     if workdir.exists() {
         if let Err(e) = std::fs::remove_dir_all(workdir) {
@@ -858,6 +996,44 @@ mod tests {
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    // ---- CLAUDE-149: bot-own-PR targeting, ceiling, Needs Review ----------
+
+    #[test]
+    fn config_defaults_to_enabled_with_pr_ceiling() {
+        // The handler is on by default and only auto-fixes the bot's own PRs.
+        let d = ForgejoCiFixConfig::default();
+        assert!(d.enabled);
+        assert_eq!(d.max_pr_attempts, 3);
+        assert_eq!(d.needs_review_label, "needs-review");
+        assert_eq!(d.needs_review_state, "Needs Review");
+        assert!(d.review_assignee.is_none());
+    }
+
+    #[test]
+    fn only_the_bots_own_prs_are_fixed() {
+        // CLAUDE-149: the filter is inverted vs the old anti-feedback-loop skip.
+        // The bot's own PR is worked; a human's PR is left to its author.
+        assert!(is_own_pr("claude-run", "claude-run"));
+        assert!(!is_own_pr("alice", "claude-run"));
+    }
+
+    #[test]
+    fn pr_ceiling_triggers_at_max_pr_attempts() {
+        // Below the ceiling keep fixing; at or above it, flag Needs Review.
+        assert!(!pr_ceiling_reached(0, 3));
+        assert!(!pr_ceiling_reached(2, 3));
+        assert!(pr_ceiling_reached(3, 3));
+        assert!(pr_ceiling_reached(4, 3));
+    }
+
+    #[test]
+    fn needs_review_comment_names_attempts_and_pr() {
+        let body = needs_review_comment(3, &job());
+        assert!(body.contains("3 time(s)"), "{body}");
+        assert!(body.contains("PR #52"), "{body}");
+        assert!(body.to_lowercase().contains("human review"), "{body}");
     }
 
     // ---- decision gate (AC: decision-gate coverage) -----------------------
