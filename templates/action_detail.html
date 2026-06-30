@@ -69,6 +69,33 @@
   {% endif %}
 </div>
 
+{% if !events.is_empty() %}
+<h2>Input errors / warnings</h2>
+<div class="card">
+  <p class="dim" style="margin-top: 0;">Poll/input-phase diagnostics (e.g. VCS probe failures). These skip a project's issues before any job is created, so they do not appear in the per-run job outcomes below.</p>
+  <table>
+    <thead><tr><th>When</th><th>Level</th><th>Context</th><th>Message</th><th>Run</th></tr></thead>
+    <tbody>
+      {% for e in events %}
+        <tr>
+          <td class="mono dim">{{ e.ts }}</td>
+          <td>
+            {% if e.level == "error" || e.level == "warn" %}
+              <span class="badge bad">{{ e.level }}</span>
+            {% else %}
+              <span class="badge neutral">{{ e.level }}</span>
+            {% endif %}
+          </td>
+          <td class="mono">{{ e.context.as_deref().unwrap_or("-") }}</td>
+          <td{% if e.level == "error" || e.level == "warn" %} style="color: var(--bad);"{% endif %}>{{ e.message }}</td>
+          <td class="mono">{% if let Some(rid) = e.run_id %}<a href="/runs/{{ rid }}">#{{ rid }}</a>{% else %}<span class="dim">-</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
 <h2>Recent runs
   <label style="float: right; font-size: 11px; text-transform: none; letter-spacing: 0; font-weight: normal; cursor: pointer;">
     <input type="checkbox"
