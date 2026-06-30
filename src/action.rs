@@ -118,8 +118,12 @@ pub enum NativeConfig {
     /// enum's variants size-balanced (`clippy::large_enum_variant`). `Box<T>` is
     /// serde- and `PartialEq`-transparent, and field access auto-derefs.
     Youtrack(Box<YoutrackConfig>),
-    /// Forgejo CI-fix built-in handler config (CLAUDE-29).
-    ForgejoCiFix(ForgejoCiFixConfig),
+    /// Forgejo CI-fix built-in handler config (CLAUDE-29). Boxed (CLAUDE-149):
+    /// the auto-fix / Needs Review fields grew it past the boxed Youtrack
+    /// variant, so the box keeps the enum size-balanced
+    /// (`clippy::large_enum_variant`). `Box<T>` is serde- and
+    /// `PartialEq`-transparent, and field access auto-derefs.
+    ForgejoCiFix(Box<ForgejoCiFixConfig>),
 }
 
 impl NativeConfig {
@@ -426,10 +430,10 @@ pub fn default_github_mcp_endpoint() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ForgejoCiFixConfig {
-    /// CLAUDE-149: master enable toggle. Defaults to `false`, so the handler is
-    /// a no-op unless an operator explicitly opts in. A failing open PR is the
-    /// author's to fix; auto-pushing a corrective commit onto the PR branch is
-    /// off by default.
+    /// CLAUDE-149: master enable toggle. Defaults to `true`. The handler only
+    /// auto-fixes the bot's OWN failing PRs (those authored by `bot_author`); a
+    /// human's failing PR is left to its author. Set `false` to turn the handler
+    /// off entirely.
     pub enabled: bool,
     /// Forgejo host, e.g. `dev.a8n.run` (bare host, no scheme), passed to
     /// `fj --host`.
@@ -443,14 +447,31 @@ pub struct ForgejoCiFixConfig {
     pub max_files: u64,
     /// Decision gate: a diff changing more than this many lines is `too_big`.
     pub max_lines: u64,
-    /// PR author login skipped to avoid a fix-on-fix feedback loop; also the
-    /// git author name used for the fix commit.
+    /// CLAUDE-149: the bot's own login. ONLY PRs authored by this login are
+    /// auto-fixed (the bot iterates on its own failing PR); every other author's
+    /// PR is left alone. Also the git author name used for the fix commit.
     pub bot_author: String,
     /// Git author email used for the fix commit.
     pub bot_email: String,
     /// Marker appended to the fix commit message so the bot's own push does not
     /// re-trigger this action.
     pub skip_marker: String,
+    /// CLAUDE-149: per-PR fix-push ceiling. The bot keeps pushing corrective
+    /// commits to its own PR until CI passes; after this many distinct fix pushes
+    /// on one PR it stops and flags the PR Needs Review instead. Separate from
+    /// the per-commit attempt cap (which resets on every new head SHA). Default 3.
+    pub max_pr_attempts: u64,
+    /// CLAUDE-149: Forgejo label added to a PR when the per-PR ceiling is reached
+    /// (Needs Review). Default `needs-review`.
+    pub needs_review_label: String,
+    /// CLAUDE-149: YouTrack State set on the PR's source issue when the per-PR
+    /// ceiling is reached, best-effort (only when the PR body references an
+    /// issue). Default `Needs Review`.
+    pub needs_review_state: String,
+    /// CLAUDE-149: YouTrack login assigned to the PR's source issue when the
+    /// per-PR ceiling is reached, best-effort. `None` (default) skips the
+    /// assignee step.
+    pub review_assignee: Option<String>,
     /// Forgejo API token (inline plaintext for now; CLAUDE-26 encrypts it). The
     /// CLI backend ignores it and uses `fj`'s credential store today.
     pub token: Option<String>,
@@ -459,7 +480,7 @@ pub struct ForgejoCiFixConfig {
 impl Default for ForgejoCiFixConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             host: "dev.a8n.run".to_string(),
             repos: Vec::new(),
             window_minutes: 45,
@@ -468,6 +489,10 @@ impl Default for ForgejoCiFixConfig {
             bot_author: "claude-run".to_string(),
             bot_email: "claude-run@a8n.run".to_string(),
             skip_marker: "[skip claude]".to_string(),
+            max_pr_attempts: 3,
+            needs_review_label: "needs-review".to_string(),
+            needs_review_state: "Needs Review".to_string(),
+            review_assignee: None,
             token: None,
         }
     }
