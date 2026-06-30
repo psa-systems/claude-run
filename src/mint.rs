@@ -68,6 +68,10 @@ pub struct MintRequest<'a> {
     /// workflow group onto one open issue (CLAUDE-100) because there is no log
     /// to tell two failures apart; public repos keep per-run minting.
     pub private: bool,
+    /// CLAUDE-149: whether the failing run has an open PR for its branch. When
+    /// set, the auto-fix (queue-for-fix) route is suppressed so the PR author
+    /// owns the fix; a human-action failure still mints.
+    pub has_open_pr: bool,
 }
 
 /// The DEV-335 caps, reused (not re-derived) from the runner's existing
@@ -101,6 +105,11 @@ pub enum MintOutcome {
     SkippedTransient,
     /// Loop safety: the failing run was triggered by a bot login (a fix-PR run).
     SkippedBotLoop,
+    /// CLAUDE-149: the failing run has an open PR, so the auto-fix (queued)
+    /// route is suppressed: a failing open PR is the author's to fix, not the
+    /// bot's. Only the queue-for-fix buckets are suppressed; a human-action
+    /// failure on an open PR still mints.
+    SkippedOpenPr,
     /// The per-key attempt cap was already reached.
     SkippedAttemptCap,
     /// The daily run cap was already reached.
@@ -381,6 +390,13 @@ pub fn mint(
     let Some(route) = route(req.triage.bucket) else {
         return Ok(MintOutcome::SkippedTransient);
     };
+
+    // CLAUDE-149: a failing open PR is the author's to fix. Suppress the auto-fix
+    // (queue-for-fix) route for it so no corrective PR is queued; a human-action
+    // failure on an open PR still mints (it needs a human, not the bot).
+    if req.has_open_pr && route.queue_for_fix {
+        return Ok(MintOutcome::SkippedOpenPr);
+    }
 
     // Loop safety: a fix-PR run the bot triggered must not mint a new task.
     if is_bot_loop(req.trigger_user, cfg) {
@@ -864,6 +880,7 @@ mod tests {
             triage: t,
             log_path: None,
             private: false,
+            has_open_pr: false,
         }
     }
 
@@ -1119,6 +1136,64 @@ mod tests {
         );
         // Bucket 2 never queues for the fix bot.
         assert!(!calls.iter().any(|c| c.contains("AI Agent")), "{calls:?}");
+    }
+
+    // ---- CLAUDE-149: a failing open PR is left to its author --------------
+
+    #[test]
+    fn open_pr_suppresses_the_auto_fix_mint() {
+        // A code-fix failure on a run WITH an open PR is the author's to fix:
+        // the queue-for-fix route is suppressed and nothing is minted.
+        let t = triage(TriageBucket::CodeFix);
+        let tracker = StubTracker::new();
+        let mut r = req("fabrikam/forgejo-cli", &t, "alice");
+        r.has_open_pr = true;
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert_eq!(out, MintOutcome::SkippedOpenPr);
+        assert!(
+            tracker.calls().is_empty(),
+            "no yt calls for an open-PR failure: {:?}",
+            tracker.calls()
+        );
+    }
+
+    #[test]
+    fn open_pr_does_not_suppress_a_human_action_mint() {
+        // Only the queue-for-fix (auto-fix) route is suppressed for an open PR.
+        // A human-action failure still needs a human, so it mints and assigns.
+        let t = triage(TriageBucket::HumanAction);
+        let tracker = StubTracker::new();
+        let mut r = req("contoso/claude-run", &t, "alice");
+        r.has_open_pr = true;
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert!(
+            matches!(out, MintOutcome::Created { .. }),
+            "human-action on an open PR still mints: {out:?}"
+        );
+        assert!(
+            tracker.calls().iter().any(|c| c.contains("assignee=alice")),
+            "{:?}",
+            tracker.calls()
+        );
+    }
+
+    #[test]
+    fn no_open_pr_keeps_the_auto_fix_mint() {
+        // The suppression is gated on the open PR: with no open PR (the canonical
+        // push-to-main / branch case) a code-fix still queues as before.
+        let t = triage(TriageBucket::CodeFix);
+        let tracker = StubTracker::new();
+        let r = req("fabrikam/forgejo-cli", &t, "alice"); // has_open_pr: false
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
+        assert!(
+            tracker
+                .calls()
+                .iter()
+                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+            "{:?}",
+            tracker.calls()
+        );
     }
 
     // ---- AC 1: the redacted log is attached when present -------------------

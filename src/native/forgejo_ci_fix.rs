@@ -98,6 +98,14 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
         }
     };
 
+    // CLAUDE-149: disabled by default. A failing open PR is the author's to fix;
+    // do not gather or auto-push a corrective commit onto the PR branch unless an
+    // operator explicitly opts in. Short-circuit before any caps/gather work.
+    if !cfg.enabled {
+        info!(action = %action.name, "forgejo-ci-fix is disabled (CLAUDE-149); skipping run");
+        return Ok(());
+    }
+
     let defaults = RunnerDefaults::default();
     let limits = job::effective_limits(&defaults, loaded);
 
@@ -858,6 +866,15 @@ mod tests {
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    // ---- CLAUDE-149: disabled by default ----------------------------------
+
+    #[test]
+    fn config_defaults_to_disabled() {
+        // The handler is a no-op unless an operator explicitly opts in: a failing
+        // open PR is left to its author rather than auto-fixed by a bot push.
+        assert!(!ForgejoCiFixConfig::default().enabled);
     }
 
     // ---- decision gate (AC: decision-gate coverage) -----------------------
