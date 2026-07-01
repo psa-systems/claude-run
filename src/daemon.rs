@@ -1074,7 +1074,17 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
                         .ok()
                         .map(|d| d.with_timezone(&Utc))
                 });
-        if scheduler::next_fire_due(&parsed, last_started, now).is_some() {
+        // CLAUDE-156: consult the in-flight set before treating the action as
+        // due. Without this, the window between `dispatch` and `run_begin`
+        // writing the fresh `runs.started_at` row (after the gather phase on the
+        // native path) leaves `action_last_run_started` reporting a stale/None
+        // timestamp, so `next_fire_due` returns "due" on every 5s tick and the
+        // log fills with a "scheduler firing" storm, each call short-circuited
+        // by the same in-flight guard inside `dispatch`. Skipping here suppresses
+        // both the redundant log and the wasted dispatch call. The lock is taken
+        // and released before `dispatch`, so there is no lock-ordering hazard.
+        let in_flight = dispatch.in_flight.lock().await.contains(&r.name);
+        if scheduler::should_fire(&parsed, last_started, now, in_flight) {
             info!(action = %r.name, "scheduler firing");
             dispatch.clone().dispatch(r.name.clone(), "scheduler").await;
         }
