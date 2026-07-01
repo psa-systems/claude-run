@@ -420,10 +420,10 @@ impl Default for WorkdirGcConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PreferencesConfig {
-    /// BCP-47 locale (e.g. `en-US`). ADVISORY / RESERVED for now: it is stored
-    /// and round-trips through the API but does NOT localize month / weekday
-    /// names in this issue (that needs chrono's `unstable-locales` feature).
-    /// Wiring it live is tracked in CLAUDE-155.
+    /// BCP-47 locale (e.g. `en-US`). CLAUDE-155: mapped to a [`chrono::Locale`]
+    /// (hyphen normalized to underscore) and passed to `format_localized`, so
+    /// name-emitting specifiers (`%A`, `%a`, `%B`, `%b`, `%p`) render in this
+    /// locale. Validated on save; an unknown locale is rejected.
     pub locale: String,
     /// IANA timezone name (e.g. `America/New_York`), parsed as a
     /// [`chrono_tz::Tz`]. Displayed timestamps are converted into it. Default

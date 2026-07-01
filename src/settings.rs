@@ -154,11 +154,21 @@ pub fn current_preferences() -> PreferencesConfig {
         .clone()
 }
 
-/// Validate a [`PreferencesConfig`] before it is persisted: the `timezone` must
-/// be a known IANA name and the `datetime_format` must be a parseable strftime
-/// pattern. Returns a human message on the first failure, `Ok(())` otherwise.
-/// `locale` is advisory and not validated (see CLAUDE-155).
+/// CLAUDE-155: map the preferences BCP-47 `locale` string (e.g. `en-US`) to a
+/// [`chrono::Locale`]. chrono's locale identifiers use an underscore separator
+/// (`en_US`), so the hyphen is normalized before parsing. Returns `Err` with the
+/// offending value for an unknown locale so callers can reject it on save.
+pub fn parse_locale(locale: &str) -> std::result::Result<chrono::Locale, String> {
+    chrono::Locale::try_from(locale.replace('-', "_").as_str())
+        .map_err(|_| format!("unknown locale `{locale}`"))
+}
+
+/// Validate a [`PreferencesConfig`] before it is persisted: the `locale` must map
+/// to a known [`chrono::Locale`], the `timezone` must be a known IANA name, and
+/// the `datetime_format` must be a parseable strftime pattern. Returns a human
+/// message on the first failure, `Ok(())` otherwise.
 pub fn validate_preferences(prefs: &PreferencesConfig) -> std::result::Result<(), String> {
+    parse_locale(&prefs.locale)?;
     prefs
         .timezone
         .parse::<chrono_tz::Tz>()
@@ -182,13 +192,17 @@ fn strftime_has_error(fmt: &str) -> bool {
 
 /// Render one stored RFC3339 UTC timestamp string for display: parse it, convert
 /// to the preferences' `timezone`, and format with the `datetime_format`
-/// strftime pattern. On ANY failure (unparseable input, bad timezone, bad
-/// format) it returns the input unchanged, so sentinels like `running` / `never`
-/// / empty pass through and a malformed value is never blanked or panicked on.
+/// strftime pattern in the preferences' `locale`. Name-emitting specifiers
+/// (`%A`, `%a`, `%B`, `%b`, `%p`) render in that locale via chrono's
+/// `format_localized` (CLAUDE-155). On ANY failure (unparseable input, bad
+/// timezone, bad locale, bad format) it returns the input unchanged, so
+/// sentinels like `running` / `never` / empty pass through and a malformed value
+/// is never blanked or panicked on.
 pub fn format_datetime(rfc3339: &str, prefs: &PreferencesConfig) -> String {
-    let (Ok(tz), Ok(dt)) = (
+    let (Ok(tz), Ok(dt), Ok(locale)) = (
         prefs.timezone.parse::<chrono_tz::Tz>(),
         chrono::DateTime::parse_from_rfc3339(rfc3339),
+        parse_locale(&prefs.locale),
     ) else {
         return rfc3339.to_string();
     };
@@ -196,7 +210,7 @@ pub fn format_datetime(rfc3339: &str, prefs: &PreferencesConfig) -> String {
         return rfc3339.to_string();
     }
     dt.with_timezone(&tz)
-        .format(&prefs.datetime_format)
+        .format_localized(&prefs.datetime_format, locale)
         .to_string()
 }
 
@@ -834,6 +848,55 @@ mod tests {
     }
 
     #[test]
+    fn format_datetime_localizes_names() {
+        // CLAUDE-155: name-emitting specifiers render in the configured locale.
+        // 2026-07-01 is a Wednesday in July at 13:05 (PM).
+        let fr = PreferencesConfig {
+            locale: "fr-FR".to_string(),
+            timezone: "UTC".to_string(),
+            datetime_format: "%A %d %B %Y %p".to_string(),
+        };
+        // French: mercredi (weekday), juillet (month). chrono renders French %p
+        // empty, so the trailing separator collapses; assert the localized words.
+        let out = format_datetime("2026-07-01T13:05:09Z", &fr);
+        assert!(out.contains("mercredi"), "weekday not localized: {out}");
+        assert!(out.contains("juillet"), "month not localized: {out}");
+
+        // Same instant in English keeps the English names, proving locale drives it.
+        let en = PreferencesConfig {
+            locale: "en-US".to_string(),
+            ..fr.clone()
+        };
+        assert_eq!(
+            format_datetime("2026-07-01T13:05:09Z", &en),
+            "Wednesday 01 July 2026 PM"
+        );
+    }
+
+    #[test]
+    fn parse_locale_maps_and_rejects() {
+        // BCP-47 hyphen form normalizes to chrono's underscore identifier.
+        assert!(parse_locale("fr-FR").is_ok());
+        assert!(parse_locale("en-US").is_ok());
+        // Unknown locale is rejected with the offending value surfaced.
+        let err = parse_locale("zz-ZZ").expect_err("unknown locale must reject");
+        assert!(err.contains("zz-ZZ"), "{err}");
+    }
+
+    #[test]
+    fn format_datetime_falls_back_on_bad_locale() {
+        // A stored-but-invalid locale must not panic or blank; input passes through.
+        let bad_locale = PreferencesConfig {
+            locale: "zz-ZZ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_datetime("2026-07-01T00:00:00Z", &bad_locale),
+            "2026-07-01T00:00:00Z"
+        );
+    }
+
+    #[test]
     fn format_datetime_falls_back_on_malformed_input() {
         let prefs = PreferencesConfig::default();
         // Sentinels and non-timestamps pass through unchanged, never blanked.
@@ -907,6 +970,19 @@ mod tests {
             .expect_err("bad format must reject");
         match err {
             SaveError::Invalid(m) => assert!(m.contains("datetime_format"), "{m}"),
+            other => panic!("expected Invalid, got {other}"),
+        }
+
+        // CLAUDE-155: an unknown locale is rejected on save with the value named.
+        let err = live
+            .save_section(
+                Section::Preferences,
+                r#"{"locale":"zz-ZZ","timezone":"UTC","datetime_format":"%Y-%m-%d"}"#,
+            )
+            .await
+            .expect_err("bad locale must reject");
+        match err {
+            SaveError::Invalid(m) => assert!(m.contains("locale") && m.contains("zz-ZZ"), "{m}"),
             other => panic!("expected Invalid, got {other}"),
         }
 
