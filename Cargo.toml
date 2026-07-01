@@ -1,6 +1,6 @@
 [package]
 name = "claude-run"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 description = "YAML-driven Claude Code runner. Rust port of scripts/claude-run.nu."
 license = "MIT"
@@ -61,11 +61,11 @@ features = ["macros"]
 
 [dependencies.chrono]
 version = "0.4"
-# CLAUDE-155: `unstable-locales` pulls in `pure-rust-locales` and enables
-# `format_localized`, so `%A`/`%B`/`%p` render in the preferences `locale`.
-features = ["serde", "unstable-locales"]
+features = [
+    "serde",
+    "unstable-locales",
+]
 
-# CLAUDE-154: IANA timezone parsing for the preferences date/time rendering.
 [dependencies.chrono-tz]
 version = "0.10"
 features = ["serde"]
