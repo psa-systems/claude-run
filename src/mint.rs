@@ -1,4 +1,4 @@
-//! Triage-driven YouTrack issue mint (CLAUDE-46, part of the webhook fast-path
+//! Triage-driven YouTrack issue mint (CLAUDE-46, part of the webhook
 //! epic CLAUDE-36).
 //!
 //! Turns a triaged failure ([`crate::triage::Triage`]) plus its
@@ -72,6 +72,11 @@ pub struct MintRequest<'a> {
     /// set, the auto-fix (queue-for-fix) route is suppressed so the PR author
     /// owns the fix; a human-action failure still mints.
     pub has_open_pr: bool,
+    /// CLAUDE-153: the webhook-scoped auto-fix toggle (`[webhook].auto_fix`).
+    /// When `false`, a queue-for-fix route (`code_fix` / `auto_fix`) is
+    /// suppressed so no corrective fixup PR is queued and the failure stays
+    /// reported on the original PR; a human-action failure still mints.
+    pub auto_fix_enabled: bool,
 }
 
 /// The DEV-335 caps, reused (not re-derived) from the runner's existing
@@ -110,6 +115,11 @@ pub enum MintOutcome {
     /// bot's. Only the queue-for-fix buckets are suppressed; a human-action
     /// failure on an open PR still mints.
     SkippedOpenPr,
+    /// CLAUDE-153: the webhook-scoped auto-fix toggle (`[webhook].auto_fix`) is
+    /// off, so a queue-for-fix bucket (`code_fix` / `auto_fix`) mints nothing
+    /// and queues no fixup PR; the failure stays on the original PR. Only the
+    /// queue-for-fix buckets are suppressed; a human-action failure still mints.
+    SkippedAutoFixDisabled,
     /// The per-key attempt cap was already reached.
     SkippedAttemptCap,
     /// The daily run cap was already reached.
@@ -390,6 +400,14 @@ pub fn mint(
     let Some(route) = route(req.triage.bucket) else {
         return Ok(MintOutcome::SkippedTransient);
     };
+
+    // CLAUDE-153: the webhook-scoped auto-fix toggle. When off, a queue-for-fix
+    // route mints nothing and queues no corrective fixup PR, leaving the failure
+    // reported on the original PR for its author (the CLAUDE-152 behavior). Only
+    // the queue-for-fix buckets are gated; a human-action failure still mints.
+    if !req.auto_fix_enabled && route.queue_for_fix {
+        return Ok(MintOutcome::SkippedAutoFixDisabled);
+    }
 
     // CLAUDE-149: a failing open PR is the author's to fix. Suppress the auto-fix
     // (queue-for-fix) route for it so no corrective PR is queued; a human-action
@@ -881,6 +899,7 @@ mod tests {
             log_path: None,
             private: false,
             has_open_pr: false,
+            auto_fix_enabled: true,
         }
     }
 
@@ -1184,6 +1203,77 @@ mod tests {
         let t = triage(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let r = req("fabrikam/forgejo-cli", &t, "alice"); // has_open_pr: false
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
+        assert!(
+            tracker
+                .calls()
+                .iter()
+                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+            "{:?}",
+            tracker.calls()
+        );
+    }
+
+    // ---- CLAUDE-153: the webhook-scoped auto-fix toggle -------------------
+
+    #[test]
+    fn auto_fix_off_suppresses_the_queue_for_fix_mint() {
+        // With the webhook auto-fix toggle off, a code-fix failure mints nothing
+        // and queues no fixup PR (CLAUDE-152): the failure stays on the PR.
+        let t = triage(TriageBucket::CodeFix);
+        let tracker = StubTracker::new();
+        let mut r = req("fabrikam/forgejo-cli", &t, "alice");
+        r.auto_fix_enabled = false;
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert_eq!(out, MintOutcome::SkippedAutoFixDisabled);
+        assert!(
+            tracker.calls().is_empty(),
+            "no yt calls when auto-fix is off: {:?}",
+            tracker.calls()
+        );
+    }
+
+    #[test]
+    fn auto_fix_off_also_suppresses_the_auto_fix_bucket() {
+        // The `auto_fix` bucket routes like a code-fix (queue-for-fix), so the
+        // toggle gates it too: no mint, no queued fixup.
+        let t = auto_fix_triage(cargo_fmt_detail());
+        let tracker = StubTracker::new();
+        let mut r = req("fabrikam/forgejo-cli", &t, "alice");
+        r.auto_fix_enabled = false;
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert_eq!(out, MintOutcome::SkippedAutoFixDisabled);
+        assert!(tracker.calls().is_empty(), "{:?}", tracker.calls());
+    }
+
+    #[test]
+    fn auto_fix_off_still_mints_a_human_action() {
+        // The toggle gates only the queue-for-fix buckets. A human-action failure
+        // needs a human either way, so it still mints and assigns.
+        let t = triage(TriageBucket::HumanAction);
+        let tracker = StubTracker::new();
+        let mut r = req("contoso/claude-run", &t, "alice");
+        r.auto_fix_enabled = false;
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert!(
+            matches!(out, MintOutcome::Created { .. }),
+            "human-action mints even with auto-fix off: {out:?}"
+        );
+        assert!(
+            tracker.calls().iter().any(|c| c.contains("assignee=alice")),
+            "{:?}",
+            tracker.calls()
+        );
+    }
+
+    #[test]
+    fn auto_fix_on_keeps_the_queue_for_fix_mint() {
+        // With the toggle on, a code-fix queues for the fix bot as before.
+        let t = triage(TriageBucket::CodeFix);
+        let tracker = StubTracker::new();
+        let mut r = req("fabrikam/forgejo-cli", &t, "alice");
+        r.auto_fix_enabled = true;
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
         assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
         assert!(

@@ -131,7 +131,7 @@ pub async fn run_set_job_keys(pool: &SqlitePool, run_id: i64, keys: &[String]) -
 }
 
 /// CLAUDE-93: record per-job outbound links for a run as a JSON object mapping
-/// job key to URL (`runs.job_links`). The webhook fast-path stores the failure
+/// job key to URL (`runs.job_links`). The webhook stores the failure
 /// event's `html_url` so the run-detail tables can link the job key straight
 /// to the Forgejo Actions run.
 pub async fn run_set_job_links(
