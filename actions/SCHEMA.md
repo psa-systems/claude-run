@@ -637,6 +637,14 @@ $CLAUDE_RUN_STATE_DIR/
 }
 ```
 
+## Synthetic webhook action (`webhook-forgejo`)
+
+The inbound Forgejo webhook (`POST /webhooks/forgejo/<source>`) surfaces on the dashboard as a synthetic action named `webhook-forgejo` (renamed from `webhook-fast-path` in CLAUDE-153). It is not a YAML file under `actions/`: it is Rust-defined, injected by the web layer only when at least one webhook source is configured, and reserved (an on-disk YAML claiming the name `webhook-forgejo` is refused at scan). Its per-key attempt counter and daily run ledger are recorded under this name like any other action, so its run history, durations chart, and last-run recency render on the dashboard. A one-time startup migration (SQL migration `0013` plus a log-directory rename) carries any pre-rename history across.
+
+- **Read-only:** edit, export, and delete are rejected (HTTP 403); there is no backing YAML to operate on, and a manual trigger is rejected (HTTP 400) because it is event-driven, not scheduled.
+- **Pausable (CLAUDE-153):** it participates in the same per-action Pause as every other action. Pause/Resume controls and a Paused badge appear on the dashboard, and `POST /api/actions/webhook-forgejo/pause` / `/resume` write and clear its `paused_actions` row. While paused, an inbound delivery is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, then dropped without minting or queuing, so Forgejo does not treat it as a failed delivery and retry.
+- **Auto-fix toggle (CLAUDE-153):** the `Webhook` settings section carries an `auto_fix` boolean, default `false` (opt-in). When off, a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) mints nothing and queues no corrective fixup PR: the failure stays reported on the original PR for its author. A `human_action` failure still mints. When on, the corrective-fixup behavior applies (subject to the CLAUDE-149 open-PR suppression). This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. It is DB-backed (`config.webhook`) and edited live on the Settings page or via `PUT /api/settings/webhook`.
+
 ## Deleting an action
 
 An action can be deleted from all three surfaces: the CLI (`claude-run action delete <name>`), the web UI (the Delete button on an action's detail page), and the JSON API (`POST /actions/<name>/delete`).

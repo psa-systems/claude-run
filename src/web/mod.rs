@@ -46,9 +46,9 @@ const IDIOMORPH_JS: &[u8] = include_bytes!("../../assets/idiomorph-ext.min.js");
 pub struct WebState {
     pub api: Arc<AppState>,
     pub paths: Paths,
-    /// CLAUDE-61: whether the Forgejo webhook fast-path is configured
+    /// CLAUDE-61: whether the Forgejo webhook is configured
     /// (`[webhook].secret_ref` set). When true the web layer injects a synthetic
-    /// read-only `webhook-fast-path` action so its runs are visible; when false
+    /// read-only `webhook-forgejo` action so its runs are visible; when false
     /// the entry is absent (historical runs stay queryable on the dashboard).
     pub webhook_enabled: bool,
 }
@@ -132,8 +132,10 @@ struct ActionView {
     last_run_started: Option<String>,
     paused: Option<PauseInfo>,
     /// CLAUDE-61: a synthetic, read-only, event-driven action (the
-    /// `webhook-fast-path` entry). The templates label it event-driven and hide
-    /// the edit / delete / trigger / pause controls, which do not apply.
+    /// `webhook-forgejo` entry). The templates label it event-driven and hide
+    /// the edit / delete / trigger controls, which do not apply. CLAUDE-153: the
+    /// Pause / Resume controls DO apply and are shown (a paused webhook accepts
+    /// and drops deliveries).
     synthetic: bool,
 }
 
@@ -149,7 +151,7 @@ struct RunRow {
     /// CLAUDE-14: key of the job currently being processed, or NULL when no job
     /// is in flight (run finished, or a legacy run predating the column).
     current_job_key: Option<String>,
-    /// CLAUDE-80: live pipeline stage of an in-flight run (webhook fast-path:
+    /// CLAUDE-80: live pipeline stage of an in-flight run (webhook:
     /// download / triage / classify / mint), or NULL when the run records no
     /// stage info (scheduled runs, finished runs).
     stage: Option<String>,
@@ -415,7 +417,7 @@ async fn enriched_actions(
             synthetic: false,
         });
     }
-    // CLAUDE-61: surface the event-driven webhook fast-path as a synthetic
+    // CLAUDE-61: surface the event-driven webhook as a synthetic
     // read-only action when it is configured, so its runs get the same
     // dashboard / action-detail surfaces other actions have. It has no backing
     // YAML and is never indexed in the `actions` table; it lives only here.
@@ -425,13 +427,25 @@ async fn enriched_actions(
     Ok(out)
 }
 
-/// CLAUDE-61: build the synthetic `webhook-fast-path` action view. Read-only and
+/// CLAUDE-61: build the synthetic `webhook-forgejo` action view. Read-only and
 /// event-driven: no schedule, no file, always "enabled" (it fires on webhook
 /// deliveries, not a timer). Its `last_run_started` comes from the recorded
 /// webhook runs so the dashboard shows recency like any other action.
+///
+/// CLAUDE-153: unlike edit/export/delete (which stay rejected), this action
+/// participates in Pause. Its `paused` state is read from the shared
+/// `paused_actions` row like every other action, so the dashboard shows a
+/// Paused badge and the Pause/Resume controls act on it; a paused delivery is
+/// accepted-and-dropped by the inbound endpoint.
 async fn synthetic_webhook_action(pool: &SqlitePool) -> Result<ActionView, WebError> {
     let name = webhooks::WEBHOOK_MINT_ACTION.to_string();
     let last = state::action_last_run_started(pool, &name).await?;
+    let paused = state::action_pause_status(pool, &name)
+        .await?
+        .map(|(at, r)| PauseInfo {
+            paused_at: at,
+            reason: r,
+        });
     Ok(ActionView {
         name,
         file_path: "(synthetic, event-driven; no file)".to_string(),
@@ -442,7 +456,7 @@ async fn synthetic_webhook_action(pool: &SqlitePool) -> Result<ActionView, WebEr
         last_seen_at: String::new(),
         parse_error: None,
         last_run_started: last,
-        paused: None,
+        paused,
         synthetic: true,
     })
 }
@@ -3163,7 +3177,7 @@ async fn run_detail(
             .flatten();
 
     let planned_keys = state::run_job_keys(pool, run.id).await.unwrap_or_default();
-    // CLAUDE-93: per-job links recorded on the run (the webhook fast-path
+    // CLAUDE-93: per-job links recorded on the run (the webhook
     // stores the event's `html_url`). A map entry beats the action's
     // link_template; scheduled actions have no entries and render as before.
     let job_links = state::run_job_links(pool, run.id).await.unwrap_or_default();
@@ -4895,6 +4909,44 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(del.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn synthetic_action_reflects_pause_state() {
+            // CLAUDE-153: the synthetic webhook action participates in Pause. Its
+            // `paused` field is read from the shared `paused_actions` row, so a
+            // pause set on its name shows up on the dashboard (and Resume clears).
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION;
+
+            // Unpaused: the synthetic entry reports no pause.
+            let before = super::super::enriched_actions(&s.api.pool, true)
+                .await
+                .unwrap();
+            let entry = before.iter().find(|a| a.name == synthetic).unwrap();
+            assert!(entry.paused.is_none(), "starts unpaused");
+
+            // Pause it, then the entry reports the pause (with the reason).
+            state::action_pause_set(&s.api.pool, synthetic, Some("maintenance"))
+                .await
+                .unwrap();
+            let paused = super::super::enriched_actions(&s.api.pool, true)
+                .await
+                .unwrap();
+            let entry = paused.iter().find(|a| a.name == synthetic).unwrap();
+            let info = entry.paused.as_ref().expect("synthetic action is paused");
+            assert_eq!(info.reason.as_deref(), Some("maintenance"));
+
+            // Resume clears it.
+            state::action_pause_clear(&s.api.pool, synthetic)
+                .await
+                .unwrap();
+            let after = super::super::enriched_actions(&s.api.pool, true)
+                .await
+                .unwrap();
+            let entry = after.iter().find(|a| a.name == synthetic).unwrap();
+            assert!(entry.paused.is_none(), "resume clears the pause");
         }
 
         #[tokio::test]

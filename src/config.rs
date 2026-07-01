@@ -160,6 +160,17 @@ pub struct WebhookConfig {
     /// names with other characters are warned about at load. An empty map
     /// disables the listener (no endpoints, fail-closed like an unset secret).
     pub sources: BTreeMap<String, WebhookSource>,
+    /// CLAUDE-153: webhook-scoped auto-fix switch. When `false` (the default,
+    /// opt-in), a failure the webhook triage routes to a queue-for-fix bucket
+    /// (`code_fix` / `auto_fix`) mints nothing and queues no corrective fixup
+    /// PR, so a red PR check stays reported on the original PR for its author to
+    /// fix in place (the CLAUDE-152 behavior). A `human_action` failure still
+    /// mints. This gates only the webhook fixup routing; it is independent of the
+    /// framework-wide `[mint].auto_fix.enabled` detector switch and of the
+    /// CLAUDE-149 open-PR suppression. Being on `WebhookConfig` it is DB-backed
+    /// (`config.webhook`) and edited live on the Settings page / via
+    /// `PUT /api/settings/webhook` with no restart.
+    pub auto_fix: bool,
 }
 
 impl Default for WebhookConfig {
@@ -167,6 +178,7 @@ impl Default for WebhookConfig {
         Self {
             replay_window_secs: 300,
             sources: BTreeMap::new(),
+            auto_fix: false,
         }
     }
 }

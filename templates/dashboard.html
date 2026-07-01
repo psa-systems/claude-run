@@ -59,7 +59,8 @@
       <h3><a href="/actions/{{ a.name }}">{{ a.name }}</a></h3>
       <div class="meta">
         {% if a.synthetic %}
-          <span class="badge ok">event-driven</span> - webhook fast-path (read-only)
+          <span class="badge ok">event-driven</span> - webhook-forgejo (read-only)
+          {% if a.paused.is_some() %}<span class="badge pause">paused</span>{% endif %}
         {% else %}
           {% if a.parse_error.is_some() %}
             <span class="badge bad">parse error</span>
@@ -80,14 +81,18 @@
       <div class="meta">
         last run: {% if let Some(t) = a.last_run_started %}{{ t }}{% else %}<span class="dim">never</span>{% endif %}
       </div>
-      {% if !a.synthetic %}
       <div class="row-actions">
+        {# CLAUDE-61: no manual trigger for the synthetic webhook action (it is
+           event-driven and the scheduler never dispatches it). CLAUDE-153: it
+           still participates in Pause/Resume like every other action. #}
+        {% if !a.synthetic %}
         <form hx-post="/api/actions/{{ a.name }}/trigger"
               hx-swap="none"
               hx-disabled-elt="find button"
               hx-on::after-request="htmx.trigger('body', 'refreshNow')">
           <button class="btn">Trigger now</button>
         </form>
+        {% endif %}
         {% if a.paused.is_some() %}
           <form hx-post="/api/actions/{{ a.name }}/resume"
                 hx-swap="none"
@@ -104,7 +109,6 @@
           </form>
         {% endif %}
       </div>
-      {% endif %}
     </div>
   {% endfor %}
   {% if actions.is_empty() %}
