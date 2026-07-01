@@ -63,6 +63,11 @@ features = ["macros"]
 version = "0.4"
 features = ["serde"]
 
+# CLAUDE-154: IANA timezone parsing for the preferences date/time rendering.
+[dependencies.chrono-tz]
+version = "0.10"
+features = ["serde"]
+
 [dependencies.clap]
 version = "4"
 features = [

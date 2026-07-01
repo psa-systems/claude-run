@@ -28,12 +28,12 @@
     <dt>SHA-256</dt>       <dd>{{ action.yaml_sha256 }}</dd>
     <dt>Enabled</dt>       <dd>{{ action.enabled }}</dd>
     <dt>Schedule</dt>      <dd>{% if let Some(k) = action.schedule_kind %}{{ k }}{% if let Some(s) = action.schedule_spec %} <strong>{{ s }}</strong>{% endif %}{% else %}<span class="dim">none</span>{% endif %}</dd>
-    <dt>Last seen</dt>     <dd>{{ action.last_seen_at }}</dd>
+    <dt>Last seen</dt>     <dd>{{ action.last_seen_at|datetime }}</dd>
     {% if let Some(e) = action.parse_error %}
       <dt>Parse error</dt> <dd style="color: var(--bad);">{{ e }}</dd>
     {% endif %}
     {% if let Some(p) = paused %}
-      <dt>Paused</dt>      <dd><span class="badge pause">paused</span> since {{ p.paused_at }}{% if let Some(r) = p.reason %} - {{ r }}{% endif %}</dd>
+      <dt>Paused</dt>      <dd><span class="badge pause">paused</span> since {{ p.paused_at|datetime }}{% if let Some(r) = p.reason %} - {{ r }}{% endif %}</dd>
     {% endif %}
   </dl>
   <div class="row-actions" style="margin-top: 16px;">
@@ -118,8 +118,8 @@
       {% for r in runs %}
         <tr>
           <td class="mono"><a href="/runs/{{ r.id }}">#{{ r.id }}</a></td>
-          <td class="mono dim">{{ r.started_at }}</td>
-          <td class="mono dim">{{ r.ended_at.as_deref().unwrap_or("-") }}</td>
+          <td class="mono dim">{{ r.started_at|datetime }}</td>
+          <td class="mono dim">{{ r.ended_at.as_deref().unwrap_or("-")|datetime }}</td>
           <td class="mono">{{ r.duration() }}</td>
           <td class="dim">{{ r.triggered_by }}</td>
           <td class="mono">{{ r.jobs_processed }}{% if r.failed_jobs > 0 %} <span style="color: var(--bad);">({{ r.failed_jobs }} failed)</span>{% endif %}</td>

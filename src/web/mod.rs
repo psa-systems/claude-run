@@ -37,6 +37,20 @@ use crate::state;
 
 pub mod webhooks;
 
+/// CLAUDE-154: custom Askama filters. `{{ ts | datetime }}` renders a stored
+/// RFC3339 UTC timestamp string through the live display preferences (timezone +
+/// strftime format). Askama filters are free functions, so the preferences come
+/// from the process-global snapshot kept current by `LiveSettings`. Malformed
+/// input and sentinels (`running`, `never`, empty) pass through unchanged.
+mod filters {
+    pub fn datetime(value: &str) -> ::askama::Result<String> {
+        Ok(crate::settings::format_datetime(
+            value,
+            &crate::settings::current_preferences(),
+        ))
+    }
+}
+
 const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
 // CLAUDE-139: idiomorph + its htmx extension, vendored so the live poll can
 // morph the DOM in place instead of replacing it (preserves selection/scroll).
@@ -2655,6 +2669,24 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "longer age past which even unpushed-commit workdirs are deleted.",
             },
         ],
+        Preferences => vec![
+            FieldDoc {
+                name: "locale",
+                badge: "reserved",
+                note:
+                    "BCP-47 locale; advisory only for now (localized names tracked in CLAUDE-155).",
+            },
+            FieldDoc {
+                name: "timezone",
+                badge: "live",
+                note: "IANA name (e.g. America/New_York); all displayed dates convert into it.",
+            },
+            FieldDoc {
+                name: "datetime_format",
+                badge: "live",
+                note: "chrono strftime pattern; use a preset button below or edit freely.",
+            },
+        ],
     }
 }
 
@@ -3363,6 +3395,24 @@ async fn job_stream_page(
 
 // ---- SSE ------------------------------------------------------------------
 
+/// CLAUDE-154: add a preference-formatted `ts_fmt` alongside a stream event's
+/// raw `ts` so the live log renders the same timezone + format as every other
+/// date, while the client keeps the raw `ts` for its hover tooltip. Lines that
+/// are not JSON objects, or carry no string `ts`, pass through unchanged.
+fn augment_stream_line_ts(line: &str, prefs: &crate::config::PreferencesConfig) -> String {
+    use serde_json::Value;
+    let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(line) else {
+        return line.to_string();
+    };
+    let ts = match map.get("ts") {
+        Some(Value::String(s)) => s.clone(),
+        _ => return line.to_string(),
+    };
+    let fmt = crate::settings::format_datetime(&ts, prefs);
+    map.insert("ts_fmt".to_string(), Value::String(fmt));
+    Value::Object(map).to_string()
+}
+
 async fn job_stream_sse(
     State(s): State<WebState>,
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
@@ -3376,6 +3426,11 @@ async fn job_stream_sse(
             .await?;
     let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
     let path = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
+
+    // CLAUDE-154: snapshot the display preferences for this connection so each
+    // event's `ts` is formatted server-side (chrono strftime can't run in JS),
+    // keeping the live log on the same timezone + format as every other date.
+    let prefs = crate::settings::current_preferences();
 
     // Resume offset for reconnects. Each `msg` event is tagged with its 0-based
     // line index as the SSE `id`. On a native browser reconnect the index comes
@@ -3434,7 +3489,8 @@ async fn job_stream_sse(
                 Ok(Some(line)) => {
                     let is_terminal = line.contains("\"type\":\"result\"");
                     if idx >= resume_from {
-                        yield Ok(Event::default().event("msg").id(idx.to_string()).data(line));
+                        let data = augment_stream_line_ts(&line, &prefs);
+                        yield Ok(Event::default().event("msg").id(idx.to_string()).data(data));
                     }
                     idx += 1;
                     if is_terminal {

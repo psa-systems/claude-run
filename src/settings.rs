@@ -31,7 +31,8 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
-    MintConfig, OnDiskConfig, Paths, UpdateConfig, WebhookConfig, WorkdirGcConfig,
+    MintConfig, OnDiskConfig, Paths, PreferencesConfig, UpdateConfig, WebhookConfig,
+    WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -46,16 +47,19 @@ pub enum Section {
     LogFilter,
     /// CLAUDE-106: preserved / aside workdir GC retention windows.
     WorkdirGc,
+    /// CLAUDE-154: global display preferences (locale, timezone, date format).
+    Preferences,
 }
 
 impl Section {
     /// Every section, in display order (used by the Settings page).
-    pub const ALL: [Section; 5] = [
+    pub const ALL: [Section; 6] = [
         Section::Mint,
         Section::Update,
         Section::Webhook,
         Section::LogFilter,
         Section::WorkdirGc,
+        Section::Preferences,
     ];
 
     /// `settings` table primary key for this section's JSON document.
@@ -66,6 +70,7 @@ impl Section {
             Section::Webhook => "config.webhook",
             Section::LogFilter => "config.log_filter",
             Section::WorkdirGc => "config.workdir_gc",
+            Section::Preferences => "config.preferences",
         }
     }
 
@@ -77,6 +82,7 @@ impl Section {
             Section::Webhook => "webhook",
             Section::LogFilter => "log_filter",
             Section::WorkdirGc => "workdir_gc",
+            Section::Preferences => "preferences",
         }
     }
 
@@ -93,6 +99,7 @@ impl Section {
             Section::Webhook => "Webhook sources",
             Section::LogFilter => "Log filter",
             Section::WorkdirGc => "Workdir GC",
+            Section::Preferences => "Display preferences",
         }
     }
 
@@ -103,6 +110,7 @@ impl Section {
             Section::Webhook => "live (replay window: restart)",
             Section::LogFilter => "live",
             Section::WorkdirGc => "next sweep",
+            Section::Preferences => "live",
         }
     }
 }
@@ -116,6 +124,80 @@ pub struct LogFilterDoc {
     /// Tracing `EnvFilter` directive (see `[daemon].log_filter` docs). `None`
     /// keeps the built-in default; `CLAUDE_RUN_LOG` still wins at runtime.
     pub filter: Option<String>,
+}
+
+// ---- CLAUDE-154: preferences snapshot + date formatting -------------------
+
+/// Process-global snapshot of the live [`PreferencesConfig`]. Askama filters are
+/// free functions with no request state, so the `datetime` filter reads the
+/// current preferences from here. Kept current by [`LiveSettings`] (set on build
+/// and on every save of the Preferences section). Defaults to UTC / ISO, so an
+/// unset snapshot renders exactly today's values.
+fn preferences_cell() -> &'static std::sync::RwLock<PreferencesConfig> {
+    static CELL: std::sync::OnceLock<std::sync::RwLock<PreferencesConfig>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::RwLock::new(PreferencesConfig::default()))
+}
+
+/// Replace the process-global preferences snapshot (called by [`LiveSettings`]).
+pub fn set_preferences_snapshot(prefs: PreferencesConfig) {
+    *preferences_cell()
+        .write()
+        .expect("preferences lock poisoned") = prefs;
+}
+
+/// Clone the current process-global preferences snapshot.
+pub fn current_preferences() -> PreferencesConfig {
+    preferences_cell()
+        .read()
+        .expect("preferences lock poisoned")
+        .clone()
+}
+
+/// Validate a [`PreferencesConfig`] before it is persisted: the `timezone` must
+/// be a known IANA name and the `datetime_format` must be a parseable strftime
+/// pattern. Returns a human message on the first failure, `Ok(())` otherwise.
+/// `locale` is advisory and not validated (see CLAUDE-155).
+pub fn validate_preferences(prefs: &PreferencesConfig) -> std::result::Result<(), String> {
+    prefs
+        .timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| format!("unknown IANA timezone `{}`", prefs.timezone))?;
+    if strftime_has_error(&prefs.datetime_format) {
+        return Err(format!(
+            "invalid strftime datetime_format `{}`",
+            prefs.datetime_format
+        ));
+    }
+    Ok(())
+}
+
+/// True when the strftime pattern contains an unparseable specifier. chrono
+/// surfaces a bad specifier as an [`Item::Error`] in the parsed item stream and
+/// would otherwise panic when the format is written, so we detect it up front.
+fn strftime_has_error(fmt: &str) -> bool {
+    use chrono::format::{Item, StrftimeItems};
+    StrftimeItems::new(fmt).any(|item| matches!(item, Item::Error))
+}
+
+/// Render one stored RFC3339 UTC timestamp string for display: parse it, convert
+/// to the preferences' `timezone`, and format with the `datetime_format`
+/// strftime pattern. On ANY failure (unparseable input, bad timezone, bad
+/// format) it returns the input unchanged, so sentinels like `running` / `never`
+/// / empty pass through and a malformed value is never blanked or panicked on.
+pub fn format_datetime(rfc3339: &str, prefs: &PreferencesConfig) -> String {
+    let (Ok(tz), Ok(dt)) = (
+        prefs.timezone.parse::<chrono_tz::Tz>(),
+        chrono::DateTime::parse_from_rfc3339(rfc3339),
+    ) else {
+        return rfc3339.to_string();
+    };
+    if strftime_has_error(&prefs.datetime_format) {
+        return rfc3339.to_string();
+    }
+    dt.with_timezone(&tz)
+        .format(&prefs.datetime_format)
+        .to_string()
 }
 
 // ---- raw + typed store ----------------------------------------------------
@@ -173,6 +255,9 @@ pub struct EffectiveRuntime {
     /// in `config.toml`), so there is no file fallback: the DB value or the
     /// built-in default.
     pub workdir_gc: WorkdirGcConfig,
+    /// CLAUDE-154: global display preferences. Brand-new section (never in
+    /// `config.toml`), so the DB value or the built-in default (UTC / ISO).
+    pub preferences: PreferencesConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
@@ -194,12 +279,16 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
     let workdir_gc = get_json::<WorkdirGcConfig>(pool, Section::WorkdirGc.key())
         .await?
         .unwrap_or_default();
+    let preferences = get_json::<PreferencesConfig>(pool, Section::Preferences.key())
+        .await?
+        .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
         update,
         webhook,
         log_filter,
         workdir_gc,
+        preferences,
     })
 }
 
@@ -360,6 +449,7 @@ pub struct LiveSettings {
     log_filter: Arc<RwLock<Option<String>>>,
     log_apply: Option<LogFilterApply>,
     workdir_gc: Arc<RwLock<WorkdirGcConfig>>,
+    preferences: Arc<RwLock<PreferencesConfig>>,
 }
 
 impl LiveSettings {
@@ -368,6 +458,9 @@ impl LiveSettings {
     /// already applied), unless `log_apply` is `None` (env wins / no handle).
     pub fn new(pool: SqlitePool, eff: EffectiveRuntime, log_apply: Option<LogFilterApply>) -> Self {
         let webhook_rate = build_rate_map(&eff.webhook);
+        // CLAUDE-154: seed the process-global snapshot the Askama `datetime`
+        // filter reads, so display formatting is live from startup.
+        set_preferences_snapshot(eff.preferences.clone());
         let s = Self {
             pool,
             mint: Arc::new(RwLock::new(eff.mint)),
@@ -377,6 +470,7 @@ impl LiveSettings {
             log_filter: Arc::new(RwLock::new(eff.log_filter.clone())),
             log_apply,
             workdir_gc: Arc::new(RwLock::new(eff.workdir_gc)),
+            preferences: Arc::new(RwLock::new(eff.preferences)),
         };
         if let (Some(apply), Some(filter)) = (s.log_apply.as_ref(), eff.log_filter.as_ref()) {
             match apply(filter) {
@@ -433,6 +527,7 @@ impl LiveSettings {
                 filter: self.log_filter.read().await.clone(),
             }),
             Section::WorkdirGc => to_pretty(&*self.workdir_gc.read().await),
+            Section::Preferences => to_pretty(&*self.preferences.read().await),
         }
     }
 
@@ -484,6 +579,15 @@ impl LiveSettings {
                 set_json(&self.pool, section.key(), &v).await?;
                 *self.workdir_gc.write().await = v;
             }
+            Section::Preferences => {
+                let v: PreferencesConfig = parse(json)?;
+                // Reject an unknown timezone or an unparseable strftime format
+                // before persisting: nothing is stored on an invalid payload.
+                validate_preferences(&v).map_err(SaveError::Invalid)?;
+                set_json(&self.pool, section.key(), &v).await?;
+                set_preferences_snapshot(v.clone());
+                *self.preferences.write().await = v;
+            }
         }
         Ok(())
     }
@@ -520,6 +624,7 @@ mod tests {
             webhook: WebhookConfig::default(),
             log_filter: None,
             workdir_gc: WorkdirGcConfig::default(),
+            preferences: PreferencesConfig::default(),
         }
     }
 
@@ -686,6 +791,131 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(get_raw(&pool, Section::Mint.key()).await.unwrap().is_none());
+    }
+
+    // ---- CLAUDE-154: preferences formatting + validation -------------------
+
+    #[test]
+    fn format_datetime_defaults_reproduce_utc_iso() {
+        // Default prefs (UTC, %Y-%m-%d %H:%M:%S %Z) render the same wall-clock
+        // as the stored value, only reformatted.
+        let prefs = PreferencesConfig::default();
+        assert_eq!(
+            format_datetime("2026-07-01T00:00:00Z", &prefs),
+            "2026-07-01 00:00:00 UTC"
+        );
+    }
+
+    #[test]
+    fn format_datetime_converts_timezone() {
+        let prefs = PreferencesConfig {
+            timezone: "America/New_York".to_string(),
+            datetime_format: "%Y-%m-%d %H:%M:%S %Z".to_string(),
+            ..Default::default()
+        };
+        // 2026-07-01T00:00:00Z is EDT (UTC-4) -> 2026-06-30 20:00:00.
+        assert_eq!(
+            format_datetime("2026-07-01T00:00:00Z", &prefs),
+            "2026-06-30 20:00:00 EDT"
+        );
+    }
+
+    #[test]
+    fn format_datetime_honors_custom_format() {
+        let prefs = PreferencesConfig {
+            timezone: "UTC".to_string(),
+            datetime_format: "%m/%d/%Y %I:%M:%S %p".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_datetime("2026-07-01T13:05:09Z", &prefs),
+            "07/01/2026 01:05:09 PM"
+        );
+    }
+
+    #[test]
+    fn format_datetime_falls_back_on_malformed_input() {
+        let prefs = PreferencesConfig::default();
+        // Sentinels and non-timestamps pass through unchanged, never blanked.
+        assert_eq!(format_datetime("running", &prefs), "running");
+        assert_eq!(format_datetime("never", &prefs), "never");
+        assert_eq!(format_datetime("", &prefs), "");
+        assert_eq!(format_datetime("not-a-date", &prefs), "not-a-date");
+    }
+
+    #[test]
+    fn format_datetime_falls_back_on_bad_prefs() {
+        // A stored-but-somehow-invalid tz / format must not panic or blank.
+        let bad_tz = PreferencesConfig {
+            timezone: "Mars/Olympus".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_datetime("2026-07-01T00:00:00Z", &bad_tz),
+            "2026-07-01T00:00:00Z"
+        );
+        let bad_fmt = PreferencesConfig {
+            datetime_format: "%Q".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_datetime("2026-07-01T00:00:00Z", &bad_fmt),
+            "2026-07-01T00:00:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn preferences_save_validates_timezone_and_format() {
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+
+        // Valid payload persists and updates the global snapshot.
+        live.save_section(
+            Section::Preferences,
+            r#"{"locale":"fr-FR","timezone":"Europe/Paris","datetime_format":"%d.%m.%Y %H:%M:%S"}"#,
+        )
+        .await
+        .unwrap();
+        let stored: PreferencesConfig = get_json(&pool, Section::Preferences.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.timezone, "Europe/Paris");
+        assert_eq!(stored.locale, "fr-FR");
+        assert_eq!(current_preferences().timezone, "Europe/Paris");
+
+        // Invalid timezone is rejected, nothing overwritten.
+        let err = live
+            .save_section(
+                Section::Preferences,
+                r#"{"locale":"en-US","timezone":"Nowhere/Void","datetime_format":"%Y-%m-%d"}"#,
+            )
+            .await
+            .expect_err("bad timezone must reject");
+        match err {
+            SaveError::Invalid(m) => assert!(m.contains("timezone"), "{m}"),
+            other => panic!("expected Invalid, got {other}"),
+        }
+
+        // Invalid strftime format is rejected too.
+        let err = live
+            .save_section(
+                Section::Preferences,
+                r#"{"locale":"en-US","timezone":"UTC","datetime_format":"%Q"}"#,
+            )
+            .await
+            .expect_err("bad format must reject");
+        match err {
+            SaveError::Invalid(m) => assert!(m.contains("datetime_format"), "{m}"),
+            other => panic!("expected Invalid, got {other}"),
+        }
+
+        // The earlier valid value survived both rejected saves.
+        let stored: PreferencesConfig = get_json(&pool, Section::Preferences.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.timezone, "Europe/Paris");
     }
 
     #[tokio::test]
