@@ -23,8 +23,8 @@
 
 <div class="card">
   <dl class="kv">
-    <dt>Started</dt>       <dd>{{ run.started_at }}</dd>
-    <dt>Ended</dt>         <dd>{{ run.ended_at.as_deref().unwrap_or("running") }}</dd>
+    <dt>Started</dt>       <dd>{{ run.started_at|datetime }}</dd>
+    <dt>Ended</dt>         <dd>{{ run.ended_at.as_deref().unwrap_or("running")|datetime }}</dd>
     <dt>Duration</dt>      <dd>{{ run.duration() }}</dd>
     {# CLAUDE-80: live pipeline stage, present only while an in-flight run
        reports one (webhook-forgejo). Updates ride the 2s poll. #}

@@ -27,7 +27,7 @@
   <h2>Globally paused</h2>
   <div class="card">
     <span class="badge pause">paused</span>
-    Since {{ g.paused_at }}{% if let Some(r) = g.reason %} - {{ r }}{% endif %}.
+    Since {{ g.paused_at|datetime }}{% if let Some(r) = g.reason %} - {{ r }}{% endif %}.
     <form hx-post="/api/resume"
           hx-swap="none"
           hx-disabled-elt="find button"
@@ -262,8 +262,8 @@
           <tr>
             <td class="mono"><a href="/runs/{{ r.id }}">#{{ r.id }}</a></td>
             <td>{{ r.action_name }}</td>
-            <td class="mono dim">{{ r.started_at }}</td>
-            <td class="mono dim">{{ r.ended_at.as_deref().unwrap_or("-") }}</td>
+            <td class="mono dim">{{ r.started_at|datetime }}</td>
+            <td class="mono dim">{{ r.ended_at.as_deref().unwrap_or("-")|datetime }}</td>
             <td class="mono">{{ r.duration() }}</td>
             <td class="dim">{{ r.triggered_by }}</td>
             <td class="mono">{{ r.jobs_processed }}{% if r.failed_jobs > 0 %} <span style="color: var(--bad);">({{ r.failed_jobs }} failed)</span>{% endif %}</td>
