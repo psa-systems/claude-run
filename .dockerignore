@@ -2,9 +2,13 @@
 .git
 .gitignore
 .gitattributes
+.gitmodules
 
 # Forgejo CI (built outside the image)
 .forgejo
+
+# Vendored shared just tooling (local-dev only, no role in the image build)
+common
 
 # Build artifacts (regenerated inside the image)
 target
