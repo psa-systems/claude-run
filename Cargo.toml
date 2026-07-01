@@ -61,7 +61,9 @@ features = ["macros"]
 
 [dependencies.chrono]
 version = "0.4"
-features = ["serde"]
+# CLAUDE-155: `unstable-locales` pulls in `pure-rust-locales` and enables
+# `format_localized`, so `%A`/`%B`/`%p` render in the preferences `locale`.
+features = ["serde", "unstable-locales"]
 
 # CLAUDE-154: IANA timezone parsing for the preferences date/time rendering.
 [dependencies.chrono-tz]

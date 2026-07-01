@@ -2672,9 +2672,9 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
         Preferences => vec![
             FieldDoc {
                 name: "locale",
-                badge: "reserved",
+                badge: "live",
                 note:
-                    "BCP-47 locale; advisory only for now (localized names tracked in CLAUDE-155).",
+                    "BCP-47 locale (e.g. fr-FR); localizes month/weekday/AM-PM names (%A %a %B %b %p).",
             },
             FieldDoc {
                 name: "timezone",
