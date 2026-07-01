@@ -1,4 +1,4 @@
-//! Failure triage engine (CLAUDE-45, part of the webhook fast-path epic
+//! Failure triage engine (CLAUDE-45, part of the webhook epic
 //! CLAUDE-36).
 //!
 //! A verified `action_run_failure` event plus its redacted job log
