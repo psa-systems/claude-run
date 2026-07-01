@@ -86,6 +86,28 @@ pub fn next_fire_due(
     }
 }
 
+/// CLAUDE-156: the scheduler's per-tick fire decision, factored out so the
+/// in-flight guard is unit-testable.
+///
+/// An action already running is never re-fired on subsequent ticks. During the
+/// window between `dispatch` and `run_begin` writing the fresh `runs.started_at`
+/// row (which for the native YouTrack handler is only after the gather phase),
+/// `next_fire_due` alone keeps returning "due" every 5s tick because the DB
+/// still reports the previous cycle's (already interval-old) `started_at` or
+/// `None`. That produced a "scheduler firing" storm in the logs and a wasted
+/// `dispatch` call every tick, each short-circuited by the in-flight guard. The
+/// `in_flight` check here suppresses both. It applies uniformly to the native,
+/// scripted, and native-routing-bypass paths, since all of them are dispatched
+/// through the same in-flight set.
+pub fn should_fire(
+    schedule: &ParsedSchedule,
+    last_run_started: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    in_flight: bool,
+) -> bool {
+    !in_flight && next_fire_due(schedule, last_run_started, now).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +166,59 @@ mod tests {
             ParsedSchedule::Interval(d) => assert_eq!(d.as_secs(), 1800),
             _ => panic!("wrong variant"),
         }
+    }
+
+    // CLAUDE-156: the reported case - `"5m"` means 5 minutes (300s), so the
+    // parser is not the bug. Guards against a regression that would mis-parse
+    // the minutes suffix.
+    #[test]
+    fn interval_5m_parses_to_300s() {
+        let s = Schedule {
+            kind: ScheduleKind::Interval,
+            spec: Some("5m".into()),
+        };
+        match parse_schedule(&s).unwrap() {
+            ParsedSchedule::Interval(d) => assert_eq!(d.as_secs(), 300),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // CLAUDE-156: an in-flight action is never re-fired, even across the many
+    // 5s ticks that a single run outlasts while its fresh `runs.started_at` row
+    // does not yet exist (`last_run_started == None`). This is the firing-storm
+    // regression guard: `next_fire_due` reports the action "due" on every tick,
+    // but `should_fire` suppresses the fire while the run is in flight.
+    #[test]
+    fn in_flight_action_not_refired_across_ticks() {
+        let s = ParsedSchedule::Interval(Duration::from_secs(300));
+        let start = ts("2026-07-01T15:04:47Z");
+        for i in 0..60 {
+            let now = start + chrono::Duration::seconds(i * 5);
+            // The DB has no fresh started_at yet, so next_fire_due says "due"...
+            assert!(next_fire_due(&s, None, now).is_some());
+            // ...but should_fire refuses to fire while the action is in flight.
+            assert!(!should_fire(&s, None, now, true));
+        }
+    }
+
+    // CLAUDE-156: once the run finishes (no longer in flight) and its
+    // `started_at` is recorded, the 5m interval is honored: not due before 5m,
+    // due at 5m. So the action fires at most once per interval.
+    #[test]
+    fn interval_5m_fires_at_most_once_per_period() {
+        let s = ParsedSchedule::Interval(Duration::from_secs(300));
+        let started = ts("2026-07-01T15:04:47Z");
+        assert!(!should_fire(
+            &s,
+            Some(started),
+            started + chrono::Duration::seconds(299),
+            false
+        ));
+        assert!(should_fire(
+            &s,
+            Some(started),
+            started + chrono::Duration::seconds(300),
+            false
+        ));
     }
 }
