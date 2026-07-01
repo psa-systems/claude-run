@@ -101,8 +101,9 @@ shown or stored on the page: fields ending in `_ref` (`auth_token_ref`, a webhoo
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
 secret refs, adding a source), `next event` / `next invocation` for mint / update, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
-`GET` / `PUT /api/settings/{mint,update,webhook,log_filter,workdir_gc}`. The `workdir_gc` section (CLAUDE-106) is
-DB-only from birth (it was never a `config.toml` key), so it is not part of the one-time import below; it simply
+`GET` / `PUT /api/settings/{mint,update,webhook,log_filter,workdir_gc,preferences}`. The `workdir_gc` (CLAUDE-106) and
+`preferences` (CLAUDE-154) sections are DB-only from birth (never `config.toml` keys), so they are not part of the
+one-time import below; each simply
 defaults until edited.
 
 **One-time import, then breaking.** The first daemon start after upgrading imports any of the four moved sections still
@@ -146,6 +147,16 @@ losing the configured windows.
 Known limitation: the handful of startup lines emitted before the stored filter is applied (e.g. the config-source line)
 are governed by the initial filter, not the saved one; use `CLAUDE_RUN_LOG` when those specific lines are needed at
 `debug`.
+
+## Display preferences (CLAUDE-154)
+
+Every timestamp is stored as an RFC3339 UTC string; how it is displayed in the web UI is a single global setting (this is a single-operator daemon with no user table, so there are no per-user rows). The `preferences` section is DB-backed and edited on the **Settings** page (the `Display preferences` section, or `GET` / `PUT /api/settings/preferences`). Fields:
+
+- `timezone`: an IANA name (e.g. `America/New_York`, default `UTC`). Every displayed date is converted into it before formatting.
+- `datetime_format`: a chrono strftime pattern (default `%Y-%m-%d %H:%M:%S %Z`, e.g. `2026-07-01 00:00:00 UTC`). The Settings page offers preset buttons (ISO-seconds `%Y-%m-%d %H:%M:%S`, ISO-minutes `%Y-%m-%d %H:%M`, US `%m/%d/%Y %I:%M:%S %p`, EU `%d.%m.%Y %H:%M:%S`, RFC3339 `%Y-%m-%dT%H:%M:%S%:z`) that fill the field, plus free-form editing.
+- `locale`: a BCP-47 locale (default `en-US`). Advisory / reserved for now: it is stored and round-trips through the API but does NOT yet localize month / weekday names (that needs chrono's `unstable-locales` feature). Wiring it live is tracked in CLAUDE-155.
+
+Edits apply live (the dashboard, run and action detail pages, the secrets table, and the live job-stream log all reformat on the next render). Saving an unknown timezone or an unparseable strftime format is rejected inline and nothing is persisted. With the defaults (`UTC` + ISO-with-seconds) displayed times equal today's stored UTC values; only the surface format changes, never the underlying data. Elapsed durations (run duration, the +offset in the live log) and `report` analytics are wall-clock spans, not dates, and are left unformatted.
 
 ## Self-update (release trains)
 

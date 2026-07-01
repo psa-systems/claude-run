@@ -410,6 +410,42 @@ impl Default for WorkdirGcConfig {
     }
 }
 
+/// CLAUDE-154: global display preferences. A single-operator daemon has no
+/// `users` table, so this is one global section (settings key
+/// `config.preferences`, editable on the web Settings page) rather than
+/// per-user rows. It drives how every stored RFC3339 UTC timestamp is rendered
+/// in the web UI: convert to `timezone`, then format with `datetime_format`
+/// (a chrono strftime string). Defaults reproduce today's UTC ISO-with-seconds
+/// surface, so behavior is unchanged until an operator configures it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PreferencesConfig {
+    /// BCP-47 locale (e.g. `en-US`). ADVISORY / RESERVED for now: it is stored
+    /// and round-trips through the API but does NOT localize month / weekday
+    /// names in this issue (that needs chrono's `unstable-locales` feature).
+    /// Wiring it live is tracked in CLAUDE-155.
+    pub locale: String,
+    /// IANA timezone name (e.g. `America/New_York`), parsed as a
+    /// [`chrono_tz::Tz`]. Displayed timestamps are converted into it. Default
+    /// `UTC` keeps today's values.
+    pub timezone: String,
+    /// chrono strftime pattern applied after the timezone conversion. Default
+    /// `%Y-%m-%d %H:%M:%S %Z` renders e.g. `2026-07-01 00:00:00 UTC`. The
+    /// Settings page offers presets plus free-form editing; the stored value is
+    /// always the resolved strftime string.
+    pub datetime_format: String,
+}
+
+impl Default for PreferencesConfig {
+    fn default() -> Self {
+        Self {
+            locale: "en-US".to_string(),
+            timezone: "UTC".to_string(),
+            datetime_format: "%Y-%m-%d %H:%M:%S %Z".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {

@@ -48,6 +48,18 @@
   </table>
   {% endif %}
   <form method="post" action="/settings/{{ sec.path }}">
+    {% if sec.path == "preferences" %}
+    {# CLAUDE-154: preset buttons fill the datetime_format field in the JSON
+       editor below; free-form editing of the textarea still works. #}
+    <div class="dim" style="margin-bottom: 6px;">Date/time format presets:</div>
+    <div class="preset-row" style="margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 6px;">
+      <button type="button" class="btn preset-btn" data-format="%Y-%m-%d %H:%M:%S">ISO seconds</button>
+      <button type="button" class="btn preset-btn" data-format="%Y-%m-%d %H:%M">ISO minutes</button>
+      <button type="button" class="btn preset-btn" data-format="%m/%d/%Y %I:%M:%S %p">US</button>
+      <button type="button" class="btn preset-btn" data-format="%d.%m.%Y %H:%M:%S">EU</button>
+      <button type="button" class="btn preset-btn" data-format="%Y-%m-%dT%H:%M:%S%:z">RFC3339</button>
+    </div>
+    {% endif %}
     <textarea name="json" rows="12" spellcheck="false"
               style="width: 100%; background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 10px; font-family: var(--mono); font-size: 12px; line-height: 1.4;">{{ sec.json }}</textarea>
     <div style="margin-top: 8px;">
@@ -56,5 +68,26 @@
   </form>
 </div>
 {% endfor %}
+
+<script>
+  // CLAUDE-154: a preset button rewrites the datetime_format value inside its
+  // section's JSON editor, preserving the rest of the document. Free-form edits
+  // to the textarea keep working; the stored value is always the JSON blob.
+  document.querySelectorAll('.preset-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var form = btn.closest('form');
+      var ta = form && form.querySelector('textarea[name="json"]');
+      if (!ta) return;
+      var fmt = btn.getAttribute('data-format');
+      try {
+        var doc = JSON.parse(ta.value);
+        doc.datetime_format = fmt;
+        ta.value = JSON.stringify(doc, null, 2);
+      } catch (e) {
+        // Textarea is not valid JSON (mid-edit): leave it for the operator to fix.
+      }
+    });
+  });
+</script>
 
 {% endblock %}
