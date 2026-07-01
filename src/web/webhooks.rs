@@ -65,13 +65,15 @@ use crate::secrets::{self, SecretsKey};
 use crate::state;
 use crate::triage::{self, FailureClassifier, TriageInput};
 
-/// Synthetic action name the webhook fast-path records its DEV-335 caps under
+/// Synthetic action name the Forgejo webhook records its DEV-335 caps under
 /// (per-key attempt counter + daily run ledger in [`crate::state`]), so the
 /// event-driven mint throttles on the same accounting shape as the scheduled
-/// actions instead of re-deriving its own.
-pub const WEBHOOK_MINT_ACTION: &str = "webhook-fast-path";
+/// actions instead of re-deriving its own. CLAUDE-153 renamed this from the
+/// former `webhook-fast-path`; a startup data migration (migration `0013` plus
+/// the log-dir rename in [`crate::daemon`]) carries existing history across.
+pub const WEBHOOK_MINT_ACTION: &str = "webhook-forgejo";
 
-/// `runs.triggered_by` value for the event-driven webhook fast-path, alongside
+/// `runs.triggered_by` value for the event-driven webhook, alongside
 /// the existing `scheduler` / `trigger` / `cli` sources (CLAUDE-61). Each
 /// consumed verified failure becomes one run recorded under this source so the
 /// dashboard / action-detail surfaces show webhook activity like any action.
@@ -514,6 +516,7 @@ pub async fn consume_events(
             log_available,
             log_artifact,
             log_unavailable_reason,
+            webhook_cfg.auto_fix,
         )
         .await;
         finish_webhook_run(
@@ -528,7 +531,7 @@ pub async fn consume_events(
     }
 }
 
-/// CLAUDE-80: live stage labels for the webhook fast-path pipeline, surfaced on
+/// CLAUDE-80: live stage labels for the webhook pipeline, surfaced on
 /// the run-detail page (Stage row + the running job's LIVE column) via
 /// `runs.stage`. `run_finish` clears the column, so no label outlives its run.
 pub const STAGE_FETCHING_LOGS: &str = "fetching action logs";
@@ -692,7 +695,7 @@ async fn resolve_log_token(pool: &SqlitePool, name: &str) -> crate::error::Resul
     Ok(token.trim().to_string())
 }
 
-/// CLAUDE-61: open the `runs` row for one webhook fast-path event and stamp its
+/// CLAUDE-61: open the `runs` row for one webhook event and stamp its
 /// single planned job key. CLAUDE-80: also registers the job in-flight (so the
 /// run-detail badge reads `running`, not `queued`, for the whole pipeline) and
 /// sets the initial stage. CLAUDE-93: stores the event's `html_url` as the
@@ -728,7 +731,7 @@ async fn begin_webhook_run(pool: &SqlitePool, job_key: &str, html_url: &str) -> 
     }
 }
 
-/// CLAUDE-61: close a webhook fast-path run. Writes one `job_outcomes` row
+/// CLAUDE-61: close a webhook run. Writes one `job_outcomes` row
 /// carrying the human-readable `summary` (triage bucket + mint result, plus the
 /// redacted-log artifact path when present) and finalizes the run. A webhook run
 /// has no `claude --print` stream (`claude_ran = false`), so the run-detail page
@@ -778,7 +781,7 @@ async fn finish_webhook_run(
     }
 }
 
-/// CLAUDE-61: the run-record summary for one webhook fast-path event. `text` is
+/// CLAUDE-61: the run-record summary for one webhook event. `text` is
 /// the human-readable outcome (triage bucket + mint result, or an error), and
 /// `ok` is whether the pipeline completed: a decided outcome (mint or any skip)
 /// is `ok`, a triage/mint fault is not.
@@ -811,6 +814,9 @@ fn mint_summary(outcome: &MintOutcome) -> String {
         MintOutcome::SkippedTransient => "no issue (transient)".to_string(),
         MintOutcome::SkippedBotLoop => "no issue (bot-loop guard)".to_string(),
         MintOutcome::SkippedOpenPr => "no issue (open PR; left to author)".to_string(),
+        MintOutcome::SkippedAutoFixDisabled => {
+            "no issue (webhook auto-fix off; left on PR)".to_string()
+        }
         MintOutcome::SkippedAttemptCap => "no issue (per-key attempt cap)".to_string(),
         MintOutcome::SkippedDailyCap => "no issue (daily run cap)".to_string(),
         MintOutcome::SkippedDuplicateOpen { existing } => {
@@ -830,6 +836,7 @@ fn mint_summary(outcome: &MintOutcome) -> String {
 /// from the forge, runs the hybrid triage + mint on a blocking thread (every
 /// step shells out), and advances the caps ledger only when an issue was
 /// actually created. Logs the decision; never propagates an error to the loop.
+#[allow(clippy::too_many_arguments)]
 async fn triage_and_mint(
     ctx: &MintContext,
     run_id: Option<i64>,
@@ -838,6 +845,7 @@ async fn triage_and_mint(
     log_available: bool,
     log_artifact: Option<PathBuf>,
     log_unavailable_reason: Option<String>,
+    auto_fix_enabled: bool,
 ) -> WebhookRunSummary {
     // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
     // run's (repo, index); the daily ledger is per synthetic action. The
@@ -902,6 +910,7 @@ async fn triage_and_mint(
             log_artifact.as_deref(),
             log_unavailable_reason,
             has_open_pr,
+            auto_fix_enabled,
             &report_stage,
         )
     })
@@ -954,6 +963,7 @@ fn decide_mint(
     log_artifact: Option<&std::path::Path>,
     log_unavailable_reason: Option<String>,
     has_open_pr: bool,
+    auto_fix_enabled: bool,
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
 ) -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
     let input = TriageInput {
@@ -986,6 +996,7 @@ fn decide_mint(
         log_path: log_artifact,
         private: ev.private,
         has_open_pr,
+        auto_fix_enabled,
     };
     let outcome = mint::mint(tracker, mint_cfg, route_cache, &req, caps)?;
     Ok((verdict.bucket, outcome))
@@ -1064,6 +1075,9 @@ fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
         }
         MintOutcome::SkippedOpenPr => {
             info!(repo = %ev.repo, run = ev.index_in_repo, "open PR for this run; auto-fix suppressed (CLAUDE-149), minted nothing")
+        }
+        MintOutcome::SkippedAutoFixDisabled => {
+            info!(repo = %ev.repo, run = ev.index_in_repo, "webhook auto-fix toggle off (CLAUDE-153); no fixup queued, failure left on the PR")
         }
         MintOutcome::SkippedAttemptCap => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, "per-key attempt cap reached; minted nothing")
@@ -1187,6 +1201,32 @@ async fn forgejo_webhook(
         body_bytes = body.len(),
         "forgejo webhook authenticated"
     );
+
+    // CLAUDE-153: when the synthetic `webhook-forgejo` action is paused, accept
+    // the delivery and drop it (no parse, no event, no mint). A 2xx keeps
+    // Forgejo from treating it as a failed delivery and retrying; signature,
+    // replay, and rate-limit already ran above, so pause short-circuits only the
+    // mint step, matching every other action's "paused = does not run".
+    match state::action_pause_status(&st.pool, WEBHOOK_MINT_ACTION).await {
+        Ok(Some(_)) => {
+            info!(
+                source = %source,
+                delivery,
+                "webhook-forgejo action is paused; delivery accepted and dropped"
+            );
+            return StatusCode::OK.into_response();
+        }
+        Ok(None) => {}
+        Err(e) => {
+            // Pause state is unknown. Fail safe: do NOT mint against a possible
+            // pause. Ack (2xx) so Forgejo does not retry (the delivery id is
+            // already in the replay store, so a same-id retry would 409 anyway);
+            // the scheduled `youtrack` / `forgejo-ci-fix` poll is the backstop
+            // that still catches this failure on its next run.
+            warn!(source = %source, delivery, error = %e, "webhook-forgejo pause-status read failed; accepting and dropping (scheduled poll is the backstop)");
+            return StatusCode::OK.into_response();
+        }
+    }
 
     // Parse only after the request is authenticated and de-duplicated.
     let payload: ActionPayload = match serde_json::from_slice(&body) {
@@ -1746,6 +1786,7 @@ mod tests {
             None,
             Some("private repo: unauthorized".to_string()),
             false,
+            true, // auto_fix_enabled
             &|_| {},
         )
         .unwrap();
@@ -1785,6 +1826,7 @@ mod tests {
             None,
             None,
             true,
+            true, // auto_fix_enabled
             &|_| {},
         )
         .unwrap();
@@ -1813,6 +1855,7 @@ mod tests {
             None,
             None,
             false, // has_open_pr: no PR, so the code_fix route still queues
+            true,  // auto_fix_enabled
             &|_| {},
         )
         .unwrap();
@@ -1856,6 +1899,7 @@ mod tests {
             None,
             None,
             false,
+            true, // auto_fix_enabled
             &|_| {},
         )
         .unwrap();
@@ -1898,6 +1942,7 @@ mod tests {
             None,
             None,
             false, // has_open_pr: push to main, no PR
+            true,  // auto_fix_enabled
             &|_| {},
         )
         .unwrap();
@@ -1951,6 +1996,7 @@ mod tests {
             None,
             None,
             true, // has_open_pr: a failing open PR
+            true, // auto_fix_enabled
             &|_| {},
         )
         .unwrap();
@@ -1964,6 +2010,43 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains("AI Agent")),
             "fix bot never queued: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn auto_fix_off_code_fix_mints_nothing_and_leaves_it_on_the_pr() {
+        // CLAUDE-153 end-to-end through decide_mint: with the webhook auto-fix
+        // toggle OFF, a code_fix failure (even with no open PR) mints nothing and
+        // queues no fixup PR, so the red check stays reported on the PR
+        // (CLAUDE-152). No `create` and no `AI Agent` write reach the tracker.
+        let classifier = StubClassifier::new(TriageBucket::CodeFix);
+        let tracker = StubTracker::new();
+        let (bucket, out) = decide_mint(
+            &classifier,
+            &tracker,
+            &mint_cfg(),
+            &route_cache(),
+            &caps(),
+            &event(),
+            "error[E0308]: mismatched types".to_string(),
+            true,
+            None,
+            None,
+            false, // has_open_pr: no PR; the toggle, not open-PR, does the gating
+            false, // auto_fix_enabled: OFF
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(bucket, TriageBucket::CodeFix);
+        assert_eq!(out, MintOutcome::SkippedAutoFixDisabled);
+        let calls = tracker.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create")),
+            "no issue minted when auto-fix is off: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("AI Agent")),
+            "fix bot never queued when auto-fix is off: {calls:?}"
         );
     }
 
@@ -2403,6 +2486,7 @@ mod tests {
             None,
             None,
             true,
+            true, // auto_fix_enabled
             &report,
         )
         .unwrap();
@@ -2432,6 +2516,7 @@ mod tests {
             None,
             None,
             true,
+            true, // auto_fix_enabled
             &report,
         )
         .unwrap();
@@ -2529,6 +2614,7 @@ mod tests {
             WebhookConfig {
                 replay_window_secs: 300,
                 sources,
+                auto_fix: false,
             }
         }
 
@@ -2648,6 +2734,7 @@ mod tests {
             let config = WebhookConfig {
                 replay_window_secs: 300,
                 sources,
+                auto_fix: false,
             };
             let (tx, _rx) = mpsc::channel(8);
             let st = WebhookState::new(pool, config, tx);
@@ -2698,6 +2785,62 @@ mod tests {
             // verified failure reaches the event channel.
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
             assert!(rx.try_recv().is_ok());
+        }
+
+        #[tokio::test]
+        async fn paused_action_accepts_and_drops_without_emitting() {
+            // CLAUDE-153: with the synthetic `webhook-forgejo` action paused, an
+            // otherwise-valid authenticated delivery is acked with 2xx (so Forgejo
+            // does not retry) but no event is emitted (no mint/queue). The
+            // signature/replay/rate-limit checks still ran to get here.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            // Pause the synthetic webhook action in the shared control table.
+            state::action_pause_set(&st.pool, WEBHOOK_MINT_ACTION, Some("maintenance"))
+                .await
+                .unwrap();
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig), Some("p-1")),
+                Bytes::from(raw),
+            )
+            .await;
+            // 2xx (accept-and-drop), and nothing reached the event channel.
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(
+                rx.try_recv().is_err(),
+                "paused action must not emit a mint event"
+            );
+        }
+
+        #[tokio::test]
+        async fn resumed_action_emits_again() {
+            // CLAUDE-153: clearing the pause row restores the accepted+emit path,
+            // proving the pause is a live toggle, not a permanent disable.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            state::action_pause_set(&st.pool, WEBHOOK_MINT_ACTION, None)
+                .await
+                .unwrap();
+            state::action_pause_clear(&st.pool, WEBHOOK_MINT_ACTION)
+                .await
+                .unwrap();
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig), Some("p-2")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            assert!(rx.try_recv().is_ok(), "resumed action emits again");
         }
 
         #[tokio::test]

@@ -254,7 +254,7 @@ Auth (and every action `token_ref`) reads from an encrypted secrets store. Two t
 
    `auth_token_ref` is the **name** of a stored secret. It is not the token value and not the `age` public key.
 
-## Webhook fast-path
+## Webhook (Forgejo)
 
 The daemon turns a Forgejo `action_run_failure` delivery into a triaged YouTrack issue in seconds, instead of waiting
 for the next scheduled poll. The pipeline is `POST /webhooks/forgejo/<source>` (HMAC-verified, replay-protected,
@@ -284,6 +284,8 @@ keeps pushing corrective commits until CI passes; after `max_pr_attempts` distin
 Needs Review (a PR comment, the `needs-review` label, and best-effort sets the source issue's State and assignee). The
 `enabled` toggle defaults to `true` and is a master kill switch.
 
+**CLAUDE-153: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings gates whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) queues a corrective fixup PR. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check mints nothing and queues no fixup PR, so the failure stays reported on the original PR for its author to fix in place (a `human_action` failure still mints); with it on, the corrective-fixup behavior above applies, still subject to the CLAUDE-149 open-PR suppression. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
+
 A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then
 the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the
 primary mechanism: the repo-to-project binding already lives in YouTrack (each project's enabled `GiteaChangesProcessor`
@@ -298,8 +300,8 @@ wrong destination is diagnosable.
 
 The webhook sources and the mint routing are edited on the **Settings** page (the `Webhook sources` and `Issue minting`
 sections, formerly `[webhook]` and `[mint]` in `config.toml`; CLAUDE-101), or over the API. Adding / editing a source (
-allow-list, rate limit, `secret_ref`, `log_token_ref`) takes effect live; `replay_window_secs` applies on restart. A
-mint edit is honored by the next event.
+allow-list, rate limit, `secret_ref`, `log_token_ref`) and the webhook `auto_fix` toggle (CLAUDE-153) take effect live;
+`replay_window_secs` applies on restart. A mint edit is honored by the next event.
 
 ### Auto-fix for mechanically-fixable failures (CLAUDE-104)
 

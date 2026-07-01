@@ -173,7 +173,7 @@ async fn trigger_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AckResponse>, AppError> {
-    // CLAUDE-61: the synthetic `webhook-fast-path` action is event-driven; it has
+    // CLAUDE-61: the synthetic `webhook-forgejo` action is event-driven; it has
     // no input/prompt and the scheduler never dispatches it, so a manual trigger
     // is meaningless. Reject it explicitly rather than 404 as "unknown".
     if name == crate::web::webhooks::WEBHOOK_MINT_ACTION {
@@ -243,7 +243,7 @@ async fn delete_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AckResponse>, AppError> {
-    // CLAUDE-61: the synthetic `webhook-fast-path` action has no backing YAML to
+    // CLAUDE-61: the synthetic `webhook-forgejo` action has no backing YAML to
     // remove; refuse deletion explicitly.
     if name == crate::web::webhooks::WEBHOOK_MINT_ACTION {
         return Err(AppError {

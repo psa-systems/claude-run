@@ -67,6 +67,11 @@ impl Daemon {
 
         let pool = crate::db::open(&self.paths.state_db()).await?;
 
+        // CLAUDE-153: migration 0013 renamed the webhook action's persisted DB
+        // rows; the on-disk stream-log directory lives outside SQLite, so rename
+        // it here (best-effort) so past webhook run logs stay under the new name.
+        rename_webhook_log_dir(&self.paths);
+
         // CLAUDE-101: import any runtime config section still living in
         // config.toml into the DB (once), or refuse to start if a section is
         // present in BOTH the file and the DB. Then resolve the effective
@@ -105,8 +110,8 @@ impl Daemon {
         info!(socket = %sock_path.display(), "daemon listening");
 
         let snippet = SnippetRunner::new(self.on_disk.daemon.nu_binary.as_deref());
-        // `Arc` so the same invoker backs both the dispatcher and the webhook
-        // fast-path triage classifier (CLAUDE-47).
+        // `Arc` so the same invoker backs both the dispatcher and the
+        // webhook triage classifier (CLAUDE-47).
         let claude = Arc::new(ClaudeInvoker::new(
             self.on_disk.daemon.claude_binary.as_deref(),
         ));
@@ -138,8 +143,8 @@ impl Daemon {
         // TCP router: web UI at root, JSON API under `/api/`. Same handlers
         // as the unix-socket flavor, just nested + sibling-mounted.
         let api_for_tcp = api::router((*api_state).clone());
-        // CLAUDE-61: the web layer injects the synthetic `webhook-fast-path`
-        // action only when the webhook fast-path is configured. CLAUDE-87: that
+        // CLAUDE-61: the web layer injects the synthetic `webhook-forgejo`
+        // action only when the Forgejo webhook is configured. CLAUDE-87: that
         // is now any configured source (an empty `sources` map disables it).
         // CLAUDE-101: `webhook_enabled` reflects the effective (DB-resolved)
         // config at start.
@@ -316,7 +321,7 @@ impl Daemon {
     }
 }
 
-/// Build the webhook fast-path [`crate::web::webhooks::MintContext`] (CLAUDE-47):
+/// Build the webhook [`crate::web::webhooks::MintContext`] (CLAUDE-47):
 /// resolve a provider backend (CLI-first), wrap the shared `claude` invoker in a
 /// triage [`crate::triage::ClaudeClassifier`], and bundle the on-disk mint
 /// config + caps. Returns `None` (mint disabled, the consumer runs log-only)
@@ -331,21 +336,20 @@ fn build_mint_context(
     use crate::action::ClaudeBlock;
     use crate::triage::{ClaudeClassifier, FailureClassifier};
 
-    let backend: Arc<dyn crate::provider::Backend> = match crate::provider::resolve(
-        crate::provider::DEFAULT_PRIORITY,
-    ) {
-        Ok(b) => Arc::from(b),
-        Err(e) => {
-            warn!(error = %e, "no usable provider backend; webhook fast-path runs log-only (no mint)");
-            return None;
-        }
-    };
+    let backend: Arc<dyn crate::provider::Backend> =
+        match crate::provider::resolve(crate::provider::DEFAULT_PRIORITY) {
+            Ok(b) => Arc::from(b),
+            Err(e) => {
+                warn!(error = %e, "no usable provider backend; webhook runs log-only (no mint)");
+                return None;
+            }
+        };
 
     // Classification is a single bounded-log JSON reply: no repo checkout, no
     // edit tools. Run claude read-only in a stable cwd under the webhook log dir.
     let cwd = webhook_log_dir.join("triage");
     if let Err(e) = std::fs::create_dir_all(&cwd) {
-        warn!(error = %e, "creating triage workdir failed; webhook fast-path runs log-only (no mint)");
+        warn!(error = %e, "creating triage workdir failed; webhook runs log-only (no mint)");
         return None;
     }
     let claude_cfg = ClaudeBlock {
@@ -362,7 +366,7 @@ fn build_mint_context(
         stream_log,
     ));
 
-    info!(backend = backend.name(), "webhook fast-path mint enabled");
+    info!(backend = backend.name(), "webhook mint enabled");
     Some(crate::web::webhooks::MintContext {
         pool: pool.clone(),
         classifier,
@@ -405,6 +409,36 @@ fn pidfile_lock(pidfile: &Path) -> Result<std::fs::File> {
 async fn serve_tcp(listener: tokio::net::TcpListener, app: axum::Router) -> Result<()> {
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// CLAUDE-153: rename the webhook action's on-disk stream-log directory from the
+/// old `logs/webhook-fast-path/` to `logs/webhook-forgejo/` at serve start, so
+/// past webhook run logs stay reachable under the renamed action (the DB rows
+/// are migrated by migration `0013`; the log dir lives outside SQLite).
+///
+/// Best-effort and idempotent: it acts only when the old path exists and the new
+/// one does not, so a second start (new dir already present) is a no-op, and it
+/// never clobbers a directory. Any rename failure is logged and swallowed rather
+/// than blocking startup: the logs are diagnostic history, not operational state.
+fn rename_webhook_log_dir(paths: &Paths) {
+    let logs = paths.logs_dir();
+    let old = logs.join("webhook-fast-path");
+    let new = logs.join("webhook-forgejo");
+    if old.exists() && !new.exists() {
+        match std::fs::rename(&old, &new) {
+            Ok(()) => info!(
+                from = %old.display(),
+                to = %new.display(),
+                "renamed webhook log directory to the webhook-forgejo name (CLAUDE-153)"
+            ),
+            Err(e) => warn!(
+                from = %old.display(),
+                to = %new.display(),
+                error = %e,
+                "renaming webhook log directory failed; old run logs stay under the former name"
+            ),
+        }
+    }
 }
 
 /// CLAUDE-57: classified web-UI bind failure. Carries a stable `kind` tag, a
@@ -567,7 +601,7 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
         }
         match action::load_from_path(&path) {
             Ok(la) => {
-                // CLAUDE-61: `webhook-fast-path` is a reserved synthetic action
+                // CLAUDE-61: `webhook-forgejo` is a reserved synthetic action
                 // name the web layer injects for the event-driven webhook runs.
                 // An on-disk YAML claiming it would be editable / schedulable and
                 // would collide with the synthetic entry, so refuse to index it.
@@ -1311,7 +1345,7 @@ mod tests {
     }
 
     // CLAUDE-61: an on-disk YAML claiming the reserved synthetic name
-    // `webhook-fast-path` must not be indexed (it would collide with the
+    // `webhook-forgejo` must not be indexed (it would collide with the
     // synthetic action the web layer injects, and become editable/schedulable).
     #[tokio::test]
     async fn scan_actions_refuses_reserved_synthetic_name() {
@@ -1321,10 +1355,10 @@ mod tests {
         let actions_dir = tmp.path().join("actions");
         std::fs::create_dir_all(&actions_dir).unwrap();
         // A perfectly valid action that simply claims the reserved name.
-        let file = actions_dir.join("webhook-fast-path.yml");
+        let file = actions_dir.join("webhook-forgejo.yml");
         std::fs::write(
             &file,
-            "name: webhook-fast-path\ninput:\n  command: print '[]'\nprompt: print 'hi'\nenabled: false\n",
+            "name: webhook-forgejo\ninput:\n  command: print '[]'\nprompt: print 'hi'\nenabled: false\n",
         )
         .unwrap();
 
@@ -1337,5 +1371,44 @@ mod tests {
                 .any(|r| r.name == crate::web::webhooks::WEBHOOK_MINT_ACTION),
             "a YAML using the reserved synthetic name must not be indexed"
         );
+    }
+
+    // CLAUDE-153: the webhook log dir is renamed to the new action name at start.
+    #[test]
+    fn rename_webhook_log_dir_moves_old_dir_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let old = paths.logs_dir().join("webhook-fast-path");
+        let new = paths.logs_dir().join("webhook-forgejo");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("marker.jsonl"), b"{}").unwrap();
+
+        rename_webhook_log_dir(&paths);
+        assert!(!old.exists(), "old dir is gone after the rename");
+        assert!(
+            new.join("marker.jsonl").exists(),
+            "logs moved to the new dir"
+        );
+
+        // Second start: new dir already present, old absent -> no-op, no panic.
+        rename_webhook_log_dir(&paths);
+        assert!(new.join("marker.jsonl").exists());
+    }
+
+    // CLAUDE-153: an existing new dir is never clobbered by a stray old dir.
+    #[test]
+    fn rename_webhook_log_dir_does_not_clobber_existing_new_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let old = paths.logs_dir().join("webhook-fast-path");
+        let new = paths.logs_dir().join("webhook-forgejo");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("keep.jsonl"), b"new").unwrap();
+
+        rename_webhook_log_dir(&paths);
+        // Both remain: the guard skips the rename when the new dir exists.
+        assert!(old.exists(), "old dir left intact when new already exists");
+        assert!(new.join("keep.jsonl").exists(), "new dir untouched");
     }
 }
