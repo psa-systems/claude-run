@@ -945,7 +945,11 @@ mod tests {
             .unwrap();
         assert_eq!(stored.timezone, "Europe/Paris");
         assert_eq!(stored.locale, "fr-FR");
-        assert_eq!(current_preferences().timezone, "Europe/Paris");
+        // Assert on this instance's own live copy, not the process-global
+        // `current_preferences()` snapshot: that global is single-writer in
+        // production but is rewritten by every parallel test's
+        // `LiveSettings::new`, so reading it here races (CLAUDE-154).
+        assert_eq!(live.preferences.read().await.timezone, "Europe/Paris");
 
         // Invalid timezone is rejected, nothing overwritten.
         let err = live
