@@ -2827,20 +2827,17 @@ struct AboutTpl {
     error: Option<String>,
 }
 
-/// Resolve the registry token from the configured `[update].token_ref`
+/// Build a lazy resolver for the registry token named by `[update].token_ref`
 /// (CLAUDE-55). `None` when no `token_ref` is set (the anonymous-first path).
-/// Mirrors the CLI's `resolve_update_token`.
-async fn resolve_update_token(
+/// Mirrors the CLI's `configured_update_token` (CLAUDE-158): nothing is decrypted
+/// here; the secret is resolved only on registry escalation.
+fn configured_update_token(
     pool: &SqlitePool,
     cfg: &crate::config::UpdateConfig,
-) -> Result<Option<String>, crate::error::Error> {
-    let Some(name) = cfg.token_ref.as_deref() else {
-        return Ok(None);
-    };
-    let key = crate::secrets::SecretsKey::load()?;
-    Ok(Some(
-        crate::secrets::resolve_secret(pool, &key, name).await?,
-    ))
+) -> Option<crate::update::ConfiguredToken> {
+    cfg.token_ref
+        .clone()
+        .map(|name| crate::update::ConfiguredToken::new(pool.clone(), name))
 }
 
 /// Render the About page (HTTP 200). `check` / `applied` / `error` carry the
@@ -2873,11 +2870,8 @@ async fn about_check(State(s): State<WebState>) -> Result<Response, WebError> {
         Ok(t) => t,
         Err(e) => return render_about(&s, None, None, Some(e.to_string())).await,
     };
-    let token = match resolve_update_token(&s.api.pool, &cfg).await {
-        Ok(t) => t,
-        Err(e) => return render_about(&s, None, None, Some(e.to_string())).await,
-    };
-    match crate::update::web_check(train, token).await {
+    let configured = configured_update_token(&s.api.pool, &cfg);
+    match crate::update::web_check(train, configured).await {
         Ok(outcome) => render_about(&s, Some(CheckView::from_outcome(&outcome)), None, None).await,
         Err(e) => {
             render_about(
@@ -2897,11 +2891,8 @@ async fn about_update(State(s): State<WebState>) -> Result<Response, WebError> {
         Ok(t) => t,
         Err(e) => return render_about(&s, None, None, Some(e.to_string())).await,
     };
-    let token = match resolve_update_token(&s.api.pool, &cfg).await {
-        Ok(t) => t,
-        Err(e) => return render_about(&s, None, None, Some(e.to_string())).await,
-    };
-    match crate::update::web_update(train, token).await {
+    let configured = configured_update_token(&s.api.pool, &cfg);
+    match crate::update::web_update(train, configured).await {
         Ok(tag) => render_about(&s, None, Some(tag), None).await,
         Err(e) => render_about(&s, None, None, Some(e.to_string())).await,
     }

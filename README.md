@@ -183,11 +183,9 @@ in `config.toml`), or over the API:
   `latest.sha256` sidecar rather than by semver.
 - `--version <tag>` pins an exact published tag and is independent of the train.
 
-Auth is anonymous-first. When `[update].token_ref` is set, the named secret is decrypted from the store (same mechanism
-as `web.auth_token_ref` and action `token_ref`s; the raw token never appears in `config.toml`) and used for the registry
-requests. When it is unset, a private registry still falls back to the host `fj` token on a 401/403 with
-`claude-run version check --use-fj-token` (the interactive `fj`-token escalation is CLI-only). The download is always
-verified against the published SHA-256 sidecar before the binary is atomically swapped in place.
+Auth is anonymous-first. The registry is queried with no credentials first; a token is consulted only when the registry answers 401/403. When `[update].token_ref` is set, the named secret is decrypted from the store (same mechanism as `web.auth_token_ref` and action `token_ref`s; the raw token never appears in `config.toml`) and used for the registry requests. When it is unset, a private registry still falls back to the host `fj` token on a 401/403 with `claude-run version check --use-fj-token` (the interactive `fj`-token escalation is CLI-only). The download is always verified against the published SHA-256 sidecar before the binary is atomically swapped in place.
+
+The `age` key file is only consulted on registry escalation (CLAUDE-158): a configured `token_ref` is decrypted lazily inside the 401/403 handler, not up front, so an anonymously-readable registry succeeds with no key file even when `token_ref` is set, and `--use-fj-token` escalates without touching the age store at all. This means the CLI process (not just the daemon) must have `CLAUDE_RUN_SECRETS_KEY_FILE` in its environment when the configured `token_ref` is the escalation path: the daemon gets it from its unit's `Environment=` line, but an interactive shell running `claude-run version check` / `version update` does not inherit that, so export it (same value as the daemon unit) or pass `--use-fj-token`. When escalation genuinely needs the key file and it is missing, the error names both remedies rather than the bare `CLAUDE_RUN_SECRETS_KEY_FILE is not set`.
 
 The same check / apply is available from the browser on the **About** page (linked in the nav). "Check for updates" runs
 the on-demand registry check (anonymous-first, escalating only to the configured `token_ref`) and shows current vs
