@@ -270,16 +270,22 @@ impl Updater {
 
     /// List published versions, escalating from anonymous to a caller-supplied
     /// token on 401/403. `authorize` is invoked ONLY when anonymous access is
-    /// refused; it returns `Some(token)` to retry or `None` to give up. Returns
-    /// the credential that worked (so a download can reuse it) and the versions.
-    pub async fn list_versions(
-        &self,
-        authorize: impl FnOnce() -> Option<String>,
-    ) -> Result<(Cred, Vec<String>)> {
+    /// refused; its future resolves to `Ok(Some(token))` to retry, `Ok(None)` to
+    /// give up, or `Err` when the escalation credential itself cannot be produced
+    /// (CLAUDE-158: e.g. the configured `token_ref` secret cannot be decrypted).
+    /// Because the callback is async and lazy, any key-file load / secret decrypt
+    /// happens only on the escalation path and never on the anonymous-first path.
+    /// Returns the credential that worked (so a download can reuse it) and the
+    /// versions.
+    pub async fn list_versions<F, Fut>(&self, authorize: F) -> Result<(Cred, Vec<String>)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Option<String>>>,
+    {
         if let AuthOutcome::Ok(v) = self.try_list(&Cred::Anonymous).await? {
             return Ok((Cred::Anonymous, v));
         }
-        match authorize() {
+        match authorize().await? {
             Some(token) => {
                 let cred = Cred::Token(token);
                 match self.try_list(&cred).await? {
@@ -512,7 +518,7 @@ fn install_err(current: &Path, dir: &Path, e: std::io::Error) -> Error {
 // results so both the CLI commands below and the web About handlers call the
 // same logic. The web path is anonymous-first, escalating only to the
 // configured `[update].token_ref`; the interactive `--use-fj-token` escalation
-// stays CLI-only (see `authorizer`).
+// stays CLI-only (see `authorize`).
 // ---------------------------------------------------------------------------
 
 /// Resolve the check outcome from an already-listed registry. `updater`/`cred`
@@ -606,26 +612,84 @@ pub async fn apply_core(
     Ok(target)
 }
 
+/// Lazily decrypts the configured `[update].token_ref` secret (CLAUDE-55) only
+/// when the registry demands escalation. Holds the DB pool and the secret name;
+/// [`ConfiguredToken::resolve`] loads the age key file and decrypts the secret,
+/// and it runs ONLY inside the `list_versions` authorizer, i.e. only on a
+/// 401/403 and only when the configured-token branch is taken.
+///
+/// CLAUDE-158: this keeps `version check` / `version update` anonymous-first. A
+/// configured `token_ref` no longer forces `CLAUDE_RUN_SECRETS_KEY_FILE` to be
+/// present up front, so an anonymously-readable registry succeeds with no key
+/// file even when `token_ref` is set, and `--use-fj-token` can escalate without
+/// touching the age store at all.
+pub struct ConfiguredToken {
+    pool: sqlx::SqlitePool,
+    name: String,
+}
+
+impl ConfiguredToken {
+    /// Build a lazy resolver for the secret named `name` (from
+    /// `[update].token_ref`) against `pool`. Nothing is decrypted here.
+    pub fn new(pool: sqlx::SqlitePool, name: String) -> Self {
+        Self { pool, name }
+    }
+
+    /// Decrypt the configured secret. Runs only on the registry escalation path.
+    /// When the key file env var is unset, returns an actionable error naming
+    /// both remedies rather than the bare `CLAUDE_RUN_SECRETS_KEY_FILE is not
+    /// set` (CLAUDE-158); other load failures (file missing / unparseable) pass
+    /// through with their already-actionable messages.
+    async fn resolve(&self) -> Result<String> {
+        if std::env::var_os(crate::secrets::KEY_FILE_ENV).is_none() {
+            return Err(Error::Secret(format!(
+                "the registry requires authentication and `[update].token_ref` is configured, \
+                 but {KEY} is not set in this process, so the configured token cannot be \
+                 decrypted. Export {KEY} to the same age key file the daemon uses (see the \
+                 daemon unit's Environment=), or re-run with --use-fj-token to escalate via the \
+                 operator fj keys.json instead.",
+                KEY = crate::secrets::KEY_FILE_ENV
+            )));
+        }
+        let key = crate::secrets::SecretsKey::load()?;
+        crate::secrets::resolve_secret(&self.pool, &key, &self.name).await
+    }
+}
+
 /// CLAUDE-129: web entry for the on-demand check. Builds the updater from env,
-/// lists versions anonymous-first (escalating only to `configured_token`), and
-/// returns the structured outcome. Used by `POST /about/check`.
+/// lists versions anonymous-first (escalating only to the `configured` token),
+/// and returns the structured outcome. Used by `POST /about/check`.
 pub async fn web_check(
     train: UpdateTrain,
-    configured_token: Option<String>,
+    configured: Option<ConfiguredToken>,
 ) -> Result<CheckOutcome> {
     let updater = Updater::new()?;
-    let (cred, versions) = updater.list_versions(move || configured_token).await?;
+    let (cred, versions) = updater
+        .list_versions(|| resolve_configured(configured))
+        .await?;
     check_core(train, &updater, &cred, &versions).await
 }
 
 /// CLAUDE-129: web entry for the apply action. Builds the updater from env,
-/// lists versions anonymous-first (escalating only to `configured_token`),
+/// lists versions anonymous-first (escalating only to the `configured` token),
 /// and applies the newest build on `train`. Returns the applied tag. Does NOT
 /// restart the daemon. Used by `POST /about/update`.
-pub async fn web_update(train: UpdateTrain, configured_token: Option<String>) -> Result<String> {
+pub async fn web_update(train: UpdateTrain, configured: Option<ConfiguredToken>) -> Result<String> {
     let updater = Updater::new()?;
-    let (cred, versions) = updater.list_versions(move || configured_token).await?;
+    let (cred, versions) = updater
+        .list_versions(|| resolve_configured(configured))
+        .await?;
     apply_core(train, &updater, &cred, &versions).await
+}
+
+/// The web escalation path has no `--use-fj-token` / interactive fallback: it
+/// uses the configured `token_ref` if set, otherwise gives up (the daemon runs
+/// with the key file in its environment, so a configured token always resolves).
+async fn resolve_configured(configured: Option<ConfiguredToken>) -> Result<Option<String>> {
+    match configured {
+        Some(ct) => ct.resolve().await.map(Some),
+        None => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -634,17 +698,18 @@ pub async fn web_update(train: UpdateTrain, configured_token: Option<String>) ->
 
 /// `claude-run version check [--train <release|latest>]`.
 ///
-/// `configured_token` is the registry token resolved from `[update].token_ref`
-/// (CLAUDE-55), or `None` for the anonymous-first path.
+/// `configured` lazily resolves `[update].token_ref` (CLAUDE-55) on escalation,
+/// or `None` when no `token_ref` is set. It is decrypted only if the registry
+/// answers 401/403 and the configured-token branch wins (CLAUDE-158).
 pub async fn check(
     train: UpdateTrain,
     use_fj_token: bool,
-    configured_token: Option<String>,
+    configured: Option<ConfiguredToken>,
 ) -> Result<i32> {
     let updater = Updater::new()?;
     let host = updater.registry.host.clone();
     let (cred, versions) = updater
-        .list_versions(authorizer(&host, use_fj_token, configured_token))
+        .list_versions(|| authorize(&host, use_fj_token, configured))
         .await?;
     let outcome = check_core(train, &updater, &cred, &versions).await?;
     print_check_outcome(&outcome);
@@ -707,19 +772,20 @@ fn print_check_outcome(o: &CheckOutcome) {
 
 /// `claude-run version update [--train <release|latest>] [--version <tag>]`.
 ///
-/// `configured_token` is the registry token resolved from `[update].token_ref`
-/// (CLAUDE-55), or `None` for the anonymous-first path.
+/// `configured` lazily resolves `[update].token_ref` (CLAUDE-55) on escalation,
+/// or `None` when no `token_ref` is set. Shares the identical lazy-resolution
+/// path with [`check`] (CLAUDE-158).
 pub async fn update(
     train: UpdateTrain,
     pin: Option<String>,
     use_fj_token: bool,
-    configured_token: Option<String>,
+    configured: Option<ConfiguredToken>,
     yes: bool,
 ) -> Result<i32> {
     let updater = Updater::new()?;
     let host = updater.registry.host.clone();
     let (cred, versions) = updater
-        .list_versions(authorizer(&host, use_fj_token, configured_token))
+        .list_versions(|| authorize(&host, use_fj_token, configured))
         .await?;
 
     let target = select_target(train, &versions, pin.as_deref())?;
@@ -746,35 +812,53 @@ fn available_list(versions: &[String]) -> String {
     }
 }
 
-/// Build the `authorize` callback for [`Updater::list_versions`]: only consulted
-/// on a 401/403. A `configured_token` (CLAUDE-55, from `[update].token_ref`) is
-/// used directly with no prompt. Otherwise confirmation is granted by
-/// `--use-fj-token`, the `CLAUDE_RUN_USE_FJ_TOKEN` env opt-in, or an interactive
-/// prompt; the token then comes from `fj`'s `keys.json` for the host.
-fn authorizer(
+/// The `authorize` callback for [`Updater::list_versions`]: only consulted on a
+/// 401/403.
+///
+/// Precedence (CLAUDE-158, unchanged from the eager path when the key file is
+/// present): a configured `token_ref` (CLAUDE-55) is preferred and is decrypted
+/// lazily here via [`ConfiguredToken::resolve`], so the age key file is loaded
+/// only at escalation time. When it resolves, it wins.
+///
+/// When the configured token cannot be produced (e.g. `CLAUDE_RUN_SECRETS_KEY_FILE`
+/// is unset), an explicit `--use-fj-token` / `CLAUDE_RUN_USE_FJ_TOKEN` opt-in acts
+/// as the escalation fallback and pulls the token from `fj`'s `keys.json` without
+/// touching the age store, so `--use-fj-token` works with `token_ref` set and no
+/// key file. Without that opt-in the decrypt error (already actionable, naming
+/// both remedies) surfaces.
+///
+/// With no `token_ref` configured, escalation is granted by the opt-in or an
+/// interactive prompt, and the token comes from `fj`'s `keys.json` for the host.
+async fn authorize(
     host: &str,
     use_fj_token: bool,
-    configured_token: Option<String>,
-) -> impl FnOnce() -> Option<String> + '_ {
-    move || {
-        if let Some(token) = configured_token {
-            return Some(token);
+    configured: Option<ConfiguredToken>,
+) -> Result<Option<String>> {
+    let opt_in = use_fj_token
+        || matches!(
+            std::env::var("CLAUDE_RUN_USE_FJ_TOKEN").as_deref(),
+            Ok("1") | Ok("true")
+        );
+    if let Some(ct) = configured {
+        match ct.resolve().await {
+            Ok(token) => return Ok(Some(token)),
+            Err(_) if opt_in => {
+                // The configured token could not be decrypted, but the operator
+                // explicitly opted into the fj store: escalate via it instead.
+                return Ok(fj_token_for_host(host));
+            }
+            Err(e) => return Err(e),
         }
-        let opt_in = use_fj_token
-            || matches!(
-                std::env::var("CLAUDE_RUN_USE_FJ_TOKEN").as_deref(),
-                Ok("1") | Ok("true")
-            );
-        let confirmed = opt_in
-            || (std::io::stdin().is_terminal()
-                && confirm(&format!(
-                    "Registry requires authentication. Use the fj token for {host}?"
-                )));
-        if !confirmed {
-            return None;
-        }
-        fj_token_for_host(host)
     }
+    let confirmed = opt_in
+        || (std::io::stdin().is_terminal()
+            && confirm(&format!(
+                "Registry requires authentication. Use the fj token for {host}?"
+            )));
+    if !confirmed {
+        return Ok(None);
+    }
+    Ok(fj_token_for_host(host))
 }
 
 /// Look up the `fj` token for `host` in `~/.local/share/forgejo-cli/keys.json`.
@@ -1027,7 +1111,7 @@ mod tests {
         let (base, _h) = spawn_stub(false).await;
         let updater = Updater::with_registry(registry_for(&base)).unwrap();
         let (cred, versions) = updater
-            .list_versions(|| panic!("authorize must not be called when anonymous works"))
+            .list_versions(|| async { panic!("authorize must not be called when anonymous works") })
             .await
             .unwrap();
         assert!(matches!(cred, Cred::Anonymous));
@@ -1043,7 +1127,7 @@ mod tests {
         let (base, _h) = spawn_stub(true).await;
         let updater = Updater::with_registry(registry_for(&base)).unwrap();
         let (cred, versions) = updater
-            .list_versions(|| Some("GOODTOKEN".to_string()))
+            .list_versions(|| async { Ok(Some("GOODTOKEN".to_string())) })
             .await
             .unwrap();
         assert!(matches!(cred, Cred::Token(_)));
@@ -1054,7 +1138,10 @@ mod tests {
     async fn fails_when_token_declined() {
         let (base, _h) = spawn_stub(true).await;
         let updater = Updater::with_registry(registry_for(&base)).unwrap();
-        let err = updater.list_versions(|| None).await.unwrap_err();
+        let err = updater
+            .list_versions(|| async { Ok(None) })
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("requires authentication"));
     }
 
@@ -1063,10 +1150,146 @@ mod tests {
         let (base, _h) = spawn_stub(true).await;
         let updater = Updater::with_registry(registry_for(&base)).unwrap();
         let err = updater
-            .list_versions(|| Some("WRONG".to_string()))
+            .list_versions(|| async { Ok(Some("WRONG".to_string())) })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("rejected the fj token"));
+    }
+
+    // ---- lazy configured-token resolution (CLAUDE-158) ---------------------
+
+    async fn mem_pool() -> sqlx::SqlitePool {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::db::MIGRATOR.run(&pool).await.unwrap();
+        pool
+    }
+
+    fn write_test_key(dir: &Path) -> PathBuf {
+        use age::secrecy::ExposeSecret;
+        let identity = age::x25519::Identity::generate();
+        let path = dir.join("key.txt");
+        std::fs::write(&path, identity.to_string().expose_secret()).unwrap();
+        path
+    }
+
+    /// AC1/AC6: with `token_ref` set but the registry anonymously readable, the
+    /// authorizer never runs, so the key file is never consulted even when
+    /// `CLAUDE_RUN_SECRETS_KEY_FILE` is unset. Anonymous-first is preserved.
+    #[tokio::test]
+    async fn anonymous_success_with_token_ref_and_no_key_file() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+        let (base, _h) = spawn_stub(false).await;
+        let updater = Updater::with_registry(registry_for(&base)).unwrap();
+        let host = updater.registry.host.clone();
+        // The pool is never queried and the key file never loaded because the
+        // anonymous request succeeds first.
+        let pool = mem_pool().await;
+        let configured = Some(ConfiguredToken::new(pool, "registry-token".to_string()));
+        let (cred, versions) = updater
+            .list_versions(|| authorize(&host, false, configured))
+            .await
+            .unwrap();
+        assert!(matches!(cred, Cred::Anonymous));
+        assert_eq!(
+            select_newest(&versions),
+            Some(semver::Version::parse("0.2.0").unwrap())
+        );
+    }
+
+    /// AC4: with `token_ref` set, the key file present, and a 401 registry, the
+    /// configured secret is decrypted lazily on escalation and used. Behavior
+    /// matches the pre-CLAUDE-158 eager path.
+    #[tokio::test]
+    async fn escalation_uses_configured_token_when_key_file_present() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = write_test_key(tmp.path());
+        std::env::set_var(crate::secrets::KEY_FILE_ENV, &key_path);
+
+        let key = crate::secrets::SecretsKey::load_from_file(&key_path).unwrap();
+        let pool = mem_pool().await;
+        let ciphertext = key.encrypt("GOODTOKEN").unwrap();
+        crate::state::secret_create(&pool, "registry-token", &ciphertext)
+            .await
+            .unwrap();
+
+        let (base, _h) = spawn_stub(true).await;
+        let updater = Updater::with_registry(registry_for(&base)).unwrap();
+        let host = updater.registry.host.clone();
+        let configured = Some(ConfiguredToken::new(pool, "registry-token".to_string()));
+        let (cred, versions) = updater
+            .list_versions(|| authorize(&host, false, configured))
+            .await
+            .unwrap();
+        assert!(matches!(cred, Cred::Token(_)));
+        assert_eq!(versions.len(), 3);
+        std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+    }
+
+    /// AC3: with `token_ref` set, the key file unset, no `--use-fj-token`, and a
+    /// 401 registry, escalation fails with an actionable message naming both
+    /// remedies rather than the bare `CLAUDE_RUN_SECRETS_KEY_FILE is not set`.
+    #[tokio::test]
+    async fn escalation_without_key_file_yields_actionable_error() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+        let (base, _h) = spawn_stub(true).await;
+        let updater = Updater::with_registry(registry_for(&base)).unwrap();
+        let host = updater.registry.host.clone();
+        let pool = mem_pool().await;
+        let configured = Some(ConfiguredToken::new(pool, "registry-token".to_string()));
+        let err = updater
+            .list_versions(|| authorize(&host, false, configured))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        // Names both remedies, and is not the bare "is not set" error.
+        assert!(msg.contains(crate::secrets::KEY_FILE_ENV), "msg: {msg}");
+        assert!(msg.contains("--use-fj-token"), "msg: {msg}");
+        assert!(
+            msg != format!("secret: {} is not set", crate::secrets::KEY_FILE_ENV),
+            "should not be the bare error, got: {msg}"
+        );
+    }
+
+    /// AC2: with `token_ref` set, the key file unset, and `--use-fj-token`
+    /// passed, escalation falls back to the `fj` `keys.json` token and never
+    /// fails on the missing key file. The age store is not touched.
+    #[tokio::test]
+    async fn use_fj_token_escalates_when_key_file_absent() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+
+        // Point `fj`'s data dir at a temp keys.json holding the stub's token.
+        let tmp = tempfile::tempdir().unwrap();
+        let host = "registry.example";
+        let keys_dir = tmp.path().join("forgejo-cli");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+        std::fs::write(
+            keys_dir.join("keys.json"),
+            serde_json::json!({"hosts": {host: {"token": "GOODTOKEN"}}}).to_string(),
+        )
+        .unwrap();
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+
+        let pool = mem_pool().await;
+        let configured = Some(ConfiguredToken::new(pool, "registry-token".to_string()));
+        // Missing key file -> configured resolve fails, but the explicit fj
+        // opt-in escalates via keys.json instead of surfacing the decrypt error.
+        let resolved = authorize(host, true, configured).await.unwrap();
+        assert_eq!(resolved.as_deref(), Some("GOODTOKEN"));
+
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
     }
 
     // ---- non-interactive cores (CLAUDE-129) --------------------------------
@@ -1077,7 +1300,7 @@ mod tests {
     async fn check_core_release_reports_newest() {
         let (base, _h) = spawn_stub(false).await;
         let updater = Updater::with_registry(registry_for(&base)).unwrap();
-        let (cred, versions) = updater.list_versions(|| None).await.unwrap();
+        let (cred, versions) = updater.list_versions(|| async { Ok(None) }).await.unwrap();
         let outcome = check_core(UpdateTrain::Release, &updater, &cred, &versions)
             .await
             .unwrap();
@@ -1096,7 +1319,7 @@ mod tests {
     async fn check_core_latest_compares_digests() {
         let (base, _h) = spawn_stub(false).await;
         let updater = Updater::with_registry(registry_for(&base)).unwrap();
-        let (cred, versions) = updater.list_versions(|| None).await.unwrap();
+        let (cred, versions) = updater.list_versions(|| async { Ok(None) }).await.unwrap();
         let outcome = check_core(UpdateTrain::Latest, &updater, &cred, &versions)
             .await
             .unwrap();
@@ -1114,7 +1337,7 @@ mod tests {
     async fn apply_core_refuses_on_checksum_mismatch() {
         let (base, _h) = spawn_stub(false).await;
         let updater = Updater::with_registry(registry_for(&base)).unwrap();
-        let (cred, versions) = updater.list_versions(|| None).await.unwrap();
+        let (cred, versions) = updater.list_versions(|| async { Ok(None) }).await.unwrap();
         let err = apply_core(UpdateTrain::Release, &updater, &cred, &versions)
             .await
             .unwrap_err();
