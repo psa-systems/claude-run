@@ -428,8 +428,8 @@ async fn version_cmd(
             let pool = db::open(&paths.state_db()).await?;
             let update_cfg = settings::effective_update(&pool, on_disk).await?;
             let train = resolve_train(train, &update_cfg.train)?;
-            let token = resolve_update_token(&pool, &update_cfg).await?;
-            update::check(train, use_fj_token, token).await
+            let configured = configured_update_token(&pool, &update_cfg);
+            update::check(train, use_fj_token, configured).await
         }
         VersionCmd::Update {
             version,
@@ -440,8 +440,8 @@ async fn version_cmd(
             let pool = db::open(&paths.state_db()).await?;
             let update_cfg = settings::effective_update(&pool, on_disk).await?;
             let train = resolve_train(train, &update_cfg.train)?;
-            let token = resolve_update_token(&pool, &update_cfg).await?;
-            update::update(train, version, use_fj_token, token, yes).await
+            let configured = configured_update_token(&pool, &update_cfg);
+            update::update(train, version, use_fj_token, configured, yes).await
         }
     }
 }
@@ -457,19 +457,20 @@ fn resolve_train(
     }
 }
 
-/// Resolve the registry token from `[update].token_ref` (CLAUDE-55). `None` when
-/// no `token_ref` is configured (the anonymous-first path). When set, the secret
-/// is decrypted from the store; a missing secret or key file surfaces an error.
-async fn resolve_update_token(
+/// Build a lazy resolver for the registry token named by `[update].token_ref`
+/// (CLAUDE-55). `None` when no `token_ref` is configured (the anonymous-first
+/// path). CLAUDE-158: nothing is decrypted here; the age key file is loaded and
+/// the secret decrypted only if the registry demands escalation (401/403) and
+/// the configured-token branch is taken, so a configured `token_ref` no longer
+/// forces `CLAUDE_RUN_SECRETS_KEY_FILE` to be present up front.
+fn configured_update_token(
     pool: &sqlx::SqlitePool,
     update_cfg: &cfg::UpdateConfig,
-) -> claude_run::error::Result<Option<String>> {
-    let Some(name) = update_cfg.token_ref.as_deref() else {
-        return Ok(None);
-    };
-    let key = secrets::SecretsKey::load()?;
-    let token = secrets::resolve_secret(pool, &key, name).await?;
-    Ok(Some(token))
+) -> Option<update::ConfiguredToken> {
+    update_cfg
+        .token_ref
+        .clone()
+        .map(|name| update::ConfiguredToken::new(pool.clone(), name))
 }
 
 async fn run_action(
