@@ -13,6 +13,84 @@ pub fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// Current time as epoch milliseconds. Matches the unit `yt issue inspect --json`
+/// reports linked-issue `resolved` timestamps in, so the dependency gate's
+/// `blocked_until` backoff (CLAUDE-161) is directly comparable.
+pub fn now_epoch_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+/// Persisted dependency-gate backoff state for one (action, issue) (CLAUDE-161).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyGateState {
+    /// Epoch ms before which the gate does not re-evaluate the issue.
+    pub blocked_until_ms: i64,
+    /// Canonical signature of the unmet-blocker set at the last evaluation;
+    /// drives comment idempotency (re-comment only when it changes).
+    pub signature: String,
+}
+
+/// Read the dependency-gate backoff row for `(action, key)`, if any.
+pub async fn dependency_gate_get(
+    pool: &SqlitePool,
+    action: &str,
+    key: &str,
+) -> Result<Option<DependencyGateState>> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT blocked_until, signature FROM dependency_gate \
+         WHERE action_name = ? AND job_key = ?",
+    )
+    .bind(action)
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(
+        row.map(|(blocked_until_ms, signature)| DependencyGateState {
+            blocked_until_ms,
+            signature,
+        }),
+    )
+}
+
+/// Record (or refresh) the dependency-gate backoff for `(action, key)`.
+pub async fn dependency_gate_upsert(
+    pool: &SqlitePool,
+    action: &str,
+    key: &str,
+    blocked_until_ms: i64,
+    signature: &str,
+) -> Result<()> {
+    let now = now_iso();
+    sqlx::query(
+        r#"
+        INSERT INTO dependency_gate (action_name, job_key, blocked_until, signature, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(action_name, job_key) DO UPDATE SET
+            blocked_until = excluded.blocked_until,
+            signature = excluded.signature,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(action)
+    .bind(key)
+    .bind(blocked_until_ms)
+    .bind(signature)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Drop the dependency-gate row for `(action, key)` (its dependencies cleared).
+pub async fn dependency_gate_clear(pool: &SqlitePool, action: &str, key: &str) -> Result<()> {
+    sqlx::query("DELETE FROM dependency_gate WHERE action_name = ? AND job_key = ?")
+        .bind(action)
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn attempts_get(pool: &SqlitePool, action: &str, key: &str) -> Result<u32> {
     let row: Option<(i64,)> =
         sqlx::query_as("SELECT count FROM attempt_counters WHERE action_name = ? AND job_key = ?")

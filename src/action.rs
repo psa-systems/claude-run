@@ -198,6 +198,11 @@ pub struct YoutrackSource {
     /// `yt` assignee argument (a login, `me`, or `unassigned`). `None` (the
     /// default) leaves the Assignee untouched, exactly as before.
     pub assignee: Option<String>,
+    /// Pre-clone dependency gate (CLAUDE-161): skip a queued issue whose blockers
+    /// are still open, leaving it Queued so it auto-resumes when they clear.
+    /// Enabled by default; `enabled: false` makes the gate a no-op.
+    #[serde(skip_serializing_if = "Dependencies::is_default")]
+    pub dependencies: Dependencies,
 }
 
 impl Default for YoutrackSource {
@@ -211,8 +216,58 @@ impl Default for YoutrackSource {
             prompt: None,
             automerge: Automerge::default(),
             assignee: None,
+            dependencies: Dependencies::default(),
         }
     }
+}
+
+/// Pre-clone dependency gate settings (CLAUDE-161). Before the clone and the
+/// `claude --print` invocation, a queued issue with any unmet dependency link is
+/// left Queued (no transition to Working), consumes no attempt, and posts a
+/// blocker comment (idempotently). Blocking is by direction-resolved link `verb`
+/// (YT-40): the defaults block `depends on` (Depend INWARD, an open blocker) and
+/// `parent for` (Subtask OUTWARD, an open child), never `is required for` /
+/// `subtask of`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Dependencies {
+    /// Master switch. `true` (the default) runs the gate; `false` makes it a
+    /// no-op and pickup proceeds exactly as before.
+    pub enabled: bool,
+    /// Backoff (humantime, e.g. `5m`) before a blocked issue is re-evaluated.
+    /// While the window is open the issue stays Queued with no `yt` read and no
+    /// comment, so repeated polls do not spam the issue.
+    pub recheck_timeout: String,
+    /// Direction-resolved link verbs that block. A queued issue is blocked when
+    /// it has any link whose `verb` is listed here and whose target is
+    /// unresolved.
+    pub block_on: Vec<String>,
+}
+
+impl Default for Dependencies {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            recheck_timeout: default_recheck_timeout(),
+            block_on: default_block_on(),
+        }
+    }
+}
+
+impl Dependencies {
+    /// True when every field is at its default. Used to skip serializing an
+    /// untouched `dependencies` block so existing action YAML stays unchanged.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn default_recheck_timeout() -> String {
+    "5m".to_string()
+}
+
+fn default_block_on() -> Vec<String> {
+    vec!["depends on".to_string(), "parent for".to_string()]
 }
 
 /// Opt-in, CI-gated automerge of the PR the runner opens after a successful
@@ -706,6 +761,63 @@ post:
             "https://api.githubcopilot.com/mcp/"
         );
         assert!(cfg.github.token_ref.is_none());
+    }
+
+    /// CLAUDE-161: the dependency gate defaults to on, a 5m re-check backoff, and
+    /// blocking on `depends on` / `parent for`, matching the issue spec. A bare
+    /// `native: {}` resolves them.
+    #[test]
+    fn native_config_dependency_gate_defaults() {
+        let loaded = validate_str(NATIVE, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        let deps = &cfg.youtrack.dependencies;
+        assert!(deps.enabled);
+        assert_eq!(deps.recheck_timeout, "5m");
+        assert_eq!(deps.block_on, vec!["depends on", "parent for"]);
+    }
+
+    /// CLAUDE-161: an untouched `dependencies` block round-trips out of the
+    /// serialized YAML (`skip_serializing_if`), so saving an action through the
+    /// web form does not write a redundant block.
+    #[test]
+    fn native_config_dependency_gate_skips_serializing_default() {
+        let cfg = YoutrackConfig::default();
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("dependencies"),
+            "default dependencies must not serialize: {yaml}"
+        );
+    }
+
+    /// CLAUDE-161: a non-humantime `recheck_timeout` is rejected at load with a
+    /// typed `ActionInvalidField`, so a bad value fails fast rather than silently
+    /// falling back at gate time.
+    #[test]
+    fn validate_str_rejects_bad_recheck_timeout() {
+        let raw = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    dependencies:\n      recheck_timeout: \"not-a-duration\"\n";
+        let err = validate_str(raw, "<candidate>").unwrap_err();
+        assert!(
+            matches!(&err, Error::ActionInvalidField { field, .. }
+                if field == "native.youtrack.dependencies.recheck_timeout"),
+            "got {err:?}"
+        );
+    }
+
+    /// CLAUDE-161: a valid humantime `recheck_timeout` and an `enabled: false`
+    /// override parse cleanly.
+    #[test]
+    fn native_config_parses_dependency_overrides() {
+        let raw = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    dependencies:\n      enabled: false\n      recheck_timeout: 30s\n      block_on:\n        - depends on\n";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        let deps = &cfg.youtrack.dependencies;
+        assert!(!deps.enabled);
+        assert_eq!(deps.recheck_timeout, "30s");
+        assert_eq!(deps.block_on, vec!["depends on"]);
     }
 
     #[test]
@@ -1235,6 +1347,20 @@ fn validate_native(action: &Action, label: &str) -> Result<()> {
             native: native.kind().as_str().to_string(),
             path: label.to_string(),
         });
+    }
+    // CLAUDE-161: reject a `dependencies.recheck_timeout` that is not a valid
+    // humantime duration at load, so a bad value fails fast instead of at gate
+    // time (where it would silently fall back to the default).
+    if let NativeConfig::Youtrack(cfg) = native {
+        let raw = &cfg.youtrack.dependencies.recheck_timeout;
+        if let Err(e) = humantime::parse_duration(raw) {
+            return Err(Error::ActionInvalidField {
+                name: action.name.clone(),
+                field: "native.youtrack.dependencies.recheck_timeout".to_string(),
+                reason: format!("`{raw}` is not a valid duration: {e}"),
+                path: label.to_string(),
+            });
+        }
     }
     Ok(())
 }

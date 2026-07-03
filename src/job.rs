@@ -434,6 +434,11 @@ pub enum ProcessedJob {
     NeedsReview { key: String },
     /// Transient claude error - job will be retried next firing.
     Transient { key: String },
+    /// CLAUDE-161: the pre-clone dependency gate found an unmet dependency, so the
+    /// issue was left Queued and never cloned or handed to claude. Consumes no
+    /// attempt (like `Filtered` / `CapHit`, no `attempts_increment` runs on this
+    /// path). `blockers` lists the unmet dependencies (`ID (verb)`), for logging.
+    Blocked { key: String, blockers: Vec<String> },
     /// Job reached at least pre steps; outcome record is meaningful.
     Done {
         key: String,

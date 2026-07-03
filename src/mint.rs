@@ -792,6 +792,9 @@ mod tests {
                 .push(format!("comment {key} | {body}"));
             Ok(())
         }
+        fn issue_links(&self, _key: &str) -> Result<Vec<crate::provider::IssueLink>> {
+            unreachable!("mint does not read issue links")
+        }
         fn resolve_vcs(&self, _project_key: &str) -> Result<VcsRepo> {
             unreachable!("mint does not resolve vcs")
         }

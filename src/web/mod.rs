@@ -2049,6 +2049,20 @@ fn youtrack_form_to_yaml(
             am_default.check_interval_seconds,
         )?,
     };
+    // CLAUDE-161: preserve a hand-written `dependencies` block. The structured
+    // form has no dependency-gate UI, so read the existing
+    // `native.youtrack.dependencies` sub-block off the parsed on-disk action
+    // (before we overwrite the `native` key below) and carry it forward, so
+    // editing any other field in the form does not silently reset the gate.
+    // Missing / unparsable -> the default (enabled 5m gate); `prune_yaml` still
+    // drops an all-default block so an untouched action writes no `dependencies`.
+    youtrack.dependencies = map
+        .get("native")
+        .and_then(|n| n.get("youtrack"))
+        .and_then(|y| y.get("dependencies"))
+        .cloned()
+        .and_then(|d| serde_yaml::from_value::<crate::action::Dependencies>(d).ok())
+        .unwrap_or_default();
     // CLAUDE-54: preserve a hand-written `github` block. The form exposes only
     // `token_ref`, so read the existing `native.github` sub-block off the parsed
     // on-disk action (before we overwrite the `native` key below) to carry its
@@ -4592,6 +4606,28 @@ mod tests {
             assert_eq!(yt.github.token_ref.as_deref(), Some("gh-new"));
             assert_eq!(yt.github.hosts, vec!["ghe.example.com".to_string()]);
             assert_eq!(yt.github.mcp_endpoint, "https://ghe.example.com/mcp/");
+        }
+
+        #[test]
+        fn dependencies_block_preserved_on_save() {
+            // CLAUDE-161 no-wipe regression: an action whose YAML carries a
+            // hand-written `dependencies` block survives a structured-form save
+            // intact, since the form has no dependency-gate UI to reconstruct it.
+            let base: serde_yaml::Value = serde_yaml::from_str(
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    dependencies:\n      enabled: false\n      recheck_timeout: 30s\n      block_on:\n        - depends on\n",
+            )
+            .unwrap();
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            let yaml = youtrack_form_to_yaml(base, &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            let deps = &yt.youtrack.dependencies;
+            assert!(!deps.enabled, "hand-written enabled:false must survive");
+            assert_eq!(deps.recheck_timeout, "30s");
+            assert_eq!(deps.block_on, vec!["depends on".to_string()]);
         }
 
         #[test]

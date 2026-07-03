@@ -545,6 +545,34 @@ async fn process_job(
         }
     }
 
+    // ---- dependency gate (CLAUDE-161) ----
+    // AI Agent is confirmed Queued and nothing has been mutated. Skip a queued
+    // issue whose blockers are still open: leave it Queued (auto-resumes when the
+    // dependency clears), consume no attempt, and never clone or invoke claude.
+    // A disabled gate (or a met/absent dependency set) returns `Proceed`.
+    match dependency_gate(pool, backend, src, &action.name, key).await {
+        Ok(GateDecision::Proceed) => {}
+        Ok(GateDecision::Blocked { blockers }) => {
+            info!(
+                action = %action.name,
+                key = %key,
+                blockers = %blockers.join("; "),
+                "job blocked by unmet dependencies; left Queued, no attempt consumed"
+            );
+            return Ok(ProcessedJob::Blocked {
+                key: key.clone(),
+                blockers,
+            });
+        }
+        // A dependency-read failure must not strand an otherwise-workable issue:
+        // fall back to the pre-gate behavior (pick it up; the agent self-parks if
+        // it truly cannot proceed). The gate is an optimization over that correct
+        // baseline, not a correctness gate.
+        Err(e) => {
+            warn!(action = %action.name, key = %key, error = %e, "dependency gate read failed; proceeding with pickup");
+        }
+    }
+
     // CLAUDE-102: a preserved workdir from a failed finalize (unpushed commits)
     // must not be clobbered by this attempt's clone; move it aside first.
     preserve_aside(&workdir_path);
@@ -697,6 +725,147 @@ async fn process_job(
         stream_log_path,
         duration_ms: started.elapsed().as_millis() as i64,
         timed_out: claude_result.timed_out,
+    })
+}
+
+/// One unmet blocker: the linked issue's id and the direction-resolved verb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Blocker {
+    id: String,
+    verb: String,
+}
+
+impl Blocker {
+    /// Human rendering used in the comment, the outcome, and the signature.
+    fn display(&self) -> String {
+        format!("{} ({})", self.id, self.verb)
+    }
+}
+
+/// The pre-clone dependency gate's verdict (CLAUDE-161).
+enum GateDecision {
+    /// No unmet dependency: pickup proceeds exactly as before.
+    Proceed,
+    /// Blocked by unmet dependencies; the issue stays Queued.
+    Blocked { blockers: Vec<String> },
+}
+
+/// Pure: the unmet blockers among `links`, per the `block_on` verbs. A link
+/// blocks iff its direction-resolved `verb` is listed in `block_on` and its
+/// target is unresolved (`resolved` is `None`). Direction is already baked into
+/// the verb by YT-40 (`depends on` = Depend INWARD, `parent for` = Subtask
+/// OUTWARD, etc.), so matching the verb resolves direction exactly. The result is
+/// sorted and de-duplicated so its signature is order-independent.
+fn unmet_blockers(links: &[provider::IssueLink], block_on: &[String]) -> Vec<Blocker> {
+    let mut out: Vec<Blocker> = links
+        .iter()
+        .filter(|l| l.resolved.is_none())
+        .filter(|l| block_on.iter().any(|v| v == &l.verb))
+        .map(|l| Blocker {
+            id: l.target.clone(),
+            verb: l.verb.clone(),
+        })
+        .collect();
+    out.sort_by(|a, b| (&a.id, &a.verb).cmp(&(&b.id, &b.verb)));
+    out.dedup();
+    out
+}
+
+/// Canonical, order-independent signature of an (already sorted) blocker set.
+/// Equality drives comment idempotency: re-comment only when it changes.
+fn blocker_signature(blockers: &[Blocker]) -> String {
+    blockers
+        .iter()
+        .map(Blocker::display)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The blocked-state comment body: lists each unmet blocker by id and
+/// relationship. Posted only on entering the blocked state or when the set
+/// changes.
+fn blocked_comment(blockers: &[Blocker]) -> String {
+    let mut s = String::from(
+        "Dependency gate: this issue has unmet dependencies, so it was not picked up. \
+         It stays Queued and will be re-evaluated automatically; no attempt was consumed.\n\n\
+         Unmet blockers:\n",
+    );
+    for b in blockers {
+        s.push_str(&format!("- {} ({})\n", b.id, b.verb));
+    }
+    s
+}
+
+/// The pre-clone dependency gate (CLAUDE-161). Returns [`GateDecision::Proceed`]
+/// when the issue has no unmet dependency (clear, none, or its backoff just
+/// re-evaluated clean), else [`GateDecision::Blocked`]. Side effects on the
+/// blocked path: post the blocker comment (idempotently), and persist the
+/// re-check backoff (`blocked_until`) plus the blocker-set signature. While a
+/// backoff window is open the issue is not re-evaluated at all (no `yt` read, no
+/// comment); the persisted signature reconstructs the blocker list for the
+/// outcome.
+async fn dependency_gate(
+    pool: &SqlitePool,
+    backend: &dyn Backend,
+    src: &YoutrackSource,
+    action: &str,
+    key: &str,
+) -> Result<GateDecision> {
+    let deps = &src.dependencies;
+    // Disabled: a no-op. No `yt` read, no DB touch; pickup proceeds as before.
+    if !deps.enabled {
+        return Ok(GateDecision::Proceed);
+    }
+    let prev = state::dependency_gate_get(pool, action, key).await?;
+    let now_ms = state::now_epoch_ms();
+
+    // Backoff: within the window, do not re-evaluate (no `yt` read, no comment).
+    if let Some(p) = &prev {
+        if now_ms < p.blocked_until_ms {
+            let blockers = p
+                .signature
+                .split("; ")
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            return Ok(GateDecision::Blocked { blockers });
+        }
+    }
+
+    // Re-evaluate: read the live links and compute the unmet blocker set.
+    let links = backend.issue_links(key)?;
+    let blockers = unmet_blockers(&links, &deps.block_on);
+    if blockers.is_empty() {
+        // Cleared (or never blocked): drop any persisted gate state, proceed.
+        if prev.is_some() {
+            state::dependency_gate_clear(pool, action, key).await?;
+        }
+        return Ok(GateDecision::Proceed);
+    }
+
+    let signature = blocker_signature(&blockers);
+    // Comment only when the unmet-blocker set changed since the last comment.
+    let changed = prev
+        .as_ref()
+        .map(|p| p.signature != signature)
+        .unwrap_or(true);
+    if changed {
+        if let Err(e) = backend.comment(key, &blocked_comment(&blockers)) {
+            // Best-effort: a comment failure must not strand the gate.
+            warn!(action = %action, key = %key, error = %e, "dependency-gate blocker comment failed (non-fatal)");
+        }
+    }
+
+    // Persist the re-check backoff window and the current signature. The
+    // recheck_timeout is validated at action load, so the parse cannot fail here;
+    // the fallback keeps the gate total regardless.
+    let recheck = humantime::parse_duration(&deps.recheck_timeout)
+        .unwrap_or_else(|_| Duration::from_secs(300));
+    let blocked_until = now_ms + recheck.as_millis() as i64;
+    state::dependency_gate_upsert(pool, action, key, blocked_until, &signature).await?;
+
+    Ok(GateDecision::Blocked {
+        blockers: blockers.iter().map(Blocker::display).collect(),
     })
 }
 
@@ -1511,9 +1680,11 @@ fn preserve_aside(workdir: &Path) {
 mod tests {
     use super::*;
     use crate::action::PrStrategy;
+    use crate::db::MIGRATOR;
     use crate::provider::cli::testutil::StubRunner;
-    use crate::provider::CliBackend;
+    use crate::provider::{CliBackend, IssueLink, LinkDirection};
     use serde_json::Value;
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
     fn job() -> YoutrackJob {
@@ -2862,5 +3033,188 @@ mod tests {
             "disabled automerge must not poll: {calls:?}"
         );
         assert!(!calls.iter().any(|c| c.contains("pr merge")), "{calls:?}");
+    }
+
+    // ---- CLAUDE-161 pre-clone dependency gate ----
+
+    async fn mem_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        pool
+    }
+
+    fn link(
+        direction: LinkDirection,
+        verb: &str,
+        target: &str,
+        resolved: Option<i64>,
+    ) -> IssueLink {
+        IssueLink {
+            direction,
+            verb: verb.to_string(),
+            target: target.to_string(),
+            resolved,
+        }
+    }
+
+    /// CLAUDE-161: the blocking rule (pure). `depends on` (Depend INWARD) and
+    /// `parent for` (Subtask OUTWARD) with an unresolved target block; the reverse
+    /// verbs `is required for` / `subtask of` never block; a resolved target is
+    /// met. The result is sorted, so its signature is order-independent.
+    #[test]
+    fn unmet_blockers_honors_direction_and_resolved() {
+        let block_on = crate::action::Dependencies::default().block_on;
+        let links = vec![
+            link(LinkDirection::Inward, "depends on", "YT-40", None), // BLOCK: open blocker
+            link(LinkDirection::Outward, "parent for", "CLAUDE-9", None), // BLOCK: open child
+            link(LinkDirection::Outward, "is required for", "CLAUDE-1", None), // reverse Depend
+            link(LinkDirection::Inward, "subtask of", "CLAUDE-2", None), // reverse Subtask
+            link(LinkDirection::Inward, "depends on", "CLAUDE-3", Some(123)), // met (resolved)
+        ];
+        let blockers = unmet_blockers(&links, &block_on);
+        let ids: Vec<&str> = blockers.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["CLAUDE-9", "YT-40"],
+            "only unmet blocking verbs, sorted"
+        );
+        assert_eq!(
+            blocker_signature(&blockers),
+            "CLAUDE-9 (parent for); YT-40 (depends on)"
+        );
+    }
+
+    /// CLAUDE-161: a blocked issue is left Queued, a blocker comment is posted
+    /// once, and a backoff row is persisted. A re-eval inside the backoff window
+    /// does no `yt` read and no comment; after the window expires an unchanged
+    /// blocker set re-reads but does not re-comment (idempotency).
+    #[tokio::test]
+    async fn dependency_gate_blocks_comments_then_backs_off() {
+        let pool = mem_pool().await;
+        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"YT-40","summary":"x"}]}]}"#;
+        let body = blocked_comment(&[Blocker {
+            id: "YT-40".into(),
+            verb: "depends on".into(),
+        }]);
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect)
+                .ok("yt", &["issue", "comment", "MK-16", &body], ""),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let s = src();
+
+        let count = |needle: &str| {
+            runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.starts_with(needle))
+                .count()
+        };
+        let inspects = || count("yt issue inspect MK-16");
+        let comments = || count("yt issue comment MK-16");
+
+        // First eval: blocked, comments once, persists backoff.
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16")
+            .await
+            .unwrap();
+        assert!(matches!(d, GateDecision::Blocked { .. }));
+        assert_eq!(inspects(), 1);
+        assert_eq!(comments(), 1);
+        let st = state::dependency_gate_get(&pool, "act", "MK-16")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(st.signature, "YT-40 (depends on)");
+        assert!(st.blocked_until_ms > state::now_epoch_ms());
+
+        // Second eval within the backoff window: no read, no comment.
+        let d2 = dependency_gate(&pool, &backend, &s, "act", "MK-16")
+            .await
+            .unwrap();
+        match d2 {
+            GateDecision::Blocked { blockers } => {
+                assert_eq!(blockers, vec!["YT-40 (depends on)".to_string()]);
+            }
+            _ => panic!("still blocked within backoff"),
+        }
+        assert_eq!(inspects(), 1, "backoff must suppress the re-read");
+        assert_eq!(comments(), 1, "backoff must suppress the re-comment");
+
+        // Expire the window: re-eval reads again, unchanged set -> no re-comment.
+        state::dependency_gate_upsert(
+            &pool,
+            "act",
+            "MK-16",
+            state::now_epoch_ms() - 1000,
+            &st.signature,
+        )
+        .await
+        .unwrap();
+        let d3 = dependency_gate(&pool, &backend, &s, "act", "MK-16")
+            .await
+            .unwrap();
+        assert!(matches!(d3, GateDecision::Blocked { .. }));
+        assert_eq!(inspects(), 2, "expired backoff re-reads");
+        assert_eq!(comments(), 1, "unchanged blocker set must not re-comment");
+    }
+
+    /// CLAUDE-161: `enabled: false` makes the gate a no-op: it proceeds without
+    /// any `yt` read or DB touch (the stub has no inspect response, so a read
+    /// would error).
+    #[tokio::test]
+    async fn dependency_gate_disabled_is_noop() {
+        let pool = mem_pool().await;
+        let runner = Arc::new(StubRunner::new());
+        let backend = CliBackend::new(runner.clone());
+        let mut s = src();
+        s.dependencies.enabled = false;
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16")
+            .await
+            .unwrap();
+        assert!(matches!(d, GateDecision::Proceed));
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "disabled gate must not touch yt"
+        );
+    }
+
+    /// CLAUDE-161: when all dependencies are met (or absent), the gate proceeds
+    /// and clears any stale backoff row so a previously-blocked issue resumes.
+    #[tokio::test]
+    async fn dependency_gate_met_proceeds_and_clears_state() {
+        let pool = mem_pool().await;
+        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"YT-40","resolved":123}]}]}"#;
+        let runner =
+            Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
+        let backend = CliBackend::new(runner.clone());
+        let s = src();
+        // Seed a stale (expired) blocked row to prove it is cleared on the met path.
+        state::dependency_gate_upsert(
+            &pool,
+            "act",
+            "MK-16",
+            state::now_epoch_ms() - 1000,
+            "YT-40 (depends on)",
+        )
+        .await
+        .unwrap();
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16")
+            .await
+            .unwrap();
+        assert!(matches!(d, GateDecision::Proceed));
+        assert!(
+            state::dependency_gate_get(&pool, "act", "MK-16")
+                .await
+                .unwrap()
+                .is_none(),
+            "met dependency must clear the backoff row"
+        );
     }
 }
