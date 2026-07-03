@@ -41,10 +41,13 @@ use crate::cancel::RunRegistry;
 use crate::state;
 
 /// CLAUDE-40: the daemon's in-memory set of action names with a dispatched run.
-/// Shared between the dispatcher (which inserts/removes names as runs start and
-/// finish) and the API delete handler (which consults it for the in-flight
-/// guard, authoritative for a job dispatched before its `runs` row is written).
-pub type InFlight = Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>;
+/// Shared between the dispatcher (which bumps/drops a per-action refcount as runs
+/// start and finish) and the API delete handler (which consults it for the
+/// in-flight guard, authoritative for a job dispatched before its `runs` row is
+/// written). CLAUDE-162: a refcount rather than a set, since overlapping runs
+/// mean several runs for one action can be dispatched-but-not-recorded at once; a
+/// positive count means "in flight".
+pub type InFlight = Arc<tokio::sync::Mutex<std::collections::HashMap<String, usize>>>;
 
 /// Shared state injected into every handler. `Clone` is trivial because the
 /// fields are already cheap-clone (`SqlitePool` is `Arc`-shaped, `Sender`
@@ -261,7 +264,7 @@ async fn delete_action(
     }
     // 409 if a run is in flight: the in-memory set catches a job dispatched
     // before its `runs` row exists; the DB query catches a recorded live run.
-    let dispatched = s.in_flight.lock().await.contains(&name);
+    let dispatched = s.in_flight.lock().await.get(&name).is_some_and(|&n| n > 0);
     if dispatched || state::action_has_active_run(&s.pool, &name).await? {
         return Err(AppError {
             status: StatusCode::CONFLICT,
@@ -510,7 +513,7 @@ mod tests {
             trigger_tx,
             version: "test",
             runs: Arc::new(RunRegistry::new()),
-            in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
         })
     }

@@ -45,7 +45,7 @@ limits: # optional per-action overrides of env defaults
   claude_timeout_seconds: 600
   daily_budget_usd: 5.00
 concurrency: # optional; default is strictly sequential
-  max_parallel: 1           # distinct-key jobs in flight at once (default 1)
+  max_parallel: 1           # distinct-key jobs in flight at once, daemon-wide (default 1)
   key: [ project, repo, workflow ]   # job fields composing the concurrency key
 schedule: # optional; omit for trigger-only (manual)
   kind: interval            # interval | cron | manual
@@ -498,16 +498,17 @@ concurrency:
 
 | Key            | Default                     | Meaning                                                   |
 |----------------|-----------------------------|-----------------------------------------------------------|
-| `max_parallel` | `1`                         | Maximum distinct-key jobs in flight at once within a run. |
+| `max_parallel` | `1`                         | Maximum distinct-key jobs in flight at once for this action, enforced daemon-wide. |
 | `key`          | `[project, repo, workflow]` | Job fields whose values compose the concurrency key.      |
 
 Semantics:
 
 - **Same key serializes.** At most one job per resolved key runs at a time, so
   two jobs against the same repo never collide on the clone dir, branch, or PR. Per-key concurrency is fixed at 1 and is
-  not configurable.
+  not configurable. This holds across **overlapping runs** too (see below): an issue queued into a second run against a
+  repo a first run is still working never runs concurrently with it.
 - **Distinct keys parallelize**, up to `max_parallel`. `max_parallel: 1` (the default) reproduces the original
-  strictly-sequential behavior exactly.
+  strictly-sequential behavior, now enforced daemon-wide (at most one job for the action across all its overlapping runs).
 - **Key resolution.** For a scripted action the key is built from the listed fields on each job's JSON object; for the
   native `youtrack` action the handler maps `project` to the issue-id prefix and `repo` to the resolved repo path.
   `workflow` is forward-looking (reserved for a future Forgejo-failed-workflow action) and is unset on YouTrack jobs
@@ -515,11 +516,31 @@ Semantics:
 - **Daemon-wide gate.** The key gate is held at the daemon level, so two executions sharing a key never overlap even
   across a scheduled run and a manual trigger. (It is in-memory per process; a standalone `claude-run run` uses its own
   gate but the per-action lock still prevents it from overlapping a daemon-driven run of the same action.)
-- **Caps stay best-effort.** The daily cap and budget are checked before each job launches; because up to `max_parallel`
-  jobs can pass the check before any of them advances the ledger, the cap may overshoot by at most `max_parallel - 1`
-  jobs.
+- **`max_parallel` is a daemon-wide cap (CLAUDE-162), not a per-run one.** The daemon holds one shared semaphore per
+  action, so the total number of concurrent jobs for an action stays `<= max_parallel` even when several **overlapping**
+  pickup runs are in flight at once. A separate global cap (`max_parallel_global`, a runtime setting) bounds total
+  concurrent jobs across all actions. Each job acquires a global permit, then the per-action permit, then the key gate,
+  in that fixed order, so the pipeline is deadlock-free.
+- **Caps stay best-effort.** The daily cap and budget are checked before each job launches; because up to
+  `max_parallel_global` jobs can pass the check before any of them advances the ledger, the cap may overshoot by at most
+  `max_parallel_global - 1` jobs.
 - **`max_parallel` is bounded by available worker threads.** Each running job occupies a thread for the duration of its
   `claude` invocation, so set `max_parallel` no higher than the host has cores to spare.
+
+#### Overlapping runs and continuous pickup (CLAUDE-162)
+
+The daemon no longer serializes runs per action. An issue queued while a run is in flight is picked up by a new,
+**overlapping** run within `regather_interval` (a runtime setting, default 60s) rather than waiting for the in-flight run
+to drain, subject only to the concurrency caps above. The whole-run per-action file lock that used to force a full drain
+is gone on the daemon path; a manual `trigger` during an in-flight run now starts an overlapping pickup run instead of
+being dropped. Two overlapping runs never both work the same job: each run drops issues already in flight in another open
+run (an admission check that also suppresses empty, redundant runs), the native `youtrack` handler re-reads the live `AI
+Agent` field per job, and the daemon-wide key gate serializes same-repo work. `max_parallel_global` and
+`regather_interval` are edited on the web **Settings** page (the Concurrency section) or via
+`GET`/`PUT /api/settings/concurrency`.
+
+> The standalone `claude-run run <action>` path still takes the per-action cross-process `flock`. Running standalone
+> `run` for an action the daemon also schedules is unsupported concurrent use.
 
 ### `schedule` (record, optional)
 

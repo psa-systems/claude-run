@@ -446,6 +446,43 @@ impl Default for PreferencesConfig {
     }
 }
 
+/// CLAUDE-162: daemon-wide concurrency + continuous-pickup settings. A DB-backed
+/// runtime section (settings key `config.concurrency`, editable on the web
+/// Settings page and via `GET`/`PUT /api/settings/concurrency`) per the
+/// CLAUDE-101 bootstrap-vs-runtime split, so it is NOT a `config.toml` key (a
+/// brand-new section, so there is no file fallback: the DB value or the default).
+///
+/// `max_parallel_global` caps total concurrent jobs across ALL actions; the
+/// daemon acquires a global permit before each per-action permit (`max_parallel`)
+/// so overlapping runs cannot spawn unbounded concurrent `claude` processes.
+/// `regather_interval_secs` is the cadence at which the scheduler starts
+/// overlapping pickup runs, decoupled from (and typically faster than) an
+/// action's `schedule.spec`, so an issue queued mid-run is picked up within one
+/// interval rather than waiting for the in-flight run to drain.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConcurrencyConfig {
+    /// Global cap on concurrent jobs across every action. `0` means auto: the
+    /// daemon defaults it to the maximum `concurrency.max_parallel` among enabled
+    /// actions, so a single action still reaches its full per-action cap out of
+    /// the box (matching "global 5 = per-action 5"). Raise it to allow more
+    /// cross-action concurrency, lower it to throttle host `claude` load.
+    pub max_parallel_global: u32,
+    /// Cadence, in seconds, at which the scheduler starts an overlapping pickup
+    /// run for each enabled non-manual action. Default 60s. The 5s scheduler tick
+    /// is unchanged; this only governs the fire decision. Must be >= 1.
+    pub regather_interval_secs: u64,
+}
+
+impl Default for ConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel_global: 0,
+            regather_interval_secs: 60,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
