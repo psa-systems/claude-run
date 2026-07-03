@@ -30,6 +30,14 @@ pub enum Error {
     #[error("action `{name}` has a run in flight; cancel or wait before deleting")]
     ActionInFlight { name: String },
 
+    #[error("action {name}: invalid `{field}` ({path}): {reason}")]
+    ActionInvalidField {
+        name: String,
+        field: String,
+        reason: String,
+        path: String,
+    },
+
     #[error("action {name}: kind `{kind}` does not match native config `{native}` ({path})")]
     ActionKindMismatch {
         name: String,

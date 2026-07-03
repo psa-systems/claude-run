@@ -111,6 +111,48 @@ pub struct PullRequest {
     pub url: String,
 }
 
+/// Direction of an issue link, mirroring the YouTrack REST `IssueLink.direction`
+/// and the `direction` field `yt issue inspect --json` emits (YT-40). `Both` is
+/// the undirected case (e.g. `Relates`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkDirection {
+    Outward,
+    Inward,
+    Both,
+}
+
+impl LinkDirection {
+    /// Parse the `direction` string `yt` emits. Unknown values map to `Both`
+    /// (the least-committal, non-directional reading); the dependency gate keys
+    /// off the resolved `verb`, so an unexpected direction never mis-blocks.
+    pub fn from_yt(s: &str) -> Self {
+        match s {
+            "OUTWARD" => LinkDirection::Outward,
+            "INWARD" => LinkDirection::Inward,
+            _ => LinkDirection::Both,
+        }
+    }
+}
+
+/// One directed link from an issue to a single linked target, flattened from the
+/// `links[].issues[]` shape of `yt issue inspect --json` (YT-40 / CLAUDE-161).
+/// Each linked issue in a `links[]` entry becomes its own row so the dependency
+/// gate can filter by `verb` (the direction-resolved relationship) and test each
+/// target's `resolved` timestamp independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueLink {
+    /// Resolved link direction (`OUTWARD` / `INWARD` / `BOTH`).
+    pub direction: LinkDirection,
+    /// Direction-resolved relationship verb, e.g. `depends on`, `parent for`,
+    /// `is required for`, `subtask of`, `relates to`.
+    pub verb: String,
+    /// The linked issue's `idReadable`, e.g. `YT-40`.
+    pub target: String,
+    /// The linked issue's `resolved` epoch-ms timestamp. `None` (absent or null
+    /// in the JSON) means the target is unresolved, i.e. an unmet dependency.
+    pub resolved: Option<i64>,
+}
+
 /// The YouTrack-side operations native handlers need. Backed by `yt` today; an
 /// MCP backend can implement the same surface later.
 pub trait IssueTracker: Send + Sync {
@@ -134,6 +176,13 @@ pub trait IssueTracker: Send + Sync {
 
     /// Add a comment to an issue.
     fn comment(&self, key: &str, body: &str) -> Result<()>;
+
+    /// The issue's directed links, flattened one row per linked target, with each
+    /// link's resolved `direction` / `verb` and each target's nullable `resolved`
+    /// timestamp (YT-40). Backs the pre-clone dependency gate (CLAUDE-161), which
+    /// blocks a queued issue on any unmet dependency before it is cloned or handed
+    /// to claude.
+    fn issue_links(&self, key: &str) -> Result<Vec<IssueLink>>;
 
     /// Resolve a project's enabled VCS integration to a clonable repo. Errors
     /// [`Error::NoVcsIntegration`] when the project has none.
