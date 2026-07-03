@@ -127,6 +127,32 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
     let jobs = gather(backend.as_ref(), &cfg, Utc::now());
     info!(action = %action.name, count = jobs.len(), "forgejo-ci-fix jobs gathered");
 
+    // CLAUDE-162: admission check. Drop PRs already in flight in another
+    // (overlapping) run of this action, then, if nothing fresh remains, return
+    // WITHOUT `run_begin` so a re-gather that only re-sees already-claimed work
+    // creates no empty run row. The per-PR KeyGate below serializes any PR that a
+    // simultaneous re-gather races in before its in-flight marker lands.
+    let gathered = jobs.len();
+    let inflight: std::collections::HashSet<String> =
+        state::action_inflight_keys(pool, &action.name)
+            .await?
+            .into_iter()
+            .collect();
+    let jobs: Vec<_> = jobs
+        .into_iter()
+        .filter(|j| !inflight.contains(&j.key))
+        .collect();
+    if jobs.is_empty() {
+        info!(
+            action = %action.name,
+            gathered,
+            "no fresh queued work (all in flight in another run); skipping empty run"
+        );
+        return Ok(());
+    }
+    // CLAUDE-162: this action's per-action cap, enforced daemon-wide.
+    let max_parallel = action.concurrency.max_parallel.max(1) as usize;
+
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
 
     // CLAUDE-9: register a cancellation token, unregistered on every exit path.
@@ -161,11 +187,29 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
             warn!(cost_usd = cost, "daily budget reached mid-run, stopping");
             break;
         }
+        // CLAUDE-162: acquire the daemon-wide caps (global -> per-action) and the
+        // per-PR key gate before working the job, so overlapping forgejo-ci-fix
+        // runs stay bounded by the global cap and never work the same PR at once.
+        // Both permits and the key guard release at the end of this iteration.
+        let _permits = ctx.limiter.acquire(&action.name, max_parallel).await;
+        let _key_guard = ctx.keygate.acquire(&job.key).await;
+        if cancel.is_cancelled() {
+            break;
+        }
         // CLAUDE-14: exactly one job shows as "running" at a time.
         if let Err(e) = state::run_set_current_job(pool, run_id, Some(&planned_keys[idx])).await {
             warn!(error = %e, "run_set_current_job failed (non-fatal)");
         }
-        let outcome = process_job(&ctx, backend.as_ref(), &cfg, &limits, &cancel, job).await?;
+        // CLAUDE-162: mark this PR in flight so an overlapping run's admission
+        // check dedups against it.
+        if let Err(e) = state::run_inflight_add(pool, run_id, &planned_keys[idx]).await {
+            warn!(error = %e, "run_inflight_add failed (non-fatal)");
+        }
+        let outcome = process_job(&ctx, backend.as_ref(), &cfg, &limits, &cancel, job).await;
+        if let Err(e) = state::run_inflight_remove(pool, run_id, &planned_keys[idx]).await {
+            warn!(error = %e, "run_inflight_remove failed (non-fatal)");
+        }
+        let outcome = outcome?;
         record_outcome(&ctx, run_id, &outcome).await?;
         processed += 1;
     }

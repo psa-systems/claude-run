@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::action::{ActionKind, LoadedAction};
 use crate::cancel::RunRegistry;
 use crate::claude::ClaudeInvoker;
-use crate::concurrency::KeyGate;
+use crate::concurrency::{KeyGate, Limiter};
 use crate::config::Paths;
 use crate::error::{Error, Result};
 use crate::snippet::SnippetRunner;
@@ -46,6 +46,9 @@ pub struct NativeContext<'a> {
     pub registry: Option<&'a RunRegistry>,
     /// CLAUDE-28: daemon-wide per-key gate, used by the handler's executor.
     pub keygate: KeyGate,
+    /// CLAUDE-162: daemon-wide concurrency limiter (global + per-action caps),
+    /// used by the handler's executor so caps hold across overlapping runs.
+    pub limiter: Limiter,
 }
 
 /// Boxed future returned by a [`NativeHandler`]. Hand-rolled (rather than

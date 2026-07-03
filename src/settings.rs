@@ -31,8 +31,8 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
-    MintConfig, OnDiskConfig, Paths, PreferencesConfig, UpdateConfig, WebhookConfig,
-    WorkdirGcConfig,
+    ConcurrencyConfig, MintConfig, OnDiskConfig, Paths, PreferencesConfig, UpdateConfig,
+    WebhookConfig, WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -49,17 +49,20 @@ pub enum Section {
     WorkdirGc,
     /// CLAUDE-154: global display preferences (locale, timezone, date format).
     Preferences,
+    /// CLAUDE-162: daemon-wide concurrency caps + continuous-pickup cadence.
+    Concurrency,
 }
 
 impl Section {
     /// Every section, in display order (used by the Settings page).
-    pub const ALL: [Section; 6] = [
+    pub const ALL: [Section; 7] = [
         Section::Mint,
         Section::Update,
         Section::Webhook,
         Section::LogFilter,
         Section::WorkdirGc,
         Section::Preferences,
+        Section::Concurrency,
     ];
 
     /// `settings` table primary key for this section's JSON document.
@@ -71,6 +74,7 @@ impl Section {
             Section::LogFilter => "config.log_filter",
             Section::WorkdirGc => "config.workdir_gc",
             Section::Preferences => "config.preferences",
+            Section::Concurrency => "config.concurrency",
         }
     }
 
@@ -83,6 +87,7 @@ impl Section {
             Section::LogFilter => "log_filter",
             Section::WorkdirGc => "workdir_gc",
             Section::Preferences => "preferences",
+            Section::Concurrency => "concurrency",
         }
     }
 
@@ -100,6 +105,7 @@ impl Section {
             Section::LogFilter => "Log filter",
             Section::WorkdirGc => "Workdir GC",
             Section::Preferences => "Display preferences",
+            Section::Concurrency => "Concurrency",
         }
     }
 
@@ -111,6 +117,7 @@ impl Section {
             Section::LogFilter => "live",
             Section::WorkdirGc => "next sweep",
             Section::Preferences => "live",
+            Section::Concurrency => "next tick",
         }
     }
 }
@@ -272,6 +279,9 @@ pub struct EffectiveRuntime {
     /// CLAUDE-154: global display preferences. Brand-new section (never in
     /// `config.toml`), so the DB value or the built-in default (UTC / ISO).
     pub preferences: PreferencesConfig,
+    /// CLAUDE-162: daemon-wide concurrency caps + continuous-pickup cadence.
+    /// Brand-new section (never in `config.toml`), so the DB value or the default.
+    pub concurrency: ConcurrencyConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
@@ -296,6 +306,9 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
     let preferences = get_json::<PreferencesConfig>(pool, Section::Preferences.key())
         .await?
         .unwrap_or_default();
+    let concurrency = get_json::<ConcurrencyConfig>(pool, Section::Concurrency.key())
+        .await?
+        .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
         update,
@@ -303,7 +316,19 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
         log_filter,
         workdir_gc,
         preferences,
+        concurrency,
     })
+}
+
+/// CLAUDE-162: validate a [`ConcurrencyConfig`] before it is persisted. The
+/// cadence must be at least one second (a zero interval would fire an overlapping
+/// run every tick). `max_parallel_global` needs no bound: `0` means auto and any
+/// positive value is a valid explicit cap. Returns a human message on failure.
+pub fn validate_concurrency(cfg: &ConcurrencyConfig) -> std::result::Result<(), String> {
+    if cfg.regather_interval_secs == 0 {
+        return Err("regather_interval_secs must be >= 1".to_string());
+    }
+    Ok(())
 }
 
 /// Resolve the effective [`UpdateConfig`] for a CLI `version` invocation: the DB
@@ -464,6 +489,7 @@ pub struct LiveSettings {
     log_apply: Option<LogFilterApply>,
     workdir_gc: Arc<RwLock<WorkdirGcConfig>>,
     preferences: Arc<RwLock<PreferencesConfig>>,
+    concurrency: Arc<RwLock<ConcurrencyConfig>>,
 }
 
 impl LiveSettings {
@@ -485,6 +511,7 @@ impl LiveSettings {
             log_apply,
             workdir_gc: Arc::new(RwLock::new(eff.workdir_gc)),
             preferences: Arc::new(RwLock::new(eff.preferences)),
+            concurrency: Arc::new(RwLock::new(eff.concurrency)),
         };
         if let (Some(apply), Some(filter)) = (s.log_apply.as_ref(), eff.log_filter.as_ref()) {
             match apply(filter) {
@@ -524,6 +551,13 @@ impl LiveSettings {
         self.workdir_gc.clone()
     }
 
+    /// CLAUDE-162: shared handle to the live concurrency config, read by the
+    /// scheduler each tick (global cap + regather cadence) so a Settings save
+    /// applies on the next tick.
+    pub fn concurrency_handle(&self) -> Arc<RwLock<ConcurrencyConfig>> {
+        self.concurrency.clone()
+    }
+
     /// CLAUDE-129: a snapshot of the live update config (train + token_ref), read
     /// by the About page handlers to drive the on-demand check / apply.
     pub async fn update_config(&self) -> UpdateConfig {
@@ -542,6 +576,7 @@ impl LiveSettings {
             }),
             Section::WorkdirGc => to_pretty(&*self.workdir_gc.read().await),
             Section::Preferences => to_pretty(&*self.preferences.read().await),
+            Section::Concurrency => to_pretty(&*self.concurrency.read().await),
         }
     }
 
@@ -602,6 +637,14 @@ impl LiveSettings {
                 set_preferences_snapshot(v.clone());
                 *self.preferences.write().await = v;
             }
+            Section::Concurrency => {
+                let v: ConcurrencyConfig = parse(json)?;
+                // Reject a zero cadence before persisting: nothing is stored on an
+                // invalid payload.
+                validate_concurrency(&v).map_err(SaveError::Invalid)?;
+                set_json(&self.pool, section.key(), &v).await?;
+                *self.concurrency.write().await = v;
+            }
         }
         Ok(())
     }
@@ -639,6 +682,7 @@ mod tests {
             log_filter: None,
             workdir_gc: WorkdirGcConfig::default(),
             preferences: PreferencesConfig::default(),
+            concurrency: ConcurrencyConfig::default(),
         }
     }
 
@@ -996,6 +1040,65 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.timezone, "Europe/Paris");
+    }
+
+    // CLAUDE-162: the concurrency section round-trips, defaults to auto global
+    // (0) + 60s cadence, and rejects a zero cadence without overwriting.
+    #[tokio::test]
+    async fn concurrency_section_round_trips_and_validates() {
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+
+        // Default is auto (0) + 60s, and is exposed on the shared handle.
+        let handle = live.concurrency_handle();
+        assert_eq!(handle.read().await.max_parallel_global, 0);
+        assert_eq!(handle.read().await.regather_interval_secs, 60);
+
+        // Valid payload persists and is visible live.
+        live.save_section(
+            Section::Concurrency,
+            r#"{"max_parallel_global":8,"regather_interval_secs":30}"#,
+        )
+        .await
+        .unwrap();
+        let stored: ConcurrencyConfig = get_json(&pool, Section::Concurrency.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.max_parallel_global, 8);
+        assert_eq!(stored.regather_interval_secs, 30);
+        assert_eq!(handle.read().await.max_parallel_global, 8);
+
+        // A zero cadence is rejected and does not overwrite the stored value.
+        let err = live
+            .save_section(
+                Section::Concurrency,
+                r#"{"max_parallel_global":2,"regather_interval_secs":0}"#,
+            )
+            .await
+            .expect_err("zero cadence must reject");
+        match err {
+            SaveError::Invalid(m) => assert!(m.contains("regather_interval_secs"), "{m}"),
+            other => panic!("expected Invalid, got {other}"),
+        }
+        let stored: ConcurrencyConfig = get_json(&pool, Section::Concurrency.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.regather_interval_secs, 30,
+            "rejected save must not overwrite"
+        );
+
+        // An unknown field is rejected (deny_unknown_fields).
+        let err = live
+            .save_section(
+                Section::Concurrency,
+                r#"{"max_parallel_global":1,"bogus":true}"#,
+            )
+            .await
+            .expect_err("unknown field must reject");
+        assert!(matches!(err, SaveError::Invalid(_)));
     }
 
     #[tokio::test]

@@ -154,6 +154,31 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     }
     info!(action = %action.name, count = jobs.len(), "youtrack jobs gathered");
 
+    // CLAUDE-162: admission check. Drop issues already in flight in another
+    // (overlapping) run of this action, then, if nothing fresh remains, return
+    // WITHOUT `run_begin` so a re-gather that only re-sees already-claimed work
+    // does not litter run history with empty run rows. The live AI-Agent re-read
+    // filter, the daemon-wide `KeyGate` (same-repo serialization), and this dedup
+    // together guarantee two overlapping runs never both work the same issue.
+    let gathered = jobs.len();
+    let inflight: std::collections::HashSet<String> =
+        state::action_inflight_keys(pool, &action.name)
+            .await?
+            .into_iter()
+            .collect();
+    let jobs: Vec<YoutrackJob> = jobs
+        .into_iter()
+        .filter(|j| !inflight.contains(&j.key))
+        .collect();
+    if jobs.is_empty() {
+        info!(
+            action = %action.name,
+            gathered,
+            "no fresh queued work (all in flight in another run); skipping empty run"
+        );
+        return Ok(());
+    }
+
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
     // CLAUDE-147: backfill this poll's input-phase events onto the new run row.
     if !input_events.is_empty() {
@@ -297,7 +322,9 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     }
 
     let exec = Executor {
+        action: action.name.clone(),
         max_parallel,
+        limiter: ctx.limiter.clone(),
         gate: ctx.keygate.clone(),
         cancel: cancel.clone(),
     };
