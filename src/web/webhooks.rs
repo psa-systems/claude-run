@@ -1699,6 +1699,9 @@ mod tests {
         fn comment(&self, _key: &str, _body: &str) -> crate::error::Result<()> {
             unreachable!()
         }
+        fn issue_links(&self, _key: &str) -> crate::error::Result<Vec<crate::provider::IssueLink>> {
+            unreachable!()
+        }
         fn resolve_vcs(
             &self,
             _project_key: &str,
