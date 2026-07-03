@@ -8,22 +8,23 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::action::{self, LoadedAction};
 use crate::api::{self, AppState};
 use crate::cancel::{CancellationToken, RegistryGuard, RunRegistry};
 use crate::claude::ClaudeInvoker;
-use crate::concurrency::{Executor, KeyGate};
-use crate::config::{OnDiskConfig, Paths};
+use crate::concurrency::{Executor, KeyGate, Limiter};
+use crate::config::{ConcurrencyConfig, OnDiskConfig, Paths};
 use crate::error::Result;
 use crate::job::{self, RunnerDefaults};
-use crate::lock::ActionLock;
-use crate::scheduler::{self, ParsedSchedule};
+use crate::scheduler;
 use crate::snippet::SnippetRunner;
 use crate::state::{self, ActionIndexRow};
 
@@ -124,7 +125,10 @@ impl Daemon {
         // CLAUDE-40: one in-flight set shared between the dispatcher (which
         // tracks dispatched runs) and the API (whose delete handler refuses a
         // delete while a run is dispatched but not yet recorded in `runs`).
-        let in_flight: api::InFlight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        // CLAUDE-162: a per-action refcount (not a set), since overlapping runs
+        // mean several runs for one action can be dispatched-but-not-recorded at
+        // once; the delete handler treats a positive count as "in flight".
+        let in_flight: api::InFlight = Arc::new(Mutex::new(HashMap::new()));
 
         let api_state = Arc::new(AppState {
             pool: pool.clone(),
@@ -227,6 +231,19 @@ impl Daemon {
             settings.webhook_handle(),
         ));
 
+        // CLAUDE-162: one daemon-wide concurrency limiter (global + per-action
+        // semaphores), shared across every run so caps hold across overlapping
+        // runs. The initial global cap is resolved from the concurrency setting
+        // and the indexed actions (auto = the max enabled-action max_parallel);
+        // `scheduler_tick` recomputes it every tick so a Settings save applies.
+        let concurrency = settings.concurrency_handle();
+        let initial_global = {
+            let cfg = concurrency.read().await.clone();
+            let actions = state::action_index_list(&pool).await.unwrap_or_default();
+            resolve_global_cap(&cfg, &actions)
+        };
+        let limiter = Limiter::new(initial_global);
+
         let dispatch = Arc::new(Dispatcher {
             paths: self.paths.clone(),
             pool: pool.clone(),
@@ -238,6 +255,10 @@ impl Daemon {
             // across a scheduled run and a manual trigger.
             keygate: KeyGate::new(),
             runs,
+            // CLAUDE-162: daemon-wide caps + continuous-pickup state.
+            limiter,
+            concurrency,
+            last_fire: Mutex::new(HashMap::new()),
         });
 
         let scheduler_task = tokio::spawn(scheduler_loop(dispatch.clone(), trigger_tx.clone()));
@@ -628,6 +649,9 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
                     last_seen_at: now.clone(),
                     parse_error: None,
                     link_template: la.action.link_template.clone(),
+                    // CLAUDE-162: cache the per-action cap so the scheduler can
+                    // resolve the global auto default without re-parsing YAML.
+                    max_parallel: la.action.concurrency.max_parallel.max(1) as i64,
                 };
                 state::action_index_upsert(pool, &row).await?;
             }
@@ -657,6 +681,7 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
                     last_seen_at: now.clone(),
                     parse_error: Some(e.to_string()),
                     link_template: None,
+                    max_parallel: 1,
                 };
                 state::action_index_upsert(pool, &row).await?;
             }
@@ -694,16 +719,28 @@ struct Dispatcher {
     keygate: KeyGate,
     /// CLAUDE-9: per-run cancellation tokens, registered by `run_action_inner`.
     runs: Arc<RunRegistry>,
+    /// CLAUDE-162: daemon-wide concurrency limiter (global + per-action
+    /// semaphores), acquired per job so caps hold across overlapping runs.
+    limiter: Limiter,
+    /// CLAUDE-162: live handle to the concurrency settings (global cap + regather
+    /// cadence), read each scheduler tick so a Settings save applies live.
+    concurrency: Arc<RwLock<ConcurrencyConfig>>,
+    /// CLAUDE-162: in-memory per-action timestamp of the last pickup fire. Drives
+    /// the `regather_interval` cadence decoupled from run rows, so an action whose
+    /// re-gather finds no fresh work (and thus creates no run row) is still not
+    /// re-fired every 5s tick.
+    last_fire: Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 impl Dispatcher {
+    /// CLAUDE-162: start an (overlapping) run for `action_name`. Unlike the
+    /// pre-CLAUDE-162 dispatch, a run is NOT rejected because another run for the
+    /// same action is in flight; overlap is the point. The in-flight refcount is
+    /// bumped for the delete-conflict guard and dropped when the run finishes.
     async fn dispatch(self: Arc<Self>, action_name: String, trigger_source: &'static str) {
         {
             let mut g = self.in_flight.lock().await;
-            if !g.insert(action_name.clone()) {
-                info!(action = %action_name, "already in flight, skipping");
-                return;
-            }
+            *g.entry(action_name.clone()).or_insert(0) += 1;
         }
         let me = self.clone();
         let name_for_log = action_name.clone();
@@ -711,7 +748,13 @@ impl Dispatcher {
             if let Err(e) = me.execute(&action_name, trigger_source).await {
                 warn!(action = %name_for_log, error = %e, "action execution errored");
             }
-            me.in_flight.lock().await.remove(&name_for_log);
+            let mut g = me.in_flight.lock().await;
+            if let Some(n) = g.get_mut(&name_for_log) {
+                *n -= 1;
+                if *n == 0 {
+                    g.remove(&name_for_log);
+                }
+            }
         });
     }
 
@@ -739,16 +782,14 @@ impl Dispatcher {
             }
         };
 
-        // Cross-process per-action lock. Returns None if a CLI process or
-        // another worker is already running this action.
-        let lock_dir = self.paths.runtime_dir.join("locks");
-        let _lock = match ActionLock::try_acquire(&lock_dir, action_name)? {
-            Some(l) => l,
-            None => {
-                info!(action = %action_name, "lock held elsewhere, skipping");
-                return Ok(());
-            }
-        };
+        // CLAUDE-162: the whole-run per-action `flock` (`ActionLock`) is gone on
+        // the daemon path: it forced a full drain (only one run per action at a
+        // time), which is exactly the run barrier this issue removes. In-process
+        // correctness now comes from the daemon-wide `Limiter` (per-action +
+        // global caps) plus the `KeyGate` (same-key serialization). The
+        // standalone `claude-run run` path still takes `ActionLock` for its
+        // cross-process guard; running standalone `run` for an action the daemon
+        // also schedules is unsupported concurrent use (documented in the README).
 
         run_action_inner(
             &loaded,
@@ -759,6 +800,7 @@ impl Dispatcher {
             trigger_source,
             Some(&self.runs),
             &self.keygate,
+            &self.limiter,
         )
         .await
     }
@@ -779,6 +821,7 @@ pub async fn run_action_inner(
     triggered_by: &str,
     registry: Option<&RunRegistry>,
     keygate: &KeyGate,
+    limiter: &Limiter,
 ) -> Result<()> {
     // CLAUDE-30: native kinds route to a built-in Rust handler. Scripted
     // actions fall through to the generic nu-snippet pipeline below, unchanged.
@@ -792,6 +835,7 @@ pub async fn run_action_inner(
             triggered_by,
             registry,
             keygate: keygate.clone(),
+            limiter: limiter.clone(),
         })
         .await;
     }
@@ -813,6 +857,34 @@ pub async fn run_action_inner(
     let jobs = job::gather_jobs(loaded, snippet.as_ref(), paths).await?;
     info!(action = %loaded.action.name, count = jobs.len(), "input jobs gathered");
 
+    // CLAUDE-162: admission check. Compute each gathered job's key and drop those
+    // already in flight in another (overlapping) run of this action. If nothing
+    // fresh remains, return WITHOUT `run_begin` so a re-gather that only re-sees
+    // already-claimed work does not litter run history with empty, redundant run
+    // rows. Same-key serialization + the run_inflight dedup keep two overlapping
+    // runs from ever working the same job.
+    let all_keys: Vec<String> = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, j)| job::job_key(loaded, j, i))
+        .collect();
+    let inflight: std::collections::HashSet<String> =
+        state::action_inflight_keys(pool, &loaded.action.name)
+            .await?
+            .into_iter()
+            .collect();
+    let fresh_idx: Vec<usize> = (0..jobs.len())
+        .filter(|&i| !inflight.contains(&all_keys[i]))
+        .collect();
+    if fresh_idx.is_empty() {
+        info!(
+            action = %loaded.action.name,
+            gathered = jobs.len(),
+            "no fresh queued work (all in flight in another run); skipping empty run"
+        );
+        return Ok(());
+    }
+
     let run_id = state::run_begin(pool, &loaded.action.name, triggered_by).await?;
 
     // CLAUDE-9: register a cancellation token for this run and ensure it is
@@ -824,12 +896,8 @@ pub async fn run_action_inner(
     let _registry_guard = RegistryGuard { registry, run_id };
 
     // CLAUDE-1: record the planned job keys so the web UI shows what's
-    // queued / in-flight before any outcome record lands.
-    let planned_keys: Vec<String> = jobs
-        .iter()
-        .enumerate()
-        .map(|(i, j)| job::job_key(loaded, j, i))
-        .collect();
+    // queued / in-flight before any outcome record lands (fresh subset only).
+    let planned_keys: Vec<String> = fresh_idx.iter().map(|&i| all_keys[i].clone()).collect();
     if let Err(e) = state::run_set_job_keys(pool, run_id, &planned_keys).await {
         warn!(error = %e, "run_set_job_keys failed (non-fatal)");
     }
@@ -845,10 +913,13 @@ pub async fn run_action_inner(
     let paths_owned = paths.clone();
     let pool_owned = pool.clone();
 
-    let mut items: Vec<(String, crate::concurrency::JobFuture)> = Vec::with_capacity(jobs.len());
-    for (idx, job) in jobs.iter().enumerate() {
+    // CLAUDE-162: build one task per FRESH job (the dedup dropped in-flight ones).
+    let mut items: Vec<(String, crate::concurrency::JobFuture)> =
+        Vec::with_capacity(fresh_idx.len());
+    for (slot, &idx) in fresh_idx.iter().enumerate() {
+        let job = &jobs[idx];
         let gate_key = job::concurrency_key(loaded, job, idx);
-        let job_key = planned_keys[idx].clone();
+        let job_key = planned_keys[slot].clone();
         let job = job.clone();
         let loaded = loaded_arc.clone();
         let paths = paths_owned.clone();
@@ -932,7 +1003,9 @@ pub async fn run_action_inner(
     }
 
     let exec = Executor {
+        action: loaded.action.name.clone(),
         max_parallel,
+        limiter: limiter.clone(),
         gate: keygate.clone(),
         cancel: cancel.clone(),
     };
@@ -962,6 +1035,25 @@ pub async fn run_action_inner(
     }
     info!(action = %loaded.action.name, processed, exit_code, "run complete");
     Ok(())
+}
+
+/// CLAUDE-162: resolve the effective global concurrency cap. An explicit
+/// `max_parallel_global > 0` wins; `0` (auto) resolves to the maximum
+/// `max_parallel` among enabled actions, so a single action still reaches its
+/// full per-action cap out of the box. Floored to 1 (an empty/all-disabled index
+/// yields at least one permit so triggers still run). Pure, so the auto default
+/// is unit-testable without a daemon.
+pub fn resolve_global_cap(cfg: &ConcurrencyConfig, actions: &[ActionIndexRow]) -> usize {
+    if cfg.max_parallel_global > 0 {
+        return cfg.max_parallel_global as usize;
+    }
+    actions
+        .iter()
+        .filter(|a| a.enabled && a.parse_error.is_none())
+        .map(|a| a.max_parallel.max(1) as usize)
+        .max()
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// CLAUDE-11: resolve once every in-flight run has unregistered, i.e. all the
@@ -1034,6 +1126,16 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
     }
     let now = Utc::now();
     let rows = state::action_index_list(&dispatch.pool).await?;
+
+    // CLAUDE-162: resolve + apply the effective global cap every tick, so a
+    // Settings save (or an action's max_parallel edit) takes effect on the next
+    // tick. `set_global_max` is a no-op when the value is unchanged.
+    let cfg = dispatch.concurrency.read().await.clone();
+    dispatch
+        .limiter
+        .set_global_max(resolve_global_cap(&cfg, &rows));
+    let interval = std::time::Duration::from_secs(cfg.regather_interval_secs.max(1));
+
     for r in rows {
         if !r.enabled || r.parse_error.is_some() {
             continue;
@@ -1044,50 +1146,32 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
         {
             continue;
         }
+        // Manual actions never auto-fire; only `trigger` dispatches them.
         let Some(kind) = r.schedule_kind.as_deref() else {
             continue;
         };
-        let schedule = match kind {
-            "manual" => continue,
-            "interval" => crate::action::Schedule {
-                kind: crate::action::ScheduleKind::Interval,
-                spec: r.schedule_spec.clone(),
-            },
-            "cron" => crate::action::Schedule {
-                kind: crate::action::ScheduleKind::Cron,
-                spec: r.schedule_spec.clone(),
-            },
-            _ => continue,
-        };
-        let parsed = match scheduler::parse_schedule(&schedule) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if matches!(parsed, ParsedSchedule::Manual) {
+        if kind == "manual" {
             continue;
         }
-        let last_started: Option<DateTime<Utc>> =
-            state::action_last_run_started(&dispatch.pool, &r.name)
-                .await?
-                .and_then(|s| {
-                    DateTime::parse_from_rfc3339(&s)
-                        .ok()
-                        .map(|d| d.with_timezone(&Utc))
-                });
-        // CLAUDE-156: consult the in-flight set before treating the action as
-        // due. Without this, the window between `dispatch` and `run_begin`
-        // writing the fresh `runs.started_at` row (after the gather phase on the
-        // native path) leaves `action_last_run_started` reporting a stale/None
-        // timestamp, so `next_fire_due` returns "due" on every 5s tick and the
-        // log fills with a "scheduler firing" storm, each call short-circuited
-        // by the same in-flight guard inside `dispatch`. Skipping here suppresses
-        // both the redundant log and the wasted dispatch call. The lock is taken
-        // and released before `dispatch`, so there is no lock-ordering hazard.
-        let in_flight = dispatch.in_flight.lock().await.contains(&r.name);
-        if scheduler::should_fire(&parsed, last_started, now, in_flight) {
-            info!(action = %r.name, "scheduler firing");
-            dispatch.clone().dispatch(r.name.clone(), "scheduler").await;
+        // CLAUDE-162: the pickup fire decision is governed by `regather_interval`,
+        // decoupled from the action's `schedule.spec`, using the in-memory
+        // last-fire stamp (not run rows) so an empty re-gather does not re-fire
+        // every tick. Overlapping runs are allowed, so there is NO in-flight
+        // suppression here; a saturated cap is instead handled by `can_admit`,
+        // which back-pressures without advancing the last-fire stamp so the next
+        // tick retries the moment a permit frees.
+        let last_fire = dispatch.last_fire.lock().await.get(&r.name).copied();
+        if !scheduler::regather_due(last_fire, now, interval) {
+            continue;
         }
+        let max_parallel = r.max_parallel.max(1) as usize;
+        if !dispatch.limiter.can_admit(&r.name, max_parallel) {
+            info!(action = %r.name, "pickup deferred: concurrency cap saturated");
+            continue;
+        }
+        info!(action = %r.name, "scheduler firing (pickup)");
+        dispatch.last_fire.lock().await.insert(r.name.clone(), now);
+        dispatch.clone().dispatch(r.name.clone(), "scheduler").await;
     }
     Ok(())
 }
@@ -1298,6 +1382,7 @@ mod tests {
             "test",
             None,
             &KeyGate::new(),
+            &Limiter::new(1),
         )
         .await
         .expect("native handler caps out cleanly");
@@ -1403,6 +1488,57 @@ mod tests {
         // Second start: new dir already present, old absent -> no-op, no panic.
         rename_webhook_log_dir(&paths);
         assert!(new.join("marker.jsonl").exists());
+    }
+
+    // CLAUDE-162: the global-cap resolver. An explicit `max_parallel_global > 0`
+    // wins verbatim; `0` (auto) resolves to the maximum enabled-action
+    // `max_parallel`; disabled / parse-error actions are excluded; an empty set
+    // floors to 1 so triggers still run.
+    #[test]
+    fn resolve_global_cap_explicit_and_auto() {
+        fn row(name: &str, enabled: bool, parse_ok: bool, mp: i64) -> ActionIndexRow {
+            ActionIndexRow {
+                name: name.to_string(),
+                file_path: format!("/x/{name}.yml"),
+                yaml_sha256: String::new(),
+                enabled,
+                schedule_kind: Some("interval".to_string()),
+                schedule_spec: Some("60s".to_string()),
+                last_seen_at: "2026-01-01T00:00:00+00:00".to_string(),
+                parse_error: (!parse_ok).then(|| "bad".to_string()),
+                link_template: None,
+                max_parallel: mp,
+            }
+        }
+        let rows = vec![
+            row("a", true, true, 3),
+            row("b", true, true, 5),
+            // Disabled and parse-error rows do not raise the auto cap.
+            row("c", false, true, 9),
+            row("d", true, false, 9),
+        ];
+
+        // Explicit value wins regardless of the actions.
+        let explicit = ConcurrencyConfig {
+            max_parallel_global: 2,
+            regather_interval_secs: 60,
+        };
+        assert_eq!(resolve_global_cap(&explicit, &rows), 2);
+
+        // Auto (0) -> max enabled+parseable max_parallel (5, not 9).
+        let auto = ConcurrencyConfig {
+            max_parallel_global: 0,
+            regather_interval_secs: 60,
+        };
+        assert_eq!(resolve_global_cap(&auto, &rows), 5);
+
+        // Auto with no eligible actions floors to 1.
+        assert_eq!(resolve_global_cap(&auto, &[]), 1);
+        assert_eq!(
+            resolve_global_cap(&auto, &[row("c", false, true, 9)]),
+            1,
+            "a lone disabled action still yields at least one permit"
+        );
     }
 
     // CLAUDE-153: an existing new dir is never clobbered by a stray old dir.

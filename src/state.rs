@@ -529,6 +529,11 @@ pub struct ActionIndexRow {
     pub parse_error: Option<String>,
     /// CLAUDE-1: optional URL template for rendering job keys as links.
     pub link_template: Option<String>,
+    /// CLAUDE-162: the action's configured `concurrency.max_parallel`, cached in
+    /// the index so the scheduler can resolve the `max_parallel_global` auto
+    /// default without re-parsing every action's YAML each tick. Defaults to 1.
+    #[sqlx(default)]
+    pub max_parallel: i64,
 }
 
 pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Result<()> {
@@ -536,8 +541,8 @@ pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Res
         r#"
         INSERT INTO actions (
             name, file_path, yaml_sha256, enabled,
-            schedule_kind, schedule_spec, last_seen_at, parse_error, link_template
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            schedule_kind, schedule_spec, last_seen_at, parse_error, link_template, max_parallel
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
             file_path = excluded.file_path,
             yaml_sha256 = excluded.yaml_sha256,
@@ -546,7 +551,8 @@ pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Res
             schedule_spec = excluded.schedule_spec,
             last_seen_at = excluded.last_seen_at,
             parse_error = excluded.parse_error,
-            link_template = excluded.link_template
+            link_template = excluded.link_template,
+            max_parallel = excluded.max_parallel
         "#,
     )
     .bind(&row.name)
@@ -558,6 +564,7 @@ pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Res
     .bind(&row.last_seen_at)
     .bind(&row.parse_error)
     .bind(&row.link_template)
+    .bind(row.max_parallel)
     .execute(pool)
     .await?;
     Ok(())
@@ -565,7 +572,7 @@ pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Res
 
 pub async fn action_index_list(pool: &SqlitePool) -> Result<Vec<ActionIndexRow>> {
     let rows = sqlx::query_as::<_, ActionIndexRow>(
-        "SELECT name, file_path, yaml_sha256, enabled, schedule_kind, schedule_spec, last_seen_at, parse_error, link_template FROM actions ORDER BY name",
+        "SELECT name, file_path, yaml_sha256, enabled, schedule_kind, schedule_spec, last_seen_at, parse_error, link_template, max_parallel FROM actions ORDER BY name",
     )
     .fetch_all(pool)
     .await?;
@@ -633,6 +640,26 @@ pub async fn action_has_active_run(pool: &SqlitePool, action: &str) -> Result<bo
             .fetch_optional(pool)
             .await?;
     Ok(row.is_some())
+}
+
+/// CLAUDE-162: the set of job keys currently in flight across every still-open
+/// (not-yet-finished) run of `action`. A re-gather started while a prior run is
+/// working an issue dedups its gathered jobs against this set, so an overlapping
+/// pickup run never re-claims work another open run already holds. Joins
+/// `run_inflight_jobs` (per-job markers, migration 0007) to the open `runs` rows.
+pub async fn action_inflight_keys(pool: &SqlitePool, action: &str) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT rij.job_key
+        FROM run_inflight_jobs rij
+        JOIN runs r ON r.id = rij.run_id
+        WHERE r.action_name = ? AND r.ended_at IS NULL
+        "#,
+    )
+    .bind(action)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(k,)| k).collect())
 }
 
 // ---- CLAUDE-26: encrypted secrets ---------------------------------------
@@ -1015,6 +1042,7 @@ mod tests {
             last_seen_at: now_iso(),
             parse_error: None,
             link_template: None,
+            max_parallel: 1,
         }
     }
 
@@ -1083,5 +1111,58 @@ mod tests {
             !action_has_active_run(&pool, "act").await.unwrap(),
             "a finished run is no longer in flight"
         );
+    }
+
+    // CLAUDE-162: with two OVERLAPPING open runs for one action,
+    // `action_has_active_run` stays true until BOTH finish, and
+    // `action_last_run_started` returns the most recently started of the two, so
+    // the delete-conflict guard and the schedule bookkeeping both behave with
+    // multiple concurrent runs.
+    #[tokio::test]
+    async fn multiple_open_runs_are_tracked_correctly() {
+        let pool = mem_pool().await;
+        let r1 = run_begin(&pool, "act", "scheduler").await.unwrap();
+        let r2 = run_begin(&pool, "act", "trigger").await.unwrap();
+
+        assert!(action_has_active_run(&pool, "act").await.unwrap());
+        // The later run started at or after the earlier; the query returns the
+        // newest by started_at (ties broken by row order, still an open run).
+        let last = action_last_run_started(&pool, "act").await.unwrap();
+        assert!(last.is_some(), "an active run reports a start time");
+
+        // Finishing one of two open runs leaves the action still in flight.
+        run_finish(&pool, r1, crate::exit::OK, 0).await.unwrap();
+        assert!(
+            action_has_active_run(&pool, "act").await.unwrap(),
+            "still in flight while the second run is open"
+        );
+
+        run_finish(&pool, r2, crate::exit::OK, 0).await.unwrap();
+        assert!(!action_has_active_run(&pool, "act").await.unwrap());
+    }
+
+    // CLAUDE-162: `action_inflight_keys` returns the union of in-flight job keys
+    // across every OPEN run of the action, and excludes keys from finished runs,
+    // so the overlapping-run admission check dedups against exactly the work
+    // another live run currently holds.
+    #[tokio::test]
+    async fn action_inflight_keys_unions_open_runs() {
+        let pool = mem_pool().await;
+        let r1 = run_begin(&pool, "act", "scheduler").await.unwrap();
+        let r2 = run_begin(&pool, "act", "trigger").await.unwrap();
+        run_inflight_add(&pool, r1, "ISSUE-1").await.unwrap();
+        run_inflight_add(&pool, r2, "ISSUE-2").await.unwrap();
+        // A different action's in-flight key must not leak in.
+        let other = run_begin(&pool, "other", "scheduler").await.unwrap();
+        run_inflight_add(&pool, other, "ISSUE-9").await.unwrap();
+
+        let mut keys = action_inflight_keys(&pool, "act").await.unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["ISSUE-1".to_string(), "ISSUE-2".to_string()]);
+
+        // Finishing r1 drops its in-flight markers, so only r2's key remains.
+        run_finish(&pool, r1, crate::exit::OK, 1).await.unwrap();
+        let keys = action_inflight_keys(&pool, "act").await.unwrap();
+        assert_eq!(keys, vec!["ISSUE-2".to_string()]);
     }
 }
