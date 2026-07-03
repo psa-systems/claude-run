@@ -256,11 +256,14 @@ pub trait Forge: Send + Sync {
         )))
     }
 
-    /// CLAUDE-149: the issue keys (`#<KEY>-N` references) found in PR
-    /// `pr_number`'s body (`fj pr view <repo>#<n> --json`). Used to flag the
-    /// source issue Needs Review when the per-PR auto-fix ceiling is reached. The
-    /// default returns an empty list (no linkage), so a backend without PR-body
-    /// access degrades to the PR-side flag only.
+    /// CLAUDE-160: the owning issue keys found in PR `pr_number`'s body
+    /// (`fj pr view <repo>#<n> --json`) - only the bare `#<KEY>-N` references
+    /// alone on their own line (the commit convention's trailer), never IDs
+    /// cross-linked in prose. Used to flag the source issue Needs Review when the
+    /// per-PR auto-fix ceiling is reached; scoping to the owning reference keeps
+    /// the flag off related / depends / relates mentions. The default returns an
+    /// empty list (no linkage), so a backend without PR-body access degrades to
+    /// the PR-side flag only.
     fn pr_referenced_issues(&self, host: &str, repo: &str, pr_number: u64) -> Result<Vec<String>> {
         let _ = (host, repo, pr_number);
         Ok(Vec::new())
