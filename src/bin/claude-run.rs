@@ -516,9 +516,15 @@ async fn run_action(
     // CLAUDE-28: a standalone `run` is a single process with no daemon, so it
     // gets its own ephemeral key gate; the per-action lock already prevents it
     // from overlapping a daemon-driven run of the same action.
+    // CLAUDE-162: it also gets its own ephemeral limiter sized to the action's
+    // own `max_parallel`, so the global cap never over-restricts a single
+    // standalone run (there are no other actions to bound it against here).
     let keygate = claude_run::concurrency::KeyGate::new();
+    let limiter = claude_run::concurrency::Limiter::new(
+        loaded.action.concurrency.max_parallel.max(1) as usize,
+    );
     daemon::run_action_inner(
-        &loaded, paths, &pool, snippet, claude, "cli", None, &keygate,
+        &loaded, paths, &pool, snippet, claude, "cli", None, &keygate, &limiter,
     )
     .await?;
     Ok(exit::OK)

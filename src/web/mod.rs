@@ -1692,7 +1692,13 @@ async fn action_delete(
     if indexed_action_path(&s.api.pool, &name).await?.is_none() {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     }
-    let dispatched = s.api.in_flight.lock().await.contains(&name);
+    let dispatched = s
+        .api
+        .in_flight
+        .lock()
+        .await
+        .get(&name)
+        .is_some_and(|&n| n > 0);
     if dispatched || state::action_has_active_run(&s.api.pool, &name).await? {
         return Ok((
             StatusCode::CONFLICT,
@@ -2685,6 +2691,18 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "datetime_format",
                 badge: "live",
                 note: "chrono strftime pattern; use a preset button below or edit freely.",
+            },
+        ],
+        Concurrency => vec![
+            FieldDoc {
+                name: "max_parallel_global",
+                badge: "next tick",
+                note: "global cap on concurrent jobs across all actions; 0 = auto (max enabled max_parallel).",
+            },
+            FieldDoc {
+                name: "regather_interval_secs",
+                badge: "next tick",
+                note: "cadence (seconds) the scheduler starts overlapping pickup runs; >= 1.",
             },
         ],
     }
@@ -4036,7 +4054,7 @@ mod tests {
                 trigger_tx,
                 version: "test",
                 runs: Arc::new(RunRegistry::new()),
-                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
             });
             let paths = Paths {
@@ -4067,6 +4085,7 @@ mod tests {
                     last_seen_at: "2026-01-01T00:00:00+00:00".to_string(),
                     parse_error: None,
                     link_template: None,
+                    max_parallel: 1,
                 },
             )
             .await
@@ -5062,7 +5081,7 @@ mod tests {
                 trigger_tx,
                 version: "test",
                 runs: Arc::new(RunRegistry::new()),
-                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
             });
             let paths = Paths {
@@ -5312,7 +5331,7 @@ mod tests {
                 trigger_tx,
                 version: "9.9.9 (testsha, 2026-06-25)",
                 runs: Arc::new(RunRegistry::new()),
-                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+                in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
             });
             WebState {

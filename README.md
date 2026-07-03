@@ -101,9 +101,9 @@ shown or stored on the page: fields ending in `_ref` (`auth_token_ref`, a webhoo
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
 secret refs, adding a source), `next event` / `next invocation` for mint / update, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
-`GET` / `PUT /api/settings/{mint,update,webhook,log_filter,workdir_gc,preferences}`. The `workdir_gc` (CLAUDE-106) and
-`preferences` (CLAUDE-154) sections are DB-only from birth (never `config.toml` keys), so they are not part of the
-one-time import below; each simply
+`GET` / `PUT /api/settings/{mint,update,webhook,log_filter,workdir_gc,preferences,concurrency}`. The `workdir_gc`
+(CLAUDE-106), `preferences` (CLAUDE-154), and `concurrency` (CLAUDE-162) sections are DB-only from birth (never
+`config.toml` keys), so they are not part of the one-time import below; each simply
 defaults until edited.
 
 **One-time import, then breaking.** The first daemon start after upgrading imports any of the four moved sections still
@@ -157,6 +157,37 @@ Every timestamp is stored as an RFC3339 UTC string; how it is displayed in the w
 - `locale`: a BCP-47 locale (default `en-US`). Advisory / reserved for now: it is stored and round-trips through the API but does NOT yet localize month / weekday names (that needs chrono's `unstable-locales` feature). Wiring it live is tracked in CLAUDE-155.
 
 Edits apply live (the dashboard, run and action detail pages, the secrets table, and the live job-stream log all reformat on the next render). Saving an unknown timezone or an unparseable strftime format is rejected inline and nothing is persisted. With the defaults (`UTC` + ISO-with-seconds) displayed times equal today's stored UTC values; only the surface format changes, never the underlying data. Elapsed durations (run duration, the +offset in the live log) and `report` analytics are wall-clock spans, not dates, and are left unformatted.
+
+## Continuous pickup and concurrency caps (CLAUDE-162)
+
+The daemon does not serialize runs per action. An issue queued while a run is in flight is picked up by a new,
+**overlapping** run within `regather_interval` (default 60s) rather than waiting for the in-flight run to drain, and it is
+never blocked behind an unrelated in-flight run of another action. A manual `trigger` during an in-flight run likewise
+starts an overlapping pickup run instead of being silently dropped. Concurrency is bounded by three limits:
+
+- **Per-action `max_parallel`** (the action's `concurrency.max_parallel`, default 1), now enforced **daemon-wide**: the
+  total number of concurrent jobs for an action stays `<= max_parallel` across all its overlapping runs, not just within
+  one run.
+- **Global `max_parallel_global`** caps total concurrent jobs across every action, so overlapping runs cannot spawn an
+  unbounded number of concurrent `claude` processes. Unset (`0`) it defaults to the maximum enabled-action
+  `max_parallel`, so a single action still reaches its full per-action cap out of the box.
+- **Per-key serialization** (unchanged): same-repo / same-project jobs still serialize by the daemon-wide key gate, so
+  distinct repos parallelize but two jobs against the same repo never run at once, even across overlapping runs.
+
+Each job acquires a global permit, then the per-action permit, then the key gate, in that fixed order, so the pipeline is
+deadlock-free. Two overlapping runs never both work the same job: each run drops issues already in flight in another open
+run (an admission check that also suppresses empty, redundant runs), the native `youtrack` handler re-reads the live `AI
+Agent` field per job, and the key gate serializes same-repo work. The daily cap and budget stay best-effort; because up
+to `max_parallel_global` jobs can pass the pre-launch check before any advances the ledger, the documented overshoot
+bound is `max_parallel_global - 1`.
+
+`max_parallel_global` and `regather_interval` are a DB-backed runtime setting (the `concurrency` section) edited on the
+**Settings** page or via `GET` / `PUT /api/settings/concurrency`; fields are `max_parallel_global` (default `0` = auto)
+and `regather_interval_secs` (default `60`, must be `>= 1`). Both apply on the next scheduler tick.
+
+> The whole-run per-action `flock` that used to force a full drain is gone on the daemon path. The standalone
+> `claude-run run <action>` path still takes it as a cross-process guard; running standalone `run` for an action the
+> daemon also schedules is unsupported concurrent use.
 
 ## Self-update (release trains)
 
