@@ -28,48 +28,67 @@ fn number_from_pr_url(url: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
-/// CLAUDE-149: extract bare `#<KEY>-N` issue references from `text` (e.g.
-/// `#CLAUDE-149`), returning the keys without the leading `#`, deduped in
-/// first-seen order. A key matches `[A-Z][A-Z0-9]*-[0-9]+` (the bare reference
-/// the bot's commit / PR body carries per the commit convention). Only ASCII
-/// bytes are matched, so the slice boundaries stay on char boundaries.
+/// CLAUDE-160: extract only the *owning* `#<KEY>-N` issue references from
+/// `text`, returning the keys without the leading `#`, deduped in first-seen
+/// order. A key matches `[A-Z][A-Z0-9]*-[0-9]+`.
+///
+/// An owning reference is a **bare `#<KEY>-N` alone on its own line** (the
+/// commit convention's trailer block, per each repo's `CLAUDE.md`): "End of
+/// body, last block, one issue per line, BARE id with nothing after it." A
+/// commit can legitimately serve several issues, so every such bare line is an
+/// owning reference and is returned.
+///
+/// IDs that appear embedded in prose - a "Related issues" list, "depends on
+/// #KEY-N" / "relates to #KEY-N" cross-links, or the `(#NNN)` PR number in a
+/// Forgejo "Merge pull request" subject - carry other text on the line and are
+/// deliberately IGNORED. They are cross-links, never transition targets. This
+/// is what keeps VCS-triggered automation (e.g. the CI-fix `Needs Review` flag)
+/// acting only on the change's owning issue rather than fanning its command out
+/// to every ID mentioned in the body.
+///
+/// Only ASCII bytes are matched, so the slice boundaries stay on char
+/// boundaries.
 fn parse_issue_refs(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
     let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'#' {
-            i += 1;
-            continue;
-        }
-        let start = i + 1;
-        let mut j = start;
-        // KEY: an uppercase letter then uppercase letters / digits.
-        if j < bytes.len() && bytes[j].is_ascii_uppercase() {
-            j += 1;
-            while j < bytes.len() && (bytes[j].is_ascii_uppercase() || bytes[j].is_ascii_digit()) {
-                j += 1;
-            }
-            // `-` then one or more digits.
-            if j < bytes.len() && bytes[j] == b'-' {
-                j += 1;
-                let digits_start = j;
-                while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j > digits_start {
-                    let key = text[start..j].to_string();
-                    if !out.contains(&key) {
-                        out.push(key);
-                    }
-                    i = j;
-                    continue;
-                }
+    for line in text.lines() {
+        if let Some(key) = bare_issue_ref(line.trim()) {
+            if !out.contains(&key) {
+                out.push(key);
             }
         }
-        i += 1;
     }
     out
+}
+
+/// CLAUDE-160: if `s` is EXACTLY a bare `#<KEY>-N` reference and nothing else,
+/// return the key (`<KEY>-N`, no leading `#`); otherwise `None`. Callers pass an
+/// already-trimmed line, so any surrounding prose leaves trailing/leading bytes
+/// that make the match fail - which is precisely how a cross-link mention is
+/// distinguished from the owning-reference trailer.
+fn bare_issue_ref(s: &str) -> Option<String> {
+    let rest = s.strip_prefix('#')?;
+    let bytes = rest.as_bytes();
+    let mut j = 0;
+    // KEY: an uppercase letter then uppercase letters / digits.
+    if j < bytes.len() && bytes[j].is_ascii_uppercase() {
+        j += 1;
+        while j < bytes.len() && (bytes[j].is_ascii_uppercase() || bytes[j].is_ascii_digit()) {
+            j += 1;
+        }
+        // `-` then one or more digits, consuming the WHOLE string (bare id,
+        // nothing after it).
+        if j < bytes.len() && bytes[j] == b'-' {
+            j += 1;
+            let digits_start = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > digits_start && j == bytes.len() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Captured result of running an external command.
@@ -874,9 +893,11 @@ impl Forge for CliBackend {
     }
 
     fn pr_referenced_issues(&self, host: &str, repo: &str, pr_number: u64) -> Result<Vec<String>> {
-        // CLAUDE-149: read the PR body and extract the bare `#<KEY>-N` references
-        // the bot's commit / PR body carries, so the source issue can be flagged
-        // Needs Review. Addressed as `owner/repo#n` (no checkout needed).
+        // CLAUDE-160: read the PR body and extract only the owning-reference
+        // lines (bare `#<KEY>-N` alone on a line, per the commit convention), so
+        // flagging the source issue Needs Review never fans out to related
+        // issues cross-linked in prose. Addressed as `owner/repo#n` (no checkout
+        // needed).
         let id = format!("{repo}#{pr_number}");
         let args = ["--host", host, "pr", "view", &id, "--json"];
         let out = self
@@ -1731,17 +1752,76 @@ mod tests {
     }
 
     #[test]
+    fn pr_referenced_issues_returns_only_the_owning_ref_not_cross_links() {
+        // CLAUDE-160: the PR body cross-links two related issues in prose and
+        // carries the owning issue as a bare trailer line. Only the owning issue
+        // is returned, so flagging Needs Review never touches the related work.
+        let view = r#"{"number":52,"body":"Implements the fix.\n\nRelated issues:\n- depends on #YOTUN-72\n- relates to #YOTUN-73\n\n#YOTUN-65\n\nCo-Authored-By: x"}"#;
+        let b = backend(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "view",
+                "contoso/claude-run#52",
+                "--json",
+            ],
+            view,
+        ));
+        let keys = b
+            .pr_referenced_issues("dev.a8n.run", "contoso/claude-run", 52)
+            .unwrap();
+        assert_eq!(keys, vec!["YOTUN-65".to_string()]);
+    }
+
+    #[test]
     fn parse_issue_refs_finds_dedupes_and_ignores_non_refs() {
-        assert_eq!(parse_issue_refs("fixes #CLAUDE-149"), vec!["CLAUDE-149"]);
-        // Multiple refs, deduped in first-seen order.
+        // A bare owning reference on its own line is picked up.
+        assert_eq!(parse_issue_refs("#CLAUDE-149"), vec!["CLAUDE-149"]);
+        // Multiple owning refs (one per line), deduped in first-seen order.
         assert_eq!(
             parse_issue_refs("#LC-200\n#YT-1\n#LC-200"),
             vec!["LC-200".to_string(), "YT-1".to_string()]
         );
+        // Surrounding whitespace on the trailer line is tolerated.
+        assert_eq!(parse_issue_refs("  #YT-1  "), vec!["YT-1".to_string()]);
         // A bare `#` or a `#word` with no `-N` is not a ref.
         assert!(parse_issue_refs("# heading\n#notakey\n#lower-1").is_empty());
         // A key needs at least one trailing digit.
         assert!(parse_issue_refs("#CLAUDE-").is_empty());
+    }
+
+    #[test]
+    fn parse_issue_refs_ignores_cross_links_and_keeps_only_owning_line() {
+        // CLAUDE-160: a body that cross-links related work in prose but carries
+        // the owning reference as a bare trailer line must yield ONLY the owning
+        // issue - never the related / depends / relates mentions.
+        let body = "Implements the pointer-event drag fix.\n\
+             \n\
+             Related issues:\n\
+             - depends on #YOTUN-72 (future feature)\n\
+             - relates to #YOTUN-73 (backend bug)\n\
+             \n\
+             #YOTUN-65\n\
+             \n\
+             Co-Authored-By: x";
+        assert_eq!(parse_issue_refs(body), vec!["YOTUN-65".to_string()]);
+    }
+
+    #[test]
+    fn parse_issue_refs_ignores_forgejo_merge_subject_pr_number_and_prose() {
+        // CLAUDE-160: a Forgejo "Merge pull request ... (#NNN)" commit embeds the
+        // whole PR description. The `(#145)` PR number is not a KEY-N ref, and a
+        // second unrelated issue ID mentioned in prose must not be returned;
+        // only the bare owning trailer line survives.
+        let body = "Merge pull request 'feat: drag' (#145) from feat/x into main\n\
+             \n\
+             Reviewed-on: https://dev.a8n.run/contoso/x/pulls/145\n\
+             Implements the fix. See also #YOTUN-73 for the backend follow-up.\n\
+             \n\
+             #YOTUN-65";
+        assert_eq!(parse_issue_refs(body), vec!["YOTUN-65".to_string()]);
     }
 
     #[test]
