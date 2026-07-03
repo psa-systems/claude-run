@@ -143,6 +143,12 @@ native:
       enabled: false                      # off by default; finalize stops at Code Review
       wait_seconds: 1800                  # max total seconds to wait for checks to go green
       check_interval_seconds: 30          # seconds between CI status polls
+    dependencies:                         # optional; pre-clone dependency gate (CLAUDE-161)
+      enabled: true                       # on by default; false makes the gate a no-op
+      recheck_timeout: 5m                 # backoff before a blocked issue is re-evaluated
+      block_on:                           # direction-resolved link verbs that block
+        - depends on                      # Depend INWARD: an open blocker gates this issue
+        - parent for                      # Subtask OUTWARD: an open child gates this parent
   forgejo:
     base_url: https://forge.example       # optional; default derives host per issue VCS
     token_ref: fj-prod                    # optional; name of an encrypted secret
@@ -166,6 +172,9 @@ native:
 | `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge (CLAUDE-126). When `false`, finalize stops at Code Review with no CI wait and no merge (unchanged behavior). |
 | `youtrack.automerge.wait_seconds` | `1800`                   | Maximum total seconds to wait for the PR's checks to go green (and the branch to be up to date) before giving up and leaving the PR open. |
 | `youtrack.automerge.check_interval_seconds` | `30`           | Seconds between combined-CI-status polls.                                                            |
+| `youtrack.dependencies.enabled` | `true`                    | Master switch for the pre-clone dependency gate (CLAUDE-161). When `true`, a queued issue with any unmet dependency is left Queued (not cloned, no claude spend) and re-evaluated after `recheck_timeout`. When `false`, the gate is a no-op and pickup proceeds exactly as before. See [Pre-clone dependency gate](#pre-clone-dependency-gate-claude-161). |
+| `youtrack.dependencies.recheck_timeout` | `5m`              | Humantime backoff before a blocked issue is re-evaluated. While the window is open the issue stays Queued with no `yt` read and no comment (no per-poll spam). Validated at action load. |
+| `youtrack.dependencies.block_on` | `["depends on", "parent for"]` | Direction-resolved link verbs (YT-40) that block. A queued issue is blocked when it has any link whose `verb` is listed here and whose target is unresolved. The defaults block `depends on` (Depend INWARD, an open blocker) and `parent for` (Subtask OUTWARD, an open child); the reverse verbs `is required for` and `subtask of` never block. |
 | `forgejo.base_url`      | per-issue VCS host                 | Forgejo base URL.                                                                                   |
 | `forgejo.token_ref`     | none                               | Name of an encrypted secret holding the Forgejo API token (CLAUDE-26). `None` uses host `fj` auth.  |
 | `forgejo.pr_strategy`   | `branch`                           | PR-creation strategy (CLAUDE-103). `branch`: push a real server branch (`git push --set-upstream origin HEAD`) and open the PR over the API, so the PR stays mergeable and updatable. `agit`: `fj pr create -aA`, a branchless PR whose head lives only at `refs/pull/<N>/head` and loses its merge button if it falls behind an up-to-date base. The selected strategy is authoritative (no silent cross-strategy fallback). |
@@ -219,6 +228,21 @@ never hangs on a long wait. The outcomes:
 
 Automerge is currently implemented for the Forgejo (`fj`) backend only; a GitHub-hosted job with automerge enabled logs
 the unsupported merge and leaves the PR at Code Review (GitHub automerge is a follow-up).
+
+##### Pre-clone dependency gate (CLAUDE-161)
+
+When issues are mass-assigned to the runner (AI Agent = Queued), an issue whose blockers are still open would otherwise be picked up, cloned, and handed to the agent only to discover it cannot proceed. The dependency gate moves that check before the clone, where it is knowable for free. After the live AI-Agent re-read confirms the issue is still `queued` and before any clone or `claude --print`, the gate reads the issue's links (`yt issue inspect --json`, which since YT-40 carries each link's resolved `direction` / `verb` and each target's nullable `resolved` timestamp) and blocks the issue when it has any unmet dependency.
+
+A link blocks when its direction-resolved `verb` is listed in `dependencies.block_on` and its target is unresolved (`resolved` is null/absent). The defaults are `depends on` (Depend INWARD: an open blocker gates this issue) and `parent for` (Subtask OUTWARD: an open child gates this parent). The reverse verbs never block: `is required for` (Depend OUTWARD, issues this one blocks) and `subtask of` (Subtask INWARD, this issue's parent). A blocker or child counts as **met** iff its `resolved` timestamp is non-null.
+
+When blocked:
+
+- The issue is left at AI Agent = `queued` (no transition to Working); it is **not** cloned and `claude` is **not** invoked.
+- No `max_attempts_per_key` slot is consumed (the same no-attempt semantics as the skip-attempt / parked path); the run outcome is `Blocked`, distinct from filtered / failed / needs-review.
+- A comment listing the unmet blockers (id + relationship) is posted on entering the blocked state, and re-posted only when the unmet-blocker set changes, so repeated re-checks do not spam the issue.
+- A per-issue backoff is recorded: `blocked_until = now + recheck_timeout`. While the window is open the gate skips re-evaluating the issue entirely (it stays Queued; no `yt` read, no comment). The state persists across polls and daemon restarts in the `dependency_gate` table (migration `0015_dependency_gate.sql`), keyed by (action, issue key).
+
+When dependencies are met, the issue has none, or `enabled: false`, the gate is a no-op and pickup proceeds exactly as before (Working, clone, claude). No "unblocked" comment is posted; the normal Working transition and eventual PR are the signal. If the link read itself fails, the gate does not strand the issue: it falls back to normal pickup (the agent self-parks if it truly cannot proceed), since the gate is an optimization over that correct baseline.
 
 #### Credential injection (CLAUDE-26)
 

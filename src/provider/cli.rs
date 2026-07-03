@@ -238,6 +238,38 @@ struct ProjectListEntry {
     archived: bool,
 }
 
+/// The `links` array of `yt issue inspect --json` (YT-40 / CLAUDE-161). Only the
+/// links are deserialized; the surrounding `issue` / `comments` / etc. objects
+/// are ignored.
+#[derive(Debug, Deserialize)]
+struct InspectLinks {
+    #[serde(default)]
+    links: Vec<RawLink>,
+}
+
+/// One `links[]` entry: the resolved `direction` / `verb` (YT-40) plus the linked
+/// issues that entry connects to.
+#[derive(Debug, Deserialize)]
+struct RawLink {
+    #[serde(default)]
+    direction: String,
+    #[serde(default)]
+    verb: String,
+    #[serde(default)]
+    issues: Vec<RawLinkedIssue>,
+}
+
+/// One linked issue inside a `links[]` entry. `resolved` is the nullable epoch-ms
+/// resolution timestamp; it is omitted entirely for an unresolved issue, so
+/// `#[serde(default)]` maps both absent and null to `None` (an unmet dependency).
+#[derive(Debug, Deserialize)]
+struct RawLinkedIssue {
+    #[serde(rename = "idReadable")]
+    id_readable: String,
+    #[serde(default)]
+    resolved: Option<i64>,
+}
+
 impl CliBackend {
     /// Backend with default binary names (`yt`, `fj`) and the default forge key
     /// store under the user's data dir.
@@ -611,6 +643,25 @@ impl IssueTracker for CliBackend {
     fn comment(&self, key: &str, body: &str) -> Result<()> {
         self.yt_ok(&["issue", "comment", key, body])?;
         Ok(())
+    }
+
+    fn issue_links(&self, key: &str) -> Result<Vec<super::IssueLink>> {
+        let stdout = self.yt_ok(&["issue", "inspect", key, "--json"])?;
+        let parsed: InspectLinks = Self::parse_json(&self.yt, "yt issue inspect --json", &stdout)?;
+        // Flatten each `links[]` entry into one row per linked target, carrying the
+        // entry's direction/verb (YT-40) onto every target it lists.
+        let mut out = Vec::new();
+        for link in parsed.links {
+            for issue in link.issues {
+                out.push(super::IssueLink {
+                    direction: super::LinkDirection::from_yt(&link.direction),
+                    verb: link.verb.clone(),
+                    target: issue.id_readable,
+                    resolved: issue.resolved,
+                });
+            }
+        }
+        Ok(out)
     }
 
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo> {
@@ -1067,6 +1118,45 @@ mod tests {
         let issues = b.list_queued("AI Agent: Queued").unwrap();
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[0]["idReadable"], "MK-16");
+    }
+
+    /// CLAUDE-161: `issue_links` flattens the `yt issue inspect --json` `links`
+    /// array into one row per linked target, carrying each entry's resolved
+    /// `direction` / `verb` (YT-40) and each target's nullable `resolved`. A
+    /// resolved target keeps its epoch-ms timestamp; an unresolved one (the key
+    /// omitted) maps to `None`. Empty `issues` arrays contribute no rows.
+    #[test]
+    fn issue_links_parses_direction_verb_resolved() {
+        let json = r#"{
+          "issue": {"idReadable": "CLAUDE-31"},
+          "links": [
+            {"direction": "BOTH", "verb": "relates to", "issues": []},
+            {"direction": "INWARD", "verb": "depends on",
+             "issues": [{"idReadable": "CLAUDE-30", "summary": "x"}]},
+            {"direction": "OUTWARD", "verb": "is required for",
+             "issues": [{"idReadable": "CLAUDE-32", "resolved": 1780049281523}]},
+            {"direction": "OUTWARD", "verb": "parent for",
+             "issues": [{"idReadable": "CLAUDE-40"}]}
+          ]
+        }"#;
+        let b =
+            backend(StubRunner::new().ok("yt", &["issue", "inspect", "CLAUDE-31", "--json"], json));
+        let links = b.issue_links("CLAUDE-31").unwrap();
+        assert_eq!(links.len(), 3, "empty issues array contributes no row");
+
+        let dep = links.iter().find(|l| l.target == "CLAUDE-30").unwrap();
+        assert_eq!(dep.direction, crate::provider::LinkDirection::Inward);
+        assert_eq!(dep.verb, "depends on");
+        assert_eq!(dep.resolved, None, "resolved key omitted => unmet");
+
+        let req = links.iter().find(|l| l.target == "CLAUDE-32").unwrap();
+        assert_eq!(req.direction, crate::provider::LinkDirection::Outward);
+        assert_eq!(req.verb, "is required for");
+        assert_eq!(req.resolved, Some(1780049281523));
+
+        let child = links.iter().find(|l| l.target == "CLAUDE-40").unwrap();
+        assert_eq!(child.verb, "parent for");
+        assert_eq!(child.resolved, None);
     }
 
     #[test]
