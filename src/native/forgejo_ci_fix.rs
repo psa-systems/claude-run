@@ -202,7 +202,11 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
         }
         // CLAUDE-162: mark this PR in flight so an overlapping run's admission
         // check dedups against it.
-        if let Err(e) = state::run_inflight_add(pool, run_id, &planned_keys[idx]).await {
+        // CLAUDE-163: one job per PR key, so the concurrency key equals the job
+        // key here; the sequential `Limiter::acquire` path is otherwise unchanged.
+        if let Err(e) =
+            state::run_inflight_add(pool, run_id, &planned_keys[idx], &planned_keys[idx]).await
+        {
             warn!(error = %e, "run_inflight_add failed (non-fatal)");
         }
         let outcome = process_job(&ctx, backend.as_ref(), &cfg, &limits, &cancel, job).await;
