@@ -89,6 +89,15 @@ pre:
 Identifier used for the lock file, state file, log directory, and PAUSED flag. Should be kebab-case and unique across
 all actions on the host.
 
+The action index is keyed by this exact string, so two files whose `name:` differ only by case (`youtrack` vs
+`YouTrack`) are indexed as two independent, separately-scheduled actions. At scan time the daemon flags (but does not
+merge or disable) two kinds of redundant configuration among enabled actions (CLAUDE-164): (1) names equal ignoring
+case, and (2) two native actions of the same `kind` polling the same source (for `kind: youtrack`, the same
+`native.youtrack.query` and `base_url`; for `kind: forgejo-ci-fix`, the same `host` and `repos`). Either condition
+means both actions gather the same jobs and silently compete on the shared daemon-wide concurrency caps. The daemon
+emits a WARN log and a persisted notice on each colliding action (visible on the action page); no action is
+auto-disabled - rename, consolidate, or disable one yourself.
+
 ### `kind` (enum, optional, default `scripted`)
 
 The dispatch discriminator (CLAUDE-30). Selects how the runner executes the action:
