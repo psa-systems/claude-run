@@ -510,9 +510,18 @@ async fn run_action(
     let snippet = Arc::new(snippet::SnippetRunner::new(
         on_disk.daemon.nu_binary.as_deref(),
     ));
-    let claude = Arc::new(claude_mod::ClaudeInvoker::new(
-        on_disk.daemon.claude_binary.as_deref(),
-    ));
+    // CLAUDE-165: like the daemon, a standalone `run` seeds and routes the agent
+    // to its dedicated CLAUDE_CONFIG_DIR so it loads the slim bot CLAUDE.md, not
+    // the operator's global `~/.claude/CLAUDE.md`.
+    let agent_config_dir = claude_run::agent_home::resolve_config_dir(
+        paths,
+        on_disk.daemon.claude_config_dir.as_deref(),
+    );
+    claude_run::agent_home::ensure(&agent_config_dir)?;
+    let claude = Arc::new(
+        claude_mod::ClaudeInvoker::new(on_disk.daemon.claude_binary.as_deref())
+            .with_config_dir(Some(agent_config_dir)),
+    );
     // CLAUDE-28: a standalone `run` is a single process with no daemon, so it
     // gets its own ephemeral key gate; the per-action lock already prevents it
     // from overlapping a daemon-driven run of the same action.

@@ -111,11 +111,22 @@ impl Daemon {
         info!(socket = %sock_path.display(), "daemon listening");
 
         let snippet = SnippetRunner::new(self.on_disk.daemon.nu_binary.as_deref());
+        // CLAUDE-165: seed the agent's dedicated CLAUDE_CONFIG_DIR (slim bot
+        // CLAUDE.md + linked host login) before spawning any agent, so the child
+        // never loads the operator's global `~/.claude/CLAUDE.md`. A missing host
+        // credential file aborts serve start with a clear error.
+        let agent_config_dir = crate::agent_home::resolve_config_dir(
+            &self.paths,
+            self.on_disk.daemon.claude_config_dir.as_deref(),
+        );
+        crate::agent_home::ensure(&agent_config_dir)?;
+        info!(dir = %agent_config_dir.display(), "seeded claude agent config dir");
         // `Arc` so the same invoker backs both the dispatcher and the
         // webhook triage classifier (CLAUDE-47).
-        let claude = Arc::new(ClaudeInvoker::new(
-            self.on_disk.daemon.claude_binary.as_deref(),
-        ));
+        let claude = Arc::new(
+            ClaudeInvoker::new(self.on_disk.daemon.claude_binary.as_deref())
+                .with_config_dir(Some(agent_config_dir)),
+        );
 
         // CLAUDE-9: one registry shared between the dispatcher (which registers
         // a token per run) and the API state (whose /runs/:id/cancel handler

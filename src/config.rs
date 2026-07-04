@@ -490,6 +490,15 @@ pub struct DaemonConfig {
     pub nu_binary: Option<String>,
     /// Optional override for the claude binary. Default: "claude".
     pub claude_binary: Option<String>,
+    /// CLAUDE-165: where the spawned `claude` agent reads its user-level config
+    /// (`CLAUDE.md`, `.credentials.json`, `settings.json`) from, via the
+    /// `CLAUDE_CONFIG_DIR` env var. A path the daemon needs before it can spawn
+    /// the agent, so it is a bootstrap `config.toml` key (not a DB-backed runtime
+    /// setting). When unset it defaults to `<CLAUDE_RUN_CONFIG_DIR>/claude-agent-home`,
+    /// self-contained under claude-run's own config tree. At serve start the
+    /// daemon seeds this dir with the slim bot `CLAUDE.md` and links the host
+    /// login, so the agent never loads the operator's global `~/.claude/CLAUDE.md`.
+    pub claude_config_dir: Option<String>,
     /// CLAUDE-62: persistent log filter, a tracing `EnvFilter` directive string
     /// (e.g. `info,claude_run=debug,sqlx=warn`). Applied after config load via a
     /// reload layer. Precedence: `CLAUDE_RUN_LOG` > this field > the built-in

@@ -81,6 +81,12 @@ pub struct ClaudeInvoker {
     /// terminal `result` event before force-terminating the group. Defaults to
     /// `RESULT_EXIT_GRACE`; tests override it to keep the hang case fast.
     result_exit_grace: Duration,
+    /// CLAUDE-165: when set, spawned `claude` children get
+    /// `CLAUDE_CONFIG_DIR=<dir>` so they read the slim bot `CLAUDE.md` and the
+    /// linked host credentials instead of the operator's global `~/.claude`.
+    /// `HOME` is left inherited so git/ssh keep working. `None` (the default and
+    /// every test) inherits the ambient environment unchanged.
+    config_dir: Option<PathBuf>,
 }
 
 impl ClaudeInvoker {
@@ -88,7 +94,15 @@ impl ClaudeInvoker {
         Self {
             binary: binary.unwrap_or("claude").to_string(),
             result_exit_grace: RESULT_EXIT_GRACE,
+            config_dir: None,
         }
+    }
+
+    /// CLAUDE-165: route spawned children at `dir` via `CLAUDE_CONFIG_DIR`.
+    /// A builder so `new` stays source-compatible with existing callers/tests.
+    pub fn with_config_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.config_dir = dir;
+        self
     }
 
     pub fn stream_log_path(logs_dir: &Path, action: &str, key: &str, attempt: u32) -> PathBuf {
@@ -163,7 +177,8 @@ impl ClaudeInvoker {
         // child's stdout pipe. Accepted because the runner already owns the
         // child's lifecycle (timeout kill, CLAUDE-52 / CLAUDE-53), so a dead
         // runner already implies a dead run.
-        let mut child = Command::new("timeout")
+        let mut command = Command::new("timeout");
+        command
             .arg(format!("{}s", timeout.as_secs()))
             .arg(&self.binary)
             .arg("--print")
@@ -176,8 +191,13 @@ impl ClaudeInvoker {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log_err))
-            .process_group(0)
-            .spawn()?;
+            .process_group(0);
+        // CLAUDE-165: point the agent at its dedicated user-level config dir
+        // (slim bot CLAUDE.md + linked host credentials). HOME is left inherited.
+        if let Some(dir) = &self.config_dir {
+            command.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        let mut child = command.spawn()?;
 
         // Relay claude's piped stdout to the stream log, stamping each JSON
         // object line with its arrival time. Runs on its own thread next to the
@@ -700,6 +720,56 @@ exit "$code"
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// CLAUDE-165: when the invoker carries a `config_dir`, the spawned child
+    /// gets `CLAUDE_CONFIG_DIR=<dir>` and still inherits `HOME` unchanged. The
+    /// stub records both env vars as seen by the child so the assertion checks
+    /// the real spawn path, not a rebuilt Command.
+    #[test]
+    fn invoke_sets_config_dir_env_and_inherits_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-env.txt");
+        let stub = dir.path().join("claude-stub.sh");
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\n\
+                 printf 'CFG=%s\\nHOME=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$HOME\" > '{}'\n\
+                 printf '%s\\n' '{RESULT_LINE}'\n\
+                 exit 0\n",
+                marker.display()
+            ),
+        );
+
+        let cfg_dir = dir.path().join("claude-agent-home");
+        let invoker =
+            ClaudeInvoker::new(Some(stub.to_str().unwrap())).with_config_dir(Some(cfg_dir.clone()));
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let res = invoker
+            .invoke(
+                "hi",
+                &cfg,
+                Duration::from_secs(10),
+                dir.path(),
+                &log,
+                &cancel,
+            )
+            .unwrap();
+        assert!(res.ok, "stub run succeeds");
+
+        let seen = std::fs::read_to_string(&marker).unwrap();
+        assert!(
+            seen.contains(&format!("CFG={}", cfg_dir.display())),
+            "child must see CLAUDE_CONFIG_DIR=<dir>, got:\n{seen}"
+        );
+        let expected_home = std::env::var("HOME").unwrap_or_default();
+        assert!(
+            seen.contains(&format!("HOME={expected_home}")),
+            "child must inherit HOME unchanged, got:\n{seen}"
+        );
+    }
+
     /// CLAUDE-53: claude emits its terminal result event and then exits on its
     /// own within the grace window. Behavior is unchanged from today: the result
     /// event is parsed for the success outcome, and nothing is force-terminated.
@@ -715,6 +785,7 @@ exit "$code"
         let invoker = ClaudeInvoker {
             binary: stub.to_str().unwrap().to_string(),
             result_exit_grace: Duration::from_secs(30),
+            config_dir: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -753,6 +824,7 @@ exit "$code"
             binary: stub.to_str().unwrap().to_string(),
             // Short grace so the test doesn't wait the production 30s.
             result_exit_grace: Duration::from_millis(300),
+            config_dir: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -808,6 +880,7 @@ exit "$code"
         let invoker = ClaudeInvoker {
             binary: stub.to_str().unwrap().to_string(),
             result_exit_grace: Duration::from_secs(30),
+            config_dir: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -967,6 +1040,7 @@ exit "$code"
         let invoker = ClaudeInvoker {
             binary: stub.to_str().unwrap().to_string(),
             result_exit_grace: Duration::from_secs(30),
+            config_dir: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -1131,6 +1205,7 @@ exit "$code"
         let invoker = ClaudeInvoker {
             binary: stub.to_str().unwrap().to_string(),
             result_exit_grace: Duration::from_secs(30),
+            config_dir: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
