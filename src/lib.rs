@@ -16,6 +16,7 @@
 //! runtime contract.
 
 pub mod action;
+pub mod agent_home;
 pub mod api;
 pub mod auth;
 pub mod autofix;
