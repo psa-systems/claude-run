@@ -92,7 +92,9 @@ XDG-compliant; each path overridable by the matching env var.
 
 Configuration splits in two. `config.toml` is the **bootstrap** file: only what the daemon must know before it can open
 the DB and bind the listener, namely `[web]` (bind / port / `auth_token_ref` / login) and `[daemon]` binary overrides (
-`nu_binary`, `claude_binary`). Everything runtime-tunable, namely issue minting (`[mint]`), the update train (
+`nu_binary`, `claude_binary`) plus `[daemon].claude_config_dir` (CLAUDE-165: where the spawned agent reads its
+user-level `CLAUDE.md` / credentials from; defaults to `<CLAUDE_RUN_CONFIG_DIR>/claude-agent-home`, seeded at serve
+start with the slim bot `CLAUDE.md` and a symlink to the host `~/.claude/.credentials.json`). Everything runtime-tunable, namely issue minting (`[mint]`), the update train (
 `[update]`), the webhook sources (`[webhook]`), and the log filter (`[daemon].log_filter`), now lives in the database
 and is edited in the app on the **Settings** page (`/settings`, in the nav next to Dashboard), behind the same auth gate
 as the rest of the web UI. A `config.toml` containing only `[web]` and `[daemon]` binary overrides is a complete, valid
@@ -396,6 +398,17 @@ Running the daemon on the host means every `claude` child it spawns inherits the
 loads the operator's interactive `~/.claude/CLAUDE.md` (which prescribes a full Git + YouTrack workflow) and contradicts
 the local-only agent contract. The container runtime (CLAUDE-37) fixes that: the whole daemon runs in a container with a
 clean `$HOME`, so each child inherits a slim, bot-specific user memory instead.
+
+**Host (non-container) deployments (CLAUDE-165).** When the daemon runs directly on the host it now achieves the same
+isolation without a clean `$HOME`: at serve start it seeds `[daemon].claude_config_dir` (default
+`<CLAUDE_RUN_CONFIG_DIR>/claude-agent-home`) with the embedded slim bot `CLAUDE.md` (the same `deploy/bot-CLAUDE.md` the
+container bakes in) and, on Linux, a symlink `<dir>/.credentials.json` to the host login at `~/.claude/.credentials.json`,
+then spawns every `claude` child with `CLAUDE_CONFIG_DIR=<dir>`. That relocates where Claude Code reads the user-level
+`CLAUDE.md` and credentials, so the child loads the bot memory instead of the operator's global `~/.claude/CLAUDE.md`
+while staying authenticated with the shared host login; `HOME` is left inherited so git/ssh keep working, and (unlike
+`--bare`) MCP servers, hooks, and skills stay enabled. If the host credential file is absent at serve start the daemon
+fails loudly naming the path (run `claude` once to log in first). On macOS credentials live in the Keychain rather than
+`.credentials.json`, so the symlink step is Linux-only.
 
 **Image.** `oci-build/Dockerfile` has a `runtime` target built on the CI image (`dev.a8n.run/pandoras-box/rust-builder-musl`).
 It carries `claude-run` plus the pinned runtime toolchain: `nu`, the `claude` CLI, coreutils `timeout`, `git`, `yt` (
