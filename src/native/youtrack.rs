@@ -987,7 +987,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "Steps:",
         "1. Run 'yt issue inspect {{key}}' to read the full description and acceptance criteria.",
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
-        "3. Create a feature branch off the default branch per the Git workflow in CLAUDE.md.",
+        "3. Create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). Do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
         "4. Make the minimum change required to satisfy the acceptance criteria.",
         "5. Commit with a message that references the issue on its own line as '#{{key}}' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
         "6. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop.",
@@ -1780,6 +1780,15 @@ mod tests {
         assert!(p.contains("/tmp/wd/.claude-run-needs-review"));
         assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"));
         assert!(!p.contains("{{"), "unresolved placeholder:\n{p}");
+        // CLAUDE-165: step 3 is self-contained and no longer delegates the git
+        // steps to CLAUDE.md; it instructs staying on the feature branch and
+        // never switching to `main` (the leak that stranded FJ-51's work).
+        assert!(
+            !p.contains("per the Git workflow in CLAUDE.md"),
+            "step 3 must not delegate to the Git workflow in CLAUDE.md:\n{p}"
+        );
+        assert!(p.contains("leave it checked out as HEAD when you stop"));
+        assert!(p.contains("Never run 'git checkout main'"));
     }
 
     #[test]
