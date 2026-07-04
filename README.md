@@ -16,6 +16,10 @@ long-running daemon.
 - **Skip-attempt marker**: an action's post step can write `$workdir/.claude-run-skip-attempt` for outcomes that park a
   job pending human input (so the attempt cap doesn't trip).
 - **Pause / resume**: globally or per-action; persisted in SQLite, takes effect on the next scheduler tick.
+- **Duplicate-source guardrail**: at scan time the daemon flags (but never merges or disables) two enabled actions that
+  do redundant work - names that differ only by case, or two native actions of the same `kind` polling the same source.
+  Both would gather the same jobs and silently compete on the shared concurrency caps; you get a WARN log and a notice
+  on each colliding action instead of discovering the contention during an incident.
 - **HTTP API over a unix socket**: the daemon exposes `/status`, `/actions`, `/actions/<n>/trigger`, `/pause`,
   `/resume`, ... The CLI client speaks that API when the daemon is reachable, else operates on the DB directly.
 

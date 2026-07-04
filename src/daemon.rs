@@ -601,6 +601,119 @@ async fn serve_unix(listener: UnixListener, app: axum::Router) -> Result<()> {
     }
 }
 
+/// CLAUDE-164: one enabled, successfully-parsed action's identity, collected
+/// during a scan so the guardrail can spot two actions doing identical work.
+struct ScannedAction {
+    /// The action `name:` as written (case preserved).
+    name: String,
+    /// On-disk YAML path, for the operator-facing notice.
+    file_path: String,
+    /// Effective native source key (`kind` + source query + `base_url`, or
+    /// `kind` + host + repos), or `None` for a scripted action, whose source is
+    /// an opaque nu snippet we cannot compare.
+    source_key: Option<String>,
+}
+
+/// CLAUDE-164: a detected redundant-configuration collision between two or more
+/// enabled actions. `members` are the action names whose pages carry the
+/// notice; `message` is the operator-facing warning naming every colliding file.
+struct Collision {
+    members: Vec<String>,
+    message: String,
+}
+
+/// CLAUDE-164: the effective native source key for same-source detection.
+/// `None` for a scripted action (its source is an opaque nu snippet). For a
+/// native kind the key folds in the kind plus the fields that determine which
+/// jobs it gathers, so two actions with equal keys provably poll the same
+/// source. `\u{1f}` (unit separator) joins the parts so no field value can forge
+/// a boundary.
+fn native_source_key(action: &crate::action::Action) -> Option<String> {
+    use crate::action::NativeConfig;
+    match action.native.as_ref()? {
+        NativeConfig::Youtrack(cfg) => {
+            let base = cfg.youtrack.base_url.as_deref().unwrap_or("");
+            Some(format!("youtrack\u{1f}{base}\u{1f}{}", cfg.youtrack.query))
+        }
+        NativeConfig::ForgejoCiFix(cfg) => {
+            // Repos are a set: order in YAML is irrelevant to which PRs are
+            // gathered, so sort before joining to canonicalize the key.
+            let mut repos = cfg.repos.clone();
+            repos.sort();
+            Some(format!(
+                "forgejo-ci-fix\u{1f}{}\u{1f}{}",
+                cfg.host,
+                repos.join(",")
+            ))
+        }
+    }
+}
+
+/// CLAUDE-164: detect enabled actions that do redundant work. Two conditions,
+/// each a distinct acceptance criterion: (1) names equal ignoring case
+/// (`youtrack` vs `YouTrack`), almost always the same intended action split by a
+/// typo, both scheduled; (2) the same native kind + source key, so they gather
+/// the same jobs.
+///
+/// A group of one never fires; scripted actions have no source key and so are
+/// exempt from (2). The two checks are independent, so the production case
+/// (case-colliding names that also share a query) yields both notices.
+fn detect_collisions(scanned: &[ScannedAction]) -> Vec<Collision> {
+    use std::collections::BTreeMap;
+    let mut collisions = Vec::new();
+
+    let describe = |group: &[&ScannedAction]| {
+        group
+            .iter()
+            .map(|a| format!("{} ({})", a.name, a.file_path))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    // 1. Case-insensitive action-name collision.
+    let mut by_lower: BTreeMap<String, Vec<&ScannedAction>> = BTreeMap::new();
+    for a in scanned {
+        by_lower.entry(a.name.to_lowercase()).or_default().push(a);
+    }
+    for (lower, group) in &by_lower {
+        if group.len() < 2 {
+            continue;
+        }
+        collisions.push(Collision {
+            members: group.iter().map(|a| a.name.clone()).collect(),
+            message: format!(
+                "redundant config: {} enabled actions share the case-insensitive name \"{}\": {}. Both are scheduled and silently compete on the shared concurrency caps; rename or disable one (CLAUDE-164).",
+                group.len(),
+                lower,
+                describe(group),
+            ),
+        });
+    }
+
+    // 2. Same native source (kind + query/base_url, or kind + host + repos).
+    let mut by_source: BTreeMap<&str, Vec<&ScannedAction>> = BTreeMap::new();
+    for a in scanned {
+        if let Some(key) = a.source_key.as_deref() {
+            by_source.entry(key).or_default().push(a);
+        }
+    }
+    for group in by_source.values() {
+        if group.len() < 2 {
+            continue;
+        }
+        collisions.push(Collision {
+            members: group.iter().map(|a| a.name.clone()).collect(),
+            message: format!(
+                "redundant config: {} enabled actions poll the same source: {}. They gather the same jobs and silently compete on the shared concurrency caps; consolidate or disable one (CLAUDE-164).",
+                group.len(),
+                describe(group),
+            ),
+        });
+    }
+
+    collisions
+}
+
 pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
     if !actions_dir.is_dir() {
         info!(dir = %actions_dir.display(), "actions dir does not exist; nothing to index");
@@ -614,6 +727,9 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
             return Ok(());
         }
     };
+    // CLAUDE-164: identities of the enabled, successfully-parsed actions, used
+    // after the loop to flag redundant-work collisions.
+    let mut scanned: Vec<ScannedAction> = Vec::new();
     for entry in read.flatten() {
         let path = entry.path();
         let ext = path.extension().and_then(|s| s.to_str());
@@ -654,6 +770,15 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
                     max_parallel: la.action.concurrency.max_parallel.max(1) as i64,
                 };
                 state::action_index_upsert(pool, &row).await?;
+                // CLAUDE-164: only enabled actions are scheduled, so only they
+                // can compete; disabled and parse-errored files are excluded.
+                if la.action.enabled {
+                    scanned.push(ScannedAction {
+                        name: la.action.name.clone(),
+                        file_path: la.path.display().to_string(),
+                        source_key: native_source_key(&la.action),
+                    });
+                }
             }
             Err(e) => {
                 // Index the broken file too so the operator can see it.
@@ -695,6 +820,24 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
     for row in state::action_index_list(pool).await? {
         if !Path::new(&row.file_path).exists() {
             state::action_index_delete(pool, &row.name).await?;
+        }
+    }
+
+    // CLAUDE-164: guardrail. Two enabled actions that poll the same source
+    // (case-colliding names, or the same native kind + source query) are both
+    // scheduled and silently double-gather while contending on the shared
+    // daemon-wide concurrency caps. Detection is operator-visible only: a WARN
+    // log plus a persisted `run_events` notice on each colliding action. Never
+    // auto-disable - that risks silencing the wrong one and dropping work.
+    for collision in detect_collisions(&scanned) {
+        warn!(message = %collision.message, "duplicate-source action guardrail");
+        let events = [state::InputEvent {
+            level: "warn".to_string(),
+            context: Some("config-collision".to_string()),
+            message: collision.message.clone(),
+        }];
+        for member in &collision.members {
+            state::run_events_record(pool, member, &now, &events).await?;
         }
     }
     Ok(())
@@ -1466,6 +1609,142 @@ mod tests {
                 .any(|r| r.name == crate::web::webhooks::WEBHOOK_MINT_ACTION),
             "a YAML using the reserved synthetic name must not be indexed"
         );
+    }
+
+    // CLAUDE-164: unit-level collision detection over synthetic identities.
+    fn scanned(name: &str, source: Option<&str>) -> ScannedAction {
+        ScannedAction {
+            name: name.to_string(),
+            file_path: format!("/actions/{name}.yml"),
+            source_key: source.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn detect_collisions_flags_case_insensitive_name_collision() {
+        // Two enabled actions whose names differ only by case, even with
+        // unrelated sources, are flagged and both are named as members.
+        let cols = detect_collisions(&[
+            scanned("youtrack", Some("youtrack\u{1f}\u{1f}q-a")),
+            scanned("YouTrack", Some("youtrack\u{1f}\u{1f}q-b")),
+        ]);
+        assert_eq!(cols.len(), 1, "one name-case collision");
+        let mut members = cols[0].members.clone();
+        members.sort();
+        assert_eq!(members, vec!["YouTrack", "youtrack"]);
+        assert!(
+            cols[0].message.contains("youtrack.yml") && cols[0].message.contains("YouTrack.yml"),
+            "message names both files: {}",
+            cols[0].message
+        );
+    }
+
+    #[test]
+    fn detect_collisions_flags_same_native_source_with_unrelated_names() {
+        // Same kind + source key, names unrelated: still redundant work.
+        let cols = detect_collisions(&[
+            scanned(
+                "primary",
+                Some("youtrack\u{1f}\u{1f}-Resolved AI Agent: Queued"),
+            ),
+            scanned(
+                "mirror",
+                Some("youtrack\u{1f}\u{1f}-Resolved AI Agent: Queued"),
+            ),
+        ]);
+        assert_eq!(cols.len(), 1, "one same-source collision");
+        let mut members = cols[0].members.clone();
+        members.sort();
+        assert_eq!(members, vec!["mirror", "primary"]);
+        assert!(cols[0].message.contains("poll the same source"));
+    }
+
+    #[test]
+    fn detect_collisions_silent_for_single_distinct_and_scripted() {
+        // A lone action never collides.
+        assert!(detect_collisions(&[scanned("solo", Some("youtrack\u{1f}\u{1f}q"))]).is_empty());
+        // Two genuinely different queries do not collide.
+        assert!(detect_collisions(&[
+            scanned("a", Some("youtrack\u{1f}\u{1f}q-a")),
+            scanned("b", Some("youtrack\u{1f}\u{1f}q-b")),
+        ])
+        .is_empty());
+        // Two scripted actions (no source key) with distinct names do not
+        // collide: their nu-snippet sources are opaque and uncomparable.
+        assert!(detect_collisions(&[scanned("x", None), scanned("y", None)]).is_empty());
+    }
+
+    // CLAUDE-164: a full scan of two case-colliding, same-query youtrack actions
+    // must WARN via a persisted run_events notice on BOTH actions, and must NOT
+    // auto-disable either (both index rows survive, still enabled).
+    #[tokio::test]
+    async fn scan_actions_warns_on_duplicate_source_and_keeps_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let actions_dir = tmp.path().join("actions");
+        std::fs::create_dir_all(&actions_dir).unwrap();
+        let body = |name: &str| {
+            format!(
+                "name: {name}\nkind: youtrack\nnative:\n  youtrack:\n    query: \"-Resolved AI Agent: Queued\"\n"
+            )
+        };
+        std::fs::write(actions_dir.join("YouTrack.yml"), body("YouTrack")).unwrap();
+        std::fs::write(actions_dir.join("youtrack.yml"), body("youtrack")).unwrap();
+
+        scan_actions(&pool, &actions_dir).await.unwrap();
+
+        // Both actions carry a warn-level config-collision notice.
+        for name in ["YouTrack", "youtrack"] {
+            let events = state::run_events_for_action(&pool, name, 50).await.unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.level == "warn" && e.context.as_deref() == Some("config-collision")),
+                "action {name} has a config-collision warning: {events:?}"
+            );
+        }
+
+        // No auto-disable: both index rows survive and stay enabled.
+        let rows = state::action_index_list(&pool).await.unwrap();
+        for name in ["YouTrack", "youtrack"] {
+            let row = rows.iter().find(|r| r.name == name).expect("row present");
+            assert!(row.enabled, "action {name} is NOT auto-disabled");
+        }
+    }
+
+    // CLAUDE-164: a single youtrack action, and a disabled colliding twin, must
+    // NOT produce any config-collision notice.
+    #[tokio::test]
+    async fn scan_actions_silent_for_single_and_disabled_twin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let actions_dir = tmp.path().join("actions");
+        std::fs::create_dir_all(&actions_dir).unwrap();
+        // Enabled action plus a DISABLED case-colliding twin sharing its query.
+        std::fs::write(
+            actions_dir.join("YouTrack.yml"),
+            "name: YouTrack\nkind: youtrack\nnative:\n  youtrack:\n    query: \"-Resolved AI Agent: Queued\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            actions_dir.join("youtrack.yml"),
+            "name: youtrack\nkind: youtrack\nnative:\n  youtrack:\n    query: \"-Resolved AI Agent: Queued\"\nenabled: false\n",
+        )
+        .unwrap();
+
+        scan_actions(&pool, &actions_dir).await.unwrap();
+
+        for name in ["YouTrack", "youtrack"] {
+            let events = state::run_events_for_action(&pool, name, 50).await.unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e.context.as_deref() == Some("config-collision")),
+                "no collision notice when the twin is disabled: {name} {events:?}"
+            );
+        }
     }
 
     // CLAUDE-153: the webhook log dir is renamed to the new action name at start.
