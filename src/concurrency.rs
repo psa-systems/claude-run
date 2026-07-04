@@ -18,18 +18,29 @@
 //!   and daemon-lived, so a cap holds across *overlapping* runs of an action, not
 //!   just within one run (the old per-run [`Semaphore`] only bounded a single
 //!   run's snapshot).
-//! - [`Executor`]: spawns one task per job, each acquiring, in order, (a) a
-//!   global permit, (b) a per-action permit, then (c) its key gate so same-key
-//!   jobs serialize.
+//! - [`Executor`]: spawns one task per job, each acquiring, in order, (a) its key
+//!   gate (via a NON-BLOCKING try), then (b) a global permit, then (c) a
+//!   per-action permit, then runs.
 //!
 //! A per-action `max_parallel == 1` reproduces the original strictly-sequential
 //! behavior, now enforced daemon-wide (at most one job for that action across all
 //! its overlapping runs).
 //!
-//! Acquisition order is semaphores-then-gate on purpose (CLAUDE-162): a held key
-//! never blocks on a permit, and the fixed global -> per-action -> key ordering is
-//! consistent across every acquirer, so there is no lock-order inversion and the
-//! pipeline is deadlock-free.
+//! CLAUDE-163: acquisition order is gate-then-semaphores, and the gate is a
+//! non-blocking `try`. CLAUDE-162 originally ordered it semaphores-then-gate so a
+//! held key never blocked on a permit; the side effect was permit starvation. A
+//! job that shared its concurrency key with a running sibling still grabbed a
+//! global and per-action permit and then parked on the key mutex, holding those
+//! permits while doing no work. With one project's backlog gathered into a run,
+//! `min(N, cap)` permits were consumed while exactly one job ran, so every other
+//! project and action was starved even though its key was free. Gating first with
+//! a non-blocking try fixes it: a job whose key is busy takes NO permit and defers
+//! (`Ok(false)`), left for the next pickup gather. Only a job that actually holds
+//! its key ever holds a permit, so the permits held by an action equal the number
+//! of its jobs running, never the number waiting on a key. There is still no
+//! lock-order inversion: the key is only ever taken by a non-blocking try, so no
+//! job waits on a permit while another waits on that key, and the pipeline stays
+//! deadlock-free.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -72,6 +83,21 @@ impl KeyGate {
             g.entry(key.to_string()).or_default().clone()
         };
         m.lock_owned().await
+    }
+
+    /// CLAUDE-163: non-blocking acquire. Returns `Some(guard)` if no other holder
+    /// of `key` is in flight, `None` if the key is already held. Used by the
+    /// [`Executor`] to gate on the key *before* taking any permit: a job whose key
+    /// is busy defers instead of parking on the mutex while holding scarce
+    /// permits. Because the key is only ever taken by this try (never a blocking
+    /// wait), no job ever waits on a permit while another waits on that key, so the
+    /// gate-then-permit order introduces no lock-order inversion.
+    pub fn try_acquire(&self, key: &str) -> Option<OwnedMutexGuard<()>> {
+        let m = {
+            let mut g = self.inner.lock().unwrap();
+            g.entry(key.to_string()).or_default().clone()
+        };
+        m.try_lock_owned().ok()
     }
 }
 
@@ -223,12 +249,23 @@ impl Executor {
             let action = self.action.clone();
             let max_parallel = self.max_parallel;
             handles.push(tokio::spawn(async move {
-                // CLAUDE-162: fixed acquisition order, consistent across every
-                // acquirer: (a) global permit, (b) per-action permit, then (c)
-                // the key gate. Semaphores before the key mutex means a job that
-                // is waiting on its key holds no permit against which a distinct
-                // key could block, and the single ordering rules out any
-                // lock-order inversion.
+                // CLAUDE-163: gate on the concurrency key FIRST, with a
+                // non-blocking try, before taking any permit. A job whose key is
+                // already held by a running sibling takes no permit and defers
+                // (`Ok(false)`); it is left Queued for the next pickup gather. Only
+                // once the key is held do we take the global then per-action
+                // permit, so a permit is never held by a job merely waiting on a
+                // key (the CLAUDE-162 permit-starvation bug). Because the key is
+                // only ever taken by this non-blocking try, no job waits on a
+                // permit while another waits on that key: no lock-order inversion,
+                // the pipeline stays deadlock-free.
+                if cancel.is_cancelled() {
+                    return Ok(false);
+                }
+                let _key_guard = match gate.try_acquire(&key) {
+                    Some(g) => g,
+                    None => return Ok(false),
+                };
                 let global = limiter.global();
                 let _global_permit = match global.acquire_owned().await {
                     Ok(p) => p,
@@ -242,10 +279,6 @@ impl Executor {
                     Ok(p) => p,
                     Err(_) => return Ok(false),
                 };
-                if cancel.is_cancelled() {
-                    return Ok(false);
-                }
-                let _key_guard = gate.acquire(&key).await;
                 if cancel.is_cancelled() {
                     return Ok(false);
                 }
@@ -357,9 +390,127 @@ mod tests {
             gate: KeyGate::new(),
             cancel: CancellationToken::new(),
         };
-        exec.run(items).await;
+        let results = exec.run(items).await;
         // Never more than one same-key job in flight at a time.
         assert_eq!(key_peak.load(Ordering::SeqCst), 1);
+        // CLAUDE-163: only one same-key job runs per pass; the other two find the
+        // key held and defer (`Ok(false)`) without taking a permit or running.
+        assert_eq!(results.iter().filter(|r| matches!(r, Ok(true))).count(), 1);
+        assert_eq!(results.iter().filter(|r| matches!(r, Ok(false))).count(), 2);
+    }
+
+    // CLAUDE-163: a job whose concurrency key is already held takes NO permit and
+    // defers; only one same-key job runs per pass. With N same-key jobs and a
+    // global/per-action cap of C, at most one permit is ever held on their
+    // account, so the semaphore never drops below C-1 available.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_key_backlog_holds_at_most_one_permit() {
+        let limiter = Limiter::new(5);
+        let min_global = Arc::new(AtomicUsize::new(usize::MAX));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let n = 7usize;
+        let items: Vec<(String, JobFuture)> = (0..n)
+            .map(|_| {
+                let limiter = limiter.clone();
+                let min_global = min_global.clone();
+                let ran = ran.clone();
+                let fut: JobFuture = Box::pin(async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    // Sampled while this job holds its permit: never below cap-1.
+                    let avail = limiter.global().available_permits();
+                    min_global.fetch_min(avail, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    Ok(true)
+                });
+                ("bunyip".to_string(), fut)
+            })
+            .collect();
+        let exec = Executor {
+            action: "youtrack".into(),
+            max_parallel: 5,
+            limiter: limiter.clone(),
+            gate: KeyGate::new(),
+            cancel: CancellationToken::new(),
+        };
+        let results = exec.run(items).await;
+        // Exactly one same-key job ran; the other six deferred without a permit.
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert_eq!(results.iter().filter(|r| matches!(r, Ok(true))).count(), 1);
+        assert_eq!(
+            results.iter().filter(|r| matches!(r, Ok(false))).count(),
+            n - 1
+        );
+        // Cap 5, exactly one permit ever held -> min available observed is 4.
+        assert_eq!(min_global.load(Ordering::SeqCst), 4);
+    }
+
+    // CLAUDE-163: an unrelated key runs immediately alongside a large same-key
+    // backlog. The backlog's parked siblings no longer consume permits, so a
+    // second project (distinct key) is never starved behind a single serialized
+    // key draining.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn distinct_key_runs_alongside_saturated_same_key_backlog() {
+        let distinct_ran = Arc::new(AtomicUsize::new(0));
+        let mut items: Vec<(String, JobFuture)> = Vec::new();
+        // Ten jobs for one project (the concentrated backlog).
+        for _ in 0..10 {
+            let fut: JobFuture = Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                Ok(true)
+            });
+            items.push(("bunyip".to_string(), fut));
+        }
+        // One job for a second project with a free key.
+        {
+            let distinct_ran = distinct_ran.clone();
+            let fut: JobFuture = Box::pin(async move {
+                distinct_ran.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            });
+            items.push(("mapps".to_string(), fut));
+        }
+        let exec = Executor {
+            action: "youtrack".into(),
+            max_parallel: 5,
+            limiter: Limiter::new(5),
+            gate: KeyGate::new(),
+            cancel: CancellationToken::new(),
+        };
+        let results = exec.run(items).await;
+        // The unrelated key ran despite the backlog holding the youtrack key.
+        assert_eq!(distinct_ran.load(Ordering::SeqCst), 1);
+        // One bunyip + one mapps ran; the other nine bunyip jobs deferred.
+        assert_eq!(results.iter().filter(|r| matches!(r, Ok(true))).count(), 2);
+    }
+
+    // CLAUDE-163: heavy contention across a few keys with tight caps completes
+    // without deadlock. The gate-then-permit order (non-blocking gate) introduces
+    // no lock-order inversion, so the run always makes progress and terminates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn contended_keys_make_progress_without_deadlock() {
+        let items: Vec<(String, JobFuture)> = (0..12)
+            .map(|i| {
+                let fut: JobFuture = Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok(true)
+                });
+                // Three distinct keys, several jobs each, under a cap of 2.
+                (format!("key-{}", i % 3), fut)
+            })
+            .collect();
+        let exec = Executor {
+            action: "a".into(),
+            max_parallel: 2,
+            limiter: Limiter::new(2),
+            gate: KeyGate::new(),
+            cancel: CancellationToken::new(),
+        };
+        let results = tokio::time::timeout(Duration::from_secs(5), exec.run(items))
+            .await
+            .expect("executor completed without deadlock");
+        // Every job resolved (ran or deferred); none hung.
+        assert_eq!(results.len(), 12);
+        assert!(results.iter().all(|r| r.is_ok()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

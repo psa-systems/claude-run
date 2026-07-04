@@ -154,21 +154,26 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     }
     info!(action = %action.name, count = jobs.len(), "youtrack jobs gathered");
 
-    // CLAUDE-162: admission check. Drop issues already in flight in another
-    // (overlapping) run of this action, then, if nothing fresh remains, return
-    // WITHOUT `run_begin` so a re-gather that only re-sees already-claimed work
-    // does not litter run history with empty run rows. The live AI-Agent re-read
-    // filter, the daemon-wide `KeyGate` (same-repo serialization), and this dedup
-    // together guarantee two overlapping runs never both work the same issue.
+    // CLAUDE-162 / CLAUDE-163: admission check. Drop gathered jobs whose
+    // CONCURRENCY key (project) is already in flight in another (overlapping) run
+    // of this action, then, if nothing fresh remains, return WITHOUT `run_begin`
+    // so a re-gather that only re-sees already-claimed work does not litter run
+    // history with empty run rows. CLAUDE-163: deduping by concurrency key (not
+    // issue id) stops a run from gathering a second same-project issue while that
+    // project is already in flight; such a sibling could only park on the KeyGate
+    // and defer, so gathering it is pure churn. The live AI-Agent re-read filter,
+    // the daemon-wide `KeyGate` (same-project serialization), and this dedup
+    // together guarantee two overlapping runs never both work the same project.
+    let key_fields = action.concurrency.key.clone();
     let gathered = jobs.len();
-    let inflight: std::collections::HashSet<String> =
-        state::action_inflight_keys(pool, &action.name)
+    let inflight_ckeys: std::collections::HashSet<String> =
+        state::action_inflight_concurrency_keys(pool, &action.name)
             .await?
             .into_iter()
             .collect();
     let jobs: Vec<YoutrackJob> = jobs
         .into_iter()
-        .filter(|j| !inflight.contains(&j.key))
+        .filter(|j| !inflight_ckeys.contains(&concurrency_key(&key_fields, j)))
         .collect();
     if jobs.is_empty() {
         info!(
@@ -226,7 +231,6 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     // they never collide on the clone dir / branch / PR. `max_parallel: 1`
     // reproduces the original strictly-sequential behavior.
     let max_parallel = action.concurrency.max_parallel.max(1) as usize;
-    let key_fields = action.concurrency.key.clone();
     let loaded_arc = Arc::new(loaded.clone());
     let paths_owned = ctx.paths.clone();
     let pool_owned = pool.clone();
@@ -236,6 +240,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     let mut items: Vec<(String, crate::concurrency::JobFuture)> = Vec::with_capacity(jobs.len());
     for job in jobs.into_iter() {
         let gate_key = concurrency_key(&key_fields, &job);
+        let inflight_ckey = gate_key.clone();
         let loaded = loaded_arc.clone();
         let paths = paths_owned.clone();
         let pool = pool_owned.clone();
@@ -274,7 +279,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                     let backend = credentialed_backend(&runner, &guard);
                     (backend, Some(guard))
                 };
-            if let Err(e) = state::run_inflight_add(&pool, run_id, &job.key).await {
+            if let Err(e) = state::run_inflight_add(&pool, run_id, &job.key, &inflight_ckey).await {
                 warn!(error = %e, "run_inflight_add failed (non-fatal)");
             }
             // CLAUDE-50: pick the Forge by the job's resolved host. A GitHub host
