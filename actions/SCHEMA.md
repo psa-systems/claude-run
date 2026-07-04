@@ -552,8 +552,15 @@ Semantics:
 - **`max_parallel` is a daemon-wide cap (CLAUDE-162), not a per-run one.** The daemon holds one shared semaphore per
   action, so the total number of concurrent jobs for an action stays `<= max_parallel` even when several **overlapping**
   pickup runs are in flight at once. A separate global cap (`max_parallel_global`, a runtime setting) bounds total
-  concurrent jobs across all actions. Each job acquires a global permit, then the per-action permit, then the key gate,
-  in that fixed order, so the pipeline is deadlock-free.
+  concurrent jobs across all actions. Each job first gates on its concurrency key with a non-blocking try, then acquires a
+  global permit, then the per-action permit, in that fixed order, so the pipeline is deadlock-free.
+- **A same-key backlog never starves other keys or actions (CLAUDE-163).** A permit (global or per-action) is only ever
+  held by a job that actually holds its concurrency key and is running, never by one merely waiting on a key. A job whose
+  key is already held by a running sibling takes no permit and defers, staying Queued for the next pickup gather. So one
+  project with a large queued backlog drains one issue at a time without consuming the caps: other projects (distinct
+  keys) and other actions keep running, and the scheduler no longer logs `pickup deferred: concurrency cap saturated` when
+  the only in-flight work is a single serialized key. (Before CLAUDE-163 the caps were exhausted by same-key siblings
+  parked on the key gate while holding permits.)
 - **Caps stay best-effort.** The daily cap and budget are checked before each job launches; because up to
   `max_parallel_global` jobs can pass the check before any of them advances the ledger, the cap may overshoot by at most
   `max_parallel_global - 1` jobs.
@@ -566,9 +573,11 @@ The daemon no longer serializes runs per action. An issue queued while a run is 
 **overlapping** run within `regather_interval` (a runtime setting, default 60s) rather than waiting for the in-flight run
 to drain, subject only to the concurrency caps above. The whole-run per-action file lock that used to force a full drain
 is gone on the daemon path; a manual `trigger` during an in-flight run now starts an overlapping pickup run instead of
-being dropped. Two overlapping runs never both work the same job: each run drops issues already in flight in another open
-run (an admission check that also suppresses empty, redundant runs), the native `youtrack` handler re-reads the live `AI
-Agent` field per job, and the daemon-wide key gate serializes same-repo work. `max_parallel_global` and
+being dropped. Two overlapping runs never both work the same job: each run drops gathered jobs whose **concurrency key**
+is already in flight in another open run (CLAUDE-163 widened this admission check from issue id to concurrency key, so a
+run never gathers a second same-project issue while that project is in flight; the check also suppresses empty, redundant
+runs), the native `youtrack` handler re-reads the live `AI Agent` field per job, and the daemon-wide key gate serializes
+same-repo work. `max_parallel_global` and
 `regather_interval` are edited on the web **Settings** page (the Concurrency section) or via
 `GET`/`PUT /api/settings/concurrency`.
 

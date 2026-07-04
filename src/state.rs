@@ -273,12 +273,25 @@ pub async fn run_stage_set(pool: &SqlitePool, run_id: i64, stage: Option<&str>) 
 /// CLAUDE-28: mark a job key as in flight for a run. Replaces the single
 /// `run_set_current_job` marker so a run with several jobs running in parallel
 /// badges all of them. Idempotent (`INSERT OR IGNORE`).
-pub async fn run_inflight_add(pool: &SqlitePool, run_id: i64, key: &str) -> Result<()> {
-    sqlx::query("INSERT OR IGNORE INTO run_inflight_jobs (run_id, job_key) VALUES (?, ?)")
-        .bind(run_id)
-        .bind(key)
-        .execute(pool)
-        .await?;
+///
+/// CLAUDE-163: also records the job's `concurrency_key` so the admission dedup
+/// can drop gathered jobs whose concurrency key (project / repo) is already in
+/// flight, not just those whose issue id is. For a path with one job per key
+/// (webhook, forgejo-ci-fix) the concurrency key equals `key`.
+pub async fn run_inflight_add(
+    pool: &SqlitePool,
+    run_id: i64,
+    key: &str,
+    concurrency_key: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO run_inflight_jobs (run_id, job_key, concurrency_key) VALUES (?, ?, ?)",
+    )
+    .bind(run_id)
+    .bind(key)
+    .bind(concurrency_key)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -732,6 +745,31 @@ pub async fn action_inflight_keys(pool: &SqlitePool, action: &str) -> Result<Vec
         FROM run_inflight_jobs rij
         JOIN runs r ON r.id = rij.run_id
         WHERE r.action_name = ? AND r.ended_at IS NULL
+        "#,
+    )
+    .bind(action)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(k,)| k).collect())
+}
+
+/// CLAUDE-163: the set of CONCURRENCY keys currently in flight across every
+/// still-open run of `action`. A re-gather dedups its gathered jobs against this
+/// set (by each job's concurrency key), so an overlapping pickup run never
+/// gathers a second same-key job while that key is already in flight and could
+/// only park on the KeyGate. NULL `concurrency_key` values (rows written before
+/// migration 0016) are ignored. Joins `run_inflight_jobs` to the open `runs`.
+pub async fn action_inflight_concurrency_keys(
+    pool: &SqlitePool,
+    action: &str,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT rij.concurrency_key
+        FROM run_inflight_jobs rij
+        JOIN runs r ON r.id = rij.run_id
+        WHERE r.action_name = ? AND r.ended_at IS NULL
+          AND rij.concurrency_key IS NOT NULL
         "#,
     )
     .bind(action)
@@ -1228,11 +1266,17 @@ mod tests {
         let pool = mem_pool().await;
         let r1 = run_begin(&pool, "act", "scheduler").await.unwrap();
         let r2 = run_begin(&pool, "act", "trigger").await.unwrap();
-        run_inflight_add(&pool, r1, "ISSUE-1").await.unwrap();
-        run_inflight_add(&pool, r2, "ISSUE-2").await.unwrap();
+        run_inflight_add(&pool, r1, "ISSUE-1", "PROJ-A")
+            .await
+            .unwrap();
+        run_inflight_add(&pool, r2, "ISSUE-2", "PROJ-B")
+            .await
+            .unwrap();
         // A different action's in-flight key must not leak in.
         let other = run_begin(&pool, "other", "scheduler").await.unwrap();
-        run_inflight_add(&pool, other, "ISSUE-9").await.unwrap();
+        run_inflight_add(&pool, other, "ISSUE-9", "PROJ-C")
+            .await
+            .unwrap();
 
         let mut keys = action_inflight_keys(&pool, "act").await.unwrap();
         keys.sort();
@@ -1242,5 +1286,42 @@ mod tests {
         run_finish(&pool, r1, crate::exit::OK, 1).await.unwrap();
         let keys = action_inflight_keys(&pool, "act").await.unwrap();
         assert_eq!(keys, vec!["ISSUE-2".to_string()]);
+    }
+
+    // CLAUDE-163: `action_inflight_concurrency_keys` returns the union of
+    // in-flight CONCURRENCY keys across open runs of the action (distinct,
+    // excluding other actions and finished runs), so the admission dedup drops a
+    // gathered job whose project/repo is already in flight even if its issue id
+    // is not.
+    #[tokio::test]
+    async fn action_inflight_concurrency_keys_unions_open_runs() {
+        let pool = mem_pool().await;
+        let r1 = run_begin(&pool, "act", "scheduler").await.unwrap();
+        let r2 = run_begin(&pool, "act", "trigger").await.unwrap();
+        // Two different issues sharing one concurrency key (same project).
+        run_inflight_add(&pool, r1, "ALPHA-1", "ALPHA")
+            .await
+            .unwrap();
+        run_inflight_add(&pool, r2, "BETA-3", "BETA")
+            .await
+            .unwrap();
+        // A different action's in-flight concurrency key must not leak in.
+        let other = run_begin(&pool, "other", "scheduler").await.unwrap();
+        run_inflight_add(&pool, other, "GAMMA-9", "GAMMA")
+            .await
+            .unwrap();
+
+        let mut keys = action_inflight_concurrency_keys(&pool, "act")
+            .await
+            .unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["ALPHA".to_string(), "BETA".to_string()]);
+
+        // Finishing r1 drops ALPHA; only BETA remains in flight.
+        run_finish(&pool, r1, crate::exit::OK, 1).await.unwrap();
+        let keys = action_inflight_concurrency_keys(&pool, "act")
+            .await
+            .unwrap();
+        assert_eq!(keys, vec!["BETA".to_string()]);
     }
 }

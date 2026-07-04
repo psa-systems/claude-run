@@ -1000,24 +1000,32 @@ pub async fn run_action_inner(
     let jobs = job::gather_jobs(loaded, snippet.as_ref(), paths).await?;
     info!(action = %loaded.action.name, count = jobs.len(), "input jobs gathered");
 
-    // CLAUDE-162: admission check. Compute each gathered job's key and drop those
-    // already in flight in another (overlapping) run of this action. If nothing
-    // fresh remains, return WITHOUT `run_begin` so a re-gather that only re-sees
+    // CLAUDE-162 / CLAUDE-163: admission check. Compute each gathered job's issue
+    // key and concurrency key, and drop jobs whose CONCURRENCY key is already in
+    // flight in another (overlapping) run of this action. If nothing fresh
+    // remains, return WITHOUT `run_begin` so a re-gather that only re-sees
     // already-claimed work does not litter run history with empty, redundant run
-    // rows. Same-key serialization + the run_inflight dedup keep two overlapping
-    // runs from ever working the same job.
+    // rows. CLAUDE-163: deduping by concurrency key (not issue id) stops a run
+    // from gathering a second same-key job while that key is in flight; such a
+    // sibling could only park on the KeyGate and defer. Same-key serialization +
+    // this dedup keep two overlapping runs from ever working the same key.
     let all_keys: Vec<String> = jobs
         .iter()
         .enumerate()
         .map(|(i, j)| job::job_key(loaded, j, i))
         .collect();
-    let inflight: std::collections::HashSet<String> =
-        state::action_inflight_keys(pool, &loaded.action.name)
+    let all_ckeys: Vec<String> = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, j)| job::concurrency_key(loaded, j, i))
+        .collect();
+    let inflight_ckeys: std::collections::HashSet<String> =
+        state::action_inflight_concurrency_keys(pool, &loaded.action.name)
             .await?
             .into_iter()
             .collect();
     let fresh_idx: Vec<usize> = (0..jobs.len())
-        .filter(|&i| !inflight.contains(&all_keys[i]))
+        .filter(|&i| !inflight_ckeys.contains(&all_ckeys[i]))
         .collect();
     if fresh_idx.is_empty() {
         info!(
@@ -1062,6 +1070,7 @@ pub async fn run_action_inner(
     for (slot, &idx) in fresh_idx.iter().enumerate() {
         let job = &jobs[idx];
         let gate_key = job::concurrency_key(loaded, job, idx);
+        let inflight_ckey = gate_key.clone();
         let job_key = planned_keys[slot].clone();
         let job = job.clone();
         let loaded = loaded_arc.clone();
@@ -1085,7 +1094,7 @@ pub async fn run_action_inner(
             }
             // CLAUDE-28: mark this job in flight (cleared below and by
             // `run_finish`) so the web UI can badge every running job.
-            if let Err(e) = state::run_inflight_add(&pool, run_id, &job_key).await {
+            if let Err(e) = state::run_inflight_add(&pool, run_id, &job_key, &inflight_ckey).await {
                 warn!(error = %e, "run_inflight_add failed (non-fatal)");
             }
             let ctx = job::JobContext {

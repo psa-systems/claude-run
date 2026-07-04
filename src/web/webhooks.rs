@@ -716,7 +716,9 @@ async fn begin_webhook_run(pool: &SqlitePool, job_key: &str, html_url: &str) -> 
             if let Err(e) = state::run_set_job_links(pool, id, &links).await {
                 warn!(error = %e, "recording webhook run job link failed");
             }
-            if let Err(e) = state::run_inflight_add(pool, id, job_key).await {
+            // CLAUDE-163: one job per webhook event, so the concurrency key
+            // equals the job key here.
+            if let Err(e) = state::run_inflight_add(pool, id, job_key, job_key).await {
                 warn!(error = %e, "registering webhook job in flight failed");
             }
             if let Err(e) = state::run_stage_set(pool, id, Some(STAGE_FETCHING_LOGS)).await {
