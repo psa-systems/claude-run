@@ -357,8 +357,10 @@ impl Default for YoutrackStates {
 /// How the runner opens the PR for a worked Forgejo issue (CLAUDE-103).
 ///
 /// `Branch` (the default) pushes a real server branch with the git CLI
-/// (`git push --set-upstream origin HEAD`) and opens the PR over the API, so
-/// Forgejo can always offer "Update Branch" and the PR stays mergeable.
+/// (`git push --set-upstream origin <branch>:<branch>`, where `<branch>` is
+/// resolved by name, not from the ambient `HEAD`; CLAUDE-166) and opens the PR
+/// over the API with an explicit `--head`, so Forgejo can always offer "Update
+/// Branch" and the PR stays mergeable.
 /// `Agit` runs `fj pr create -aA`, which creates a branchless PR whose head
 /// lives only at `refs/pull/<N>/head`; such a PR loses its merge button the
 /// moment it falls behind a base that requires an up-to-date branch. AGit is

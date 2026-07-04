@@ -2065,11 +2065,33 @@ mod tests {
         // CLAUDE-103 default: the branch strategy pushes a real server branch and
         // opens the PR via the API; `-aA` is never invoked.
         let dir = tempfile::tempdir().unwrap();
+        // CLAUDE-166: the branch strategy resolves the feature branch by name
+        // (origin/HEAD base, for-each-ref listing, rev-list ahead check) before
+        // pushing `<branch>:<branch>` and opening the PR with an explicit --head.
         let runner = Arc::new(
             StubRunner::new()
-                .ok("git", &["push", "--set-upstream", "origin", "HEAD"], "")
-                .ok("git", &["log", "-1", "--format=%s"], "feat: x\n")
-                .ok("git", &["log", "-1", "--format=%b"], "body\n\n#MK-16\n")
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
                 .ok(
                     "fj",
                     &[
@@ -2080,6 +2102,8 @@ mod tests {
                         "feat: x",
                         "--body-file",
                         ".claude-run-pr-body.md",
+                        "--head",
+                        "feat/x",
                         "--json",
                     ],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
@@ -2112,7 +2136,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin HEAD"),
+                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
             "{calls:?}"
         );
         assert!(
@@ -2430,11 +2454,25 @@ mod tests {
         // silent fallback to AGit.
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
+        // CLAUDE-166: branch resolution succeeds (feat/x is ahead of base); the
+        // push of the resolved branch is what fails, and that error must reach
+        // the preserved-workdir comment.
         let runner = Arc::new(
             StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
                 .fail(
                     "git",
-                    &["push", "--set-upstream", "origin", "HEAD"],
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
                     128,
                     "no upstream",
                 )

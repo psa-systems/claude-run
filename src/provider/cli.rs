@@ -362,29 +362,109 @@ impl CliBackend {
         })
     }
 
+    /// CLAUDE-166: resolve the feature branch by NAME, independent of the
+    /// current `HEAD`. The base (default) branch is whatever `origin/HEAD` points
+    /// at (e.g. `origin/main`); the feature branch is the single LOCAL branch
+    /// (other than the base) that has commits ahead of the base. This is also the
+    /// defense-in-depth guardrail (proposed-approach step 6): a branch is a
+    /// candidate ONLY if it has a non-empty `rev-list <base>..<branch>`, so the
+    /// "no commits ahead" / no-diff case falls into the zero-candidate error
+    /// below rather than delegating to `fj`'s opaque "no changes between head and
+    /// base". The workdir is named in the errors so the branch stays recoverable
+    /// (the failure comment in `src/native/youtrack.rs` preserves it).
+    fn resolve_feature_branch(&self, workdir: &Path) -> Result<String> {
+        // The base branch is whatever `origin/HEAD` points at, e.g. `origin/main`.
+        let base_args = ["rev-parse", "--abbrev-ref", "origin/HEAD"];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &base_args, &[])?;
+        let base_ref = Self::checked("git", out, &base_args)?.trim().to_string();
+        let base_branch = base_ref
+            .strip_prefix("origin/")
+            .unwrap_or(&base_ref)
+            .to_string();
+
+        // Enumerate local branches (never the remote-tracking or `HEAD` refs).
+        let list_args = ["for-each-ref", "--format=%(refname:short)", "refs/heads/"];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &list_args, &[])?;
+        let listed = Self::checked("git", out, &list_args)?;
+
+        let mut candidates: Vec<String> = Vec::new();
+        for line in listed.lines() {
+            let branch = line.trim();
+            if branch.is_empty() || branch == base_branch {
+                continue;
+            }
+            // Ahead of base? A non-empty `rev-list <base>..<branch>` means yes.
+            let range = format!("{base_ref}..{branch}");
+            let ahead_args = ["rev-list", range.as_str()];
+            let out = self
+                .runner
+                .run_in_env(Some(workdir), "git", &ahead_args, &[])?;
+            let ahead = Self::checked("git", out, &ahead_args)?;
+            if !ahead.trim().is_empty() {
+                candidates.push(branch.to_string());
+            }
+        }
+
+        match candidates.len() {
+            1 => Ok(candidates.pop().unwrap()),
+            0 => Err(Error::Other(anyhow::anyhow!(
+                "no feature branch with commits ahead of `{base_ref}`; the agent \
+                 produced no branch or no commits (base `{base_branch}`). The work, \
+                 if any, is preserved in the workdir `{}` for recovery.",
+                workdir.display()
+            ))),
+            _ => Err(Error::Other(anyhow::anyhow!(
+                "multiple candidate feature branches ahead of `{base_ref}`: {}; \
+                 refusing to guess which to open a PR for. The workdir `{}` is \
+                 preserved for recovery.",
+                candidates.join(", "),
+                workdir.display()
+            ))),
+        }
+    }
+
     /// Branch-backed PR creation (CLAUDE-103 default, originally the CLAUDE-102
-    /// fallback). Push the working branch with the git CLI (`--set-upstream
-    /// origin HEAD`, same-name remote branch), then open the PR over the Forgejo
-    /// API with `fj pr create`, deriving the title and body from the head commit
-    /// exactly like AGit autofill would (the body carries the bare `#<KEY>-N`
-    /// reference, so YouTrack still links the PR). The body travels via a file
-    /// (fj convention for long bodies), written under the workdir with a
-    /// RELATIVE path so the runner key stays deterministic; removed best-effort
-    /// afterwards. The head is `refs/heads/<branch>`, never `refs/pull/<N>/head`.
+    /// fallback). Push the working branch with the git CLI (same-name remote
+    /// branch), then open the PR over the Forgejo API with `fj pr create`,
+    /// deriving the title and body from the head commit exactly like AGit
+    /// autofill would (the body carries the bare `#<KEY>-N` reference, so
+    /// YouTrack still links the PR). The body travels via a file (fj convention
+    /// for long bodies), written under the workdir with a RELATIVE path so the
+    /// runner key stays deterministic; removed best-effort afterwards. The head
+    /// is `refs/heads/<branch>`, never `refs/pull/<N>/head`.
+    ///
+    /// CLAUDE-166: the feature branch is resolved authoritatively by NAME, never
+    /// from the ambient `HEAD`. Everything (push, title/body, `fj --head`) binds
+    /// to that resolved branch, so a stray `git checkout main`, a detached
+    /// `HEAD`, or an agent bug can no longer strand the work and open a silent
+    /// `main`-vs-`main` PR. The push, title, and body all target the resolved
+    /// branch; `fj pr create` is invoked with an explicit `--head`, mirroring the
+    /// GitHub backend (`github.rs`).
     fn create_pr_branch(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
-        let push_args = ["push", "--set-upstream", "origin", "HEAD"];
+        let branch = self.resolve_feature_branch(workdir)?;
+
+        // Push the resolved branch BY NAME (`<branch>:<branch>`), not `HEAD`, so
+        // the server branch carries the feature name regardless of the current
+        // checkout.
+        let refspec = format!("{branch}:{branch}");
+        let push_args = ["push", "--set-upstream", "origin", refspec.as_str()];
         let out = self
             .runner
             .run_in_env(Some(workdir), "git", &push_args, &[])?;
         Self::checked("git", out, &push_args)?;
 
-        let title_args = ["log", "-1", "--format=%s"];
+        // Title/body derive from the feature branch tip, not `HEAD`.
+        let title_args = ["log", "-1", "--format=%s", branch.as_str()];
         let out = self
             .runner
             .run_in_env(Some(workdir), "git", &title_args, &[])?;
         let title = Self::checked("git", out, &title_args)?.trim().to_string();
 
-        let body_args = ["log", "-1", "--format=%b"];
+        let body_args = ["log", "-1", "--format=%b", branch.as_str()];
         let out = self
             .runner
             .run_in_env(Some(workdir), "git", &body_args, &[])?;
@@ -400,6 +480,8 @@ impl CliBackend {
             title.as_str(),
             "--body-file",
             BODY_FILE,
+            "--head",
+            branch.as_str(),
             "--json",
         ];
         let res = self
@@ -1451,40 +1533,90 @@ mod tests {
         );
     }
 
+    /// Register the git plumbing calls CLAUDE-166 resolve-by-name performs
+    /// before the push: `origin/HEAD` -> base, `for-each-ref` lists local
+    /// branches, and one `rev-list <base>..<branch>` per non-base branch. The
+    /// caller passes the branch listing and, per branch, whether it is ahead.
+    fn with_branch_resolution(
+        runner: StubRunner,
+        base_ref: &str,
+        branches: &[&str],
+        ahead: &[(&str, &str)],
+    ) -> StubRunner {
+        let base_branch = base_ref.strip_prefix("origin/").unwrap_or(base_ref);
+        let listing = branches.join("\n");
+        let mut r = runner
+            .ok(
+                "git",
+                &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                base_ref,
+            )
+            .ok(
+                "git",
+                &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                &listing,
+            );
+        for b in branches {
+            if *b == base_branch {
+                continue;
+            }
+            let range = format!("{base_ref}..{b}");
+            let out = ahead
+                .iter()
+                .find(|(name, _)| name == b)
+                .map(|(_, sha)| *sha)
+                .unwrap_or("");
+            r = r.ok("git", &["rev-list", range.as_str()], out);
+        }
+        r
+    }
+
     #[test]
     fn create_pr_branch_strategy_pushes_branch_and_creates_via_api() {
         // CLAUDE-103 default: `pr_strategy: branch` pushes a real server branch
         // with the git CLI and opens the PR over the API, deriving title/body
-        // from the head commit. `-aA` is never invoked.
+        // from the head commit. `-aA` is never invoked. CLAUDE-166: the branch is
+        // resolved by name and pushed as `<branch>:<branch>` with an explicit
+        // `--head`.
         let wd = tempfile::tempdir().unwrap();
-        let runner = Arc::new(
-            StubRunner::new()
-                .ok("git", &["push", "--set-upstream", "origin", "HEAD"], "")
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%s"],
-                    "feat(x): do the thing\n",
-                )
-                .ok(
-                    "git",
-                    &["log", "-1", "--format=%b"],
-                    "Body of the commit.\n\n#MK-16\n",
-                )
-                .ok(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "create",
-                        "feat(x): do the thing",
-                        "--body-file",
-                        ".claude-run-pr-body.md",
-                        "--json",
-                    ],
-                    r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
-                ),
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        )
+        .ok(
+            "git",
+            &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+            "",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%s", "feat/x"],
+            "feat(x): do the thing\n",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%b", "feat/x"],
+            "Body of the commit.\n\n#MK-16\n",
+        )
+        .ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "feat(x): do the thing",
+                "--body-file",
+                ".claude-run-pr-body.md",
+                "--head",
+                "feat/x",
+                "--json",
+            ],
+            r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
         );
+        let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         let pr = b
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
@@ -1497,12 +1629,170 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "git push --set-upstream origin HEAD"),
+                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
             "{calls:?}"
+        );
+        // Never push the ambient HEAD; always the resolved branch by name.
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin HEAD"),
+            "must not push HEAD: {calls:?}"
         );
         assert!(
             !calls.iter().any(|c| c.contains("-aA")),
             "branch strategy must never invoke -aA: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_resolves_by_name_when_head_is_on_main() {
+        // CLAUDE-166 / FJ-51: the agent committed on a feature branch but left
+        // `HEAD` on `main`. Resolution is by NAME (never `HEAD`), so the runner
+        // still pushes the feature branch and opens feature -> base, rather than
+        // attempting main-vs-main. The StubRunner keys on (binary, args) with no
+        // notion of the current `HEAD`; the guarantee is that the runner never
+        // issues a `HEAD`-derived push or a `main`-vs-`main` create.
+        let wd = tempfile::tempdir().unwrap();
+        // `main` (the base) is listed alongside the feature branch and is NOT a
+        // candidate (`main` == base, and it has no commits ahead of itself).
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "fix/CLAUDE-166-work"],
+            &[("fix/CLAUDE-166-work", "deadbeef\n")],
+        )
+        .ok(
+            "git",
+            &[
+                "push",
+                "--set-upstream",
+                "origin",
+                "fix/CLAUDE-166-work:fix/CLAUDE-166-work",
+            ],
+            "",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%s", "fix/CLAUDE-166-work"],
+            "fix: harden PR creation\n",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%b", "fix/CLAUDE-166-work"],
+            "#CLAUDE-166\n",
+        )
+        .ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "fix: harden PR creation",
+                "--body-file",
+                ".claude-run-pr-body.md",
+                "--head",
+                "fix/CLAUDE-166-work",
+                "--json",
+            ],
+            r#"{"number":51,"html_url":"https://dev.a8n.run/n/c/pulls/51"}"#,
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+        assert_eq!(pr.number, Some(51));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c
+                    == "git push --set-upstream origin fix/CLAUDE-166-work:fix/CLAUDE-166-work"),
+            "must push the feature branch by name: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("--head fix/CLAUDE-166-work")),
+            "fj must open feature -> base with explicit --head: {calls:?}"
+        );
+        // The bug's signature: a HEAD push or a `main`-vs-`main` create.
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin HEAD"),
+            "must not push HEAD: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--head main")),
+            "must not open main-vs-main: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_zero_candidates_is_distinct_actionable_error() {
+        // CLAUDE-166: the FJ-51 no-branch / no-commits case is made explicit. The
+        // only local branch is the base itself, so there is no candidate; the
+        // runner errors loudly (naming base and preserved workdir) instead of
+        // delegating to `fj`'s opaque "no changes between head and base".
+        let wd = tempfile::tempdir().unwrap();
+        let runner = Arc::new(with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main"],
+            &[],
+        ));
+        let b = CliBackend::new(runner.clone());
+        match b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap_err()
+        {
+            Error::Other(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("no feature branch"), "{msg}");
+                assert!(msg.contains("origin/main"), "{msg}");
+                assert!(msg.contains("preserved"), "{msg}");
+            }
+            other => panic!("expected Other actionable error, got {other:?}"),
+        }
+        // Never reached `fj`, so no opaque validation error is surfaced.
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr create")),
+            "must not delegate to fj on zero candidates: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_multiple_candidates_names_them_and_refuses() {
+        // CLAUDE-166: more than one branch ahead of base -> refuse to guess,
+        // naming the candidates.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = Arc::new(with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/a", "feat/b"],
+            &[("feat/a", "aaa\n"), ("feat/b", "bbb\n")],
+        ));
+        let b = CliBackend::new(runner.clone());
+        match b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap_err()
+        {
+            Error::Other(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("multiple candidate"), "{msg}");
+                assert!(msg.contains("feat/a"), "{msg}");
+                assert!(msg.contains("feat/b"), "{msg}");
+            }
+            other => panic!("expected Other actionable error, got {other:?}"),
+        }
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr create")),
+            "must not delegate to fj on multiple candidates: {calls:?}"
         );
     }
 
@@ -1536,12 +1826,20 @@ mod tests {
         // underlying CLI error directly. There is NO silent switch to AGit that
         // would emit a branchless PR.
         let wd = tempfile::tempdir().unwrap();
-        let runner = Arc::new(StubRunner::new().fail(
-            "git",
-            &["push", "--set-upstream", "origin", "HEAD"],
-            128,
-            "could not read Username",
-        ));
+        let runner = Arc::new(
+            with_branch_resolution(
+                StubRunner::new(),
+                "origin/main",
+                &["main", "feat/x"],
+                &[("feat/x", "abc\n")],
+            )
+            .fail(
+                "git",
+                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                128,
+                "could not read Username",
+            ),
+        );
         let b = CliBackend::new(runner.clone());
         match b
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
