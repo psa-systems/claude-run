@@ -46,14 +46,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
        target/release/.fingerprint/claude_run-* \
        target/release/.fingerprint/claude-run-*
 
-# Real source + migrations + templates + assets. The binary embeds, all at
-# compile time: migrations via sqlx::migrate!, the web UI's askama templates
-# via #[template(path = ...)], and assets/htmx.min.js via include_bytes!. All
-# resolve from these crate-root directories, so each must be present.
+# Real source + migrations + templates + assets + deploy. The binary embeds,
+# all at compile time: migrations via sqlx::migrate!, the web UI's askama
+# templates via #[template(path = ...)], assets/htmx.min.js via include_bytes!,
+# and deploy/bot-CLAUDE.md via include_str! (src/agent_home.rs). All resolve
+# from these crate-root directories, so each must be present.
 COPY src ./src
 COPY migrations ./migrations
 COPY templates ./templates
 COPY assets ./assets
+COPY deploy ./deploy
 COPY build.rs ./
 
 # Bake build metadata into the binary. build.rs reads these env vars; the
