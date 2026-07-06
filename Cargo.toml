@@ -1,6 +1,6 @@
 [package]
 name = "claude-run"
-version = "0.16.0"
+version = "0.16.1"
 edition = "2021"
 description = "YAML-driven Claude Code runner. Rust port of scripts/claude-run.nu."
 license = "MIT"
