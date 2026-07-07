@@ -2090,6 +2090,30 @@ mod tests {
                     "main\nfeat/x",
                 )
                 .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                // CLAUDE-170: idempotency plumbing before the push. Remote branch
+                // absent, no open PR -> unchanged push + create happy path.
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
                 .ok(
                     "git",
                     &["push", "--set-upstream", "origin", "feat/x:feat/x"],
@@ -2479,6 +2503,15 @@ mod tests {
                     "main\nfeat/x",
                 )
                 .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                // CLAUDE-170: idempotency plumbing before the push. Remote branch
+                // absent, so the push is attempted (and fails as before).
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
                 .fail(
                     "git",
                     &["push", "--set-upstream", "origin", "feat/x:feat/x"],

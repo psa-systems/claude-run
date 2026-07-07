@@ -28,6 +28,27 @@ fn number_from_pr_url(url: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
+/// CLAUDE-170: derive the `owner/repo` path (the form `list_open_prs` expects)
+/// from an `origin` remote URL. Handles the HTTPS clone URLs this runner uses
+/// (`https://[creds@]host/owner/repo[.git]`) and the SSH form
+/// (`git@host:owner/repo[.git]`): strip a trailing `.git`, take the last two
+/// `/`-separated segments, and drop any scheme/host/credentials prefix left on
+/// the owner segment. Returns `None` if either segment is empty.
+fn repo_path_from_remote_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let mut segments = url.rsplit('/');
+    let repo = segments.next()?;
+    let owner_seg = segments.next()?;
+    // The owner segment may still carry an SSH `host:` or userinfo `@` prefix;
+    // keep only the final component after the last `:` or `@`.
+    let owner = owner_seg.rsplit([':', '@']).next()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
 /// CLAUDE-160: extract only the *owning* `#<KEY>-N` issue references from
 /// `text`, returning the keys without the leading `#`, deduped in first-seen
 /// order. A key matches `[A-Z][A-Z0-9]*-[0-9]+`.
@@ -444,27 +465,174 @@ impl CliBackend {
     /// `main`-vs-`main` PR. The push, title, and body all target the resolved
     /// branch; `fj pr create` is invoked with an explicit `--head`, mirroring the
     /// GitHub backend (`github.rs`).
+    ///
+    /// CLAUDE-170: idempotent against a pre-existing `origin/<branch>`. The
+    /// feature-branch name is deterministic per issue key, so a re-run, a
+    /// concurrent duplicate run, or a manual pre-push of the same branch is a
+    /// DETERMINISTIC collision, not a transient one. Before pushing, the remote
+    /// state of the branch is read (`git ls-remote`) and reconciled WITHOUT force:
+    /// absent -> push + create; local fast-forwards or equals remote -> (fast-
+    /// forward) push then find-or-create the PR; diverged (or remote-ahead) ->
+    /// never push, adopt an already-open PR for the branch if one exists, else
+    /// fail loudly naming both SHAs and the preserved workdir. No `--force` /
+    /// `--force-with-lease` is ever issued.
     fn create_pr_branch(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
         let branch = self.resolve_feature_branch(workdir)?;
 
-        // Push the resolved branch BY NAME (`<branch>:<branch>`), not `HEAD`, so
-        // the server branch carries the feature name regardless of the current
-        // checkout.
+        // Repo path (`owner/repo`) for the open-PR lookup, derived from the
+        // workdir's `origin` remote (the form `list_open_prs` expects).
+        let repo = self.origin_repo_path(workdir)?;
+
+        // Local tip of the resolved branch, and the remote branch's tip (if the
+        // branch already exists on `origin`), read BEFORE any push.
+        let local_sha = self.rev_parse(workdir, &branch)?;
+        let remote_sha = self.remote_branch_sha(workdir, &branch)?;
+
+        match remote_sha {
+            // Absent: unchanged happy path (push `<branch>:<branch>`, create the
+            // PR with `--head <branch>`).
+            None => {
+                self.push_branch(workdir, &branch)?;
+                self.find_or_create_pr(workdir, host, &repo, &branch)
+            }
+            // Equal to local: nothing to push; find-or-create the PR.
+            Some(ref remote_sha) if *remote_sha == local_sha => {
+                self.find_or_create_pr(workdir, host, &repo, &branch)
+            }
+            // Present and not equal. A fast-forward push is legal only when the
+            // remote tip is an ancestor of the local tip; then push (never force)
+            // and find-or-create. Otherwise the branch has diverged (or the
+            // remote is ahead): refuse to force, adopt an open PR if one exists,
+            // else fail loudly.
+            Some(remote_sha) => {
+                if self.is_ancestor(workdir, &remote_sha, &local_sha)? {
+                    self.push_branch(workdir, &branch)?;
+                    self.find_or_create_pr(workdir, host, &repo, &branch)
+                } else {
+                    match self.find_open_pr(host, &repo, &branch)? {
+                        Some(pr) => Ok(pr),
+                        None => Err(Error::Other(anyhow::anyhow!(
+                            "remote branch `{branch}` has diverged from the local work \
+                             (local {local_sha}, remote {remote_sha}) and no open PR exists \
+                             for it; refusing to force-push over it. The work is preserved in \
+                             the workdir `{}` for recovery.",
+                            workdir.display()
+                        ))),
+                    }
+                }
+            }
+        }
+    }
+
+    /// CLAUDE-170: the `owner/repo` path of the workdir's `origin` remote, for
+    /// the open-PR lookup (`list_open_prs`). Errors loudly if the remote URL is
+    /// unparseable so the caller never silently skips the idempotency reconcile.
+    fn origin_repo_path(&self, workdir: &Path) -> Result<String> {
+        let url_args = ["remote", "get-url", "origin"];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &url_args, &[])?;
+        let url = Self::checked("git", out, &url_args)?;
+        repo_path_from_remote_url(url.trim()).ok_or_else(|| {
+            Error::Other(anyhow::anyhow!(
+                "could not parse an `owner/repo` path from the origin remote URL `{}`",
+                url.trim()
+            ))
+        })
+    }
+
+    /// CLAUDE-170: the commit SHA a git revision (e.g. a branch name) resolves to
+    /// in the workdir.
+    fn rev_parse(&self, workdir: &Path, rev: &str) -> Result<String> {
+        let args = ["rev-parse", rev];
+        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        Ok(Self::checked("git", out, &args)?.trim().to_string())
+    }
+
+    /// CLAUDE-170: the SHA of `origin/<branch>` if the branch exists on the
+    /// remote, else `None`. `git ls-remote --heads origin <branch>` prints one
+    /// `"<sha>\t<ref>"` line per matching head and nothing (exit 0) when the
+    /// branch is absent, so no branch existence is inferred from an exit code.
+    fn remote_branch_sha(&self, workdir: &Path, branch: &str) -> Result<Option<String>> {
+        let args = ["ls-remote", "--heads", "origin", branch];
+        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        let stdout = Self::checked("git", out, &args)?;
+        Ok(stdout
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().next())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()))
+    }
+
+    /// CLAUDE-170: `true` iff `ancestor` is an ancestor of `descendant` (i.e. a
+    /// fast-forward from `ancestor` to `descendant` is possible).
+    /// `git merge-base --is-ancestor` signals the answer via exit status (0 =
+    /// yes, 1 = no), so a bare `checked` would misread the legitimate "no" as an
+    /// error; the exit code is inspected directly and any OTHER code propagates.
+    fn is_ancestor(&self, workdir: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+        let args = ["merge-base", "--is-ancestor", ancestor, descendant];
+        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        match out.exit_code {
+            0 => Ok(true),
+            1 => Ok(false),
+            // Any other exit is a real failure (bad object, not a repo, ...).
+            _ => Self::checked("git", out, &args).map(|_| unreachable!()),
+        }
+    }
+
+    /// CLAUDE-170: push the resolved branch BY NAME (`<branch>:<branch>`), not
+    /// `HEAD`, so the server branch carries the feature name regardless of the
+    /// current checkout. Never forced: a rejected non-fast-forward push is a
+    /// real-divergence signal the caller has already ruled out before calling.
+    fn push_branch(&self, workdir: &Path, branch: &str) -> Result<()> {
         let refspec = format!("{branch}:{branch}");
         let push_args = ["push", "--set-upstream", "origin", refspec.as_str()];
         let out = self
             .runner
             .run_in_env(Some(workdir), "git", &push_args, &[])?;
         Self::checked("git", out, &push_args)?;
+        Ok(())
+    }
+
+    /// CLAUDE-170: an already-open PR whose head branch is `branch`, matched by
+    /// `head_ref` against `list_open_prs` (`fj pr search --repo <repo> --state
+    /// open --json`). Returns the first match (a repo has at most one open PR per
+    /// head branch) as an adoptable [`PullRequest`], else `None`.
+    fn find_open_pr(&self, host: &str, repo: &str, branch: &str) -> Result<Option<PullRequest>> {
+        let prs = self.list_open_prs(host, repo)?;
+        Ok(prs
+            .into_iter()
+            .find(|p| p.head_ref == branch)
+            .map(|p| PullRequest {
+                number: Some(p.number),
+                url: p.html_url,
+            }))
+    }
+
+    /// CLAUDE-170: adopt an already-open PR for `branch` if one exists, else
+    /// create it. The title/body derivation from the branch tip and the
+    /// `fj pr create` call run ONLY on the create path, so adopting an existing
+    /// PR issues no `pr create`.
+    fn find_or_create_pr(
+        &self,
+        workdir: &Path,
+        host: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<PullRequest> {
+        if let Some(pr) = self.find_open_pr(host, repo, branch)? {
+            return Ok(pr);
+        }
 
         // Title/body derive from the feature branch tip, not `HEAD`.
-        let title_args = ["log", "-1", "--format=%s", branch.as_str()];
+        let title_args = ["log", "-1", "--format=%s", branch];
         let out = self
             .runner
             .run_in_env(Some(workdir), "git", &title_args, &[])?;
         let title = Self::checked("git", out, &title_args)?.trim().to_string();
 
-        let body_args = ["log", "-1", "--format=%b", branch.as_str()];
+        let body_args = ["log", "-1", "--format=%b", branch];
         let out = self
             .runner
             .run_in_env(Some(workdir), "git", &body_args, &[])?;
@@ -481,7 +649,7 @@ impl CliBackend {
             "--body-file",
             BODY_FILE,
             "--head",
-            branch.as_str(),
+            branch,
             "--json",
         ];
         let res = self
@@ -1571,6 +1739,52 @@ mod tests {
         r
     }
 
+    /// CLAUDE-170: register the pre-push idempotency plumbing `create_pr_branch`
+    /// runs after resolving the branch: the origin remote URL (parsed to
+    /// `owner/repo`), the local branch SHA, and the remote branch state.
+    /// `ls_remote` is the `git ls-remote --heads` stdout to return (empty string
+    /// = branch absent on the remote; a `"<sha>\tref"` line = present at `<sha>`).
+    fn with_remote_state(
+        runner: StubRunner,
+        branch: &str,
+        local_sha: &str,
+        ls_remote: &str,
+    ) -> StubRunner {
+        runner
+            .ok(
+                "git",
+                &["remote", "get-url", "origin"],
+                "https://dev.a8n.run/contoso/claude-run.git",
+            )
+            .ok("git", &["rev-parse", branch], local_sha)
+            .ok(
+                "git",
+                &["ls-remote", "--heads", "origin", branch],
+                ls_remote,
+            )
+    }
+
+    /// CLAUDE-170: the `fj pr search` open-PR lookup the branch path issues
+    /// against `contoso/claude-run` (the repo `with_remote_state`'s origin URL
+    /// parses to). `json` is the stdout to return (`"[]"` = no open PRs).
+    fn with_open_pr_search(runner: StubRunner, json: &str) -> StubRunner {
+        runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "search",
+                "--repo",
+                "contoso/claude-run",
+                "--state",
+                "open",
+                "--json",
+            ],
+            json,
+        )
+    }
+
     #[test]
     fn create_pr_branch_strategy_pushes_branch_and_creates_via_api() {
         // CLAUDE-103 default: `pr_strategy: branch` pushes a real server branch
@@ -1584,38 +1798,42 @@ mod tests {
             "origin/main",
             &["main", "feat/x"],
             &[("feat/x", "abc123\n")],
-        )
-        .ok(
-            "git",
-            &["push", "--set-upstream", "origin", "feat/x:feat/x"],
-            "",
-        )
-        .ok(
-            "git",
-            &["log", "-1", "--format=%s", "feat/x"],
-            "feat(x): do the thing\n",
-        )
-        .ok(
-            "git",
-            &["log", "-1", "--format=%b", "feat/x"],
-            "Body of the commit.\n\n#MK-16\n",
-        )
-        .ok(
-            "fj",
-            &[
-                "--host",
-                "dev.a8n.run",
-                "pr",
-                "create",
-                "feat(x): do the thing",
-                "--body-file",
-                ".claude-run-pr-body.md",
-                "--head",
-                "feat/x",
-                "--json",
-            ],
-            r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
         );
+        // CLAUDE-170: remote branch absent -> unchanged happy path (push +
+        // create). No open PR yet, so find-or-create falls through to create.
+        let runner = with_remote_state(runner, "feat/x", "abc123", "");
+        let runner = with_open_pr_search(runner, "[]")
+            .ok(
+                "git",
+                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "feat(x): do the thing\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "Body of the commit.\n\n#MK-16\n",
+            )
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "feat(x): do the thing",
+                    "--body-file",
+                    ".claude-run-pr-body.md",
+                    "--head",
+                    "feat/x",
+                    "--json",
+                ],
+                r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
+            );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         let pr = b
@@ -1661,43 +1879,46 @@ mod tests {
             "origin/main",
             &["main", "fix/CLAUDE-166-work"],
             &[("fix/CLAUDE-166-work", "deadbeef\n")],
-        )
-        .ok(
-            "git",
-            &[
-                "push",
-                "--set-upstream",
-                "origin",
-                "fix/CLAUDE-166-work:fix/CLAUDE-166-work",
-            ],
-            "",
-        )
-        .ok(
-            "git",
-            &["log", "-1", "--format=%s", "fix/CLAUDE-166-work"],
-            "fix: harden PR creation\n",
-        )
-        .ok(
-            "git",
-            &["log", "-1", "--format=%b", "fix/CLAUDE-166-work"],
-            "#CLAUDE-166\n",
-        )
-        .ok(
-            "fj",
-            &[
-                "--host",
-                "dev.a8n.run",
-                "pr",
-                "create",
-                "fix: harden PR creation",
-                "--body-file",
-                ".claude-run-pr-body.md",
-                "--head",
-                "fix/CLAUDE-166-work",
-                "--json",
-            ],
-            r#"{"number":51,"html_url":"https://dev.a8n.run/n/c/pulls/51"}"#,
         );
+        // CLAUDE-170: remote branch absent, no open PR -> push + create.
+        let runner = with_remote_state(runner, "fix/CLAUDE-166-work", "deadbeef", "");
+        let runner = with_open_pr_search(runner, "[]")
+            .ok(
+                "git",
+                &[
+                    "push",
+                    "--set-upstream",
+                    "origin",
+                    "fix/CLAUDE-166-work:fix/CLAUDE-166-work",
+                ],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "fix/CLAUDE-166-work"],
+                "fix: harden PR creation\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "fix/CLAUDE-166-work"],
+                "#CLAUDE-166\n",
+            )
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "fix: harden PR creation",
+                    "--body-file",
+                    ".claude-run-pr-body.md",
+                    "--head",
+                    "fix/CLAUDE-166-work",
+                    "--json",
+                ],
+                r#"{"number":51,"html_url":"https://dev.a8n.run/n/c/pulls/51"}"#,
+            );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         let pr = b
@@ -1826,20 +2047,19 @@ mod tests {
         // underlying CLI error directly. There is NO silent switch to AGit that
         // would emit a branchless PR.
         let wd = tempfile::tempdir().unwrap();
-        let runner = Arc::new(
-            with_branch_resolution(
-                StubRunner::new(),
-                "origin/main",
-                &["main", "feat/x"],
-                &[("feat/x", "abc\n")],
-            )
-            .fail(
-                "git",
-                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
-                128,
-                "could not read Username",
-            ),
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc\n")],
         );
+        // CLAUDE-170: remote branch absent, so the push is attempted (and fails).
+        let runner = Arc::new(with_remote_state(runner, "feat/x", "abc", "").fail(
+            "git",
+            &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+            128,
+            "could not read Username",
+        ));
         let b = CliBackend::new(runner.clone());
         match b
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
@@ -1856,6 +2076,246 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains("-aA")),
             "branch failure must not fall back to AGit: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn repo_path_from_remote_url_parses_https_and_ssh_and_creds() {
+        // CLAUDE-170: the open-PR lookup derives `owner/repo` from the origin
+        // remote. HTTPS (the runner's clone form), token-embedded HTTPS, and SSH
+        // all reduce to the last two path segments with the host/creds dropped.
+        assert_eq!(
+            repo_path_from_remote_url("https://dev.a8n.run/contoso/claude-run.git"),
+            Some("contoso/claude-run".to_string())
+        );
+        assert_eq!(
+            repo_path_from_remote_url("https://dev.a8n.run/contoso/claude-run"),
+            Some("contoso/claude-run".to_string())
+        );
+        assert_eq!(
+            repo_path_from_remote_url("https://oauth2:tok@dev.a8n.run/contoso/claude-run.git"),
+            Some("contoso/claude-run".to_string())
+        );
+        assert_eq!(
+            repo_path_from_remote_url("git@dev.a8n.run:contoso/claude-run.git"),
+            Some("contoso/claude-run".to_string())
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_adopts_open_pr_when_remote_equals_local() {
+        // CLAUDE-170 (a): the remote branch already exists at the SAME commit as
+        // the local tip (a re-run of already-delivered work). No push is needed;
+        // the already-open PR for the branch is adopted. No `pr create` is issued.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n");
+        let runner = Arc::new(with_open_pr_search(
+            runner,
+            r#"[{"number":88,"head_ref":"feat/x","html_url":"https://dev.a8n.run/n/c/pulls/88"}]"#,
+        ));
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+        assert_eq!(pr.number, Some(88));
+        assert_eq!(pr.url, "https://dev.a8n.run/n/c/pulls/88");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "equal remote must not push: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("pr create")),
+            "adopting an open PR must not create a new one: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--force")),
+            "no force anywhere: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_fast_forwards_then_creates_when_local_ahead() {
+        // CLAUDE-170 (b): the remote branch exists and the local tip fast-forwards
+        // it (remote is an ancestor of local). The push is an ordinary (never
+        // forced) fast-forward; with no open PR yet, the PR is then created.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "newsha\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "newsha", "oldsha\trefs/heads/feat/x\n");
+        let runner = with_open_pr_search(runner, "[]")
+            // remote (oldsha) IS an ancestor of local (newsha) -> fast-forward.
+            .ok(
+                "git",
+                &["merge-base", "--is-ancestor", "oldsha", "newsha"],
+                "",
+            )
+            .ok(
+                "git",
+                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "feat(x): more work\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "#CLAUDE-170\n",
+            )
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "feat(x): more work",
+                    "--body-file",
+                    ".claude-run-pr-body.md",
+                    "--head",
+                    "feat/x",
+                    "--json",
+                ],
+                r#"{"number":90,"html_url":"https://dev.a8n.run/n/c/pulls/90"}"#,
+            );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+        assert_eq!(pr.number, Some(90));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+            "fast-forward must push the branch: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--force")),
+            "fast-forward must never force: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_adopts_open_pr_when_diverged() {
+        // CLAUDE-170 (c) + the YOTUN-96 signature: the remote branch is present
+        // and NOT a fast-forward of the local tip (neither is an ancestor of the
+        // other). Force is banned, so the runner adopts the already-open PR for
+        // the branch: it returns the PR (finalize advances to Code Review, NOT
+        // Failed), pushes nothing, and issues no `pr create` and no force.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/yotun-96"],
+            &[("feat/yotun-96", "localsha\n")],
+        );
+        let runner = with_remote_state(
+            runner,
+            "feat/yotun-96",
+            "localsha",
+            "remotesha\trefs/heads/feat/yotun-96\n",
+        );
+        let runner = with_open_pr_search(
+            runner,
+            r#"[{"number":165,"head_ref":"feat/yotun-96","html_url":"https://dev.a8n.run/a/y/pulls/165"}]"#,
+        )
+        // Neither commit is an ancestor of the other -> diverged (exit 1).
+        .fail(
+            "git",
+            &["merge-base", "--is-ancestor", "remotesha", "localsha"],
+            1,
+            "",
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+        assert_eq!(pr.number, Some(165), "adopts the existing open PR");
+        assert_eq!(pr.url, "https://dev.a8n.run/a/y/pulls/165");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "diverged must not push: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("pr create")),
+            "diverged-with-PR must adopt, not create: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--force")),
+            "no force anywhere: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_diverged_with_no_pr_is_loud_error() {
+        // CLAUDE-170 (d): remote branch present and diverged with NO open PR. The
+        // runner cannot force and has nothing to adopt: it returns a distinct,
+        // actionable error naming the branch, both SHAs, and the preserved
+        // workdir. The raw git "fetch first" hint never surfaces, no push is
+        // issued, and no force is attempted.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "localsha\n")],
+        );
+        let runner = with_remote_state(
+            runner,
+            "feat/x",
+            "localsha",
+            "remotesha\trefs/heads/feat/x\n",
+        );
+        let runner = with_open_pr_search(runner, "[]").fail(
+            "git",
+            &["merge-base", "--is-ancestor", "remotesha", "localsha"],
+            1,
+            "",
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        match b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap_err()
+        {
+            Error::Other(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("feat/x"), "names the branch: {msg}");
+                assert!(msg.contains("localsha"), "names the local SHA: {msg}");
+                assert!(msg.contains("remotesha"), "names the remote SHA: {msg}");
+                assert!(msg.contains("preserved"), "names the workdir: {msg}");
+                assert!(
+                    !msg.contains("fetch first"),
+                    "raw git hint must not surface: {msg}"
+                );
+            }
+            other => panic!("expected Other actionable error, got {other:?}"),
+        }
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "diverged must not push: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--force")),
+            "no force anywhere: {calls:?}"
         );
     }
 
