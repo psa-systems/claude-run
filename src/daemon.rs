@@ -96,6 +96,13 @@ impl Daemon {
             info!(count = cancelled, "cancelled orphaned runs on startup");
         }
 
+        // CLAUDE-171: stamp this serve's start. The action-detail input-error
+        // summary and the error-log page's default window are bounded to it, so
+        // each serve gets a fresh diagnostics window instead of replaying every
+        // event ever recorded.
+        let started_at = crate::settings::record_serve_start(&pool).await?;
+        info!(started_at = %started_at, "recorded serve start");
+
         scan_actions(&pool, &self.paths.actions_dir()).await?;
 
         let (trigger_tx, trigger_rx) = mpsc::channel::<String>(64);

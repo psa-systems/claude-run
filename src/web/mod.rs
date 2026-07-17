@@ -86,6 +86,11 @@ pub fn router(api: Arc<AppState>, paths: Paths, webhook_enabled: bool) -> Router
         .route("/actions", post(action_create))
         .route("/actions/:name", get(action_detail))
         .route("/actions/:name/durations", get(action_durations))
+        // CLAUDE-171: full input-event log for an action. The action-detail page
+        // only summarises the first 5 distinct events of the current serve; this
+        // page lists every matching row, undeduplicated and filterable. `:name`
+        // seeds the Action filter, which can be widened to any action or all.
+        .route("/actions/:name/events", get(action_events))
         .route(
             "/actions/:name/edit",
             get(action_edit_page).post(action_edit_save),
@@ -1176,6 +1181,11 @@ async fn dashboard(
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
 
+/// CLAUDE-171: how many distinct input-event groups the action-detail summary
+/// shows. The region is a signal, not a log: the full list is one click away on
+/// `/actions/:name/events`.
+const ACTION_EVENT_SUMMARY_LIMIT: i64 = 5;
+
 #[derive(Template)]
 #[template(path = "action_detail.html")]
 struct ActionDetailTpl {
@@ -1184,9 +1194,12 @@ struct ActionDetailTpl {
     paused: Option<PauseInfo>,
     runs: Vec<RunRow>,
     /// CLAUDE-147: input/poll-phase diagnostics for this action (probe failures,
-    /// no-VCS drops), newest first. Rendered in an "Input errors / warnings"
-    /// region; errors are styled with `var(--bad)`.
-    events: Vec<state::RunEventRecord>,
+    /// no-VCS drops). Rendered in an "Input errors / warnings" region; errors are
+    /// styled with `var(--bad)`.
+    /// CLAUDE-171: a summary, not a dump: the first
+    /// [`ACTION_EVENT_SUMMARY_LIMIT`] distinct `(level, context, message)` groups
+    /// since this serve started, oldest first, each with its repeat count.
+    events: Vec<state::RunEventGroup>,
     /// CLAUDE-42: current state of the "Show empty runs" toggle. Threaded into
     /// the poll-region `hx-get` so the choice survives the 5s self-refresh.
     show_empty: bool,
@@ -1236,7 +1249,18 @@ async fn action_detail(
     // CLAUDE-147: input/poll-phase diagnostics (VCS probe failures, no-VCS
     // drops) recorded by `gather()`. Queried by action name independent of any
     // run row, so a zero-job poll's events are surfaced too.
-    let events = state::run_events_for_action(pool, &name, 50).await?;
+    // CLAUDE-171: summarised, not dumped. A diagnostic that re-fires every poll
+    // used to fill the whole region with byte-identical rows; the summary keeps
+    // the first 5 distinct groups of the current serve, each with its repeat
+    // count. The full undeduplicated list lives behind "View error log".
+    let started_at = crate::settings::serve_started_at(pool).await?;
+    let events = state::run_events_summary_for_action(
+        pool,
+        &name,
+        started_at.as_deref(),
+        ACTION_EVENT_SUMMARY_LIMIT,
+    )
+    .await?;
     let tpl = ActionDetailTpl {
         version: s.api.version,
         action,
@@ -1291,6 +1315,333 @@ async fn action_durations(
         version: s.api.version,
         action_name: name,
         chart,
+    };
+    Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
+// ---- input-event log page (CLAUDE-171) ------------------------------------
+//
+// The action-detail region summarises; this page is the full record. It lists
+// every `run_events` row with no dedup, filtered by whitelisted Level / Action /
+// Context selections, a parameterized message substring search, and a
+// since-this-serve vs all-time window, sorted by time and paginated. The
+// filter/whitelist/HTMX shape is the dashboard's (`RunsView`, CLAUDE-141/142):
+// every user-supplied value is validated server-side before it reaches SQL, and
+// every control morph-swaps the table region in place.
+
+/// CLAUDE-171: rows per page on the error-log table.
+const EVENTS_PAGE_SIZE: i64 = 50;
+
+/// CLAUDE-171: distinct `level` values present in `run_events`, alphabetically.
+/// Drives the Level dropdown and whitelists the incoming `?level=`.
+async fn distinct_event_levels(pool: &SqlitePool) -> Result<Vec<String>, WebError> {
+    let rows =
+        sqlx::query_scalar::<_, String>("SELECT DISTINCT level FROM run_events ORDER BY level")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
+}
+
+/// CLAUDE-171: distinct `action_name` values present in `run_events`,
+/// alphabetically. Drives the Action dropdown and whitelists `?action=`. Note
+/// this is the events table's own action column, not `runs`': an action can have
+/// diagnostics without ever having produced a run row.
+async fn distinct_event_actions(pool: &SqlitePool) -> Result<Vec<String>, WebError> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT action_name FROM run_events ORDER BY action_name",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// CLAUDE-171: distinct non-null `context` values present in `run_events`,
+/// alphabetically. Drives the Context dropdown and whitelists `?context=`.
+/// `context` is free-form (a project key, or `config-collision`) and nullable;
+/// NULL/empty is not a selectable value, so it is excluded from the list.
+async fn distinct_event_contexts(pool: &SqlitePool) -> Result<Vec<String>, WebError> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT context FROM run_events WHERE context IS NOT NULL AND context <> '' ORDER BY context",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// CLAUDE-171: whitelisted filter + sort selection for the error-log table. The
+/// `RunsView` sibling: every field is validated in [`action_events`] before it
+/// lands here (`dir`/`since` against fixed allow-lists, `level`/`action`/
+/// `context` against the actual distinct DB values), so nothing user-controlled
+/// reaches the SQL text and every string echoed back into the page or a query
+/// string is known-safe. `q` is the one free-form field: it never reaches the
+/// clause text either, only a bound `instr()` parameter.
+#[derive(Default, Clone)]
+struct EventsView {
+    /// `asc` or `desc`; empty (the default) sorts descending (newest first).
+    dir: String,
+    /// Exact `level` to filter to, or empty for all.
+    level: String,
+    /// Exact `action_name` to filter to, or empty for all actions.
+    action: String,
+    /// Exact `context` to filter to, or empty for all.
+    context: String,
+    /// `all` for all-time; empty (the default) bounds to the current serve.
+    since: String,
+    /// Free-text message substring (bound as a parameter, never interpolated).
+    q: String,
+}
+
+impl EventsView {
+    /// Whether the all-time window is selected (the since toggle's non-default).
+    fn all_time(&self) -> bool {
+        self.since == "all"
+    }
+
+    /// SQL `ORDER BY` for the When column. The only sortable column, so just the
+    /// whitelisted direction; `id` breaks ties (several events share one poll
+    /// `ts`) and keeps paging stable.
+    fn order_by(&self) -> String {
+        let dir = if self.dir == "asc" { "ASC" } else { "DESC" };
+        format!("ORDER BY ts {dir}, id {dir}")
+    }
+
+    /// SQL `WHERE` clause (empty or leading ` WHERE ...`) shared by the listing
+    /// and its `COUNT(*)`, with `?` placeholders for every value, plus the
+    /// ordered binds. `started_at` bounds the default since-this-serve window;
+    /// `None` (no serve has stamped the DB) leaves the window unbounded rather
+    /// than hiding every row.
+    fn where_clause(&self, started_at: Option<&str>) -> (String, Vec<String>) {
+        let mut conds: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        if !self.level.is_empty() {
+            conds.push("level = ?".to_string());
+            binds.push(self.level.clone());
+        }
+        if !self.action.is_empty() {
+            conds.push("action_name = ?".to_string());
+            binds.push(self.action.clone());
+        }
+        if !self.context.is_empty() {
+            conds.push("context = ?".to_string());
+            binds.push(self.context.clone());
+        }
+        if !self.q.is_empty() {
+            // Same plain substring test as the CLAUDE-143 run search: `instr`
+            // over a lowercased needle, so LIKE metacharacters (% _) in the
+            // query text need no escaping. SQLite `lower()` is ASCII-only,
+            // matching the ASCII needle.
+            conds.push("instr(lower(message), ?) > 0".to_string());
+            binds.push(self.q.to_ascii_lowercase());
+        }
+        if !self.all_time() {
+            if let Some(start) = started_at {
+                conds.push("ts >= ?".to_string());
+                binds.push(start.to_string());
+            }
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conds.join(" AND "))
+        };
+        (where_clause, binds)
+    }
+
+    /// Direction the When header should request next: flip to `desc` when it is
+    /// already the ascending sort, otherwise `asc`.
+    fn dir_for_when(&self) -> &'static str {
+        if self.dir == "asc" {
+            "desc"
+        } else {
+            "asc"
+        }
+    }
+
+    /// Sort-direction glyph for the When header. The table is always sorted by
+    /// time, so the arrow is always shown.
+    fn arrow_when(&self) -> &'static str {
+        arrow("when", &self.dir, "when")
+    }
+
+    /// Full filter/sort query string for pagination and the poll refresh, so
+    /// each request re-states the active view. `q` rides `hx-include` of the
+    /// filter form and `page` rides `hx-vals`, exactly as on the dashboard.
+    /// Values are pre-whitelisted; askama escapes the `&` joiners.
+    fn filter_query(&self) -> String {
+        self.query_without("")
+    }
+
+    /// The When header's target: the same view with the direction toggled.
+    fn sort_query(&self) -> String {
+        format!(
+            "dir={}&level={}&action={}&context={}&since={}",
+            self.dir_for_when(),
+            self.level,
+            self.action,
+            self.context,
+            self.since,
+        )
+    }
+
+    /// Every param except `omit`, for a filter control whose own value supplies
+    /// the omitted param. Keeping it out of the URL avoids a duplicate query key
+    /// (which axum's `Query` would reject).
+    fn query_without(&self, omit: &str) -> String {
+        [
+            ("dir", self.dir.as_str()),
+            ("level", self.level.as_str()),
+            ("action", self.action.as_str()),
+            ("context", self.context.as_str()),
+            ("since", self.since.as_str()),
+        ]
+        .iter()
+        .filter(|(k, _)| *k != omit)
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+    }
+}
+
+/// CLAUDE-171: total `run_events` rows matching the active filter, for the page
+/// bounds and the "X-Y of N" indicator. Counts over the same `WHERE` as
+/// [`fetch_run_events`], so the two never disagree.
+async fn count_run_events(
+    pool: &SqlitePool,
+    view: &EventsView,
+    started_at: Option<&str>,
+) -> Result<i64, WebError> {
+    let (where_clause, binds) = view.where_clause(started_at);
+    let sql = format!("SELECT COUNT(*) FROM run_events{where_clause}");
+    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    Ok(q.fetch_one(pool).await?)
+}
+
+/// CLAUDE-171: one page of `run_events` rows under the active filter. Every row
+/// is returned as recorded: no dedup here, unlike the action-detail summary.
+async fn fetch_run_events(
+    pool: &SqlitePool,
+    view: &EventsView,
+    started_at: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<state::RunEventLogRecord>, WebError> {
+    let (where_clause, binds) = view.where_clause(started_at);
+    let order_by = view.order_by();
+    let sql = format!(
+        "SELECT run_id, ts, level, context, message, action_name FROM run_events{where_clause} {order_by} LIMIT ? OFFSET ?"
+    );
+    let mut q = sqlx::query_as::<_, state::RunEventLogRecord>(&sql);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    Ok(q.bind(limit).bind(offset).fetch_all(pool).await?)
+}
+
+#[derive(Template)]
+#[template(path = "action_events.html")]
+struct ActionEventsTpl {
+    version: &'static str,
+    /// The action the page was entered from. Seeds the Action filter default and
+    /// the breadcrumb; the filter itself may point elsewhere.
+    action_name: String,
+    events: Vec<state::RunEventLogRecord>,
+    page: PageNav,
+    view: EventsView,
+    level_options: Vec<String>,
+    action_options: Vec<String>,
+    context_options: Vec<String>,
+    /// The current serve's start, for the since-toggle label. `None` renders the
+    /// all-time-only degraded state (no serve has stamped this DB).
+    started_at: Option<String>,
+}
+
+/// CLAUDE-171: query params for the error-log page. `action` is `Option` so an
+/// absent param (the link from the action page) can default to the route's
+/// action, while an explicit empty `?action=` (the dropdown's "all") widens to
+/// every action. Every other filter's empty value already means "all".
+#[derive(Deserialize, Default)]
+struct ActionEventsQuery {
+    #[serde(default)]
+    dir: String,
+    #[serde(default)]
+    level: String,
+    action: Option<String>,
+    #[serde(default)]
+    context: String,
+    #[serde(default)]
+    since: String,
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    page: Option<i64>,
+}
+
+async fn action_events(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+    Query(q): Query<ActionEventsQuery>,
+) -> Result<Response, WebError> {
+    let pool = &s.api.pool;
+    // 404 unknown actions cleanly, like the durations chart: only names the
+    // daemon has indexed (plus the synthetic webhook action) resolve.
+    let known_synthetic = s.webhook_enabled && is_synthetic_action(&name);
+    if !known_synthetic && indexed_action_path(pool, &name).await?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
+    }
+
+    // Whitelist every selection before it reaches SQL or the page. `dir`/`since`
+    // check against fixed allow-lists; Level/Action/Context are kept only when
+    // they match an actual distinct value in `run_events` (the same lists that
+    // populate the dropdowns), so a stale or hand-edited param drops to "all"
+    // instead of echoing arbitrary input.
+    let level_options = distinct_event_levels(pool).await?;
+    let context_options = distinct_event_contexts(pool).await?;
+    // The route's action is always offered even when it has no events yet, so
+    // the default selection is always a real option in the dropdown.
+    let mut action_options = distinct_event_actions(pool).await?;
+    if !action_options.contains(&name) {
+        action_options.push(name.clone());
+        action_options.sort();
+    }
+    let view = EventsView {
+        dir: if q.dir == "asc" { "asc" } else { "desc" }.to_string(),
+        level: whitelist_member(&q.level, &level_options),
+        // Absent => this action; present (including "") => the user's choice.
+        action: whitelist_member(q.action.as_deref().unwrap_or(&name), &action_options),
+        context: whitelist_member(&q.context, &context_options),
+        since: whitelisted(&q.since, &["all"]),
+        q: q.q.clone(),
+    };
+
+    let started_at = crate::settings::serve_started_at(pool).await?;
+    let total = count_run_events(pool, &view, started_at.as_deref()).await?;
+    let total_pages = ((total + EVENTS_PAGE_SIZE - 1) / EVENTS_PAGE_SIZE).max(1);
+    let page = q.page.unwrap_or(1).clamp(1, total_pages);
+    let offset = (page - 1) * EVENTS_PAGE_SIZE;
+    let events =
+        fetch_run_events(pool, &view, started_at.as_deref(), EVENTS_PAGE_SIZE, offset).await?;
+    let page_nav = PageNav {
+        page,
+        total_pages,
+        total,
+        start: if total == 0 { 0 } else { offset + 1 },
+        end: offset + events.len() as i64,
+        has_prev: page > 1,
+        has_next: page < total_pages,
+    };
+    let tpl = ActionEventsTpl {
+        version: s.api.version,
+        action_name: name,
+        events,
+        page: page_nav,
+        view,
+        level_options,
+        action_options,
+        context_options,
+        started_at,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
@@ -4030,10 +4381,11 @@ mod tests {
     // actions directory.
     mod editor {
         use super::super::{
-            action_create, action_delete, action_detail, action_edit_save, action_export,
-            action_to_youtrack_form, youtrack_create, youtrack_edit_page, youtrack_edit_save,
-            youtrack_form_to_yaml, youtrack_new_page, ActionDetailQuery, ActionForm, WebState,
-            YoutrackEditForm,
+            action_create, action_delete, action_detail, action_edit_save, action_events,
+            action_export, action_to_youtrack_form, youtrack_create, youtrack_edit_page,
+            youtrack_edit_save, youtrack_form_to_yaml, youtrack_new_page, ActionDetailQuery,
+            ActionEventsQuery, ActionForm, EventsView, WebState, YoutrackEditForm,
+            ACTION_EVENT_SUMMARY_LIMIT,
         };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
@@ -4156,6 +4508,446 @@ mod tests {
             assert!(body.contains("VS"));
             // The warn level renders with the bad badge / var(--bad) styling.
             assert!(body.contains("var(--bad)"));
+        }
+
+        /// Record `n` byte-identical input events for `action`, one per poll
+        /// second apart, mimicking a diagnostic that re-fires every poll.
+        async fn record_repeats(
+            pool: &SqlitePool,
+            action: &str,
+            level: &str,
+            context: &str,
+            message: &str,
+            stamps: &[&str],
+        ) {
+            for ts in stamps {
+                state::run_events_record(
+                    pool,
+                    action,
+                    ts,
+                    &[state::InputEvent {
+                        level: level.to_string(),
+                        context: Some(context.to_string()),
+                        message: message.to_string(),
+                    }],
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn action_detail_collapses_repeated_events_into_one_counted_row() {
+            // CLAUDE-171: the motivating case. The CLAUDE-164 config-collision
+            // warn is recorded on every 5s poll; the region used to render one
+            // byte-identical row per poll, burying every other diagnostic. It
+            // must now collapse to a single row carrying the occurrence count
+            // and the first/last-seen stamps, and the distinct probe failure
+            // recorded alongside it must still be visible.
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("youtrack.yml");
+            std::fs::write(&file, NATIVE_MINIMAL).unwrap();
+            index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
+            crate::settings::record_serve_start(&s.api.pool)
+                .await
+                .unwrap();
+
+            record_repeats(
+                &s.api.pool,
+                "youtrack",
+                "warn",
+                "config-collision",
+                "duplicate source: youtrack and youtrack-2 poll the same query",
+                &[
+                    "2999-01-01T00:00:00Z",
+                    "2999-01-01T00:00:05Z",
+                    "2999-01-01T00:00:10Z",
+                    "2999-01-01T00:00:15Z",
+                ],
+            )
+            .await;
+            record_repeats(
+                &s.api.pool,
+                "youtrack",
+                "warn",
+                "VS",
+                "VCS probe failed; issues skipped this poll",
+                &["2999-01-01T00:00:20Z"],
+            )
+            .await;
+
+            let groups = state::run_events_summary_for_action(
+                &s.api.pool,
+                "youtrack",
+                Some("2999-01-01T00:00:00Z"),
+                ACTION_EVENT_SUMMARY_LIMIT,
+            )
+            .await
+            .unwrap();
+            // Four identical rows + one distinct row collapse to two groups,
+            // ordered by first occurrence ascending.
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0].count, 4);
+            assert_eq!(groups[0].first_ts, "2999-01-01T00:00:00Z");
+            assert_eq!(groups[0].last_ts, "2999-01-01T00:00:15Z");
+            assert_eq!(groups[0].context.as_deref(), Some("config-collision"));
+            assert_eq!(groups[1].count, 1);
+            assert_eq!(groups[1].context.as_deref(), Some("VS"));
+
+            let resp = action_detail(
+                State(s.clone()),
+                AxumPath("youtrack".to_string()),
+                Query(ActionDetailQuery::default()),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            let body = body_string(resp).await;
+            // One row for the flood, carrying its repeat count, and the distinct
+            // diagnostic is not buried.
+            assert_eq!(body.matches("duplicate source").count(), 1);
+            assert!(body.contains("&times;4"));
+            assert!(body.contains("VCS probe failed"));
+            assert!(body.contains("View error log"));
+        }
+
+        #[tokio::test]
+        async fn action_detail_summary_is_bounded_to_five_since_serve_start() {
+            // CLAUDE-171: two halves of the same contract. Events from a
+            // previous daemon lifetime (ts < started_at) are out of the window,
+            // and the current lifetime's distinct groups are capped at the first
+            // 5 by first occurrence.
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("youtrack.yml");
+            std::fs::write(&file, NATIVE_MINIMAL).unwrap();
+            index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
+
+            record_repeats(
+                &s.api.pool,
+                "youtrack",
+                "warn",
+                "OLD",
+                "from a previous serve",
+                &["2000-01-01T00:00:00Z"],
+            )
+            .await;
+            // Seven distinct diagnostics in this lifetime; only the first five
+            // by first-seen may render.
+            for i in 0..7 {
+                record_repeats(
+                    &s.api.pool,
+                    "youtrack",
+                    "warn",
+                    "VS",
+                    &format!("probe failure {i}"),
+                    &[&format!("2999-01-01T00:00:0{i}Z")],
+                )
+                .await;
+            }
+
+            let groups = state::run_events_summary_for_action(
+                &s.api.pool,
+                "youtrack",
+                Some("2999-01-01T00:00:00Z"),
+                ACTION_EVENT_SUMMARY_LIMIT,
+            )
+            .await
+            .unwrap();
+            assert_eq!(groups.len() as i64, ACTION_EVENT_SUMMARY_LIMIT);
+            let messages: Vec<&str> = groups.iter().map(|g| g.message.as_str()).collect();
+            assert_eq!(
+                messages,
+                vec![
+                    "probe failure 0",
+                    "probe failure 1",
+                    "probe failure 2",
+                    "probe failure 3",
+                    "probe failure 4",
+                ]
+            );
+            assert!(groups.iter().all(|g| g.message != "from a previous serve"));
+        }
+
+        #[tokio::test]
+        async fn action_events_page_lists_every_event_undeduplicated() {
+            // CLAUDE-171: the log page is the summary's opposite: the same four
+            // identical rows the action page collapses to one must all appear
+            // here, with their owning action rendered in the Action column.
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("youtrack.yml");
+            std::fs::write(&file, NATIVE_MINIMAL).unwrap();
+            index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
+            crate::settings::record_serve_start(&s.api.pool)
+                .await
+                .unwrap();
+
+            record_repeats(
+                &s.api.pool,
+                "youtrack",
+                "warn",
+                "config-collision",
+                "duplicate source detected",
+                &[
+                    "2999-01-01T00:00:00Z",
+                    "2999-01-01T00:00:05Z",
+                    "2999-01-01T00:00:10Z",
+                    "2999-01-01T00:00:15Z",
+                ],
+            )
+            .await;
+
+            let resp = action_events(
+                State(s.clone()),
+                AxumPath("youtrack".to_string()),
+                Query(ActionEventsQuery::default()),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            // No dedup: one row per recorded event, and the count says four.
+            assert_eq!(body.matches("duplicate source detected").count(), 4);
+            assert!(body.contains("1-4 of 4"));
+            // The Action column renders `run_events.action_name`.
+            assert!(body.contains(r#"<td><a href="/actions/youtrack">youtrack</a></td>"#));
+        }
+
+        #[tokio::test]
+        async fn action_events_page_404s_unknown_action() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let resp = action_events(
+                State(s.clone()),
+                AxumPath("nope".to_string()),
+                Query(ActionEventsQuery::default()),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn action_events_filters_are_whitelisted_and_applied() {
+            // CLAUDE-171: every filter narrows the list, the route's action is
+            // the default Action selection, and a value that is not an actual
+            // distinct DB value drops to "all" instead of reaching SQL or being
+            // echoed back into the page.
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            for name in ["youtrack", "other"] {
+                let file = actions.join(format!("{name}.yml"));
+                std::fs::write(&file, NATIVE_MINIMAL).unwrap();
+                index_action(&s.api.pool, name, file.to_str().unwrap()).await;
+            }
+            crate::settings::record_serve_start(&s.api.pool)
+                .await
+                .unwrap();
+
+            record_repeats(
+                &s.api.pool,
+                "youtrack",
+                "warn",
+                "VS",
+                "VCS probe failed",
+                &["2999-01-01T00:00:00Z"],
+            )
+            .await;
+            record_repeats(
+                &s.api.pool,
+                "youtrack",
+                "info",
+                "VS",
+                "no enabled VCS integration",
+                &["2999-01-01T00:00:01Z"],
+            )
+            .await;
+            record_repeats(
+                &s.api.pool,
+                "other",
+                "warn",
+                "config-collision",
+                "duplicate source detected",
+                &["2999-01-01T00:00:02Z"],
+            )
+            .await;
+            // A previous lifetime's event: only the all-time window shows it.
+            record_repeats(
+                &s.api.pool,
+                "youtrack",
+                "warn",
+                "VS",
+                "ancient probe failure",
+                &["2000-01-01T00:00:00Z"],
+            )
+            .await;
+
+            async fn render(s: &WebState, name: &str, q: ActionEventsQuery) -> String {
+                let resp = action_events(State(s.clone()), AxumPath(name.to_string()), Query(q))
+                    .await
+                    .unwrap()
+                    .into_response();
+                body_string(resp).await
+            }
+
+            // Default: this action, current serve. The other action's event and
+            // the previous lifetime's event are both out.
+            let body = render(&s, "youtrack", ActionEventsQuery::default()).await;
+            assert!(body.contains("VCS probe failed"));
+            assert!(body.contains("no enabled VCS integration"));
+            assert!(!body.contains("duplicate source detected"));
+            assert!(!body.contains("ancient probe failure"));
+
+            // Level filter.
+            let body = render(
+                &s,
+                "youtrack",
+                ActionEventsQuery {
+                    level: "info".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(body.contains("no enabled VCS integration"));
+            assert!(!body.contains("VCS probe failed"));
+
+            // Action filter widened to all: the other action's event appears.
+            let body = render(
+                &s,
+                "youtrack",
+                ActionEventsQuery {
+                    action: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(body.contains("duplicate source detected"));
+            assert!(body.contains("VCS probe failed"));
+
+            // Context filter.
+            let body = render(
+                &s,
+                "youtrack",
+                ActionEventsQuery {
+                    action: Some(String::new()),
+                    context: "config-collision".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(body.contains("duplicate source detected"));
+            assert!(!body.contains("VCS probe failed"));
+
+            // Message substring search, case-insensitive.
+            let body = render(
+                &s,
+                "youtrack",
+                ActionEventsQuery {
+                    q: "PROBE".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(body.contains("VCS probe failed"));
+            assert!(!body.contains("no enabled VCS integration"));
+
+            // Since toggle: all-time reaches the previous lifetime's event.
+            let body = render(
+                &s,
+                "youtrack",
+                ActionEventsQuery {
+                    since: "all".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(body.contains("ancient probe failure"));
+
+            // A hand-edited value that is not a distinct DB value drops to "all"
+            // rather than filtering or being echoed into the page.
+            let injected = "' OR 1=1 --";
+            let body = render(
+                &s,
+                "youtrack",
+                ActionEventsQuery {
+                    level: injected.to_string(),
+                    context: injected.to_string(),
+                    action: Some(injected.to_string()),
+                    dir: injected.to_string(),
+                    since: injected.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(!body.contains("OR 1=1"));
+            // Dropping to "all" on action/level/context, and to the default
+            // (current serve) window on `since`.
+            assert!(body.contains("duplicate source detected"));
+            assert!(!body.contains("ancient probe failure"));
+        }
+
+        #[test]
+        fn events_view_binds_every_filter_value_as_a_parameter() {
+            // CLAUDE-171: the clause text is built from fixed fragments only;
+            // every value travels as a `?` bind, in clause order.
+            let view = EventsView {
+                dir: "asc".to_string(),
+                level: "warn".to_string(),
+                action: "youtrack".to_string(),
+                context: "VS".to_string(),
+                since: String::new(),
+                q: "Probe".to_string(),
+            };
+            let (clause, binds) = view.where_clause(Some("2999-01-01T00:00:00Z"));
+            assert_eq!(
+                clause,
+                " WHERE level = ? AND action_name = ? AND context = ? AND instr(lower(message), ?) > 0 AND ts >= ?"
+            );
+            assert_eq!(
+                binds,
+                vec![
+                    "warn",
+                    "youtrack",
+                    "VS",
+                    // Lowercased for the ASCII-only `lower()` comparison.
+                    "probe",
+                    "2999-01-01T00:00:00Z",
+                ]
+            );
+            assert_eq!(view.order_by(), "ORDER BY ts ASC, id ASC");
+
+            // All-time drops the window bound; an unstamped DB does too, rather
+            // than hiding every row.
+            let all_time = EventsView {
+                since: "all".to_string(),
+                ..view.clone()
+            };
+            let (clause, binds) = all_time.where_clause(Some("2999-01-01T00:00:00Z"));
+            assert!(!clause.contains("ts >= ?"));
+            assert_eq!(binds.len(), 4);
+            let (clause, _) = view.where_clause(None);
+            assert!(!clause.contains("ts >= ?"));
+
+            // No selection at all: no clause, no binds.
+            let (clause, binds) = EventsView::default().where_clause(None);
+            assert_eq!(clause, "");
+            assert!(binds.is_empty());
+            assert_eq!(
+                EventsView::default().order_by(),
+                "ORDER BY ts DESC, id DESC"
+            );
         }
 
         #[tokio::test]
