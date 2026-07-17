@@ -21,7 +21,8 @@ long-running daemon.
   Both would gather the same jobs and silently compete on the shared concurrency caps; you get a WARN log and a notice
   on each colliding action instead of discovering the contention during an incident.
 - **HTTP API over a unix socket**: the daemon exposes `/status`, `/actions`, `/actions/<n>/trigger`, `/pause`,
-  `/resume`, ... The CLI client speaks that API when the daemon is reachable, else operates on the DB directly.
+  `/resume`, `/runs/<id>/cancel`, ... The CLI client speaks that API when the daemon is reachable, else operates on the
+  DB directly.
 
 ## Install
 
@@ -56,6 +57,9 @@ claude-run status
 claude-run pause youtrack --reason "addressing a blocker"
 claude-run resume youtrack
 
+# Cancel an in-flight run by id (needs a running daemon; the run lives in the daemon's process table).
+claude-run cancel 42
+
 # Action management.
 claude-run action list
 claude-run action show youtrack
@@ -73,6 +77,23 @@ claude-run version update --yes            # install the newest release-train bu
 claude-run version update --train latest   # install the moving `latest` build
 claude-run version update --version v0.2.0 # pin an exact tag (independent of train)
 ```
+
+## Web UI pages
+
+The daemon's TCP web UI (loopback by default; see "Web UI / API auth") is more than the Dashboard. The pages an operator
+will want to know about:
+
+- **Action detail** (`/actions/<name>`) carries an **Input errors / warnings** summary region (CLAUDE-147 / CLAUDE-171):
+  the first few (`ACTION_EVENT_SUMMARY_LIMIT = 5`) distinct input / poll-phase diagnostics (probe failures, no-VCS drops)
+  seen since the current serve started, each with its repeat count. It is a signal, not a log.
+- **Action error log** (`/actions/<name>/events`, CLAUDE-171) is the full list behind that summary: every matching
+  `run_events` row, undeduplicated and paginated (50 per page), filterable by a whitelisted Level / Action / Context /
+  message substring and an optional "since boot" bound. `<name>` seeds the Action filter, which can be widened to any
+  action or all.
+- **Reports** (`/reports`, CLAUDE-117) is the historical reporting page (spend / runs / time-of-day / day-of-week),
+  global by default and narrowable with `action` + `range` query params.
+- **About** (`/about`, CLAUDE-129) shows version + build info and drives the on-demand self-update check / apply (see
+  "Self-update").
 
 ## Filesystem layout
 
