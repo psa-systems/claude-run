@@ -1,0 +1,12 @@
+-- CLAUDE-175: index job_outcomes(ts) so the Phase 6 retention prune seeks the
+-- rows past the cutoff instead of scanning the whole table.
+--
+-- The daemon retention sweep (see `src/retention.rs`) deletes rows with
+-- `ts < <cutoff>`. `job_outcomes` already indexes (action_name, job_key) and
+-- (run_id), but neither has `ts` as its leading column, so a bare `ts <` range
+-- predicate would full-scan an unbounded table. This single-column index turns
+-- that DELETE into an index range seek. `run_events` (CLAUDE-172) will need the
+-- equivalent single-column `ts` index when it joins the same shared sweep; its
+-- existing idx_run_events_action_ts leads with action_name and cannot serve the
+-- bare cutoff predicate either.
+CREATE INDEX IF NOT EXISTS idx_job_outcomes_ts ON job_outcomes(ts);

@@ -3070,6 +3070,18 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "cadence (seconds) the scheduler starts overlapping pickup runs; >= 1.",
             },
         ],
+        DbRetention => vec![
+            FieldDoc {
+                name: "enabled",
+                badge: "next sweep",
+                note: "master toggle; false parks the history-table prune without losing the window.",
+            },
+            FieldDoc {
+                name: "retention_days",
+                badge: "next sweep",
+                note: "age past which job_outcomes / run_events rows are pruned; must be >= 90 (the longest report range).",
+            },
+        ],
     }
 }
 
