@@ -20,6 +20,7 @@
   </dl>
   <div class="row-actions" style="margin-top: 16px;">
     <a class="btn" href="/actions/{{ action.name }}/durations">Durations</a>
+    <a class="btn" href="/actions/{{ action.name }}/events">View error log</a>
     <span class="badge neutral">read-only - no edit / delete / trigger</span>
   </div>
   {% else %}
@@ -40,6 +41,7 @@
     <a class="btn" href="/actions/{{ action.name }}/edit">Edit</a>
     <a class="btn" href="/actions/{{ action.name }}/export">Export</a>
     <a class="btn" href="/actions/{{ action.name }}/durations">Durations</a>
+    <a class="btn" href="/actions/{{ action.name }}/events">View error log</a>
     <form method="post" action="/actions/{{ action.name }}/delete"
           onsubmit="return confirm('Delete action {{ action.name }}? The YAML file and its index/pause/counter state are removed; run history is kept.');">
       <button class="btn" type="submit">Delete</button>
@@ -69,16 +71,21 @@
   {% endif %}
 </div>
 
+{# CLAUDE-171: a summary, not the log. At most 5 rows: the first distinct
+   (level, context, message) groups since this serve started, oldest first, with
+   identical repeats collapsed into a count. A diagnostic that re-fires every
+   poll therefore costs one row instead of burying every other signal. The full
+   undeduplicated history is behind "View error log". #}
 {% if !events.is_empty() %}
 <h2>Input errors / warnings</h2>
 <div class="card">
-  <p class="dim" style="margin-top: 0;">Poll/input-phase diagnostics (e.g. VCS probe failures). These skip a project's issues before any job is created, so they do not appear in the per-run job outcomes below.</p>
+  <p class="dim" style="margin-top: 0;">Poll/input-phase diagnostics (e.g. VCS probe failures). These skip a project's issues before any job is created, so they do not appear in the per-run job outcomes below. Showing the first 5 distinct diagnostics since the daemon started; repeats are collapsed into a count. <a href="/actions/{{ action.name }}/events">View error log</a> for every event.</p>
   <table>
     <thead><tr><th>When</th><th>Level</th><th>Context</th><th>Message</th><th>Run</th></tr></thead>
     <tbody>
       {% for e in events %}
         <tr>
-          <td class="mono dim">{{ e.ts }}</td>
+          <td class="mono dim">{{ e.first_ts|datetime }}{% if e.count > 1 %} <span class="badge neutral">&times;{{ e.count }}</span> <span class="dim">last {{ e.last_ts|datetime }}</span>{% endif %}</td>
           <td>
             {% if e.level == "error" || e.level == "warn" %}
               <span class="badge bad">{{ e.level }}</span>
