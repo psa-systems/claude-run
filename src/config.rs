@@ -410,6 +410,37 @@ impl Default for WorkdirGcConfig {
     }
 }
 
+/// CLAUDE-175: DB-backed retention for the unbounded history tables (settings
+/// key `config.db_retention`, editable on the web Settings page), Phase 6 of the
+/// roadmap. NOT a `config.toml` key. The daemon sweep ([`crate::retention`]) runs
+/// on `serve` start and on a periodic tick, deleting rows from every table in
+/// [`crate::retention::RETENTION_TABLES`] whose `ts` is older than
+/// `retention_days`. `job_outcomes` is the driver (this issue); `run_events`
+/// (CLAUDE-172) shares the same config, helper, and loop rather than a divergent
+/// implementation.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DbRetentionConfig {
+    /// Master enable toggle. When `false`, no sweep deletes any row, so an
+    /// operator can park the feature without losing the configured window.
+    pub enabled: bool,
+    /// Age, in days, past which a history row is deleted, measured from its
+    /// stored `ts`. Default 180 days. This must stay `>=` the longest reporting
+    /// range the web UI exposes (90 days, [`crate::report::Range::Last90Days`]),
+    /// so the bounded reports are never silently truncated; the all-time report
+    /// (`Range::All`) is inherently bounded by this window once a prune runs.
+    pub retention_days: u64,
+}
+
+impl Default for DbRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: 180,
+        }
+    }
+}
+
 /// CLAUDE-154: global display preferences. A single-operator daemon has no
 /// `users` table, so this is one global section (settings key
 /// `config.preferences`, editable on the web Settings page) rather than
