@@ -11,8 +11,9 @@
 //!
 //! Every table here must have a single-column index on its `ts` column so the
 //! `ts < cutoff` predicate is an index range seek, not a full table scan (see
-//! `migrations/0017_job_outcomes_ts_index.sql`); the `prune_uses_ts_index` test
-//! asserts the query plan uses that index.
+//! `migrations/0017_job_outcomes_ts_index.sql` and
+//! `migrations/0018_run_events_ts_index.sql`); the `prune_uses_ts_index` tests
+//! assert the query plan uses those indexes.
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::SqlitePool;
@@ -33,12 +34,20 @@ pub struct RetentionTable {
 }
 
 /// The tables the daemon retention sweep prunes. `job_outcomes` is the driver
-/// (CLAUDE-175). CLAUDE-172 appends `run_events` here (plus its own
-/// single-column `ts` index) so it shares this exact helper, config, and loop.
-pub const RETENTION_TABLES: &[RetentionTable] = &[RetentionTable {
-    table: "job_outcomes",
-    ts_col: "ts",
-}];
+/// (CLAUDE-175); `run_events` (CLAUDE-172) joins the same list, each with its
+/// own single-column `ts` index (`idx_job_outcomes_ts` from migration 0017,
+/// `idx_run_events_ts` from migration 0018) so both share this exact helper,
+/// config, and loop.
+pub const RETENTION_TABLES: &[RetentionTable] = &[
+    RetentionTable {
+        table: "job_outcomes",
+        ts_col: "ts",
+    },
+    RetentionTable {
+        table: "run_events",
+        ts_col: "ts",
+    },
+];
 
 /// Tally of one [`sweep`] pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -139,6 +148,26 @@ mod tests {
             .unwrap()
     }
 
+    /// Insert a `run_events` row with an explicit `ts`. `run_id` is left NULL
+    /// (events are recorded keyed by action_name + ts before any run exists).
+    async fn insert_event(pool: &SqlitePool, message: &str, ts: &str) {
+        sqlx::query(
+            "INSERT INTO run_events (action_name, ts, level, message) VALUES ('act', ?, 'warn', ?)",
+        )
+        .bind(ts)
+        .bind(message)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn count_events(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM run_events")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
     fn cfg(enabled: bool, days: u64) -> DbRetentionConfig {
         DbRetentionConfig {
             enabled,
@@ -208,6 +237,77 @@ mod tests {
         assert!(
             !detail.contains("SCAN job_outcomes"),
             "prune must not full-scan job_outcomes, got plan: {detail}"
+        );
+    }
+
+    /// CLAUDE-172: the shared sweep prunes aged `run_events` rows and keeps the
+    /// in-window ones, in the same pass as `job_outcomes`.
+    #[tokio::test]
+    async fn prunes_run_events_past_the_window_keeps_fresh() {
+        let pool = pool().await;
+        let now = Utc::now();
+        let old = (now - Duration::days(200)).to_rfc3339();
+        let fresh = (now - Duration::days(10)).to_rfc3339();
+        insert_event(&pool, "OLD", &old).await;
+        insert_event(&pool, "FRESH", &fresh).await;
+        assert_eq!(count_events(&pool).await, 2);
+
+        let stats = sweep(&pool, &cfg(true, 180), now).await.unwrap();
+        assert_eq!(stats.deleted, 1, "only the aged run_events row is pruned");
+        assert_eq!(count_events(&pool).await, 1);
+        let survivor: String = sqlx::query_scalar("SELECT message FROM run_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(survivor, "FRESH", "the in-window run_events row is kept");
+    }
+
+    /// CLAUDE-172: a disabled sweep must not prune `run_events` either.
+    #[tokio::test]
+    async fn disabled_sweep_keeps_run_events() {
+        let pool = pool().await;
+        let now = Utc::now();
+        insert_event(&pool, "OLD", &(now - Duration::days(400)).to_rfc3339()).await;
+        let stats = sweep(&pool, &cfg(false, 180), now).await.unwrap();
+        assert_eq!(stats, RetentionStats::default());
+        assert_eq!(count_events(&pool).await, 1);
+    }
+
+    /// AC: the `run_events` prune predicate must use the single-column `ts`
+    /// index from migration 0018, never table-scan an unbounded `run_events`
+    /// (idx_run_events_action_ts leads with action_name and cannot serve the
+    /// bare cutoff predicate).
+    #[tokio::test]
+    async fn prune_uses_ts_index_run_events() {
+        let pool = pool().await;
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as("EXPLAIN QUERY PLAN DELETE FROM run_events WHERE ts < ?")
+                .bind(Utc::now().to_rfc3339())
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let detail = plan
+            .iter()
+            .map(|(_, _, _, d)| d.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            detail.contains("idx_run_events_ts") && detail.contains("SEARCH"),
+            "prune must seek idx_run_events_ts, got plan: {detail}"
+        );
+        assert!(
+            !detail.contains("SCAN run_events"),
+            "prune must not full-scan run_events, got plan: {detail}"
+        );
+    }
+
+    /// CLAUDE-172: guard that `run_events` is actually wired into the shared
+    /// retention list, so appending it cannot silently regress.
+    #[test]
+    fn run_events_is_in_retention_tables() {
+        assert!(
+            RETENTION_TABLES.iter().any(|t| t.table == "run_events"),
+            "run_events must be pruned by the shared retention sweep"
         );
     }
 
