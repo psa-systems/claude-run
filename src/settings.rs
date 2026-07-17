@@ -31,8 +31,8 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
-    ConcurrencyConfig, MintConfig, OnDiskConfig, Paths, PreferencesConfig, UpdateConfig,
-    WebhookConfig, WorkdirGcConfig,
+    ConcurrencyConfig, DbRetentionConfig, MintConfig, OnDiskConfig, Paths, PreferencesConfig,
+    UpdateConfig, WebhookConfig, WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -51,11 +51,13 @@ pub enum Section {
     Preferences,
     /// CLAUDE-162: daemon-wide concurrency caps + continuous-pickup cadence.
     Concurrency,
+    /// CLAUDE-175: DB history-table retention window (Phase 6).
+    DbRetention,
 }
 
 impl Section {
     /// Every section, in display order (used by the Settings page).
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
         Section::Mint,
         Section::Update,
         Section::Webhook,
@@ -63,6 +65,7 @@ impl Section {
         Section::WorkdirGc,
         Section::Preferences,
         Section::Concurrency,
+        Section::DbRetention,
     ];
 
     /// `settings` table primary key for this section's JSON document.
@@ -75,6 +78,7 @@ impl Section {
             Section::WorkdirGc => "config.workdir_gc",
             Section::Preferences => "config.preferences",
             Section::Concurrency => "config.concurrency",
+            Section::DbRetention => "config.db_retention",
         }
     }
 
@@ -88,6 +92,7 @@ impl Section {
             Section::WorkdirGc => "workdir_gc",
             Section::Preferences => "preferences",
             Section::Concurrency => "concurrency",
+            Section::DbRetention => "db_retention",
         }
     }
 
@@ -106,6 +111,7 @@ impl Section {
             Section::WorkdirGc => "Workdir GC",
             Section::Preferences => "Display preferences",
             Section::Concurrency => "Concurrency",
+            Section::DbRetention => "DB retention",
         }
     }
 
@@ -118,6 +124,7 @@ impl Section {
             Section::WorkdirGc => "next sweep",
             Section::Preferences => "live",
             Section::Concurrency => "next tick",
+            Section::DbRetention => "next sweep",
         }
     }
 }
@@ -305,6 +312,9 @@ pub struct EffectiveRuntime {
     /// CLAUDE-162: daemon-wide concurrency caps + continuous-pickup cadence.
     /// Brand-new section (never in `config.toml`), so the DB value or the default.
     pub concurrency: ConcurrencyConfig,
+    /// CLAUDE-175: DB history-table retention window. Brand-new section (never in
+    /// `config.toml`), so the DB value or the built-in default (180 days).
+    pub db_retention: DbRetentionConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
@@ -332,6 +342,9 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
     let concurrency = get_json::<ConcurrencyConfig>(pool, Section::Concurrency.key())
         .await?
         .unwrap_or_default();
+    let db_retention = get_json::<DbRetentionConfig>(pool, Section::DbRetention.key())
+        .await?
+        .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
         update,
@@ -340,6 +353,7 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
         workdir_gc,
         preferences,
         concurrency,
+        db_retention,
     })
 }
 
@@ -350,6 +364,23 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
 pub fn validate_concurrency(cfg: &ConcurrencyConfig) -> std::result::Result<(), String> {
     if cfg.regather_interval_secs == 0 {
         return Err("regather_interval_secs must be >= 1".to_string());
+    }
+    Ok(())
+}
+
+/// Longest reporting range the web UI exposes, in days
+/// ([`crate::report::Range::Last90Days`]). A retention window shorter than this
+/// would silently truncate the bounded reports, so a save is rejected below it.
+pub const MIN_DB_RETENTION_DAYS: u64 = 90;
+
+/// CLAUDE-175: validate a [`DbRetentionConfig`] before it is persisted. The
+/// window must stay `>=` the longest reporting range so a prune never silently
+/// truncates the 30d / 90d reports. Returns a human message on failure.
+pub fn validate_db_retention(cfg: &DbRetentionConfig) -> std::result::Result<(), String> {
+    if cfg.enabled && cfg.retention_days < MIN_DB_RETENTION_DAYS {
+        return Err(format!(
+            "retention_days must be >= {MIN_DB_RETENTION_DAYS} (the longest report range) so reports are not truncated"
+        ));
     }
     Ok(())
 }
@@ -513,6 +544,7 @@ pub struct LiveSettings {
     workdir_gc: Arc<RwLock<WorkdirGcConfig>>,
     preferences: Arc<RwLock<PreferencesConfig>>,
     concurrency: Arc<RwLock<ConcurrencyConfig>>,
+    db_retention: Arc<RwLock<DbRetentionConfig>>,
 }
 
 impl LiveSettings {
@@ -535,6 +567,7 @@ impl LiveSettings {
             workdir_gc: Arc::new(RwLock::new(eff.workdir_gc)),
             preferences: Arc::new(RwLock::new(eff.preferences)),
             concurrency: Arc::new(RwLock::new(eff.concurrency)),
+            db_retention: Arc::new(RwLock::new(eff.db_retention)),
         };
         if let (Some(apply), Some(filter)) = (s.log_apply.as_ref(), eff.log_filter.as_ref()) {
             match apply(filter) {
@@ -581,6 +614,12 @@ impl LiveSettings {
         self.concurrency.clone()
     }
 
+    /// CLAUDE-175: shared handle to the live DB-retention config, read by the
+    /// retention sweep on each tick so a Settings save applies on the next sweep.
+    pub fn db_retention_handle(&self) -> Arc<RwLock<DbRetentionConfig>> {
+        self.db_retention.clone()
+    }
+
     /// CLAUDE-129: a snapshot of the live update config (train + token_ref), read
     /// by the About page handlers to drive the on-demand check / apply.
     pub async fn update_config(&self) -> UpdateConfig {
@@ -600,6 +639,7 @@ impl LiveSettings {
             Section::WorkdirGc => to_pretty(&*self.workdir_gc.read().await),
             Section::Preferences => to_pretty(&*self.preferences.read().await),
             Section::Concurrency => to_pretty(&*self.concurrency.read().await),
+            Section::DbRetention => to_pretty(&*self.db_retention.read().await),
         }
     }
 
@@ -668,6 +708,14 @@ impl LiveSettings {
                 set_json(&self.pool, section.key(), &v).await?;
                 *self.concurrency.write().await = v;
             }
+            Section::DbRetention => {
+                let v: DbRetentionConfig = parse(json)?;
+                // Reject a window shorter than the longest report range before
+                // persisting: nothing is stored on an invalid payload.
+                validate_db_retention(&v).map_err(SaveError::Invalid)?;
+                set_json(&self.pool, section.key(), &v).await?;
+                *self.db_retention.write().await = v;
+            }
         }
         Ok(())
     }
@@ -706,6 +754,7 @@ mod tests {
             workdir_gc: WorkdirGcConfig::default(),
             preferences: PreferencesConfig::default(),
             concurrency: ConcurrencyConfig::default(),
+            db_retention: DbRetentionConfig::default(),
         }
     }
 
@@ -872,6 +921,54 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(get_raw(&pool, Section::Mint.key()).await.unwrap().is_none());
+    }
+
+    // ---- CLAUDE-175: DB-retention section save + window validation ---------
+
+    #[tokio::test]
+    async fn db_retention_saves_and_rejects_too_short_window() {
+        let pool = pool().await;
+        let live = LiveSettings::detached(pool.clone());
+
+        // A window >= the longest report range persists and applies live.
+        live.save_section(
+            Section::DbRetention,
+            r#"{"enabled":true,"retention_days":120}"#,
+        )
+        .await
+        .expect("a >= 90-day window is valid");
+        let stored: DbRetentionConfig = get_json(&pool, Section::DbRetention.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.retention_days, 120);
+
+        // A window shorter than the 90-day report range is rejected, and nothing
+        // is persisted over the previously stored value.
+        let err = live
+            .save_section(
+                Section::DbRetention,
+                r#"{"enabled":true,"retention_days":30}"#,
+            )
+            .await
+            .expect_err("a < 90-day window must be rejected");
+        assert!(matches!(err, SaveError::Invalid(_)), "{err}");
+        let unchanged: DbRetentionConfig = get_json(&pool, Section::DbRetention.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.retention_days, 120,
+            "a rejected save persists nothing"
+        );
+
+        // A disabled config may carry any window (the prune never runs).
+        live.save_section(
+            Section::DbRetention,
+            r#"{"enabled":false,"retention_days":1}"#,
+        )
+        .await
+        .expect("a disabled config bypasses the window floor");
     }
 
     // ---- CLAUDE-154: preferences formatting + validation -------------------
