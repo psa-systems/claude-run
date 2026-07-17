@@ -246,6 +246,29 @@ pub async fn set_raw(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// CLAUDE-171: `settings` key holding the wall-clock start of the CURRENT serve.
+/// Not a `config.*` section: it is daemon lifetime state, not a tunable, so it
+/// never appears on the Settings page.
+const SERVE_STARTED_AT_KEY: &str = "daemon.started_at";
+
+/// CLAUDE-171: stamp the start of this serve. Written once per `serve` start
+/// (overwriting the previous lifetime's value), in the same
+/// [`crate::state::now_iso`] RFC3339-UTC-seconds format every `run_events.ts` is
+/// written in, so the web layer can bound events to this lifetime with a
+/// lexicographic `ts >= started_at`. Returns the stamp it wrote.
+pub async fn record_serve_start(pool: &SqlitePool) -> Result<String> {
+    let now = now_iso();
+    set_raw(pool, SERVE_STARTED_AT_KEY, &now).await?;
+    Ok(now)
+}
+
+/// CLAUDE-171: the current serve's start stamp, or `None` when no serve has
+/// recorded one yet (a CLI invocation against a never-served DB). Callers that
+/// filter by it treat `None` as "no lower bound" rather than "no rows".
+pub async fn serve_started_at(pool: &SqlitePool) -> Result<Option<String>> {
+    get_raw(pool, SERVE_STARTED_AT_KEY).await
+}
+
 /// Read and deserialize a JSON settings document. `None` when the key is absent.
 pub async fn get_json<T: DeserializeOwned>(pool: &SqlitePool, key: &str) -> Result<Option<T>> {
     match get_raw(pool, key).await? {
