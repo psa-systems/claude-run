@@ -15,8 +15,10 @@ attempt caps, timeouts, and a cost-based usage check. The action YAML supplies e
 
 ```yaml
 name: <kebab-id>            # required
-kind: scripted              # optional discriminator: scripted (default) | youtrack
+kind: scripted              # optional discriminator: scripted (default) | youtrack | forgejo-ci-fix
+enabled: true               # optional, default true; false skips the action in the scheduler
 workdir_base: /path/to/dir  # optional, overrides $CLAUDE_RUN_WORKDIR_BASE for this action
+link_template: https://youtrack/issue/{key}  # optional; {key} -> job key, builds a per-job link (render_link)
 input:
   command: |                # required, nu snippet, stdout = JSON array
     #!/usr/bin/env nu
@@ -33,7 +35,6 @@ claude: # optional, all keys optional
   cwd: ...
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
   permission_mode: acceptEdits
-  output_format: json
 post: # optional, ordered list of nu snippets
   - |
     ...

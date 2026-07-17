@@ -467,8 +467,8 @@ pub fn default_github_mcp_endpoint() -> String {
 /// `kind: forgejo-ci-fix`.
 ///
 /// The handler scans `repos` on `host` for open PRs whose head-commit combined
-/// CI status is `failure` and that were updated within `window_minutes`, skips
-/// PRs authored by `bot_author` (anti-feedback-loop), clones the PR branch,
+/// CI status is `failure` and that were updated within `window_minutes`, keeps
+/// only PRs authored by `bot_author` (CLAUDE-149), clones the PR branch,
 /// runs Claude to fix the failing CI, applies a diff-size decision gate
 /// (`no_changes` / `too_big` against `max_files` + `max_lines` / `push`),
 /// commits as the bot identity with the `skip_marker`, pushes, and comments on
