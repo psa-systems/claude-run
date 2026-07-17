@@ -105,7 +105,7 @@ so an invalid edit is rejected inline with the parser's own error and nothing is
 shown or stored on the page: fields ending in `_ref` (`auth_token_ref`, a webhook source's `secret_ref` /
 `log_token_ref`, `[update].token_ref`) name a credential in the Secrets store and are rendered as that name only. Each
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
-secret refs, adding a source), `next event` / `next invocation` for mint / update, and `restart` for the webhook
+secret refs, adding a source), `next event` for mint / update, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
 `GET` / `PUT /api/settings/{mint,update,webhook,log_filter,workdir_gc,preferences,concurrency,db_retention}`. The
 `workdir_gc` (CLAUDE-106), `preferences` (CLAUDE-154), `concurrency` (CLAUDE-162), and `db_retention` (CLAUDE-175)
@@ -156,7 +156,7 @@ are governed by the initial filter, not the saved one; use `CLAUDE_RUN_LOG` when
 
 ## DB retention (CLAUDE-175)
 
-The history tables append forever: every job outcome (`job_outcomes`) and every poll-phase diagnostic (`run_events`) is written and nothing deletes them, so the SQLite database grows without bound. Phase 6 bounds that growth with an age-based retention prune (`src/retention.rs`). A daemon sweep runs on `serve` start and then hourly, deleting rows whose stored `ts` is older than the configured window. The delete predicate is an index range seek on the per-table single-column `ts` index (`migrations/0017_job_outcomes_ts_index.sql` for `job_outcomes`, `migrations/0018_run_events_ts_index.sql` for `run_events`), so it never full-scans a large table. `job_outcomes` is the driver; `run_events` (CLAUDE-172) shares the same helper, config, and loop through the `RETENTION_TABLES` list rather than a divergent implementation.
+The history tables append forever: every job outcome (`job_outcomes`) and every poll-phase diagnostic (`run_events`) is written and nothing deletes them, so the SQLite database grows without bound. An age-based retention prune (`src/retention.rs`) bounds that growth. A daemon sweep runs on `serve` start and then hourly, deleting rows whose stored `ts` is older than the configured window. The delete predicate is an index range seek on the per-table single-column `ts` index (`migrations/0017_job_outcomes_ts_index.sql` for `job_outcomes`, `migrations/0018_run_events_ts_index.sql` for `run_events`), so it never full-scans a large table. `job_outcomes` is the driver; `run_events` (CLAUDE-172) shares the same helper, config, and loop through the `RETENTION_TABLES` list rather than a divergent implementation.
 
 The window is a DB-backed runtime setting edited on the **Settings** page (the `DB retention` section, or `GET` / `PUT /api/settings/db_retention`). Fields: `enabled` (master toggle, default `true`) and `retention_days` (default `180`). Edits apply on the next sweep. Set `enabled: false` to park the prune without losing the configured window.
 
@@ -168,7 +168,7 @@ Every timestamp is stored as an RFC3339 UTC string; how it is displayed in the w
 
 - `timezone`: an IANA name (e.g. `America/New_York`, default `UTC`). Every displayed date is converted into it before formatting.
 - `datetime_format`: a chrono strftime pattern (default `%Y-%m-%d %H:%M:%S %Z`, e.g. `2026-07-01 00:00:00 UTC`). The Settings page offers preset buttons (ISO-seconds `%Y-%m-%d %H:%M:%S`, ISO-minutes `%Y-%m-%d %H:%M`, US `%m/%d/%Y %I:%M:%S %p`, EU `%d.%m.%Y %H:%M:%S`, RFC3339 `%Y-%m-%dT%H:%M:%S%:z`) that fill the field, plus free-form editing.
-- `locale`: a BCP-47 locale (default `en-US`). Advisory / reserved for now: it is stored and round-trips through the API but does NOT yet localize month / weekday names (that needs chrono's `unstable-locales` feature). Wiring it live is tracked in CLAUDE-155.
+- `locale`: a BCP-47 locale (default `en-US`, CLAUDE-155). Name-emitting format specifiers (`%A`, `%a`, `%B`, `%b`, `%p`) render month / weekday / AM-PM names in this locale; it is validated on save and rejected inline if unknown.
 
 Edits apply live (the dashboard, run and action detail pages, the secrets table, and the live job-stream log all reformat on the next render). Saving an unknown timezone or an unparseable strftime format is rejected inline and nothing is persisted. With the defaults (`UTC` + ISO-with-seconds) displayed times equal today's stored UTC values; only the surface format changes, never the underlying data. Elapsed durations (run duration, the +offset in the live log) and `report` analytics are wall-clock spans, not dates, and are left unformatted.
 
@@ -421,7 +421,7 @@ fails loudly naming the path (run `claude` once to log in first). On macOS crede
 **Image.** `oci-build/Dockerfile` has a `runtime` target built on the CI image (`dev.a8n.run/pandoras-box/rust-builder-musl`).
 It carries `claude-run` plus the pinned runtime toolchain: `nu`, the `claude` CLI, coreutils `timeout`, `git`, `yt` (
 youtrack-cli), and `fj` (forgejo-cli). Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VERSION`, `YT_VERSION`,
-`FJ_VERSION` / `FJ_URL`); override any one with `--build-arg`. The container runs as the non-root user `claudebot` with
+`FJ_VERSION`); override any one with `--build-arg`. The container runs as the non-root user `claudebot` with
 `$HOME=/home/claudebot`.
 
 **Published image (CLAUDE-88).** CI publishes the runtime image to the Forgejo OCI registry on every push to main (
@@ -496,7 +496,7 @@ docker compose up --detach      # start the daemon from the published image
 docker compose logs --follow    # watch the scheduler
 ```
 
-See [CLAUDE.md](CLAUDE.md) for the project-specific deviations from `niceguyit/governance` and the phased rollout plan.
+See [CLAUDE.md](CLAUDE.md) for the project-specific deviations from `niceguyit/governance` and the phase history of the completed Rust port.
 
 ## License
 
