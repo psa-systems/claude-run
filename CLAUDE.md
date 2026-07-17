@@ -30,7 +30,7 @@ Feature delivery landed in numbered phases; this table is the status list. Phase
 | 3 | Web UI (axum templates + HTMX + SSE), TCP listener, log streaming | merged |
 | 4 | Action edit / import / export through the API | merged (CLAUDE-7) |
 | 5 | Token auth for non-loopback binds | merged (CLAUDE-48) |
-| 6 | Retention policy enforcement on the unbounded history tables, polish | `job_outcomes` shipped (CLAUDE-175); `run_events` outstanding (CLAUDE-172) |
+| 6 | Retention policy enforcement on the unbounded history tables, polish | `job_outcomes` shipped (CLAUDE-175); `run_events` shipped (CLAUDE-172) |
 
 Two unrelated numbering schemes both say "Phase N", and a bare `grep 'Phase 3'` returns hits from both. The roadmap phases in this table are one (e.g. `src/web/mod.rs` "Phase 3" = Web UI, `src/auth.rs` "Phase 5" = token auth). The separate native-actions epic (CLAUDE-30..CLAUDE-34, tracked under CLAUDE-25) is the other; its comments carry the "native-action" qualifier (e.g. `src/native/youtrack.rs` "Phase 3 of the native-action epic" = CLAUDE-32, which is NOT roadmap Phase 3). Tell them apart by that qualifier and the CLAUDE-30..34 / CLAUDE-25 issue range; a bare "Phase N" with no "native-action" wording refers to this table.
 
