@@ -21,16 +21,18 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 
 ## Phases
 
-The Rust port is rolling out in phases against the plan agreed in PR review:
+Feature delivery landed in numbered phases; this table is the status list. Phases 1-5 have shipped; Phase 6 is the only row with outstanding work.
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | `run` / `migrate`, all core modules, SQLite-backed state | merged |
 | 2 | `serve [--detach]`, scheduler, unix-socket API, lock, pause-in-DB | merged |
-| 3 | Web UI (axum templates + HTMX + SSE), TCP listener, log streaming | TBD |
-| 4 | Action edit / import / export through the API | TBD |
-| 5 | Token auth for non-loopback binds | TBD |
-| 6 | Retention policy enforcement on `job_outcomes`, polish | TBD |
+| 3 | Web UI (axum templates + HTMX + SSE), TCP listener, log streaming | merged |
+| 4 | Action edit / import / export through the API | merged (CLAUDE-7) |
+| 5 | Token auth for non-loopback binds | merged (CLAUDE-48) |
+| 6 | Retention policy enforcement on the unbounded history tables, polish | `job_outcomes` shipped (CLAUDE-175); `run_events` outstanding (CLAUDE-172) |
+
+Two unrelated numbering schemes both say "Phase N", and a bare `grep 'Phase 3'` returns hits from both. The roadmap phases in this table are one (e.g. `src/web/mod.rs` "Phase 3" = Web UI, `src/auth.rs` "Phase 5" = token auth). The separate native-actions epic (CLAUDE-30..CLAUDE-34, tracked under CLAUDE-25) is the other; its comments carry the "native-action" qualifier (e.g. `src/native/youtrack.rs` "Phase 3 of the native-action epic" = CLAUDE-32, which is NOT roadmap Phase 3). Tell them apart by that qualifier and the CLAUDE-30..34 / CLAUDE-25 issue range; a bare "Phase N" with no "native-action" wording refers to this table.
 
 Cross-cutting (not a numbered phase): a container runtime (CLAUDE-37) runs the daemon and its spawned `claude` children in an isolated `$HOME` with a slim bot CLAUDE.md, decoupled from the host's operator config. See `oci-build/Dockerfile` (`runtime` target), `compose.yml`, and `deploy/bot-CLAUDE.md`.
 
