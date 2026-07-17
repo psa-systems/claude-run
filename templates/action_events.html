@@ -1,0 +1,151 @@
+{% extends "base.html" %}
+{% block title %}{{ action_name }} error log - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><a href="/actions/{{ action_name }}">{{ action_name }}</a><span class="sep">/</span><span class="current">Error log</span>{% endblock %}
+{% block main %}
+
+<h2>Input error log</h2>
+
+{# CLAUDE-171: every filter control re-requests this region with its selection
+   encoded in the URL and morph-swaps the result in place, exactly as on the
+   dashboard. Each select carries every param EXCEPT its own (`query_without`),
+   because htmx already sends the triggering element's own name/value: repeating
+   it in the URL would give axum's `Query` a duplicate key. The free-text `q`
+   lives in `#event-filters` and rides `hx-include` (it is the one value not
+   whitelisted, so it stays out of the URLs the page builds); `page` rides
+   `hx-vals`. Server-side, `q` is bound as an `instr()` parameter and the rest
+   are whitelisted against the distinct DB values before reaching SQL.
+
+   The controls sit INSIDE #events-region so a swap re-renders them with the new
+   selection and freshly-built URLs; leaving them outside would let a second
+   filter change re-submit the previous filter's query string. #}
+<div id="events-region">
+
+<div class="card" style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+  <label style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-dim);">
+    Level
+    <select name="level" hx-trigger="change"
+            hx-get="/actions/{{ action_name }}/events?{{ view.query_without("level") }}" hx-include="#event-filters"
+            hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
+            style="margin-left: 6px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; padding: 3px 5px;">
+      <option value=""{% if view.level.is_empty() %} selected{% endif %}>all</option>
+      {% for l in level_options %}
+        <option value="{{ l }}"{% if view.level.as_str() == l.as_str() %} selected{% endif %}>{{ l }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-dim);">
+    Action
+    <select name="action" hx-trigger="change"
+            hx-get="/actions/{{ action_name }}/events?{{ view.query_without("action") }}" hx-include="#event-filters"
+            hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
+            style="margin-left: 6px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; padding: 3px 5px;">
+      <option value=""{% if view.action.is_empty() %} selected{% endif %}>all</option>
+      {% for a in action_options %}
+        <option value="{{ a }}"{% if view.action.as_str() == a.as_str() %} selected{% endif %}>{{ a }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-dim);">
+    Context
+    <select name="context" hx-trigger="change"
+            hx-get="/actions/{{ action_name }}/events?{{ view.query_without("context") }}" hx-include="#event-filters"
+            hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
+            style="margin-left: 6px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; padding: 3px 5px;">
+      <option value=""{% if view.context.is_empty() %} selected{% endif %}>all</option>
+      {% for c in context_options %}
+        <option value="{{ c }}"{% if view.context.as_str() == c.as_str() %} selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-dim);">
+    Since
+    <select name="since" hx-trigger="change"
+            hx-get="/actions/{{ action_name }}/events?{{ view.query_without("since") }}" hx-include="#event-filters"
+            hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
+            style="margin-left: 6px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; padding: 3px 5px;">
+      <option value=""{% if !view.all_time() %} selected{% endif %}>current serve</option>
+      <option value="all"{% if view.all_time() %} selected{% endif %}>all time</option>
+    </select>
+  </label>
+  <form id="event-filters"
+        hx-get="/actions/{{ action_name }}/events?{{ view.filter_query() }}"
+        hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
+        hx-trigger="submit"
+        style="display: flex; gap: 8px; align-items: center; flex: 1 1 240px;">
+    <input type="search" name="q" value="{{ view.q }}"
+           placeholder="Search messages..." autocomplete="off"
+           style="flex: 1 1 180px; min-width: 140px;">
+    <button class="btn" type="submit">Search</button>
+  </form>
+  <a class="btn" href="/actions/{{ action_name }}/events">Reset</a>
+</div>
+
+<p class="meta">
+  {% if let Some(st) = started_at %}
+    {% if view.all_time() %}
+      Showing events from all time. This serve started {{ st|datetime }}.
+    {% else %}
+      Showing events since this serve started ({{ st|datetime }}).
+    {% endif %}
+  {% else %}
+    Showing events from all time (no serve start is recorded in this database).
+  {% endif %}
+  Every matching event is listed; unlike the action page's summary, repeats are not collapsed.
+</p>
+
+{% if events.is_empty() %}
+  <div class="card"><span class="dim">No input events match this filter.</span></div>
+{% else %}
+  <table>
+    <thead><tr>
+      <th><a href="#" class="sort-link"
+             hx-get="/actions/{{ action_name }}/events?{{ view.sort_query() }}" hx-include="#event-filters"
+             hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
+             >When{{ view.arrow_when() }}</a></th>
+      <th>Level</th>
+      <th>Action</th>
+      <th>Context</th>
+      <th>Message</th>
+      <th>Run</th>
+    </tr></thead>
+    <tbody>
+      {% for e in events %}
+        <tr>
+          <td class="mono dim">{{ e.ts|datetime }}</td>
+          <td>
+            {% if e.level == "error" || e.level == "warn" %}
+              <span class="badge bad">{{ e.level }}</span>
+            {% else %}
+              <span class="badge neutral">{{ e.level }}</span>
+            {% endif %}
+          </td>
+          <td><a href="/actions/{{ e.action_name }}">{{ e.action_name }}</a></td>
+          <td class="mono">{{ e.context.as_deref().unwrap_or("-") }}</td>
+          <td{% if e.level == "error" || e.level == "warn" %} style="color: var(--bad);"{% endif %}>{{ e.message }}</td>
+          <td class="mono">{% if let Some(rid) = e.run_id %}<a href="/runs/{{ rid }}">#{{ rid }}</a>{% else %}<span class="dim">-</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <div class="pagination" style="display: flex; gap: 12px; align-items: center; margin: 12px 0; font-size: 12px;">
+    {% if page.has_prev %}
+      <a class="btn" hx-get="/actions/{{ action_name }}/events?{{ view.filter_query() }}" hx-include="#event-filters"
+         hx-vals='{"page": {{ page.page - 1 }}}'
+         hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML">Prev</a>
+    {% else %}
+      <span class="btn" aria-disabled="true" style="opacity: 0.4; pointer-events: none;">Prev</span>
+    {% endif %}
+    <span class="meta">{{ page.start }}-{{ page.end }} of {{ page.total }} (page {{ page.page }} of {{ page.total_pages }})</span>
+    {% if page.has_next %}
+      <a class="btn" hx-get="/actions/{{ action_name }}/events?{{ view.filter_query() }}" hx-include="#event-filters"
+         hx-vals='{"page": {{ page.page + 1 }}}'
+         hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML">Next</a>
+    {% else %}
+      <span class="btn" aria-disabled="true" style="opacity: 0.4; pointer-events: none;">Next</span>
+    {% endif %}
+  </div>
+{% endif %}
+
+</div><!-- /#events-region -->
+
+{% endblock %}

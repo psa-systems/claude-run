@@ -354,6 +354,36 @@ pub struct RunEventRecord {
     pub message: String,
 }
 
+/// CLAUDE-171: one persisted `run_events` row as read back for the error-log
+/// page. The sibling of [`RunEventRecord`] that also carries `action_name`, so
+/// the log's Action column can render once the filter is widened past the action
+/// the page was entered from.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct RunEventLogRecord {
+    pub run_id: Option<i64>,
+    pub ts: String,
+    pub level: String,
+    pub context: Option<String>,
+    pub message: String,
+    pub action_name: String,
+}
+
+/// CLAUDE-171: a group of byte-identical `run_events` rows collapsed into one
+/// summary row for the action-detail page.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct RunEventGroup {
+    pub level: String,
+    pub context: Option<String>,
+    pub message: String,
+    /// Occurrences of this exact `(level, context, message)` in the window.
+    pub count: i64,
+    pub first_ts: String,
+    pub last_ts: String,
+    /// Representative run: the newest attached run id in the group, or `None`
+    /// when every occurrence was a zero-job poll with no run row.
+    pub run_id: Option<i64>,
+}
+
 /// CLAUDE-147: persist this poll's input-phase events keyed by `action_name` +
 /// `poll_ts`, with a NULL `run_id` (the run row does not exist yet, since
 /// `gather()` runs before `run_begin`). [`run_events_attach`] backfills the run
@@ -424,6 +454,49 @@ pub async fn run_events_for_action(
         "#,
     )
     .bind(action)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// CLAUDE-171: the first `limit` DISTINCT input-phase diagnostics for an action
+/// since `started_at`, for the action-detail "Input errors / warnings" summary.
+///
+/// Rows with an identical `(level, context, message)` collapse into one group
+/// carrying its occurrence `count` and first/last-seen stamps, so a diagnostic
+/// that re-fires every poll (the CLAUDE-164 config-collision notice, recorded
+/// once per 5s poll) takes one row instead of burying every other diagnostic.
+/// Groups are ordered by first occurrence ascending: the earliest signal in this
+/// daemon lifetime is what the operator wants first, and it is stable as the
+/// flood keeps growing.
+///
+/// `started_at` is the current serve's stamp ([`crate::settings::serve_started_at`]).
+/// `None` means "no lower bound": every `ts` is a non-empty ISO string, so the
+/// empty-string bind matches all rows. That is the degraded path for a DB no
+/// serve has stamped yet, not the daemon's normal path.
+pub async fn run_events_summary_for_action(
+    pool: &SqlitePool,
+    action: &str,
+    started_at: Option<&str>,
+    limit: i64,
+) -> Result<Vec<RunEventGroup>> {
+    let rows = sqlx::query_as::<_, RunEventGroup>(
+        r#"
+        SELECT level, context, message,
+               COUNT(*) AS count,
+               MIN(ts) AS first_ts,
+               MAX(ts) AS last_ts,
+               MAX(run_id) AS run_id
+        FROM run_events
+        WHERE action_name = ? AND ts >= ?
+        GROUP BY level, context, message
+        ORDER BY first_ts ASC
+        LIMIT ?
+        "#,
+    )
+    .bind(action)
+    .bind(started_at.unwrap_or(""))
     .bind(limit)
     .fetch_all(pool)
     .await?;
