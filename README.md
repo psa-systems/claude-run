@@ -107,10 +107,10 @@ shown or stored on the page: fields ending in `_ref` (`auth_token_ref`, a webhoo
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
 secret refs, adding a source), `next event` / `next invocation` for mint / update, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
-`GET` / `PUT /api/settings/{mint,update,webhook,log_filter,workdir_gc,preferences,concurrency}`. The `workdir_gc`
-(CLAUDE-106), `preferences` (CLAUDE-154), and `concurrency` (CLAUDE-162) sections are DB-only from birth (never
-`config.toml` keys), so they are not part of the one-time import below; each simply
-defaults until edited.
+`GET` / `PUT /api/settings/{mint,update,webhook,log_filter,workdir_gc,preferences,concurrency,db_retention}`. The
+`workdir_gc` (CLAUDE-106), `preferences` (CLAUDE-154), `concurrency` (CLAUDE-162), and `db_retention` (CLAUDE-175)
+sections are DB-only from birth (never `config.toml` keys), so they are not part of the one-time import below; each
+simply defaults until edited.
 
 **One-time import, then breaking.** The first daemon start after upgrading imports any of the four moved sections still
 present in `config.toml` into the database and logs a warning naming each one and telling you to remove it from the
@@ -153,6 +153,14 @@ losing the configured windows.
 Known limitation: the handful of startup lines emitted before the stored filter is applied (e.g. the config-source line)
 are governed by the initial filter, not the saved one; use `CLAUDE_RUN_LOG` when those specific lines are needed at
 `debug`.
+
+## DB retention (CLAUDE-175)
+
+The history tables append forever: every job outcome (`job_outcomes`) and, once CLAUDE-172 lands, every poll-phase diagnostic (`run_events`) is written and nothing deletes them, so the SQLite database grows without bound. Phase 6 bounds that growth with an age-based retention prune (`src/retention.rs`). A daemon sweep runs on `serve` start and then hourly, deleting rows whose stored `ts` is older than the configured window. The delete predicate is an index range seek on the per-table single-column `ts` index (`migrations/0017_job_outcomes_ts_index.sql`), so it never full-scans a large table. `job_outcomes` is the driver; `run_events` shares the same helper, config, and loop through the `RETENTION_TABLES` list rather than a divergent implementation.
+
+The window is a DB-backed runtime setting edited on the **Settings** page (the `DB retention` section, or `GET` / `PUT /api/settings/db_retention`). Fields: `enabled` (master toggle, default `true`) and `retention_days` (default `180`). Edits apply on the next sweep. Set `enabled: false` to park the prune without losing the configured window.
+
+Reporting interaction: the reports layer aggregates spend from `job_outcomes.ts`, and the web UI exposes 30-day and 90-day (and all-time) ranges. `retention_days` must stay `>=` the longest bounded range (90 days), so a save below 90 (while enabled) is rejected inline; the 180-day default leaves comfortable margin. The all-time range is inherently bounded by the retention window once a prune runs (its lower bound is whatever the oldest surviving row is), which is expected: retention is the layer that caps unbounded history.
 
 ## Display preferences (CLAUDE-154)
 

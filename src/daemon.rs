@@ -288,6 +288,15 @@ impl Daemon {
         // the shared handle so a Settings save applies on the next sweep.
         let gc_task = tokio::spawn(gc_loop(self.paths.clone(), settings.workdir_gc_handle()));
 
+        // CLAUDE-175: Phase 6 retention sweep. Prunes the unbounded history
+        // tables (job_outcomes; run_events joins via the same helper under
+        // CLAUDE-172) past the configured window on the same hourly cadence as
+        // the workdir GC. The first tick fires immediately, so a prune runs on
+        // serve start; reads the live config off the shared handle so a Settings
+        // save applies on the next sweep.
+        let retention_task =
+            tokio::spawn(retention_loop(pool.clone(), settings.db_retention_handle()));
+
         // Graceful shutdown on SIGINT (Ctrl-C), SIGTERM (service managers,
         // `claude-run stop`), or SIGQUIT. All fall through to the same cleanup
         // below.
@@ -315,6 +324,7 @@ impl Daemon {
         scheduler_task.abort();
         trigger_task.abort();
         gc_task.abort();
+        retention_task.abort();
 
         // CLAUDE-11: cancel in-flight runs through the CLAUDE-9 path (child
         // terminated, `post` run with a synthesized cancelled result,
@@ -1269,6 +1279,31 @@ async fn gc_loop(paths: Paths, cfg: Arc<tokio::sync::RwLock<crate::config::Workd
             ),
             Ok(_) => {}
             Err(e) => warn!(error = %e, "workdir GC sweep task failed"),
+        }
+    }
+}
+
+/// CLAUDE-175: periodic DB retention sweep. Prunes the unbounded history tables
+/// past the configured window on the [`GC_TICK_SECS`] cadence, reading the live
+/// config off the shared handle so a Settings save applies on the next tick. The
+/// interval's first tick fires immediately, so a prune runs on serve start.
+async fn retention_loop(
+    pool: sqlx::SqlitePool,
+    cfg: Arc<tokio::sync::RwLock<crate::config::DbRetentionConfig>>,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(GC_TICK_SECS));
+    loop {
+        ticker.tick().await;
+        let snapshot = cfg.read().await.clone();
+        if !snapshot.enabled {
+            continue;
+        }
+        match crate::retention::sweep(&pool, &snapshot, chrono::Utc::now()).await {
+            Ok(stats) if stats.deleted > 0 => {
+                info!(deleted = stats.deleted, "db retention sweep complete")
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "db retention sweep failed"),
         }
     }
 }
