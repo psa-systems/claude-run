@@ -1,21 +1,39 @@
-# General Task Runner
+# claude-run task runner.
 #
-# Most recipes are inherited from the shared psa-systems task runner, vendored
-# as the `common` git submodule and imported below. Only the recipes that
-# differ for claude-run (a unix-socket daemon plus CLI, not a web service) are
-# defined here; a recipe defined here overrides the imported one of the same
-# name.
+# Most recipes come from the shared psa-systems task runner, vendored as the
+# `common` git submodule and imported below. After cloning this repo run
+# `git submodule update --init` so the import resolves. To pull a newer common:
+# update the submodule and commit the new gitlink.
 #
-# Inherited from common/common.just: default, install-hooks, check-fmt,
-# check-clippy, check-build, check-docker, typecheck, lint, fmt, build, test,
-# create-release. (Cargo.toml has no [features], so common's `--all-features`
-# on clippy/typecheck is a no-op here; package.name == app == claude-run, so
-# common's `cargo update --package {{app}}` in create-release resolves.)
+# claude-run configures the shared recipes through variables wherever common
+# exposes one (per common's blast-radius rule), so the shared implementation
+# stays the single source of truth:
+#   - app: image tags (claude-run:check|local), cargo cache volume names, and
+#     the exported binary name (binary_name defaults to app, which is correct
+#     here: package.name == binary == claude-run).
+#   - pre_commit_mode = "docker" + dev_image: claude-run has no compose.dev.yml
+#     (daemon plus CLI, not a web service), so `just pre-commit` runs the checks
+#     in the rust-builder-musl image via `docker run`, not a compose service.
+#   - test_args = "": run the full suite. The unit tests live in src/** behind
+#     `mod tests` on the library target, which common's default `--bins` skips.
+#   - dockerfile defaults to oci-build/Dockerfile, which is where it lives here.
 #
-# common also ships web-service dev recipes (dev-local*, dev-logs, dev-clean*,
+# Inherited from common/common.just: default, install-hooks, pre-commit
+# (+ -compose / -docker), check-fmt, check-clippy, check-build, check-docker,
+# fmt, lint, typecheck, build, test, build-docker, build-docker-export,
+# dev-clean, dev-clean-all, create-release (+ -generic / -workspace). Cargo.toml
+# has no [features], so common's `--all-features` on clippy/typecheck is a no-op
+# here; package.name == app, so create-release's `cargo update --package` in the
+# default "generic" layout resolves.
+#
+# common also ships compose-only web-service recipes (dev-local*, dev-logs,
 # ensure-env) that assume a compose.dev.yml `app` service. claude-run has no
-# such service, so those recipes are inapplicable here; splitting them out of
-# the shared core so non-web repos stop inheriting them is tracked in DI-13.
+# compose stack, so those inherited recipes are inapplicable here (harmless if
+# left unused); dev-clean detects the missing compose.dev.yml and skips its
+# teardown, so it needs no override.
+#
+# Only two recipes below override a common recipe (`check`, `run`); the rest
+# have no common counterpart.
 
 # A recipe defined here overrides the imported one of the same name. common
 # already sets allow-duplicate-variables (which lets `app` below override its
@@ -28,50 +46,25 @@ import 'common/common.just'
 # inherited recipes. Overrides common's placeholder default.
 app := "claude-run"
 
-# Toolchain image for the local pre-commit hook (matches Forgejo CI).
+# No compose.dev.yml: run the pre-commit checks in the builder image via
+# `docker run`. Tracks the rust-builder-musl tag baked into oci-build/Dockerfile
+# so the local toolchain matches CI.
+pre_commit_mode := "docker"
 dev_image := "dev.a8n.run/pandoras-box/rust-builder-musl:v1.0.0-rust1.94-alpine"
 
-# -- Hooks (override) ---------------------------------------------------------
-
-# Run the same checks as .forgejo/workflows/check.yml inside the rust-builder-musl image so the toolchain matches CI. Overrides common's compose.dev.yml-based pre-commit: claude-run has no compose.dev.yml and runs cargo via `docker run` on the builder image.
-[group: 'hooks']
-pre-commit:
-    #!/usr/bin/env nu
-    let img = "{{ dev_image }}"
-    let vol_target = "dev-claude-run-cargo-target"
-    let vol_reg = "dev-claude-run-cargo-registry"
-    let docker_args = [
-        --rm
-        --volume $"($env.PWD):/build"
-        --workdir /build
-        # Mount the cargo target cache OUTSIDE the /build bind mount and point
-        # cargo at it with CARGO_TARGET_DIR. Nesting a named volume at
-        # /build/target makes the Docker daemon create a root-owned target/ on
-        # the host that needs sudo to remove (DEV-371). The cache still persists
-        # in the named volume; only its mount path moves off the bind mount.
-        --volume $"($vol_target):/cargo-target"
-        --env CARGO_TARGET_DIR=/cargo-target
-        --volume $"($vol_reg):/usr/local/cargo/registry"
-    ]
-    print "\n[pre-commit] cargo fmt --check"
-    ^docker run ...$docker_args $img cargo fmt --check
-    print "\n[pre-commit] cargo clippy --all-targets -- -D warnings"
-    ^docker run ...$docker_args $img cargo clippy --all-targets -- -D warnings
-    print "\n[pre-commit] cargo build --all-targets"
-    ^docker run ...$docker_args $img cargo build --all-targets
-    print "\n[pre-commit] cargo test"
-    ^docker run ...$docker_args $img cargo test
-    print "\n[pre-commit] all checks passed"
+# Run the full test suite in pre-commit: the unit tests are library-target
+# tests in src/**, which common's default `--bins` would skip.
+test_args := ""
 
 # -- Checks (override) --------------------------------------------------------
 
 # Umbrella check: fmt + clippy + build + tests + builder-stage docker compile. Overrides common's `check`, which omits tests; reuses the inherited `test` recipe so tests run as part of `just check`.
-[group: 'checks']
+[group: 'check']
 check: check-fmt check-clippy check-build test check-docker
 
 # -- Development --------------------------------------------------------------
 
-# Run the CLI with arguments (e.g. just run status, just run trigger youtrack).
+# Run the CLI with arguments (e.g. just run status, just run trigger youtrack). Overrides common's `run`, which builds --release; the debug build keeps CLI iteration fast.
 [group: 'dev']
 run *args:
     cargo run -- {{ args }}
@@ -81,24 +74,11 @@ run *args:
 watch:
     cargo watch --clear
 
-# -- Build (override) ---------------------------------------------------------
+# -- Build --------------------------------------------------------------------
 
-# Build the static musl binary through the Docker builder image (delegates to build-docker-export). Writes ./output/claude-run; no host musl target or linker required.
+# Build the static musl binary through the Docker builder image (delegates to the inherited build-docker-export). Writes ./dist/claude-run; no host musl target or linker required.
 [group: 'build']
 build-static: build-docker-export
-
-# Build the full OCI build. Overrides common's build-docker: no build-args and writes a claude-run:local tag from the Dockerfile's final (binary) stage.
-[group: 'build']
-build-docker:
-    docker buildx build -t claude-run:local -f oci-build/Dockerfile .
-
-# Extract the static binary out of the OCI build via the `binary` scratch stage. Writes ./output/claude-run. Overrides common's build-docker-export, which writes ./dist.
-[group: 'build']
-build-docker-export:
-    #!/usr/bin/env nu
-    mkdir output
-    ^docker buildx build --target binary --output type=local,dest=./output -f oci-build/Dockerfile .
-    print $"Wrote ./output/claude-run"
 
 # -- Migrations ---------------------------------------------------------------
 
