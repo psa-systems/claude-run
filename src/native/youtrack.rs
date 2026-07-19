@@ -6,9 +6,17 @@
 //! ([`crate::provider`]). The pipeline is:
 //!
 //! ```text
-//! gather  -> IssueTracker::list_queued + resolve_vcs per project (drop no-VCS)
-//! filter  -> live AI Agent re-read; skip unless still Queued
-//! pre     -> AI Agent=Working, State=In Progress, git clone --depth 50
+//! gather   -> IssueTracker::list_queued + resolve_vcs per project (drop no-VCS)
+//! eligible -> CLAUDE-182 gather-time pass, BEFORE the KeyGate: live AI Agent
+//!             re-read (drop unless still Queued) + CLAUDE-161 dependency gate
+//!             (drop unmet-blocker issues, keeping their Queued/comment/backoff
+//!             side effects). Ineligible issues are dropped here so they never
+//!             hold a project's single per-poll concurrency slot and starve a
+//!             workable same-project sibling.
+//! filter   -> per-job authoritative re-check AFTER winning the KeyGate: the same
+//!             AI Agent re-read + dependency gate guard the cross-run TOCTOU right
+//!             before the first mutation (skip unless still Queued / unblocked)
+//! pre      -> AI Agent=Working, State=In Progress, git clone --depth 50
 //! prompt  -> build the CLAUDE-24 local-only instruction text in Rust
 //! claude  -> ClaudeInvoker with the action's claude block + timeout
 //! post    -> finalize state machine, runs on EVERY path (success, claude
@@ -132,17 +140,18 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     // `run_begin`, and so a zero-job poll still associates its events with this
     // timestamp on the action page.
     let poll_ts = state::now_iso();
-    let (jobs, input_events) = {
-        let (gather_backend, _gather_guard) = if creds.is_empty() {
-            (CliBackend::new(runner.clone()), None)
-        } else {
-            let dir = cred_base.join(format!("gather-{}", std::process::id()));
-            let guard = JobCredentials::materialize(&dir, &creds, None)?;
-            let backend = credentialed_backend(&runner, &guard);
-            (backend, Some(guard))
-        };
-        gather(&gather_backend, &src.query)?
+    // CLAUDE-182: keep the gather backend alive past `gather` so the gather-time
+    // eligibility pass below reuses its yt-only credentials for the AI Agent
+    // re-read and dependency-gate reads.
+    let (gather_backend, gather_guard) = if creds.is_empty() {
+        (CliBackend::new(runner.clone()), None)
+    } else {
+        let dir = cred_base.join(format!("gather-{}", std::process::id()));
+        let guard = JobCredentials::materialize(&dir, &creds, None)?;
+        let backend = credentialed_backend(&runner, &guard);
+        (backend, Some(guard))
     };
+    let (jobs, input_events) = gather(&gather_backend, &src.query)?;
     // CLAUDE-147: persist input-phase diagnostics before `run_begin` so they
     // survive even if no run row is ever created. Non-fatal: a bookkeeping
     // failure must not abort the poll.
@@ -180,6 +189,29 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
             action = %action.name,
             gathered,
             "no fresh queued work (all in flight in another run); skipping empty run"
+        );
+        return Ok(());
+    }
+
+    // CLAUDE-182: gather-time eligibility pass. Evaluate the two read-only checks
+    // (live `AI Agent` re-read, CLAUDE-161 dependency gate) BEFORE building
+    // executor items and acquiring the KeyGate, and drop every ineligible issue.
+    // A blocked or no-longer-Queued issue is a pure read (it never clones,
+    // branches, or opens a PR), so it must not hold its project's single per-poll
+    // concurrency slot: doing so starved a workable same-project sibling, because
+    // the blocked issue won the shared project key each poll and consumed the
+    // slot without doing work. Blocked issues keep every CLAUDE-161 side effect
+    // (stay Queued, idempotent blocker comment, `blocked_until` backoff, persisted
+    // signature); only genuinely-workable issues compete for the project key here.
+    let eligible_from = jobs.len();
+    let jobs = filter_eligible(pool, &gather_backend, src, &action.name, jobs).await;
+    // The gather backend's credentials are done; scrub them now.
+    drop(gather_guard);
+    if jobs.is_empty() {
+        info!(
+            action = %action.name,
+            gathered = eligible_from,
+            "no workable queued issues after the eligibility pass (all blocked or filtered); skipping empty run"
         );
         return Ok(());
     }
@@ -497,6 +529,91 @@ fn project_key(idreadable: &str) -> String {
         .to_string()
 }
 
+/// CLAUDE-182: a candidate's gather-time verdict. Only [`Eligibility::Eligible`]
+/// issues are built into executor items and compete for the KeyGate; a
+/// [`Eligibility::Filtered`] (no longer Queued) or [`Eligibility::Blocked`]
+/// (unmet dependency) issue is dropped before the gate so it never holds its
+/// project's single per-poll concurrency slot.
+enum Eligibility {
+    Eligible,
+    Filtered,
+    Blocked,
+}
+
+/// CLAUDE-182: run the two read-only eligibility checks for one gathered
+/// candidate BEFORE any executor item is built or the KeyGate acquired: the live
+/// `AI Agent` re-read (drop unless still Queued) then the CLAUDE-161 dependency
+/// gate (drop an issue with unmet blockers). A blocked issue keeps every
+/// CLAUDE-161 side effect; this only moves WHEN the gate runs (at gather, not
+/// after winning the concurrency key), so a blocked issue no longer consumes the
+/// project's per-poll work slot. `process_job` still re-runs both checks after it
+/// wins the key: that post-gate re-read is the authoritative cross-run TOCTOU
+/// guard right before the first mutation (`src/concurrency.rs` module docs).
+async fn evaluate_eligibility(
+    pool: &SqlitePool,
+    backend: &dyn Backend,
+    src: &YoutrackSource,
+    action: &str,
+    job: &YoutrackJob,
+) -> Eligibility {
+    let key = &job.key;
+    // ---- filter: live AI Agent re-read (drop unless still Queued) ----
+    match backend.get_field(key, &src.custom_field) {
+        Ok(v) if v.trim() == src.states.queued => {}
+        Ok(v) => {
+            info!(action = %action, key = %key, ai_agent = %v.trim(), "job filtered at gather (no longer Queued); not competing for the concurrency slot");
+            return Eligibility::Filtered;
+        }
+        Err(e) => {
+            // Conservative: a lookup failure drops the candidate this poll so a
+            // transient error cannot let an ineligible issue be worked; a
+            // still-Queued job returns on the next gather.
+            warn!(action = %action, key = %key, error = %e, "AI Agent lookup failed at gather; dropping this poll");
+            return Eligibility::Filtered;
+        }
+    }
+    // ---- dependency gate (CLAUDE-161) ----
+    match dependency_gate(pool, backend, src, action, key).await {
+        Ok(GateDecision::Proceed) => Eligibility::Eligible,
+        Ok(GateDecision::Blocked { blockers }) => {
+            info!(
+                action = %action,
+                key = %key,
+                blockers = %blockers.join("; "),
+                "job blocked by unmet dependencies at gather; left Queued, no attempt consumed, not competing for the concurrency slot"
+            );
+            Eligibility::Blocked
+        }
+        // A dependency-read failure must not strand an otherwise-workable issue:
+        // fall back to pickup (the agent self-parks if it truly cannot proceed).
+        Err(e) => {
+            warn!(action = %action, key = %key, error = %e, "dependency gate read failed at gather; proceeding with pickup");
+            Eligibility::Eligible
+        }
+    }
+}
+
+/// CLAUDE-182: keep only the workable candidates, dropping every issue the
+/// gather-time eligibility pass rules out (no-longer-Queued or dependency-
+/// blocked). Runs per candidate, before the executor is built, so ineligible
+/// issues never compete for a project's concurrency key.
+async fn filter_eligible(
+    pool: &SqlitePool,
+    backend: &dyn Backend,
+    src: &YoutrackSource,
+    action: &str,
+    jobs: Vec<YoutrackJob>,
+) -> Vec<YoutrackJob> {
+    let mut eligible = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        if let Eligibility::Eligible = evaluate_eligibility(pool, backend, src, action, &job).await
+        {
+            eligible.push(job);
+        }
+    }
+    eligible
+}
+
 /// Process a single job through filter / pre / prompt / claude / finalize,
 /// returning the outcome record. Mirrors [`crate::job::process_job`]'s
 /// contracts: finalize runs on every path that reached the workdir, transient
@@ -535,6 +652,12 @@ async fn process_job(
     let workdir_path = workdir::job_workdir(&wb_base, &action.name, key);
 
     // ---- filter: live AI Agent re-read ----
+    // CLAUDE-182: the gather-time eligibility pass ([`filter_eligible`]) already
+    // dropped issues that were not Queued, so this poll's candidate never should
+    // have reached the KeyGate ineligible. This re-read is the authoritative
+    // post-gate re-check for the cross-run TOCTOU: an overlapping run may have
+    // moved this issue to Working since gather, and it must be caught before the
+    // first mutation (`src/concurrency.rs` module docs).
     match backend.get_field(key, &src.custom_field) {
         Ok(v) if v.trim() == src.states.queued => {}
         Ok(v) => {
@@ -551,10 +674,15 @@ async fn process_job(
     }
 
     // ---- dependency gate (CLAUDE-161) ----
-    // AI Agent is confirmed Queued and nothing has been mutated. Skip a queued
-    // issue whose blockers are still open: leave it Queued (auto-resumes when the
-    // dependency clears), consume no attempt, and never clone or invoke claude.
-    // A disabled gate (or a met/absent dependency set) returns `Proceed`.
+    // CLAUDE-182: the gather-time pass already dropped issues with unmet blockers
+    // before the KeyGate, so a blocked issue no longer holds the project's per-poll
+    // slot. This post-gate re-check catches the rare case where a dependency became
+    // unmet between gather and winning the key; the gate's side effects are
+    // idempotent, so re-running it here is safe. AI Agent is confirmed Queued and
+    // nothing has been mutated. Skip a queued issue whose blockers are still open:
+    // leave it Queued (auto-resumes when the dependency clears), consume no
+    // attempt, and never clone or invoke claude. A disabled gate (or a met/absent
+    // dependency set) returns `Proceed`.
     match dependency_gate(pool, backend, src, &action.name, key).await {
         Ok(GateDecision::Proceed) => {}
         Ok(GateDecision::Blocked { blockers }) => {
@@ -801,14 +929,20 @@ fn blocked_comment(blockers: &[Blocker]) -> String {
     s
 }
 
-/// The pre-clone dependency gate (CLAUDE-161). Returns [`GateDecision::Proceed`]
-/// when the issue has no unmet dependency (clear, none, or its backoff just
-/// re-evaluated clean), else [`GateDecision::Blocked`]. Side effects on the
-/// blocked path: post the blocker comment (idempotently), and persist the
-/// re-check backoff (`blocked_until`) plus the blocker-set signature. While a
-/// backoff window is open the issue is not re-evaluated at all (no `yt` read, no
-/// comment); the persisted signature reconstructs the blocker list for the
-/// outcome.
+/// The dependency gate (CLAUDE-161). Returns [`GateDecision::Proceed`] when the
+/// issue has no unmet dependency (clear, none, or its backoff just re-evaluated
+/// clean), else [`GateDecision::Blocked`]. Side effects on the blocked path: post
+/// the blocker comment (idempotently), and persist the re-check backoff
+/// (`blocked_until`) plus the blocker-set signature. While a backoff window is
+/// open the issue is not re-evaluated at all (no `yt` read, no comment); the
+/// persisted signature reconstructs the blocker list for the outcome.
+///
+/// CLAUDE-182: invoked in two places, and the backoff makes the pair cheap. The
+/// gather-time pass ([`filter_eligible`]) runs it BEFORE the KeyGate to drop a
+/// blocked issue so it never holds the project's per-poll slot; [`process_job`]
+/// re-runs it after winning the key as the authoritative pre-clone re-check. A
+/// workable issue persists no state, so the second read is a plain re-read; a
+/// blocked issue is dropped at gather and never reaches `process_job`.
 async fn dependency_gate(
     pool: &SqlitePool,
     backend: &dyn Backend,
@@ -3300,6 +3434,149 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "met dependency must clear the backoff row"
+        );
+    }
+
+    // ---- CLAUDE-182 gather-time eligibility pass ----
+
+    /// CLAUDE-182: the gather-time eligibility pass drops a dependency-blocked
+    /// issue so a workable same-project sibling is the sole candidate for the
+    /// project's concurrency key. Reproduces the TOOL-33 / TOOL-34 starvation:
+    /// TOOL-34 depends on the still-open TOOL-33, TOOL-33 is workable. Gather
+    /// order lists the blocked issue first (the trigger that let it win the shared
+    /// TOOL key and consume the poll slot before this fix). A single pass keeps
+    /// only TOOL-33 and drops TOOL-34, while TOOL-34 keeps its blocked side
+    /// effects (idempotent blocker comment + persisted backoff); TOOL-33 persists
+    /// no gate state.
+    #[tokio::test]
+    async fn eligibility_pass_drops_blocked_sibling_keeps_workable() {
+        let pool = mem_pool().await;
+        let mk_job = |key: &str| YoutrackJob {
+            key: key.into(),
+            summary: "s".into(),
+            repo_host: "https://dev.a8n.run".into(),
+            repo_path: "contoso/tools".into(),
+            clone_url: "https://dev.a8n.run/contoso/tools.git".into(),
+        };
+        // TOOL-34 depends on the still-open TOOL-33 -> blocked.
+        let blocked_inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"TOOL-33","summary":"x"}]}]}"#;
+        let blocked_body = blocked_comment(&[Blocker {
+            id: "TOOL-33".into(),
+            verb: "depends on".into(),
+        }]);
+        // TOOL-33 has no unmet blockers -> workable.
+        let workable_inspect = r#"{"links":[]}"#;
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "TOOL-34", "AI Agent"],
+                    "Queued",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "inspect", "TOOL-34", "--json"],
+                    blocked_inspect,
+                )
+                .ok("yt", &["issue", "comment", "TOOL-34", &blocked_body], "")
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "TOOL-33", "AI Agent"],
+                    "Queued",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "inspect", "TOOL-33", "--json"],
+                    workable_inspect,
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let s = src();
+
+        let jobs = vec![mk_job("TOOL-34"), mk_job("TOOL-33")];
+        let eligible = filter_eligible(&pool, &backend, &s, "act", jobs).await;
+
+        // Only the workable issue survives to compete for the concurrency key.
+        let keys: Vec<&str> = eligible.iter().map(|j| j.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["TOOL-33"],
+            "blocked TOOL-34 dropped before the executor; TOOL-33 is the sole candidate"
+        );
+
+        // The blocked issue kept its CLAUDE-161 side effects: comment + backoff.
+        {
+            let calls = runner.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c == &format!("yt issue comment TOOL-34 {blocked_body}")),
+                "blocked issue still gets its blocker comment: {calls:?}"
+            );
+        }
+        let st = state::dependency_gate_get(&pool, "act", "TOOL-34")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(st.signature, "TOOL-33 (depends on)");
+        assert!(st.blocked_until_ms > state::now_epoch_ms());
+        // The workable issue persisted no gate state (nothing to back off).
+        assert!(
+            state::dependency_gate_get(&pool, "act", "TOOL-33")
+                .await
+                .unwrap()
+                .is_none(),
+            "workable issue must not persist gate state"
+        );
+    }
+
+    /// CLAUDE-182: an issue no longer `Queued` at gather (an overlapping run moved
+    /// it to Working) is dropped by the eligibility pass and likewise does not
+    /// occupy the project's per-poll slot; a still-Queued sibling survives.
+    #[tokio::test]
+    async fn eligibility_pass_drops_non_queued_issue() {
+        let pool = mem_pool().await;
+        let mk_job = |key: &str| YoutrackJob {
+            key: key.into(),
+            summary: "s".into(),
+            repo_host: "https://dev.a8n.run".into(),
+            repo_path: "contoso/tools".into(),
+            clone_url: "https://dev.a8n.run/contoso/tools.git".into(),
+        };
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "TOOL-34", "AI Agent"],
+                    "Working",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "TOOL-33", "AI Agent"],
+                    "Queued",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "inspect", "TOOL-33", "--json"],
+                    r#"{"links":[]}"#,
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let s = src();
+
+        let jobs = vec![mk_job("TOOL-34"), mk_job("TOOL-33")];
+        let eligible = filter_eligible(&pool, &backend, &s, "act", jobs).await;
+        let keys: Vec<&str> = eligible.iter().map(|j| j.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["TOOL-33"],
+            "non-Queued TOOL-34 dropped; TOOL-33 survives"
+        );
+        // A dropped-at-filter issue is never even read for links.
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c == "yt issue inspect TOOL-34 --json"),
+            "filtered issue must not reach the dependency read: {calls:?}"
         );
     }
 }
