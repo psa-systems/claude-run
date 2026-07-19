@@ -1,7 +1,9 @@
 ---
 
-# Validate code on every push and pull request by running 'just check'
-# Mirrors the local `just check` + `just test` recipes (which use ./dev/cargo).
+# Validate code on every push and pull request.
+# Mirrors the local `just check` recipe. This stays a standalone workflow rather
+# than calling common's reusable check.yml, which hardcodes `cargo test --bins`
+# and would skip this crate's library-target unit tests; see PC-6.
 name: Check
 
 on:
