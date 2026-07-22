@@ -692,6 +692,202 @@ pub fn fetch_workflow_yaml(
     None
 }
 
+/// CLAUDE-190: parse the failing run's branch from a redacted job log's checkout
+/// section. The `actions/checkout` step dumps `GITHUB_REF=refs/heads/<branch>`
+/// (and `GITHUB_REF_NAME=<branch>` on a branch build); the run-detail API
+/// returns `head_branch: null` on the deployed Forgejo, so the log is the
+/// reliable source. Returns the first branch found, or `None` when the log
+/// carries no readable ref line (truncated / diagnostic-free / logless). A tag
+/// build (`refs/tags/...`) yields no branch here.
+pub fn parse_branch_from_log(log: &str) -> Option<String> {
+    // Prefer the fully-qualified branch ref.
+    for line in log.lines() {
+        if let Some(rest) = line.trim().strip_prefix("GITHUB_REF=") {
+            if let Some(b) = rest.trim().strip_prefix("refs/heads/") {
+                let b = b.trim();
+                if !b.is_empty() {
+                    return Some(b.to_string());
+                }
+            }
+        }
+    }
+    // Fall back to the short ref name (a branch build sets it to the branch).
+    for line in log.lines() {
+        if let Some(rest) = line.trim().strip_prefix("GITHUB_REF_NAME=") {
+            let b = rest.trim();
+            if !b.is_empty() {
+                return Some(b.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// CLAUDE-190: resolve the branch, preferring a non-empty run-detail `head_branch`
+/// and falling back to the log checkout section. On the deployed Forgejo run
+/// detail returns `head_branch: null`, so in practice this is the log parse; the
+/// run-detail arm keeps the resolver correct where the field IS populated.
+pub fn resolve_branch(run_detail_branch: Option<&str>, log: &str) -> Option<String> {
+    match run_detail_branch {
+        Some(b) if !b.trim().is_empty() => Some(b.trim().to_string()),
+        _ => parse_branch_from_log(log),
+    }
+}
+
+/// CLAUDE-190: where to list a run's jobs, to resolve the failing job's name and
+/// index for the root-cause dedupe key. Reads the API jobs endpoint
+/// (`GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_global_id}/jobs`), keyed
+/// by the run's GLOBAL id (like the run-logs endpoint). A public repo needs no
+/// token; a private repo passes the source's `log_token_ref`.
+#[derive(Debug, Clone)]
+pub struct RunJobsApiTarget {
+    /// Forge origin, e.g. `https://dev.a8n.run`.
+    pub base_url: String,
+    /// `owner/repo`.
+    pub repo: String,
+    /// The run's global id from the payload (`run.id`).
+    pub run_global_id: i64,
+    /// PAT for a private repo; `None` for a public repo.
+    pub token: Option<String>,
+}
+
+impl RunJobsApiTarget {
+    /// Build a target from the failure event, deriving the forge origin from
+    /// `html_url`. `None` when the origin cannot be derived.
+    pub fn for_run(
+        html_url: &str,
+        repo: &str,
+        run_global_id: i64,
+        token: Option<String>,
+    ) -> Option<Self> {
+        let base_url = base_from_html_url(html_url, repo)?;
+        Some(Self {
+            base_url,
+            repo: repo.to_string(),
+            run_global_id,
+            token,
+        })
+    }
+
+    /// The jobs-list URL for this target.
+    pub fn jobs_url(&self) -> String {
+        format!(
+            "{}/api/v1/repos/{}/actions/runs/{}/jobs",
+            self.base_url.trim_end_matches('/'),
+            self.repo,
+            self.run_global_id,
+        )
+    }
+}
+
+/// One job pulled from the jobs-list JSON: its display `name` and outcome
+/// `status` (the `conclusion` when present, else the `status`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobInfo {
+    pub name: String,
+    pub status: String,
+}
+
+/// CLAUDE-190: outcome of a jobs-list fetch. Auth-class / not-found responses are
+/// terminal after one request; only transport errors and 5xx retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobsOutcome {
+    Resolved(Vec<JobInfo>),
+    AuthDenied(u16),
+    NotFound,
+    Failed(String),
+}
+
+/// Parse the jobs-list body into `JobInfo`s, tolerant of Forgejo's field naming:
+/// the array is `workflow_jobs` (webhook shape) or `jobs`, or a bare array. The
+/// outcome is `conclusion` when present, else `status`.
+fn parse_jobs_list(bytes: &[u8]) -> std::result::Result<Vec<JobInfo>, String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let arr = value
+        .get("workflow_jobs")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.get("jobs").and_then(|v| v.as_array()))
+        .or_else(|| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for job in arr {
+        let name = job
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let status = job
+            .get("conclusion")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| job.get("status").and_then(serde_json::Value::as_str))
+            .unwrap_or("")
+            .to_string();
+        out.push(JobInfo { name, status });
+    }
+    Ok(out)
+}
+
+/// CLAUDE-190: the failing job's `(name, index)` for the root-cause key: the
+/// first job whose status is a failure, else the first job (index 0). `None`
+/// for an empty list. The index is the job's position in the run's jobs list.
+pub fn resolve_failing_job(jobs: &[JobInfo]) -> Option<(String, u64)> {
+    if let Some((i, j)) = jobs
+        .iter()
+        .enumerate()
+        .find(|(_, j)| is_failure_status(&j.status))
+    {
+        return Some((j.name.clone(), i as u64));
+    }
+    jobs.first().map(|j| (j.name.clone(), 0))
+}
+
+/// True for a job status/conclusion that denotes a failure.
+fn is_failure_status(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "failure" | "failed" | "error"
+    )
+}
+
+/// CLAUDE-190: fetch the run's jobs list. One request decides 200/401/403/404;
+/// only transport errors and other statuses retry within the configured budget.
+/// Best-effort: the caller degrades to a job-agnostic key on any non-`Resolved`.
+pub fn fetch_run_jobs<S: FnMut(Duration)>(
+    transport: &dyn LogTransport,
+    cfg: &LogFetchConfig,
+    target: &RunJobsApiTarget,
+    mut sleep: S,
+) -> Result<JobsOutcome> {
+    let url = target.jobs_url();
+    let mut backoff = cfg.initial_backoff;
+    let mut last_reason = "no attempt made".to_string();
+
+    for attempt_no in 0..=cfg.max_retries {
+        match transport.get_bytes(&url, target.token.as_deref()) {
+            Ok((200, bytes)) => {
+                return match parse_jobs_list(&bytes) {
+                    Ok(jobs) => Ok(JobsOutcome::Resolved(jobs)),
+                    Err(e) => Ok(JobsOutcome::Failed(format!("parsing jobs list: {e}"))),
+                };
+            }
+            Ok((status @ (401 | 403), _)) => return Ok(JobsOutcome::AuthDenied(status)),
+            Ok((404, _)) => return Ok(JobsOutcome::NotFound),
+            Ok((status, body)) => {
+                last_reason = format!("status {status}, {} body bytes", body.len());
+            }
+            Err(e) => last_reason = e,
+        }
+        if attempt_no < cfg.max_retries {
+            sleep(backoff);
+            backoff = (backoff * 2).min(cfg.max_backoff);
+        }
+    }
+
+    Ok(JobsOutcome::Failed(last_reason))
+}
+
 /// Redact secrets from `input`: first mask each known secret value verbatim,
 /// then redact token *shapes* (known prefixes, and high-entropy values that
 /// follow an auth keyword). Pure; the unit of the AC's redaction test.
@@ -1339,5 +1535,123 @@ mod tests {
         // Below MIN_KNOWN_SECRET_LEN: not masked (avoids nuking common substrings).
         let out = redact("value is abc", &["abc".to_string()]);
         assert_eq!(out, "value is abc");
+    }
+
+    // ---- CLAUDE-190: branch parse + resolve -------------------------------
+
+    #[test]
+    fn parse_branch_reads_the_checkout_ref() {
+        let log = "Run actions/checkout\nGITHUB_REF=refs/heads/feat/CLAUDE-190\nGITHUB_SHA=abc\n";
+        assert_eq!(
+            parse_branch_from_log(log),
+            Some("feat/CLAUDE-190".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_branch_falls_back_to_ref_name() {
+        let log = "some line\nGITHUB_REF_NAME=main\nmore\n";
+        assert_eq!(parse_branch_from_log(log), Some("main".to_string()));
+    }
+
+    #[test]
+    fn parse_branch_none_when_absent_or_tag() {
+        assert_eq!(parse_branch_from_log("no ref here\ndone\n"), None);
+        // A tag ref is not a branch (refs/heads/ only).
+        assert_eq!(parse_branch_from_log("GITHUB_REF=refs/tags/v1.2.3\n"), None);
+    }
+
+    #[test]
+    fn resolve_branch_prefers_run_detail_then_log() {
+        // Run detail populated -> used verbatim.
+        assert_eq!(
+            resolve_branch(Some("release"), "GITHUB_REF=refs/heads/main\n"),
+            Some("release".to_string())
+        );
+        // The deployed Forgejo case: head_branch null/None -> log-parse fallback.
+        assert_eq!(
+            resolve_branch(None, "GITHUB_REF=refs/heads/main\n"),
+            Some("main".to_string())
+        );
+        // Empty run-detail branch also falls back to the log.
+        assert_eq!(
+            resolve_branch(Some("  "), "GITHUB_REF=refs/heads/main\n"),
+            Some("main".to_string())
+        );
+    }
+
+    // ---- CLAUDE-190: jobs-list resolution ---------------------------------
+
+    fn jobs_body(jobs: &[(&str, &str)]) -> Vec<u8> {
+        let items: Vec<String> = jobs
+            .iter()
+            .map(|(name, status)| format!(r#"{{"name":"{name}","status":"{status}"}}"#))
+            .collect();
+        format!(r#"{{"workflow_jobs":[{}]}}"#, items.join(",")).into_bytes()
+    }
+
+    #[test]
+    fn resolve_failing_job_picks_the_failing_one() {
+        let jobs = parse_jobs_list(&jobs_body(&[
+            ("build", "success"),
+            ("test", "failure"),
+            ("lint", "waiting"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            resolve_failing_job(&jobs),
+            Some(("test".to_string(), 1)),
+            "the failing job's name and its index"
+        );
+    }
+
+    #[test]
+    fn resolve_failing_job_reads_conclusion_over_status() {
+        // A finished job carries a `conclusion`; prefer it over `status`.
+        let body =
+            br#"{"workflow_jobs":[{"name":"check","status":"completed","conclusion":"failure"}]}"#;
+        let jobs = parse_jobs_list(body).unwrap();
+        assert_eq!(resolve_failing_job(&jobs), Some(("check".to_string(), 0)));
+    }
+
+    #[test]
+    fn resolve_failing_job_defaults_to_first_when_none_failed() {
+        let jobs = parse_jobs_list(&jobs_body(&[("only", "success")])).unwrap();
+        assert_eq!(resolve_failing_job(&jobs), Some(("only".to_string(), 0)));
+        // Empty list -> no job.
+        assert_eq!(resolve_failing_job(&[]), None);
+    }
+
+    fn jobs_target() -> RunJobsApiTarget {
+        RunJobsApiTarget {
+            base_url: "https://dev.a8n.run".to_string(),
+            repo: "contoso/claude-run".to_string(),
+            run_global_id: 4242,
+            token: Some("test-pat".to_string()),
+        }
+    }
+
+    #[test]
+    fn fetch_run_jobs_resolves_the_failing_job() {
+        let body = jobs_body(&[("build", "success"), ("test", "failure")]);
+        let transport = SeqBytesTransport::new(vec![Ok((200, body))]);
+        let out = fetch_run_jobs(&transport, &cfg(), &jobs_target(), |_| {}).unwrap();
+        let JobsOutcome::Resolved(jobs) = out else {
+            panic!("expected Resolved, got {out:?}");
+        };
+        assert_eq!(resolve_failing_job(&jobs), Some(("test".to_string(), 1)));
+        assert!(transport.urls()[0].contains("/actions/runs/4242/jobs"));
+    }
+
+    #[test]
+    fn fetch_run_jobs_auth_and_not_found_are_terminal() {
+        for status in [401_u16, 403] {
+            let transport = SeqBytesTransport::new(vec![Ok((status, Vec::new()))]);
+            let out = fetch_run_jobs(&transport, &cfg(), &jobs_target(), |_| {}).unwrap();
+            assert_eq!(out, JobsOutcome::AuthDenied(status));
+        }
+        let transport = SeqBytesTransport::new(vec![Ok((404, Vec::new()))]);
+        let out = fetch_run_jobs(&transport, &cfg(), &jobs_target(), |_| {}).unwrap();
+        assert_eq!(out, JobsOutcome::NotFound);
     }
 }
