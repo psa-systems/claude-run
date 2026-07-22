@@ -15,7 +15,7 @@ attempt caps, timeouts, and a cost-based usage check. The action YAML supplies e
 
 ```yaml
 name: <kebab-id>            # required
-kind: scripted              # optional: scripted (default) | youtrack | forgejo-ci-fix | ci-failure-analysis
+kind: scripted              # optional: scripted (default) | youtrack | forgejo-ci-fix | ci-failure-analysis | ci-failure-reconcile
 enabled: true               # optional, default true; false skips the action in the scheduler
 workdir_base: /path/to/dir  # optional, overrides $CLAUDE_RUN_WORKDIR_BASE for this action
 link_template: https://youtrack/issue/{key}  # optional; {key} -> job key, builds a per-job link (render_link)
@@ -114,6 +114,9 @@ The dispatch discriminator (CLAUDE-30). Selects how the runner executes the acti
 - `ci-failure-analysis`: a built-in Rust handler that enriches each open "CI failure" / "Auto-fix" issue with a deep,
   log-grounded root-cause comment (CLAUDE-189). Config only, supplying a typed
   [`native`](#native-record-required-for-native-kinds) block.
+- `ci-failure-reconcile`: a built-in Rust handler that auto-closes each open "CI failure" / "Auto-fix" issue once the
+  failing `(repo, branch, workflow, job)` it tracks is green again on its latest run (CLAUDE-191). Config only, supplying
+  a typed [`native`](#native-record-required-for-native-kinds) block.
 
 `scripted` and native kinds share all the run accounting (locking, daily caps, per-job attempt caps, budget, job-outcome
 records); only job production and the per-job pipeline differ.
@@ -375,6 +378,63 @@ native:
 **Deployment prerequisite:** the runner's Forgejo must expose the v16 REST run-logs endpoint
 (`GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_id}/logs`, Forgejo PR 12666) and the runs-list endpoint. On a
 pre-v16 instance both 404 and the handler posts an "unavailable" note rather than crashing.
+
+#### `kind: ci-failure-reconcile`
+
+A single flat config record (no sub-records). The mint path only ever observes CI failures, so a stale open "CI failure"
+/ "Auto-fix" issue is closed by hand today; this handler closes it automatically once its failing job is green again. On
+each run it scans the tracker for open issues whose summary starts with one of `summary_prefixes`, inspects each and reads
+the hidden `Branch:` / `Job:` markers the CLAUDE-190 rekey embeds (plus the `## Failure` block's `- Repo:` / `- Workflow:`
+/ `- Run:`); a pre-rekey issue whose branch/job are not parseable is skipped and left for manual close. Then for each
+allow-listed repo it pages the Forgejo runs list, reduces it to the LATEST run per `(branch, workflow_id)` (resolving a
+null `head_branch` from the run's log checkout section, bounded by `max_branch_resolves`), and reads each latest run's
+per-job status from the jobs endpoint. Every open issue whose `(repo, branch, workflow, job)` exactly matches a now-green
+job (job status `success`) is closed: State set to `resolved_state` and a run-linked comment posted. The dedup key is the
+issue id.
+
+**Only the LATEST run decides.** A newer failure after an older green run leaves the job red and the issue open. Matching
+is exact on all four of `(repo, branch, workflow, job)`, so a green sibling branch or job never closes a still-broken
+issue. The close is idempotent: an already-closed issue (its resolved State drops it from `#Unresolved`, and a hidden
+auto-closed comment marker) is never re-closed or re-commented. **Selection is by summary prefix + markers ONLY; it NEVER
+selects by `AI Agent`** (reconcile is independent of the code-fix runner), so `query` must not filter on `AI Agent`. The
+reconciler performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. All runs-list / jobs /
+log reads go through `forge_log` (Rust), never a raw REST call from a nu snippet (tooling-gap rule, FJ-22).
+
+```yaml
+kind: ci-failure-reconcile
+native:
+  enabled: true                       # master toggle (default true)
+  query: "#Unresolved"                # candidate query; MUST NOT filter by AI Agent
+  summary_prefixes: # summary prefixes an issue must start with
+    - "CI failure:"
+    - "Auto-fix:"
+  repos: # allow-list: exact owner/repo, owner/*, or *
+    - contoso/claude-run
+  log_token_ref: forgejo-log-pat      # encrypted secret: Forgejo PAT (repo read scope). Required.
+  resolved_state: Done                # State set on a closed issue
+  close_comment: "Auto-closed: run #{run_index} on `{branch}` succeeded ({run_url}); the failing `{job}` is green, root cause resolved."
+  max_branch_resolves: 40             # cap on per-repo branch-from-log resolutions
+```
+
+| Key                   | Default                        | Meaning                                                                                 |
+|-----------------------|--------------------------------|-----------------------------------------------------------------------------------------|
+| `enabled`             | `true`                         | Master toggle. While false the handler no-ops.                                          |
+| `query`               | `#Unresolved`                  | YouTrack candidate query. MUST NOT filter by `AI Agent`.                                 |
+| `summary_prefixes`    | `["CI failure:", "Auto-fix:"]` | Summary prefixes an issue must start with to be reconciled.                              |
+| `repos`               | `[]`                           | Allow-list of `owner/repo` full names to scan: exact `owner/repo`, `owner/*`, or `*`. Empty scans nothing. |
+| `log_token_ref`       | none                           | Encrypted-secret name (CLAUDE-26) of a Forgejo PAT with repository read scope, used to page the runs list, read the jobs endpoint, and resolve a null-branch run's branch from its log. Required; without it the handler no-ops. |
+| `resolved_state`      | `Done`                         | State set on a closed issue (the CLAUDE project's only resolved State).                  |
+| `close_comment`       | (the auto-closed sentence)     | Run-linked close-comment template; `{run_index}` / `{branch}` / `{run_url}` / `{job}` are substituted, and a hidden auto-closed marker is appended. |
+| `max_branch_resolves` | `40`                           | Cap on per-repo branch-from-log resolutions when the runs list returns `head_branch` null. Reaching it is logged, never silent. |
+
+`repos` and `resolved_state` are the distinctive keys that disambiguate this variant from the other native configs under
+the untagged `native:` block, so a shipped action must set at least one of them (the shipped `ci-failure-reconcile.yml`
+sets both). The generic blocks (`schedule`, `output`, `limits`) stay at the top level of the action.
+
+**Deployment prerequisite:** the runner's Forgejo must expose the runs-list endpoint
+(`GET /api/v1/repos/{owner}/{repo}/actions/runs`) and the per-run jobs endpoint
+(`GET .../actions/runs/{run_id}/jobs`); a null-branch run additionally needs the v16 REST run-logs endpoint to resolve its
+branch. On an instance lacking them a repo scan is skipped with a warning rather than crashing.
 
 ### `workdir_base` (string, optional)
 
