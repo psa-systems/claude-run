@@ -61,6 +61,25 @@ pub struct MintRequest<'a> {
     pub commit_sha: &'a str,
     /// Workflow filename, e.g. `ci.yml` (part of the secondary dedupe key).
     pub workflow_id: &'a str,
+    /// CLAUDE-190: the failing run's branch, resolved by the consumer from the
+    /// log checkout section (`GITHUB_REF=refs/heads/<branch>`), else the run
+    /// detail. Empty when unresolvable (a logless failure). Part of the
+    /// root-cause dedupe key.
+    pub branch: &'a str,
+    /// CLAUDE-190: the failing job's name, resolved from the jobs endpoint.
+    /// Empty when unresolvable. Part of the root-cause dedupe key.
+    pub job_name: &'a str,
+    /// CLAUDE-190: the failing job's index within the run (the jobs endpoint
+    /// position). Defaults to [`crate::forge_log::DEFAULT_JOB_INDEX`] when
+    /// unresolvable. Surfaced as a hidden marker; not part of the key (the
+    /// job name is the stable identity across runs).
+    pub job_index: u64,
+    /// CLAUDE-190: a deterministic, pure-string signature of the first
+    /// diagnostic line in the redacted log (paths / numbers stripped), so the
+    /// same root cause across commits yields the same key. `None` when no
+    /// diagnostic line is derivable (truncated / diagnostic-free / logless
+    /// failure); the key then falls back to `(repo, branch, workflow, job)`.
+    pub failure_signature: Option<&'a str>,
     /// Run URL, surfaced in the issue body.
     pub html_url: &'a str,
     /// Login that triggered the run; matched against the loop-safety bot list.
@@ -69,9 +88,9 @@ pub struct MintRequest<'a> {
     pub triage: &'a Triage,
     /// Redacted job-log artifact to attach; `None` when no log was available.
     pub log_path: Option<&'a Path>,
-    /// CLAUDE-92 `repository.private`. When set, repeated failures of the same
-    /// workflow group onto one open issue (CLAUDE-100) because there is no log
-    /// to tell two failures apart; public repos keep per-run minting.
+    /// CLAUDE-92 `repository.private`, from the payload. CLAUDE-190: no longer
+    /// gates dedupe (the root-cause key collapses repeats for public and private
+    /// repos alike); retained as context on the request.
     pub private: bool,
     /// CLAUDE-149: whether the failing run has an open PR for its branch. When
     /// set, the auto-fix (queue-for-fix) route is suppressed so the PR author
@@ -374,21 +393,98 @@ fn marker(parts: &[&str]) -> String {
     format!("crdedupe{}", hex::encode(&digest[..8]))
 }
 
-/// Primary dedupe marker: `(repo, index_in_repo)`.
+/// Primary dedupe marker: `(repo, index_in_repo)`. Per-run: it collapses only a
+/// webhook redelivery of the identical run (idempotency), never across commits.
 fn primary_marker(req: &MintRequest) -> String {
     marker(&[req.repo, &req.index_in_repo.to_string()])
 }
 
-/// Secondary dedupe marker: `(repo, commit_sha, workflow_id)`.
+/// Secondary dedupe marker: `(repo, commit_sha, workflow_id)`. Commit-scoped, so
+/// retained only for back-compat with issues minted before the root-cause key
+/// (a resolved such issue must still not be reopened); the cross-run collapse is
+/// [`root_cause_marker`], not this.
 fn secondary_marker(req: &MintRequest) -> String {
     marker(&[req.repo, req.commit_sha, req.workflow_id])
 }
 
-/// CLAUDE-100 group marker: `(wf, repo, workflow_id)`, independent of the
-/// commit / run index so every failure of the same workflow in the same repo
-/// shares it. Used (private repos only) to group repeats onto one open issue.
-fn group_marker(req: &MintRequest) -> String {
-    marker(&["wf", req.repo, req.workflow_id])
+/// CLAUDE-190 root-cause dedupe marker: the cross-run collapsing key. Keyed on
+/// `(repo, branch, workflow_id, job_name, failure_signature)` so N commits that
+/// each fail the same job on the same branch with the same signature collapse
+/// onto ONE open issue, while a different signature (a different root cause)
+/// stays a separate issue. When no signature is derivable (a truncated /
+/// diagnostic-free / logless failure) the key falls back to
+/// `(repo, branch, workflow_id, job_name)`: this still collapses the
+/// "branch is broken" storm onto one issue, intentionally grouping two
+/// indistinguishable logless failures (the CLAUDE-189 analysis can later split a
+/// mis-grouped issue).
+fn root_cause_marker(req: &MintRequest) -> String {
+    match req.failure_signature {
+        Some(sig) => marker(&[req.repo, req.branch, req.workflow_id, req.job_name, sig]),
+        None => marker(&[req.repo, req.branch, req.workflow_id, req.job_name]),
+    }
+}
+
+/// CLAUDE-190: extract a deterministic failure signature from a redacted log,
+/// or `None` when the log carries no recognizable diagnostic line. Pure string
+/// work (no LLM, no I/O): the first diagnostic line, normalized so the same root
+/// cause across commits yields the same signature.
+pub fn failure_signature(log: &str) -> Option<String> {
+    log.lines()
+        .find(|l| is_diagnostic_line(l))
+        .map(normalize_signature)
+}
+
+/// True for a line that looks like a compiler / runtime / test diagnostic: the
+/// first such line in a log is the signature source. Ordered by how the tools
+/// print them (a panic / assertion precedes the run summary), so the first hit
+/// is the specific cause, not the generic "test result: FAILED" tally.
+fn is_diagnostic_line(line: &str) -> bool {
+    let t = line.trim();
+    let lower = t.to_ascii_lowercase();
+    t.starts_with("error[")
+        || lower.starts_with("error:")
+        || lower.contains("panicked at")
+        || lower.contains("assertion failed")
+        || lower.contains("assertion `")
+        || (lower.starts_with("thread '") && lower.contains("panicked"))
+        || lower.starts_with("test result: failed")
+}
+
+/// Normalize a diagnostic line so the same root cause yields the same signature:
+/// lowercase, replace each path-like token with its basename (drop `/…`
+/// prefixes), replace runs of digits with `#` (strip line/column numbers,
+/// timestamps, hashes), and collapse whitespace.
+fn normalize_signature(line: &str) -> String {
+    let debased: Vec<String> = line
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .map(|tok| {
+            if tok.contains('/') {
+                tok.rsplit('/').next().unwrap_or(tok).to_string()
+            } else {
+                tok.to_string()
+            }
+        })
+        .collect();
+    mask_digit_runs(&debased.join(" "))
+}
+
+/// Replace every maximal run of ASCII digits with a single `#`.
+fn mask_digit_runs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_digits = false;
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+            }
+        } else {
+            out.push(c);
+            in_digits = false;
+        }
+    }
+    out
 }
 
 /// Mint (or decline to mint) a YouTrack issue from a triaged failure. Pure
@@ -434,46 +530,35 @@ pub fn mint(
         return Ok(MintOutcome::SkippedDailyCap);
     }
 
-    // Dedupe. A resolved issue for either key is never reopened; an open issue
-    // for either key means we already have the task.
+    // Dedupe (CLAUDE-190). Three keys: the per-run `primary` (webhook-redelivery
+    // idempotency), the commit-scoped `secondary` (back-compat only), and the
+    // cross-run `root_cause` (the collapse). A resolved issue for ANY key is
+    // never reopened.
     let primary = primary_marker(req);
     let secondary = secondary_marker(req);
-    for m in [&primary, &secondary] {
+    let root_cause = root_cause_marker(req);
+    for m in [&primary, &secondary, &root_cause] {
         if let Some(existing) = find_first(tracker, &format!("{m} #Resolved"))? {
             return Ok(MintOutcome::SkippedResolved { existing });
         }
     }
-    for m in [&primary, &secondary] {
-        if let Some(existing) = find_first(tracker, &format!("{m} #Unresolved"))? {
-            return Ok(MintOutcome::SkippedDuplicateOpen { existing });
-        }
+
+    // Per-run redelivery of the identical run: idempotency, no second issue.
+    if let Some(existing) = find_first(tracker, &format!("{primary} #Unresolved"))? {
+        return Ok(MintOutcome::SkippedDuplicateOpen { existing });
     }
 
-    // CLAUDE-100: private repos have no log to distinguish two failures of the
-    // same workflow, so a repeat of the same `(repo, workflow_id)` groups onto
-    // the existing OPEN issue instead of minting a sibling. The per-run checks
-    // above run FIRST, so a redelivery of an already-associated run resolves to
-    // `SkippedDuplicateOpen` before this group search. A failure after the
-    // grouped issue is resolved finds no open match here and mints a fresh
-    // issue below (a fixed-then-broken workflow is a new regression). Public
-    // repos keep their per-run logs and skip grouping until the post-v16
-    // signature key (CLAUDE-96 follow-up) lands.
-    let group = if req.private {
-        Some(group_marker(req))
-    } else {
-        None
-    };
-    if let Some(group) = &group {
-        if let Some(existing) = find_first(tracker, &format!("{group} #Unresolved"))? {
-            // Comment the new run onto the open issue, carrying this run's own
-            // per-run Dedupe-Key line so a redelivery of THIS run full-text
-            // matches and hits the per-run `SkippedDuplicateOpen` path above
-            // (no second comment). No issue is created, so the caps ledger does
-            // not advance (the caller only counts `Created`).
-            let body = build_association_comment(req, &primary, &secondary);
-            tracker.comment(&existing, &body)?;
-            return Ok(MintOutcome::AssociatedWithOpen { existing });
-        }
+    // Cross-run collapse: an OPEN issue for the root-cause key means the same
+    // failing job / branch / signature already has a task (a later commit that
+    // fails the same way). Append this run to it and mint nothing; a different
+    // signature yields a different key and mints a sibling. The comment carries
+    // this run's own per-run Dedupe-Key so a redelivery of THIS run full-text
+    // matches and hits the per-run `SkippedDuplicateOpen` path above (no second
+    // comment). No issue is created, so the caps ledger does not advance.
+    if let Some(existing) = find_first(tracker, &format!("{root_cause} #Unresolved"))? {
+        let body = build_association_comment(req, &primary, &root_cause);
+        tracker.comment(&existing, &body)?;
+        return Ok(MintOutcome::AssociatedWithOpen { existing });
     }
 
     // Create the issue in the mapped project, bucket 2 pre-assigned to a human.
@@ -481,7 +566,7 @@ pub fn mint(
     let (project, source) =
         route_cache.resolve_project(tracker, cfg, req.repo, &forge_host(req.html_url));
     let summary = build_summary(req);
-    let description = build_description(req, &primary, &secondary, group.as_deref());
+    let description = build_description(req, &primary, &secondary, &root_cause);
     let assignee = if route.assign_human {
         cfg.human_assignee.as_deref()
     } else {
@@ -558,30 +643,27 @@ fn autofix_label<'a>(detail: &'a crate::autofix::AutoFix, workflow_id: &'a str) 
 }
 
 /// Markdown issue body: the triage analysis, the run metadata, and the hidden
-/// dedupe markers a later mint searches for. `group` is the CLAUDE-100 group
-/// marker, present only for private repos; when set it is appended to the
-/// `Dedupe-Key:` line so future repeats of the same workflow group onto this
-/// issue. Public repos omit it, keeping their body byte-for-byte unchanged.
+/// dedupe / reconciler markers a later mint (and the CLAUDE-191 auto-close
+/// reconciler) searches for. `root_cause` is the CLAUDE-190 cross-run collapse
+/// key; it rides the `Dedupe-Key:` line (so a later run's `{root_cause}
+/// #Unresolved` full-text search matches this issue) and is repeated as an
+/// explicit `Root-Cause-Key:` marker alongside `Branch:` / `Job:`.
 fn build_description(
     req: &MintRequest,
     primary: &str,
     secondary: &str,
-    group: Option<&str>,
+    root_cause: &str,
 ) -> String {
     // CLAUDE-104: an auto-fix failure gets an implementation-spec body (concrete
     // problem, fix command, new-branch + PR-vs-main delivery instruction) with
     // no "human must commit directly to main" wording.
     if let Some(detail) = &req.triage.auto_fix {
-        return build_auto_fix_description(req, detail, primary, secondary, group);
+        return build_auto_fix_description(req, detail, primary, secondary, root_cause);
     }
     let attached = if req.log_path.is_some() {
         "The redacted failing-job log is attached to this issue."
     } else {
         "No job log was available (transient miss); none attached."
-    };
-    let dedupe_keys = match group {
-        Some(group) => format!("Dedupe-Key: {primary} {secondary} {group}"),
-        None => format!("Dedupe-Key: {primary} {secondary}"),
     };
     let mut lines = vec![
         "## Triage".to_string(),
@@ -595,23 +677,28 @@ fn build_description(
         "## Failure".to_string(),
         format!("- Repo: `{}`", req.repo),
         format!("- Workflow: `{}`", req.workflow_id),
+        format!("- Branch: `{}`", req.branch),
         format!("- Commit: `{}`", req.commit_sha),
         format!("- Run: {}", req.html_url),
         String::new(),
         attached.to_string(),
         String::new(),
         "<!-- claude-run dedupe markers; do not edit -->".to_string(),
-        dedupe_keys,
+        format!("Dedupe-Key: {primary} {secondary} {root_cause}"),
     ];
-    push_run_global_id_marker(&mut lines, req);
+    push_reconciler_markers(&mut lines, req, root_cause);
     lines.join("\n")
 }
 
-/// CLAUDE-189: append the hidden `Run-Global-Id:` marker under the dedupe-marker
-/// comment block when the run's global id is known (`> 0`). The
-/// ci-failure-analysis action reads it to address the v16 run-logs endpoint
-/// directly; pre-existing issues without it fall back to index resolution.
-fn push_run_global_id_marker(lines: &mut Vec<String>, req: &MintRequest) {
+/// CLAUDE-190/189: append the hidden reconciler markers under the dedupe-marker
+/// comment block. `Root-Cause-Key:` / `Branch:` / `Job:` let the auto-close
+/// reconciler (CLAUDE-191) find every issue for a `(repo, branch, workflow,
+/// job)` by full-text search; `Run-Global-Id:` (when known) lets the
+/// ci-failure-analysis action address the v16 run-logs endpoint directly.
+fn push_reconciler_markers(lines: &mut Vec<String>, req: &MintRequest, root_cause: &str) {
+    lines.push(format!("Root-Cause-Key: {root_cause}"));
+    lines.push(format!("Branch: {}", req.branch));
+    lines.push(format!("Job: {}", req.job_name));
     if req.run_global_id > 0 {
         lines.push(format!("Run-Global-Id: {}", req.run_global_id));
     }
@@ -627,7 +714,7 @@ fn build_auto_fix_description(
     detail: &crate::autofix::AutoFix,
     primary: &str,
     secondary: &str,
-    group: Option<&str>,
+    root_cause: &str,
 ) -> String {
     let short = short_sha(req.commit_sha);
     let branch = format!("chore/{}-{}", detail.kind, short);
@@ -636,10 +723,7 @@ fn build_auto_fix_description(
     } else {
         "No job log was attached."
     };
-    let dedupe_keys = match group {
-        Some(group) => format!("Dedupe-Key: {primary} {secondary} {group}"),
-        None => format!("Dedupe-Key: {primary} {secondary}"),
-    };
+    let dedupe_keys = format!("Dedupe-Key: {primary} {secondary} {root_cause}");
 
     // Fix step: the concrete command(s) when the detector knows them, else a
     // reproduce-and-fix instruction for the generic checks-workflow case.
@@ -681,6 +765,7 @@ fn build_auto_fix_description(
     lines.push("## Failure".to_string());
     lines.push(format!("- Repo: `{}`", req.repo));
     lines.push(format!("- Workflow: `{}`", req.workflow_id));
+    lines.push(format!("- Branch: `{}`", req.branch));
     lines.push(format!("- Commit: `{}`", req.commit_sha));
     lines.push(format!("- Run: {}", req.html_url));
     lines.push(String::new());
@@ -688,16 +773,16 @@ fn build_auto_fix_description(
     lines.push(String::new());
     lines.push("<!-- claude-run dedupe markers; do not edit -->".to_string());
     lines.push(dedupe_keys);
-    push_run_global_id_marker(&mut lines, req);
+    push_reconciler_markers(&mut lines, req, root_cause);
     lines.join("\n")
 }
 
-/// CLAUDE-100: the comment posted onto an existing open issue when a private
-/// repo's workflow fails again. Carries the new run's number, short SHA, and
-/// run link, plus this run's own per-run `Dedupe-Key:` line so a redelivery of
-/// THIS run full-text matches and hits the per-run duplicate path (no second
-/// comment).
-fn build_association_comment(req: &MintRequest, primary: &str, secondary: &str) -> String {
+/// CLAUDE-190: the comment posted onto an existing open issue when the same
+/// root cause fails again on a later commit. Carries the new run's number, short
+/// SHA, and run link, plus this run's own per-run `Dedupe-Key:` line (the
+/// per-run `primary` and the `root_cause`) so a redelivery of THIS run full-text
+/// matches and hits the per-run duplicate path (no second comment).
+fn build_association_comment(req: &MintRequest, primary: &str, root_cause: &str) -> String {
     let short_sha = req.commit_sha.chars().take(8).collect::<String>();
     [
         format!(
@@ -707,7 +792,7 @@ fn build_association_comment(req: &MintRequest, primary: &str, secondary: &str) 
         format!("- Run: {}", req.html_url),
         String::new(),
         "<!-- claude-run dedupe markers; do not edit -->".to_string(),
-        format!("Dedupe-Key: {primary} {secondary}"),
+        format!("Dedupe-Key: {primary} {root_cause}"),
     ]
     .join("\n")
 }
@@ -917,6 +1002,10 @@ mod tests {
             run_global_id: 0,
             commit_sha: "abc123def456",
             workflow_id: "ci.yml",
+            branch: "main",
+            job_name: "check",
+            job_index: 0,
+            failure_signature: None,
             html_url: "https://dev.a8n.run/owner/repo/actions/runs/7",
             trigger_user: user,
             triage: t,
@@ -1094,7 +1183,8 @@ mod tests {
         r.run_global_id = 21077;
         let p = primary_marker(&r);
         let s = secondary_marker(&r);
-        let body = build_description(&r, &p, &s, None);
+        let rc = root_cause_marker(&r);
+        let body = build_description(&r, &p, &s, &rc);
         assert!(
             body.contains("Run-Global-Id: 21077"),
             "known global id is embedded as a hidden marker: {body}"
@@ -1104,7 +1194,7 @@ mod tests {
         let af = auto_fix_triage(cargo_fmt_detail());
         let mut r = req("owner/repo", &af, "alice");
         r.run_global_id = 21077;
-        let body = build_description(&r, &p, &s, None);
+        let body = build_description(&r, &p, &s, &rc);
         assert!(
             body.contains("Run-Global-Id: 21077"),
             "auto-fix body embeds the marker too: {body}"
@@ -1119,7 +1209,8 @@ mod tests {
         let r = req("owner/repo", &t, "alice"); // run_global_id: 0
         let p = primary_marker(&r);
         let s = secondary_marker(&r);
-        let body = build_description(&r, &p, &s, None);
+        let rc = root_cause_marker(&r);
+        let body = build_description(&r, &p, &s, &rc);
         assert!(
             !body.contains("Run-Global-Id"),
             "no marker when unknown: {body}"
@@ -1474,39 +1565,36 @@ mod tests {
         assert!(!tracker.calls().iter().any(|c| c.starts_with("create")));
     }
 
-    #[test]
-    fn secondary_key_also_dedupes_against_an_open_issue() {
-        // The primary (repo,index) key misses, but the secondary
-        // (repo,commit,workflow) key matches an open issue -> still no duplicate.
-        let t = triage(TriageBucket::CodeFix);
-        let r = req("owner/repo", &t, "alice");
-        let secondary = secondary_marker(&r);
-        let tracker = StubTracker::new().with_search(
-            &format!("{secondary} #Unresolved"),
-            r#"[{"idReadable":"CLAUDE-51"}]"#,
-        );
-        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert_eq!(
-            out,
-            MintOutcome::SkippedDuplicateOpen {
-                existing: "CLAUDE-51".to_string()
-            }
-        );
+    // ---- CLAUDE-190: root-cause cross-run collapse ------------------------
+
+    /// A request carrying a derived failure signature (the common case).
+    fn req_with_sig<'a>(
+        repo: &'a str,
+        t: &'a Triage,
+        user: &'a str,
+        sig: &'a str,
+    ) -> MintRequest<'a> {
+        let mut r = req(repo, t, user);
+        r.failure_signature = Some(sig);
+        r
     }
 
-    // ---- CLAUDE-100: group repeated private-repo failures -----------------
-
     #[test]
-    fn private_repeat_groups_onto_the_open_issue_and_creates_nothing() {
-        // AC 1: a private-repo repeat of the same (repo, workflow_id) while the
-        // first issue is open comments onto it and mints nothing.
+    fn root_cause_collapses_repeats_across_commits() {
+        // AC 4: a later commit that fails the same job on the same branch with
+        // the same signature finds the OPEN root-cause issue, appends a
+        // run-association comment, and mints nothing (regardless of commit SHA).
         let t = triage(TriageBucket::CodeFix);
-        let mut r = req("owner/repo", &t, "alice");
-        r.private = true;
-        let group = group_marker(&r);
+        let r = req_with_sig(
+            "owner/repo",
+            &t,
+            "alice",
+            "assertion failed: expected # got #",
+        );
+        let root_cause = root_cause_marker(&r);
         let tracker = StubTracker::new().with_search(
-            &format!("{group} #Unresolved"),
-            r#"[{"idReadable":"CLAUDE-60","summary":"check.yml failing"}]"#,
+            &format!("{root_cause} #Unresolved"),
+            r#"[{"idReadable":"CLAUDE-60","summary":"CI failure: ci.yml"}]"#,
         );
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
         assert_eq!(
@@ -1518,80 +1606,101 @@ mod tests {
         let calls = tracker.calls();
         assert!(
             !calls.iter().any(|c| c.starts_with("create")),
-            "no issue minted: {calls:?}"
+            "no second issue minted: {calls:?}"
         );
-        // The comment carries the new run's OWN per-run markers, so a redelivery
-        // of this run hits the per-run duplicate path (AC 2).
+        // The comment carries this run's per-run primary and the root-cause key.
         let primary = primary_marker(&r);
-        let secondary = secondary_marker(&r);
         assert!(
             calls.iter().any(|c| c.starts_with("comment CLAUDE-60 |")
                 && c.contains(&primary)
-                && c.contains(&secondary)),
-            "comment carries per-run Dedupe-Key: {calls:?}"
+                && c.contains(&root_cause)),
+            "comment carries per-run + root-cause keys: {calls:?}"
         );
     }
 
     #[test]
-    fn private_repeat_after_resolution_mints_a_new_issue() {
-        // AC 3: only a RESOLVED issue carries the group marker (the group search
-        // is #Unresolved only), so a failure after resolution finds no open
-        // match and mints a fresh issue (a new regression).
-        let t = triage(TriageBucket::HumanAction);
-        let mut r = req("contoso/claude-run", &t, "alice");
-        r.private = true;
-        // No open group match is canned -> the search misses and we create.
-        let tracker = StubTracker::new();
+    fn different_signatures_on_same_job_mint_two_issues() {
+        // AC 5: same branch / workflow / job but a DIFFERENT signature is a
+        // different root cause -> a distinct key -> a second issue is minted.
+        let t = triage(TriageBucket::CodeFix);
+        // The open issue is keyed on signature A.
+        let a = req_with_sig("owner/repo", &t, "alice", "error[e#]: mismatched types");
+        let key_a = root_cause_marker(&a);
+        // The new failure carries signature B, so its root-cause search misses.
+        let b = req_with_sig("owner/repo", &t, "alice", "error[e#]: cannot find value");
+        let tracker = StubTracker::new().with_search(
+            &format!("{key_a} #Unresolved"),
+            r#"[{"idReadable":"CLAUDE-60"}]"#,
+        );
+        let out = mint(&tracker, &cfg(), &route_cache(), &b, &caps()).unwrap();
+        assert!(
+            matches!(out, MintOutcome::Created { .. }),
+            "a different signature mints a sibling: {out:?}"
+        );
+        assert_ne!(key_a, root_cause_marker(&b), "distinct keys per signature");
+    }
+
+    #[test]
+    fn resolved_root_cause_key_is_never_reopened() {
+        // AC 6: a RESOLVED issue for the root-cause key is not reopened.
+        let t = triage(TriageBucket::CodeFix);
+        let r = req_with_sig("owner/repo", &t, "alice", "panicked at boom");
+        let root_cause = root_cause_marker(&r);
+        let tracker = StubTracker::new().with_search(
+            &format!("{root_cause} #Resolved"),
+            r#"[{"idReadable":"CLAUDE-40"}]"#,
+        );
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
         assert_eq!(
             out,
-            MintOutcome::Created {
-                key: "CLAUDE-99".to_string(),
-                project: "CLAUDE".to_string(),
-                bucket: TriageBucket::HumanAction,
-                source: RouteSource::Fallback,
+            MintOutcome::SkippedResolved {
+                existing: "CLAUDE-40".to_string()
             }
         );
-        assert!(tracker.calls().iter().any(|c| c.starts_with("create")));
+        assert!(!tracker.calls().iter().any(|c| c.starts_with("create")));
     }
 
     #[test]
-    fn public_repo_never_runs_the_group_search() {
-        // AC 4: a public repo (private = false) never searches the group marker
-        // and mints exactly as before.
-        let t = triage(TriageBucket::CodeFix);
-        let r = req("owner/repo", &t, "alice"); // private defaults to false
-        let group = group_marker(&r);
+    fn no_signature_fallback_key_still_collapses_the_storm() {
+        // AC 3 fallback: with no derivable signature the key degrades to
+        // (repo, branch, workflow, job), which still collapses a logless
+        // "branch is broken" storm onto one open issue.
+        let t = triage(TriageBucket::HumanAction);
+        let r = req("owner/repo", &t, "alice"); // failure_signature: None
+        let root_cause = root_cause_marker(&r);
+        // The fallback key is job-scoped, not commit-scoped.
+        assert_eq!(
+            root_cause,
+            marker(&["owner/repo", "main", "ci.yml", "check"])
+        );
         let tracker = StubTracker::new().with_search(
-            &format!("{group} #Unresolved"),
+            &format!("{root_cause} #Unresolved"),
             r#"[{"idReadable":"CLAUDE-60"}]"#,
         );
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert!(matches!(out, MintOutcome::Created { .. }));
-        let calls = tracker.calls();
-        assert!(
-            !calls.iter().any(|c| c.contains(&group)),
-            "group marker never searched for a public repo: {calls:?}"
+        assert_eq!(
+            out,
+            MintOutcome::AssociatedWithOpen {
+                existing: "CLAUDE-60".to_string()
+            }
         );
-        assert!(!calls.iter().any(|c| c.starts_with("comment")));
     }
 
     #[test]
-    fn per_run_dedupe_takes_precedence_over_group_association() {
-        // AC 2 ordering: an open per-run match short-circuits before the group
+    fn per_run_redelivery_takes_precedence_over_root_cause_association() {
+        // Ordering: an open per-run match short-circuits before the root-cause
         // search, so an exact-run redelivery never comments a second time.
         let t = triage(TriageBucket::CodeFix);
-        let mut r = req("owner/repo", &t, "alice");
-        r.private = true;
+        let r = req_with_sig("owner/repo", &t, "alice", "boom");
         let primary = primary_marker(&r);
-        let group = group_marker(&r);
+        let root_cause = root_cause_marker(&r);
         let tracker = StubTracker::new()
             .with_search(
                 &format!("{primary} #Unresolved"),
                 r#"[{"idReadable":"CLAUDE-50"}]"#,
             )
             .with_search(
-                &format!("{group} #Unresolved"),
+                &format!("{root_cause} #Unresolved"),
                 r#"[{"idReadable":"CLAUDE-60"}]"#,
             );
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
@@ -1601,10 +1710,65 @@ mod tests {
                 existing: "CLAUDE-50".to_string()
             }
         );
-        // Resolved to the per-run path: no comment, no create.
         let calls = tracker.calls();
         assert!(!calls.iter().any(|c| c.starts_with("comment")), "{calls:?}");
         assert!(!calls.iter().any(|c| c.starts_with("create")), "{calls:?}");
+    }
+
+    // ---- CLAUDE-190: signature extraction + normalization -----------------
+
+    #[test]
+    fn signature_is_stable_across_commits_and_splits_on_cause() {
+        // The same root cause on two different commits (paths / line numbers
+        // differ) yields the SAME signature; a different diagnostic differs.
+        let a = failure_signature(
+            "   Compiling foo\nerror[E0308]: mismatched types\n  --> src/a.rs:12:9\n",
+        )
+        .unwrap();
+        let b = failure_signature(
+            "   Compiling foo\nerror[E0308]: mismatched types\n  --> src/other/b.rs:99:1\n",
+        )
+        .unwrap();
+        assert_eq!(a, b, "same cause across commits -> same signature");
+        let c = failure_signature("error[E0425]: cannot find value `x`\n").unwrap();
+        assert_ne!(a, c, "different cause -> different signature");
+    }
+
+    #[test]
+    fn signature_normalizes_paths_and_numbers() {
+        let s =
+            failure_signature("thread 'main' panicked at /home/ci/work/src/lib.rs:42:5\n").unwrap();
+        // Path basename kept, digits masked to '#', lowercased.
+        assert!(s.contains("lib.rs"), "basename kept: {s}");
+        assert!(!s.contains("/home/ci"), "path prefix dropped: {s}");
+        assert!(!s.chars().any(|c| c.is_ascii_digit()), "digits masked: {s}");
+        assert_eq!(s, s.to_ascii_lowercase(), "lowercased: {s}");
+    }
+
+    #[test]
+    fn signature_none_when_no_diagnostic_line() {
+        // A diagnostic-free / truncated log yields no signature (fallback key).
+        assert!(failure_signature("Compiling...\nBuilding...\nDone.\n").is_none());
+        assert!(failure_signature("").is_none());
+    }
+
+    #[test]
+    fn description_embeds_root_cause_branch_and_job_markers() {
+        // AC 7: the body carries hidden Root-Cause-Key / Branch / Job markers and
+        // the root-cause key rides the Dedupe-Key line (searchable).
+        let t = triage(TriageBucket::CodeFix);
+        let r = req_with_sig("owner/repo", &t, "alice", "boom");
+        let p = primary_marker(&r);
+        let s = secondary_marker(&r);
+        let rc = root_cause_marker(&r);
+        let body = build_description(&r, &p, &s, &rc);
+        assert!(
+            body.contains(&format!("Dedupe-Key: {p} {s} {rc}")),
+            "{body}"
+        );
+        assert!(body.contains(&format!("Root-Cause-Key: {rc}")), "{body}");
+        assert!(body.contains("Branch: main"), "{body}");
+        assert!(body.contains("Job: check"), "{body}");
     }
 
     // ---- CLAUDE-104: auto-fix minting -------------------------------------
@@ -1669,7 +1833,8 @@ mod tests {
         let r = req("contoso/claude-run", &t, "alice");
         let primary = primary_marker(&r);
         let secondary = secondary_marker(&r);
-        let body = build_description(&r, &primary, &secondary, None);
+        let root_cause = root_cause_marker(&r);
+        let body = build_description(&r, &primary, &secondary, &root_cause);
         assert!(body.contains("cargo fmt --all"), "fix command: {body}");
         assert!(
             body.contains("chore/cargo-fmt-abc123de"),
@@ -1689,6 +1854,7 @@ mod tests {
         );
         // The dedupe markers still ride the body so repeats group (AC 7).
         assert!(body.contains(&primary) && body.contains(&secondary));
+        assert!(body.contains(&root_cause), "root-cause key in body: {body}");
     }
 
     #[test]
@@ -1705,7 +1871,8 @@ mod tests {
         let r = req("contoso/claude-run", &t, "alice");
         let primary = primary_marker(&r);
         let secondary = secondary_marker(&r);
-        let body = build_description(&r, &primary, &secondary, None);
+        let root_cause = root_cause_marker(&r);
+        let body = build_description(&r, &primary, &secondary, &root_cause);
         assert!(body.contains("Reproduce the `ci.yml` checks"), "{body}");
         assert!(body.contains("chore/checks-workflow-abc123de"), "{body}");
         assert!(body.contains("Failing step: `Clippy`."), "{body}");
