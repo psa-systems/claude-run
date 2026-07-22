@@ -89,6 +89,12 @@ pub enum ActionKind {
     /// Config lives in `native` as [`NativeConfig::CiFailureAnalysis`].
     #[serde(rename = "ci-failure-analysis")]
     CiFailureAnalysis,
+    /// Built-in CI-failure auto-close reconciler (CLAUDE-191): polls Forgejo and
+    /// closes each open CI-failure issue whose failing `(repo, branch, workflow,
+    /// job)` is now green on its latest run. Config lives in `native` as
+    /// [`NativeConfig::CiFailureReconcile`].
+    #[serde(rename = "ci-failure-reconcile")]
+    CiFailureReconcile,
 }
 
 impl ActionKind {
@@ -105,6 +111,7 @@ impl ActionKind {
             ActionKind::Youtrack => "youtrack",
             ActionKind::ForgejoCiFix => "forgejo-ci-fix",
             ActionKind::CiFailureAnalysis => "ci-failure-analysis",
+            ActionKind::CiFailureReconcile => "ci-failure-reconcile",
         }
     }
 }
@@ -134,6 +141,10 @@ pub enum NativeConfig {
     /// the enum's variants size-balanced (`clippy::large_enum_variant`), matching
     /// the other native variants.
     CiFailureAnalysis(Box<CiFailureAnalysisConfig>),
+    /// CI-failure auto-close reconciler config (CLAUDE-191). Boxed to keep the
+    /// enum's variants size-balanced (`clippy::large_enum_variant`), matching the
+    /// other native variants.
+    CiFailureReconcile(Box<CiFailureReconcileConfig>),
 }
 
 impl NativeConfig {
@@ -143,6 +154,7 @@ impl NativeConfig {
             NativeConfig::Youtrack(_) => ActionKind::Youtrack,
             NativeConfig::ForgejoCiFix(_) => ActionKind::ForgejoCiFix,
             NativeConfig::CiFailureAnalysis(_) => ActionKind::CiFailureAnalysis,
+            NativeConfig::CiFailureReconcile(_) => ActionKind::CiFailureReconcile,
         }
     }
 }
@@ -615,6 +627,76 @@ impl Default for CiFailureAnalysisConfig {
             summary_prefixes: vec!["CI failure:".to_string(), "Auto-fix:".to_string()],
             log_token_ref: None,
             max_analysis_bytes: 24 * 1024,
+        }
+    }
+}
+
+/// Config for the native CI-failure auto-close reconciler (CLAUDE-191). Supplied
+/// under the action's `native:` key when `kind: ci-failure-reconcile`.
+///
+/// On a schedule the handler scans the tracker for open CI-failure issues (whose
+/// summary starts with one of `summary_prefixes`), reads each issue's hidden
+/// `Branch:` / `Job:` markers (or, for a pre-rekey issue, the `## Failure` block,
+/// skipping when branch/job are not parseable), then for each allow-listed repo
+/// pages the Forgejo runs list, reduces it to the LATEST run per
+/// `(branch, workflow_id)`, and reads that run's per-job status from the jobs
+/// endpoint. An open issue whose `(repo, branch, workflow, job)` is success on its
+/// latest run is closed: State set to `resolved_state` and a run-linked comment
+/// posted. The close is idempotent (an already-closed issue is skipped). All
+/// Forgejo reads go through [`crate::forge_log`] (Rust), never a raw REST call.
+///
+/// `repos` and `resolved_state` are the distinctive fields that disambiguate this
+/// variant from the other native configs under the untagged `native:` key, so a
+/// shipped action MUST set at least one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CiFailureReconcileConfig {
+    /// Master enable toggle. `true` (the default) runs the handler; `false` makes
+    /// a run a no-op.
+    pub enabled: bool,
+    /// YouTrack query selecting the candidate issues to scan. MUST NOT filter by
+    /// `AI Agent` (reconcile is independent of the code-fix runner's
+    /// `AI Agent: Queued` selector); the summary-prefix + marker filtering happens
+    /// in the handler. Default `#Unresolved`.
+    pub query: String,
+    /// Summary prefixes an issue must start with to be reconciled. Default
+    /// `["CI failure:", "Auto-fix:"]`, matching the mint summaries.
+    pub summary_prefixes: Vec<String>,
+    /// Allow-list of `owner/repo` full names whose runs the reconciler scans. Each
+    /// entry is an exact `owner/repo`, a per-owner `owner/*`, or the global `*`
+    /// (the same three literal forms the webhook allow-list accepts). Empty (the
+    /// default) scans nothing, so the reconciler must be given the repos to poll.
+    pub repos: Vec<String>,
+    /// Name of the encrypted secret (CLAUDE-26) holding a Forgejo PAT with
+    /// repository read scope, used to page the runs list, read the jobs endpoint,
+    /// and (when `head_branch` is null) fetch a run's log to resolve its branch.
+    /// When unset the handler no-ops with a warning.
+    pub log_token_ref: Option<String>,
+    /// The State value set on a closed issue. Default `Done` (the CLAUDE project's
+    /// only resolved State).
+    pub resolved_state: String,
+    /// Template for the run-linked auto-close comment. The placeholders
+    /// `{run_index}`, `{branch}`, `{run_url}`, and `{job}` are substituted with the
+    /// now-green run's per-repo index, branch, web URL, and job name. A hidden
+    /// auto-closed marker is always appended (not part of the template).
+    pub close_comment: String,
+    /// Cap on the number of runs whose branch is resolved from the log per repo
+    /// per run (bounds log fetches when the runs list returns `head_branch` null).
+    /// Reached-cap is logged, never silent. Default 40.
+    pub max_branch_resolves: usize,
+}
+
+impl Default for CiFailureReconcileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            query: "#Unresolved".to_string(),
+            summary_prefixes: vec!["CI failure:".to_string(), "Auto-fix:".to_string()],
+            repos: Vec::new(),
+            log_token_ref: None,
+            resolved_state: "Done".to_string(),
+            close_comment: "Auto-closed: run #{run_index} on `{branch}` succeeded ({run_url}); the failing `{job}` is green, root cause resolved.".to_string(),
+            max_branch_resolves: 40,
         }
     }
 }
@@ -1278,6 +1360,111 @@ native:
         assert!(action.post.is_empty());
         let Some(NativeConfig::CiFailureAnalysis(_)) = &action.native else {
             panic!("expected ci-failure-analysis native config");
+        };
+        let reserialized = serde_yaml::to_string(&action).unwrap();
+        let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
+        assert_eq!(reloaded.action.native, action.native);
+        assert_eq!(reloaded.action.kind, action.kind);
+    }
+
+    // ---- CLAUDE-191: ci-failure-reconcile native config -------------------
+
+    #[test]
+    fn ci_failure_reconcile_native_parses_and_defaults() {
+        let raw = "\
+name: ci-failure-reconcile
+kind: ci-failure-reconcile
+native:
+  repos:
+    - contoso/claude-run
+  log_token_ref: forgejo-log-pat
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        assert_eq!(loaded.action.kind, ActionKind::CiFailureReconcile);
+        assert!(loaded.action.kind.is_native());
+        let Some(NativeConfig::CiFailureReconcile(cfg)) = loaded.action.native else {
+            panic!("expected ci-failure-reconcile native config");
+        };
+        assert!(cfg.enabled);
+        assert_eq!(cfg.repos, vec!["contoso/claude-run".to_string()]);
+        assert_eq!(cfg.log_token_ref.as_deref(), Some("forgejo-log-pat"));
+        // Unset fields fall back to the documented defaults.
+        assert_eq!(cfg.query, "#Unresolved");
+        assert_eq!(
+            cfg.summary_prefixes,
+            vec!["CI failure:".to_string(), "Auto-fix:".to_string()]
+        );
+        assert_eq!(cfg.resolved_state, "Done");
+        assert_eq!(cfg.max_branch_resolves, 40);
+    }
+
+    #[test]
+    fn ci_failure_reconcile_native_overrides_and_rejects_unknown_keys() {
+        let raw = "\
+name: cfr
+kind: ci-failure-reconcile
+native:
+  enabled: false
+  query: \"project: CLAUDE #Unresolved\"
+  summary_prefixes: [\"CI failure:\"]
+  repos: [\"contoso/*\", \"fabrikam/forgejo-cli\"]
+  log_token_ref: pat
+  resolved_state: Closed
+  close_comment: \"Fixed by run {run_url}\"
+  max_branch_resolves: 5
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::CiFailureReconcile(cfg)) = loaded.action.native else {
+            panic!("expected ci-failure-reconcile native config");
+        };
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.query, "project: CLAUDE #Unresolved");
+        assert_eq!(cfg.summary_prefixes, vec!["CI failure:".to_string()]);
+        assert_eq!(
+            cfg.repos,
+            vec![
+                "contoso/*".to_string(),
+                "fabrikam/forgejo-cli".to_string()
+            ]
+        );
+        assert_eq!(cfg.resolved_state, "Closed");
+        assert_eq!(cfg.close_comment, "Fixed by run {run_url}");
+        assert_eq!(cfg.max_branch_resolves, 5);
+
+        let bogus = format!("{raw}  bogus: nope\n");
+        assert!(matches!(
+            validate_str(&bogus, "<candidate>").unwrap_err(),
+            Error::Yaml(_)
+        ));
+    }
+
+    /// The default query must NEVER select by `AI Agent`: reconcile is independent
+    /// of the code-fix runner's `AI Agent: Queued` selector.
+    #[test]
+    fn ci_failure_reconcile_default_query_never_selects_by_ai_agent() {
+        let cfg = CiFailureReconcileConfig::default();
+        assert!(!cfg.query.contains("AI Agent"), "query: {}", cfg.query);
+        assert!(!cfg.query.contains("Queued"), "query: {}", cfg.query);
+    }
+
+    /// The shipped `actions/ci-failure-reconcile.yml` loads, is recognized as a
+    /// native ci-failure-reconcile action with no script-bearing fields, and
+    /// round-trips through serialize -> parse unchanged.
+    #[test]
+    fn shipped_ci_failure_reconcile_action_is_native_and_round_trips() {
+        const SHIPPED: &str = include_str!("../actions/ci-failure-reconcile.yml");
+        let loaded = validate_str(SHIPPED, "actions/ci-failure-reconcile.yml")
+            .expect("shipped action valid");
+        let action = loaded.action;
+        assert_eq!(action.name, "ci-failure-reconcile");
+        assert_eq!(action.kind, ActionKind::CiFailureReconcile);
+        assert!(action.input.is_none());
+        assert!(action.filter.is_none());
+        assert!(action.pre.is_empty());
+        assert!(action.prompt.is_none());
+        assert!(action.post.is_empty());
+        let Some(NativeConfig::CiFailureReconcile(_)) = &action.native else {
+            panic!("expected ci-failure-reconcile native config");
         };
         let reserialized = serde_yaml::to_string(&action).unwrap();
         let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();

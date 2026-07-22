@@ -647,6 +647,149 @@ fn parse_runs_list(bytes: &[u8]) -> std::result::Result<Vec<RunRef>, String> {
     Ok(out)
 }
 
+/// CLAUDE-191: one run pulled from the runs-list JSON with the full set of fields
+/// the auto-close reconciler needs to group and evaluate runs. The reconciler
+/// reduces these to the LATEST run per `(branch, workflow_id)` and reads each
+/// latest run's per-job status from the jobs endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunEntry {
+    /// The run's GLOBAL id (`run.id`); addresses the jobs / run-logs endpoints.
+    pub global_id: i64,
+    /// The run's per-repo index (`index_in_repo`); the `/actions/runs/<N>` URL.
+    pub index: i64,
+    /// Workflow filename, e.g. `ci.yml`.
+    pub workflow_id: String,
+    /// The run's branch from the runs list (`head_branch`), or empty when the API
+    /// returns it null (the deployed Forgejo), in which case the reconciler
+    /// resolves it from the run's log checkout section.
+    pub branch: String,
+    /// The run outcome: the `conclusion` when present, else the `status`.
+    pub status: String,
+    /// The run web URL, used to derive the forge origin and link the close comment.
+    pub html_url: String,
+}
+
+/// CLAUDE-191: parse the runs-list body into [`RunEntry`]s, tolerant of Forgejo's
+/// field naming (same shape as [`parse_runs_list`], plus the workflow / branch /
+/// status / url fields). Runs missing an `id` are skipped. The branch is empty
+/// when `head_branch` is null (the reconciler then resolves it from the log).
+fn parse_runs_list_entries(bytes: &[u8]) -> std::result::Result<Vec<RunEntry>, String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let arr = value
+        .get("workflow_runs")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let str_field = |run: &serde_json::Value, keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|k| run.get(*k).and_then(serde_json::Value::as_str))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut out = Vec::new();
+    for run in arr {
+        let Some(global_id) = run.get("id").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        let index = ["index_in_repo", "index", "run_number", "number"]
+            .iter()
+            .find_map(|k| run.get(*k).and_then(serde_json::Value::as_i64))
+            .unwrap_or(0);
+        // The outcome is `conclusion` when present, else `status` (mirrors the
+        // jobs-list parse), so a completed-success run reads `success`.
+        let status = run
+            .get("conclusion")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| run.get("status").and_then(serde_json::Value::as_str))
+            .unwrap_or("")
+            .to_string();
+        out.push(RunEntry {
+            global_id,
+            index,
+            workflow_id: str_field(&run, &["workflow_id", "workflow_name", "workflow"]),
+            branch: str_field(&run, &["head_branch", "head_ref", "branch"]),
+            status,
+            html_url: str_field(&run, &["html_url", "url"]),
+        });
+    }
+    Ok(out)
+}
+
+/// CLAUDE-191: outcome of fetching the runs list. Auth-class / not-found responses
+/// on the FIRST page are terminal; a mid-paging error stops paging and returns the
+/// entries already collected (partial coverage is better than none for a poll).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunsListOutcome {
+    Resolved(Vec<RunEntry>),
+    AuthDenied(u16),
+    NotFound,
+    Failed(String),
+}
+
+/// CLAUDE-191: page the repo's Action runs list into [`RunEntry`]s, newest-first,
+/// up to `max_pages` pages of [`RUNS_PAGE_LIMIT`] each (or until a short/empty
+/// page, the last one). Terminal on 401/403/404 on the first page; once some
+/// entries are collected, a later-page error stops paging and returns them.
+pub fn fetch_runs(
+    transport: &dyn LogTransport,
+    target: &RunsListApiTarget,
+    max_pages: u32,
+) -> Result<RunsListOutcome> {
+    let mut all: Vec<RunEntry> = Vec::new();
+    for page in 1..=max_pages {
+        let url = target.runs_url(page, RUNS_PAGE_LIMIT);
+        match transport.get_bytes(&url, Some(&target.token)) {
+            Ok((200, bytes)) => {
+                let entries = match parse_runs_list_entries(&bytes) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        if !all.is_empty() {
+                            break;
+                        }
+                        return Ok(RunsListOutcome::Failed(format!("parsing runs list: {e}")));
+                    }
+                };
+                let short = entries.len() < RUNS_PAGE_LIMIT as usize;
+                all.extend(entries);
+                if short {
+                    break;
+                }
+            }
+            Ok((status @ (401 | 403), _)) => {
+                if !all.is_empty() {
+                    break;
+                }
+                return Ok(RunsListOutcome::AuthDenied(status));
+            }
+            Ok((404, _)) => {
+                if !all.is_empty() {
+                    break;
+                }
+                return Ok(RunsListOutcome::NotFound);
+            }
+            Ok((status, body)) => {
+                if !all.is_empty() {
+                    break;
+                }
+                return Ok(RunsListOutcome::Failed(format!(
+                    "status {status}, {} body bytes",
+                    body.len()
+                )));
+            }
+            Err(e) => {
+                if !all.is_empty() {
+                    break;
+                }
+                return Ok(RunsListOutcome::Failed(e));
+            }
+        }
+    }
+    Ok(RunsListOutcome::Resolved(all))
+}
+
 /// CLAUDE-189: candidate repo paths a failing workflow file may live under, tried
 /// in order. `workflow_id` is the payload's workflow filename (e.g. `check.yml`).
 const WORKFLOW_DIRS: &[&str] = &[
@@ -1330,6 +1473,80 @@ mod tests {
         let transport = SeqBytesTransport::new(vec![Err("connect refused".to_string())]);
         let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
         assert!(matches!(out, RunIdOutcome::Failed(r) if r.contains("connect refused")));
+    }
+
+    // ---- CLAUDE-191: full runs-list entries + paging ----------------------
+
+    /// A runs-list page carrying the reconciler's full field set.
+    fn runs_page_full(runs: &[(i64, i64, &str, &str, &str)]) -> Vec<u8> {
+        let items: Vec<String> = runs
+            .iter()
+            .map(|(id, index, workflow, branch, status)| {
+                format!(
+                    r#"{{"id":{id},"index_in_repo":{index},"workflow_id":"{workflow}","head_branch":{branch},"status":"completed","conclusion":"{status}","html_url":"https://dev.a8n.run/initech/chat/actions/runs/{index}"}}"#,
+                    branch = if branch.is_empty() { "null".to_string() } else { format!("\"{branch}\"") },
+                )
+            })
+            .collect();
+        format!(r#"{{"workflow_runs":[{}]}}"#, items.join(",")).into_bytes()
+    }
+
+    #[test]
+    fn parse_entries_reads_all_fields_and_null_branch() {
+        let body = runs_page_full(&[
+            (21099, 4036, "ci.yml", "main", "success"),
+            (21077, 4034, "ci.yml", "", "failure"), // head_branch null
+        ]);
+        let entries = parse_runs_list_entries(&body).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].global_id, 21099);
+        assert_eq!(entries[0].workflow_id, "ci.yml");
+        assert_eq!(entries[0].branch, "main");
+        assert_eq!(entries[0].status, "success"); // conclusion wins over status
+        assert!(entries[0].html_url.ends_with("/runs/4036"));
+        // A null head_branch parses as an empty branch (log-resolved later).
+        assert_eq!(entries[1].branch, "");
+        assert_eq!(entries[1].status, "failure");
+    }
+
+    #[test]
+    fn fetch_runs_collects_across_pages_until_short() {
+        // A full first page (50 entries) then a short second page ends paging.
+        let full: Vec<(i64, i64, &str, &str, &str)> = (0..50)
+            .map(|n| (90000 + n, 5000 + n, "ci.yml", "main", "success"))
+            .collect();
+        let page1 = runs_page_full(&full);
+        let page2 = runs_page_full(&[(21077, 4034, "ci.yml", "feature", "failure")]);
+        let transport = SeqBytesTransport::new(vec![Ok((200, page1)), Ok((200, page2))]);
+        let out = fetch_runs(&transport, &runs_target(), RUNS_MAX_PAGES).unwrap();
+        let RunsListOutcome::Resolved(entries) = out else {
+            panic!("expected Resolved");
+        };
+        assert_eq!(entries.len(), 51);
+        assert_eq!(transport.urls().len(), 2, "stopped at the short page");
+    }
+
+    #[test]
+    fn fetch_runs_auth_denied_on_first_page_is_terminal() {
+        let transport = SeqBytesTransport::new(vec![Ok((403, Vec::new()))]);
+        let out = fetch_runs(&transport, &runs_target(), RUNS_MAX_PAGES).unwrap();
+        assert_eq!(out, RunsListOutcome::AuthDenied(403));
+    }
+
+    #[test]
+    fn fetch_runs_error_after_first_page_returns_collected() {
+        // Page 1 full (so paging continues), page 2 errors: keep page-1 entries.
+        let full: Vec<(i64, i64, &str, &str, &str)> = (0..50)
+            .map(|n| (90000 + n, 5000 + n, "ci.yml", "main", "success"))
+            .collect();
+        let page1 = runs_page_full(&full);
+        let transport =
+            SeqBytesTransport::new(vec![Ok((200, page1)), Err("connect refused".to_string())]);
+        let out = fetch_runs(&transport, &runs_target(), RUNS_MAX_PAGES).unwrap();
+        let RunsListOutcome::Resolved(entries) = out else {
+            panic!("expected Resolved with the collected page-1 entries");
+        };
+        assert_eq!(entries.len(), 50);
     }
 
     // ---- CLAUDE-189: workflow YAML fetch ---------------------------------
