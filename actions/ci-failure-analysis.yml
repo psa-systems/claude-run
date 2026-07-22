@@ -1,0 +1,72 @@
+---
+# Agentic CI-failure log analysis (CLAUDE-189).
+#
+# Native action (`kind: ci-failure-analysis`) routing to the built-in Rust
+# handler in `src/native/ci_failure_analysis.rs`. This file is config only and
+# carries no script-bearing fields (input.command / filter / pre / prompt /
+# post).
+#
+# For every open, unresolved issue whose summary starts with `CI failure:` or
+# `Auto-fix:` and that is not yet marked analyzed, the handler:
+#   gather  -> yt list --query <query> --json, keep matching-prefix issues. The
+#              selector is summary-prefix + analyzed-marker ONLY; it NEVER selects
+#              by `AI Agent: Queued` (that field belongs to the code-fix runner in
+#              actions/youtrack.yml).
+#   resolve -> parse repo / run index / run URL / commit / workflow from the
+#              issue's `## Failure` block; read the run GLOBAL id from a hidden
+#              `Run-Global-Id:` marker when present, else resolve it by matching
+#              index_in_repo against the runs-list API.
+#   fetch   -> pull the complete redacted run log (v16 REST endpoint) plus the
+#              failing workflow YAML into the workdir. A log miss posts a short
+#              "unavailable" note once and leaves the issue un-marked for retry.
+#   analyze -> one agentic `claude` session (Read,Grep,Bash) over both files.
+#   finalize-> post the analysis as a YouTrack comment and mark the issue analyzed
+#              so it is never analyzed twice (idempotent).
+#
+# All log / runs-list / workflow-YAML reads go through `forge_log` (Rust), never a
+# raw REST call from a nu snippet (tooling-gap rule, FJ-22). Redaction is
+# preserved end to end via `forge_log::redact`.
+
+name: ci-failure-analysis
+
+kind: ci-failure-analysis
+
+native:
+  # Master enable toggle (default true).
+  enabled: true
+  # YouTrack candidate query. MUST NOT filter by `AI Agent`; summary-prefix and
+  # analyzed-marker filtering happens in the handler.
+  query: "#Unresolved"
+  # Summary prefixes an issue must start with to be analyzed.
+  summary_prefixes:
+    - "CI failure:"
+    - "Auto-fix:"
+  # Name of the encrypted secret (CLAUDE-26) holding a Forgejo PAT with
+  # repository read scope, used to fetch the run log, resolve the run global id,
+  # and read the workflow YAML through the v16 REST API. Required; without it the
+  # handler no-ops.
+  log_token_ref: forgejo-log-pat
+  # Cap (bytes) on the posted analysis comment.
+  max_analysis_bytes: 24576
+
+# /home has more space than /tmp.
+workdir_base: ~/workspace
+
+# The analysis session reads local files only.
+claude:
+  allowed_tools: "Read,Grep,Bash"
+  permission_mode: acceptEdits
+
+output:
+  file: ci-failure-analysis.jsonl
+
+# Poll on an interval, like the other native actions.
+schedule:
+  kind: interval
+  spec: 30m
+
+limits:
+  max_attempts_per_key: 3
+  max_runs_per_day: 50
+  claude_timeout_seconds: 600
+  daily_budget_usd: 5.00
