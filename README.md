@@ -401,6 +401,33 @@ is suppressed (a human's PR is left to its author), and `forgejo-ci-fix` separat
 iterating until green or flagging Needs Review. Dedupe markers are unchanged, so repeats of the same
 `(repo, workflow_id, commit_sha)` still group.
 
+### Deep CI-failure analysis (CLAUDE-189)
+
+A minted "CI failure" issue's `## Triage` prose is a one-shot classification: it does not read the complete run log, does
+not cross-reference the failing workflow YAML to name the exact step that failed, and does not distinguish a
+truncated / diagnostic-free log from a real compiler/clippy/test error. The `ci-failure-analysis` native action
+(`kind: ci-failure-analysis`, `src/native/ci_failure_analysis.rs`) closes that gap: on a schedule it enriches every open,
+unresolved "CI failure" / "Auto-fix" issue with a deep, log-grounded root-cause comment, produced automatically and
+idempotently, including for issues already open when the feature ships (the CLAUDE-185 backfill case).
+
+For each issue it: parses the run coordinates from the `## Failure` block; resolves the run GLOBAL id from a hidden
+`Run-Global-Id:` marker the mint now embeds (`run.id`), or, for a pre-existing issue with no marker, by matching
+`index_in_repo` against the runs-list API (the run web URL uses the per-repo index, but the v16 run-logs endpoint keys by
+the global id); fetches the complete redacted run log plus the failing workflow YAML into a workdir; runs one agentic
+`claude` session (tools `Read,Grep,Bash`) over both; and posts the analysis as a YouTrack comment carrying a hidden marker
+so the issue is never analyzed twice. The analysis names the exact failing workflow step (by mapping log position to
+workflow step order), the root-cause diagnostic or an explicit statement that the stored log is truncated / diagnostic
+-free, and concrete remediation.
+
+Selection is by summary prefix + analyzed-marker ONLY; it **never** selects by `AI Agent: Queued` (that field belongs to
+the code-fix runner, so analysis, a read-only enrichment, must not collide with it). A log miss (auth denied, pruned, or a
+pre-v16 endpoint) posts a short "unavailable" note once and leaves the issue un-marked so a later run retries; it never
+crashes or marks analyzed on a miss. Log / runs-list / workflow-YAML reads stay inside `forge_log` (Rust), never a raw
+REST call from a nu snippet (FJ-22), and redaction is preserved end to end via `forge_log::redact`, so no token lands in a
+posted comment. Configure it in `actions/ci-failure-analysis.yml` (`log_token_ref` names the Forgejo PAT secret;
+`query` / `summary_prefixes` / `max_analysis_bytes` tune selection and the comment cap). See `actions/SCHEMA.md`
+(`kind: ci-failure-analysis`).
+
 ### Migration from the single-source listener (CLAUDE-87)
 
 This is a **breaking config change**: the old top-level `webhook.secret_ref` / `webhook.allowed_repos` /

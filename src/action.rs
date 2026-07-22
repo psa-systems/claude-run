@@ -84,6 +84,11 @@ pub enum ActionKind {
     /// lives in `native` as [`NativeConfig::ForgejoCiFix`].
     #[serde(rename = "forgejo-ci-fix")]
     ForgejoCiFix,
+    /// Built-in CI-failure-analysis handler (CLAUDE-189): enriches each open "CI
+    /// failure" / "Auto-fix" issue with a deep, log-grounded root-cause comment.
+    /// Config lives in `native` as [`NativeConfig::CiFailureAnalysis`].
+    #[serde(rename = "ci-failure-analysis")]
+    CiFailureAnalysis,
 }
 
 impl ActionKind {
@@ -99,6 +104,7 @@ impl ActionKind {
             ActionKind::Scripted => "scripted",
             ActionKind::Youtrack => "youtrack",
             ActionKind::ForgejoCiFix => "forgejo-ci-fix",
+            ActionKind::CiFailureAnalysis => "ci-failure-analysis",
         }
     }
 }
@@ -124,6 +130,10 @@ pub enum NativeConfig {
     /// (`clippy::large_enum_variant`). `Box<T>` is serde- and
     /// `PartialEq`-transparent, and field access auto-derefs.
     ForgejoCiFix(Box<ForgejoCiFixConfig>),
+    /// CI-failure-analysis built-in handler config (CLAUDE-189). Boxed to keep
+    /// the enum's variants size-balanced (`clippy::large_enum_variant`), matching
+    /// the other native variants.
+    CiFailureAnalysis(Box<CiFailureAnalysisConfig>),
 }
 
 impl NativeConfig {
@@ -132,6 +142,7 @@ impl NativeConfig {
         match self {
             NativeConfig::Youtrack(_) => ActionKind::Youtrack,
             NativeConfig::ForgejoCiFix(_) => ActionKind::ForgejoCiFix,
+            NativeConfig::CiFailureAnalysis(_) => ActionKind::CiFailureAnalysis,
         }
     }
 }
@@ -551,6 +562,59 @@ impl Default for ForgejoCiFixConfig {
             needs_review_state: "Needs Review".to_string(),
             review_assignee: None,
             token: None,
+        }
+    }
+}
+
+/// Config for the native CI-failure-analysis handler (CLAUDE-189). Supplied under
+/// the action's `native:` key when `kind: ci-failure-analysis`.
+///
+/// The handler scans the tracker for open, unresolved issues whose summary starts
+/// with one of `summary_prefixes` and that are not yet marked analyzed, then for
+/// each: resolves the run coordinates from the issue's `## Failure` block, fetches
+/// the complete redacted run log (v16 REST endpoint, PAT from `log_token_ref`)
+/// plus the failing workflow YAML, runs one agentic `claude` session over both,
+/// and posts a deep root-cause comment before marking the issue analyzed
+/// (idempotent). Selection is by summary prefix + analyzed-marker ONLY; it never
+/// selects by `AI Agent: Queued` (that field belongs to the code-fix runner).
+///
+/// The generic blocks (`workdir_base`, `claude`, `limits`, `schedule`, `output`)
+/// stay at the top level of the action, not inside `native`. Every field
+/// defaults; `query` and `summary_prefixes` are the distinctive fields that
+/// disambiguate this variant from the others.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CiFailureAnalysisConfig {
+    /// Master enable toggle. `true` (the default) runs the handler; `false` makes
+    /// a run a no-op.
+    pub enabled: bool,
+    /// YouTrack query selecting the candidate issues to scan. It MUST NOT filter
+    /// by `AI Agent` (analysis is read-only enrichment and must not collide with
+    /// the code-fix runner's `AI Agent: Queued` selector); the summary-prefix and
+    /// analyzed-marker filtering happens in the handler. Default `#Unresolved`.
+    pub query: String,
+    /// Summary prefixes an issue must start with to be analyzed. Default
+    /// `["CI failure:", "Auto-fix:"]`, matching the mint summaries.
+    pub summary_prefixes: Vec<String>,
+    /// Name of the encrypted secret (CLAUDE-26) holding a Forgejo PAT with
+    /// repository read scope, used to fetch the run log, resolve the run global
+    /// id, and read the workflow YAML through the v16 REST API. When unset the
+    /// handler no-ops with a warning (private-repo logs cannot be fetched
+    /// anonymously).
+    pub log_token_ref: Option<String>,
+    /// Cap (bytes) on the posted analysis comment, so a runaway agent reply cannot
+    /// blow the comment. Default 24 KiB.
+    pub max_analysis_bytes: usize,
+}
+
+impl Default for CiFailureAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            query: "#Unresolved".to_string(),
+            summary_prefixes: vec!["CI failure:".to_string(), "Auto-fix:".to_string()],
+            log_token_ref: None,
+            max_analysis_bytes: 24 * 1024,
         }
     }
 }
@@ -1124,6 +1188,97 @@ native:
         };
 
         // Serialize -> parse round-trip yields an identical native config.
+        let reserialized = serde_yaml::to_string(&action).unwrap();
+        let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
+        assert_eq!(reloaded.action.native, action.native);
+        assert_eq!(reloaded.action.kind, action.kind);
+    }
+
+    // ---- CLAUDE-189: ci-failure-analysis native kind ---------------------
+
+    #[test]
+    fn ci_failure_analysis_native_parses_and_defaults() {
+        let raw = "\
+name: ci-failure-analysis
+kind: ci-failure-analysis
+native:
+  query: \"#Unresolved\"
+  log_token_ref: forgejo-log-pat
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        assert_eq!(loaded.action.kind, ActionKind::CiFailureAnalysis);
+        assert!(loaded.action.kind.is_native());
+        let Some(NativeConfig::CiFailureAnalysis(cfg)) = loaded.action.native else {
+            panic!("expected ci-failure-analysis native config");
+        };
+        assert!(cfg.enabled);
+        assert_eq!(cfg.query, "#Unresolved");
+        assert_eq!(cfg.log_token_ref.as_deref(), Some("forgejo-log-pat"));
+        // Unset fields fall back to the documented defaults.
+        assert_eq!(
+            cfg.summary_prefixes,
+            vec!["CI failure:".to_string(), "Auto-fix:".to_string()]
+        );
+        assert_eq!(cfg.max_analysis_bytes, 24 * 1024);
+    }
+
+    #[test]
+    fn ci_failure_analysis_native_overrides_and_rejects_unknown_keys() {
+        let raw = "\
+name: cfa
+kind: ci-failure-analysis
+native:
+  enabled: false
+  query: \"project: CLAUDE #Unresolved\"
+  summary_prefixes: [\"CI failure:\"]
+  log_token_ref: pat
+  max_analysis_bytes: 4096
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::CiFailureAnalysis(cfg)) = loaded.action.native else {
+            panic!("expected ci-failure-analysis native config");
+        };
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.query, "project: CLAUDE #Unresolved");
+        assert_eq!(cfg.summary_prefixes, vec!["CI failure:".to_string()]);
+        assert_eq!(cfg.max_analysis_bytes, 4096);
+
+        let bogus = format!("{raw}  bogus: nope\n");
+        assert!(matches!(
+            validate_str(&bogus, "<candidate>").unwrap_err(),
+            Error::Yaml(_)
+        ));
+    }
+
+    /// The default query must NEVER select by `AI Agent`: analysis is read-only
+    /// enrichment and must not collide with the code-fix runner's
+    /// `AI Agent: Queued` selector.
+    #[test]
+    fn ci_failure_analysis_default_query_never_selects_by_ai_agent() {
+        let cfg = CiFailureAnalysisConfig::default();
+        assert!(!cfg.query.contains("AI Agent"), "query: {}", cfg.query);
+        assert!(!cfg.query.contains("Queued"), "query: {}", cfg.query);
+    }
+
+    /// The shipped `actions/ci-failure-analysis.yml` loads, is recognized as a
+    /// native ci-failure-analysis action with no script-bearing fields, and
+    /// round-trips through serialize -> parse unchanged.
+    #[test]
+    fn shipped_ci_failure_analysis_action_is_native_and_round_trips() {
+        const SHIPPED: &str = include_str!("../actions/ci-failure-analysis.yml");
+        let loaded =
+            validate_str(SHIPPED, "actions/ci-failure-analysis.yml").expect("shipped action valid");
+        let action = loaded.action;
+        assert_eq!(action.name, "ci-failure-analysis");
+        assert_eq!(action.kind, ActionKind::CiFailureAnalysis);
+        assert!(action.input.is_none());
+        assert!(action.filter.is_none());
+        assert!(action.pre.is_empty());
+        assert!(action.prompt.is_none());
+        assert!(action.post.is_empty());
+        let Some(NativeConfig::CiFailureAnalysis(_)) = &action.native else {
+            panic!("expected ci-failure-analysis native config");
+        };
         let reserialized = serde_yaml::to_string(&action).unwrap();
         let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
         assert_eq!(reloaded.action.native, action.native);

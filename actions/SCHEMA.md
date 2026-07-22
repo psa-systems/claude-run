@@ -15,7 +15,7 @@ attempt caps, timeouts, and a cost-based usage check. The action YAML supplies e
 
 ```yaml
 name: <kebab-id>            # required
-kind: scripted              # optional discriminator: scripted (default) | youtrack | forgejo-ci-fix
+kind: scripted              # optional: scripted (default) | youtrack | forgejo-ci-fix | ci-failure-analysis
 enabled: true               # optional, default true; false skips the action in the scheduler
 workdir_base: /path/to/dir  # optional, overrides $CLAUDE_RUN_WORKDIR_BASE for this action
 link_template: https://youtrack/issue/{key}  # optional; {key} -> job key, builds a per-job link (render_link)
@@ -111,6 +111,9 @@ The dispatch discriminator (CLAUDE-30). Selects how the runner executes the acti
   block.
 - `forgejo-ci-fix`: a built-in Rust handler that fixes failing CI on Forgejo PRs (CLAUDE-29, supersedes DEV-330). Like
   `youtrack` it is config only and supplies a typed [`native`](#native-record-required-for-native-kinds) block.
+- `ci-failure-analysis`: a built-in Rust handler that enriches each open "CI failure" / "Auto-fix" issue with a deep,
+  log-grounded root-cause comment (CLAUDE-189). Config only, supplying a typed
+  [`native`](#native-record-required-for-native-kinds) block.
 
 `scripted` and native kinds share all the run accounting (locking, daily caps, per-job attempt caps, budget, job-outcome
 records); only job production and the per-job pipeline differ.
@@ -330,6 +333,48 @@ go through the `fj` CLI (no raw REST); clone / push auth comes from `fj`'s own c
 prerequisite:** the runner's `fj` must be a build that exposes `--json` on `pr search` (FJ-1), `pr status` (FJ-2), and
 `pr view`, plus `pr edit <PR> labels --add`. An older `fj` without these cannot drive the gather reads or the Needs
 Review flag.
+
+#### `kind: ci-failure-analysis`
+
+A single flat config record (no sub-records). The handler scans the tracker for open, unresolved issues whose summary
+starts with one of `summary_prefixes` and that are not yet marked analyzed, then for each: parses the run coordinates from
+the issue's `## Failure` block (reading the run GLOBAL id from a hidden `Run-Global-Id:` marker when present, else
+resolving it by matching `index_in_repo` against the runs-list API), fetches the complete redacted run log (v16 REST
+endpoint, PAT from `log_token_ref`) plus the failing workflow YAML into the workdir, runs one agentic `claude` session
+(tools `Read,Grep,Bash`) over both files, and posts a deep root-cause comment before marking the issue analyzed (a hidden
+comment marker) so it is never analyzed twice. The dedup / attempt key is the issue id. The generic blocks
+(`workdir_base`, `claude`, `limits`, `schedule`, `output`) stay at the top level of the action, not inside `native`.
+
+**Selection is by summary prefix + analyzed-marker ONLY; it NEVER selects by `AI Agent: Queued`.** That field belongs to
+the code-fix runner in `actions/youtrack.yml`; analysis is read-only enrichment and must not collide with it, so `query`
+must not filter on `AI Agent`. A log miss (`AuthDenied` / `NotFound` / `Failed`) posts a short "unavailable" note once and
+leaves the issue un-marked so a later run retries; it never crashes or marks analyzed on a miss. Redaction is preserved
+end to end via `forge_log::redact`, and all log / runs-list / workflow-YAML reads go through `forge_log` (Rust), never a
+raw REST call from a nu snippet (tooling-gap rule, FJ-22).
+
+```yaml
+kind: ci-failure-analysis
+native:
+  enabled: true                       # master toggle (default true)
+  query: "#Unresolved"                # candidate query; MUST NOT filter by AI Agent
+  summary_prefixes: # summary prefixes an issue must start with
+    - "CI failure:"
+    - "Auto-fix:"
+  log_token_ref: forgejo-log-pat      # encrypted secret: Forgejo PAT (repo read scope). Required.
+  max_analysis_bytes: 24576           # cap on the posted analysis comment
+```
+
+| Key                  | Default                        | Meaning                                                              |
+|----------------------|--------------------------------|----------------------------------------------------------------------|
+| `enabled`            | `true`                         | Master toggle. While false the handler no-ops.                       |
+| `query`              | `#Unresolved`                  | YouTrack candidate query. MUST NOT filter by `AI Agent` (see above). |
+| `summary_prefixes`   | `["CI failure:", "Auto-fix:"]` | Summary prefixes an issue must start with to be analyzed.            |
+| `log_token_ref`      | none                           | Encrypted-secret name (CLAUDE-26) of a Forgejo PAT with repository read scope, used to fetch the log, resolve the run global id, and read the workflow YAML. Required; without it the handler no-ops. |
+| `max_analysis_bytes` | `24576`                        | Cap (bytes) on the posted analysis comment.                          |
+
+**Deployment prerequisite:** the runner's Forgejo must expose the v16 REST run-logs endpoint
+(`GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_id}/logs`, Forgejo PR 12666) and the runs-list endpoint. On a
+pre-v16 instance both 404 and the handler posts an "unavailable" note rather than crashing.
 
 ### `workdir_base` (string, optional)
 

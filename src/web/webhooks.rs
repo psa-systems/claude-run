@@ -990,6 +990,7 @@ fn decide_mint(
     let req = MintRequest {
         repo: &ev.repo,
         index_in_repo: ev.index_in_repo,
+        run_global_id: ev.run_global_id,
         commit_sha: &ev.commit_sha,
         workflow_id: &ev.workflow_id,
         html_url: &ev.html_url,
@@ -1702,6 +1703,9 @@ mod tests {
             unreachable!()
         }
         fn issue_links(&self, _key: &str) -> crate::error::Result<Vec<crate::provider::IssueLink>> {
+            unreachable!()
+        }
+        fn inspect_issue(&self, _key: &str) -> crate::error::Result<crate::provider::IssueInspect> {
             unreachable!()
         }
         fn resolve_vcs(

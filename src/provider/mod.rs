@@ -153,6 +153,19 @@ pub struct IssueLink {
     pub resolved: Option<i64>,
 }
 
+/// CLAUDE-189: an issue's body plus its comment texts, from
+/// `yt issue inspect --json`. Backs the ci-failure-analysis action, which parses
+/// the `## Failure` block and `Run-Global-Id:` marker out of `description` and
+/// detects its own hidden analyzed-marker (to stay idempotent) across
+/// `description` + `comments`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IssueInspect {
+    /// The issue's Markdown description / body.
+    pub description: String,
+    /// The text of each comment on the issue, in order.
+    pub comments: Vec<String>,
+}
+
 /// The YouTrack-side operations native handlers need. Backed by `yt` today; an
 /// MCP backend can implement the same surface later.
 pub trait IssueTracker: Send + Sync {
@@ -183,6 +196,11 @@ pub trait IssueTracker: Send + Sync {
     /// blocks a queued issue on any unmet dependency before it is cloned or handed
     /// to claude.
     fn issue_links(&self, key: &str) -> Result<Vec<IssueLink>>;
+
+    /// CLAUDE-189: read an issue's description and comment texts via
+    /// `yt issue inspect --json`. Backs the ci-failure-analysis action's
+    /// coordinate parsing and idempotent analyzed-marker detection.
+    fn inspect_issue(&self, key: &str) -> Result<IssueInspect>;
 
     /// Resolve a project's enabled VCS integration to a clonable repo. Errors
     /// [`Error::NoVcsIntegration`] when the project has none.

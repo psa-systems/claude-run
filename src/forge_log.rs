@@ -512,6 +512,186 @@ fn write_api_artifact(out_dir: &Path, target: &RunLogsApiTarget, text: &str) -> 
     Ok(path)
 }
 
+/// CLAUDE-189: where to list a repo's Action runs from, to resolve a run's
+/// GLOBAL id from its per-repo `index_in_repo`. The run web URL
+/// (`/actions/runs/{index}`) uses `index_in_repo`, but the v16 run-logs endpoint
+/// keys by the global `run.id`; a pre-existing "CI failure" issue (minted before
+/// the `Run-Global-Id:` marker shipped) carries only the index, so the analysis
+/// action resolves it here. Reads the API runs-list endpoint
+/// (`GET /api/v1/repos/{owner}/{repo}/actions/runs`), which lives on the API
+/// router where PATs work.
+#[derive(Debug, Clone)]
+pub struct RunsListApiTarget {
+    /// Forge origin, e.g. `https://dev.a8n.run`.
+    pub base_url: String,
+    /// `owner/repo`.
+    pub repo: String,
+    /// PAT with repository read scope.
+    pub token: String,
+}
+
+impl RunsListApiTarget {
+    /// Build a target from the run's `html_url`, deriving the forge origin like
+    /// [`RunLogsApiTarget::for_run`]. `None` when the origin cannot be derived.
+    pub fn for_run(html_url: &str, repo: &str, token: String) -> Option<Self> {
+        let base_url = base_from_html_url(html_url, repo)?;
+        Some(Self {
+            base_url,
+            repo: repo.to_string(),
+            token,
+        })
+    }
+
+    /// The runs-list URL for one page.
+    pub fn runs_url(&self, page: u32, limit: u32) -> String {
+        format!(
+            "{}/api/v1/repos/{}/actions/runs?page={}&limit={}",
+            self.base_url.trim_end_matches('/'),
+            self.repo,
+            page,
+            limit,
+        )
+    }
+}
+
+/// CLAUDE-189: outcome of resolving a run's global id from its per-repo index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunIdOutcome {
+    /// The global id for the requested `index_in_repo`.
+    Resolved(i64),
+    /// 401/403: the token was rejected.
+    AuthDenied(u16),
+    /// 404 (endpoint absent), or the index was not found in any page.
+    NotFound,
+    /// Transport / 5xx / unparseable body.
+    Failed(String),
+}
+
+/// Number of runs requested per page and the paging ceiling. `50 * 40 = 2000`
+/// most-recent runs are scanned, enough to reach a recently-minted "CI failure"
+/// issue's run; a run older than that resolves `NotFound` and the caller notes
+/// the log as unavailable rather than crashing.
+const RUNS_PAGE_LIMIT: u32 = 50;
+const RUNS_MAX_PAGES: u32 = 40;
+
+/// CLAUDE-189: resolve the GLOBAL run id for `index_in_repo` by paging the
+/// repo's Action runs list and matching each run's per-repo index. Terminal on
+/// 401/403/404 after one request; a transport error / 5xx / unparseable body is
+/// `Failed`. Pages until a match, an empty/short page (the last page), or the
+/// paging ceiling.
+pub fn resolve_run_global_id(
+    transport: &dyn LogTransport,
+    target: &RunsListApiTarget,
+    index_in_repo: i64,
+) -> Result<RunIdOutcome> {
+    for page in 1..=RUNS_MAX_PAGES {
+        let url = target.runs_url(page, RUNS_PAGE_LIMIT);
+        match transport.get_bytes(&url, Some(&target.token)) {
+            Ok((200, bytes)) => {
+                let runs = match parse_runs_list(&bytes) {
+                    Ok(r) => r,
+                    Err(e) => return Ok(RunIdOutcome::Failed(format!("parsing runs list: {e}"))),
+                };
+                if let Some(id) = runs.iter().find(|r| r.index == index_in_repo).map(|r| r.id) {
+                    return Ok(RunIdOutcome::Resolved(id));
+                }
+                // An empty or short page is the last page: the index is not here.
+                if runs.len() < RUNS_PAGE_LIMIT as usize {
+                    return Ok(RunIdOutcome::NotFound);
+                }
+            }
+            Ok((status @ (401 | 403), _)) => return Ok(RunIdOutcome::AuthDenied(status)),
+            Ok((404, _)) => return Ok(RunIdOutcome::NotFound),
+            Ok((status, body)) => {
+                return Ok(RunIdOutcome::Failed(format!(
+                    "status {status}, {} body bytes",
+                    body.len()
+                )))
+            }
+            Err(e) => return Ok(RunIdOutcome::Failed(e)),
+        }
+    }
+    Ok(RunIdOutcome::NotFound)
+}
+
+/// One run's (global id, per-repo index) pulled from the runs-list JSON.
+struct RunRef {
+    id: i64,
+    index: i64,
+}
+
+/// Parse the runs-list body into `(id, index)` pairs, tolerant of Forgejo's
+/// field naming: the per-repo index is `index_in_repo` (webhook shape) or one of
+/// `index` / `run_number` / `number`. Runs missing an `id` are skipped.
+fn parse_runs_list(bytes: &[u8]) -> std::result::Result<Vec<RunRef>, String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    // The endpoint returns `{ "workflow_runs": [...] }`; tolerate a bare array.
+    let arr = value
+        .get("workflow_runs")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for run in arr {
+        let Some(id) = run.get("id").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        let index = ["index_in_repo", "index", "run_number", "number"]
+            .iter()
+            .find_map(|k| run.get(*k).and_then(serde_json::Value::as_i64));
+        if let Some(index) = index {
+            out.push(RunRef { id, index });
+        }
+    }
+    Ok(out)
+}
+
+/// CLAUDE-189: candidate repo paths a failing workflow file may live under, tried
+/// in order. `workflow_id` is the payload's workflow filename (e.g. `check.yml`).
+const WORKFLOW_DIRS: &[&str] = &[
+    ".forgejo/workflows",
+    ".github/workflows",
+    ".gitea/workflows",
+];
+
+/// CLAUDE-189: fetch the failing workflow's YAML from the repo at the failing
+/// commit, read-only, so the analysis can map log position to workflow step
+/// order. Tries each known workflow directory via the API raw-file endpoint
+/// (`GET /api/v1/repos/{owner}/{repo}/raw/{path}?ref={commit}`) and returns the
+/// first that resolves 200, redacted. `None` when none resolve (the analysis
+/// proceeds over the log alone and says the YAML was unavailable). Never errors
+/// on a miss.
+pub fn fetch_workflow_yaml(
+    transport: &dyn LogTransport,
+    base_url: &str,
+    repo: &str,
+    commit: &str,
+    workflow_id: &str,
+    token: &str,
+    known_secrets: &[String],
+) -> Option<String> {
+    let base = base_url.trim_end_matches('/');
+    // A workflow_id already carrying a path segment is tried verbatim first.
+    let mut candidates: Vec<String> = Vec::new();
+    if workflow_id.contains('/') {
+        candidates.push(workflow_id.to_string());
+    }
+    for dir in WORKFLOW_DIRS {
+        candidates.push(format!("{dir}/{workflow_id}"));
+    }
+    for path in candidates {
+        let url = format!("{base}/api/v1/repos/{repo}/raw/{path}?ref={commit}");
+        if let Ok((200, bytes)) = transport.get_bytes(&url, Some(token)) {
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            if !text.trim().is_empty() {
+                return Some(redact(&text, known_secrets));
+            }
+        }
+    }
+    None
+}
+
 /// Redact secrets from `input`: first mask each known secret value verbatim,
 /// then redact token *shapes* (known prefixes, and high-entropy values that
 /// follow an auth keyword). Pure; the unit of the AC's redaction test.
@@ -828,6 +1008,185 @@ mod tests {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(8),
         }
+    }
+
+    // ---- CLAUDE-189: runs-list global-id resolution ----------------------
+
+    /// One queued bytes response: `(status, body)` or a transport error.
+    type BytesResponse = std::result::Result<(u16, Vec<u8>), String>;
+
+    /// A bytes transport that maps each request URL to a queued response by the
+    /// order requested. `get` panics so the resolver never uses the text route.
+    struct SeqBytesTransport {
+        responses: Mutex<VecDeque<BytesResponse>>,
+        urls: Mutex<Vec<String>>,
+    }
+
+    impl SeqBytesTransport {
+        fn new(responses: Vec<BytesResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                urls: Mutex::new(Vec::new()),
+            }
+        }
+        fn urls(&self) -> Vec<String> {
+            self.urls.lock().unwrap().clone()
+        }
+    }
+
+    impl LogTransport for SeqBytesTransport {
+        fn get(&self, url: &str, _t: Option<&str>) -> std::result::Result<HttpResponse, String> {
+            panic!("text route used for an API fetch: {url}");
+        }
+        fn get_bytes(
+            &self,
+            url: &str,
+            token: Option<&str>,
+        ) -> std::result::Result<(u16, Vec<u8>), String> {
+            assert_eq!(token, Some("test-pat"), "API fetch must send the token");
+            self.urls.lock().unwrap().push(url.to_string());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok((200, br#"{"workflow_runs":[]}"#.to_vec())))
+        }
+    }
+
+    fn runs_target() -> RunsListApiTarget {
+        RunsListApiTarget {
+            base_url: "https://dev.a8n.run".to_string(),
+            repo: "initech/chat".to_string(),
+            token: "test-pat".to_string(),
+        }
+    }
+
+    fn runs_page(runs: &[(i64, i64)]) -> Vec<u8> {
+        let items: Vec<String> = runs
+            .iter()
+            .map(|(id, index)| format!(r#"{{"id":{id},"index_in_repo":{index}}}"#))
+            .collect();
+        format!(r#"{{"workflow_runs":[{}]}}"#, items.join(",")).into_bytes()
+    }
+
+    #[test]
+    fn resolve_matches_index_to_global_id_on_first_page() {
+        // The CLAUDE-185 shape: index 4034 -> global id 21077.
+        let body = runs_page(&[(21099, 4036), (21077, 4034), (21050, 4030)]);
+        let transport = SeqBytesTransport::new(vec![Ok((200, body))]);
+        let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
+        assert_eq!(out, RunIdOutcome::Resolved(21077));
+        assert_eq!(
+            transport.urls().len(),
+            1,
+            "found on page 1, no further pages"
+        );
+    }
+
+    #[test]
+    fn resolve_pages_until_the_index_is_found() {
+        // A full page (50 entries) that misses, then a second page with the hit.
+        let mut full: Vec<(i64, i64)> = (0..50).map(|n| (90000 + n, 5000 + n)).collect();
+        // Ensure none on page 1 matches index 4034.
+        assert!(!full.iter().any(|(_, idx)| *idx == 4034));
+        let page1 = runs_page(&full);
+        full.clear();
+        let page2 = runs_page(&[(21077, 4034)]);
+        let transport = SeqBytesTransport::new(vec![Ok((200, page1)), Ok((200, page2))]);
+        let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
+        assert_eq!(out, RunIdOutcome::Resolved(21077));
+        assert_eq!(
+            transport.urls().len(),
+            2,
+            "paged once past the full first page"
+        );
+        assert!(transport.urls()[0].contains("page=1"));
+        assert!(transport.urls()[1].contains("page=2"));
+    }
+
+    #[test]
+    fn resolve_short_page_without_match_is_not_found() {
+        let body = runs_page(&[(1, 10), (2, 11)]); // short page, no 4034
+        let transport = SeqBytesTransport::new(vec![Ok((200, body))]);
+        let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
+        assert_eq!(out, RunIdOutcome::NotFound);
+        assert_eq!(
+            transport.urls().len(),
+            1,
+            "stopped at the last (short) page"
+        );
+    }
+
+    #[test]
+    fn resolve_auth_and_not_found_are_terminal() {
+        for status in [401_u16, 403] {
+            let transport = SeqBytesTransport::new(vec![Ok((status, Vec::new()))]);
+            let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
+            assert_eq!(out, RunIdOutcome::AuthDenied(status));
+        }
+        let transport = SeqBytesTransport::new(vec![Ok((404, Vec::new()))]);
+        let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
+        assert_eq!(out, RunIdOutcome::NotFound);
+    }
+
+    #[test]
+    fn resolve_transport_error_is_failed() {
+        let transport = SeqBytesTransport::new(vec![Err("connect refused".to_string())]);
+        let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
+        assert!(matches!(out, RunIdOutcome::Failed(r) if r.contains("connect refused")));
+    }
+
+    // ---- CLAUDE-189: workflow YAML fetch ---------------------------------
+
+    #[test]
+    fn workflow_yaml_tries_dirs_and_returns_first_hit_redacted() {
+        // First dir (.forgejo) 404s; second (.github) resolves. The YAML carries a
+        // token that must be redacted in the returned text.
+        let yaml =
+            "jobs:\n  check:\n    steps:\n      - run: echo ghp_abcdefghij0123456789ABCDEFG\n";
+        let transport = SeqBytesTransport::new(vec![
+            Ok((404, Vec::new())),
+            Ok((200, yaml.as_bytes().to_vec())),
+        ]);
+        let out = fetch_workflow_yaml(
+            &transport,
+            "https://dev.a8n.run",
+            "initech/chat",
+            "a456a957",
+            "check.yml",
+            "test-pat",
+            &[],
+        )
+        .expect("workflow yaml found");
+        assert!(out.contains("jobs:"));
+        assert!(
+            !out.contains("ghp_abcdefghij0123456789ABCDEFG"),
+            "token redacted"
+        );
+        assert!(out.contains(REDACTED));
+        let urls = transport.urls();
+        assert!(urls[0].contains(".forgejo/workflows/check.yml"));
+        assert!(urls[1].contains(".github/workflows/check.yml"));
+        assert!(urls[1].contains("ref=a456a957"));
+    }
+
+    #[test]
+    fn workflow_yaml_all_miss_returns_none() {
+        let transport = SeqBytesTransport::new(vec![
+            Ok((404, Vec::new())),
+            Ok((404, Vec::new())),
+            Ok((404, Vec::new())),
+        ]);
+        let out = fetch_workflow_yaml(
+            &transport,
+            "https://dev.a8n.run",
+            "initech/chat",
+            "a456a957",
+            "check.yml",
+            "test-pat",
+            &[],
+        );
+        assert!(out.is_none());
     }
 
     // ---- URL / base derivation -------------------------------------------

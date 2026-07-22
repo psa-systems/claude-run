@@ -52,6 +52,11 @@ pub struct MintRequest<'a> {
     pub repo: &'a str,
     /// The run's per-repo index (one half of the primary dedupe key).
     pub index_in_repo: i64,
+    /// CLAUDE-189: the run's GLOBAL id (`run.id`), embedded as a hidden
+    /// `Run-Global-Id:` marker so the ci-failure-analysis action can address the
+    /// v16 REST run-logs endpoint (keyed by the global id) without re-resolving
+    /// it from the runs-list API. `0` when unknown (never emitted then).
+    pub run_global_id: i64,
     /// Failing commit SHA (part of the secondary dedupe key).
     pub commit_sha: &'a str,
     /// Workflow filename, e.g. `ci.yml` (part of the secondary dedupe key).
@@ -578,7 +583,7 @@ fn build_description(
         Some(group) => format!("Dedupe-Key: {primary} {secondary} {group}"),
         None => format!("Dedupe-Key: {primary} {secondary}"),
     };
-    [
+    let mut lines = vec![
         "## Triage".to_string(),
         format!(
             "Bucket: `{}` (classified by {:?}).",
@@ -597,8 +602,19 @@ fn build_description(
         String::new(),
         "<!-- claude-run dedupe markers; do not edit -->".to_string(),
         dedupe_keys,
-    ]
-    .join("\n")
+    ];
+    push_run_global_id_marker(&mut lines, req);
+    lines.join("\n")
+}
+
+/// CLAUDE-189: append the hidden `Run-Global-Id:` marker under the dedupe-marker
+/// comment block when the run's global id is known (`> 0`). The
+/// ci-failure-analysis action reads it to address the v16 run-logs endpoint
+/// directly; pre-existing issues without it fall back to index resolution.
+fn push_run_global_id_marker(lines: &mut Vec<String>, req: &MintRequest) {
+    if req.run_global_id > 0 {
+        lines.push(format!("Run-Global-Id: {}", req.run_global_id));
+    }
 }
 
 /// CLAUDE-104: the implementation-spec body for an auto-fixable failure. Names
@@ -672,6 +688,7 @@ fn build_auto_fix_description(
     lines.push(String::new());
     lines.push("<!-- claude-run dedupe markers; do not edit -->".to_string());
     lines.push(dedupe_keys);
+    push_run_global_id_marker(&mut lines, req);
     lines.join("\n")
 }
 
@@ -795,6 +812,9 @@ mod tests {
         fn issue_links(&self, _key: &str) -> Result<Vec<crate::provider::IssueLink>> {
             unreachable!("mint does not read issue links")
         }
+        fn inspect_issue(&self, _key: &str) -> Result<crate::provider::IssueInspect> {
+            unreachable!("mint does not inspect issues")
+        }
         fn resolve_vcs(&self, _project_key: &str) -> Result<VcsRepo> {
             unreachable!("mint does not resolve vcs")
         }
@@ -894,6 +914,7 @@ mod tests {
         MintRequest {
             repo,
             index_in_repo: 7,
+            run_global_id: 0,
             commit_sha: "abc123def456",
             workflow_id: "ci.yml",
             html_url: "https://dev.a8n.run/owner/repo/actions/runs/7",
@@ -1062,6 +1083,47 @@ mod tests {
         assert_ne!(p, s);
         // Stable across calls (same inputs -> same marker).
         assert_eq!(p, primary_marker(&r));
+    }
+
+    // ---- CLAUDE-189: the hidden Run-Global-Id marker ----------------------
+
+    #[test]
+    fn description_embeds_run_global_id_marker_when_known() {
+        let t = triage(TriageBucket::CodeFix);
+        let mut r = req("owner/repo", &t, "alice");
+        r.run_global_id = 21077;
+        let p = primary_marker(&r);
+        let s = secondary_marker(&r);
+        let body = build_description(&r, &p, &s, None);
+        assert!(
+            body.contains("Run-Global-Id: 21077"),
+            "known global id is embedded as a hidden marker: {body}"
+        );
+
+        // The auto-fix body carries it too.
+        let af = auto_fix_triage(cargo_fmt_detail());
+        let mut r = req("owner/repo", &af, "alice");
+        r.run_global_id = 21077;
+        let body = build_description(&r, &p, &s, None);
+        assert!(
+            body.contains("Run-Global-Id: 21077"),
+            "auto-fix body embeds the marker too: {body}"
+        );
+    }
+
+    #[test]
+    fn description_omits_run_global_id_marker_when_unknown() {
+        // Pre-existing / index-only issues (global id 0) emit no marker; the
+        // analysis action falls back to runs-list resolution for them.
+        let t = triage(TriageBucket::CodeFix);
+        let r = req("owner/repo", &t, "alice"); // run_global_id: 0
+        let p = primary_marker(&r);
+        let s = secondary_marker(&r);
+        let body = build_description(&r, &p, &s, None);
+        assert!(
+            !body.contains("Run-Global-Id"),
+            "no marker when unknown: {body}"
+        );
     }
 
     // ---- AC 5: bucket 3 mints nothing -------------------------------------
