@@ -1,0 +1,75 @@
+---
+# CI-failure auto-close reconciler (CLAUDE-191).
+#
+# Native action (`kind: ci-failure-reconcile`) routing to the built-in Rust
+# handler in `src/native/ci_failure_reconcile.rs`. This file is config only and
+# carries no script-bearing fields (input.command / filter / pre / prompt /
+# post).
+#
+# The mint path only ever observes CI failures, so a stale open "CI failure" /
+# "Auto-fix" issue is closed by hand today. On a schedule this handler closes it
+# automatically once its failing job is green again:
+#   gather  -> yt list --query <query> --json, keep matching-prefix issues, then
+#              inspect each and read the hidden `Branch:` / `Job:` markers (plus
+#              the `## Failure` block's Repo / Workflow / Run). A pre-rekey issue
+#              with no parseable branch/job is skipped (left for manual close).
+#   scan    -> for each allow-listed repo, page the runs list and reduce it to the
+#              LATEST run per (branch, workflow_id); when `head_branch` is null the
+#              branch is resolved from the run's log (bounded by
+#              max_branch_resolves).
+#   green   -> read each latest run's per-job status from the jobs endpoint; a job
+#              whose status is `success` is a now-green (branch, workflow, job).
+#   close   -> every open issue whose (repo, branch, workflow, job) exactly matches
+#              a now-green job is set to `resolved_state` and gets a run-linked
+#              comment. Idempotent: an already-closed issue is skipped.
+#
+# Only the LATEST run decides: a newer failure after an older green run leaves the
+# job red and the issue open. All runs-list / jobs / log reads go through
+# `forge_log` (Rust), never a raw REST call from a nu snippet (tooling-gap rule,
+# FJ-22). The reconciler performs no git/PR actions and does not depend on the
+# CLAUDE-189 analysis having run.
+
+name: ci-failure-reconcile
+
+kind: ci-failure-reconcile
+
+native:
+  # Master enable toggle (default true).
+  enabled: true
+  # YouTrack candidate query. MUST NOT filter by `AI Agent`; summary-prefix and
+  # marker filtering happens in the handler.
+  query: "#Unresolved"
+  # Summary prefixes an issue must start with to be reconciled.
+  summary_prefixes:
+    - "CI failure:"
+    - "Auto-fix:"
+  # Allow-list of `owner/repo` full names whose runs are scanned. Each entry is an
+  # exact `owner/repo`, a per-owner `owner/*`, or the global `*`. Empty scans
+  # nothing.
+  repos:
+    - contoso/claude-run
+  # Name of the encrypted secret (CLAUDE-26) holding a Forgejo PAT with repository
+  # read scope, used to page the runs list, read the jobs endpoint, and resolve a
+  # null-branch run's branch from its log. Required; without it the handler
+  # no-ops.
+  log_token_ref: forgejo-log-pat
+  # State set on a closed issue (the CLAUDE project's only resolved State).
+  resolved_state: Done
+  # Run-linked auto-close comment template. {run_index} / {branch} / {run_url} /
+  # {job} are substituted from the now-green run; a hidden marker is appended.
+  close_comment: "Auto-closed: run #{run_index} on `{branch}` succeeded ({run_url}); the failing `{job}` is green, root cause resolved."
+  # Cap on the number of runs whose branch is resolved from the log per repo, to
+  # bound log fetches when the runs list returns `head_branch` null. Reached-cap
+  # is logged, never silent.
+  max_branch_resolves: 40
+
+output:
+  file: ci-failure-reconcile.jsonl
+
+# Poll on an interval, like the other native actions.
+schedule:
+  kind: interval
+  spec: 30m
+
+limits:
+  max_runs_per_day: 50

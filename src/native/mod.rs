@@ -16,6 +16,7 @@
 //! outcome records and JSONL output stay byte-identical to the scripted path.
 
 pub mod ci_failure_analysis;
+pub mod ci_failure_reconcile;
 pub mod forgejo_ci_fix;
 pub mod youtrack;
 
@@ -71,6 +72,9 @@ fn handler_for(kind: ActionKind) -> Option<Box<dyn NativeHandler>> {
         ActionKind::CiFailureAnalysis => {
             Some(Box::new(ci_failure_analysis::CiFailureAnalysisHandler))
         }
+        ActionKind::CiFailureReconcile => {
+            Some(Box::new(ci_failure_reconcile::CiFailureReconcileHandler))
+        }
     }
 }
 
@@ -108,5 +112,10 @@ mod tests {
     #[test]
     fn ci_failure_analysis_has_a_native_handler() {
         assert!(handler_for(ActionKind::CiFailureAnalysis).is_some());
+    }
+
+    #[test]
+    fn ci_failure_reconcile_has_a_native_handler() {
+        assert!(handler_for(ActionKind::CiFailureReconcile).is_some());
     }
 }
