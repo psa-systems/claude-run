@@ -337,6 +337,21 @@ rate-limited) -> internal-route log fetch + redaction -> hybrid triage -> issue 
 scheduled `youtrack` / `forgejo-ci-fix` actions remain the backstop and dedupe against webhook-minted issues through the
 same hidden markers, so a poll that races the webhook never files a second issue.
 
+**CLAUDE-190: dedup keys on the failure, not the commit.** The cross-run collapse key is
+`hash(repo, branch, workflow_id, job_name, failure_signature)`, so N commits that each fail the same job on the same
+branch with the same failure collapse onto ONE open issue (later runs append a run-association comment instead of minting
+a duplicate), while a genuinely different failure signature on the same job stays a separate issue. The
+`failure_signature` is a deterministic, pure-string signature of the first diagnostic line in the redacted log
+(lowercased, path prefixes dropped, digit runs masked, whitespace collapsed): no LLM, computed on every event. When no
+diagnostic line is derivable (a truncated / diagnostic-free / logless failure) the key falls back to
+`hash(repo, branch, workflow_id, job_name)`, which still collapses a "branch is broken" storm onto one issue (two
+indistinguishable logless failures on the same job are intentionally grouped; the CLAUDE-189 analysis can later split a
+mis-grouped issue). The branch is read from the run's log checkout section (`GITHUB_REF=refs/heads/<branch>`; the deployed
+Forgejo returns `head_branch: null` from run detail) and the job name/index from the jobs API, both resolved in Rust. The
+issue body carries hidden `Dedupe-Key:`, `Root-Cause-Key:`, `Branch:`, `Job:`, and `Run-Global-Id:` markers so the
+CLAUDE-191 auto-close reconciler can find every issue for a `(repo, branch, workflow, job)`; a resolved issue is never
+reopened.
+
 The listener is multi-source (CLAUDE-87): each `<source>` is a `[webhook.sources.<source>]` config block with its own
 HMAC secret and allow-list, served at its own URL path. One Forgejo org webhook per source means a leaked org secret
 authenticates only that org's allow-listed payloads, and each source has its own rate-limit bucket so one org's failure
@@ -398,8 +413,9 @@ and the delivery instruction: commit on a fresh `chore/<kind>-<short-sha>` branc
 configured PR strategy (CLAUDE-103), never a direct push to main. The `has_open_pr == true` case is handled by CLAUDE-149
 instead: this auto-fix path applies only when there is no open PR. When a PR is already open the webhook `code_fix` route
 is suppressed (a human's PR is left to its author), and `forgejo-ci-fix` separately fixes the bot's own failing PRs,
-iterating until green or flagging Needs Review. Dedupe markers are unchanged, so repeats of the same
-`(repo, workflow_id, commit_sha)` still group.
+iterating until green or flagging Needs Review. Repeats of the same failure group by the CLAUDE-190 root-cause key
+(`hash(repo, branch, workflow_id, job_name, failure_signature)`), not the commit SHA, so an auto-fix failure that recurs
+on a later commit lands on the same open issue.
 
 ### Deep CI-failure analysis (CLAUDE-189)
 

@@ -508,6 +508,13 @@ pub async fn consume_events(
             continue;
         };
         let artifact = log_artifact.clone();
+        // CLAUDE-190: resolve the failing job's name/index via the jobs API so
+        // the root-cause dedupe key is job-scoped (best-effort: an unavailable
+        // endpoint degrades to a job-agnostic key, which still collapses the
+        // storm). The branch and the failure signature are derived from the log
+        // inside `decide_mint`.
+        let (job_name, job_index) =
+            resolve_failing_job_meta(&pool, &webhook_cfg, &cfg, transport.clone(), &ev).await;
         let result = triage_and_mint(
             ctx,
             run_id,
@@ -517,6 +524,8 @@ pub async fn consume_events(
             log_artifact,
             log_unavailable_reason,
             webhook_cfg.auto_fix,
+            job_name,
+            job_index,
         )
         .await;
         finish_webhook_run(
@@ -695,6 +704,83 @@ async fn resolve_log_token(pool: &SqlitePool, name: &str) -> crate::error::Resul
     Ok(token.trim().to_string())
 }
 
+/// CLAUDE-190: the source's `log_token_ref` decrypted, or `None` when the source
+/// has no token configured or it cannot be resolved. Used for the jobs-API fetch
+/// on a private repo (a public repo reads the endpoint unauthenticated).
+async fn source_log_token(
+    pool: &SqlitePool,
+    webhook_cfg: &WebhookConfig,
+    source: &str,
+) -> Option<String> {
+    let token_ref = webhook_cfg
+        .sources
+        .get(source)
+        .and_then(|s| s.log_token_ref.clone())?;
+    match resolve_log_token(pool, &token_ref).await {
+        Ok(t) => Some(t),
+        Err(e) => {
+            warn!(source = %source, token_ref = %token_ref, error = %e, "resolving log token for job resolution failed");
+            None
+        }
+    }
+}
+
+/// CLAUDE-190: resolve the failing job's `(name, index)` for the root-cause
+/// dedupe key via the jobs API. Best-effort: `("", DEFAULT_JOB_INDEX)` on any
+/// miss (no run global id, no token on a private repo, pre-v16, transport
+/// error), so the key degrades to a job-agnostic form that still collapses a
+/// branch-broken storm onto one issue. Resolution stays in Rust (no raw REST
+/// from a nu snippet, per the tooling-gap rule).
+async fn resolve_failing_job_meta(
+    pool: &SqlitePool,
+    webhook_cfg: &WebhookConfig,
+    fetch_cfg: &crate::forge_log::LogFetchConfig,
+    transport: Arc<dyn crate::forge_log::LogTransport>,
+    ev: &VerifiedFailureEvent,
+) -> (String, u64) {
+    use crate::forge_log::{JobsOutcome, RunJobsApiTarget, DEFAULT_JOB_INDEX};
+    let miss = (String::new(), DEFAULT_JOB_INDEX);
+    if ev.run_global_id <= 0 {
+        return miss;
+    }
+    let token = if ev.private {
+        source_log_token(pool, webhook_cfg, &ev.source).await
+    } else {
+        None
+    };
+    let Some(target) = RunJobsApiTarget::for_run(&ev.html_url, &ev.repo, ev.run_global_id, token)
+    else {
+        return miss;
+    };
+    let fetch_cfg = fetch_cfg.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        crate::forge_log::fetch_run_jobs(
+            transport.as_ref(),
+            &fetch_cfg,
+            &target,
+            std::thread::sleep,
+        )
+    })
+    .await;
+    match out {
+        Ok(Ok(JobsOutcome::Resolved(jobs))) => {
+            crate::forge_log::resolve_failing_job(&jobs).unwrap_or(miss)
+        }
+        Ok(Ok(other)) => {
+            debug!(repo = %ev.repo, run = ev.index_in_repo, outcome = ?other, "jobs endpoint did not resolve; root-cause key is job-agnostic");
+            miss
+        }
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "jobs-list fetch failed; root-cause key is job-agnostic");
+            miss
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "jobs-list fetch task panicked; root-cause key is job-agnostic");
+            miss
+        }
+    }
+}
+
 /// CLAUDE-61: open the `runs` row for one webhook event and stamp its
 /// single planned job key. CLAUDE-80: also registers the job in-flight (so the
 /// run-detail badge reads `running`, not `queued`, for the whole pipeline) and
@@ -848,6 +934,8 @@ async fn triage_and_mint(
     log_artifact: Option<PathBuf>,
     log_unavailable_reason: Option<String>,
     auto_fix_enabled: bool,
+    job_name: String,
+    job_index: u64,
 ) -> WebhookRunSummary {
     // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
     // run's (repo, index); the daily ledger is per synthetic action. The
@@ -913,6 +1001,8 @@ async fn triage_and_mint(
             log_unavailable_reason,
             has_open_pr,
             auto_fix_enabled,
+            &job_name,
+            job_index,
             &report_stage,
         )
     })
@@ -966,8 +1056,17 @@ fn decide_mint(
     log_unavailable_reason: Option<String>,
     has_open_pr: bool,
     auto_fix_enabled: bool,
+    job_name: &str,
+    job_index: u64,
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
 ) -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
+    // CLAUDE-190: derive the deterministic failure signature and the branch from
+    // the redacted log before it is moved into the triage input. The branch's
+    // run-detail source is `None` here: the deployed Forgejo returns
+    // `head_branch: null`, so the log checkout section is the reliable source
+    // (`resolve_branch` keeps the run-detail arm for instances that populate it).
+    let failure_signature = crate::mint::failure_signature(&log_text);
+    let branch = crate::forge_log::resolve_branch(None, &log_text).unwrap_or_default();
     let input = TriageInput {
         repo: ev.repo.clone(),
         workflow_id: ev.workflow_id.clone(),
@@ -993,6 +1092,10 @@ fn decide_mint(
         run_global_id: ev.run_global_id,
         commit_sha: &ev.commit_sha,
         workflow_id: &ev.workflow_id,
+        branch: &branch,
+        job_name,
+        job_index,
+        failure_signature: failure_signature.as_deref(),
         html_url: &ev.html_url,
         trigger_user: &ev.trigger_user,
         triage: &verdict,
@@ -1796,6 +1899,8 @@ mod tests {
             Some("private repo: unauthorized".to_string()),
             false,
             true, // auto_fix_enabled
+            "",
+            0,
             &|_| {},
         )
         .unwrap();
@@ -1836,6 +1941,8 @@ mod tests {
             None,
             true,
             true, // auto_fix_enabled
+            "",
+            0,
             &|_| {},
         )
         .unwrap();
@@ -1865,6 +1972,8 @@ mod tests {
             None,
             false, // has_open_pr: no PR, so the code_fix route still queues
             true,  // auto_fix_enabled
+            "",
+            0,
             &|_| {},
         )
         .unwrap();
@@ -1909,6 +2018,8 @@ mod tests {
             None,
             false,
             true, // auto_fix_enabled
+            "",
+            0,
             &|_| {},
         )
         .unwrap();
@@ -1952,6 +2063,8 @@ mod tests {
             None,
             false, // has_open_pr: push to main, no PR
             true,  // auto_fix_enabled
+            "",
+            0,
             &|_| {},
         )
         .unwrap();
@@ -2006,6 +2119,8 @@ mod tests {
             None,
             true, // has_open_pr: a failing open PR
             true, // auto_fix_enabled
+            "",
+            0,
             &|_| {},
         )
         .unwrap();
@@ -2043,6 +2158,8 @@ mod tests {
             None,
             false, // has_open_pr: no PR; the toggle, not open-PR, does the gating
             false, // auto_fix_enabled: OFF
+            "",
+            0,
             &|_| {},
         )
         .unwrap();
@@ -2496,6 +2613,8 @@ mod tests {
             None,
             true,
             true, // auto_fix_enabled
+            "",
+            0,
             &report,
         )
         .unwrap();
@@ -2526,6 +2645,8 @@ mod tests {
             None,
             true,
             true, // auto_fix_enabled
+            "",
+            0,
             &report,
         )
         .unwrap();
