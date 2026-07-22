@@ -674,6 +674,12 @@ fn native_source_key(action: &crate::action::Action) -> Option<String> {
                 repos.join(",")
             ))
         }
+        NativeConfig::CiFailureAnalysis(cfg) => {
+            // Two analysis actions gather the same jobs iff they scan with the
+            // same query (the summary-prefix + analyzed-marker filtering is
+            // identical logic), so the query is the source key.
+            Some(format!("ci-failure-analysis\u{1f}{}", cfg.query))
+        }
     }
 }
 

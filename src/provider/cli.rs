@@ -268,6 +268,33 @@ struct InspectLinks {
     links: Vec<RawLink>,
 }
 
+/// CLAUDE-189: the `issue` + `comments` of `yt issue inspect --json`, for the
+/// ci-failure-analysis action. Only the description and each comment's text are
+/// consumed; `links` and the rest are ignored here (parsed separately by
+/// [`InspectLinks`]).
+#[derive(Debug, Deserialize)]
+struct InspectBody {
+    #[serde(default)]
+    issue: InspectIssue,
+    #[serde(default)]
+    comments: Vec<InspectComment>,
+}
+
+/// The `issue` object of the inspect JSON. Only the description is read.
+#[derive(Debug, Default, Deserialize)]
+struct InspectIssue {
+    #[serde(default)]
+    description: String,
+}
+
+/// One `comments[]` entry. Forgejo/YouTrack name the body `text`; a couple of
+/// fallbacks keep the parse tolerant across `yt` versions.
+#[derive(Debug, Deserialize)]
+struct InspectComment {
+    #[serde(default, alias = "content", alias = "body")]
+    text: String,
+}
+
 /// One `links[]` entry: the resolved `direction` / `verb` (YT-40) plus the linked
 /// issues that entry connects to.
 #[derive(Debug, Deserialize)]
@@ -912,6 +939,15 @@ impl IssueTracker for CliBackend {
             }
         }
         Ok(out)
+    }
+
+    fn inspect_issue(&self, key: &str) -> Result<super::IssueInspect> {
+        let stdout = self.yt_ok(&["issue", "inspect", key, "--json"])?;
+        let parsed: InspectBody = Self::parse_json(&self.yt, "yt issue inspect --json", &stdout)?;
+        Ok(super::IssueInspect {
+            description: parsed.issue.description,
+            comments: parsed.comments.into_iter().map(|c| c.text).collect(),
+        })
     }
 
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo> {
