@@ -444,6 +444,29 @@ posted comment. Configure it in `actions/ci-failure-analysis.yml` (`log_token_re
 `query` / `summary_prefixes` / `max_analysis_bytes` tune selection and the comment cap). See `actions/SCHEMA.md`
 (`kind: ci-failure-analysis`).
 
+### Auto-close of fixed CI-failure issues (CLAUDE-191)
+
+The mint path keeps only `action_run_failure` events and drops every success, so nothing in claude-run ever observes a
+run going green: a "CI failure" / "Auto-fix" issue whose root cause is later fixed stays open until a human closes it by
+hand. The `ci-failure-reconcile` native action (`kind: ci-failure-reconcile`, `src/native/ci_failure_reconcile.rs`) closes
+that gap. On a schedule it scans open CI-failure issues, reads each issue's hidden `Branch:` / `Job:` markers (the
+CLAUDE-190 rekey markers; a pre-rekey issue with no parseable branch/job is left for manual close), then for each
+allow-listed repo pages the Forgejo runs list, reduces it to the LATEST run per `(branch, workflow_id)`, and reads that
+run's per-job status from the jobs endpoint. Every open issue whose `(repo, branch, workflow, job)` is `success` on its
+latest run is closed: State set to `resolved_state` (default `Done`) and a run-linked comment posted ("Auto-closed: run
+#N on `<branch>` succeeded ...; the failing `<job>` is green, root cause resolved.").
+
+Only the LATEST run decides, so a newer failure after an older green run leaves the job red and the issue open; matching is
+exact on all four of `(repo, branch, workflow, job)`, so a green sibling branch or job never closes a still-broken issue.
+The close is idempotent (a resolved issue drops out of the `#Unresolved` scan, and a hidden auto-closed marker guards
+against a re-comment). When the runs list returns `head_branch` null (the deployed Forgejo), the branch is resolved from
+the run's log checkout section, bounded by `max_branch_resolves`. The reconciler is polling by design (a success webhook
+can be missed or arrive out of order, and success events are dropped at the ingress; polling reflects current truth); it
+performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. All runs-list / jobs / log reads stay
+inside `forge_log` (Rust), never a raw REST call from a nu snippet (FJ-22). Configure it in
+`actions/ci-failure-reconcile.yml` (`repos` names the allow-list, `log_token_ref` the Forgejo PAT secret). See
+`actions/SCHEMA.md` (`kind: ci-failure-reconcile`).
+
 ### Migration from the single-source listener (CLAUDE-87)
 
 This is a **breaking config change**: the old top-level `webhook.secret_ref` / `webhook.allowed_repos` /

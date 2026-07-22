@@ -680,6 +680,17 @@ fn native_source_key(action: &crate::action::Action) -> Option<String> {
             // identical logic), so the query is the source key.
             Some(format!("ci-failure-analysis\u{1f}{}", cfg.query))
         }
+        NativeConfig::CiFailureReconcile(cfg) => {
+            // Two reconcilers gather the same work iff they scan the same issue
+            // query over the same repo set (order-irrelevant, so sorted).
+            let mut repos = cfg.repos.clone();
+            repos.sort();
+            Some(format!(
+                "ci-failure-reconcile\u{1f}{}\u{1f}{}",
+                cfg.query,
+                repos.join(",")
+            ))
+        }
     }
 }
 
