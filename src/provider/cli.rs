@@ -460,15 +460,19 @@ impl CliBackend {
         match candidates.len() {
             1 => Ok(candidates.pop().unwrap()),
             0 => Err(Error::Other(anyhow::anyhow!(
+                // CLAUDE-193: state the condition, not an outcome the later
+                // `cleanup_or_preserve` decision can contradict.
                 "no feature branch with commits ahead of `{base_ref}`; the agent \
-                 produced no branch or no commits (base `{base_branch}`). The work, \
-                 if any, is preserved in the workdir `{}` for recovery.",
+                 produced no branch or no commits (base `{base_branch}`). Any \
+                 unpushed work in the workdir `{}` is preserved; branches already \
+                 pushed remain on the remote.",
                 workdir.display()
             ))),
             _ => Err(Error::Other(anyhow::anyhow!(
                 "multiple candidate feature branches ahead of `{base_ref}`: {}; \
-                 refusing to guess which to open a PR for. The workdir `{}` is \
-                 preserved for recovery.",
+                 refusing to guess which to open a PR for. Any unpushed work in \
+                 the workdir `{}` is preserved; branches already pushed remain on \
+                 the remote.",
                 candidates.join(", "),
                 workdir.display()
             ))),
@@ -501,8 +505,13 @@ impl CliBackend {
     /// absent -> push + create; local fast-forwards or equals remote -> (fast-
     /// forward) push then find-or-create the PR; diverged (or remote-ahead) ->
     /// never push, adopt an already-open PR for the branch if one exists, else
-    /// fail loudly naming both SHAs and the preserved workdir. No `--force` /
+    /// fail loudly naming both SHAs and the workdir. No `--force` /
     /// `--force-with-lease` is ever issued.
+    ///
+    /// CLAUDE-193: the error text states the retention CONDITION ("any unpushed
+    /// work in the workdir is preserved; branches already pushed remain on the
+    /// remote"), never a flat outcome, because `cleanup_or_preserve` makes the
+    /// keep-or-delete decision later and can legitimately delete the directory.
     fn create_pr_branch(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
         let branch = self.resolve_feature_branch(workdir)?;
 
@@ -541,8 +550,9 @@ impl CliBackend {
                         None => Err(Error::Other(anyhow::anyhow!(
                             "remote branch `{branch}` has diverged from the local work \
                              (local {local_sha}, remote {remote_sha}) and no open PR exists \
-                             for it; refusing to force-push over it. The work is preserved in \
-                             the workdir `{}` for recovery.",
+                             for it; refusing to force-push over it. Any unpushed work in the \
+                             workdir `{}` is preserved; branches already pushed remain on the \
+                             remote.",
                             workdir.display()
                         ))),
                     }
