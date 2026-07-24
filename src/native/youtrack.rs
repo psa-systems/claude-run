@@ -549,7 +549,9 @@ fn forge_access_check(
 /// each resolved repo, once per repo per poll, and drops the repo's issues when
 /// it cannot. `AI Agent` is left at `Queued` on that path: the condition is a
 /// missing permission grant, not a defect in the issue, so the next poll after
-/// the grant picks it up with no manual field edit.
+/// the grant picks it up with no manual field edit. CLAUDE-196: the probe covers
+/// repository read only; the PR path also needs the issue scope (`actions/SCHEMA.md`,
+/// "Forgejo token scopes"), so passing it does not prove the token can open a PR.
 ///
 /// Returns the eligible jobs plus the CLAUDE-147 input-phase events (the
 /// per-project probe failures and no-VCS drops) that the caller persists to

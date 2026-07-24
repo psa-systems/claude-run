@@ -192,7 +192,7 @@ native:
 | `youtrack.dependencies.recheck_timeout` | `5m`              | Humantime backoff before a blocked issue is re-evaluated. While the window is open the issue stays Queued with no `yt` read and no comment (no per-poll spam). Validated at action load. |
 | `youtrack.dependencies.block_on` | `["depends on", "parent for"]` | Direction-resolved link verbs (YT-40) that block. A queued issue is blocked when it has any link whose `verb` is listed here and whose target is unresolved. The defaults block `depends on` (Depend INWARD, an open blocker) and `parent for` (Subtask OUTWARD, an open child); the reverse verbs `is required for` and `subtask of` never block. |
 | `forgejo.base_url`      | per-issue VCS host                 | Forgejo base URL.                                                                                   |
-| `forgejo.token_ref`     | none                               | Name of an encrypted secret holding the Forgejo API token (CLAUDE-26). `None` uses host `fj` auth.  |
+| `forgejo.token_ref`     | none                               | Name of an encrypted secret holding the Forgejo API token (CLAUDE-26). `None` uses host `fj` auth. The token must carry the **`write:repository`** and **`write:issue`** scopes (see [Forgejo token scopes](#forgejo-token-scopes-claude-196)). |
 | `forgejo.pr_strategy`   | `branch`                           | PR-creation strategy (CLAUDE-103). `branch`: resolve the feature branch by name (independent of the current `HEAD`; CLAUDE-166), push it as `git push --set-upstream origin <branch>:<branch>`, and open the PR over the API with an explicit `--head`, so the PR stays mergeable and updatable. `agit`: `fj pr create -aA`, a branchless PR whose head lives only at `refs/pull/<N>/head` and loses its merge button if it falls behind an up-to-date base. The selected strategy is authoritative (no silent cross-strategy fallback). |
 | `github.hosts`          | empty                              | Extra GitHub host(s) beyond `github.com` to treat as GitHub (e.g. GitHub Enterprise). Bare hosts.   |
 | `github.mcp_endpoint`   | `https://api.githubcopilot.com/mcp/` | Remote GitHub MCP endpoint used to open the PR (no local server to install).                      |
@@ -211,6 +211,39 @@ prompt is sent to the agent; an unknown placeholder (or an unterminated `{{`) is
 | `{{workdir}}`            | Absolute path of the per-job working directory (the repo is cloned here).     |
 | `{{needs_review_marker}}`| The `.claude-run-needs-review` marker filename.                               |
 | `{{skip_attempt_marker}}`| The `.claude-run-skip-attempt` marker filename.                               |
+
+##### Forgejo token scopes (CLAUDE-196)
+
+The token named by `forgejo.token_ref` (or the host `keys.json` entry `fj` falls back to) must carry
+**`write:repository`** and **`write:issue`**, in the labels the deployed Forgejo's token UI uses (verified against
+Forgejo `16.0.0+gitea-1.22.0`, `models/auth/access_token_scope.go`). Forgejo scopes API endpoints by category, not by
+`fj` command name, and the runner's PR path crosses two categories: `fj pr search` and `fj pr comment` are backed by the
+**issues** API even though they name a PR. A repository-only token passes the CLAUDE-194 preflight and `fj pr create`
+and then fails the CLAUDE-170 open-PR lookup with `403 Forbidden`.
+
+Every `fj` command the runner issues, the fj-source call it makes, and the category Forgejo routes that endpoint under
+(`routers/api/v1/api.go`: the repository group, and the separate `/repos` group carrying
+`tokenRequiresScopes(...CategoryIssue)`):
+
+| `fj` command (`src/provider/cli.rs`)             | fj source call                                             | Forgejo endpoint                                     | Scope category    |
+|--------------------------------------------------|-------------------------------------------------------------|--------------------------------------------------------|--------------------|
+| `repo view <repo> --json` (`:1154`)              | `fj_core::repo::get` -> `repo_get`                          | `GET /repos/{o}/{r}`                                   | repository (read)  |
+| `pr create <title> --body-file .. --head <b> --json` (`:698`) | `fj_core::prs::create` -> `repo_create_pull_request` | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
+| `pr create -aA --json` (AGit, `:725`)            | same as above                                                | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
+| `pr search --repo <r> --state open --json` (`:1173`) | `fj_core::issues::list_page` -> `issue_list_issues` (`type=pulls`), then one `prs::get` per hit | `GET /repos/{o}/{r}/issues?type=pulls`, `GET /repos/{o}/{r}/pulls/{i}` | **issue (read)** + repository (read) |
+| `pr status <id> --json` (`:1191`)                | `prs::get` + `prs::get_commit_statuses`                      | `GET /repos/{o}/{r}/pulls/{i}`, `GET /repos/{o}/{r}/commits/{sha}/status` | repository (read)  |
+| `pr merge <id> --method merge --delete` (`:1222`) | `repo::get` + `prs::get` + `prs::merge` -> `repo_merge_pull_request` | `POST /repos/{o}/{r}/pulls/{i}/merge`          | repository (write) |
+| `pr comment <id> --body-file <f>` (`:1263`)      | `fj_core::issues::create_comment` -> `issue_create_comment`  | `POST /repos/{o}/{r}/issues/{i}/comments`              | **issue (write)**  |
+| `pr edit <id> labels --add <label>` (`:1283`)    | `fj_core::issues::edit_labels` -> `issue_list_labels` + `issue_add_label` | `GET /repos/{o}/{r}/labels`, `POST /repos/{o}/{r}/issues/{i}/labels` | **issue (write)**  |
+| `pr view <id> --json` (`:1299`)                  | `prs::get` + `prs::list_files` + `repo::get`                 | `GET /repos/{o}/{r}/pulls/{i}`, `.../files`            | repository (read)  |
+
+Two things the token does **not** have to cover: the `git push` in front of `pr create` authenticates with the daemon
+host's own git credentials, not this token (CLAUDE-194); and the org-label lookup inside `pr edit labels`
+(`org_list_labels`, `GET /orgs/{org}/labels`, organization category) is failure-tolerant in fj, so `read:organization`
+is optional and only needed to attach an org-level label.
+
+Adding a new `fj` call to the runner requires re-checking the endpoint's category in fj's source and updating this
+table, since a new category is a silent 403 on every existing deployment until each token is re-minted.
 
 ##### Forge auto-routing by host (CLAUDE-50)
 
@@ -268,6 +301,11 @@ When dependencies are met, the issue has none, or `enabled: false`, the gate is 
 The runner uses two identities against the same forge host: `fj` / `gh` authenticate with the action's `token_ref` (the bot), while `git push` authenticates from the daemon host's own git credentials. A repo the forge token cannot see therefore clones and pushes fine and fails only at `pr create`, with a bare 404 that names neither the repo, the host, nor the identity, after a whole Claude run has been paid for.
 
 At gather time, once per repo per poll (not once per issue), the runner asks the forge whether the token can READ the resolved repo: `fj --host <host> repo view <owner/repo> --json` for Forgejo, `gh repo view <owner/repo> --json nameWithOwner` for a GitHub-hosted job. **Deployment prerequisite:** the runner's `fj` must expose `repo view --json`.
+
+The probe tests repository read only, which is **less** than the PR path needs: opening a PR also goes through the
+issues API (`fj pr search`, `fj pr comment`), so a token scoped to repository alone passes this probe and still fails
+later with `403 Forbidden` (CLAUDE-196). See [Forgejo token scopes](#forgejo-token-scopes-claude-196) for the full
+requirement; a passing probe means the repo is visible, not that the token can open a PR.
 
 When the probe fails, every issue of that repo is dropped for the poll and one `warn` input event (visible on the action page) records the host, the `owner/repo`, and the CLI's cause. `AI Agent` is left at **`Queued`**: the condition is a missing permission grant, not a defect in the issue, so the next poll after the grant picks the issues up with no manual field change. This is deliberately unlike the `Failed` path a mid-run failure takes.
 
@@ -374,7 +412,7 @@ native:
   summary_prefixes: # summary prefixes an issue must start with
     - "CI failure:"
     - "Auto-fix:"
-  log_token_ref: forgejo-log-pat      # encrypted secret: Forgejo PAT (repo read scope). Required.
+  log_token_ref: forgejo-log-pat      # encrypted secret: Forgejo PAT (read:repository scope). Required.
   max_analysis_bytes: 24576           # cap on the posted analysis comment
 ```
 
@@ -383,7 +421,7 @@ native:
 | `enabled`            | `true`                         | Master toggle. While false the handler no-ops.                       |
 | `query`              | `#Unresolved`                  | YouTrack candidate query. MUST NOT filter by `AI Agent` (see above). |
 | `summary_prefixes`   | `["CI failure:", "Auto-fix:"]` | Summary prefixes an issue must start with to be analyzed.            |
-| `log_token_ref`      | none                           | Encrypted-secret name (CLAUDE-26) of a Forgejo PAT with repository read scope, used to fetch the log, resolve the run global id, and read the workflow YAML. Required; without it the handler no-ops. |
+| `log_token_ref`      | none                           | Encrypted-secret name (CLAUDE-26) of a Forgejo PAT with the **`read:repository`** scope, used to fetch the log, resolve the run global id, and read the workflow YAML. Read-only and repository-category only: every endpoint it touches (`/repos/{o}/{r}/actions/runs/{id}/logs`, `.../jobs`, `/repos/{o}/{r}/raw/{path}`) is in Forgejo's repository group, so unlike `forgejo.token_ref` this one needs no issue scope (CLAUDE-196). Required; without it the handler no-ops. |
 | `max_analysis_bytes` | `24576`                        | Cap (bytes) on the posted analysis comment.                          |
 
 **Deployment prerequisite:** the runner's Forgejo must expose the v16 REST run-logs endpoint
@@ -421,7 +459,7 @@ native:
     - "Auto-fix:"
   repos: # allow-list: exact owner/repo, owner/*, or *
     - contoso/claude-run
-  log_token_ref: forgejo-log-pat      # encrypted secret: Forgejo PAT (repo read scope). Required.
+  log_token_ref: forgejo-log-pat      # encrypted secret: Forgejo PAT (read:repository scope). Required.
   resolved_state: Done                # State set on a closed issue
   close_comment: "Auto-closed: run #{run_index} on `{branch}` succeeded ({run_url}); the failing `{job}` is green, root cause resolved."
   max_branch_resolves: 40             # cap on per-repo branch-from-log resolutions
@@ -433,7 +471,7 @@ native:
 | `query`               | `#Unresolved`                  | YouTrack candidate query. MUST NOT filter by `AI Agent`.                                 |
 | `summary_prefixes`    | `["CI failure:", "Auto-fix:"]` | Summary prefixes an issue must start with to be reconciled.                              |
 | `repos`               | `[]`                           | Allow-list of `owner/repo` full names to scan: exact `owner/repo`, `owner/*`, or `*`. Empty scans nothing. |
-| `log_token_ref`       | none                           | Encrypted-secret name (CLAUDE-26) of a Forgejo PAT with repository read scope, used to page the runs list, read the jobs endpoint, and resolve a null-branch run's branch from its log. Required; without it the handler no-ops. |
+| `log_token_ref`       | none                           | Encrypted-secret name (CLAUDE-26) of a Forgejo PAT with the **`read:repository`** scope, used to page the runs list, read the jobs endpoint, and resolve a null-branch run's branch from its log. Repository-category only, same as the `ci-failure-analysis` log token (CLAUDE-196). Required; without it the handler no-ops. |
 | `resolved_state`      | `Done`                         | State set on a closed issue (the CLAUDE project's only resolved State).                  |
 | `close_comment`       | (the auto-closed sentence)     | Run-linked close-comment template; `{run_index}` / `{branch}` / `{run_url}` / `{job}` are substituted, and a hidden auto-closed marker is appended. |
 | `max_branch_resolves` | `40`                           | Cap on per-repo branch-from-log resolutions when the runs list returns `head_branch` null. Reaching it is logged, never silent. |

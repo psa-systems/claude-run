@@ -41,6 +41,15 @@ Runtime dependencies (host-installed, not bundled):
 - `timeout` (coreutils) - wall-clock cap around claude.
 - Whatever CLIs the actions themselves invoke (`yt`, `fj`, `git`, ...).
 
+**Forgejo bot token scopes.** The token `fj` authenticates with - the host `keys.json` entry, or the encrypted secret an
+action names in `forgejo.token_ref` - must carry both **`write:repository`** and **`write:issue`**. Forgejo scopes its
+API by endpoint category rather than by `fj` command name, and the PR path crosses both: `pr create`, `pr merge`,
+`pr status`, `pr view`, and `repo view` are repository-category, while the open-PR lookup (`fj pr search`) and PR
+comments / labels (`fj pr comment`, `fj pr edit labels`) go through the issues API. A repository-only token opens PRs
+until it hits the open-PR lookup and then fails with `403 Forbidden`. The read-only log-fetch token
+(`log_token_ref`, used by the CI-failure actions) needs only `read:repository`. Per-command breakdown with the endpoint
+each call maps to: `actions/SCHEMA.md`, "Forgejo token scopes".
+
 ## Use
 
 ```nu
@@ -548,7 +557,7 @@ volumes `claude-bot-{config,data,state}`; prefix each with `dev-` for a developm
 | bind `./actions` (ro)                            | `/home/claudebot/.config/claude-run/actions`         | action YAML under version control                                                                   |
 | bind `~/.claude/.credentials.json` (ro)          | `/home/claudebot/.claude/.credentials.json`          | Claude CLI auth (alternative: `ANTHROPIC_API_KEY` env)                                              |
 | bind `~/.config/youtrack-cli` (ro)               | `/home/claudebot/.config/youtrack-cli`               | `yt` auth/config                                                                                    |
-| bind `~/.local/share/forgejo-cli/keys.json` (ro) | `/home/claudebot/.local/share/forgejo-cli/keys.json` | `fj` auth                                                                                           |
+| bind `~/.local/share/forgejo-cli/keys.json` (ro) | `/home/claudebot/.local/share/forgejo-cli/keys.json` | `fj` auth; the token needs `write:repository` + `write:issue` (see Install)                          |
 | bind `~/.gitconfig` (ro)                         | `/home/claudebot/.gitconfig`                         | git identity for clones/commits                                                                     |
 | secret `claude-run-age-key`                      | `/run/secrets/claude-run-age-key`                    | age identity decrypting the secrets store                                                           |
 | tmpfs                                            | `/home/claudebot/.runtime/claude-run`                | daemon unix socket (`CLAUDE_RUN_RUNTIME_DIR`); ephemeral so a stale socket never survives a restart |
