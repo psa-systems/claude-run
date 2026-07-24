@@ -33,7 +33,7 @@
 //! merged CLAUDE-24 runner-creates-PR contract. The agent itself does only
 //! local engineering work (no push, no PR, no YouTrack write).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1298,11 +1298,11 @@ fn finalize(
             }
             Err(e) => {
                 // CLAUDE-102: the error reaches the journal here (the run loop
-                // only records `outcome: Failed`), and the comment names the
-                // preserved workdir so the committed branch is recoverable.
+                // only records `outcome: Failed`). CLAUDE-193: the comment names
+                // where the work actually is (preserved workdir, or the remote
+                // branch the push already landed), never "nothing to preserve".
                 warn!(key = %job.key, error = %e, "PR creation failed; finalizing as Failed");
-                let preserved = has_unpushed_commits(workdir).then_some(workdir);
-                let body = pr_failure_comment(claude_result, &e, preserved);
+                let body = pr_failure_comment(claude_result, &e, &work_location(workdir));
                 comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
                 Ok(Finalized::Failed)
             }
@@ -1554,22 +1554,26 @@ fn success_comment(r: &ClaudeResult, pr_url: &str) -> String {
     .join("\n")
 }
 
-fn pr_failure_comment(r: &ClaudeResult, err: &Error, preserved_at: Option<&Path>) -> String {
-    // CLAUDE-102: when the workdir holds unpushed commits it is preserved (not
-    // cleaned), and this comment is the recovery pointer to the branch.
-    let preserved_line = match preserved_at {
-        Some(p) => format!(
+fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> String {
+    // CLAUDE-102 / CLAUDE-193: name where the work actually is. Under the branch
+    // PR strategy the push happens before the PR call, so a PR-only failure
+    // leaves the work on the remote, not in a preserved workdir.
+    let location_line = match work {
+        WorkLocation::PreservedWorkdir(p) => format!(
             "The committed branch is PRESERVED on the daemon host at: `{}` (push it manually or re-run after the PR path is fixed).",
             p.display()
         ),
-        None => "No local commits were found to preserve.".to_string(),
+        WorkLocation::RemoteBranch { branch, sha } => format!(
+            "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before the PR call failed, so nothing was lost. Re-queue this issue (set AI Agent = Queued) once the PR path is fixed; the runner reconciles the existing remote branch and opens the PR without re-pushing. The workdir on the daemon host is not kept, because the forge holds the same commits."
+        ),
+        WorkLocation::None => "No local commits were found to preserve.".to_string(),
     };
     let mut body = [
         "Claude AI agent run completed but PR creation FAILED:".to_string(),
         String::new(),
         err.to_string(),
         String::new(),
-        preserved_line,
+        location_line,
         String::new(),
         r.summary.clone(),
         String::new(),
@@ -1674,16 +1678,25 @@ fn cleanup_workdir(workdir: &Path) {
     }
 }
 
-/// CLAUDE-105: true when any local branch tip in `workdir` is absent from the
-/// live remote as reported by `git ls-remote origin` - exactly the work
-/// deleting the directory would destroy. This asks the source of truth rather
-/// than trusting remote-tracking refs: a `--depth` clone is `--single-branch`,
-/// so its only tracking ref is `origin/main` and the old `--not --remotes`
-/// heuristic false-positived on every non-`main` branch (CLAUDE-102's intent
-/// was to save unpushed work, not preserve every feature-branch run). Any git
-/// or network failure errs toward `true`: preserving costs disk, a wrong delete
-/// costs the run.
-pub(crate) fn has_unpushed_commits(workdir: &Path) -> bool {
+/// CLAUDE-193: one local branch and whether its tip is on the live remote.
+struct BranchTip {
+    branch: String,
+    sha: String,
+    on_remote: bool,
+}
+
+/// CLAUDE-193: every local branch tip classified against the live remote, plus
+/// the remote's default branch (its `HEAD` symref) when advertised.
+struct RepoTips {
+    tips: Vec<BranchTip>,
+    default_branch: Option<String>,
+}
+
+/// CLAUDE-193: the single `git ls-remote origin` code path, shared by
+/// [`has_unpushed_commits`] (preserve-or-delete) and [`work_location`] (what the
+/// PR-failure comment tells a human). `None` means a git or network failure, on
+/// which both callers err toward preserving.
+fn branch_tips(workdir: &Path) -> Option<RepoTips> {
     fn git(workdir: &Path, args: &[&str]) -> Option<String> {
         let out = Command::new("git")
             .arg("-C")
@@ -1696,41 +1709,110 @@ pub(crate) fn has_unpushed_commits(workdir: &Path) -> bool {
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    // Local branch tips. No branches means nothing local to lose -> delete.
-    let branches = match git(
+    // Local branch tips. No branches means nothing local to lose, and no remote
+    // query is needed.
+    let branches = git(
         workdir,
         &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
-    ) {
-        Some(s) => s,
-        None => return true,
-    };
+    )?;
     let branches: Vec<&str> = branches
         .lines()
         .map(str::trim)
         .filter(|b| !b.is_empty())
         .collect();
     if branches.is_empty() {
-        return false;
+        return Some(RepoTips {
+            tips: Vec::new(),
+            default_branch: None,
+        });
     }
 
-    // The live remote's advertised SHAs (first column of each ls-remote line).
-    let remote = match git(workdir, &["ls-remote", "origin"]) {
-        Some(s) => s,
-        None => return true,
-    };
-    let remote_shas: std::collections::HashSet<&str> =
-        remote.split_whitespace().step_by(2).collect();
-
-    for branch in branches {
-        let tip = match git(workdir, &["rev-parse", branch]) {
-            Some(s) => s.trim().to_string(),
-            None => return true,
-        };
-        if !remote_shas.contains(tip.as_str()) {
-            return true;
+    // The live remote's advertised SHAs, plus the `ref: refs/heads/<x>\tHEAD`
+    // symref line that names the default branch.
+    let remote = git(workdir, &["ls-remote", "--symref", "origin"])?;
+    let mut remote_shas: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut default_branch = None;
+    for line in remote.lines() {
+        let mut fields = line.split_whitespace();
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some("ref:"), Some(target), Some("HEAD")) => {
+                default_branch = target.strip_prefix("refs/heads/").map(str::to_string);
+            }
+            (Some(sha), Some(_), None) => {
+                remote_shas.insert(sha);
+            }
+            _ => {}
         }
     }
-    false
+
+    let mut tips = Vec::new();
+    for branch in branches {
+        let sha = git(workdir, &["rev-parse", branch])?.trim().to_string();
+        let on_remote = remote_shas.contains(sha.as_str());
+        tips.push(BranchTip {
+            branch: branch.to_string(),
+            sha,
+            on_remote,
+        });
+    }
+    Some(RepoTips {
+        tips,
+        default_branch,
+    })
+}
+
+/// CLAUDE-105: true when any local branch tip in `workdir` is absent from the
+/// live remote as reported by `git ls-remote origin` - exactly the work
+/// deleting the directory would destroy. This asks the source of truth rather
+/// than trusting remote-tracking refs: a `--depth` clone is `--single-branch`,
+/// so its only tracking ref is `origin/main` and the old `--not --remotes`
+/// heuristic false-positived on every non-`main` branch (CLAUDE-102's intent
+/// was to save unpushed work, not preserve every feature-branch run). Any git
+/// or network failure errs toward `true`: preserving costs disk, a wrong delete
+/// costs the run.
+pub(crate) fn has_unpushed_commits(workdir: &Path) -> bool {
+    match branch_tips(workdir) {
+        Some(r) => r.tips.iter().any(|t| !t.on_remote),
+        None => true,
+    }
+}
+
+/// CLAUDE-193: where a failed-PR run's work actually is, for the comment a human
+/// reads. Computed from the same [`branch_tips`] query that decides
+/// preserve-or-delete, so the comment can never contradict
+/// [`cleanup_or_preserve`].
+enum WorkLocation {
+    /// Unpushed commits exist, so the workdir is kept on the daemon host.
+    PreservedWorkdir(PathBuf),
+    /// Every local tip is on the remote: the push landed and only the PR call
+    /// failed, so the work is safe on the forge under this branch.
+    RemoteBranch { branch: String, sha: String },
+    /// Nothing local beyond the remote's default branch.
+    None,
+}
+
+fn work_location(workdir: &Path) -> WorkLocation {
+    // A failed query errs toward preserve, matching `has_unpushed_commits`.
+    let Some(RepoTips {
+        tips,
+        default_branch,
+    }) = branch_tips(workdir)
+    else {
+        return WorkLocation::PreservedWorkdir(workdir.to_path_buf());
+    };
+    if tips.iter().any(|t| !t.on_remote) {
+        return WorkLocation::PreservedWorkdir(workdir.to_path_buf());
+    }
+    match tips
+        .into_iter()
+        .find(|t| default_branch.as_deref() != Some(t.branch.as_str()))
+    {
+        Some(t) => WorkLocation::RemoteBranch {
+            branch: t.branch,
+            sha: t.sha,
+        },
+        None => WorkLocation::None,
+    }
 }
 
 /// CLAUDE-105: remove gitignored build artifacts from a workdir about to be
@@ -2557,6 +2639,84 @@ mod tests {
         assert!(has_unpushed_commits(&clone));
         cleanup_or_preserve(&clone, "YouTrack", "MK-16");
         assert!(clone.exists(), "an unpushed commit must survive cleanup");
+    }
+
+    // ---- CLAUDE-193: the PR-failure comment names where the work is --------
+
+    fn pr_error() -> Error {
+        Error::Other(anyhow::anyhow!("fj pr create failed: 404 Not Found"))
+    }
+
+    #[test]
+    fn pr_failure_comment_names_the_pushed_remote_branch() {
+        // GAD-1 shape: `push_branch` succeeded and only `fj pr create` failed,
+        // so every local tip is on the remote. The comment must point at the
+        // branch, never claim there was nothing to preserve.
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(&clone, &["checkout", "-b", "fix/redact-env-vars-on-export"]);
+        std::fs::write(clone.join("new.txt"), "work").unwrap();
+        git_in(&clone, &["add", "."]);
+        git_in(&clone, &["commit", "-m", "fix: redact"]);
+        git_in(&clone, &["push", "origin", "fix/redact-env-vars-on-export"]);
+        let sha = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&clone)
+                .args(["rev-parse", "fix/redact-env-vars-on-export"])
+                .output()
+                .expect("git runs")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone));
+
+        assert!(
+            body.contains("fix/redact-env-vars-on-export"),
+            "comment must name the remote branch: {body}"
+        );
+        assert!(body.contains(&sha), "comment must name the tip SHA: {body}");
+        assert!(
+            !body.contains("No local commits were found to preserve."),
+            "pushed work must never read as unrecoverable: {body}"
+        );
+        assert!(!body.contains("PRESERVED on the daemon host"));
+    }
+
+    #[test]
+    fn pr_failure_comment_names_the_preserved_workdir_when_unpushed() {
+        // Unchanged CLAUDE-102 path: an unpushed commit keeps the workdir, and
+        // the comment is the recovery pointer to it.
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(&clone, &["checkout", "-b", "feat/y"]);
+        std::fs::write(clone.join("new.txt"), "work").unwrap();
+        git_in(&clone, &["add", "."]);
+        git_in(&clone, &["commit", "-m", "feat: y"]);
+
+        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone));
+
+        assert!(
+            body.contains("PRESERVED on the daemon host at: `"),
+            "unpushed work keeps the preserve line: {body}"
+        );
+        assert!(body.contains(&clone.display().to_string()));
+        assert!(!body.contains("No local commits were found to preserve."));
+    }
+
+    #[test]
+    fn pr_failure_comment_reports_nothing_for_a_bare_default_branch_clone() {
+        // Only the remote's default branch exists locally with no commits ahead:
+        // there genuinely is no work to point at.
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+
+        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone));
+
+        assert!(body.contains("No local commits were found to preserve."));
     }
 
     #[test]
