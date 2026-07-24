@@ -16,6 +16,24 @@ use tracing::{debug, warn};
 use super::{Backend, Forge, IssueTracker, PullRequest, VcsMapEntry, VcsRepo};
 use crate::error::{Error, Result};
 
+/// CLAUDE-194: restate a `fj pr create` failure with the repo, the host, and the
+/// permission hypothesis. The bare CLI text for a repo the token cannot see is
+/// `not found: The target couldn't be found.`, which names none of the three, and
+/// the push having succeeded (it authenticates with the host's git credentials,
+/// not the forge token) makes a permission cause look impossible. Applied on both
+/// create paths (branch and AGit); `head` is the pushed branch where there is one.
+fn pr_create_error(fj: &str, repo: &str, host: &str, head: Option<&str>, e: Error) -> Error {
+    let head = head
+        .map(|b| format!(" (head branch `{b}`)"))
+        .unwrap_or_default();
+    Error::Other(anyhow::anyhow!(
+        "`{fj} pr create` failed for `{repo}` on {host}{head}: {e}. The forge token may lack \
+         access to `{repo}`: a private repo the token cannot see answers 404 `not found` here \
+         even though the push succeeded, because the push authenticates with the host's git \
+         credentials, not the forge token."
+    ))
+}
+
 /// CLAUDE-136: derive a PR number from a forge PR URL's trailing
 /// `/pulls/<n>` (Forgejo) or `/pull/<n>` (GitHub-style) segment. Used only as a
 /// fallback when `fj pr create --json` omits the `number` field.
@@ -694,7 +712,8 @@ impl CliBackend {
             .run_in_env(Some(workdir), &self.fj, &create_args, &self.fj_envs())
             .and_then(|out| Self::checked(&self.fj, out, &create_args));
         let _ = std::fs::remove_file(workdir.join(BODY_FILE));
-        self.created_pr(&res?)
+        let stdout = res.map_err(|e| pr_create_error(&self.fj, repo, host, Some(branch), e))?;
+        self.created_pr(&stdout)
     }
 
     /// CLAUDE-103 opt-in: AGit + autofill (`fj --host <host> pr create -aA`).
@@ -707,7 +726,15 @@ impl CliBackend {
         let stdout = self
             .runner
             .run_in_env(Some(workdir), &self.fj, &args, &self.fj_envs())
-            .and_then(|out| Self::checked(&self.fj, out, &args))?;
+            .and_then(|out| Self::checked(&self.fj, out, &args))
+            // CLAUDE-194: same restatement as the branch path; the repo is read
+            // from `origin` only on this failure path.
+            .map_err(|e| {
+                let repo = self
+                    .origin_repo_path(workdir)
+                    .unwrap_or_else(|_| "<unparseable origin remote>".to_string());
+                pr_create_error(&self.fj, &repo, host, None, e)
+            })?;
         self.created_pr(&stdout)
     }
 
@@ -1116,6 +1143,29 @@ impl Forge for CliBackend {
             // No server branch (head lives only at `refs/pull/<N>/head`).
             PrStrategy::Agit => self.create_pr_agit(workdir, host),
         }
+    }
+
+    /// CLAUDE-194: `fj --host <host> repo view <owner/repo> --json`. A readable
+    /// repo answers with the repo object; one the token cannot see answers 404
+    /// (`not found`), the same way `fj pr create` does, so this probe carries the
+    /// signal `fj pr search` lacks (an invisible repo and a repo with no open PRs
+    /// both search as an empty array, exit 0).
+    fn repo_access(&self, host: &str, repo: &str) -> Result<()> {
+        let args = ["--host", host, "repo", "view", repo, "--json"];
+        let out = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        if out.ok {
+            return Ok(());
+        }
+        Err(Error::Other(anyhow::anyhow!(
+            "forge token cannot read `{repo}` on {host}: `{} repo view` exited {} ({}). \
+             A private repo the token cannot see answers 404 `not found`, so this is most \
+             likely a missing permission grant for the bot on {repo}.",
+            self.fj,
+            out.exit_code,
+            out.stderr.trim()
+        )))
     }
 
     fn list_open_prs(&self, host: &str, repo: &str) -> Result<Vec<super::ForgePullRequest>> {
@@ -2768,6 +2818,145 @@ mod tests {
             vec![("XDG_DATA_HOME".to_string(), "/tmp/creds".to_string())]
         );
         assert!(!fj.1.iter().any(|(k, _)| k == "YOUTRACK_CLI_CONFIG"));
+    }
+
+    #[test]
+    fn repo_access_ok_for_a_readable_repo() {
+        // CLAUDE-194: `fj repo view <owner/repo> --json` exits 0 for a repo the
+        // token can read, and the probe injects the fj credential env so it tests
+        // the BOT identity, not the operator store.
+        let runner = Arc::new(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "repo",
+                "view",
+                "contoso/claude-run",
+                "--json",
+            ],
+            r#"{"full_name":"Contoso/claude-run","private":true}"#,
+        ));
+        let b = CliBackend::new(runner.clone()).with_fj_env(vec![(
+            "XDG_DATA_HOME".to_string(),
+            "/tmp/creds".to_string(),
+        )]);
+        b.repo_access("dev.a8n.run", "contoso/claude-run")
+            .unwrap();
+        let envs = runner.envs.lock().unwrap();
+        let fj = envs.iter().find(|(bin, _)| bin == "fj").unwrap();
+        assert_eq!(
+            fj.1,
+            vec![("XDG_DATA_HOME".to_string(), "/tmp/creds".to_string())]
+        );
+    }
+
+    #[test]
+    fn repo_access_error_names_host_and_repo() {
+        // CLAUDE-194: an invisible private repo answers 404; the error must name
+        // the host, the `owner/repo`, and the permission hypothesis, because the
+        // bare CLI text (`not found: The target couldn't be found.`) names none.
+        let b = CliBackend::new(Arc::new(StubRunner::new().fail(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "repo",
+                "view",
+                "contoso/gadgets",
+                "--json",
+            ],
+            1,
+            "not found: The target couldn't be found.",
+        )));
+        let err = b
+            .repo_access("dev.a8n.run", "contoso/gadgets")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contoso/gadgets"), "got {err}");
+        assert!(err.contains("dev.a8n.run"), "got {err}");
+        assert!(err.contains("permission"), "got {err}");
+    }
+
+    #[test]
+    fn pr_create_failure_names_repo_host_and_permission_cause() {
+        // CLAUDE-194: permissions can change mid-run, past the gather-time
+        // preflight. The `fj pr create` 404 is then restated with the repo, the
+        // host, and the possible cause instead of the bare CLI text.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "abc123", "");
+        let runner = with_open_pr_search(runner, "[]")
+            .ok(
+                "git",
+                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "feat(x): do the thing\n",
+            )
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#MK-16\n")
+            .fail(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "feat(x): do the thing",
+                    "--body-file",
+                    ".claude-run-pr-body.md",
+                    "--head",
+                    "feat/x",
+                    "--json",
+                ],
+                1,
+                "not found: The target couldn't be found.",
+            );
+        let b = CliBackend::new(Arc::new(runner));
+        let err = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contoso/claude-run"), "got {err}");
+        assert!(err.contains("dev.a8n.run"), "got {err}");
+        assert!(err.contains("may lack access"), "got {err}");
+        // The body file is still cleaned up on the failure path.
+        assert!(!wd.path().join(".claude-run-pr-body.md").exists());
+    }
+
+    #[test]
+    fn agit_pr_create_failure_also_names_repo_host_and_cause() {
+        // CLAUDE-194: the AGit create path is the sibling of the branch path and
+        // gets the same restatement; the repo is read from `origin` on failure.
+        let b = CliBackend::new(Arc::new(
+            StubRunner::new()
+                .fail(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+                    1,
+                    "not found: The target couldn't be found.",
+                )
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/gadgets.git",
+                ),
+        ));
+        let err = b
+            .create_pr(Path::new("/tmp/wd"), "dev.a8n.run", PrStrategy::Agit)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contoso/gadgets"), "got {err}");
+        assert!(err.contains("dev.a8n.run"), "got {err}");
+        assert!(err.contains("may lack access"), "got {err}");
     }
 
     #[test]

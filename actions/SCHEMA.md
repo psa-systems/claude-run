@@ -262,6 +262,16 @@ When blocked:
 
 When dependencies are met, the issue has none, or `enabled: false`, the gate is a no-op and pickup proceeds exactly as before (Working, clone, claude). No "unblocked" comment is posted; the normal Working transition and eventual PR are the signal. If the link read itself fails, the gate does not strand the issue: it falls back to normal pickup (the agent self-parks if it truly cannot proceed), since the gate is an optimization over that correct baseline.
 
+##### Forge repo-access preflight (CLAUDE-194)
+
+The runner uses two identities against the same forge host: `fj` / `gh` authenticate with the action's `token_ref` (the bot), while `git push` authenticates from the daemon host's own git credentials. A repo the forge token cannot see therefore clones and pushes fine and fails only at `pr create`, with a bare 404 that names neither the repo, the host, nor the identity, after a whole Claude run has been paid for.
+
+At gather time, once per repo per poll (not once per issue), the runner asks the forge whether the token can READ the resolved repo: `fj --host <host> repo view <owner/repo> --json` for Forgejo, `gh repo view <owner/repo> --json nameWithOwner` for a GitHub-hosted job. **Deployment prerequisite:** the runner's `fj` must expose `repo view --json`.
+
+When the probe fails, every issue of that repo is dropped for the poll and one `warn` input event (visible on the action page) records the host, the `owner/repo`, and the CLI's cause. `AI Agent` is left at **`Queued`**: the condition is a missing permission grant, not a defect in the issue, so the next poll after the grant picks the issues up with no manual field change. This is deliberately unlike the `Failed` path a mid-run failure takes.
+
+The probe is skipped entirely when the action sets no forge `token_ref`, and skipped per host when the action carries no token for that host's forge: `fj` / `gh` then read the operator's own credential store, so the probe would test the wrong identity. A permission change *after* gather still fails at `pr create`, so that error is also restated with the repo, the host, and the possible-permission cause instead of the bare CLI text.
+
 #### Credential injection (CLAUDE-26)
 
 `token_ref` names an entry in the encrypted secrets store (managed under `/secrets` in the web UI, encrypted at rest
