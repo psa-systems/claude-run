@@ -214,8 +214,21 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     // slot without doing work. Blocked issues keep every CLAUDE-161 side effect
     // (stay Queued, idempotent blocker comment, `blocked_until` backoff, persisted
     // signature); only genuinely-workable issues compete for the project key here.
+    // CLAUDE-195: a human-initiated run (daemon `trigger` or a direct `run`, i.e.
+    // any origin other than the scheduler's periodic pickup) forces the dependency
+    // gate to read links live, ignoring any open backoff window. Both gate call
+    // sites in this run receive the same value.
+    let bypass_backoff = ctx.triggered_by != "scheduler";
     let eligible_from = jobs.len();
-    let jobs = filter_eligible(pool, &gather_backend, src, &action.name, jobs).await;
+    let jobs = filter_eligible(
+        pool,
+        &gather_backend,
+        src,
+        &action.name,
+        jobs,
+        bypass_backoff,
+    )
+    .await;
     // The gather backend's credentials are done; scrub them now.
     drop(gather_guard);
     if jobs.is_empty() {
@@ -357,6 +370,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 &job_cancel,
                 &job,
                 pr_strategy,
+                bypass_backoff,
             )
             .await;
             if let Err(e) = state::run_inflight_remove(&pool, run_id, &job.key).await {
@@ -683,6 +697,7 @@ async fn evaluate_eligibility(
     src: &YoutrackSource,
     action: &str,
     job: &YoutrackJob,
+    bypass_backoff: bool,
 ) -> Eligibility {
     let key = &job.key;
     // ---- filter: live AI Agent re-read (drop unless still Queued) ----
@@ -701,7 +716,7 @@ async fn evaluate_eligibility(
         }
     }
     // ---- dependency gate (CLAUDE-161) ----
-    match dependency_gate(pool, backend, src, action, key).await {
+    match dependency_gate(pool, backend, src, action, key, bypass_backoff).await {
         Ok(GateDecision::Proceed) => Eligibility::Eligible,
         Ok(GateDecision::Blocked { blockers }) => {
             info!(
@@ -731,10 +746,12 @@ async fn filter_eligible(
     src: &YoutrackSource,
     action: &str,
     jobs: Vec<YoutrackJob>,
+    bypass_backoff: bool,
 ) -> Vec<YoutrackJob> {
     let mut eligible = Vec::with_capacity(jobs.len());
     for job in jobs {
-        if let Eligibility::Eligible = evaluate_eligibility(pool, backend, src, action, &job).await
+        if let Eligibility::Eligible =
+            evaluate_eligibility(pool, backend, src, action, &job, bypass_backoff).await
         {
             eligible.push(job);
         }
@@ -761,6 +778,7 @@ async fn process_job(
     cancel: &CancellationToken,
     job: &YoutrackJob,
     pr_strategy: crate::action::PrStrategy,
+    bypass_backoff: bool,
 ) -> Result<ProcessedJob> {
     let started = Instant::now();
     let action = &loaded.action;
@@ -811,7 +829,7 @@ async fn process_job(
     // leave it Queued (auto-resumes when the dependency clears), consume no
     // attempt, and never clone or invoke claude. A disabled gate (or a met/absent
     // dependency set) returns `Proceed`.
-    match dependency_gate(pool, backend, src, &action.name, key).await {
+    match dependency_gate(pool, backend, src, &action.name, key, bypass_backoff).await {
         Ok(GateDecision::Proceed) => {}
         Ok(GateDecision::Blocked { blockers }) => {
             info!(
@@ -1071,12 +1089,21 @@ fn blocked_comment(blockers: &[Blocker]) -> String {
 /// re-runs it after winning the key as the authoritative pre-clone re-check. A
 /// workable issue persists no state, so the second read is a plain re-read; a
 /// blocked issue is dropped at gather and never reaches `process_job`.
+///
+/// CLAUDE-195: `bypass_backoff` forces the live `issue_links` read even inside an
+/// open backoff window. It is set for human-initiated runs (`claude-run trigger`,
+/// direct `claude-run run`), where the operator expects an evaluation against the
+/// live tracker, not a replay of the cached signature. The scheduler's periodic
+/// pickup passes `false`, keeping CLAUDE-182's throttle. Every other side effect
+/// (signature/`blocked_until` persistence, row clear, changed-set comment) is
+/// unchanged; bypass only skips the window short-circuit.
 async fn dependency_gate(
     pool: &SqlitePool,
     backend: &dyn Backend,
     src: &YoutrackSource,
     action: &str,
     key: &str,
+    bypass_backoff: bool,
 ) -> Result<GateDecision> {
     let deps = &src.dependencies;
     // Disabled: a no-op. No `yt` read, no DB touch; pickup proceeds as before.
@@ -1087,8 +1114,9 @@ async fn dependency_gate(
     let now_ms = state::now_epoch_ms();
 
     // Backoff: within the window, do not re-evaluate (no `yt` read, no comment).
+    // A manual trigger (`bypass_backoff`) skips this short-circuit and reads live.
     if let Some(p) = &prev {
-        if now_ms < p.blocked_until_ms {
+        if !bypass_backoff && now_ms < p.blocked_until_ms {
             let blockers = p
                 .signature
                 .split("; ")
@@ -3787,7 +3815,7 @@ mod tests {
         let comments = || count("yt issue comment MK-16");
 
         // First eval: blocked, comments once, persists backoff.
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16")
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Blocked { .. }));
@@ -3801,7 +3829,7 @@ mod tests {
         assert!(st.blocked_until_ms > state::now_epoch_ms());
 
         // Second eval within the backoff window: no read, no comment.
-        let d2 = dependency_gate(&pool, &backend, &s, "act", "MK-16")
+        let d2 = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
             .await
             .unwrap();
         match d2 {
@@ -3823,7 +3851,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let d3 = dependency_gate(&pool, &backend, &s, "act", "MK-16")
+        let d3 = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
             .await
             .unwrap();
         assert!(matches!(d3, GateDecision::Blocked { .. }));
@@ -3841,7 +3869,7 @@ mod tests {
         let backend = CliBackend::new(runner.clone());
         let mut s = src();
         s.dependencies.enabled = false;
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16")
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Proceed));
@@ -3871,7 +3899,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16")
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
             .await
             .unwrap();
         assert!(matches!(d, GateDecision::Proceed));
@@ -3881,6 +3909,148 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "met dependency must clear the backoff row"
+        );
+    }
+
+    // ---- CLAUDE-195 manual-trigger backoff bypass ----
+
+    /// CLAUDE-195: a manual trigger (`bypass_backoff = true`) inside an open
+    /// backoff window reads links live rather than replaying the cached signature.
+    /// With the blocker now resolved, the gate proceeds in the same run and clears
+    /// the persisted row, without waiting for the window to expire.
+    #[tokio::test]
+    async fn dependency_gate_bypass_reads_live_and_proceeds_when_resolved() {
+        let pool = mem_pool().await;
+        // Live links now show the blocker resolved.
+        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"YT-40","resolved":123}]}]}"#;
+        let runner =
+            Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
+        let backend = CliBackend::new(runner.clone());
+        let s = src();
+        // Seed a still-open backoff window (blocked_until in the future).
+        state::dependency_gate_upsert(
+            &pool,
+            "act",
+            "MK-16",
+            state::now_epoch_ms() + 60_000,
+            "YT-40 (depends on)",
+        )
+        .await
+        .unwrap();
+
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(d, GateDecision::Proceed),
+            "manual trigger re-reads live and proceeds on the resolved blocker"
+        );
+        assert!(
+            runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "yt issue inspect MK-16 --json"),
+            "bypass forces the live read inside the open window"
+        );
+        assert!(
+            state::dependency_gate_get(&pool, "act", "MK-16")
+                .await
+                .unwrap()
+                .is_none(),
+            "resolved blocker clears the persisted backoff row"
+        );
+    }
+
+    /// CLAUDE-195: a manual trigger inside an open window still reads live, and
+    /// when the blocker is still open it stays Blocked and re-arms `blocked_until`.
+    /// The unchanged blocker set is not re-commented.
+    #[tokio::test]
+    async fn dependency_gate_bypass_reads_live_but_still_blocks_when_open() {
+        let pool = mem_pool().await;
+        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"YT-40","summary":"x"}]}]}"#;
+        let runner =
+            Arc::new(StubRunner::new().ok("yt", &["issue", "inspect", "MK-16", "--json"], inspect));
+        let backend = CliBackend::new(runner.clone());
+        let s = src();
+        let seeded_until = state::now_epoch_ms() + 60_000;
+        state::dependency_gate_upsert(&pool, "act", "MK-16", seeded_until, "YT-40 (depends on)")
+            .await
+            .unwrap();
+
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", true)
+            .await
+            .unwrap();
+        match d {
+            GateDecision::Blocked { blockers } => {
+                assert_eq!(blockers, vec!["YT-40 (depends on)".to_string()]);
+            }
+            _ => panic!("still blocked on the open dependency"),
+        }
+        assert_eq!(
+            runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.as_str() == "yt issue inspect MK-16 --json")
+                .count(),
+            1,
+            "bypass reads live once inside the window"
+        );
+        // Unchanged blocker set: no re-comment.
+        assert!(
+            !runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("yt issue comment MK-16")),
+            "unchanged blocker set must not re-comment on the bypass path"
+        );
+        let st = state::dependency_gate_get(&pool, "act", "MK-16")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(st.signature, "YT-40 (depends on)");
+        assert!(
+            st.blocked_until_ms > state::now_epoch_ms(),
+            "still-blocked issue re-arms the backoff window"
+        );
+    }
+
+    /// CLAUDE-195: the scheduler (`bypass_backoff = false`) inside an open window
+    /// replays the cached signature with no live read, exactly as CLAUDE-182. The
+    /// stub has no inspect response, so any read would error.
+    #[tokio::test]
+    async fn dependency_gate_scheduler_replays_cached_signature_no_read() {
+        let pool = mem_pool().await;
+        let runner = Arc::new(StubRunner::new());
+        let backend = CliBackend::new(runner.clone());
+        let s = src();
+        state::dependency_gate_upsert(
+            &pool,
+            "act",
+            "MK-16",
+            state::now_epoch_ms() + 60_000,
+            "YT-40 (depends on)",
+        )
+        .await
+        .unwrap();
+
+        let d = dependency_gate(&pool, &backend, &s, "act", "MK-16", false)
+            .await
+            .unwrap();
+        match d {
+            GateDecision::Blocked { blockers } => {
+                assert_eq!(blockers, vec!["YT-40 (depends on)".to_string()]);
+            }
+            _ => panic!("scheduler replays the cached blocked decision"),
+        }
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "scheduler inside the window must not read the tracker"
         );
     }
 
@@ -3941,7 +4111,7 @@ mod tests {
         let s = src();
 
         let jobs = vec![mk_job("TOOL-34"), mk_job("TOOL-33")];
-        let eligible = filter_eligible(&pool, &backend, &s, "act", jobs).await;
+        let eligible = filter_eligible(&pool, &backend, &s, "act", jobs, false).await;
 
         // Only the workable issue survives to compete for the concurrency key.
         let keys: Vec<&str> = eligible.iter().map(|j| j.key.as_str()).collect();
@@ -4012,7 +4182,7 @@ mod tests {
         let s = src();
 
         let jobs = vec![mk_job("TOOL-34"), mk_job("TOOL-33")];
-        let eligible = filter_eligible(&pool, &backend, &s, "act", jobs).await;
+        let eligible = filter_eligible(&pool, &backend, &s, "act", jobs, false).await;
         let keys: Vec<&str> = eligible.iter().map(|j| j.key.as_str()).collect();
         assert_eq!(
             keys,
