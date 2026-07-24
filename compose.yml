@@ -69,7 +69,7 @@ services:
         source: ${HOME}/.config/youtrack-cli
         target: /home/claudebot/.config/youtrack-cli
         read_only: true
-      # fj (forgejo-cli) keys.
+      # fj (forgejo-cli) keys. Token needs write:repository + write:issue (CLAUDE-196).
       - type: bind
         source: ${HOME}/.local/share/forgejo-cli/keys.json
         target: /home/claudebot/.local/share/forgejo-cli/keys.json

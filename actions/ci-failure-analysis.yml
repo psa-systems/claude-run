@@ -42,7 +42,7 @@ native:
     - "CI failure:"
     - "Auto-fix:"
   # Name of the encrypted secret (CLAUDE-26) holding a Forgejo PAT with
-  # repository read scope, used to fetch the run log, resolve the run global id,
+  # the `read:repository` scope, used to fetch the run log, resolve the run global id,
   # and read the workflow YAML through the v16 REST API. Required; without it the
   # handler no-ops.
   log_token_ref: forgejo-log-pat
