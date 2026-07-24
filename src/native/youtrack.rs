@@ -7,6 +7,9 @@
 //!
 //! ```text
 //! gather   -> IssueTracker::list_queued + resolve_vcs per project (drop no-VCS)
+//!             + CLAUDE-194 forge repo-access preflight, once per repo: drop the
+//!             repo's issues (leaving them Queued) when the forge token cannot
+//!             read it, rather than failing at `pr create` after a paid run
 //! eligible -> CLAUDE-182 gather-time pass, BEFORE the KeyGate: live AI Agent
 //!             re-read (drop unless still Queued) + CLAUDE-161 dependency gate
 //!             (drop unmet-blocker issues, keeping their Queued/comment/backoff
@@ -151,7 +154,15 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         let backend = credentialed_backend(&runner, &guard);
         (backend, Some(guard))
     };
-    let (jobs, input_events) = gather(&gather_backend, &src.query)?;
+    // CLAUDE-194: the forge repo-access preflight. It needs its own per-host
+    // credential store (the gather backend's is yt-only), so it materializes one
+    // per probed repo; `None` when the action references no forge secret.
+    let access = forge_access_check(&runner, &creds, &cred_base, gh);
+    let (jobs, input_events) = gather(
+        &gather_backend,
+        &src.query,
+        access.as_ref().map(|a| a as &dyn RepoAccess),
+    )?;
     // CLAUDE-147: persist input-phase diagnostics before `run_begin` so they
     // survive even if no run row is ever created. Non-fatal: a bookkeeping
     // failure must not abort the poll.
@@ -442,9 +453,89 @@ fn sanitize_key(key: &str) -> String {
     key.replace(['/', '\\', '.'], "_")
 }
 
+/// CLAUDE-194: the gather-time forge repo-access preflight, injected so `gather`
+/// can probe the FORGE identity (which needs a per-host credential store) without
+/// owning credential materialization.
+trait RepoAccess {
+    /// `Ok(())` iff the forge identity can read `repo` (`owner/name`) on `host`.
+    fn check(&self, host: &str, repo: &str) -> Result<()>;
+}
+
+/// CLAUDE-194: the real [`RepoAccess`], which materializes the action's forge
+/// token into a per-host credential store and asks the matching backend for
+/// [`Forge::repo_access`]. Routes by host exactly as the per-job forge selection
+/// does, so a GitHub-hosted repo is probed with the GitHub PAT.
+struct ForgeAccessCheck {
+    runner: Arc<dyn CommandRunner>,
+    creds: Arc<secrets::ResolvedCredentials>,
+    cred_base: PathBuf,
+    gh_hosts: Vec<String>,
+    gh_endpoint: String,
+}
+
+impl RepoAccess for ForgeAccessCheck {
+    fn check(&self, host: &str, repo: &str) -> Result<()> {
+        if provider::is_github_host(host, &self.gh_hosts) {
+            // No `github.token_ref`: `gh` would run as the host store, i.e. the
+            // wrong identity, so the probe would prove nothing. Skip it.
+            if self.creds.github_token.is_none() {
+                return Ok(());
+            }
+            let forge = provider::GithubForge::new(
+                self.runner.clone(),
+                self.gh_endpoint.clone(),
+                self.creds.github_token.clone(),
+            );
+            return forge.repo_access(host, repo);
+        }
+        // Same rule for Forgejo: no `forgejo.token_ref` -> `fj` reads the
+        // operator store, so the preflight would test the operator, not the bot.
+        if self.creds.fj_token.is_none() {
+            return Ok(());
+        }
+        let dir = self.cred_base.join(format!(
+            "access-{}-{}-{}",
+            std::process::id(),
+            sanitize_key(host),
+            sanitize_key(repo)
+        ));
+        let guard = JobCredentials::materialize(&dir, &self.creds, Some(host))?;
+        let backend = credentialed_backend(&self.runner, &guard);
+        backend.repo_access(host, repo)
+    }
+}
+
+/// CLAUDE-194: build the gather-time preflight, or `None` when the action
+/// references no forge secret at all. With no `token_ref` the CLIs fall back to
+/// host auth (`src/secrets.rs`), so a probe would exercise the operator's
+/// identity rather than the bot's and could pass for a repo the bot cannot read.
+fn forge_access_check(
+    runner: &Arc<dyn CommandRunner>,
+    creds: &Arc<secrets::ResolvedCredentials>,
+    cred_base: &Path,
+    gh: &crate::action::GithubTarget,
+) -> Option<ForgeAccessCheck> {
+    if creds.fj_token.is_none() && creds.github_token.is_none() {
+        return None;
+    }
+    Some(ForgeAccessCheck {
+        runner: runner.clone(),
+        creds: creds.clone(),
+        cred_base: cred_base.to_path_buf(),
+        gh_hosts: gh.hosts.clone(),
+        gh_endpoint: gh.mcp_endpoint.clone(),
+    })
+}
+
 /// gather: list queued issues, resolve each project's VCS once (cached), and
 /// drop issues whose project has no usable VCS integration. Mirrors the
 /// scripted `input.command`.
+///
+/// CLAUDE-194: `access` additionally preflights that the forge token can READ
+/// each resolved repo, once per repo per poll, and drops the repo's issues when
+/// it cannot. `AI Agent` is left at `Queued` on that path: the condition is a
+/// missing permission grant, not a defect in the issue, so the next poll after
+/// the grant picks it up with no manual field edit.
 ///
 /// Returns the eligible jobs plus the CLAUDE-147 input-phase events (the
 /// per-project probe failures and no-VCS drops) that the caller persists to
@@ -452,9 +543,14 @@ fn sanitize_key(key: &str) -> String {
 fn gather(
     backend: &dyn Backend,
     query: &str,
+    access: Option<&dyn RepoAccess>,
 ) -> Result<(Vec<YoutrackJob>, Vec<state::InputEvent>)> {
     let issues = backend.list_queued(query)?;
     let mut vcs_cache: std::collections::HashMap<String, Option<provider::VcsRepo>> =
+        std::collections::HashMap::new();
+    // CLAUDE-194: repo -> "the forge token can read it", so N issues in one
+    // project (or across projects sharing a repo) cost ONE `repo view` call.
+    let mut access_cache: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
     let mut jobs = Vec::new();
     let mut events: Vec<state::InputEvent> = Vec::new();
@@ -504,6 +600,38 @@ fn gather(
         let Some(repo) = vcs_cache.get(&project).and_then(|r| r.clone()) else {
             continue;
         };
+        // CLAUDE-194: forge repo-access preflight. `git push` authenticates from
+        // the host's git credentials, so a repo the forge token cannot see clones
+        // and pushes fine and only fails at `fj pr create` with a bare 404, after
+        // a whole Claude run is paid for. Probe the forge identity here instead
+        // and skip the repo's issues for this poll.
+        if let Some(access) = access {
+            let host = host_only(&repo.repo_host);
+            let cache_key = format!("{host}/{}", repo.repo_path);
+            if !access_cache.contains_key(&cache_key) {
+                let readable = match access.check(&host, &repo.repo_path) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(project = %project, host = %host, repo = %repo.repo_path, error = %e, "forge repo-access preflight failed; skipping the repo's issues this poll");
+                        events.push(state::InputEvent {
+                            level: "warn".into(),
+                            context: Some(project.clone()),
+                            message: format!(
+                                "forge repo-access preflight failed for `{}` on {host}; issues \
+                                 skipped this poll and left Queued, so a permission grant is \
+                                 picked up on the next poll with no field change: {e}",
+                                repo.repo_path
+                            ),
+                        });
+                        false
+                    }
+                };
+                access_cache.insert(cache_key.clone(), readable);
+            }
+            if access_cache.get(&cache_key) != Some(&true) {
+                continue;
+            }
+        }
         let summary = issue
             .get("summary")
             .and_then(|v| v.as_str())
@@ -2101,7 +2229,7 @@ mod tests {
                 "[]",
             );
         let backend = CliBackend::new(Arc::new(runner));
-        let (jobs, events) = gather(&backend, &src().query).unwrap();
+        let (jobs, events) = gather(&backend, &src().query, None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, "MK-16");
         assert_eq!(jobs[0].summary, "a");
@@ -2143,7 +2271,7 @@ mod tests {
                 "unrecognized subcommand",
             );
         let backend = CliBackend::new(Arc::new(runner));
-        let (jobs, events) = gather(&backend, &src().query).unwrap();
+        let (jobs, events) = gather(&backend, &src().query, None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, "MK-16");
         // CLAUDE-147: the probe failure is recorded as a warn event (not the
@@ -2152,6 +2280,165 @@ mod tests {
         assert_eq!(events[0].level, "warn");
         assert_eq!(events[0].context.as_deref(), Some("ZZ"));
         assert!(events[0].message.contains("VCS probe failed"));
+    }
+
+    /// CLAUDE-194: a [`RepoAccess`] double that records every probe and either
+    /// passes or denies with a canned message.
+    struct StubAccess {
+        deny: Option<String>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl StubAccess {
+        fn allow() -> Self {
+            Self {
+                deny: None,
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn deny(msg: &str) -> Self {
+            Self {
+                deny: Some(msg.to_string()),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RepoAccess for StubAccess {
+        fn check(&self, host: &str, repo: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("{host}/{repo}"));
+            match &self.deny {
+                None => Ok(()),
+                Some(msg) => Err(Error::Other(anyhow::anyhow!("{msg}"))),
+            }
+        }
+    }
+
+    /// CLAUDE-194: two queued issues in one project, whose VCS resolves to one
+    /// repo. `yt` canned responses are shared, so the same runner can serve
+    /// several polls.
+    fn access_runner() -> StubRunner {
+        StubRunner::new()
+            .ok(
+                "yt",
+                &["list", "--query=-Resolved AI Agent: Queued", "--json"],
+                r#"[{"idReadable":"MK-16","summary":"a"},{"idReadable":"MK-17","summary":"b"}]"#,
+            )
+            .ok(
+                "yt",
+                &["project", "vcs", "list", "MK", "--enabled-only", "--json"],
+                r#"[{"serverUrl":"https://dev.a8n.run/","path":"contoso/claude-run"}]"#,
+            )
+    }
+
+    #[test]
+    fn gather_keeps_issues_when_forge_can_read_the_repo_and_probes_once() {
+        // CLAUDE-194: a readable repo proceeds unchanged, and the probe runs ONCE
+        // per repo per poll, not once per issue.
+        let backend = CliBackend::new(Arc::new(access_runner()));
+        let access = StubAccess::allow();
+        let (jobs, events) = gather(&backend, &src().query, Some(&access)).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(
+            *access.calls.lock().unwrap(),
+            vec!["dev.a8n.run/contoso/claude-run".to_string()]
+        );
+    }
+
+    #[test]
+    fn gather_drops_issues_when_forge_cannot_read_the_repo() {
+        // CLAUDE-194: an unreadable repo drops every issue of that repo before any
+        // job is built, records one warn event naming host, repo, and cause, and
+        // writes NO YouTrack field (the issues stay Queued), so the next poll
+        // after the permission grant picks them up with no manual field change.
+        let runner = Arc::new(access_runner());
+        let backend = CliBackend::new(runner.clone());
+        let denied = StubAccess::deny("forge token cannot read it (404)");
+        let (jobs, events) = gather(&backend, &src().query, Some(&denied)).unwrap();
+        assert!(jobs.is_empty(), "{jobs:?}");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].level, "warn");
+        assert_eq!(events[0].context.as_deref(), Some("MK"));
+        assert!(
+            events[0].message.contains("contoso/claude-run"),
+            "{}",
+            events[0].message
+        );
+        assert!(
+            events[0].message.contains("dev.a8n.run"),
+            "{}",
+            events[0].message
+        );
+        assert!(
+            events[0]
+                .message
+                .contains("forge token cannot read it (404)"),
+            "{}",
+            events[0].message
+        );
+        // One probe for the repo, not one per issue.
+        assert_eq!(denied.calls.lock().unwrap().len(), 1);
+        // No `AI Agent` write on the skip path: the issues stay Queued.
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("set-field")),
+            "gather must not touch AI Agent: {calls:?}"
+        );
+        drop(calls);
+
+        // The permission grant lands; the very next poll gathers the same issues
+        // with no field change in between.
+        let granted = StubAccess::allow();
+        let (jobs, events) = gather(&backend, &src().query, Some(&granted)).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn forge_access_check_is_skipped_without_a_forge_token_ref() {
+        // CLAUDE-194: with no `token_ref`, `fj` / `gh` read the OPERATOR store, so
+        // a probe would test the wrong identity. No checker is built at all.
+        let runner: Arc<dyn CommandRunner> = Arc::new(StubRunner::new());
+        let gh = crate::action::GithubTarget::default();
+        let base = Path::new("/tmp/claude-run-test-creds");
+        let host_auth = Arc::new(secrets::ResolvedCredentials::default());
+        assert!(forge_access_check(&runner, &host_auth, base, &gh).is_none());
+        // A yt-only `token_ref` is still not a FORGE identity.
+        let yt_only = Arc::new(secrets::ResolvedCredentials {
+            yt: Some(("https://yt.test".into(), "t".into())),
+            ..Default::default()
+        });
+        assert!(forge_access_check(&runner, &yt_only, base, &gh).is_none());
+        // A forge `token_ref` builds the checker.
+        let fj = Arc::new(secrets::ResolvedCredentials {
+            fj_token: Some("t".into()),
+            ..Default::default()
+        });
+        assert!(forge_access_check(&runner, &fj, base, &gh).is_some());
+    }
+
+    #[test]
+    fn forge_access_check_skips_a_host_it_has_no_token_for() {
+        // CLAUDE-194: a run carrying only a GitHub PAT probes GitHub hosts but
+        // leaves a Forgejo repo alone (that would test the operator store), and
+        // issues no CLI call for it.
+        let runner = Arc::new(StubRunner::new());
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+        let gh_only = Arc::new(secrets::ResolvedCredentials {
+            github_token: Some("pat".into()),
+            ..Default::default()
+        });
+        let check = forge_access_check(
+            &dyn_runner,
+            &gh_only,
+            Path::new("/tmp/claude-run-test-creds"),
+            &crate::action::GithubTarget::default(),
+        )
+        .unwrap();
+        check.check("dev.a8n.run", "contoso/claude-run").unwrap();
+        assert!(runner.calls.lock().unwrap().is_empty());
     }
 
     /// CLAUDE-131: a configured assignee is written via `yt issue update
