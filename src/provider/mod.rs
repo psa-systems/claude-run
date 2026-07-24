@@ -250,6 +250,13 @@ pub trait Forge: Send + Sync {
     /// `owner/name` path.
     fn clone_url(&self, host: &str, repo: &str) -> Result<String>;
 
+    /// CLAUDE-194: verify the FORGE identity can read `repo` (`owner/name`) on
+    /// `host`. `git push` authenticates from the host's own git credentials, so a
+    /// repo the forge token cannot see still clones and pushes and only fails at
+    /// `pr create` time, after a whole Claude run is paid for. This is the
+    /// preflight that catches it first; the error names the host and `owner/repo`.
+    fn repo_access(&self, host: &str, repo: &str) -> Result<()>;
+
     /// List open PRs for `repo` (`owner/name`) on `host`. Backs the CI-fix scan
     /// (`fj pr search --repo <repo> --state open --json`, FJ-1).
     fn list_open_prs(&self, host: &str, repo: &str) -> Result<Vec<ForgePullRequest>>;

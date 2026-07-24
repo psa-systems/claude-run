@@ -366,13 +366,22 @@ impl Forge for GithubForge {
                         .transport
                         .initialize(&self.endpoint, self.token.as_deref())
                     {
-                        Ok(()) => return self.open_via_mcp(&repo, &branch, &base, &title, &body),
+                        // CLAUDE-194: a create failure names the repo, the host,
+                        // and the possible-permission cause; the push succeeding
+                        // proves nothing about the API identity's access.
+                        Ok(()) => {
+                            return self
+                                .open_via_mcp(&repo, &branch, &base, &title, &body)
+                                .map_err(|e| pr_create_error(&repo, host, &branch, e))
+                        }
                         Err(e) => tried.push(format!("mcp: {e}")),
                     }
                 }
                 BackendKind::Gh => match self.runner.run(&self.gh, &["--version"]) {
                     Ok(out) if out.ok => {
-                        return self.open_via_gh(workdir, &branch, &base, &title, &body)
+                        return self
+                            .open_via_gh(workdir, &branch, &base, &title, &body)
+                            .map_err(|e| pr_create_error(&repo, host, &branch, e))
                     }
                     Ok(out) => tried.push(format!("gh: --version exited {}", out.exit_code)),
                     Err(e) => tried.push(format!("gh: {e}")),
@@ -390,6 +399,31 @@ impl Forge for GithubForge {
                 "no GitHub token configured to build an authenticated clone URL for {host}/{repo}"
             ))),
         }
+    }
+
+    /// CLAUDE-194: the GitHub repo read, `gh repo view <owner/repo> --json
+    /// nameWithOwner`, run with the action's PAT as `GH_TOKEN` exactly as
+    /// `open_via_gh` does, so the probe tests the identity that will open the PR.
+    /// The MCP transport exposes no repo-read tool, so this is `gh`-only; a host
+    /// without `gh` reports that by name rather than silently passing.
+    fn repo_access(&self, host: &str, repo: &str) -> Result<()> {
+        let envs: Vec<(&str, &str)> = match &self.token {
+            Some(t) => vec![("GH_TOKEN", t.as_str())],
+            None => Vec::new(),
+        };
+        let args = ["repo", "view", repo, "--json", "nameWithOwner"];
+        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        if out.ok {
+            return Ok(());
+        }
+        Err(Error::Other(anyhow::anyhow!(
+            "GitHub token cannot read `{repo}` on {host}: `{} repo view` exited {} ({}). \
+             A repo the token cannot see answers 404 `not found`, so this is most likely a \
+             missing permission grant for the bot on `{repo}`.",
+            self.gh,
+            out.exit_code,
+            out.stderr.trim()
+        )))
     }
 
     // The CI-fix-only operations are Forgejo-specific. A GitHub repo never enters
@@ -413,6 +447,18 @@ impl Forge for GithubForge {
     ) -> Result<()> {
         Err(unsupported("pr_comment"))
     }
+}
+
+/// CLAUDE-194: restate a PR-create failure with the repo, the host, and the
+/// permission hypothesis (the `fj` counterpart lives in `cli.rs`). The push
+/// authenticates with the PAT-in-URL or host git auth, so a successful push does
+/// not prove the API identity can see the repo.
+fn pr_create_error(repo: &str, host: &str, branch: &str, e: Error) -> Error {
+    Error::Other(anyhow::anyhow!(
+        "creating the pull request for `{repo}` on {host} (head branch `{branch}`) failed: {e}. \
+         The GitHub token may lack access to `{repo}`: a repo the token cannot see answers 404 \
+         `not found` here even though the push succeeded."
+    ))
 }
 
 fn unsupported(op: &str) -> Error {
@@ -733,6 +779,49 @@ mod tests {
             }
             other => panic!("expected NoBackend, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn repo_access_probes_gh_with_the_pat_and_names_host_and_repo() {
+        // CLAUDE-194: the GitHub repo read runs `gh repo view` with the action's
+        // PAT as GH_TOKEN, so it tests the identity that will open the PR. A
+        // denial names the host and `owner/repo`.
+        let ok_runner = Arc::new(StubRunner::new().ok(
+            "gh",
+            &["repo", "view", "octo/widget", "--json", "nameWithOwner"],
+            r#"{"nameWithOwner":"octo/widget"}"#,
+        ));
+        let forge = GithubForge::new(
+            ok_runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        );
+        forge.repo_access("github.com", "octo/widget").unwrap();
+        let envs = ok_runner.envs.lock().unwrap();
+        let gh = envs.iter().find(|(b, _)| b == "gh").unwrap();
+        assert_eq!(
+            gh.1,
+            vec![("GH_TOKEN".to_string(), "ghp_secret".to_string())]
+        );
+        drop(envs);
+
+        let denied = GithubForge::new(
+            Arc::new(StubRunner::new().fail(
+                "gh",
+                &["repo", "view", "octo/secret", "--json", "nameWithOwner"],
+                1,
+                "GraphQL: Could not resolve to a Repository",
+            )),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        );
+        let err = denied
+            .repo_access("github.com", "octo/secret")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("octo/secret"), "got {err}");
+        assert!(err.contains("github.com"), "got {err}");
+        assert!(err.contains("permission"), "got {err}");
     }
 
     #[test]
