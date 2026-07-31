@@ -17,7 +17,10 @@ on:
 jobs:
   check:
     name: fmt + clippy + build + tests
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    # Dev image, not base: this job compiles natively, and base ships cargo/rustc but no
+    # `cc`, so crate build scripts fail to link (CLAUDE-203). The sibling workflows only
+    # drive docker/nu/git, so they stay on the smaller base image.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
 
     steps:
       - name: Clone the repository
