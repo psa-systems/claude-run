@@ -534,6 +534,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "serde_yaml",
  "sha2",
  "shellexpand",
