@@ -17,6 +17,9 @@
 #              LATEST run per (branch, workflow_id); when `head_branch` is null the
 #              branch is resolved from the run's log (bounded by
 #              max_branch_resolves).
+#   dedupe  -> open issues sharing a hidden `Root-Cause-Key:` marker are collapsed
+#              onto the oldest of the group and the rest closed as duplicates
+#              (CLAUDE-198), before any Forgejo read.
 #   green   -> read each latest run's per-job status from the jobs endpoint; a job
 #              whose status is `success` is a now-green (branch, workflow, job).
 #   close   -> every open issue whose (repo, branch, workflow, job) exactly matches
@@ -78,6 +81,14 @@ native:
   # bound log fetches when the runs list returns `head_branch` null. Reached-cap
   # is logged, never silent.
   max_branch_resolves: 40
+  # CLAUDE-198: collapse open issues that share a `Root-Cause-Key:` marker onto the
+  # oldest of the group, closing the rest as duplicates. Mint's cross-run collapse
+  # is a tracker full-text search, so a lagging index lets two failures of the same
+  # job mint two issues; this closes the strays.
+  close_duplicates: true
+  # Duplicate close-comment template. {canonical} is the surviving issue id and
+  # {root_cause_key} the shared marker; the hidden auto-closed marker is appended.
+  duplicate_comment: "Auto-closed as a duplicate of {canonical}: both issues track the same failing job (root-cause key `{root_cause_key}`). Follow {canonical} for the fix."
 
 output:
   file: ci-failure-reconcile.jsonl
