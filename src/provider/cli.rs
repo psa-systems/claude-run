@@ -34,6 +34,48 @@ fn pr_create_error(fj: &str, repo: &str, host: &str, head: Option<&str>, e: Erro
     ))
 }
 
+/// CLAUDE-206: does this `fj pr create` failure mean "an open PR for this head
+/// already exists"? Forgejo answers the create with 409 and the body message
+/// `pull request already exists for these targets [...]`
+/// (`ErrPullRequestAlreadyExists`), and `forgejo-api` renders a 409 from
+/// `RepoCreatePullRequest` as `api error: <message>`, so that text is what `fj`
+/// prints. Matched on the message, not on a status code the CLI never prints.
+fn is_pr_already_exists(e: &Error) -> bool {
+    matches!(e, Error::CliFailed { stderr, .. } if stderr.to_lowercase().contains("already exists"))
+}
+
+/// CLAUDE-206: how a lookup attempt ended, for an error message that has to name
+/// both causes. `None` is "the lookup ran and found no open PR".
+fn lookup_outcome(e: Option<&Error>) -> String {
+    match e {
+        Some(e) => format!("failed ({e})"),
+        None => "succeeded and found no open PR for the branch".to_string(),
+    }
+}
+
+/// CLAUDE-206: a `pr create` failure where the open-PR lookup had ALSO failed.
+/// [`pr_create_error`] alone reads as "PR creation failed" when the run really
+/// could not check whether a PR already existed, so the lookup cause is named
+/// alongside it.
+fn pr_create_error_with_lookup(
+    fj: &str,
+    repo: &str,
+    host: &str,
+    branch: &str,
+    create_err: Error,
+    lookup_err: Option<Error>,
+) -> Error {
+    let base = pr_create_error(fj, repo, host, Some(branch), create_err);
+    match lookup_err {
+        None => base,
+        Some(l) => Error::Other(anyhow::anyhow!(
+            "{base} The open-PR lookup for `{repo}` had also {}, so the runner could not tell \
+             whether a PR already existed before creating one; both calls failed.",
+            lookup_outcome(Some(&l))
+        )),
+    }
+}
+
 /// CLAUDE-136: derive a PR number from a forge PR URL's trailing
 /// `/pulls/<n>` (Forgejo) or `/pull/<n>` (GitHub-style) segment. Used only as a
 /// fallback when `fj pr create --json` omits the `number` field.
@@ -245,6 +287,10 @@ pub struct CliBackend {
     /// CLAUDE-26: env injected on the `fj` child only, e.g. an `XDG_DATA_HOME`
     /// override pointing at a temp `forgejo-cli/keys.json`. Empty by default.
     fj_env: Vec<(String, String)>,
+    /// CLAUDE-206: operator-visible notices accumulated while serving the job
+    /// (currently: an open-PR lookup that failed and was degraded to a create).
+    /// Drained by [`Forge::take_notices`] and persisted as run events.
+    notices: std::sync::Mutex<Vec<String>>,
 }
 
 /// Shape of the forge CLI key store (`~/.local/share/forgejo-cli/keys.json`):
@@ -351,6 +397,7 @@ impl CliBackend {
             keys_path,
             yt_env: Vec::new(),
             fj_env: Vec::new(),
+            notices: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -563,14 +610,27 @@ impl CliBackend {
                     self.push_branch(workdir, &branch)?;
                     self.find_or_create_pr(workdir, host, &repo, &branch)
                 } else {
-                    match self.find_open_pr(host, &repo, &branch)? {
-                        Some(pr) => Ok(pr),
-                        None => Err(Error::Other(anyhow::anyhow!(
+                    // CLAUDE-206: the lookup stays FATAL on this arm only. Here
+                    // its result decides between adopting and refusing, so an
+                    // "assume none" would raise the refusal for the wrong
+                    // reason; a failed search and a genuine "no open PR" are
+                    // reported as the different conditions they are.
+                    match self.find_open_pr(host, &repo, &branch) {
+                        Ok(Some(pr)) => Ok(pr),
+                        Ok(None) => Err(Error::Other(anyhow::anyhow!(
                             "remote branch `{branch}` has diverged from the local work \
                              (local {local_sha}, remote {remote_sha}) and no open PR exists \
                              for it; refusing to force-push over it. Any unpushed work in the \
                              workdir `{}` is preserved; branches already pushed remain on the \
                              remote.",
+                            workdir.display()
+                        ))),
+                        Err(e) => Err(Error::Other(anyhow::anyhow!(
+                            "remote branch `{branch}` has diverged from the local work \
+                             (local {local_sha}, remote {remote_sha}) and the open-PR lookup \
+                             failed ({e}), so whether an open PR exists for it is UNKNOWN; \
+                             refusing to force-push over it. Any unpushed work in the workdir \
+                             `{}` is preserved; branches already pushed remain on the remote.",
                             workdir.display()
                         ))),
                     }
@@ -669,6 +729,14 @@ impl CliBackend {
     /// create it. The title/body derivation from the branch tip and the
     /// `fj pr create` call run ONLY on the create path, so adopting an existing
     /// PR issues no `pr create`.
+    ///
+    /// CLAUDE-206: a FAILED lookup is not fatal here. The lookup is an
+    /// optimization (`fj pr search` is an issue-category call, `pr create` a
+    /// repository-category one, so they fail independently), and the create
+    /// below is what delivers the work; a failure degrades to "unknown, assume
+    /// none" with a warn plus an operator-visible notice. The degraded path can
+    /// race a PR that already exists, so a create rejected as already-existing
+    /// retries the lookup exactly once and adopts what it finds.
     fn find_or_create_pr(
         &self,
         workdir: &Path,
@@ -676,9 +744,14 @@ impl CliBackend {
         repo: &str,
         branch: &str,
     ) -> Result<PullRequest> {
-        if let Some(pr) = self.find_open_pr(host, repo, branch)? {
-            return Ok(pr);
-        }
+        let lookup_err = match self.find_open_pr(host, repo, branch) {
+            Ok(Some(pr)) => return Ok(pr),
+            Ok(None) => None,
+            Err(e) => {
+                self.note_degraded_lookup(host, repo, branch, &e);
+                Some(e)
+            }
+        };
 
         // Title/body derive from the feature branch tip, not `HEAD`.
         let title_args = ["log", "-1", "--format=%s", branch];
@@ -712,8 +785,53 @@ impl CliBackend {
             .run_in_env(Some(workdir), &self.fj, &create_args, &self.fj_envs())
             .and_then(|out| Self::checked(&self.fj, out, &create_args));
         let _ = std::fs::remove_file(workdir.join(BODY_FILE));
-        let stdout = res.map_err(|e| pr_create_error(&self.fj, repo, host, Some(branch), e))?;
+        let stdout = match res {
+            Ok(stdout) => stdout,
+            // CLAUDE-206: the forge says a PR for this head already exists (a
+            // concurrent run, or one the degraded lookup could not see). Retry
+            // the lookup exactly once and adopt what it returns.
+            Err(e) if is_pr_already_exists(&e) => {
+                let retry = self.find_open_pr(host, repo, branch);
+                let retry_err = match retry {
+                    Ok(Some(pr)) => return Ok(pr),
+                    Ok(None) => None,
+                    Err(re) => Some(re),
+                };
+                return Err(Error::Other(anyhow::anyhow!(
+                    "`{} pr create` for `{repo}` on {host} (head branch `{branch}`) reports that \
+                     a pull request for that head already exists ({e}), but the open-PR lookup \
+                     cannot return it, so there is nothing to adopt: the first lookup {}, the \
+                     retry {}. The branch is already pushed; fix the lookup (a token missing \
+                     `read:issue` 403s `fj pr search` while `pr create` still works) and re-run.",
+                    self.fj,
+                    lookup_outcome(lookup_err.as_ref()),
+                    lookup_outcome(retry_err.as_ref()),
+                )));
+            }
+            Err(e) => {
+                return Err(pr_create_error_with_lookup(
+                    &self.fj, repo, host, branch, e, lookup_err,
+                ));
+            }
+        };
         self.created_pr(&stdout)
+    }
+
+    /// CLAUDE-206: record a lookup failure that was degraded to a create, in the
+    /// daemon journal and as a notice the run surfaces on the action page.
+    fn note_degraded_lookup(&self, host: &str, repo: &str, branch: &str, e: &Error) {
+        warn!(
+            repo = %repo,
+            branch = %branch,
+            error = %e,
+            "open-PR lookup failed; assuming no open PR and creating one"
+        );
+        self.notices.lock().unwrap().push(format!(
+            "open-PR lookup for `{repo}` on {host} failed ({e}); assumed no open PR exists for \
+             `{branch}` and created one. `fj pr search` is an issue-category call while \
+             `pr create` is repository-category, so a token missing `read:issue` fails only the \
+             lookup (actions/SCHEMA.md, \"Forgejo token scopes\")."
+        ));
     }
 
     /// CLAUDE-103 opt-in: AGit + autofill (`fj --host <host> pr create -aA`).
@@ -1145,6 +1263,10 @@ impl Forge for CliBackend {
         }
     }
 
+    fn take_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notices.lock().unwrap())
+    }
+
     /// CLAUDE-194 / CLAUDE-207: two probes, one per scope category the PR path
     /// crosses (`actions/SCHEMA.md`, "Forgejo token scopes").
     ///
@@ -1485,6 +1607,9 @@ pub mod testutil {
     pub struct StubRunner {
         /// (binary, joined-args) -> outcome.
         responses: HashMap<String, CmdOutput>,
+        /// CLAUDE-206: (binary, joined-args) -> outcome consumed by the FIRST
+        /// matching call only; later calls fall through to `responses`.
+        once: Mutex<HashMap<String, CmdOutput>>,
         /// Binaries that should report as absent from PATH.
         missing: Vec<String>,
         /// Records every (binary, args) invocation for assertions.
@@ -1530,6 +1655,22 @@ pub mod testutil {
             self
         }
 
+        /// CLAUDE-206: register a failing response consumed by the FIRST call to
+        /// `binary args...` only, so a test can model a call that fails once and
+        /// succeeds on the retry (pair it with `ok` for the standing response).
+        pub fn fail_once(self, binary: &str, args: &[&str], exit_code: i32, stderr: &str) -> Self {
+            self.once.lock().unwrap().insert(
+                Self::key(binary, args),
+                CmdOutput {
+                    ok: false,
+                    stdout: String::new(),
+                    stderr: stderr.to_string(),
+                    exit_code,
+                },
+            );
+            self
+        }
+
         /// Mark `binary` as absent from PATH (every call to it -> CliNotFound).
         pub fn missing(mut self, binary: &str) -> Self {
             self.missing.push(binary.to_string());
@@ -1542,6 +1683,9 @@ pub mod testutil {
                 return Err(Error::CliNotFound {
                     binary: binary.to_string(),
                 });
+            }
+            if let Some(out) = self.once.lock().unwrap().remove(&Self::key(binary, args)) {
+                return Ok(out);
             }
             self.responses
                 .get(&Self::key(binary, args))
@@ -1991,24 +2135,35 @@ mod tests {
             )
     }
 
-    /// CLAUDE-170: the `fj pr search` open-PR lookup the branch path issues
-    /// against `contoso/claude-run` (the repo `with_remote_state`'s origin URL
-    /// parses to). `json` is the stdout to return (`"[]"` = no open PRs).
+    /// The argv of the open-PR lookup the branch path issues against
+    /// `contoso/claude-run` (the repo `with_remote_state`'s origin URL parses
+    /// to).
+    const OPEN_PR_SEARCH: [&str; 9] = [
+        "--host",
+        "dev.a8n.run",
+        "pr",
+        "search",
+        "--repo",
+        "contoso/claude-run",
+        "--state",
+        "open",
+        "--json",
+    ];
+
+    /// CLAUDE-170: the `fj pr search` open-PR lookup the branch path issues.
+    /// `json` is the stdout to return (`"[]"` = no open PRs).
     fn with_open_pr_search(runner: StubRunner, json: &str) -> StubRunner {
-        runner.ok(
+        runner.ok("fj", &OPEN_PR_SEARCH, json)
+    }
+
+    /// CLAUDE-206: the same lookup, failing the way a token without the issue
+    /// scope does (`fj pr search` 403s while `pr create` still works).
+    fn with_failed_open_pr_search(runner: StubRunner) -> StubRunner {
+        runner.fail(
             "fj",
-            &[
-                "--host",
-                "dev.a8n.run",
-                "pr",
-                "search",
-                "--repo",
-                "contoso/claude-run",
-                "--state",
-                "open",
-                "--json",
-            ],
-            json,
+            &OPEN_PR_SEARCH,
+            1,
+            "Error: unexpected status code 403 Forbidden",
         )
     }
 
@@ -2543,6 +2698,283 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains("--force")),
             "no force anywhere: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_creates_when_open_pr_lookup_fails() {
+        // CLAUDE-206 (a): `fj pr search` 403s (an issue-category token gap) on
+        // the remote-absent arm. The lookup is an optimization, so the run
+        // degrades to "assume no open PR", still pushes and creates the PR, and
+        // records the CLI error as an operator-visible notice.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "fix/CLAUDE-206"],
+            &[("fix/CLAUDE-206", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "fix/CLAUDE-206", "abc123", "");
+        let runner = with_failed_open_pr_search(runner)
+            .ok(
+                "git",
+                &[
+                    "push",
+                    "--set-upstream",
+                    "origin",
+                    "fix/CLAUDE-206:fix/CLAUDE-206",
+                ],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "fix/CLAUDE-206"],
+                "fix(pr): degrade a failed lookup\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "fix/CLAUDE-206"],
+                "#CLAUDE-206\n",
+            )
+            .ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "fix(pr): degrade a failed lookup",
+                    "--body-file",
+                    ".claude-run-pr-body.md",
+                    "--head",
+                    "fix/CLAUDE-206",
+                    "--json",
+                ],
+                r#"{"number":206,"html_url":"https://dev.a8n.run/n/c/pulls/206"}"#,
+            );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+        assert_eq!(pr.number, Some(206), "a failed lookup must not abort");
+        // The degradation is reported, naming the CLI error and the repo.
+        let notices = b.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("403 Forbidden"), "{}", notices[0]);
+        assert!(
+            notices[0].contains("contoso/claude-run"),
+            "{}",
+            notices[0]
+        );
+        // Drained: a second call reports nothing again.
+        assert!(b.take_notices().is_empty());
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.contains("pr create")),
+            "must fall through to create: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_retries_lookup_once_when_create_says_already_exists() {
+        // CLAUDE-206 (b): the race the degraded path exposes. The first lookup
+        // fails, so the create runs and Forgejo rejects it with 409 "pull
+        // request already exists". Exactly one lookup retry follows, and it now
+        // succeeds, so the existing PR is adopted instead of the run failing.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "fix/CLAUDE-206"],
+            &[("fix/CLAUDE-206", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "fix/CLAUDE-206", "abc123", "");
+        let runner = with_open_pr_search(
+            runner,
+            r#"[{"number":207,"head_ref":"fix/CLAUDE-206","html_url":"https://dev.a8n.run/n/c/pulls/207"}]"#,
+        )
+        // ... but the FIRST lookup (before the create) fails.
+        .fail_once(
+            "fj",
+            &OPEN_PR_SEARCH,
+            1,
+            "Error: unexpected status code 403 Forbidden",
+        )
+        .ok(
+            "git",
+            &[
+                "push",
+                "--set-upstream",
+                "origin",
+                "fix/CLAUDE-206:fix/CLAUDE-206",
+            ],
+            "",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%s", "fix/CLAUDE-206"],
+            "fix(pr): degrade a failed lookup\n",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%b", "fix/CLAUDE-206"],
+            "#CLAUDE-206\n",
+        )
+        .fail(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "fix(pr): degrade a failed lookup",
+                "--body-file",
+                ".claude-run-pr-body.md",
+                "--head",
+                "fix/CLAUDE-206",
+                "--json",
+            ],
+            1,
+            "Error: api error: pull request already exists for these targets \
+             [head_repo_id: 4, base_repo_id: 4, head_branch: fix/CLAUDE-206, base_branch: main]",
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+        assert_eq!(pr.number, Some(207), "the retry adopts the existing PR");
+        let calls = runner.calls.lock().unwrap();
+        let searches = calls.iter().filter(|c| c.contains("pr search")).count();
+        assert_eq!(searches, 2, "exactly one retry: {calls:?}");
+    }
+
+    #[test]
+    fn create_pr_branch_names_both_causes_when_lookup_and_create_fail() {
+        // CLAUDE-206: the create fails for its own reason after the lookup had
+        // already failed. The error names BOTH, so "could not check whether a PR
+        // existed" is never reported as a bare "PR creation failed".
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "fix/CLAUDE-206"],
+            &[("fix/CLAUDE-206", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "fix/CLAUDE-206", "abc123", "");
+        let runner = with_failed_open_pr_search(runner)
+            .ok(
+                "git",
+                &[
+                    "push",
+                    "--set-upstream",
+                    "origin",
+                    "fix/CLAUDE-206:fix/CLAUDE-206",
+                ],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "fix/CLAUDE-206"],
+                "fix(pr): degrade a failed lookup\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "fix/CLAUDE-206"],
+                "#CLAUDE-206\n",
+            )
+            .fail(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "create",
+                    "fix(pr): degrade a failed lookup",
+                    "--body-file",
+                    ".claude-run-pr-body.md",
+                    "--head",
+                    "fix/CLAUDE-206",
+                    "--json",
+                ],
+                1,
+                "Error: not found: The target couldn't be found.",
+            );
+        let b = CliBackend::new(Arc::new(runner));
+        match b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap_err()
+        {
+            Error::Other(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("not found"), "names the create cause: {msg}");
+                assert!(
+                    msg.contains("403 Forbidden"),
+                    "names the lookup cause: {msg}"
+                );
+            }
+            other => panic!("expected Other actionable error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_pr_branch_diverged_distinguishes_failed_lookup_from_no_pr() {
+        // CLAUDE-206: the diverged arm stays fatal (the lookup is the only
+        // alternative to a force-push there), but a FAILED search no longer
+        // reads as "no open PR exists": the message says the answer is unknown
+        // and names the CLI error. Still no push and no force.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "fix/CLAUDE-206"],
+            &[("fix/CLAUDE-206", "localsha\n")],
+        );
+        let runner = with_remote_state(
+            runner,
+            "fix/CLAUDE-206",
+            "localsha",
+            "remotesha\trefs/heads/fix/CLAUDE-206\n",
+        );
+        let runner = Arc::new(with_failed_open_pr_search(runner).fail(
+            "git",
+            &["merge-base", "--is-ancestor", "remotesha", "localsha"],
+            1,
+            "",
+        ));
+        let b = CliBackend::new(runner.clone());
+        match b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap_err()
+        {
+            Error::Other(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("open-PR lookup failed"),
+                    "names the failed search: {msg}"
+                );
+                assert!(msg.contains("403 Forbidden"), "names the CLI error: {msg}");
+                assert!(msg.contains("UNKNOWN"), "not a bare no-PR claim: {msg}");
+                assert!(
+                    !msg.contains("no open PR exists"),
+                    "must not claim no PR exists: {msg}"
+                );
+            }
+            other => panic!("expected Other actionable error, got {other:?}"),
+        }
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "diverged must not push: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--force")),
+            "no force anywhere: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("pr create")),
+            "diverged must not create: {calls:?}"
         );
     }
 
