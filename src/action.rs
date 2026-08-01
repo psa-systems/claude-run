@@ -1755,6 +1755,25 @@ native:
         }
     }
 
+    /// CLAUDE-207: the repo-access preflight now probes both scope categories the
+    /// PR path uses, so the caveat that it tested repository read only (prose that
+    /// stood in for the fix) must not come back in either the schema doc or the
+    /// gather doc comment.
+    #[test]
+    fn preflight_docs_do_not_claim_the_probe_is_weaker_than_the_pr_path() {
+        for (path, src) in [
+            ("actions/SCHEMA.md", include_str!("../actions/SCHEMA.md")),
+            ("src/native/youtrack.rs", include_str!("native/youtrack.rs")),
+        ] {
+            for needle in ["repository read only", "than the PR path needs"] {
+                assert!(
+                    !src.contains(needle),
+                    "{path} still says the preflight is weaker than the PR path: {needle}"
+                );
+            }
+        }
+    }
+
     /// The default query must NEVER select by `AI Agent`: reconcile is independent
     /// of the code-fix runner's `AI Agent: Queued` selector.
     #[test]

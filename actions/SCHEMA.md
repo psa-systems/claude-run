@@ -219,8 +219,10 @@ The token named by `forgejo.token_ref` (or the host `keys.json` entry `fj` falls
 **`write:repository`** and **`write:issue`**, in the labels the deployed Forgejo's token UI uses (verified against
 Forgejo `16.0.0+gitea-1.22.0`, `models/auth/access_token_scope.go`). Forgejo scopes API endpoints by category, not by
 `fj` command name, and the runner's PR path crosses two categories: `fj pr search` and `fj pr comment` are backed by the
-**issues** API even though they name a PR. A repository-only token passes the CLAUDE-194 preflight and `fj pr create`
-and then fails the CLAUDE-170 open-PR lookup with `403 Forbidden`.
+**issues** API even though they name a PR. A repository-only token can still `fj pr create` and would fail the
+CLAUDE-170 open-PR lookup with `403 Forbidden`; since CLAUDE-207 the gather-time preflight exercises one read per
+category, so such a token is rejected before any Claude spend (see
+[Forge repo-access preflight](#forge-repo-access-preflight-claude-194-claude-207)).
 
 Every `fj` command the runner issues, the fj-source call it makes, and the category Forgejo routes that endpoint under
 (`routers/api/v1/api.go`: the repository group, and the separate `/repos` group carrying
@@ -228,15 +230,15 @@ Every `fj` command the runner issues, the fj-source call it makes, and the categ
 
 | `fj` command (`src/provider/cli.rs`)             | fj source call                                             | Forgejo endpoint                                     | Scope category    |
 |--------------------------------------------------|-------------------------------------------------------------|--------------------------------------------------------|--------------------|
-| `repo view <repo> --json` (`:1154`)              | `fj_core::repo::get` -> `repo_get`                          | `GET /repos/{o}/{r}`                                   | repository (read)  |
+| `repo view <repo> --json` (`:1162`)              | `fj_core::repo::get` -> `repo_get`                          | `GET /repos/{o}/{r}`                                   | repository (read)  |
 | `pr create <title> --body-file .. --head <b> --json` (`:698`) | `fj_core::prs::create` -> `repo_create_pull_request` | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
 | `pr create -aA --json` (AGit, `:725`)            | same as above                                                | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
-| `pr search --repo <r> --state open --json` (`:1173`) | `fj_core::issues::list_page` -> `issue_list_issues` (`type=pulls`), then one `prs::get` per hit | `GET /repos/{o}/{r}/issues?type=pulls`, `GET /repos/{o}/{r}/pulls/{i}` | **issue (read)** + repository (read) |
-| `pr status <id> --json` (`:1191`)                | `prs::get` + `prs::get_commit_statuses`                      | `GET /repos/{o}/{r}/pulls/{i}`, `GET /repos/{o}/{r}/commits/{sha}/status` | repository (read)  |
-| `pr merge <id> --method merge --delete` (`:1222`) | `repo::get` + `prs::get` + `prs::merge` -> `repo_merge_pull_request` | `POST /repos/{o}/{r}/pulls/{i}/merge`          | repository (write) |
-| `pr comment <id> --body-file <f>` (`:1263`)      | `fj_core::issues::create_comment` -> `issue_create_comment`  | `POST /repos/{o}/{r}/issues/{i}/comments`              | **issue (write)**  |
-| `pr edit <id> labels --add <label>` (`:1283`)    | `fj_core::issues::edit_labels` -> `issue_list_labels` + `issue_add_label` | `GET /repos/{o}/{r}/labels`, `POST /repos/{o}/{r}/issues/{i}/labels` | **issue (write)**  |
-| `pr view <id> --json` (`:1299`)                  | `prs::get` + `prs::list_files` + `repo::get`                 | `GET /repos/{o}/{r}/pulls/{i}`, `.../files`            | repository (read)  |
+| `pr search --repo <r> --state open --json` (`:1194`) | `fj_core::issues::list_page` -> `issue_list_issues` (`type=pulls`), then one `prs::get` per hit | `GET /repos/{o}/{r}/issues?type=pulls`, `GET /repos/{o}/{r}/pulls/{i}` | **issue (read)** + repository (read) |
+| `pr status <id> --json` (`:1213`)                | `prs::get` + `prs::get_commit_statuses`                      | `GET /repos/{o}/{r}/pulls/{i}`, `GET /repos/{o}/{r}/commits/{sha}/status` | repository (read)  |
+| `pr merge <id> --method merge --delete` (`:1243`) | `repo::get` + `prs::get` + `prs::merge` -> `repo_merge_pull_request` | `POST /repos/{o}/{r}/pulls/{i}/merge`          | repository (write) |
+| `pr comment <id> --body-file <f>` (`:1285`)      | `fj_core::issues::create_comment` -> `issue_create_comment`  | `POST /repos/{o}/{r}/issues/{i}/comments`              | **issue (write)**  |
+| `pr edit <id> labels --add <label>` (`:1305`)    | `fj_core::issues::edit_labels` -> `issue_list_labels` + `issue_add_label` | `GET /repos/{o}/{r}/labels`, `POST /repos/{o}/{r}/issues/{i}/labels` | **issue (write)**  |
+| `pr view <id> --json` (`:1321`)                  | `prs::get` + `prs::list_files` + `repo::get`                 | `GET /repos/{o}/{r}/pulls/{i}`, `.../files`            | repository (read)  |
 
 Two things the token does **not** have to cover: the `git push` in front of `pr create` authenticates with the daemon
 host's own git credentials, not this token (CLAUDE-194); and the org-label lookup inside `pr edit labels`
@@ -255,7 +257,8 @@ GitHub backend; every other host opens through `fj` exactly as before, so no exi
 The GitHub backend prefers GitHub's remote MCP (`create_pull_request`) and falls back to `gh pr create` when the MCP
 endpoint is unreachable; with neither available it errors. Unlike Forgejo's AGit flow (`fj -aA`), GitHub has no AGit
 equivalent, so the backend pushes the working branch before opening the PR. The PAT supplied via `github.token_ref`
-must carry the **`repo`** and **`pull_request`** scopes (used for the authenticated push, the MCP call, and `gh`).
+must carry the **`repo`** and **`pull_request`** scopes (used for the authenticated push, the MCP call, and `gh`). The
+gather-time preflight probes one capability per scope, so a PAT short of either is rejected before the run (CLAUDE-207).
 
 ##### CI-gated automerge (CLAUDE-126)
 
@@ -297,18 +300,22 @@ When blocked:
 
 When dependencies are met, the issue has none, or `enabled: false`, the gate is a no-op and pickup proceeds exactly as before (Working, clone, claude). No "unblocked" comment is posted; the normal Working transition and eventual PR are the signal. If the link read itself fails, the gate does not strand the issue: it falls back to normal pickup (the agent self-parks if it truly cannot proceed), since the gate is an optimization over that correct baseline.
 
-##### Forge repo-access preflight (CLAUDE-194)
+##### Forge repo-access preflight (CLAUDE-194, CLAUDE-207)
 
 The runner uses two identities against the same forge host: `fj` / `gh` authenticate with the action's `token_ref` (the bot), while `git push` authenticates from the daemon host's own git credentials. A repo the forge token cannot see therefore clones and pushes fine and fails only at `pr create`, with a bare 404 that names neither the repo, the host, nor the identity, after a whole Claude run has been paid for.
 
-At gather time, once per repo per poll (not once per issue), the runner asks the forge whether the token can READ the resolved repo: `fj --host <host> repo view <owner/repo> --json` for Forgejo, `gh repo view <owner/repo> --json nameWithOwner` for a GitHub-hosted job. **Deployment prerequisite:** the runner's `fj` must expose `repo view --json`.
+At gather time, once per repo per poll (not once per issue), the runner asks the forge whether the token can do the PR path on the resolved repo. Forgejo scopes its API by endpoint category and the PR path crosses two of them, so the preflight is **two** reads, one per category, and both must pass:
 
-The probe tests repository read only, which is **less** than the PR path needs: opening a PR also goes through the
-issues API (`fj pr search`, `fj pr comment`), so a token scoped to repository alone passes this probe and still fails
-later with `403 Forbidden` (CLAUDE-196). See [Forgejo token scopes](#forgejo-token-scopes-claude-196) for the full
-requirement; a passing probe means the repo is visible, not that the token can open a PR.
+| Backend | Repository-category probe                        | Issue / pull-request-category probe                            |
+|---------|--------------------------------------------------|-----------------------------------------------------------------|
+| Forgejo | `fj --host <host> repo view <owner/repo> --json`  | `fj --host <host> pr search --repo <owner/repo> --state open --json` |
+| GitHub  | `gh repo view <owner/repo> --json nameWithOwner`  | `gh pr list --repo <owner/repo> --state open --limit 1 --json number` |
 
-When the probe fails, every issue of that repo is dropped for the poll and one `warn` input event (visible on the action page) records the host, the `owner/repo`, and the CLI's cause. `AI Agent` is left at **`Queued`**: the condition is a missing permission grant, not a defect in the issue, so the next poll after the grant picks the issues up with no manual field change. This is deliberately unlike the `Failed` path a mid-run failure takes.
+The second probe is the exact call the PR path makes first (the CLAUDE-170 open-PR lookup), so a token carrying the repository category alone now fails at gather instead of 403-ing mid-run with the Claude session already paid for. An empty result is a pass; only a non-zero exit is a failure. The repository probe is still needed because an invisible repo and a repo with no open PRs both search as an empty array with exit 0. A GitHub fine-grained PAT scopes pull requests separately from repo metadata, so the same asymmetry exists there and is probed the same way. **Deployment prerequisite:** the runner's `fj` must expose `repo view --json` and `pr search --json`.
+
+A failing probe is reported with the capability that failed (`repo view` / `pr search`), the CLI's exit status, and the grant to add, and the two failure modes read differently because they need different grants: a **403** means the token can see the repo but is refused the call (add the named scope, `read:repository` / `read:issue` for Forgejo and `repo` / `pull_request` for GitHub, or the matching unit permission), while a **404** means the repo is not visible to the token at all (a repo permission grant for the bot; no scope reveals it). See [Forgejo token scopes](#forgejo-token-scopes-claude-196) for the per-command category breakdown.
+
+When either probe fails, every issue of that repo is dropped for the poll and one `warn` input event (visible on the action page) records the host, the `owner/repo`, and the CLI's cause. `AI Agent` is left at **`Queued`**: the condition is a missing permission grant, not a defect in the issue, so the next poll after the grant picks the issues up with no manual field change. This is deliberately unlike the `Failed` path a mid-run failure takes.
 
 The probe is skipped entirely when the action sets no forge `token_ref`, and skipped per host when the action carries no token for that host's forge: `fj` / `gh` then read the operator's own credential store, so the probe would test the wrong identity. A permission change *after* gather still fails at `pr create`, so that error is also restated with the repo, the host, and the possible-permission cause instead of the bare CLI text.
 
