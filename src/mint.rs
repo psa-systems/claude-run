@@ -56,10 +56,10 @@ pub struct MintRequest<'a> {
     pub commit_sha: &'a str,
     /// Workflow filename, e.g. `ci.yml` (part of the secondary dedupe key).
     pub workflow_id: &'a str,
-    /// CLAUDE-190: the failing run's branch, resolved by the consumer from the
-    /// log checkout section (`GITHUB_REF=refs/heads/<branch>`), else the run
-    /// detail. Empty when unresolvable (a logless failure). Part of the
-    /// root-cause dedupe key.
+    /// CLAUDE-190/199: the failing run's branch, resolved by the consumer from
+    /// the log's environment dump (`GITHUB_HEAD_REF` on a PR run, else the
+    /// `refs/heads/` short name), else the run detail. Empty when unresolvable
+    /// (a logless failure). Part of the root-cause dedupe key.
     pub branch: &'a str,
     /// CLAUDE-190: the failing job's name, resolved from the jobs endpoint.
     /// Empty when unresolvable. Part of the root-cause dedupe key.
