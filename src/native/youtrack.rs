@@ -376,6 +376,26 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
             if let Err(e) = state::run_inflight_remove(&pool, run_id, &job.key).await {
                 warn!(error = %e, "run_inflight_remove failed (non-fatal)");
             }
+            // CLAUDE-206: surface forge-side degradations (an open-PR lookup
+            // that failed and fell through to `pr create`) on the action page,
+            // not only in the daemon journal. Drained before the `?` below so a
+            // failed job still reports them. Non-fatal bookkeeping.
+            let notices = forge.take_notices();
+            if !notices.is_empty() {
+                let events: Vec<state::InputEvent> = notices
+                    .into_iter()
+                    .map(|message| state::InputEvent {
+                        level: "warn".to_string(),
+                        context: Some(job.key.clone()),
+                        message,
+                    })
+                    .collect();
+                if let Err(e) =
+                    state::run_events_record_for_run(&pool, run_id, &action.name, &events).await
+                {
+                    warn!(error = %e, "run_events_record_for_run failed (non-fatal)");
+                }
+            }
             let outcome = outcome?;
             record_outcome(loaded.as_ref(), &paths, &pool, run_id, &outcome).await?;
             Ok::<bool, crate::error::Error>(true)

@@ -219,10 +219,13 @@ The token named by `forgejo.token_ref` (or the host `keys.json` entry `fj` falls
 **`write:repository`** and **`write:issue`**, in the labels the deployed Forgejo's token UI uses (verified against
 Forgejo `16.0.0+gitea-1.22.0`, `models/auth/access_token_scope.go`). Forgejo scopes API endpoints by category, not by
 `fj` command name, and the runner's PR path crosses two categories: `fj pr search` and `fj pr comment` are backed by the
-**issues** API even though they name a PR. A repository-only token can still `fj pr create` and would fail the
+**issues** API even though they name a PR. A repository-only token can still `fj pr create` and fails the
 CLAUDE-170 open-PR lookup with `403 Forbidden`; since CLAUDE-207 the gather-time preflight exercises one read per
 category, so such a token is rejected before any Claude spend (see
-[Forge repo-access preflight](#forge-repo-access-preflight-claude-194-claude-207)).
+[Forge repo-access preflight](#forge-repo-access-preflight-claude-194-claude-207)). Should the lookup fail anyway
+(a permission change mid-run, or a transient forge error), CLAUDE-206 degrades it rather than discarding the run: on
+the create-capable arms the runner assumes no open PR exists, opens the PR, and records a `warn` run event naming the
+CLI error. See [Open-PR lookup degradation](#open-pr-lookup-degradation-claude-206).
 
 Every `fj` command the runner issues, the fj-source call it makes, and the category Forgejo routes that endpoint under
 (`routers/api/v1/api.go`: the repository group, and the separate `/repos` group carrying
@@ -230,15 +233,15 @@ Every `fj` command the runner issues, the fj-source call it makes, and the categ
 
 | `fj` command (`src/provider/cli.rs`)             | fj source call                                             | Forgejo endpoint                                     | Scope category    |
 |--------------------------------------------------|-------------------------------------------------------------|--------------------------------------------------------|--------------------|
-| `repo view <repo> --json` (`:1162`)              | `fj_core::repo::get` -> `repo_get`                          | `GET /repos/{o}/{r}`                                   | repository (read)  |
-| `pr create <title> --body-file .. --head <b> --json` (`:698`) | `fj_core::prs::create` -> `repo_create_pull_request` | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
-| `pr create -aA --json` (AGit, `:725`)            | same as above                                                | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
-| `pr search --repo <r> --state open --json` (`:1194`) | `fj_core::issues::list_page` -> `issue_list_issues` (`type=pulls`), then one `prs::get` per hit | `GET /repos/{o}/{r}/issues?type=pulls`, `GET /repos/{o}/{r}/pulls/{i}` | **issue (read)** + repository (read) |
-| `pr status <id> --json` (`:1213`)                | `prs::get` + `prs::get_commit_statuses`                      | `GET /repos/{o}/{r}/pulls/{i}`, `GET /repos/{o}/{r}/commits/{sha}/status` | repository (read)  |
-| `pr merge <id> --method merge --delete` (`:1243`) | `repo::get` + `prs::get` + `prs::merge` -> `repo_merge_pull_request` | `POST /repos/{o}/{r}/pulls/{i}/merge`          | repository (write) |
-| `pr comment <id> --body-file <f>` (`:1285`)      | `fj_core::issues::create_comment` -> `issue_create_comment`  | `POST /repos/{o}/{r}/issues/{i}/comments`              | **issue (write)**  |
-| `pr edit <id> labels --add <label>` (`:1305`)    | `fj_core::issues::edit_labels` -> `issue_list_labels` + `issue_add_label` | `GET /repos/{o}/{r}/labels`, `POST /repos/{o}/{r}/issues/{i}/labels` | **issue (write)**  |
-| `pr view <id> --json` (`:1321`)                  | `prs::get` + `prs::list_files` + `repo::get`                 | `GET /repos/{o}/{r}/pulls/{i}`, `.../files`            | repository (read)  |
+| `repo view <repo> --json` (`:1284`)              | `fj_core::repo::get` -> `repo_get`                          | `GET /repos/{o}/{r}`                                   | repository (read)  |
+| `pr create <title> --body-file .. --head <b> --json` (`:771`) | `fj_core::prs::create` -> `repo_create_pull_request` | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
+| `pr create -aA --json` (AGit, `:843`)            | same as above                                                | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
+| `pr search --repo <r> --state open --json` (`:1316`) | `fj_core::issues::list_page` -> `issue_list_issues` (`type=pulls`), then one `prs::get` per hit | `GET /repos/{o}/{r}/issues?type=pulls`, `GET /repos/{o}/{r}/pulls/{i}` | **issue (read)** + repository (read) |
+| `pr status <id> --json` (`:1335`)                | `prs::get` + `prs::get_commit_statuses`                      | `GET /repos/{o}/{r}/pulls/{i}`, `GET /repos/{o}/{r}/commits/{sha}/status` | repository (read)  |
+| `pr merge <id> --method merge --delete` (`:1365`) | `repo::get` + `prs::get` + `prs::merge` -> `repo_merge_pull_request` | `POST /repos/{o}/{r}/pulls/{i}/merge`          | repository (write) |
+| `pr comment <id> --body-file <f>` (`:1407`)      | `fj_core::issues::create_comment` -> `issue_create_comment`  | `POST /repos/{o}/{r}/issues/{i}/comments`              | **issue (write)**  |
+| `pr edit <id> labels --add <label>` (`:1427`)    | `fj_core::issues::edit_labels` -> `issue_list_labels` + `issue_add_label` | `GET /repos/{o}/{r}/labels`, `POST /repos/{o}/{r}/issues/{i}/labels` | **issue (write)**  |
+| `pr view <id> --json` (`:1443`)                  | `prs::get` + `prs::list_files` + `repo::get`                 | `GET /repos/{o}/{r}/pulls/{i}`, `.../files`            | repository (read)  |
 
 Two things the token does **not** have to cover: the `git push` in front of `pr create` authenticates with the daemon
 host's own git credentials, not this token (CLAUDE-194); and the org-label lookup inside `pr edit labels`
@@ -317,7 +320,17 @@ A failing probe is reported with the capability that failed (`repo view` / `pr s
 
 When either probe fails, every issue of that repo is dropped for the poll and one `warn` input event (visible on the action page) records the host, the `owner/repo`, and the CLI's cause. `AI Agent` is left at **`Queued`**: the condition is a missing permission grant, not a defect in the issue, so the next poll after the grant picks the issues up with no manual field change. This is deliberately unlike the `Failed` path a mid-run failure takes.
 
-The probe is skipped entirely when the action sets no forge `token_ref`, and skipped per host when the action carries no token for that host's forge: `fj` / `gh` then read the operator's own credential store, so the probe would test the wrong identity. A permission change *after* gather still fails at `pr create`, so that error is also restated with the repo, the host, and the possible-permission cause instead of the bare CLI text.
+The probe is skipped entirely when the action sets no forge `token_ref`, and skipped per host when the action carries no token for that host's forge: `fj` / `gh` then read the operator's own credential store, so the probe would test the wrong identity. A permission change *after* gather still fails at `pr create`, so that error is also restated with the repo, the host, and the possible-permission cause instead of the bare CLI text. A permission change that costs only the open-PR lookup is handled by the degradation below.
+
+##### Open-PR lookup degradation (CLAUDE-206)
+
+The CLAUDE-170 idempotency reconcile asks the forge for an already-open PR on the branch before creating one (`fj pr search`, an issue-category call). That lookup is an optimization: `fj pr create` (repository-category) is what delivers the work, and the two can fail independently, so a failed lookup must not discard a paid Claude run.
+
+On the three create-capable arms (remote branch absent, remote equal to local, remote fast-forwardable), a failed lookup is treated as "unknown, assume none": the runner logs a `warn`, records a `warn` run event naming the CLI error and the repo (visible on the action page under the issue key), and proceeds to `pr create`. The adopt path is unchanged when the lookup succeeds.
+
+That degraded path can race a PR that already exists. Forgejo answers such a create with 409 and the message `pull request already exists for these targets [...]`; on that specific failure the runner retries the lookup **exactly once** and adopts the PR when the retry succeeds. If it still cannot produce one, the error names both causes (the lookup failure and the create failure) rather than reporting a bare "PR creation failed".
+
+The diverged arm keeps the lookup fatal: there the lookup result is the only alternative to a force-push, so an assumed "none" would raise the refusal for the wrong reason. Its error distinguishes a failed search ("the open-PR lookup failed ..., so whether an open PR exists is UNKNOWN") from a genuine "no open PR exists for it". No `--force` is issued on any arm.
 
 #### Credential injection (CLAUDE-26)
 
