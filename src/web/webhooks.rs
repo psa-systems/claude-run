@@ -856,7 +856,7 @@ fn decide_mint(
     // CLAUDE-190: derive the deterministic failure signature and the branch from
     // the redacted log before it is moved into the triage input. The branch's
     // run-detail source is `None` here: the deployed Forgejo returns
-    // `head_branch: null`, so the log checkout section is the reliable source
+    // `head_branch: null`, so the log's environment dump is the reliable source
     // (`resolve_branch` keeps the run-detail arm for instances that populate it).
     let failure_signature = crate::mint::failure_signature(&log_text);
     let branch = crate::forge_log::resolve_branch(None, &log_text).unwrap_or_default();

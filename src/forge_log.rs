@@ -433,7 +433,7 @@ pub struct RunEntry {
     pub workflow_id: String,
     /// The run's branch from the runs list (`head_branch`), or empty when the API
     /// returns it null (the deployed Forgejo), in which case the reconciler
-    /// resolves it from the run's log checkout section.
+    /// resolves it from the run's log environment dump.
     pub branch: String,
     /// The run outcome: the `conclusion` when present, else the `status`.
     pub status: String,
@@ -615,39 +615,110 @@ pub fn fetch_workflow_yaml(
     None
 }
 
-/// CLAUDE-190: parse the failing run's branch from a redacted job log's checkout
-/// section. The `actions/checkout` step dumps `GITHUB_REF=refs/heads/<branch>`
-/// (and `GITHUB_REF_NAME=<branch>` on a branch build); the run-detail API
-/// returns `head_branch: null` on the deployed Forgejo, so the log is the
-/// reliable source. Returns the first branch found, or `None` when the log
-/// carries no readable ref line (truncated / diagnostic-free / logless). A tag
-/// build (`refs/tags/...`) yields no branch here.
-pub fn parse_branch_from_log(log: &str) -> Option<String> {
-    // Prefer the fully-qualified branch ref.
+/// The ref-carrying environment fields a job log exposes, in whichever form the
+/// runner printed them. Empty values are dropped at collection time, so `Some`
+/// always means a usable value.
+#[derive(Default)]
+struct RefEnv {
+    head_ref: Option<String>,
+    git_ref: Option<String>,
+    ref_name: Option<String>,
+}
+
+impl RefEnv {
+    /// First non-empty value wins, so the earliest job in a multi-job log sets
+    /// the branch and later jobs cannot overwrite it.
+    fn set(&mut self, key: &str, value: &str) {
+        let value = value.trim();
+        if value.is_empty() {
+            return;
+        }
+        let slot = match key {
+            "GITHUB_HEAD_REF" => &mut self.head_ref,
+            "GITHUB_REF" => &mut self.git_ref,
+            "GITHUB_REF_NAME" => &mut self.ref_name,
+            _ => return,
+        };
+        slot.get_or_insert_with(|| value.to_string());
+    }
+}
+
+/// CLAUDE-199: collect the ref fields from both forms a runner log uses: a
+/// line-leading `KEY=value` env dump, and the `setupEnv => map[K:V K:V ...]`
+/// Go map dump the deployed Forgejo runner prints (one whitespace-separated
+/// token per variable, key and value split at the first colon).
+fn collect_ref_env(log: &str) -> RefEnv {
+    let mut env = RefEnv::default();
     for line in log.lines() {
-        if let Some(rest) = line.trim().strip_prefix("GITHUB_REF=") {
-            if let Some(b) = rest.trim().strip_prefix("refs/heads/") {
-                let b = b.trim();
-                if !b.is_empty() {
-                    return Some(b.to_string());
+        if line.contains("setupEnv") {
+            if let Some(map) = line
+                .split_once("map[")
+                .map(|(_, rest)| rest)
+                .and_then(|rest| rest.rfind(']').map(|end| &rest[..end]))
+            {
+                for token in map.split_whitespace() {
+                    if let Some((key, value)) = token.split_once(':') {
+                        env.set(key, value);
+                    }
                 }
             }
+            continue;
+        }
+        let line = line.trim();
+        if let Some((key, value)) = line.split_once('=') {
+            env.set(key, value);
         }
     }
-    // Fall back to the short ref name (a branch build sets it to the branch).
-    for line in log.lines() {
-        if let Some(rest) = line.trim().strip_prefix("GITHUB_REF_NAME=") {
-            let b = rest.trim();
-            if !b.is_empty() {
-                return Some(b.to_string());
-            }
+    env
+}
+
+/// A branch name from one ref value: a `refs/heads/` ref short-ended, or an
+/// already-short name. Any other qualified ref (`refs/pull/N/head` on a PR run,
+/// `refs/tags/v1` on a tag build) is not a branch and yields `None`. Some
+/// Forgejo runners set `GITHUB_HEAD_REF` to the pull ref rather than the source
+/// branch, so every candidate goes through here, not just `GITHUB_REF`.
+fn branch_from_ref(value: &str) -> Option<&str> {
+    let value = value.trim();
+    match value.strip_prefix("refs/heads/") {
+        Some(short) if !short.is_empty() => Some(short),
+        Some(_) => None,
+        None if value.starts_with("refs/") || value.is_empty() => None,
+        None => Some(value),
+    }
+}
+
+/// CLAUDE-190/199: parse the failing run's branch from a redacted job log's
+/// environment dump. The run-detail API returns `head_branch: null` on the
+/// deployed Forgejo, so the log is the reliable source.
+///
+/// Precedence: `GITHUB_HEAD_REF` (the only field carrying the source branch of
+/// a PR run), else `GITHUB_REF`, else `GITHUB_REF_NAME`. A PR run's
+/// `GITHUB_REF` is `refs/pull/N/head` and its `GITHUB_REF_NAME` the bare PR
+/// number, so the last fallback is skipped when `GITHUB_REF` names a pull or
+/// tag ref rather than returning a number or a tag name as a branch. `None`
+/// when the log carries no readable ref (truncated / diagnostic-free /
+/// logless).
+pub fn parse_branch_from_log(log: &str) -> Option<String> {
+    let env = collect_ref_env(log);
+    for candidate in [env.head_ref.as_deref(), env.git_ref.as_deref()] {
+        if let Some(branch) = candidate.and_then(branch_from_ref) {
+            return Some(branch.to_string());
         }
     }
-    None
+    // `GITHUB_REF_NAME` is a bare name, so it cannot be told apart from a PR
+    // number or a tag on its own: the qualified ref decides whether to trust it.
+    let qualified_non_branch = env
+        .git_ref
+        .as_deref()
+        .is_some_and(|r| r.starts_with("refs/pull/") || r.starts_with("refs/tags/"));
+    if qualified_non_branch {
+        return None;
+    }
+    env.ref_name
 }
 
 /// CLAUDE-190: resolve the branch, preferring a non-empty run-detail `head_branch`
-/// and falling back to the log checkout section. On the deployed Forgejo run
+/// and falling back to the log environment dump. On the deployed Forgejo run
 /// detail returns `head_branch: null`, so in practice this is the log parse; the
 /// run-detail arm keeps the resolver correct where the field IS populated.
 pub fn resolve_branch(run_detail_branch: Option<&str>, log: &str) -> Option<String> {
@@ -1262,6 +1333,79 @@ mod tests {
         assert_eq!(parse_branch_from_log("no ref here\ndone\n"), None);
         // A tag ref is not a branch (refs/heads/ only).
         assert_eq!(parse_branch_from_log("GITHUB_REF=refs/tags/v1.2.3\n"), None);
+        assert_eq!(
+            parse_branch_from_log("GITHUB_REF=refs/tags/v1.2.3\nGITHUB_REF_NAME=v1.2.3\n"),
+            None,
+            "a tag's short name is not a branch"
+        );
+    }
+
+    // ---- CLAUDE-199: both log forms crossed with both trigger types -------
+    //
+    // The `*-map-*` fixtures are the `setupEnv => map[...]` lines captured
+    // from stored runner logs (a PR run and a push run), with repo names and
+    // addresses replaced by placeholders; the `env-lines-*` fixtures are the
+    // line-leading `KEY=value` env dump.
+
+    const MAP_PULL_REQUEST: &str =
+        include_str!("../tests/fixtures/forge_log/setupenv-map-pull-request.txt");
+    const MAP_PUSH: &str = include_str!("../tests/fixtures/forge_log/setupenv-map-push.txt");
+    const ENV_PULL_REQUEST: &str =
+        include_str!("../tests/fixtures/forge_log/env-lines-pull-request.txt");
+    const ENV_PUSH: &str = include_str!("../tests/fixtures/forge_log/env-lines-push.txt");
+
+    #[test]
+    fn parse_branch_reads_the_setupenv_map_form() {
+        assert_eq!(parse_branch_from_log(MAP_PUSH), Some("main".to_string()));
+        assert_eq!(
+            parse_branch_from_log(MAP_PULL_REQUEST),
+            Some("release/v0.9.0".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_branch_reads_the_env_line_form() {
+        assert_eq!(parse_branch_from_log(ENV_PUSH), Some("main".to_string()));
+        assert_eq!(
+            parse_branch_from_log(ENV_PULL_REQUEST),
+            Some("release/v0.9.0".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_branch_never_returns_a_pr_number_or_pull_ref() {
+        for (form, log) in [("map", MAP_PULL_REQUEST), ("env", ENV_PULL_REQUEST)] {
+            let branch = parse_branch_from_log(log).unwrap();
+            assert_eq!(branch, "release/v0.9.0", "{form} form");
+            assert_ne!(
+                branch, "468",
+                "{form} form: the bare PR number is not a branch"
+            );
+            assert!(!branch.starts_with("refs/"), "{form} form: {branch}");
+        }
+        // Without GITHUB_HEAD_REF there is no source branch to recover, and the
+        // PR number must not stand in for one.
+        assert_eq!(
+            parse_branch_from_log("GITHUB_REF=refs/pull/468/head\nGITHUB_REF_NAME=468\n"),
+            None
+        );
+        // Some runners set GITHUB_HEAD_REF to the pull ref instead of the source
+        // branch (seen on stored initech/billing-service logs); that is still
+        // not a branch.
+        assert_eq!(
+            parse_branch_from_log(
+                "setupEnv => map[GITHUB_HEAD_REF:refs/pull/165/head GITHUB_REF:refs/pull/165/head GITHUB_REF_NAME:165]"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_branch_ignores_non_setupenv_map_lines() {
+        // The action-metadata dump on the line above `setupEnv` is also a Go
+        // map; only the `setupEnv` one carries the run's environment.
+        assert!(MAP_PUSH.contains("Read action &{Checkout"));
+        assert_eq!(parse_branch_from_log(MAP_PUSH), Some("main".to_string()));
     }
 
     #[test]
