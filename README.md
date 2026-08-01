@@ -374,6 +374,8 @@ e.g. a main-branch / tag / release / missing-secret failure) mints a human-assig
 infra / flaky failure (`transient`) mints nothing. A failing run triggered by the fix bot's own login mints nothing (
 loop safety), and the reused per-key + daily caps throttle a storm of failures.
 
+**CLAUDE-208: a stopped run is not a broken one.** Forgejo fires `action_run_failure` for every non-success done status, and it reports run-level `failure` for a run whose jobs were merely CANCELLED, which is what a newer push to the same ref produces when it supersedes an in-flight run. The run-level status alone therefore cannot tell a broken build from a stopped one, so the consumer reads the per-job statuses that come back with the log: when no job failed and every job ended `cancelled` or `skipped`, the delivery is acked and the run closed with a summary naming those statuses, with no triage and no issue. Any other status set (including an all-`success` run under a run-level `failure`) still triages and mints, and a job list that did not resolve at all (a rejected log token, a pruned run) fails open and mints as before.
+
 **CLAUDE-149: a human's failing PR is left to its author; the bot only fixes its own.** When the failing run already has
 an open PR, the webhook `code_fix` (queue-for-fix) route is suppressed: no issue is minted and no fix is queued, because
 the author owns the red CI on their own branch. A `human_action` failure on an open PR still mints (it needs a human, not

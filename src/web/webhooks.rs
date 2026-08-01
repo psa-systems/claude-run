@@ -482,6 +482,48 @@ pub async fn consume_events(
             }
         };
 
+        // CLAUDE-208: the guard above reads the RUN-level status, which is
+        // `failure` even when every job was merely cancelled (a newer push
+        // superseded the run). Nothing failed, so triage would classify a log
+        // with no failure in it and mint noise. Skip only the all-`{cancelled,
+        // skipped}` case; any other status set still mints and logs what was
+        // observed, and an unresolved job list mints as before so a log-token
+        // 401 (CLAUDE-200) fails open. The jobs ride along with the log since
+        // CLAUDE-204 collapsed the two fetches into one `fj actions logs` call,
+        // so the saving here is the triage `claude` call and the issue.
+        let jobs_verdict =
+            crate::forge_log::JobsVerdict::resolve(log_unavailable_reason.as_deref(), &jobs);
+        if let crate::forge_log::JobsVerdict::NoFailure { .. } = &jobs_verdict {
+            let statuses = jobs_verdict.statuses_display();
+            if jobs_verdict.stopped() {
+                info!(
+                    repo = %ev.repo,
+                    run = ev.index_in_repo,
+                    job_statuses = %statuses,
+                    "no job failed (run stopped, not broken); triage and mint skipped"
+                );
+                let summary = format!(
+                    "no job failed; job statuses [{statuses}]; run stopped, not broken; triage and mint skipped; no issue"
+                );
+                finish_webhook_run(
+                    &pool,
+                    run_id,
+                    &job_key,
+                    &summary,
+                    true,
+                    log_artifact.as_deref(),
+                )
+                .await;
+                continue;
+            }
+            info!(
+                repo = %ev.repo,
+                run = ev.index_in_repo,
+                job_statuses = %statuses,
+                "run failed with no failing job; not a stopped run, continuing to triage"
+            );
+        }
+
         let Some(ctx) = mint.as_ref() else {
             // No mint configured (no usable backend): log-only, as before. The
             // run is still recorded so the operator sees the event landed.
@@ -2268,6 +2310,110 @@ mod tests {
             .unwrap();
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log unavailable"), "{summary}");
+    }
+
+    /// A `Fetched` outcome whose jobs carry `statuses` in run order.
+    fn jobs_with_statuses(statuses: &[&str]) -> crate::forge_log::RunLogsOutcome {
+        crate::forge_log::RunLogsOutcome::Fetched(
+            statuses
+                .iter()
+                .enumerate()
+                .map(|(i, s)| crate::forge_log::JobLog {
+                    name: format!("job-{i}"),
+                    status: (*s).to_string(),
+                    log: "cargo build\n".to_string(),
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_stopped_run_finishes_without_triage_or_mint() {
+        // CLAUDE-208: run-level status is `failure` (so the CLAUDE-85 guard lets
+        // it through) but every job was cancelled or skipped, which is what a
+        // superseding push produces. Nothing failed, so the consumer closes the
+        // run naming the statuses and never reaches triage or mint.
+        for statuses in [
+            &["cancelled"][..],
+            &["cancelled", "cancelled"][..],
+            &["skipped"][..],
+            &["cancelled", "skipped"][..],
+        ] {
+            let pool = memory_pool().await;
+            let out_dir = tempfile::tempdir().unwrap();
+            let logs = Arc::new(ScriptedLogs::new(jobs_with_statuses(statuses)));
+            let (tx, rx) = mpsc::channel(4);
+            tx.send(event()).await.unwrap();
+            drop(tx);
+
+            consume_events(
+                rx,
+                pool.clone(),
+                logs.clone(),
+                out_dir.path().to_path_buf(),
+                None,
+                Arc::new(RwLock::new(WebhookConfig::default())),
+            )
+            .await;
+
+            let (ok, summary): (bool, Option<String>) =
+                sqlx::query_as("SELECT ok, summary FROM job_outcomes")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(ok, "{statuses:?}");
+            let summary = summary.expect("summary recorded");
+            assert!(summary.contains("no job failed"), "{statuses:?}: {summary}");
+            assert!(summary.contains("no issue"), "{statuses:?}: {summary}");
+            for s in statuses {
+                assert!(summary.contains(s), "{statuses:?}: {summary}");
+            }
+            // The short-circuit lands before the mint branch, so the log-only
+            // summary that branch writes never appears.
+            assert!(!summary.contains("log-only"), "{statuses:?}: {summary}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_that_is_not_stopped_still_reaches_the_mint_branch() {
+        // CLAUDE-208: only the all-`{cancelled, skipped}` set short-circuits. A
+        // failing job, an every-job-success run under a run-level failure, and a
+        // run whose job list did not resolve all continue into triage / mint
+        // (here log-only, since no mint context is configured).
+        let cases: [(crate::forge_log::RunLogsOutcome, &str); 4] = [
+            (jobs_with_statuses(&["cancelled", "failure"]), "failing job"),
+            (jobs_with_statuses(&["success", "success"]), "all success"),
+            (jobs_with_statuses(&[]), "empty job list"),
+            (
+                crate::forge_log::RunLogsOutcome::AuthDenied("HTTP 401".to_string()),
+                "unresolved job list",
+            ),
+        ];
+        for (outcome, label) in cases {
+            let pool = memory_pool().await;
+            let out_dir = tempfile::tempdir().unwrap();
+            let (tx, rx) = mpsc::channel(4);
+            tx.send(event()).await.unwrap();
+            drop(tx);
+
+            consume_events(
+                rx,
+                pool.clone(),
+                Arc::new(ScriptedLogs::new(outcome)),
+                out_dir.path().to_path_buf(),
+                None,
+                Arc::new(RwLock::new(WebhookConfig::default())),
+            )
+            .await;
+
+            let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let summary = summary.expect("summary recorded");
+            assert!(summary.contains("log-only"), "{label}: {summary}");
+            assert!(!summary.contains("no job failed"), "{label}: {summary}");
+        }
     }
 
     #[tokio::test]
