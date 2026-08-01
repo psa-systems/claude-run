@@ -14,7 +14,7 @@
 #              the `## Failure` block's Repo / Workflow / Run). A pre-rekey issue
 #              with no parseable branch/job is skipped (left for manual close).
 #   scan    -> for each allow-listed repo, page the runs list and reduce it to the
-#              LATEST run per (branch, workflow_id); when `head_branch` is null the
+#              LATEST run per (branch, workflow_id); with no plain branch name the
 #              branch is resolved from the run's log (bounded by
 #              max_branch_resolves).
 #   dedupe  -> open issues sharing a hidden `Root-Cause-Key:` marker are collapsed
@@ -28,10 +28,10 @@
 #
 # Only the LATEST run decides: a newer failure after an older green run leaves the
 # job red and the issue open. Log and per-job status reads shell out to
-# `fj actions logs`; the runs list stays on the REST API until `fj` gains an
-# `actions runs` command (FJ-66). Both go through `forge_log` (Rust), never a raw
-# REST call from a nu snippet (tooling-gap rule). The reconciler performs no
-# git/PR actions and does not depend on the CLAUDE-189 analysis having run.
+# `fj actions logs` and the runs list to `fj actions runs` (CLAUDE-205). Both go
+# through `forge_log` (Rust), never a raw REST call and never one from a nu
+# snippet (tooling-gap rule). The reconciler performs no git/PR actions and does
+# not depend on the CLAUDE-189 analysis having run.
 
 name: ci-failure-reconcile
 
@@ -78,7 +78,7 @@ native:
   # {job} are substituted from the now-green run; a hidden marker is appended.
   close_comment: "Auto-closed: run #{run_index} on `{branch}` succeeded ({run_url}); the failing `{job}` is green, root cause resolved."
   # Cap on the number of runs whose branch is resolved from the log per repo, to
-  # bound log fetches when the runs list returns `head_branch` null. Reached-cap
+  # bound log fetches for runs the runs list gives no plain branch name. Reached-cap
   # is logged, never silent.
   max_branch_resolves: 40
   # CLAUDE-198: collapse open issues that share a `Root-Cause-Key:` marker onto the

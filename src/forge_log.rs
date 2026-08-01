@@ -24,17 +24,19 @@
 //!
 //! A private repo's read is authorized by the `log_token_ref` mapped to that
 //! repo. The resolved PAT reaches the `fj` child through a temp single-host
-//! `keys.json` ([`crate::provider::cli::FjActionLogs`]), never a process
+//! `keys.json` ([`crate::provider::cli::FjForgeReads`]), never a process
 //! argument and never a log line. A public repo's run reads without a token, so
 //! a deployment that configures no token still analyzes public failures.
 //! `read:repository` is the only scope needed: the three endpoints `fj` calls
 //! all sit in Forgejo's repository group behind `reqRepoReader(unit.TypeActions)`.
 //!
-//! ## Endpoints still on HTTP
+//! ## Every forge read goes through `fj` (CLAUDE-205)
 //!
-//! `fj` has no command for the runs list or for reading a raw file at a ref, so
-//! [`fetch_runs`] and [`fetch_workflow_yaml`] keep the [`LogTransport`] seam and
-//! their direct REST calls, each with a `TODO` naming its tracking issue.
+//! The runs list and the raw workflow YAML were the last two hand-rolled REST
+//! calls; they now shell out to `fj actions runs` (FJ-66) and `fj repo file`
+//! (FJ-67). The three read seams ([`ActionLogClient`], [`ActionRunsClient`],
+//! [`RepoFileClient`]) are collected in [`ForgeReads`] so a caller holds ONE
+//! client, and this module builds no HTTP request at all.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -69,62 +71,6 @@ const MIN_KNOWN_SECRET_LEN: usize = 8;
 /// `Basic`) before it is treated as a secret value. Combined with a digit check
 /// this keeps ordinary prose ("the token implementation") from being redacted.
 const MIN_VALUE_LEN: usize = 16;
-
-/// Transport seam for the two REST reads `fj` has no command for. Abstracted so
-/// the parsing is unit-testable without a network (mirrors the `McpTransport`
-/// seam in [`crate::provider::github`]).
-pub trait LogTransport: Send + Sync {
-    /// GET `url`, optionally bearing `token`. Returns the status + raw body on a
-    /// completed request, or a human-readable error string on a transport
-    /// failure (DNS, connect, TLS, ...).
-    fn get_bytes(
-        &self,
-        url: &str,
-        token: Option<&str>,
-    ) -> std::result::Result<(u16, Vec<u8>), String>;
-}
-
-/// Real transport: a blocking `reqwest` GET run on a dedicated thread so it
-/// never blocks the async runtime (same pattern as the GitHub MCP transport).
-#[derive(Debug, Default, Clone)]
-pub struct HttpLogTransport;
-
-impl HttpLogTransport {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl LogTransport for HttpLogTransport {
-    fn get_bytes(
-        &self,
-        url: &str,
-        token: Option<&str>,
-    ) -> std::result::Result<(u16, Vec<u8>), String> {
-        let url = url.to_string();
-        let token = token.map(str::to_string);
-        std::thread::spawn(move || -> std::result::Result<(u16, Vec<u8>), String> {
-            let client = reqwest::blocking::Client::builder()
-                .build()
-                .map_err(|e| format!("log http client: {e}"))?;
-            let mut req = client.get(&url);
-            if let Some(t) = &token {
-                req = req.header("Authorization", format!("token {t}"));
-            }
-            let resp = req
-                .send()
-                .map_err(|e| format!("log request to {url}: {e}"))?;
-            let status = resp.status().as_u16();
-            let body = resp
-                .bytes()
-                .map_err(|e| format!("log response body: {e}"))?
-                .to_vec();
-            Ok((status, body))
-        })
-        .join()
-        .map_err(|_| "log transport thread panicked".to_string())?
-    }
-}
 
 /// One job of a run as `fj actions logs --json` reports it. The vector order is
 /// the run order, so a job's position IS its job index.
@@ -164,7 +110,7 @@ pub enum RunLogsOutcome {
 }
 
 /// Seam over `fj actions logs`, implemented by
-/// [`crate::provider::cli::FjActionLogs`]. Abstracted so the retry / redaction
+/// [`crate::provider::cli::FjForgeReads`]. Abstracted so the retry / redaction
 /// logic is unit-testable without spawning a process.
 pub trait ActionLogClient: Send + Sync {
     /// Read `run_number`'s per-job logs for `repo` (`owner/repo`) on forge
@@ -178,6 +124,44 @@ pub trait ActionLogClient: Send + Sync {
         token: Option<&str>,
     ) -> RunLogsOutcome;
 }
+
+/// CLAUDE-205: seam over `fj actions runs`, implemented by
+/// [`crate::provider::cli::FjForgeReads`]. The implementation owns the paging,
+/// so a caller asks once for up to `max_pages` pages worth of runs.
+pub trait ActionRunsClient: Send + Sync {
+    /// List `repo`'s workflow runs on forge `host`, newest-first, over at most
+    /// `max_pages` pages. `token` is the resolved `log_token_ref`; `None` reads
+    /// unauthenticated, which is enough for a public repo.
+    fn list_runs(
+        &self,
+        host: &str,
+        repo: &str,
+        max_pages: u32,
+        token: Option<&str>,
+    ) -> RunsListOutcome;
+}
+
+/// CLAUDE-205: seam over `fj repo file`, implemented by
+/// [`crate::provider::cli::FjForgeReads`].
+pub trait RepoFileClient: Send + Sync {
+    /// Read `path` in `repo` at `git_ref` on forge `host`, returning the file's
+    /// text. `Err` carries a human-readable reason (a missing path included), so
+    /// a best-effort caller can try the next candidate.
+    fn read_file(
+        &self,
+        host: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+        token: Option<&str>,
+    ) -> std::result::Result<String, String>;
+}
+
+/// Every forge read the CI-failure actions make, so each holds ONE client
+/// instead of one per endpoint (CLAUDE-205).
+pub trait ForgeReads: ActionLogClient + ActionRunsClient + RepoFileClient {}
+
+impl<T: ActionLogClient + ActionRunsClient + RepoFileClient> ForgeReads for T {}
 
 /// Parse a `fj actions logs --json` document into its jobs.
 pub fn parse_run_logs(stdout: &str) -> std::result::Result<Vec<JobLog>, String> {
@@ -305,8 +289,8 @@ enum LastProbe {
 /// `sleep` is injected so tests drive the backoff without waiting; production
 /// passes `std::thread::sleep`. The only hard error this returns is an I/O
 /// failure writing the artifact; a missing log is a `TransientMiss`, never `Err`.
-pub fn fetch_run_log<S: FnMut(Duration)>(
-    client: &dyn ActionLogClient,
+pub fn fetch_run_log<S: FnMut(Duration), C: ActionLogClient + ?Sized>(
+    client: &C,
     cfg: &LogFetchConfig,
     target: &LogTarget,
     out_dir: &Path,
@@ -372,21 +356,10 @@ fn render_run_log(jobs: &[JobLog]) -> String {
 
 /// Authority (`host[:port]`) of a forge URL, the bare host `fj --host` takes
 /// (e.g. `dev.a8n.run`). `None` when the URL has no host segment.
-fn host_from_html_url(url: &str) -> Option<String> {
+pub fn host_from_html_url(url: &str) -> Option<String> {
     let after = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let host = after.split('/').next().unwrap_or("");
     (!host.is_empty()).then(|| host.to_string())
-}
-
-/// Derive the forge origin (scheme + host[:port]) from a run's `html_url` by
-/// stripping the `/{repo}/...` tail, for the two endpoints still on HTTP.
-/// Returns `None` if `html_url` does not contain the repo segment.
-pub fn base_from_html_url(html_url: &str, repo: &str) -> Option<String> {
-    let needle = format!("/{repo}/");
-    html_url
-        .split_once(&needle)
-        .map(|(base, _)| base.to_string())
-        .filter(|b| !b.is_empty())
 }
 
 /// Write `text` to a per-(repo, run) artifact file under `out_dir` and return
@@ -398,25 +371,6 @@ fn write_artifact(out_dir: &Path, target: &LogTarget, text: &str) -> Result<Path
     let path = out_dir.join(name);
     std::fs::write(&path, text)?;
     Ok(path)
-}
-
-/// Number of runs requested per page and the paging ceiling. `50 * 40 = 2000`
-/// most-recent runs are scanned, enough to reach a recently-minted "CI failure"
-/// issue's run; a run older than that resolves `NotFound` and the caller notes
-/// the log as unavailable rather than crashing.
-const RUNS_PAGE_LIMIT: u32 = 50;
-
-/// One page of the API runs-list endpoint
-/// (`GET /api/v1/repos/{owner}/{repo}/actions/runs`), which lives on the API
-/// router where PATs work.
-fn runs_url(base_url: &str, repo: &str, page: u32, limit: u32) -> String {
-    format!(
-        "{}/api/v1/repos/{}/actions/runs?page={}&limit={}",
-        base_url.trim_end_matches('/'),
-        repo,
-        page,
-        limit,
-    )
 }
 
 /// CLAUDE-191: one run pulled from the runs-list JSON with the full set of fields
@@ -441,15 +395,16 @@ pub struct RunEntry {
     pub html_url: String,
 }
 
-/// CLAUDE-191: parse the runs-list body into [`RunEntry`]s, tolerant of Forgejo's
-/// field naming (same shape as [`parse_runs_list`], plus the workflow / branch /
-/// status / url fields). Runs missing an `id` are skipped. The branch is empty
-/// when `head_branch` is null (the reconciler then resolves it from the log).
-fn parse_runs_list_entries(bytes: &[u8]) -> std::result::Result<Vec<RunEntry>, String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    let arr = value
-        .get("workflow_runs")
-        .and_then(|v| v.as_array())
+/// CLAUDE-191: parse one `fj actions runs --json` page into [`RunEntry`]s,
+/// tolerant of Forgejo's field naming. Runs missing an `id` are skipped. The
+/// branch is empty when the page carries no plain branch name (the reconciler
+/// then resolves it from the log).
+pub fn parse_runs_list_entries(stdout: &str) -> std::result::Result<Vec<RunEntry>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).map_err(|e| e.to_string())?;
+    let arr = ["runs", "workflow_runs"]
+        .iter()
+        .find_map(|k| value.get(*k).and_then(|v| v.as_array()))
         .or_else(|| value.as_array())
         .cloned()
         .unwrap_or_default();
@@ -482,12 +437,33 @@ fn parse_runs_list_entries(bytes: &[u8]) -> std::result::Result<Vec<RunEntry>, S
             global_id,
             index,
             workflow_id: str_field(&run, &["workflow_id", "workflow_name", "workflow"]),
-            branch: str_field(&run, &["head_branch", "head_ref", "branch"]),
+            branch: branch_name(&str_field(&run, &["head_branch", "head_ref", "branch"])),
             status,
             html_url: str_field(&run, &["html_url", "url"]),
         });
     }
     Ok(out)
+}
+
+/// CLAUDE-205: keep a plain branch name, drop anything else. `fj`'s
+/// `head_branch` is Forgejo's `prettyref`, which is the branch name only for a
+/// branch push; verified against `dev.a8n.run`, a PR run reports `#<pr-number>`
+/// and a ref-deleted push reports the bare commit sha. A non-branch value is
+/// dropped so the reconciler resolves that run's branch from its log env dump,
+/// exactly as it does for a null `head_branch`. Rejecting a real branch merely
+/// costs one log read, so the test is deliberately strict.
+fn branch_name(value: &str) -> String {
+    let looks_like_sha = value.len() >= 7 && value.chars().all(|c| c.is_ascii_hexdigit());
+    let plain = !value.is_empty()
+        && !value.starts_with("refs/")
+        && !value.starts_with('#')
+        && !value.contains("pull/")
+        && !looks_like_sha;
+    if plain {
+        value.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// CLAUDE-191: outcome of fetching the runs list. Auth-class / not-found responses
@@ -501,72 +477,6 @@ pub enum RunsListOutcome {
     Failed(String),
 }
 
-/// CLAUDE-191: page the repo's Action runs list into [`RunEntry`]s, newest-first,
-/// up to `max_pages` pages of [`RUNS_PAGE_LIMIT`] each (or until a short/empty
-/// page, the last one). Terminal on 401/403/404 on the first page; once some
-/// entries are collected, a later-page error stops paging and returns them.
-///
-/// TODO(FJ-66): stays on the REST API because `fj` has no `actions runs` command
-/// to list a repo's workflow runs. Move it onto the CLI once FJ-66 ships.
-pub fn fetch_runs(
-    transport: &dyn LogTransport,
-    base_url: &str,
-    repo: &str,
-    token: &str,
-    max_pages: u32,
-) -> Result<RunsListOutcome> {
-    let mut all: Vec<RunEntry> = Vec::new();
-    for page in 1..=max_pages {
-        let url = runs_url(base_url, repo, page, RUNS_PAGE_LIMIT);
-        match transport.get_bytes(&url, Some(token)) {
-            Ok((200, bytes)) => {
-                let entries = match parse_runs_list_entries(&bytes) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        if !all.is_empty() {
-                            break;
-                        }
-                        return Ok(RunsListOutcome::Failed(format!("parsing runs list: {e}")));
-                    }
-                };
-                let short = entries.len() < RUNS_PAGE_LIMIT as usize;
-                all.extend(entries);
-                if short {
-                    break;
-                }
-            }
-            Ok((status @ (401 | 403), _)) => {
-                if !all.is_empty() {
-                    break;
-                }
-                return Ok(RunsListOutcome::AuthDenied(status));
-            }
-            Ok((404, _)) => {
-                if !all.is_empty() {
-                    break;
-                }
-                return Ok(RunsListOutcome::NotFound);
-            }
-            Ok((status, body)) => {
-                if !all.is_empty() {
-                    break;
-                }
-                return Ok(RunsListOutcome::Failed(format!(
-                    "status {status}, {} body bytes",
-                    body.len()
-                )));
-            }
-            Err(e) => {
-                if !all.is_empty() {
-                    break;
-                }
-                return Ok(RunsListOutcome::Failed(e));
-            }
-        }
-    }
-    Ok(RunsListOutcome::Resolved(all))
-}
-
 /// CLAUDE-189: candidate repo paths a failing workflow file may live under, tried
 /// in order. `workflow_id` is the payload's workflow filename (e.g. `check.yml`).
 const WORKFLOW_DIRS: &[&str] = &[
@@ -575,26 +485,21 @@ const WORKFLOW_DIRS: &[&str] = &[
     ".gitea/workflows",
 ];
 
-/// CLAUDE-189: fetch the failing workflow's YAML from the repo at the failing
+/// CLAUDE-189: read the failing workflow's YAML from the repo at the failing
 /// commit, read-only, so the analysis can map log position to workflow step
-/// order. Tries each known workflow directory via the API raw-file endpoint
-/// (`GET /api/v1/repos/{owner}/{repo}/raw/{path}?ref={commit}`) and returns the
-/// first that resolves 200, redacted. `None` when none resolve (the analysis
-/// proceeds over the log alone and says the YAML was unavailable). Never errors
-/// on a miss.
-///
-/// TODO(FJ-67): stays on the REST API because `fj` has no command to read a raw
-/// file at a ref. Move it onto the CLI once FJ-67 ships.
-pub fn fetch_workflow_yaml(
-    transport: &dyn LogTransport,
-    base_url: &str,
+/// order. Tries each known workflow directory through `fj repo file`
+/// (CLAUDE-205) and returns the first that resolves, redacted. `None` when none
+/// resolve (the analysis proceeds over the log alone and says the YAML was
+/// unavailable). Never errors on a miss.
+pub fn read_workflow_yaml<C: RepoFileClient + ?Sized>(
+    client: &C,
+    host: &str,
     repo: &str,
     commit: &str,
     workflow_id: &str,
-    token: &str,
+    token: Option<&str>,
     known_secrets: &[String],
 ) -> Option<String> {
-    let base = base_url.trim_end_matches('/');
     // A workflow_id already carrying a path segment is tried verbatim first.
     let mut candidates: Vec<String> = Vec::new();
     if workflow_id.contains('/') {
@@ -604,10 +509,9 @@ pub fn fetch_workflow_yaml(
         candidates.push(format!("{dir}/{workflow_id}"));
     }
     for path in candidates {
-        let url = format!("{base}/api/v1/repos/{repo}/raw/{path}?ref={commit}");
-        if let Ok((200, bytes)) = transport.get_bytes(&url, Some(token)) {
-            let text = String::from_utf8_lossy(&bytes).to_string();
+        if let Ok(text) = client.read_file(host, repo, &path, commit, token) {
             if !text.trim().is_empty() {
+                // Redacted before the analysis (or disk) ever sees it.
                 return Some(redact(&text, known_secrets));
             }
         }
@@ -892,7 +796,7 @@ fn redact_token_shapes(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
 
     /// One recorded `run_logs` call: `(host, repo, run_number, token)`.
@@ -1147,77 +1051,42 @@ mod tests {
         assert!(LogTarget::for_run("", "contoso/claude-run", 7, None).is_none());
     }
 
+    /// CLAUDE-205 AC: this module builds no Forgejo HTTP request; every forge
+    /// read shells out to `fj`. Fails if a hand-rolled REST path is
+    /// reintroduced here. The needles are split so this test does not match
+    /// itself.
     #[test]
-    fn base_url_derived_for_the_http_endpoints() {
-        assert_eq!(
-            base_from_html_url(
-                "https://dev.a8n.run/contoso/claude-run/actions/runs/7",
-                "contoso/claude-run"
-            )
-            .as_deref(),
-            Some("https://dev.a8n.run")
-        );
-        assert!(
-            base_from_html_url("https://dev.a8n.run/other/repo", "contoso/claude-run").is_none()
-        );
-    }
-
-    // ---- CLAUDE-191: full runs-list entries + paging (still on HTTP) -------
-
-    /// One queued bytes response: `(status, body)` or a transport error.
-    type BytesResponse = std::result::Result<(u16, Vec<u8>), String>;
-
-    /// A bytes transport that serves queued responses in request order and
-    /// records the URLs, for the two endpoints `fj` has no command for.
-    struct SeqBytesTransport {
-        responses: Mutex<VecDeque<BytesResponse>>,
-        urls: Mutex<Vec<String>>,
-    }
-
-    impl SeqBytesTransport {
-        fn new(responses: Vec<BytesResponse>) -> Self {
-            Self {
-                responses: Mutex::new(responses.into_iter().collect()),
-                urls: Mutex::new(Vec::new()),
-            }
-        }
-        fn urls(&self) -> Vec<String> {
-            self.urls.lock().unwrap().clone()
+    fn this_module_builds_no_forgejo_http_request() {
+        let src = include_str!("forge_log.rs");
+        for needle in [concat!("api/", "v1"), concat!("req", "west")] {
+            assert!(
+                !src.contains(needle),
+                "`{needle}` is back in forge_log.rs: forge reads go through `fj`, not raw HTTP"
+            );
         }
     }
 
-    impl LogTransport for SeqBytesTransport {
-        fn get_bytes(
-            &self,
-            url: &str,
-            token: Option<&str>,
-        ) -> std::result::Result<(u16, Vec<u8>), String> {
-            assert_eq!(token, Some("test-pat"), "API fetch must send the token");
-            self.urls.lock().unwrap().push(url.to_string());
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(Ok((200, br#"{"workflow_runs":[]}"#.to_vec())))
-        }
-    }
+    // ---- CLAUDE-191 / CLAUDE-205: runs-list entries from `fj actions runs` --
 
-    const TEST_BASE: &str = "https://dev.a8n.run";
     const TEST_REPO: &str = "initech/chat";
-    const TEST_MAX_PAGES: u32 = 40;
 
-    /// A runs-list page carrying the reconciler's full field set.
-    fn runs_page_full(runs: &[(i64, i64, &str, &str, &str)]) -> Vec<u8> {
+    /// A `fj actions runs --json` page carrying the reconciler's full field set.
+    /// `head_branch` is fj's alias for Forgejo's `prettyref`.
+    fn runs_page_full(runs: &[(i64, i64, &str, &str, &str)]) -> String {
         let items: Vec<String> = runs
             .iter()
             .map(|(id, index, workflow, branch, status)| {
                 format!(
-                    r#"{{"id":{id},"index_in_repo":{index},"workflow_id":"{workflow}","head_branch":{branch},"status":"completed","conclusion":"{status}","html_url":"https://dev.a8n.run/initech/chat/actions/runs/{index}"}}"#,
+                    r#"{{"id":{id},"run_number":{index},"index_in_repo":{index},"workflow_id":"{workflow}","head_branch":{branch},"status":"{status}","conclusion":"{status}","html_url":"https://dev.a8n.run/initech/chat/actions/runs/{index}"}}"#,
                     branch = if branch.is_empty() { "null".to_string() } else { format!("\"{branch}\"") },
                 )
             })
             .collect();
-        format!(r#"{{"workflow_runs":[{}]}}"#, items.join(",")).into_bytes()
+        format!(
+            r#"{{"total_count":{},"runs":[{}]}}"#,
+            items.len(),
+            items.join(",")
+        )
     }
 
     #[test]
@@ -1239,67 +1108,117 @@ mod tests {
     }
 
     #[test]
-    fn fetch_runs_collects_across_pages_until_short() {
-        // A full first page (50 entries) then a short second page ends paging.
-        let full: Vec<(i64, i64, &str, &str, &str)> = (0..50)
-            .map(|n| (90000 + n, 5000 + n, "ci.yml", "main", "success"))
-            .collect();
-        let page1 = runs_page_full(&full);
-        let page2 = runs_page_full(&[(21077, 4034, "ci.yml", "feature", "failure")]);
-        let transport = SeqBytesTransport::new(vec![Ok((200, page1)), Ok((200, page2))]);
-        let out = fetch_runs(&transport, TEST_BASE, TEST_REPO, "test-pat", TEST_MAX_PAGES).unwrap();
-        let RunsListOutcome::Resolved(entries) = out else {
-            panic!("expected Resolved");
-        };
-        assert_eq!(entries.len(), 51);
-        assert_eq!(transport.urls().len(), 2, "stopped at the short page");
-        assert!(
-            transport.urls()[0].contains("/api/v1/repos/initech/chat/actions/runs?page=1")
+    fn parse_entries_drops_a_non_branch_prettyref() {
+        // Shapes observed on dev.a8n.run: a PR run reports `#<pr-number>` and a
+        // ref-deleted push the bare sha. Neither is a branch, so both are left
+        // empty and the reconciler resolves the branch from the run's log.
+        let body = runs_page_full(&[
+            (21099, 4036, "ci.yml", "#87", "failure"),
+            (
+                21098,
+                4035,
+                "ci.yml",
+                "46ff1b787a53527831e2e36a3263dafd9666eb54",
+                "success",
+            ),
+            (21097, 4034, "ci.yml", "pull/12/head", "failure"),
+            (21096, 4033, "ci.yml", "refs/tags/v1.2.3", "success"),
+        ]);
+        let entries = parse_runs_list_entries(&body).unwrap();
+        for e in &entries {
+            assert_eq!(e.branch, "", "{e:?}");
+        }
+        // A real branch still survives, so a push run needs no log read.
+        let body = runs_page_full(&[(21100, 4037, "ci.yml", "main", "success")]);
+        assert_eq!(parse_runs_list_entries(&body).unwrap()[0].branch, "main");
+    }
+
+    /// One run exactly as `fj actions runs --json` emitted it on `dev.a8n.run`
+    /// (`fabrikam/forgejo-cli` run 469), minus the bulky `event_payload` /
+    /// `repository` / `trigger_user` objects. Pins the parse to real output.
+    const REAL_RUNS_PAGE: &str = r#"{"total_count": 469, "runs": [{"run_number": 469, "head_branch": "main", "conclusion": "success", "ScheduleID": 0, "approved_by": 0, "commit_sha": "b08d8bcd98e2fff274c070849793da5a9d3c88a2", "created": "2026-08-01T04:02:34+02:00", "duration": 39000000000, "event": "push", "html_url": "https://dev.a8n.run/fabrikam/forgejo-cli/actions/runs/469", "id": 22958, "index_in_repo": 469, "is_fork_pull_request": false, "is_ref_deleted": false, "need_approval": false, "prettyref": "main", "started": "2026-08-01T04:02:35+02:00", "status": "success", "stopped": "2026-08-01T04:03:14+02:00", "title": "Merge pull request 'feat(actions): list workflow runs' (#87) from feat/actions-runs-command into main", "trigger_event": "push", "updated": "2026-08-01T04:03:14+02:00", "workflow_id": "check.yml"}]}"#;
+
+    #[test]
+    fn parse_entries_reads_a_real_fj_actions_runs_page() {
+        let entries = parse_runs_list_entries(REAL_RUNS_PAGE).unwrap();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.global_id, 22958);
+        assert_eq!(e.index, 469);
+        assert_eq!(e.workflow_id, "check.yml");
+        assert_eq!(e.branch, "main");
+        assert_eq!(e.status, "success");
+        assert_eq!(
+            e.html_url,
+            "https://dev.a8n.run/fabrikam/forgejo-cli/actions/runs/469"
         );
     }
 
     #[test]
-    fn fetch_runs_auth_denied_on_first_page_is_terminal() {
-        let transport = SeqBytesTransport::new(vec![Ok((403, Vec::new()))]);
-        let out = fetch_runs(&transport, TEST_BASE, TEST_REPO, "test-pat", TEST_MAX_PAGES).unwrap();
-        assert_eq!(out, RunsListOutcome::AuthDenied(403));
+    fn parse_entries_still_reads_a_bare_array() {
+        let entries = parse_runs_list_entries(
+            r#"[{"id":7,"index_in_repo":3,"workflow_id":"ci.yml","head_branch":"main","status":"success"}]"#,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index, 3);
     }
 
-    #[test]
-    fn fetch_runs_error_after_first_page_returns_collected() {
-        // Page 1 full (so paging continues), page 2 errors: keep page-1 entries.
-        let full: Vec<(i64, i64, &str, &str, &str)> = (0..50)
-            .map(|n| (90000 + n, 5000 + n, "ci.yml", "main", "success"))
-            .collect();
-        let page1 = runs_page_full(&full);
-        let transport =
-            SeqBytesTransport::new(vec![Ok((200, page1)), Err("connect refused".to_string())]);
-        let out = fetch_runs(&transport, TEST_BASE, TEST_REPO, "test-pat", TEST_MAX_PAGES).unwrap();
-        let RunsListOutcome::Resolved(entries) = out else {
-            panic!("expected Resolved with the collected page-1 entries");
-        };
-        assert_eq!(entries.len(), 50);
+    // ---- CLAUDE-189 / CLAUDE-205: workflow YAML through `fj repo file` -----
+
+    /// A [`RepoFileClient`] serving canned results keyed by path, recording every
+    /// `(path, git_ref)` it was asked for.
+    struct StubRepoFile {
+        files: HashMap<String, String>,
+        asked: Mutex<Vec<(String, String)>>,
     }
 
-    // ---- CLAUDE-189: workflow YAML fetch (still on HTTP) -----------------
+    impl StubRepoFile {
+        fn new(files: &[(&str, &str)]) -> Self {
+            Self {
+                files: files
+                    .iter()
+                    .map(|(p, c)| (p.to_string(), c.to_string()))
+                    .collect(),
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RepoFileClient for StubRepoFile {
+        fn read_file(
+            &self,
+            _host: &str,
+            _repo: &str,
+            path: &str,
+            git_ref: &str,
+            _token: Option<&str>,
+        ) -> std::result::Result<String, String> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((path.to_string(), git_ref.to_string()));
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| format!("cannot read `{path}`"))
+        }
+    }
 
     #[test]
     fn workflow_yaml_tries_dirs_and_returns_first_hit_redacted() {
-        // First dir (.forgejo) 404s; second (.github) resolves. The YAML carries a
-        // token that must be redacted in the returned text.
+        // The first dir (.forgejo) misses; the second (.github) resolves. The YAML
+        // carries a token that must be redacted in the returned text.
         let yaml =
             "jobs:\n  check:\n    steps:\n      - run: echo ghp_abcdefghij0123456789ABCDEFG\n";
-        let transport = SeqBytesTransport::new(vec![
-            Ok((404, Vec::new())),
-            Ok((200, yaml.as_bytes().to_vec())),
-        ]);
-        let out = fetch_workflow_yaml(
-            &transport,
-            TEST_BASE,
+        let client = StubRepoFile::new(&[(".github/workflows/check.yml", yaml)]);
+        let out = read_workflow_yaml(
+            &client,
+            "dev.a8n.run",
             TEST_REPO,
             "a456a957",
             "check.yml",
-            "test-pat",
+            Some("test-pat"),
             &[],
         )
         .expect("workflow yaml found");
@@ -1309,29 +1228,26 @@ mod tests {
             "token redacted"
         );
         assert!(out.contains(REDACTED));
-        let urls = transport.urls();
-        assert!(urls[0].contains(".forgejo/workflows/check.yml"));
-        assert!(urls[1].contains(".github/workflows/check.yml"));
-        assert!(urls[1].contains("ref=a456a957"));
+        let asked = client.asked.lock().unwrap().clone();
+        assert_eq!(asked[0].0, ".forgejo/workflows/check.yml");
+        assert_eq!(asked[1].0, ".github/workflows/check.yml");
+        assert!(asked.iter().all(|(_, r)| r == "a456a957"), "{asked:?}");
     }
 
     #[test]
     fn workflow_yaml_all_miss_returns_none() {
-        let transport = SeqBytesTransport::new(vec![
-            Ok((404, Vec::new())),
-            Ok((404, Vec::new())),
-            Ok((404, Vec::new())),
-        ]);
-        let out = fetch_workflow_yaml(
-            &transport,
-            TEST_BASE,
+        let client = StubRepoFile::new(&[]);
+        let out = read_workflow_yaml(
+            &client,
+            "dev.a8n.run",
             TEST_REPO,
             "a456a957",
             "check.yml",
-            "test-pat",
+            Some("test-pat"),
             &[],
         );
         assert!(out.is_none());
+        assert_eq!(client.asked.lock().unwrap().len(), WORKFLOW_DIRS.len());
     }
 
     // ---- AC 3: secret redaction ------------------------------------------

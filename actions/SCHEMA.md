@@ -422,9 +422,9 @@ comment marker) so it is never analyzed twice. The dedup / attempt key is the is
 the code-fix runner in `actions/youtrack.yml`; analysis is read-only enrichment and must not collide with it, so `query`
 must not filter on `AI Agent`. A log miss (`AuthDenied` / `TransientMiss` / `Failed`) posts a short "unavailable" note
 once and leaves the issue un-marked so a later run retries; it never crashes or marks analyzed on a miss. Redaction is
-preserved end to end via `forge_log::redact`. Log reads shell out to `fj actions logs`; the workflow-YAML read stays on
-the REST API until `fj` gains a raw-file command (FJ-67). Both go through `forge_log` (Rust), never a raw REST call from a
-nu snippet (tooling-gap rule).
+preserved end to end via `forge_log::redact`. Log reads shell out to `fj actions logs` and the workflow-YAML read to
+`fj repo file` (CLAUDE-205). Both go through `forge_log` (Rust), never a raw REST call and never one from a nu snippet
+(tooling-gap rule).
 
 ```yaml
 kind: ci-failure-analysis
@@ -447,12 +447,13 @@ native:
 | `enabled`            | `true`                         | Master toggle. While false the handler no-ops.                       |
 | `query`              | `#Unresolved`                  | YouTrack candidate query. MUST NOT filter by `AI Agent` (see above). |
 | `summary_prefixes`   | `["CI failure:", "Auto-fix:"]` | Summary prefixes an issue must start with to be analyzed.            |
-| `log_token_ref`      | the webhook sources            | Forgejo PAT with the **`read:repository`** scope, used to fetch the log and read the workflow YAML. Either one encrypted-secret name (CLAUDE-26) for every repo or a per-repo mapping (CLAUDE-200, see **Per-repo log tokens**). Reaches `fj` through a temp single-host `keys.json` carrying that one secret and nothing else (CLAUDE-204), never a process argument. Read-only and repository-category only: every endpoint it touches (the three `fj actions logs` calls `/repos/{o}/{r}/actions/runs`, `.../runs/{id}/jobs`, `.../jobs/{id}/logs`, plus `/repos/{o}/{r}/raw/{path}`) is in Forgejo's repository group behind `reqRepoReader(unit.TypeActions)`, so unlike `forgejo.token_ref` this one needs no issue scope (CLAUDE-196). Omitted, the mapping is derived from `config.webhook.sources`. |
+| `log_token_ref`      | the webhook sources            | Forgejo PAT with the **`read:repository`** scope, used to fetch the log and read the workflow YAML. Either one encrypted-secret name (CLAUDE-26) for every repo or a per-repo mapping (CLAUDE-200, see **Per-repo log tokens**). Reaches `fj` through a temp single-host `keys.json` carrying that one secret and nothing else (CLAUDE-204/CLAUDE-205), never a process argument. Read-only and repository-category only: every endpoint `fj` touches on its behalf (the three `fj actions logs` calls `/repos/{o}/{r}/actions/runs`, `.../runs/{id}/jobs`, `.../jobs/{id}/logs`, plus `/repos/{o}/{r}/raw/{path}` behind `fj repo file`) is in Forgejo's repository group behind `reqRepoReader(unit.TypeActions)`, so unlike `forgejo.token_ref` this one needs no issue scope (CLAUDE-196). Omitted, the mapping is derived from `config.webhook.sources`. |
 | `max_analysis_bytes` | `24576`                        | Cap (bytes) on the posted analysis comment.                          |
 
-**Deployment prerequisite:** a host `fj` (`forgejo-cli` 0.13.0+, which ships `fj actions logs`) on `PATH`, and a Forgejo
-exposing the Actions read endpoints it calls. Where they are absent the fetch reports a miss and the handler posts an
-"unavailable" note rather than crashing.
+**Deployment prerequisite:** a host `fj` on `PATH` carrying both `fj actions logs` and `fj repo file` (FJ-67), and a
+Forgejo exposing the Actions read endpoints it calls. `fj repo file` landed on `pandoras-box/forgejo-cli` `main` after
+the `v0.13.0` tag (merge `b08d8bc`), so no released version ships it yet: build from that commit or newer. Where they
+are absent the fetch reports a miss and the handler posts an "unavailable" note rather than crashing.
 
 ##### Per-repo log tokens (CLAUDE-200)
 
@@ -491,7 +492,8 @@ each run it scans the tracker for open issues whose summary starts with one of `
 the hidden `Branch:` / `Job:` markers the CLAUDE-190 rekey embeds (plus the `## Failure` block's `- Repo:` / `- Workflow:`
 / `- Run:`); a pre-rekey issue whose branch/job are not parseable is skipped and left for manual close. Then for each
 allow-listed repo it pages the Forgejo runs list, reduces it to the LATEST run per `(branch, workflow_id)` (resolving a
-null `head_branch` from the run's log environment dump, bounded by `max_branch_resolves`), and reads each latest run's
+a branch the runs list does not carry as a plain name from the run's log environment dump, bounded by
+`max_branch_resolves`), and reads each latest run's
 per-job status from the jobs endpoint. Every open issue whose `(repo, branch, workflow, job)` exactly matches a now-green
 job (job status `success`) is closed: State set to `resolved_state` and a run-linked comment posted. The dedup key is the
 issue id.
@@ -511,8 +513,8 @@ issue. The close is idempotent: an already-closed issue (its resolved State drop
 auto-closed comment marker) is never re-closed or re-commented. **Selection is by summary prefix + markers ONLY; it NEVER
 selects by `AI Agent`** (reconcile is independent of the code-fix runner), so `query` must not filter on `AI Agent`. The
 reconciler performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. Log and per-job status
-reads shell out to `fj actions logs`; the runs list stays on the REST API until `fj` gains an `actions runs` command
-(FJ-66). Both go through `forge_log` (Rust), never a raw REST call from a nu snippet (tooling-gap rule).
+reads shell out to `fj actions logs` and the runs list to `fj actions runs` (CLAUDE-205). Both go through `forge_log`
+(Rust), never a raw REST call and never one from a nu snippet (tooling-gap rule).
 
 ```yaml
 kind: ci-failure-reconcile
@@ -545,7 +547,7 @@ native:
 | `log_token_ref`       | the webhook sources            | Forgejo PAT with the **`read:repository`** scope, used to page the runs list and to read each latest run's per-job status and log (which also resolves a null-branch run's branch). Either one encrypted-secret name (CLAUDE-26) for every repo or a per-repo mapping (CLAUDE-200, see **Per-repo log tokens**). Reaches `fj` through a temp single-host `keys.json` (CLAUDE-204). Repository-category only, same as the `ci-failure-analysis` log token (CLAUDE-196). Omitted, the mapping is derived from `config.webhook.sources`. |
 | `resolved_state`      | `Done`                         | State set on a closed issue (the CLAUDE project's only resolved State).                  |
 | `close_comment`       | (the auto-closed sentence)     | Run-linked close-comment template; `{run_index}` / `{branch}` / `{run_url}` / `{job}` are substituted, and a hidden auto-closed marker is appended. |
-| `max_branch_resolves` | `40`                           | Cap on per-repo branch-from-log resolutions when the runs list returns `head_branch` null. Reaching it is logged, never silent. |
+| `max_branch_resolves` | `40`                           | Cap on per-repo branch-from-log resolutions for runs whose branch the runs list does not carry as a plain name (`fj`'s `head_branch` is Forgejo's `prettyref`: `#<pr-number>` on a PR run, the bare sha on a ref-deleted push). Reaching it is logged, never silent. |
 | `close_duplicates`    | `true`                         | Collapse open issues sharing a `(repo, Root-Cause-Key:)` onto the oldest and close the rest as duplicates, before any Forgejo read (CLAUDE-198). |
 | `duplicate_comment`   | (the duplicate sentence)       | Duplicate close-comment template; `{canonical}` (the surviving issue id) and `{root_cause_key}` are substituted, and the same hidden auto-closed marker is appended. |
 
@@ -553,9 +555,10 @@ native:
 the untagged `native:` block, so a shipped action must set at least one of them (the shipped `ci-failure-reconcile.yml`
 sets both). The generic blocks (`schedule`, `output`, `limits`) stay at the top level of the action.
 
-**Deployment prerequisite:** a host `fj` (`forgejo-cli` 0.13.0+) on `PATH` for the log reads, and a Forgejo exposing the
-runs-list endpoint (`GET /api/v1/repos/{owner}/{repo}/actions/runs`), which is the one read still made directly (FJ-66).
-On an instance lacking it a repo scan is skipped with a warning rather than crashing.
+**Deployment prerequisite:** a host `fj` on `PATH` carrying both `fj actions logs` and `fj actions runs` (FJ-66), and a
+Forgejo exposing the Actions read endpoints they call. `fj actions runs` landed on `pandoras-box/forgejo-cli` `main`
+after the `v0.13.0` tag (merge `b08d8bc`), so no released version ships it yet: build from that commit or newer. On a
+deployment lacking either, a repo scan is skipped with a warning rather than crashing.
 
 ### `workdir_base` (string, optional)
 
