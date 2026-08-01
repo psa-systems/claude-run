@@ -1,0 +1,189 @@
+{# Shared widgets for the structured action editors (CLAUDE-211). Imported by
+   every per-kind editor template, so a field type or a shared block (schedule,
+   limits, output, claude) is defined once. Askama macros have no access to the
+   caller's context, so every value a macro renders is a parameter. #}
+
+{# Styling for every structured editor. Emitted once per page by the template. #}
+{% macro form_styles() %}
+<style>
+  .yt-form .grid2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px 20px; }
+  .yt-form .fld { display: flex; flex-direction: column; gap: 4px; }
+  .yt-form .fld > span { color: var(--fg-dim); font-size: 12px; }
+  .yt-form .fld input, .yt-form .fld select {
+    background: #0a0c10; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px; width: 100%;
+  }
+  .yt-form .fld-inline { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+  .yt-form .fld-inline span { font-size: 13px; }
+  .yt-form .card { margin-bottom: 16px; }
+  .yt-form .card h3 { color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.05em; font-size: 12px; }
+  .yt-form .hint { font-size: 12px; margin: 8px 0 0; }
+  .yt-form textarea {
+    background: #0a0c10; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 8px 10px; font-family: var(--mono); font-size: 13px;
+    width: 100%; min-height: 360px; resize: vertical; box-sizing: border-box; line-height: 1.5;
+  }
+  .yt-form textarea.lines { min-height: 72px; }
+  .yt-form .log-token-rows { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  .yt-form .log-token-rows th { text-align: left; color: var(--fg-dim); font-size: 12px; font-weight: normal; padding: 0 8px 4px 0; }
+  .yt-form .log-token-rows td { padding: 0 8px 8px 0; vertical-align: top; }
+  .yt-form .log-token-rows select {
+    background: #0a0c10; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px; width: 100%;
+  }
+</style>
+{% endmacro %}
+
+{% macro textfield(label, fname, value, placeholder) %}
+<label class="fld">
+  <span>{{ label }}</span>
+  <input type="text" name="{{ fname }}" value="{{ value }}" placeholder="{{ placeholder }}"
+         autocomplete="off" autocapitalize="off" spellcheck="false">
+</label>
+{% endmacro %}
+
+{% macro numfield(label, fname, value, placeholder, step) %}
+<label class="fld">
+  <span>{{ label }}</span>
+  <input type="number" name="{{ fname }}" value="{{ value }}" placeholder="{{ placeholder }}"
+         step="{{ step }}" min="0" autocomplete="off">
+</label>
+{% endmacro %}
+
+{# Dropdown of stored secret *names* (values are never rendered; CLAUDE-26). #}
+{% macro tokenfield(label, fname, value, secrets) %}
+<label class="fld">
+  <span>{{ label }}</span>
+  <select name="{{ fname }}">
+    <option value="">(host auth / none)</option>
+    {% for sname in secrets %}
+    <option value="{{ sname }}"{% if value.as_str() == sname.as_str() %} selected{% endif %}>{{ sname }}</option>
+    {% endfor %}
+  </select>
+</label>
+{% endmacro %}
+
+{% macro checkbox(fname, checked, label) %}
+<label class="fld-inline">
+  <input type="checkbox" name="{{ fname }}"{% if checked %} checked{% endif %}>
+  <span>{{ label }}</span>
+</label>
+{% endmacro %}
+
+{# Multi-line text: one entry per line, blank lines dropped on save. #}
+{% macro linesfield(label, fname, value, placeholder, hint) %}
+<label class="fld">
+  <span>{{ label }}</span>
+  <textarea name="{{ fname }}" class="lines" placeholder="{{ placeholder }}"
+            spellcheck="false" autocapitalize="off">{{ value }}</textarea>
+</label>
+<p class="hint dim">{{ hint }}</p>
+{% endmacro %}
+
+{% macro textareafield(label, fname, value, hint) %}
+<label class="fld">
+  <span>{{ label }}</span>
+  <textarea name="{{ fname }}" class="lines" spellcheck="false" autocapitalize="off">{{ value }}</textarea>
+</label>
+<p class="hint dim">{{ hint }}</p>
+{% endmacro %}
+
+{% macro identity_block(name, name_placeholder, enabled, workdir_base) %}
+<div class="card">
+  <h3>Identity</h3>
+  <div class="grid2">
+    {% call textfield("Name", "name", name, name_placeholder) %}
+    {% call textfield("Workdir base", "workdir_base", workdir_base, "~/.local/share/claude-run/workdirs") %}
+  </div>
+  {% call checkbox("enabled", enabled, "Enabled (action is scheduled and eligible to run)") %}
+</div>
+{% endmacro %}
+
+{% macro schedule_block(kind, spec) %}
+<div class="card">
+  <h3>Schedule</h3>
+  <div class="grid2">
+    <label class="fld">
+      <span>Kind</span>
+      <select name="schedule_kind">
+        <option value=""{% if kind.is_empty() %} selected{% endif %}>(none)</option>
+        <option value="interval"{% if kind.as_str() == "interval" %} selected{% endif %}>interval</option>
+        <option value="cron"{% if kind.as_str() == "cron" %} selected{% endif %}>cron</option>
+        <option value="manual"{% if kind.as_str() == "manual" %} selected{% endif %}>manual</option>
+      </select>
+    </label>
+    {% call textfield("Spec", "schedule_spec", spec, "e.g. 30m or 0 */2 * * *") %}
+  </div>
+</div>
+{% endmacro %}
+
+{% macro claude_block(cwd, allowed_tools, permission_mode) %}
+<div class="card">
+  <h3>Claude</h3>
+  <div class="grid2">
+    {% call textfield("CWD", "claude_cwd", cwd, "working directory override") %}
+    {% call textfield("Allowed tools", "claude_allowed_tools", allowed_tools, "e.g. Read,Grep,Bash") %}
+    {% call textfield("Permission mode", "claude_permission_mode", permission_mode, "e.g. acceptEdits") %}
+  </div>
+</div>
+{% endmacro %}
+
+{% macro output_block(file) %}
+<div class="card">
+  <h3>Output</h3>
+  <div class="grid2">
+    {% call textfield("Result file", "output_file", file, "e.g. ci-failure-analysis.jsonl (blank = no file)") %}
+  </div>
+</div>
+{% endmacro %}
+
+{% macro limits_block(max_attempts_per_key, max_runs_per_day, claude_timeout_seconds, daily_budget_usd) %}
+<div class="card">
+  <h3>Limits</h3>
+  <div class="grid2">
+    {% call numfield("Max attempts per key", "limit_max_attempts_per_key", max_attempts_per_key, "unset = no cap", "1") %}
+    {% call numfield("Max runs per day", "limit_max_runs_per_day", max_runs_per_day, "unset = no cap", "1") %}
+    {% call numfield("Claude timeout (seconds)", "limit_claude_timeout_seconds", claude_timeout_seconds, "unset = no timeout", "1") %}
+    {% call numfield("Daily budget (USD)", "limit_daily_budget_usd", daily_budget_usd, "unset = no budget", "0.01") %}
+  </div>
+</div>
+{% endmacro %}
+
+{# `log_token_ref` in both accepted shapes (CLAUDE-200): unset (derived from
+   config.webhook.sources), one secret for every repo, or ordered per-repo rows.
+   Blank rows are dropped on save; save and reopen the form for more rows. #}
+{% macro log_token_block(mode, global, rows, secrets) %}
+<div class="card">
+  <h3>Forgejo log token</h3>
+  <label class="fld">
+    <span>Source</span>
+    <select name="log_token_mode">
+      <option value="derive"{% if mode.as_str() == "derive" %} selected{% endif %}>Derive from config.webhook.sources (default)</option>
+      <option value="global"{% if mode.as_str() == "global" %} selected{% endif %}>One secret for every repo</option>
+      <option value="per_repo"{% if mode.as_str() == "per_repo" %} selected{% endif %}>Per-repo mapping (first match wins)</option>
+    </select>
+  </label>
+  <div class="grid2" style="margin-top: 12px;">
+    {% call tokenfield("Secret (one for every repo)", "log_token_global", global, secrets) %}
+  </div>
+  <table class="log-token-rows">
+    <thead><tr><th>Repos (one pattern per line)</th><th>Secret</th></tr></thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td><textarea name="log_token_repos" class="lines" placeholder="owner/*" spellcheck="false" autocapitalize="off">{{ row.repos }}</textarea></td>
+        <td>
+          <select name="log_token_ref">
+            <option value="">(none)</option>
+            {% for sname in secrets %}
+            <option value="{{ sname }}"{% if row.token_ref.as_str() == sname.as_str() %} selected{% endif %}>{{ sname }}</option>
+            {% endfor %}
+          </select>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint dim">Leave the source on <em>Derive</em> to write no <code>log_token_ref</code> key: the mapping then comes from <code>config.webhook.sources</code>, so a token is rotated in one place. Repo patterns are exact <code>owner/repo</code>, per-owner <code>owner/*</code>, or the global <code>*</code>. A repo matching no entry is skipped with a warning. Blank rows are ignored; save and reopen the form for more rows.</p>
+</div>
+{% endmacro %}

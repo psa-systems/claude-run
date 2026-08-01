@@ -95,6 +95,14 @@ claude-run version update --version v0.2.0 # pin an exact tag (independent of tr
 The daemon's TCP web UI (loopback by default; see "Web UI / API auth") is more than the Dashboard. The pages an operator
 will want to know about:
 
+- **New action** (`/actions/new`, CLAUDE-211) is a kind picker: it lists every action kind with a one-line description
+  and a link to its editor. Every native kind (`youtrack`, `forgejo-ci-fix`, `ci-failure-analysis`,
+  `ci-failure-reconcile`) has a structured form at `/actions/new/<kind>`, so no native action has to be hand-written as
+  YAML. `scripted` is **raw YAML only** (its fields are nu snippets, which a form cannot structure); the raw editor is
+  the explicit escape hatch at `/actions/new/raw` and also handles the few advanced fields no form covers. An existing
+  native action's form is at `/actions/<name>/form` (offered from the raw editor, which stays at
+  `/actions/<name>/edit`). Every form saves through the same validation and write path as the raw editor, so a form can
+  never write a file the raw editor would reject; keys no form covers are preserved untouched on save.
 - **Action detail** (`/actions/<name>`) carries an **Input errors / warnings** summary region (CLAUDE-147 / CLAUDE-171):
   the first few (`ACTION_EVENT_SUMMARY_LIMIT = 5`) distinct input / poll-phase diagnostics (probe failures, no-VCS drops)
   seen since the current serve started, each with its repeat count. It is a signal, not a log.

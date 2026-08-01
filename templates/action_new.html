@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}New action - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><span class="current">New action</span>{% endblock %}
+{% block main %}
+
+<h2>New action</h2>
+
+<div class="card" style="margin-bottom: 16px;">
+  <span class="dim">Pick the kind of action to create. Every native kind has a structured form, so no
+  hand-written YAML is needed; the file is saved as <code>actions/&lt;name&gt;.yml</code> from the
+  <code>name:</code> field and is rejected if it does not validate or already exists.</span>
+</div>
+
+<div class="card">
+  <h3>Kinds</h3>
+  <table>
+    <thead><tr><th>Kind</th><th>What it does</th><th></th></tr></thead>
+    <tbody>
+      {% for k in kinds %}
+      <tr>
+        <td><code>{{ k.kind }}</code></td>
+        <td>{{ k.description }}</td>
+        <td class="row-actions"><a class="btn" href="{{ k.url }}">{{ k.action_label }}</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h3>Advanced</h3>
+  <span class="dim">Already have an action's YAML? <a href="/actions/new/raw">Paste it into the raw
+  editor</a>. Raw YAML is also the escape hatch for fields no form covers; every form saves through
+  the same validation and write path.</span>
+</div>
+
+<div class="row-actions" style="margin-top: 12px;">
+  <a class="btn" href="/">Cancel</a>
+</div>
+
+{% endblock %}

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use askama::Template;
 use axum::body::Body;
-use axum::extract::{Form, Path as AxumPath, Query, State};
+use axum::extract::{Form, Path as AxumPath, Query, RawForm, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -27,14 +27,15 @@ use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::action::{
-    Action, Automerge, ClaudeBlock, Concurrency, ForgejoTarget, GithubTarget, Limits, NativeConfig,
-    YoutrackConfig, YoutrackSource,
+    Action, ActionKind, Automerge, ClaudeBlock, Concurrency, ForgejoTarget, GithubTarget, Limits,
+    NativeConfig, YoutrackConfig, YoutrackSource,
 };
 use crate::api::AppState;
 use crate::claude::ClaudeInvoker;
 use crate::config::Paths;
 use crate::state;
 
+pub mod native_forms;
 pub mod webhooks;
 
 /// CLAUDE-154: custom Askama filters. `{{ ts | datetime }}` renders a stored
@@ -75,13 +76,30 @@ pub fn router(api: Arc<AppState>, paths: Paths, webhook_enabled: bool) -> Router
     };
     Router::new()
         .route("/", get(dashboard))
+        // CLAUDE-211: the new-action page is a kind picker; raw YAML is the
+        // explicit escape hatch at `/actions/new/raw` rather than the default.
         .route("/actions/new", get(action_new_page))
+        .route("/actions/new/raw", get(action_new_raw_page))
         // GET renders the structured new-action form; POST creates it. Kept under
         // `/actions/new/` so it never shadows the `/actions/:name` detail route
         // (a bare `/actions/youtrack` would mask the action named `youtrack`).
         .route(
             "/actions/new/youtrack",
             get(youtrack_new_page).post(youtrack_create),
+        )
+        .route(
+            "/actions/new/forgejo-ci-fix",
+            get(native_forms::forgejo_ci_fix_new_page).post(native_forms::forgejo_ci_fix_create),
+        )
+        .route(
+            "/actions/new/ci-failure-analysis",
+            get(native_forms::ci_failure_analysis_new_page)
+                .post(native_forms::ci_failure_analysis_create),
+        )
+        .route(
+            "/actions/new/ci-failure-reconcile",
+            get(native_forms::ci_failure_reconcile_new_page)
+                .post(native_forms::ci_failure_reconcile_create),
         )
         .route("/actions", post(action_create))
         .route("/actions/:name", get(action_detail))
@@ -95,9 +113,11 @@ pub fn router(api: Arc<AppState>, paths: Paths, webhook_enabled: bool) -> Router
             "/actions/:name/edit",
             get(action_edit_page).post(action_edit_save),
         )
+        // CLAUDE-211: dispatches to the structured editor for the action's own
+        // native kind (raw editor for `scripted`).
         .route(
             "/actions/:name/form",
-            get(youtrack_edit_page).post(youtrack_edit_save),
+            get(action_form_page).post(action_form_save),
         )
         .route("/actions/:name/export", get(action_export))
         .route("/actions/:name/delete", post(action_delete))
@@ -1811,6 +1831,14 @@ async fn reports_page(
 
 // ---- action editor / import / export (CLAUDE-7) ---------------------------
 
+/// CLAUDE-211: new-action kind picker.
+#[derive(Template)]
+#[template(path = "action_new.html")]
+struct ActionNewTpl {
+    version: &'static str,
+    kinds: Vec<KindCard>,
+}
+
 #[derive(Template)]
 #[template(path = "action_editor.html")]
 struct ActionEditorTpl {
@@ -1917,11 +1945,11 @@ async fn action_edit_page(
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
     let yaml = std::fs::read_to_string(&path).map_err(WebError::from)?;
-    // Offer the structured editor only for a parseable `kind: youtrack` action.
+    // CLAUDE-211: offer the structured editor for any parseable native kind (the
+    // form route dispatches to that kind's editor). `scripted` has none, so it
+    // stays on raw YAML.
     let form_url = match crate::action::validate_str(&yaml, &path) {
-        Ok(loaded) if matches!(loaded.action.native, Some(NativeConfig::Youtrack(_))) => {
-            Some(format!("/actions/{name}/form"))
-        }
+        Ok(loaded) if loaded.action.native.is_some() => Some(format!("/actions/{name}/form")),
         _ => None,
     };
     let tpl = ActionEditorTpl {
@@ -1962,7 +1990,71 @@ async fn action_edit_save(
     Ok(Redirect::to(&format!("/actions/{name}")).into_response())
 }
 
+/// CLAUDE-211: the new-action page lists every [`ActionKind`] with a one-line
+/// description and a link to its editor. Raw-YAML paste is an explicit
+/// alternative (`/actions/new/raw`), not the default.
 async fn action_new_page(State(s): State<WebState>) -> Result<Html<String>, WebError> {
+    let tpl = ActionNewTpl {
+        version: s.api.version,
+        kinds: ActionKind::ALL.into_iter().map(kind_card).collect(),
+    };
+    Ok(Html(tpl.render().map_err(WebError::from)?))
+}
+
+/// One row of the new-action kind picker.
+struct KindCard {
+    kind: &'static str,
+    description: &'static str,
+    url: &'static str,
+    /// Label of the row's button: which editor the link opens.
+    action_label: &'static str,
+}
+
+/// Describe a kind for the picker. The match is exhaustive, so a new
+/// [`ActionKind`] cannot ship without deciding which editor creates it.
+fn kind_card(kind: ActionKind) -> KindCard {
+    let (description, url, action_label) = match kind {
+        ActionKind::Youtrack => (
+            "Work tracker issues end to end: pick up a queued YouTrack issue, run the agent on a \
+             clone, open the PR, and drive the AI Agent state field.",
+            "/actions/new/youtrack",
+            "Structured form",
+        ),
+        ActionKind::ForgejoCiFix => (
+            "Fix failing CI on the bot's own Forgejo PRs: clone the PR branch, run the agent, and \
+             push a corrective commit when the diff stays inside the size gate.",
+            "/actions/new/forgejo-ci-fix",
+            "Structured form",
+        ),
+        ActionKind::CiFailureAnalysis => (
+            "Comment a log-grounded root-cause analysis on each open CI-failure issue, from the \
+             complete run log plus the failing workflow YAML.",
+            "/actions/new/ci-failure-analysis",
+            "Structured form",
+        ),
+        ActionKind::CiFailureReconcile => (
+            "Close each open CI-failure issue whose failing job is green again on its latest run, \
+             and collapse issues that share a root-cause key.",
+            "/actions/new/ci-failure-reconcile",
+            "Structured form",
+        ),
+        ActionKind::Scripted => (
+            "Deprecated generic pipeline (input.command -> filter -> pre -> prompt -> post). Its \
+             fields are nu snippets, which a form cannot structure, so it is raw YAML only.",
+            "/actions/new/raw",
+            "Raw YAML",
+        ),
+    };
+    KindCard {
+        kind: kind.as_str(),
+        description,
+        url,
+        action_label,
+    }
+}
+
+/// The raw-YAML editor for a new action, reached from the kind picker.
+async fn action_new_raw_page(State(s): State<WebState>) -> Result<Html<String>, WebError> {
     let tpl = ActionEditorTpl {
         version: s.api.version,
         heading: "New action".into(),
@@ -1971,7 +2063,7 @@ async fn action_new_page(State(s): State<WebState>) -> Result<Html<String>, WebE
         error: None,
         is_new: true,
         name: None,
-        form_url: Some("/actions/new/youtrack".into()),
+        form_url: Some("/actions/new".into()),
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
@@ -2612,7 +2704,7 @@ async fn render_youtrack_editor(
         None => (
             "New YouTrack action".to_string(),
             "/actions/new/youtrack".to_string(),
-            "/actions/new".to_string(),
+            "/actions/new/raw".to_string(),
         ),
     };
     let tpl = YoutrackEditorTpl {
@@ -2626,6 +2718,64 @@ async fn render_youtrack_editor(
         name,
     };
     Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
+}
+
+/// CLAUDE-211: `/actions/:name/form` for any kind. Renders the structured
+/// editor matching the action's own native config; an action with no structured
+/// editor (`scripted`, or a file that no longer parses) falls back to the raw
+/// editor.
+async fn action_form_page(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, WebError> {
+    if let Some(r) = reject_synthetic(&name) {
+        return Ok(r);
+    }
+    if indexed_action_path(&s.api.pool, &name).await?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
+    }
+    let Some((_, action)) = native_forms::indexed_action(&s, &name).await? else {
+        return Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response());
+    };
+    match action.native {
+        Some(NativeConfig::Youtrack(_)) => youtrack_edit_page(State(s), AxumPath(name)).await,
+        _ => native_forms::edit_page_for_kind(&s, name, &action).await,
+    }
+}
+
+/// POST counterpart of [`action_form_page`]: decodes the body with the form type
+/// of the action's own kind. The body is taken raw because the per-repo
+/// `log_token_ref` rows post repeated keys, which `Form<T>` collapses.
+async fn action_form_save(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+    RawForm(body): RawForm,
+) -> Result<Response, WebError> {
+    if let Some(r) = reject_synthetic(&name) {
+        return Ok(r);
+    }
+    if indexed_action_path(&s.api.pool, &name).await?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
+    }
+    let Some((path, action)) = native_forms::indexed_action(&s, &name).await? else {
+        return Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response());
+    };
+    match action.native {
+        Some(NativeConfig::Youtrack(_)) => {
+            let form: YoutrackEditForm = match serde_urlencoded::from_bytes(&body) {
+                Ok(f) => f,
+                Err(e) => {
+                    return Ok((
+                        StatusCode::BAD_REQUEST,
+                        format!("malformed form submission: {e}"),
+                    )
+                        .into_response())
+                }
+            };
+            youtrack_edit_save(State(s), AxumPath(name), Form(form)).await
+        }
+        _ => native_forms::edit_save_for_kind(&s, name, &path, &action, &body).await,
+    }
 }
 
 async fn youtrack_new_page(State(s): State<WebState>) -> Result<Response, WebError> {
@@ -5882,6 +6032,427 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // ---- structured editors for every native kind (CLAUDE-211) --------
+        //
+        // `/actions/new` is a kind picker, every native kind has a form at
+        // `/actions/new/<kind>`, and `/actions/:name/form` dispatches to the
+        // editor matching the action's own kind. Saves run through the same
+        // `validate_str` + write path as the raw editor.
+
+        use super::super::native_forms;
+        use super::super::{
+            action_form_page, action_form_save, action_new_page, action_new_raw_page,
+        };
+        use crate::action::NativeConfig;
+        use axum::extract::RawForm;
+
+        fn raw_form(body: &str) -> RawForm {
+            RawForm(axum::body::Bytes::copy_from_slice(body.as_bytes()))
+        }
+
+        /// Write and index an action file, returning its path.
+        async fn seed_action(s: &WebState, name: &str, yaml: &str) -> std::path::PathBuf {
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join(format!("{name}.yml"));
+            std::fs::write(&file, yaml).unwrap();
+            index_action(&s.api.pool, name, file.to_str().unwrap()).await;
+            file
+        }
+
+        #[tokio::test]
+        async fn action_new_page_lists_every_kind() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let body = body_string(
+                action_new_page(State(s.clone()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            for kind in crate::action::ActionKind::ALL {
+                assert!(
+                    body.contains(kind.as_str()),
+                    "{} missing: {body}",
+                    kind.as_str()
+                );
+            }
+            // Every native kind links to its structured form; scripted and the
+            // paste-YAML escape hatch both point at the raw editor.
+            assert!(body.contains("/actions/new/youtrack"));
+            assert!(body.contains("/actions/new/forgejo-ci-fix"));
+            assert!(body.contains("/actions/new/ci-failure-analysis"));
+            assert!(body.contains("/actions/new/ci-failure-reconcile"));
+            assert!(body.contains("/actions/new/raw"));
+            // The raw textarea is not the default any more.
+            assert!(!body.contains("<textarea"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn action_new_raw_page_still_serves_the_textarea() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let body = body_string(
+                action_new_raw_page(State(s.clone()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(body.contains("<textarea"));
+            // and offers the picker as the guided alternative.
+            assert!(body.contains("/actions/new\""), "{body}");
+        }
+
+        /// Every input a kind's form must expose: each field of its native
+        /// config struct plus the shared blocks. A field dropped from the
+        /// template fails here even though the Rust round trip would still pass.
+        const COMMON_INPUTS: [&str; 12] = [
+            "name",
+            "enabled",
+            "workdir_base",
+            "schedule_kind",
+            "schedule_spec",
+            "output_file",
+            "limit_max_attempts_per_key",
+            "limit_max_runs_per_day",
+            "limit_claude_timeout_seconds",
+            "limit_daily_budget_usd",
+            "native_enabled",
+            "log_token_mode",
+        ];
+
+        #[tokio::test]
+        async fn native_new_pages_render_every_field() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let claude_inputs = [
+                "claude_cwd",
+                "claude_allowed_tools",
+                "claude_permission_mode",
+            ];
+            let log_token_inputs = ["log_token_global", "log_token_repos", "log_token_ref"];
+            let cases: [(Response, &str, &str, Vec<&str>); 3] = [
+                (
+                    native_forms::forgejo_ci_fix_new_page(State(s.clone()))
+                        .await
+                        .unwrap(),
+                    "forgejo-ci-fix",
+                    "/actions/new/forgejo-ci-fix",
+                    [
+                        "host",
+                        "repos",
+                        "window_minutes",
+                        "max_files",
+                        "max_lines",
+                        "bot_author",
+                        "bot_email",
+                        "skip_marker",
+                        "max_pr_attempts",
+                        "needs_review_label",
+                        "needs_review_state",
+                        "review_assignee",
+                        "token",
+                        "token_clear",
+                    ]
+                    .into_iter()
+                    .chain(claude_inputs)
+                    .collect(),
+                ),
+                (
+                    native_forms::ci_failure_analysis_new_page(State(s.clone()))
+                        .await
+                        .unwrap(),
+                    "ci-failure-analysis",
+                    "/actions/new/ci-failure-analysis",
+                    ["query", "summary_prefixes", "max_analysis_bytes"]
+                        .into_iter()
+                        .chain(claude_inputs)
+                        .chain(log_token_inputs)
+                        .collect(),
+                ),
+                (
+                    native_forms::ci_failure_reconcile_new_page(State(s.clone()))
+                        .await
+                        .unwrap(),
+                    "ci-failure-reconcile",
+                    "/actions/new/ci-failure-reconcile",
+                    [
+                        "query",
+                        "summary_prefixes",
+                        "repos",
+                        "resolved_state",
+                        "close_comment",
+                        "max_branch_resolves",
+                        "close_duplicates",
+                        "duplicate_comment",
+                    ]
+                    .into_iter()
+                    .chain(log_token_inputs)
+                    .collect(),
+                ),
+            ];
+            for (resp, kind, post_url, fields) in cases {
+                assert_eq!(resp.status(), StatusCode::OK, "{kind}");
+                let body = body_string(resp).await;
+                // `ci-failure-reconcile` runs no agent session, so it exposes no
+                // claude block; every other input is required of every kind.
+                let expected = fields.into_iter().chain(
+                    COMMON_INPUTS
+                        .into_iter()
+                        .filter(|f| *f != "log_token_mode" || kind != "forgejo-ci-fix"),
+                );
+                for field in expected {
+                    assert!(
+                        body.contains(&format!("name=\"{field}\"")),
+                        "{kind}: no input for `{field}`"
+                    );
+                }
+                assert!(body.contains(post_url), "{post_url} missing");
+                // Every form offers the raw editor as the escape hatch.
+                assert!(body.contains("/actions/new/raw"), "{kind}");
+            }
+        }
+
+        #[tokio::test]
+        async fn native_create_writes_each_kind() {
+            for (kind, body) in [
+                ("forgejo-ci-fix", "name=fix&enabled=on&native_enabled=on"),
+                (
+                    "ci-failure-analysis",
+                    "name=analysis&enabled=on&native_enabled=on",
+                ),
+                (
+                    "ci-failure-reconcile",
+                    "name=reconcile&enabled=on&native_enabled=on",
+                ),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let s = web_state(tmp.path()).await;
+                let name = body.split('&').next().unwrap().trim_start_matches("name=");
+                let resp = match kind {
+                    "forgejo-ci-fix" => {
+                        native_forms::forgejo_ci_fix_create(State(s.clone()), raw_form(body)).await
+                    }
+                    "ci-failure-analysis" => {
+                        native_forms::ci_failure_analysis_create(State(s.clone()), raw_form(body))
+                            .await
+                    }
+                    _ => {
+                        native_forms::ci_failure_reconcile_create(State(s.clone()), raw_form(body))
+                            .await
+                    }
+                }
+                .unwrap();
+                assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{kind}");
+                let file = s.paths.actions_dir().join(format!("{name}.yml"));
+                let written = std::fs::read_to_string(&file).unwrap();
+                let loaded = crate::action::validate_str(&written, file.to_str().unwrap()).unwrap();
+                assert_eq!(loaded.action.kind.as_str(), kind);
+                // Indexed synchronously, so the redirect target resolves now.
+                assert!(super::super::indexed_action_path(&s.api.pool, name)
+                    .await
+                    .unwrap()
+                    .is_some());
+            }
+        }
+
+        #[tokio::test]
+        async fn native_create_rejects_an_invalid_form_inline() {
+            // The name is required by `validate_str`; the form must surface that
+            // rejection inline and write nothing.
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let resp =
+                native_forms::ci_failure_analysis_create(State(s.clone()), raw_form("enabled=on"))
+                    .await
+                    .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(!s.paths.actions_dir().join(".yml").exists());
+            let body = body_string(resp).await;
+            assert!(body.contains("validation failed"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn action_form_page_dispatches_on_the_actions_kind() {
+            let cases = [
+                (
+                    "yt",
+                    "name: yt\nkind: youtrack\nnative: {}\n",
+                    "name=\"yt_query\"",
+                ),
+                (
+                    "fix",
+                    "name: fix\nkind: forgejo-ci-fix\nnative:\n  host: dev.a8n.run\n",
+                    "name=\"bot_author\"",
+                ),
+                (
+                    "analysis",
+                    "name: analysis\nkind: ci-failure-analysis\nnative:\n  max_analysis_bytes: 1024\n",
+                    "name=\"max_analysis_bytes\"",
+                ),
+                (
+                    "reconcile",
+                    "name: reconcile\nkind: ci-failure-reconcile\nnative:\n  resolved_state: Done\n",
+                    "name=\"max_branch_resolves\"",
+                ),
+            ];
+            for (name, yaml, marker) in cases {
+                let tmp = tempfile::tempdir().unwrap();
+                let s = web_state(tmp.path()).await;
+                seed_action(&s, name, yaml).await;
+                let resp = action_form_page(State(s.clone()), AxumPath(name.to_string()))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{name}");
+                let body = body_string(resp).await;
+                assert!(body.contains(marker), "{name}: {marker} missing: {body}");
+            }
+        }
+
+        #[tokio::test]
+        async fn action_form_page_falls_back_to_raw_for_scripted() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_action(
+                &s,
+                "scripted",
+                "name: scripted\ninput:\n  command: echo '[]'\nprompt: hi\n",
+            )
+            .await;
+            let resp = action_form_page(State(s.clone()), AxumPath("scripted".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                resp.headers().get("location").unwrap(),
+                "/actions/scripted/edit"
+            );
+        }
+
+        #[tokio::test]
+        async fn action_form_page_404s_an_unknown_action() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let resp = action_form_page(State(s.clone()), AxumPath("nope".to_string()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn action_form_save_dispatches_on_the_actions_kind() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let file = seed_action(
+                &s,
+                "reconcile",
+                "name: reconcile\nkind: ci-failure-reconcile\nnative:\n  resolved_state: Done\n",
+            )
+            .await;
+            let resp = action_form_save(
+                State(s.clone()),
+                AxumPath("reconcile".to_string()),
+                raw_form(
+                    "name=reconcile&enabled=on&native_enabled=on&resolved_state=Fixed\
+                     &log_token_mode=per_repo&log_token_repos=contoso%2F*&log_token_ref=logs",
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let written = std::fs::read_to_string(&file).unwrap();
+            let loaded = crate::action::validate_str(&written, file.to_str().unwrap()).unwrap();
+            let Some(NativeConfig::CiFailureReconcile(cfg)) = loaded.action.native else {
+                panic!("expected a reconcile config");
+            };
+            assert_eq!(cfg.resolved_state, "Fixed");
+            // The repeated per-repo rows survive the raw-body decode.
+            assert_eq!(
+                cfg.log_token_ref,
+                Some(crate::action::LogTokenRef::PerRepo(vec![
+                    crate::action::LogTokenEntry {
+                        repos: vec!["contoso/*".to_string()],
+                        token_ref: "logs".to_string(),
+                    }
+                ]))
+            );
+        }
+
+        #[tokio::test]
+        async fn action_form_save_still_serves_youtrack() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let file = seed_action(&s, "yt", "name: yt\nkind: youtrack\nnative: {}\n").await;
+            let resp = action_form_save(
+                State(s.clone()),
+                AxumPath("yt".to_string()),
+                raw_form("name=yt&enabled=on&yt_query=mine"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let written = std::fs::read_to_string(&file).unwrap();
+            let loaded = crate::action::validate_str(&written, file.to_str().unwrap()).unwrap();
+            let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+                panic!("expected a youtrack config");
+            };
+            assert_eq!(cfg.youtrack.query, "mine");
+        }
+
+        #[tokio::test]
+        async fn edit_page_offers_the_form_for_every_native_kind() {
+            for (name, yaml) in [
+                ("yt", "name: yt\nkind: youtrack\nnative: {}\n"),
+                (
+                    "fix",
+                    "name: fix\nkind: forgejo-ci-fix\nnative:\n  host: dev.a8n.run\n",
+                ),
+                (
+                    "analysis",
+                    "name: analysis\nkind: ci-failure-analysis\nnative:\n  max_analysis_bytes: 1024\n",
+                ),
+                (
+                    "reconcile",
+                    "name: reconcile\nkind: ci-failure-reconcile\nnative:\n  resolved_state: Done\n",
+                ),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let s = web_state(tmp.path()).await;
+                seed_action(&s, name, yaml).await;
+                let body = body_string(
+                    super::super::action_edit_page(State(s.clone()), AxumPath(name.to_string()))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                assert!(
+                    body.contains(&format!("/actions/{name}/form")),
+                    "{name}: no structured-editor link: {body}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn edit_page_offers_no_form_for_scripted() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            seed_action(
+                &s,
+                "scripted",
+                "name: scripted\ninput:\n  command: echo '[]'\nprompt: hi\n",
+            )
+            .await;
+            let body = body_string(
+                super::super::action_edit_page(State(s.clone()), AxumPath("scripted".to_string()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(!body.contains("/actions/scripted/form"), "{body}");
         }
     }
 
