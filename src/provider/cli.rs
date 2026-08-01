@@ -1483,22 +1483,26 @@ impl Backend for CliBackend {
     }
 }
 
-/// CLAUDE-204: the Action-log client, `fj actions logs` behind the
-/// [`ActionLogClient`] seam. The ONE path a run's logs are read through, for
-/// public and private repos alike: `fj` resolves the per-repo run number to the
-/// internal run id, enumerates the run's jobs, and returns each job's log, so
-/// nothing here pages a runs list or guesses a job index.
+/// CLAUDE-204 / CLAUDE-205: every forge read the CI-failure actions make, all
+/// through `fj`, so each action holds ONE client:
+///
+/// - [`ActionLogClient`] -> `fj actions logs`, the ONE path a run's logs are read
+///   through for public and private repos alike: `fj` resolves the per-repo run
+///   number to the internal run id, enumerates the run's jobs, and returns each
+///   job's log, so nothing here guesses a job index.
+/// - [`crate::forge_log::ActionRunsClient`] -> `fj actions runs` (FJ-66), paged.
+/// - [`crate::forge_log::RepoFileClient`] -> `fj repo file` (FJ-67).
 ///
 /// A resolved `log_token_ref` is injected the same way the per-job forge
 /// credentials are (CLAUDE-26): a temp `$XDG_DATA_HOME` holding a single-host
 /// `keys.json` that carries that one secret and nothing else, removed when the
 /// call returns. The token is never a process argument and never logged.
-pub struct FjActionLogs {
+pub struct FjForgeReads {
     runner: Arc<dyn CommandRunner>,
     fj: String,
 }
 
-impl FjActionLogs {
+impl FjForgeReads {
     /// Client using the default `fj` binary name.
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
         Self {
@@ -1511,6 +1515,39 @@ impl FjActionLogs {
     pub fn with_binary(mut self, fj: impl Into<String>) -> Self {
         self.fj = fj.into();
         self
+    }
+}
+
+/// The temp single-host `keys.json` a `fj` read runs against, plus the env that
+/// points the child at it. Held for the whole call (a paged scan reuses one
+/// store) and removed on drop.
+struct FjCreds {
+    /// Held only so the store outlives the call and is removed on drop.
+    _keys: Option<crate::secrets::TempFjKeys>,
+    xdg: Option<String>,
+}
+
+impl FjCreds {
+    /// Write the store for `token`, or nothing at all when there is no token (a
+    /// public repo reads unauthenticated).
+    fn create(host: &str, token: Option<&str>) -> std::result::Result<Self, String> {
+        let keys = match token {
+            Some(t) => Some(
+                crate::secrets::TempFjKeys::create(host, t)
+                    .map_err(|e| format!("writing the temp fj key store failed: {e}"))?,
+            ),
+            None => None,
+        };
+        let xdg = keys.as_ref().map(|k| k.xdg_data_home());
+        Ok(Self { _keys: keys, xdg })
+    }
+
+    /// The child env: the key-store override only, or nothing.
+    fn envs(&self) -> Vec<(&str, &str)> {
+        match &self.xdg {
+            Some(v) => vec![("XDG_DATA_HOME", v.as_str())],
+            None => Vec::new(),
+        }
     }
 }
 
@@ -1552,7 +1589,7 @@ fn classify_fj_log_error(stderr: &str, exit_code: i32) -> crate::forge_log::RunL
     RunLogsOutcome::Failed(format!("fj actions logs exited {exit_code}: {detail}"))
 }
 
-impl crate::forge_log::ActionLogClient for FjActionLogs {
+impl crate::forge_log::ActionLogClient for FjForgeReads {
     fn run_logs(
         &self,
         host: &str,
@@ -1561,33 +1598,148 @@ impl crate::forge_log::ActionLogClient for FjActionLogs {
         token: Option<&str>,
     ) -> crate::forge_log::RunLogsOutcome {
         use crate::forge_log::RunLogsOutcome;
-        let keys = match token {
-            Some(t) => match crate::secrets::TempFjKeys::create(host, t) {
-                Ok(k) => Some(k),
-                Err(e) => {
-                    return RunLogsOutcome::Failed(format!(
-                        "writing the temp fj key store failed: {e}"
-                    ))
-                }
-            },
-            None => None,
-        };
-        let xdg = keys.as_ref().map(|k| k.xdg_data_home());
-        let envs: Vec<(&str, &str)> = match &xdg {
-            Some(v) => vec![("XDG_DATA_HOME", v.as_str())],
-            None => Vec::new(),
+        let creds = match FjCreds::create(host, token) {
+            Ok(c) => c,
+            Err(e) => return RunLogsOutcome::Failed(e),
         };
         let run = run_number.to_string();
         let args = [
             "--host", host, "actions", "logs", "--repo", repo, "--json", &run,
         ];
-        match self.runner.run_in_env(None, &self.fj, &args, &envs) {
+        match self.runner.run_in_env(None, &self.fj, &args, &creds.envs()) {
             Ok(out) if out.ok => match crate::forge_log::parse_run_logs(&out.stdout) {
                 Ok(jobs) => RunLogsOutcome::Fetched(jobs),
                 Err(e) => RunLogsOutcome::Failed(format!("parsing fj actions logs --json: {e}")),
             },
             Ok(out) => classify_fj_log_error(&out.stderr, out.exit_code),
             Err(e) => RunLogsOutcome::Failed(format!("running {} actions logs: {e}", self.fj)),
+        }
+    }
+}
+
+/// Runs requested per `fj actions runs` page. With the reconciler's page ceiling
+/// (`RECONCILE_MAX_PAGES`) this scans the `50 * 40 = 2000` most-recent runs,
+/// enough to reach a recently-minted "CI failure" issue's run; an older run is
+/// simply not in the scan and its issue stays open.
+const RUNS_PAGE_LIMIT: u32 = 50;
+
+/// Map a failed `fj actions runs` invocation onto a runs-list outcome, on the
+/// same discriminator [`classify_fj_log_error`] uses: `fj` reports an HTTP
+/// failure as `unexpected status code <code> <reason>`. Only `fj`'s own stderr
+/// is quoted; it carries no token.
+fn classify_fj_runs_error(stderr: &str, exit_code: i32) -> crate::forge_log::RunsListOutcome {
+    use crate::forge_log::RunsListOutcome;
+    let lower = stderr.to_ascii_lowercase();
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no stderr")
+        .to_string();
+    if lower.contains("status code 401") {
+        return RunsListOutcome::AuthDenied(401);
+    }
+    if lower.contains("status code 403") {
+        return RunsListOutcome::AuthDenied(403);
+    }
+    if lower.contains("status code 404") || lower.contains("not found") {
+        return RunsListOutcome::NotFound;
+    }
+    RunsListOutcome::Failed(format!("fj actions runs exited {exit_code}: {detail}"))
+}
+
+impl crate::forge_log::ActionRunsClient for FjForgeReads {
+    fn list_runs(
+        &self,
+        host: &str,
+        repo: &str,
+        max_pages: u32,
+        token: Option<&str>,
+    ) -> crate::forge_log::RunsListOutcome {
+        use crate::forge_log::RunsListOutcome;
+        // One store for the whole scan; removed when this call returns.
+        let creds = match FjCreds::create(host, token) {
+            Ok(c) => c,
+            Err(e) => return RunsListOutcome::Failed(e),
+        };
+        let envs = creds.envs();
+        let limit = RUNS_PAGE_LIMIT.to_string();
+
+        // Page until a short page (the last one) or the ceiling. An error or an
+        // unparseable page is terminal only before anything was collected; once
+        // some entries are in hand, paging stops and returns them (partial
+        // coverage beats none for a poll).
+        let mut all = Vec::new();
+        for page in 1..=max_pages {
+            let page = page.to_string();
+            let args = [
+                "--host", host, "actions", "runs", "--repo", repo, "--json", "--page", &page,
+                "--limit", &limit,
+            ];
+            let out = match self.runner.run_in_env(None, &self.fj, &args, &envs) {
+                Ok(out) => out,
+                Err(e) => {
+                    if !all.is_empty() {
+                        break;
+                    }
+                    return RunsListOutcome::Failed(format!(
+                        "running {} actions runs: {e}",
+                        self.fj
+                    ));
+                }
+            };
+            if !out.ok {
+                if !all.is_empty() {
+                    break;
+                }
+                return classify_fj_runs_error(&out.stderr, out.exit_code);
+            }
+            let entries = match crate::forge_log::parse_runs_list_entries(&out.stdout) {
+                Ok(e) => e,
+                Err(e) => {
+                    if !all.is_empty() {
+                        break;
+                    }
+                    return RunsListOutcome::Failed(format!("parsing fj actions runs --json: {e}"));
+                }
+            };
+            let short = entries.len() < RUNS_PAGE_LIMIT as usize;
+            all.extend(entries);
+            if short {
+                break;
+            }
+        }
+        RunsListOutcome::Resolved(all)
+    }
+}
+
+impl crate::forge_log::RepoFileClient for FjForgeReads {
+    fn read_file(
+        &self,
+        host: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+        token: Option<&str>,
+    ) -> std::result::Result<String, String> {
+        let creds = FjCreds::create(host, token)?;
+        // No `--json`: `fj repo file` writes the file's bytes to stdout
+        // unchanged, so the YAML arrives as it is in the repo.
+        let args = [
+            "--host", host, "repo", "file", path, "--ref", git_ref, "--repo", repo,
+        ];
+        match self.runner.run_in_env(None, &self.fj, &args, &creds.envs()) {
+            Ok(out) if out.ok => Ok(out.stdout),
+            Ok(out) => Err(format!(
+                "fj repo file exited {}: {}",
+                out.exit_code,
+                out.stderr
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("no stderr")
+            )),
+            Err(e) => Err(format!("running {} repo file: {e}", self.fj)),
         }
     }
 }
@@ -3608,7 +3760,7 @@ mod tests {
     #[test]
     fn action_logs_parses_the_json_document() {
         let runner = Arc::new(StubRunner::new().ok("fj", LOGS_ARGS, LOGS_JSON));
-        let logs = FjActionLogs::new(runner);
+        let logs = FjForgeReads::new(runner);
         let out = logs.run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
         let RunLogsOutcome::Fetched(jobs) = out else {
             panic!("expected Fetched, got {out:?}");
@@ -3627,7 +3779,7 @@ mod tests {
         // through a temp `keys.json` carrying that one secret and nothing else.
         // It is never a process argument.
         let runner = Arc::new(StubRunner::new().ok("fj", LOGS_ARGS, LOGS_JSON));
-        let logs = FjActionLogs::new(runner.clone());
+        let logs = FjForgeReads::new(runner.clone());
         let out = logs.run_logs("dev.a8n.run", "contoso/claude-run", 889, Some("test-pat"));
         assert!(matches!(out, RunLogsOutcome::Fetched(_)), "{out:?}");
 
@@ -3681,7 +3833,7 @@ mod tests {
             "Error: no action run #889 on contoso/claude-run\n",
         ));
         let out =
-            FjActionLogs::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
+            FjForgeReads::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
         assert!(
             matches!(&out, RunLogsOutcome::NotFound(r) if r.contains("no action run")),
             "{out:?}"
@@ -3697,7 +3849,7 @@ mod tests {
                 1,
                 &format!("Error: unexpected status code {code} Unauthorized\n"),
             ));
-            let out = FjActionLogs::new(runner).run_logs(
+            let out = FjForgeReads::new(runner).run_logs(
                 "dev.a8n.run",
                 "contoso/claude-run",
                 889,
@@ -3720,7 +3872,7 @@ mod tests {
             "Error: unexpected status code 404 Not Found\n",
         ));
         let out =
-            FjActionLogs::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
+            FjForgeReads::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
         assert!(matches!(out, RunLogsOutcome::NotFound(_)), "{out:?}");
     }
 
@@ -3728,15 +3880,234 @@ mod tests {
     fn a_missing_fj_or_unparseable_output_is_a_fault() {
         let runner = Arc::new(StubRunner::new().missing("fj"));
         let out =
-            FjActionLogs::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
+            FjForgeReads::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
         assert!(matches!(out, RunLogsOutcome::Failed(_)), "{out:?}");
 
         let runner = Arc::new(StubRunner::new().ok("fj", LOGS_ARGS, "not json"));
         let out =
-            FjActionLogs::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
+            FjForgeReads::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
         assert!(
             matches!(&out, RunLogsOutcome::Failed(r) if r.contains("parsing")),
             "{out:?}"
         );
+    }
+
+    // ---- CLAUDE-205: `fj actions runs` (FJ-66) ----------------------------
+
+    use crate::forge_log::{ActionRunsClient, RepoFileClient, RunsListOutcome};
+
+    const RUNS_REPO: &str = "initech/chat";
+    const RUNS_MAX_PAGES: u32 = 40;
+
+    /// The argv for one `fj actions runs` page, as the client builds it.
+    fn runs_args(page: &str) -> Vec<String> {
+        [
+            "--host",
+            "dev.a8n.run",
+            "actions",
+            "runs",
+            "--repo",
+            RUNS_REPO,
+            "--json",
+            "--page",
+            page,
+            "--limit",
+            "50",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// A `fj actions runs --json` page carrying `count` runs.
+    fn runs_page(count: usize, first_id: i64, branch: &str) -> String {
+        let items: Vec<String> = (0..count)
+            .map(|n| {
+                let id = first_id + n as i64;
+                format!(
+                    r#"{{"id":{id},"run_number":{id},"index_in_repo":{id},"workflow_id":"ci.yml","head_branch":"{branch}","status":"success","conclusion":"success","html_url":"https://dev.a8n.run/{RUNS_REPO}/actions/runs/{id}"}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"total_count":{},"runs":[{}]}}"#,
+            items.len(),
+            items.join(",")
+        )
+    }
+
+    /// Register a canned page response on the stub runner.
+    fn with_runs_page(runner: StubRunner, page: &str, body: &str) -> StubRunner {
+        let args = runs_args(page);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        runner.ok("fj", &args, body)
+    }
+
+    #[test]
+    fn runs_list_pages_until_a_short_page() {
+        // A full first page (50 runs) then a short second page ends paging.
+        let runner = with_runs_page(StubRunner::new(), "1", &runs_page(50, 90000, "main"));
+        let runner = with_runs_page(runner, "2", &runs_page(1, 21077, "feature"));
+        let runner = Arc::new(runner);
+        let out = FjForgeReads::new(runner.clone()).list_runs(
+            "dev.a8n.run",
+            RUNS_REPO,
+            RUNS_MAX_PAGES,
+            Some("test-pat"),
+        );
+        let RunsListOutcome::Resolved(entries) = out else {
+            panic!("expected Resolved, got {out:?}");
+        };
+        assert_eq!(entries.len(), 51);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "stopped at the short page: {calls:?}");
+        assert!(calls[0].contains("actions runs --repo initech/chat --json --page 1"));
+        // The token is never a process argument.
+        assert!(!calls.iter().any(|c| c.contains("test-pat")), "{calls:?}");
+    }
+
+    #[test]
+    fn runs_list_auth_denied_on_the_first_page_is_terminal() {
+        for (code, expected) in [(401, 401u16), (403, 403u16)] {
+            let args = runs_args("1");
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let runner = Arc::new(StubRunner::new().fail(
+                "fj",
+                &args,
+                1,
+                &format!("Error: unexpected status code {code} Unauthorized\n"),
+            ));
+            let out = FjForgeReads::new(runner.clone()).list_runs(
+                "dev.a8n.run",
+                RUNS_REPO,
+                RUNS_MAX_PAGES,
+                Some("test-pat"),
+            );
+            assert_eq!(out, RunsListOutcome::AuthDenied(expected));
+            assert_eq!(
+                runner.calls.lock().unwrap().len(),
+                1,
+                "terminal: no second page"
+            );
+        }
+    }
+
+    #[test]
+    fn runs_list_error_after_the_first_page_returns_what_was_collected() {
+        // Page 1 full (so paging continues), page 2 fails: keep page-1 entries.
+        let runner = with_runs_page(StubRunner::new(), "1", &runs_page(50, 90000, "main"));
+        let args = runs_args("2");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let runner = Arc::new(runner.fail("fj", &args, 1, "Error: connection refused\n"));
+        let out = FjForgeReads::new(runner).list_runs(
+            "dev.a8n.run",
+            RUNS_REPO,
+            RUNS_MAX_PAGES,
+            Some("test-pat"),
+        );
+        let RunsListOutcome::Resolved(entries) = out else {
+            panic!("expected Resolved with the collected page-1 entries, got {out:?}");
+        };
+        assert_eq!(entries.len(), 50);
+    }
+
+    #[test]
+    fn runs_list_injects_the_token_through_a_temp_single_host_keys_json() {
+        let runner = Arc::new(with_runs_page(
+            StubRunner::new(),
+            "1",
+            &runs_page(1, 90000, "main"),
+        ));
+        let out = FjForgeReads::new(runner.clone()).list_runs(
+            "dev.a8n.run",
+            RUNS_REPO,
+            RUNS_MAX_PAGES,
+            Some("test-pat"),
+        );
+        assert!(matches!(out, RunsListOutcome::Resolved(_)), "{out:?}");
+        let envs = runner.envs.lock().unwrap();
+        let (_, env) = envs.iter().find(|(b, _)| b == "fj").expect("fj child ran");
+        assert_eq!(env.len(), 1, "only the key-store override is injected");
+        let (_, xdg) = env
+            .iter()
+            .find(|(k, _)| k == "XDG_DATA_HOME")
+            .expect("XDG_DATA_HOME injected");
+        assert!(xdg.contains("claude-run-fj-"), "temp store path: {xdg}");
+    }
+
+    #[test]
+    fn a_public_repo_runs_scan_injects_no_credential() {
+        let runner = Arc::new(with_runs_page(
+            StubRunner::new(),
+            "1",
+            &runs_page(1, 90000, "main"),
+        ));
+        let out = FjForgeReads::new(runner.clone()).list_runs(
+            "dev.a8n.run",
+            RUNS_REPO,
+            RUNS_MAX_PAGES,
+            None,
+        );
+        assert!(matches!(out, RunsListOutcome::Resolved(_)), "{out:?}");
+        let envs = runner.envs.lock().unwrap();
+        let (_, env) = envs.iter().find(|(b, _)| b == "fj").expect("fj child ran");
+        assert!(env.is_empty(), "no env injected without a token: {env:?}");
+    }
+
+    // ---- CLAUDE-205: `fj repo file` (FJ-67) -------------------------------
+
+    const FILE_ARGS: &[&str] = &[
+        "--host",
+        "dev.a8n.run",
+        "repo",
+        "file",
+        ".forgejo/workflows/check.yml",
+        "--ref",
+        "a456a957",
+        "--repo",
+        RUNS_REPO,
+    ];
+
+    #[test]
+    fn repo_file_returns_the_bytes_fj_wrote_to_stdout() {
+        let yaml = "name: check\njobs:\n  check:\n    steps: []\n";
+        let runner = Arc::new(StubRunner::new().ok("fj", FILE_ARGS, yaml));
+        let out = FjForgeReads::new(runner.clone())
+            .read_file(
+                "dev.a8n.run",
+                RUNS_REPO,
+                ".forgejo/workflows/check.yml",
+                "a456a957",
+                Some("test-pat"),
+            )
+            .expect("the file resolves");
+        assert_eq!(out, yaml, "no `--json`, so the bytes arrive unchanged");
+        // The token rides in the temp key store, never in argv.
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("test-pat")), "{calls:?}");
+        let envs = runner.envs.lock().unwrap();
+        let (_, env) = envs.iter().find(|(b, _)| b == "fj").expect("fj child ran");
+        assert!(env.iter().any(|(k, _)| k == "XDG_DATA_HOME"));
+    }
+
+    #[test]
+    fn a_missing_path_is_an_error_the_caller_can_step_past() {
+        // FJ-67 maps the raw endpoint's 404 to a message naming path and ref.
+        let runner = Arc::new(StubRunner::new().fail(
+            "fj",
+            FILE_ARGS,
+            1,
+            "Error: cannot read `.forgejo/workflows/check.yml` at ref `a456a957` in initech/chat\n",
+        ));
+        let err = FjForgeReads::new(runner)
+            .read_file(
+                "dev.a8n.run",
+                RUNS_REPO,
+                ".forgejo/workflows/check.yml",
+                "a456a957",
+                Some("test-pat"),
+            )
+            .expect_err("a missing path must not read as content");
+        assert!(err.contains("check.yml"), "{err}");
     }
 }

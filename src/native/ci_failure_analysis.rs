@@ -25,9 +25,11 @@
 //! - finalize: post the analysis as a comment (carrying the hidden analyzed
 //!   marker) so the issue is never analyzed twice.
 //!
-//! Log fetching stays inside `forge_log` (Rust) and shells out to `fj`, never a
-//! raw REST call from a nu snippet, per the tooling-gap rule. Redaction is
-//! preserved end to end by reusing `forge_log::redact`.
+//! Both forge reads stay inside `forge_log` (Rust) and shell out to `fj`: the
+//! log through `fj actions logs`, the workflow YAML through `fj repo file`
+//! (CLAUDE-205). Never a raw REST call, and never one from a nu snippet, per the
+//! tooling-gap rule. Redaction is preserved end to end by reusing
+//! `forge_log::redact`.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -39,9 +41,7 @@ use crate::action::{CiFailureAnalysisConfig, LogTokenRef, NativeConfig};
 use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::claude::ClaudeInvoker;
 use crate::error::{Error, Result};
-use crate::forge_log::{
-    self, ActionLogClient, HttpLogTransport, LogFetchConfig, LogOutcome, LogTarget, LogTransport,
-};
+use crate::forge_log::{self, ForgeReads, LogFetchConfig, LogOutcome, LogTarget};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
 use crate::provider::{self, Backend, IssueInspect};
 use crate::secrets::{self, SecretsKey};
@@ -151,12 +151,11 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
         warn!(run_id, error = %e, "recording planned keys failed (continuing)");
     }
 
-    // CLAUDE-204: `fj actions logs` for the run log; the HTTP transport is only
-    // for the workflow-YAML read `fj` has no command for (TODO(FJ-67)).
-    let logs = crate::provider::FjActionLogs::new(std::sync::Arc::new(
+    // CLAUDE-205: ONE forge client: `fj actions logs` for the run log and
+    // `fj repo file` for the workflow YAML.
+    let fj = crate::provider::FjForgeReads::new(std::sync::Arc::new(
         crate::provider::ProcessRunner::new(),
     ));
-    let transport = HttpLogTransport::new();
     let mut processed: u32 = 0;
     for key in &keys {
         if cancel.is_cancelled() {
@@ -179,17 +178,7 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
         if let Err(e) = state::run_inflight_add(pool, run_id, key, key).await {
             warn!(run_id, error = %e, "run_inflight_add failed (continuing)");
         }
-        let outcome = process_job(
-            &ctx,
-            backend.as_ref(),
-            &cfg,
-            &limits,
-            &logs,
-            &transport,
-            &tokens,
-            key,
-        )
-        .await;
+        let outcome = process_job(&ctx, backend.as_ref(), &cfg, &limits, &fj, &tokens, key).await;
         if let Err(e) = state::run_inflight_remove(pool, run_id, key).await {
             warn!(run_id, error = %e, "run_inflight_remove failed (continuing)");
         }
@@ -215,8 +204,7 @@ async fn process_job(
     backend: &dyn Backend,
     cfg: &CiFailureAnalysisConfig,
     limits: &EffectiveLimits,
-    logs: &dyn ActionLogClient,
-    transport: &dyn LogTransport,
+    fj: &dyn ForgeReads,
     tokens: &LogTokenRef,
     key: &str,
 ) -> Result<ProcessedJob> {
@@ -276,7 +264,7 @@ async fn process_job(
     }
 
     // Fetch the complete redacted log (+ workflow YAML).
-    let fetched = fetch_analysis_inputs(logs, transport, &coords, &token, &workdir_path);
+    let fetched = fetch_analysis_inputs(fj, &coords, &token, &workdir_path);
     let inputs = match fetched {
         FetchResult::Ready(inputs) => inputs,
         FetchResult::Unavailable(reason) => {
@@ -368,8 +356,7 @@ enum FetchResult {
 /// the failing workflow YAML into `out_dir`. Never errors: any miss becomes
 /// [`FetchResult::Unavailable`].
 fn fetch_analysis_inputs(
-    logs: &dyn ActionLogClient,
-    transport: &dyn LogTransport,
+    fj: &dyn ForgeReads,
     coords: &RunCoordinates,
     token: &str,
     out_dir: &Path,
@@ -390,7 +377,7 @@ fn fetch_analysis_inputs(
         );
     };
     let log_path = match forge_log::fetch_run_log(
-        logs,
+        fj,
         &fetch_cfg,
         &log_target,
         out_dir,
@@ -412,21 +399,15 @@ fn fetch_analysis_inputs(
         Err(e) => return FetchResult::Unavailable(format!("fetching the run logs errored: {e}")),
     };
 
-    // 2. Best-effort workflow YAML at the failing commit. TODO(FJ-67): still a
-    // REST read because `fj` has no raw-file command.
-    let Some(base_url) = forge_log::base_from_html_url(&coords.html_url, &coords.repo) else {
-        return FetchResult::Ready(AnalysisInputs {
-            log_path,
-            workflow_path: None,
-        });
-    };
-    let workflow_path = forge_log::fetch_workflow_yaml(
-        transport,
-        &base_url,
+    // 2. Best-effort workflow YAML at the failing commit, through `fj repo file`
+    // (CLAUDE-205). Redacted by `read_workflow_yaml` before it is written.
+    let workflow_path = forge_log::read_workflow_yaml(
+        fj,
+        &log_target.host,
         &coords.repo,
         &coords.commit_sha,
         &coords.workflow_id,
-        token,
+        Some(token),
         &[],
     )
     .and_then(|yaml| {
@@ -652,7 +633,7 @@ async fn record_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forge_log::{JobLog, RunLogsOutcome};
+    use crate::forge_log::{ActionLogClient, JobLog, RunLogsOutcome};
     use std::sync::Mutex;
 
     fn inspect(description: &str, comments: &[&str]) -> IssueInspect {
@@ -662,46 +643,27 @@ mod tests {
         }
     }
 
-    /// A bytes transport that returns a queued response per call, for the
-    /// workflow-YAML read; a miss returns 404.
-    struct StubTransport {
-        responses: Mutex<std::collections::VecDeque<(u16, Vec<u8>)>>,
-    }
-    impl StubTransport {
-        fn new(responses: Vec<(u16, Vec<u8>)>) -> Self {
-            Self {
-                responses: Mutex::new(responses.into_iter().collect()),
-            }
-        }
-    }
-    impl LogTransport for StubTransport {
-        fn get_bytes(
-            &self,
-            _url: &str,
-            _token: Option<&str>,
-        ) -> std::result::Result<(u16, Vec<u8>), String> {
-            Ok(self
-                .responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or((404, Vec::new())))
-        }
-    }
-
-    /// A canned `fj actions logs` client returning one fixed outcome and
-    /// asserting the token the fetch was scoped with.
-    struct StubLogs {
+    /// The ONE forge client the analysis holds (CLAUDE-205): a canned
+    /// `fj actions logs` outcome plus canned `fj repo file` contents keyed by
+    /// path, asserting the token every read is scoped with. The runs list is not
+    /// used by this action.
+    struct StubFj {
         outcome: Mutex<Option<RunLogsOutcome>>,
+        files: std::collections::HashMap<String, String>,
     }
-    impl StubLogs {
+    impl StubFj {
         fn new(outcome: RunLogsOutcome) -> Self {
             Self {
                 outcome: Mutex::new(Some(outcome)),
+                files: std::collections::HashMap::new(),
             }
         }
+        fn with_file(mut self, path: &str, content: &str) -> Self {
+            self.files.insert(path.to_string(), content.to_string());
+            self
+        }
     }
-    impl ActionLogClient for StubLogs {
+    impl ActionLogClient for StubFj {
         fn run_logs(
             &self,
             host: &str,
@@ -720,6 +682,39 @@ mod tests {
                 .unwrap_or(RunLogsOutcome::NotFound("no action run #4034".to_string()))
         }
     }
+    impl crate::forge_log::ActionRunsClient for StubFj {
+        fn list_runs(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _max_pages: u32,
+            _token: Option<&str>,
+        ) -> crate::forge_log::RunsListOutcome {
+            unreachable!("the analysis action never lists runs")
+        }
+    }
+    impl crate::forge_log::RepoFileClient for StubFj {
+        fn read_file(
+            &self,
+            host: &str,
+            repo: &str,
+            path: &str,
+            git_ref: &str,
+            token: Option<&str>,
+        ) -> std::result::Result<String, String> {
+            assert_eq!(host, "dev.a8n.run");
+            assert_eq!(repo, "initech/chat");
+            assert_eq!(
+                git_ref, "a456a957",
+                "the YAML is read at the failing commit"
+            );
+            assert_eq!(token, Some("test-pat"), "the log token scopes the read");
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| format!("cannot read `{path}`"))
+        }
+    }
 
     /// AC (redaction): a log fixture containing a token is redacted before it is
     /// written to the file the analysis reads, so no token can reach the comment.
@@ -733,16 +728,15 @@ mod tests {
             html_url: "https://dev.a8n.run/initech/chat/actions/runs/4034".to_string(),
         };
         let log = "step ok\nAuthorization: token ghp_abcdefghij0123456789ABCDEFG\nboom";
-        let logs = StubLogs::new(RunLogsOutcome::Fetched(vec![JobLog {
+        let fj = StubFj::new(RunLogsOutcome::Fetched(vec![JobLog {
             name: "check".to_string(),
             status: "failure".to_string(),
             log: log.to_string(),
         }]));
-        // Workflow-YAML candidates all 404 (the stub's default), so no yaml is written.
-        let transport = StubTransport::new(vec![]);
+        // Every workflow-YAML candidate misses, so no yaml is written.
         let tmp = tempfile::tempdir().unwrap();
         let FetchResult::Ready(inputs) =
-            fetch_analysis_inputs(&logs, &transport, &coords, "test-pat", tmp.path())
+            fetch_analysis_inputs(&fj, &coords, "test-pat", tmp.path())
         else {
             panic!("expected Ready");
         };
@@ -759,6 +753,41 @@ mod tests {
         );
     }
 
+    /// CLAUDE-205 AC: the workflow YAML `fj repo file` returns is redacted before
+    /// it is written to the file the analysis reads.
+    #[test]
+    fn workflow_yaml_is_read_at_the_commit_and_redacted_before_it_is_written() {
+        let coords = RunCoordinates {
+            repo: "initech/chat".to_string(),
+            index_in_repo: 4034,
+            commit_sha: "a456a957".to_string(),
+            workflow_id: "check.yml".to_string(),
+            html_url: "https://dev.a8n.run/initech/chat/actions/runs/4034".to_string(),
+        };
+        let yaml =
+            "jobs:\n  check:\n    steps:\n      - run: echo ghp_abcdefghij0123456789ABCDEFG\n";
+        let fj = StubFj::new(RunLogsOutcome::Fetched(vec![JobLog {
+            name: "check".to_string(),
+            status: "failure".to_string(),
+            log: "boom".to_string(),
+        }]))
+        .with_file(".forgejo/workflows/check.yml", yaml);
+        let tmp = tempfile::tempdir().unwrap();
+        let FetchResult::Ready(inputs) =
+            fetch_analysis_inputs(&fj, &coords, "test-pat", tmp.path())
+        else {
+            panic!("expected Ready");
+        };
+        let path = inputs.workflow_path.expect("workflow YAML written");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("jobs:"));
+        assert!(
+            !on_disk.contains("ghp_abcdefghij0123456789ABCDEFG"),
+            "token redacted from the analyzed workflow YAML"
+        );
+        assert!(on_disk.contains("[REDACTED]"));
+    }
+
     /// AC (graceful log miss): a run `fj` cannot find yields Unavailable (never a
     /// panic), so the caller posts a note and leaves the issue un-marked.
     #[test]
@@ -770,10 +799,9 @@ mod tests {
             workflow_id: "check.yml".to_string(),
             html_url: "https://dev.a8n.run/initech/chat/actions/runs/4034".to_string(),
         };
-        let logs = StubLogs::new(RunLogsOutcome::NotFound("no action run #4034".to_string()));
-        let transport = StubTransport::new(vec![]);
+        let fj = StubFj::new(RunLogsOutcome::NotFound("no action run #4034".to_string()));
         let tmp = tempfile::tempdir().unwrap();
-        match fetch_analysis_inputs(&logs, &transport, &coords, "test-pat", tmp.path()) {
+        match fetch_analysis_inputs(&fj, &coords, "test-pat", tmp.path()) {
             FetchResult::Unavailable(reason) => {
                 assert!(reason.contains("no action run"), "{reason}")
             }
@@ -791,10 +819,9 @@ mod tests {
             workflow_id: "check.yml".to_string(),
             html_url: "https://dev.a8n.run/initech/chat/actions/runs/4034".to_string(),
         };
-        let logs = StubLogs::new(RunLogsOutcome::AuthDenied("HTTP 403: ...".to_string()));
-        let transport = StubTransport::new(vec![]);
+        let fj = StubFj::new(RunLogsOutcome::AuthDenied("HTTP 403: ...".to_string()));
         let tmp = tempfile::tempdir().unwrap();
-        match fetch_analysis_inputs(&logs, &transport, &coords, "test-pat", tmp.path()) {
+        match fetch_analysis_inputs(&fj, &coords, "test-pat", tmp.path()) {
             FetchResult::Unavailable(reason) => assert!(reason.contains("auth denied"), "{reason}"),
             FetchResult::Ready(_) => panic!("an auth denial must not be Ready"),
         }
