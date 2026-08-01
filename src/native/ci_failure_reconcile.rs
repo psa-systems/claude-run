@@ -80,18 +80,9 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
         return Ok(());
     }
     // A PAT is required to read the runs list / jobs endpoint (and to resolve a
-    // null-branch run's branch from its log) on a private repo.
-    let Some(token_ref) = cfg.log_token_ref.clone() else {
-        warn!(action = %action.name, "ci-failure-reconcile has no log_token_ref; skipping run (cannot read Forgejo)");
-        return Ok(());
-    };
-    let token = match resolve_token(pool, &token_ref).await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(action = %action.name, error = %e, "resolving the log token failed; skipping run");
-            return Ok(());
-        }
-    };
+    // null-branch run's branch from its log) on a private repo. CLAUDE-200: one
+    // mapping, resolved per repo as the scan reaches it.
+    let tokens = super::effective_log_tokens(pool, ctx.paths, cfg.log_token_ref.as_ref()).await;
 
     let backend = provider::resolve(provider::DEFAULT_PRIORITY)?;
 
@@ -175,6 +166,20 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
         }
         let repo_targets: Vec<&IssueTarget> =
             targets.iter().filter(|t| t.coords.repo == repo).collect();
+        // CLAUDE-200: the token for THIS repo. A repo the mapping does not cover
+        // is skipped before any Forgejo read, so no request goes out with another
+        // org's token and its issues stay open and untouched.
+        let Some(token_ref) = tokens.resolve(&repo) else {
+            warn!(action = %action.name, repo = %repo, "no log token maps to this repo; skipping repo");
+            continue;
+        };
+        let token = match resolve_token(pool, token_ref).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(action = %action.name, repo = %repo, token_ref, error = %e, "resolving the log token failed; skipping repo");
+                continue;
+            }
+        };
         let green = gather_now_green(&transport, &cfg, &token, &repo, &repo_targets);
 
         for gt in &repo_targets {
@@ -259,16 +264,11 @@ fn matches_prefix(summary: &str, prefixes: &[String]) -> bool {
 }
 
 /// True when `repo` (an `owner/repo` full name) matches one of the allow-list
-/// patterns: exact `owner/repo`, per-owner `owner/*`, or the global `*` (the same
-/// three literal forms the webhook allow-list accepts). An empty list denies all.
+/// patterns: exact `owner/repo`, per-owner `owner/*`, or the global `*`. The
+/// semantics live in [`crate::config::repo_matches`], shared with the webhook
+/// allow-list and the per-repo log-token mapping (CLAUDE-200).
 fn repo_allowed(allowed: &[String], repo: &str) -> bool {
-    allowed.iter().any(|pat| match pat.as_str() {
-        "*" => true,
-        p => match p.strip_suffix("/*") {
-            Some(owner) => repo.split_once('/').is_some_and(|(o, _)| o == owner),
-            None => p == repo,
-        },
-    })
+    crate::config::repo_matches(allowed, repo)
 }
 
 /// The distinct repos across `targets`, in first-seen order.
@@ -857,6 +857,40 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
         assert!(!repo_allowed(&["owner/*".to_string()], "other/anything"));
         assert!(repo_allowed(&["*".to_string()], "any/repo"));
         assert!(!repo_allowed(&[], "any/repo"), "empty list denies all");
+    }
+
+    // ---- CLAUDE-200: per-repo log token -----------------------------------
+
+    /// A cross-org allow-list plus one mapping: each repo scan uses its own org's
+    /// PAT, and a repo the mapping does not cover is skipped (no runs-list read
+    /// with another org's token) even though the allow-list admits it.
+    #[test]
+    fn each_allow_listed_repo_resolves_its_own_org_token() {
+        use crate::action::{LogTokenEntry, LogTokenRef};
+        let repos = vec![
+            "contoso/*".to_string(),
+            "initech/*".to_string(),
+            "fabrikam/*".to_string(),
+        ];
+        let tokens = LogTokenRef::PerRepo(vec![
+            LogTokenEntry {
+                repos: vec!["contoso/*".to_string()],
+                token_ref: "forgejo-logs-contoso".to_string(),
+            },
+            LogTokenEntry {
+                repos: vec!["initech/*".to_string()],
+                token_ref: "forgejo-logs-initech".to_string(),
+            },
+        ]);
+        for (repo, expected) in [
+            ("contoso/claude-run", Some("forgejo-logs-contoso")),
+            ("initech/chat", Some("forgejo-logs-initech")),
+            // Allow-listed but unmapped: skipped, never read with a wrong token.
+            ("fabrikam/forgejo-cli", None),
+        ] {
+            assert!(repo_allowed(&repos, repo), "{repo} allow-listed");
+            assert_eq!(tokens.resolve(repo), expected, "token for {repo}");
+        }
     }
 
     #[test]
