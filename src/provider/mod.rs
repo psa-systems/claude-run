@@ -298,6 +298,15 @@ pub trait Forge: Send + Sync {
         strategy: crate::action::PrStrategy,
     ) -> Result<PullRequest>;
 
+    /// CLAUDE-206: drain the operator-visible notices this backend accumulated
+    /// while serving the job, e.g. an open-PR lookup that failed and was
+    /// degraded to a create. The caller persists them as `run_events` so they
+    /// show on the action page, not only in the daemon journal. Backends with
+    /// nothing to report keep the default (empty).
+    fn take_notices(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Resolve an authenticated clone URL for `repo` on `host` using the forge
     /// CLI's stored credentials (no token in YAML or env). `repo` is the
     /// `owner/name` path.
