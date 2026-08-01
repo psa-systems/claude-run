@@ -229,6 +229,60 @@ pub trait IssueTracker: Send + Sync {
     fn attach_file(&self, key: &str, file: &std::path::Path) -> Result<()>;
 }
 
+/// CLAUDE-207: render a failed [`Forge::repo_access`] probe as an error an
+/// operator can act on: which capability failed (`cmd`), the exit status, and
+/// the grant to add (`scope`). A 403 and a 404 need different grants, so they
+/// are told apart from the CLI's own text: `fj` says `unexpected status code
+/// 403` / `not found`, `gh` says `Resource not accessible` / `Could not resolve`.
+/// Only the CLI's stderr is quoted; it carries no token.
+pub(crate) fn probe_denied(
+    identity: &str,
+    tool: &str,
+    cmd: &str,
+    scope: &str,
+    host: &str,
+    repo: &str,
+    out: &CmdOutput,
+) -> Error {
+    let detail = {
+        let t = out.stderr.trim();
+        if t.is_empty() {
+            "no stderr"
+        } else {
+            t
+        }
+    };
+    let lower = detail.to_ascii_lowercase();
+    let cause =
+        if lower.contains("403") || lower.contains("forbidden") || lower.contains("not accessible")
+        {
+            format!(
+            "HTTP 403: the token can see `{repo}` but is refused this call, so it is missing the \
+             `{scope}` scope or the matching unit permission on `{repo}`. Add `{scope}` to the \
+             token (or enable the unit) and the next poll picks the issues up."
+        )
+        } else if lower.contains("404")
+            || lower.contains("not found")
+            || lower.contains("could not resolve")
+        {
+            format!(
+                "HTTP 404: `{repo}` is not visible to this token at all, so this is a missing \
+             permission grant for the bot on `{repo}` rather than a scope problem (adding the \
+             `{scope}` scope alone will not reveal it)."
+            )
+        } else {
+            format!(
+            "the CLI reported no HTTP status; if this is not transient the token is most likely \
+             missing the `{scope}` scope or a permission grant on `{repo}`."
+        )
+        };
+    Error::Other(anyhow::anyhow!(
+        "{identity} cannot `{cmd}` on `{repo}` at {host}: `{tool} {cmd}` exited {} ({detail}). \
+         {cause}",
+        out.exit_code
+    ))
+}
+
 /// The Forgejo-side operations native handlers need.
 pub trait Forge: Send + Sync {
     /// Open a PR from the local commits in `workdir` against `host`. `strategy`
@@ -249,11 +303,17 @@ pub trait Forge: Send + Sync {
     /// `owner/name` path.
     fn clone_url(&self, host: &str, repo: &str) -> Result<String>;
 
-    /// CLAUDE-194: verify the FORGE identity can read `repo` (`owner/name`) on
+    /// CLAUDE-194: verify the FORGE identity can work `repo` (`owner/name`) on
     /// `host`. `git push` authenticates from the host's own git credentials, so a
     /// repo the forge token cannot see still clones and pushes and only fails at
     /// `pr create` time, after a whole Claude run is paid for. This is the
     /// preflight that catches it first; the error names the host and `owner/repo`.
+    ///
+    /// CLAUDE-207: the probe covers BOTH capability categories the PR path uses,
+    /// a repository read and a pull-request read, because a token carrying only
+    /// the repository category passes a repository-only probe and then 403s on
+    /// the first open-PR lookup. Implementations report which probe failed and
+    /// the scope label the operator has to add (see [`probe_denied`]).
     fn repo_access(&self, host: &str, repo: &str) -> Result<()>;
 
     /// List open PRs for `repo` (`owner/name`) on `host`. Backs the CI-fix scan

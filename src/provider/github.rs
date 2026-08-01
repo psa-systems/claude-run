@@ -401,11 +401,19 @@ impl Forge for GithubForge {
         }
     }
 
-    /// CLAUDE-194: the GitHub repo read, `gh repo view <owner/repo> --json
-    /// nameWithOwner`, run with the action's PAT as `GH_TOKEN` exactly as
-    /// `open_via_gh` does, so the probe tests the identity that will open the PR.
-    /// The MCP transport exposes no repo-read tool, so this is `gh`-only; a host
-    /// without `gh` reports that by name rather than silently passing.
+    /// CLAUDE-194 / CLAUDE-207: two probes, run with the action's PAT as
+    /// `GH_TOKEN` exactly as `open_via_gh` does, so they test the identity that
+    /// will open the PR. The MCP transport exposes neither read, so this is
+    /// `gh`-only; a host without `gh` reports that by name rather than silently
+    /// passing.
+    ///
+    /// 1. `gh repo view <owner/repo> --json nameWithOwner` (classic `repo` scope
+    ///    / fine-grained Metadata read).
+    /// 2. `gh pr list --repo <owner/repo> --state open --limit 1 --json number`
+    ///    (fine-grained `pull_request` read). A fine-grained PAT scopes pull
+    ///    requests separately from repo metadata, so the repo read alone does not
+    ///    prove the PAT can open a PR; probing both keeps the GitHub backend
+    ///    symmetric with the Forgejo one.
     fn repo_access(&self, host: &str, repo: &str) -> Result<()> {
         let envs: Vec<(&str, &str)> = match &self.token {
             Some(t) => vec![("GH_TOKEN", t.as_str())],
@@ -413,17 +421,33 @@ impl Forge for GithubForge {
         };
         let args = ["repo", "view", repo, "--json", "nameWithOwner"];
         let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
-        if out.ok {
-            return Ok(());
+        if !out.ok {
+            return Err(super::probe_denied(
+                "GitHub token",
+                &self.gh,
+                "repo view",
+                "repo",
+                host,
+                repo,
+                &out,
+            ));
         }
-        Err(Error::Other(anyhow::anyhow!(
-            "GitHub token cannot read `{repo}` on {host}: `{} repo view` exited {} ({}). \
-             A repo the token cannot see answers 404 `not found`, so this is most likely a \
-             missing permission grant for the bot on `{repo}`.",
-            self.gh,
-            out.exit_code,
-            out.stderr.trim()
-        )))
+        let args = [
+            "pr", "list", "--repo", repo, "--state", "open", "--limit", "1", "--json", "number",
+        ];
+        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        if !out.ok {
+            return Err(super::probe_denied(
+                "GitHub token",
+                &self.gh,
+                "pr list",
+                "pull_request",
+                host,
+                repo,
+                &out,
+            ));
+        }
+        Ok(())
     }
 
     // The CI-fix-only operations are Forgejo-specific. A GitHub repo never enters
@@ -781,16 +805,32 @@ mod tests {
         }
     }
 
+    /// CLAUDE-207: the two GitHub preflight probes for `repo`, as arg lists.
+    fn view_args(repo: &str) -> Vec<&str> {
+        vec!["repo", "view", repo, "--json", "nameWithOwner"]
+    }
+
+    fn pr_list_args(repo: &str) -> Vec<&str> {
+        vec![
+            "pr", "list", "--repo", repo, "--state", "open", "--limit", "1", "--json", "number",
+        ]
+    }
+
     #[test]
     fn repo_access_probes_gh_with_the_pat_and_names_host_and_repo() {
-        // CLAUDE-194: the GitHub repo read runs `gh repo view` with the action's
-        // PAT as GH_TOKEN, so it tests the identity that will open the PR. A
-        // denial names the host and `owner/repo`.
-        let ok_runner = Arc::new(StubRunner::new().ok(
-            "gh",
-            &["repo", "view", "octo/widget", "--json", "nameWithOwner"],
-            r#"{"nameWithOwner":"octo/widget"}"#,
-        ));
+        // CLAUDE-194: both reads run `gh` with the action's PAT as GH_TOKEN, so
+        // they test the identity that will open the PR. CLAUDE-207: the second
+        // read exercises the pull-request capability a fine-grained PAT scopes
+        // separately from repo metadata. A denial names the host and `owner/repo`.
+        let ok_runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "gh",
+                    &view_args("octo/widget"),
+                    r#"{"nameWithOwner":"octo/widget"}"#,
+                )
+                .ok("gh", &pr_list_args("octo/widget"), "[]"),
+        );
         let forge = GithubForge::new(
             ok_runner.clone(),
             "https://api.githubcopilot.com/mcp/".into(),
@@ -798,17 +838,20 @@ mod tests {
         );
         forge.repo_access("github.com", "octo/widget").unwrap();
         let envs = ok_runner.envs.lock().unwrap();
-        let gh = envs.iter().find(|(b, _)| b == "gh").unwrap();
-        assert_eq!(
-            gh.1,
-            vec![("GH_TOKEN".to_string(), "ghp_secret".to_string())]
-        );
+        assert_eq!(envs.len(), 2);
+        for (bin, env) in envs.iter() {
+            assert_eq!(bin, "gh");
+            assert_eq!(
+                *env,
+                vec![("GH_TOKEN".to_string(), "ghp_secret".to_string())]
+            );
+        }
         drop(envs);
 
         let denied = GithubForge::new(
             Arc::new(StubRunner::new().fail(
                 "gh",
-                &["repo", "view", "octo/secret", "--json", "nameWithOwner"],
+                &view_args("octo/secret"),
                 1,
                 "GraphQL: Could not resolve to a Repository",
             )),
@@ -822,6 +865,41 @@ mod tests {
         assert!(err.contains("octo/secret"), "got {err}");
         assert!(err.contains("github.com"), "got {err}");
         assert!(err.contains("permission"), "got {err}");
+        assert!(err.contains("not visible"), "got {err}");
+    }
+
+    #[test]
+    fn repo_access_fails_when_only_the_pull_request_probe_is_denied() {
+        // CLAUDE-207: a PAT with repo metadata but no pull-request read passes
+        // `gh repo view` and is refused `gh pr list`. The error names the failing
+        // capability, the status, and the `pull_request` scope to add.
+        let forge = GithubForge::new(
+            Arc::new(
+                StubRunner::new()
+                    .ok(
+                        "gh",
+                        &view_args("octo/widget"),
+                        r#"{"nameWithOwner":"octo/widget"}"#,
+                    )
+                    .fail(
+                        "gh",
+                        &pr_list_args("octo/widget"),
+                        1,
+                        "HTTP 403: Resource not accessible by personal access token",
+                    ),
+            ),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        );
+        let err = forge
+            .repo_access("github.com", "octo/widget")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pr list"), "got {err}");
+        assert!(err.contains("403"), "got {err}");
+        assert!(err.contains("pull_request"), "got {err}");
+        assert!(err.contains("unit permission"), "got {err}");
+        assert!(!err.contains("not visible"), "got {err}");
     }
 
     #[test]

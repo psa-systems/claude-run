@@ -1145,27 +1145,49 @@ impl Forge for CliBackend {
         }
     }
 
-    /// CLAUDE-194: `fj --host <host> repo view <owner/repo> --json`. A readable
-    /// repo answers with the repo object; one the token cannot see answers 404
-    /// (`not found`), the same way `fj pr create` does, so this probe carries the
-    /// signal `fj pr search` lacks (an invisible repo and a repo with no open PRs
-    /// both search as an empty array, exit 0).
+    /// CLAUDE-194 / CLAUDE-207: two probes, one per scope category the PR path
+    /// crosses (`actions/SCHEMA.md`, "Forgejo token scopes").
+    ///
+    /// 1. `fj --host <host> repo view <owner/repo> --json` (repository read). A
+    ///    readable repo answers with the repo object; one the token cannot see
+    ///    answers 404 `not found`, the same way `fj pr create` does, so this probe
+    ///    carries the signal `pr search` lacks (an invisible repo and a repo with
+    ///    no open PRs both search as an empty array, exit 0).
+    /// 2. `fj --host <host> pr search --repo <repo> --state open --json` (issue
+    ///    read), the exact call [`Forge::list_open_prs`] makes on the PR path. It
+    ///    is what a repository-only token 403s on after the run is paid for, so
+    ///    the preflight has to exercise it. An empty result is a pass.
     fn repo_access(&self, host: &str, repo: &str) -> Result<()> {
+        let envs = self.fj_envs();
         let args = ["--host", host, "repo", "view", repo, "--json"];
-        let out = self
-            .runner
-            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
-        if out.ok {
-            return Ok(());
+        let out = self.runner.run_in_env(None, &self.fj, &args, &envs)?;
+        if !out.ok {
+            return Err(super::probe_denied(
+                "forge token",
+                &self.fj,
+                "repo view",
+                "read:repository",
+                host,
+                repo,
+                &out,
+            ));
         }
-        Err(Error::Other(anyhow::anyhow!(
-            "forge token cannot read `{repo}` on {host}: `{} repo view` exited {} ({}). \
-             A private repo the token cannot see answers 404 `not found`, so this is most \
-             likely a missing permission grant for the bot on {repo}.",
-            self.fj,
-            out.exit_code,
-            out.stderr.trim()
-        )))
+        let args = [
+            "--host", host, "pr", "search", "--repo", repo, "--state", "open", "--json",
+        ];
+        let out = self.runner.run_in_env(None, &self.fj, &args, &envs)?;
+        if !out.ok {
+            return Err(super::probe_denied(
+                "forge token",
+                &self.fj,
+                "pr search",
+                "read:issue",
+                host,
+                repo,
+                &out,
+            ));
+        }
+        Ok(())
     }
 
     fn list_open_prs(&self, host: &str, repo: &str) -> Result<Vec<super::ForgePullRequest>> {
@@ -2929,62 +2951,117 @@ mod tests {
         assert!(!fj.1.iter().any(|(k, _)| k == "YOUTRACK_CLI_CONFIG"));
     }
 
+    /// CLAUDE-207: the two preflight probes for `repo`, as StubRunner arg lists.
+    fn view_args(repo: &str) -> Vec<&str> {
+        vec!["--host", "dev.a8n.run", "repo", "view", repo, "--json"]
+    }
+
+    fn search_args(repo: &str) -> Vec<&str> {
+        vec![
+            "--host",
+            "dev.a8n.run",
+            "pr",
+            "search",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--json",
+        ]
+    }
+
     #[test]
-    fn repo_access_ok_for_a_readable_repo() {
-        // CLAUDE-194: `fj repo view <owner/repo> --json` exits 0 for a repo the
-        // token can read, and the probe injects the fj credential env so it tests
-        // the BOT identity, not the operator store.
-        let runner = Arc::new(StubRunner::new().ok(
-            "fj",
-            &[
-                "--host",
-                "dev.a8n.run",
-                "repo",
-                "view",
-                "contoso/claude-run",
-                "--json",
-            ],
-            r#"{"full_name":"Contoso/claude-run","private":true}"#,
-        ));
+    fn repo_access_ok_when_both_probes_pass() {
+        // CLAUDE-194 / CLAUDE-207: the repository read AND the issue-category
+        // open-PR lookup both exit 0, and both inject the fj credential env so
+        // they test the BOT identity, not the operator store. An empty search
+        // result (a repo with no open PRs) is a pass.
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "fj",
+                    &view_args("contoso/claude-run"),
+                    r#"{"full_name":"Contoso/claude-run","private":true}"#,
+                )
+                .ok("fj", &search_args("contoso/claude-run"), "[]"),
+        );
         let b = CliBackend::new(runner.clone()).with_fj_env(vec![(
             "XDG_DATA_HOME".to_string(),
             "/tmp/creds".to_string(),
         )]);
         b.repo_access("dev.a8n.run", "contoso/claude-run")
             .unwrap();
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
         let envs = runner.envs.lock().unwrap();
-        let fj = envs.iter().find(|(bin, _)| bin == "fj").unwrap();
-        assert_eq!(
-            fj.1,
-            vec![("XDG_DATA_HOME".to_string(), "/tmp/creds".to_string())]
-        );
+        assert_eq!(envs.len(), 2);
+        for (bin, env) in envs.iter() {
+            assert_eq!(bin, "fj");
+            assert_eq!(
+                *env,
+                vec![("XDG_DATA_HOME".to_string(), "/tmp/creds".to_string())]
+            );
+        }
     }
 
     #[test]
-    fn repo_access_error_names_host_and_repo() {
-        // CLAUDE-194: an invisible private repo answers 404; the error must name
-        // the host, the `owner/repo`, and the permission hypothesis, because the
-        // bare CLI text (`not found: The target couldn't be found.`) names none.
-        let b = CliBackend::new(Arc::new(StubRunner::new().fail(
-            "fj",
-            &[
-                "--host",
-                "dev.a8n.run",
-                "repo",
-                "view",
-                "contoso/gadgets",
-                "--json",
-            ],
-            1,
-            "not found: The target couldn't be found.",
-        )));
+    fn repo_access_fails_when_only_the_issue_probe_is_denied() {
+        // CLAUDE-207: this is the exact scope-short token the issue is about: a
+        // repository-scoped token reads the repo fine and 403s on `pr search`,
+        // the first issue-category call the PR path makes. The error must name
+        // the failing capability, the status, and the scope to add.
+        let b = CliBackend::new(Arc::new(
+            StubRunner::new()
+                .ok(
+                    "fj",
+                    &view_args("contoso/gadgets"),
+                    r#"{"full_name":"Contoso/gadgets"}"#,
+                )
+                .fail(
+                    "fj",
+                    &search_args("contoso/gadgets"),
+                    1,
+                    "unexpected status code 403 Forbidden",
+                ),
+        ));
         let err = b
             .repo_access("dev.a8n.run", "contoso/gadgets")
             .unwrap_err()
             .to_string();
+        assert!(err.contains("pr search"), "got {err}");
+        assert!(err.contains("403"), "got {err}");
+        assert!(err.contains("read:issue"), "got {err}");
+        assert!(err.contains("contoso/gadgets"), "got {err}");
+        assert!(err.contains("dev.a8n.run"), "got {err}");
+        // The 403 wording points at the scope / unit grant, not at visibility.
+        assert!(err.contains("unit permission"), "got {err}");
+        assert!(!err.contains("not visible"), "got {err}");
+    }
+
+    #[test]
+    fn repo_access_404_names_visibility_not_scope() {
+        // CLAUDE-194 / CLAUDE-207: an invisible private repo answers 404 on the
+        // repository probe. The error must name the host, the `owner/repo`, and
+        // the permission hypothesis (the bare CLI text names none), and must read
+        // differently from the 403 above: adding a scope cannot reveal the repo.
+        let runner = Arc::new(StubRunner::new().fail(
+            "fj",
+            &view_args("contoso/gadgets"),
+            1,
+            "not found: The target couldn't be found.",
+        ));
+        let b = CliBackend::new(runner.clone());
+        let err = b
+            .repo_access("dev.a8n.run", "contoso/gadgets")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repo view"), "got {err}");
+        assert!(err.contains("404"), "got {err}");
         assert!(err.contains("contoso/gadgets"), "got {err}");
         assert!(err.contains("dev.a8n.run"), "got {err}");
         assert!(err.contains("permission"), "got {err}");
+        assert!(err.contains("not visible"), "got {err}");
+        // The second probe is not attempted once the first one fails.
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
     }
 
     #[test]
