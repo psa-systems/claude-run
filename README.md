@@ -452,7 +452,7 @@ snippet, and redaction is preserved end to end via `forge_log::redact`, so no to
 below; `query` / `summary_prefixes` / `max_analysis_bytes` tune selection and the comment cap). See `actions/SCHEMA.md`
 (`kind: ci-failure-analysis`).
 
-### Auto-close of fixed CI-failure issues (CLAUDE-191)
+### Auto-close of fixed and duplicate CI-failure issues (CLAUDE-191, CLAUDE-198)
 
 The mint path keeps only `action_run_failure` events and drops every success, so nothing in claude-run ever observes a
 run going green: a "CI failure" / "Auto-fix" issue whose root cause is later fixed stays open until a human closes it by
@@ -472,9 +472,19 @@ the run's log environment dump, bounded by `max_branch_resolves`. The reconciler
 can be missed or arrive out of order, and success events are dropped at the ingress; polling reflects current truth); it
 performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. Log and per-job status reads go
 through `fj actions logs`; the runs list stays on the REST API until `fj` gains an `actions runs` command (FJ-66). Both
-stay inside `forge_log` (Rust), never a raw REST call from a nu snippet. Configure it in
-`actions/ci-failure-reconcile.yml` (`repos` names the allow-list, `log_token_ref` picks the Forgejo PAT per repo, see
-below). See `actions/SCHEMA.md` (`kind: ci-failure-reconcile`).
+stay inside `forge_log` (Rust), never a raw REST call from a nu snippet.
+
+Duplicates are collapsed in the same pass (CLAUDE-198). Mint already declines to create a second issue for a root cause
+that has an open one, but that check is a tracker full-text search on the hidden `Root-Cause-Key:` marker, so a lagging
+index lets two failures of the same job mint two issues. Before any Forgejo read the reconciler groups the gathered
+issues by `(repo, root_cause_key)` and closes every issue of a group but the OLDEST, posting `duplicate_comment` (which
+names the survivor) and carrying the same hidden auto-closed marker; only the survivor goes on to the now-green check, so
+a failing-then-passing sequence leaves no duplicate open. An issue with no `Root-Cause-Key:` marker (minted before the
+CLAUDE-190 rekey) is never grouped, and grouping keys on the repo too, so a marker collision across repos closes nothing.
+Set `close_duplicates: false` to leave duplicates open.
+
+Configure it in `actions/ci-failure-reconcile.yml` (`repos` names the allow-list, `log_token_ref` picks the Forgejo PAT
+per repo, see below). See `actions/SCHEMA.md` (`kind: ci-failure-reconcile`).
 
 ### Per-repo log tokens for the CI-failure actions (CLAUDE-200)
 

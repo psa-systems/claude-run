@@ -115,8 +115,9 @@ The dispatch discriminator (CLAUDE-30). Selects how the runner executes the acti
   log-grounded root-cause comment (CLAUDE-189). Config only, supplying a typed
   [`native`](#native-record-required-for-native-kinds) block.
 - `ci-failure-reconcile`: a built-in Rust handler that auto-closes each open "CI failure" / "Auto-fix" issue once the
-  failing `(repo, branch, workflow, job)` it tracks is green again on its latest run (CLAUDE-191). Config only, supplying
-  a typed [`native`](#native-record-required-for-native-kinds) block.
+  failing `(repo, branch, workflow, job)` it tracks is green again on its latest run (CLAUDE-191), and collapses
+  duplicate issues that share a root-cause key (CLAUDE-198). Config only, supplying a typed
+  [`native`](#native-record-required-for-native-kinds) block.
 
 `scripted` and native kinds share all the run accounting (locking, daily caps, per-job attempt caps, budget, job-outcome
 records); only job production and the per-job pipeline differ.
@@ -475,6 +476,15 @@ per-job status from the jobs endpoint. Every open issue whose `(repo, branch, wo
 job (job status `success`) is closed: State set to `resolved_state` and a run-linked comment posted. The dedup key is the
 issue id.
 
+**Duplicate collapse (CLAUDE-198).** Mint's cross-run collapse is a tracker full-text search on the hidden
+`Root-Cause-Key:` marker, so a lagging tracker index lets two failures of the same job mint two issues. Before any
+Forgejo read, the handler groups the gathered issues by `(repo, root_cause_key)` and closes every issue of a group but
+the OLDEST (lowest issue number, the one mint's association comments already append to): State set to `resolved_state`
+and the `duplicate_comment` posted, carrying the same hidden auto-closed marker. Only the survivor goes on to the
+now-green check. Grouping is on the repo as well as the key, so a marker collision across repos closes nothing, and an
+issue with no `Root-Cause-Key:` marker (pre-rekey) is never grouped and never closed as a duplicate. Set
+`close_duplicates: false` to leave duplicates open.
+
 **Only the LATEST run decides.** A newer failure after an older green run leaves the job red and the issue open. Matching
 is exact on all four of `(repo, branch, workflow, job)`, so a green sibling branch or job never closes a still-broken
 issue. The close is idempotent: an already-closed issue (its resolved State drops it from `#Unresolved`, and a hidden
@@ -502,6 +512,8 @@ native:
   resolved_state: Done                # State set on a closed issue
   close_comment: "Auto-closed: run #{run_index} on `{branch}` succeeded ({run_url}); the failing `{job}` is green, root cause resolved."
   max_branch_resolves: 40             # cap on per-repo branch-from-log resolutions
+  close_duplicates: true              # collapse issues sharing a Root-Cause-Key onto the oldest
+  duplicate_comment: "Auto-closed as a duplicate of {canonical}: both issues track the same failing job (root-cause key `{root_cause_key}`). Follow {canonical} for the fix."
 ```
 
 | Key                   | Default                        | Meaning                                                                                 |
@@ -514,6 +526,8 @@ native:
 | `resolved_state`      | `Done`                         | State set on a closed issue (the CLAUDE project's only resolved State).                  |
 | `close_comment`       | (the auto-closed sentence)     | Run-linked close-comment template; `{run_index}` / `{branch}` / `{run_url}` / `{job}` are substituted, and a hidden auto-closed marker is appended. |
 | `max_branch_resolves` | `40`                           | Cap on per-repo branch-from-log resolutions when the runs list returns `head_branch` null. Reaching it is logged, never silent. |
+| `close_duplicates`    | `true`                         | Collapse open issues sharing a `(repo, Root-Cause-Key:)` onto the oldest and close the rest as duplicates, before any Forgejo read (CLAUDE-198). |
+| `duplicate_comment`   | (the duplicate sentence)       | Duplicate close-comment template; `{canonical}` (the surviving issue id) and `{root_cause_key}` are substituted, and the same hidden auto-closed marker is appended. |
 
 `repos` and `resolved_state` are the distinctive keys that disambiguate this variant from the other native configs under
 the untagged `native:` block, so a shipped action must set at least one of them (the shipped `ci-failure-reconcile.yml`
