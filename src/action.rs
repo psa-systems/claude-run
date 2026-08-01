@@ -723,6 +723,10 @@ impl Default for CiFailureAnalysisConfig {
 /// posted. The close is idempotent (an already-closed issue is skipped). All
 /// Forgejo reads go through [`crate::forge_log`] (Rust), never a raw REST call.
 ///
+/// CLAUDE-198: before the Forgejo scan, open issues sharing a hidden
+/// `Root-Cause-Key:` marker are collapsed onto the oldest of the group and the
+/// rest closed as duplicates (`close_duplicates`).
+///
 /// `repos` and `resolved_state` are the distinctive fields that disambiguate this
 /// variant from the other native configs under the untagged `native:` key, so a
 /// shipped action MUST set at least one of them.
@@ -764,6 +768,16 @@ pub struct CiFailureReconcileConfig {
     /// per run (bounds log fetches when the runs list returns `head_branch` null).
     /// Reached-cap is logged, never silent. Default 40.
     pub max_branch_resolves: usize,
+    /// CLAUDE-198: collapse duplicate open issues that carry the same hidden
+    /// `Root-Cause-Key:` marker before the Forgejo scan. Mint's cross-run collapse
+    /// is a full-text search, so a lagging tracker index lets two failures of the
+    /// same job mint two issues; this closes all but the oldest of each group.
+    /// `true` by default; `false` leaves duplicates open.
+    pub close_duplicates: bool,
+    /// Template for the duplicate close comment. `{canonical}` is the surviving
+    /// issue id and `{root_cause_key}` the shared marker. The hidden auto-closed
+    /// marker is always appended (not part of the template).
+    pub duplicate_comment: String,
 }
 
 impl Default for CiFailureReconcileConfig {
@@ -777,6 +791,8 @@ impl Default for CiFailureReconcileConfig {
             resolved_state: "Done".to_string(),
             close_comment: "Auto-closed: run #{run_index} on `{branch}` succeeded ({run_url}); the failing `{job}` is green, root cause resolved.".to_string(),
             max_branch_resolves: 40,
+            close_duplicates: true,
+            duplicate_comment: "Auto-closed as a duplicate of {canonical}: both issues track the same failing job (root-cause key `{root_cause_key}`). Follow {canonical} for the fix.".to_string(),
         }
     }
 }
@@ -1484,6 +1500,9 @@ native:
         );
         assert_eq!(cfg.resolved_state, "Done");
         assert_eq!(cfg.max_branch_resolves, 40);
+        // CLAUDE-198: duplicate collapse is on unless the action turns it off.
+        assert!(cfg.close_duplicates);
+        assert!(cfg.duplicate_comment.contains("{canonical}"));
     }
 
     #[test]
@@ -1500,6 +1519,8 @@ native:
   resolved_state: Closed
   close_comment: \"Fixed by run {run_url}\"
   max_branch_resolves: 5
+  close_duplicates: false
+  duplicate_comment: \"Dup of {canonical}\"
 ";
         let loaded = validate_str(raw, "<candidate>").unwrap();
         let Some(NativeConfig::CiFailureReconcile(cfg)) = loaded.action.native else {
@@ -1518,6 +1539,8 @@ native:
         assert_eq!(cfg.resolved_state, "Closed");
         assert_eq!(cfg.close_comment, "Fixed by run {run_url}");
         assert_eq!(cfg.max_branch_resolves, 5);
+        assert!(!cfg.close_duplicates);
+        assert_eq!(cfg.duplicate_comment, "Dup of {canonical}");
 
         let bogus = format!("{raw}  bogus: nope\n");
         assert!(matches!(
