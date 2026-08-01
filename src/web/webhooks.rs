@@ -100,12 +100,9 @@ pub struct ActionPayload {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActionRun {
-    /// CLAUDE-96: the run's GLOBAL id, which addresses the v16 REST run-logs
-    /// endpoint (`GetRunByID` in the upstream handler). Distinct from
-    /// `index_in_repo`. Defensive default 0 = "payload carried no id"; the API
-    /// fetch refuses to run with it.
-    #[serde(default)]
-    pub id: i64,
+    /// The run's per-repo index, which is the number `fj actions logs` takes and
+    /// the one the `/actions/runs/<N>` web URL uses. CLAUDE-204: the run's global
+    /// id is no longer read - `fj` resolves the run itself - so it is not parsed.
     pub index_in_repo: i64,
     pub commit_sha: String,
     pub workflow_id: String,
@@ -145,12 +142,9 @@ pub struct Repository {
     /// `owner/repo`, matched against the configured allow-list.
     pub full_name: String,
     /// CLAUDE-92: visibility from the payload (`modules/structs/repo.go:57`).
-    /// A private repo's logs cannot be fetched on this Forgejo version (the
-    /// internal web logs route authenticates via session cookie only:
-    /// `services/auth/{basic,oauth2}.go` `Verify` both bail on non-API paths,
-    /// and the v14 repo Actions API has no logs endpoint, FJ-22 pending), so
-    /// the consumer must not burn the retry budget discovering that. Serde
-    /// default keeps older/foreign payloads on the public path.
+    /// CLAUDE-204: no longer gates the log fetch, which is one `fj actions logs`
+    /// path for both visibilities; retained as context carried onto the mint.
+    /// Serde default keeps older/foreign payloads on the public reading.
     #[serde(default)]
     pub private: bool,
 }
@@ -176,9 +170,6 @@ pub struct VerifiedFailureEvent {
     /// CLAUDE-92: `repository.private` from the payload; gates the log fetch
     /// (see [`Repository::private`]).
     pub private: bool,
-    /// CLAUDE-96: the run's global id (`run.id`), addressing the v16 REST
-    /// run-logs endpoint. 0 when the payload carried none.
-    pub run_global_id: i64,
     /// CLAUDE-96: the webhook source (config block name) this event arrived
     /// through, so the consumer can resolve the source's `log_token_ref`.
     pub source: String,
@@ -306,17 +297,17 @@ pub struct MintContext {
     pub route_cache: Arc<VcsRouteCache>,
 }
 
-/// Drain emitted events. For each verified failure this fetches the failing
-/// job's log via the internal route, redacts secrets, and writes a redacted
-/// artifact (CLAUDE-44); then, when a [`MintContext`] is configured, triages the
-/// failure (CLAUDE-45) and mints / declines a YouTrack issue (CLAUDE-46). The
-/// fetch is best-effort: a not-ready / pruned log is a transient miss, not a
+/// Drain emitted events. For each verified failure this fetches the run's logs
+/// through `fj actions logs`, redacts secrets, and writes a redacted artifact
+/// (CLAUDE-44 / CLAUDE-204); then, when a [`MintContext`] is configured, triages
+/// the failure (CLAUDE-45) and mints / declines a YouTrack issue (CLAUDE-46).
+/// The fetch is best-effort: a not-ready / pruned log is a transient miss, not a
 /// fault. A miss does not strand the consumer - it feeds triage as a bucket-3
 /// signal (the rules pass routes an unavailable log to transient).
 pub async fn consume_events(
     mut rx: mpsc::Receiver<VerifiedFailureEvent>,
     pool: SqlitePool,
-    transport: Arc<dyn crate::forge_log::LogTransport>,
+    logs: Arc<dyn crate::forge_log::ActionLogClient>,
     out_dir: PathBuf,
     mint: Option<MintContext>,
     webhook_cfg: Arc<RwLock<WebhookConfig>>,
@@ -368,72 +359,44 @@ pub async fn consume_events(
             continue;
         }
 
-        // CLAUDE-92: the payload already declares visibility, and the event
-        // always arrives AFTER the run completed, so a private repo is decided
-        // here with ZERO fetch requests: the deployed Forgejo authenticates the
-        // internal web logs route by session cookie only (Basic/OAuth2 `Verify`
-        // bail on non-API paths; no API logs endpoint until FJ-22), so the
-        // fetch cannot succeed and retrying would only burn the 60s budget.
-        // The failure still surfaces: the no-log triage rule routes it to a
-        // human (bucket 2) instead of silently dropping it as transient.
-        let (log_text, log_available, log_artifact, log_unavailable_reason) = if ev.private {
-            // CLAUDE-96: a private repo's logs are reachable ONLY through the
-            // v16 REST endpoint with the source's PAT (`log_token_ref`); the
-            // internal web route is session-only. With a token, exactly one
-            // request decides success/401/403/404 (the run already finished, so
-            // there is nothing to wait for); without one, the CLAUDE-92
-            // unauthorized short-circuit applies with zero requests. Either
-            // way a real failure still mints via the no-log bucket-2 rule.
-            match fetch_private_log(
+        // CLAUDE-204: ONE fetch path for public and private repos. `fj actions
+        // logs` takes the per-repo run number the payload already carries, and
+        // the source's `log_token_ref` (when configured) authorizes a private
+        // repo's read; a public repo reads without one. A miss still surfaces:
+        // the no-log triage rule routes it to a human (bucket 2) rather than
+        // silently dropping it as transient.
+        let token = source_log_token(&pool, &webhook_cfg, &ev.source).await;
+        let Some(target) =
+            crate::forge_log::LogTarget::for_run(&ev.html_url, &ev.repo, ev.index_in_repo, token)
+        else {
+            warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge host from html_url; skipping log fetch");
+            finish_webhook_run(
                 &pool,
-                &webhook_cfg,
-                &cfg,
-                transport.clone(),
-                out_dir.clone(),
-                &ev,
                 run_id,
+                &job_key,
+                "could not derive forge host from html_url; log fetch skipped",
+                false,
+                None,
             )
-            .await
-            {
-                PrivateLogOutcome::Fetched(log) => (log.text, true, Some(log.artifact), None),
-                PrivateLogOutcome::Unavailable(reason) => {
-                    if let Some(id) = run_id {
-                        if let Err(e) =
-                            state::run_stage_set(&pool, id, Some(STAGE_PRIVATE_UNAUTHORIZED)).await
-                        {
-                            warn!(error = %e, "setting webhook run stage failed");
-                        }
-                    }
-                    (String::new(), false, None, Some(reason))
-                }
+            .await;
+            continue;
+        };
+        if let Some(id) = run_id {
+            if let Err(e) = state::run_stage_set(&pool, id, Some(STAGE_FETCHING_LOGS)).await {
+                warn!(error = %e, "setting webhook run stage failed");
             }
-        } else {
-            let Some(target) =
-                crate::forge_log::LogTarget::for_run(&ev.html_url, &ev.repo, ev.index_in_repo)
-            else {
-                warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge origin from html_url; skipping log fetch");
-                finish_webhook_run(
-                    &pool,
-                    run_id,
-                    &job_key,
-                    "could not derive forge origin from html_url; log fetch skipped",
-                    false,
-                    None,
-                )
-                .await;
-                continue;
-            };
+        }
 
-            // The fetch is blocking (reqwest on a thread + backoff sleeps); run
-            // it off the async runtime. No service-injected secrets reach the CI
-            // run, so `known_secrets` is empty here and pattern redaction does
-            // the work.
-            let transport = transport.clone();
+        // The fetch is blocking (a child process + backoff sleeps); run it off
+        // the async runtime. No service-injected secrets reach the CI run, so
+        // `known_secrets` is empty here and pattern redaction does the work.
+        let outcome = {
+            let logs = logs.clone();
             let fetch_cfg = cfg.clone();
             let out_dir = out_dir.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                crate::forge_log::fetch_failing_job_log(
-                    transport.as_ref(),
+            tokio::task::spawn_blocking(move || {
+                crate::forge_log::fetch_run_log(
+                    logs.as_ref(),
                     &fetch_cfg,
                     &target,
                     &out_dir,
@@ -441,50 +404,81 @@ pub async fn consume_events(
                     std::thread::sleep,
                 )
             })
-            .await;
+            .await
+        };
 
-            // Normalise the fetch result into the triage inputs. A
-            // `TransientMiss`, a fetch error, and a panicked task all collapse
-            // to "no log" with the reason preserved; the no-log triage rule
-            // (CLAUDE-92) routes those to a human rather than dropping them.
-            match outcome {
-                Ok(Ok(LogOutcome::Fetched(log))) => {
-                    info!(
-                        repo = %ev.repo,
-                        run = ev.index_in_repo,
-                        bytes = log.text.len(),
-                        artifact = %log.artifact.display(),
-                        "fetched and redacted failing job log"
-                    );
-                    (log.text, true, Some(log.artifact), None)
+        // Normalise the fetch result into the triage inputs. A `TransientMiss`,
+        // an auth denial, a fetch error, and a panicked task all collapse to
+        // "no log" with the reason preserved; the no-log triage rule
+        // (CLAUDE-92) routes those to a human rather than dropping them.
+        let (log_text, log_available, log_artifact, log_unavailable_reason, jobs) = match outcome {
+            Ok(Ok(LogOutcome::Fetched(log))) => {
+                info!(
+                    repo = %ev.repo,
+                    run = ev.index_in_repo,
+                    bytes = log.text.len(),
+                    jobs = log.jobs.len(),
+                    artifact = %log.artifact.display(),
+                    "fetched and redacted run log"
+                );
+                (log.text, true, Some(log.artifact), None, log.jobs)
+            }
+            Ok(Ok(LogOutcome::TransientMiss { reason })) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, %reason, "run log not available (transient miss)");
+                (
+                    String::new(),
+                    false,
+                    None,
+                    Some(format!("log not available after retries: {reason}")),
+                    Vec::new(),
+                )
+            }
+            Ok(Ok(LogOutcome::AuthDenied { reason })) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, %reason, "log token rejected");
+                if let Some(id) = run_id {
+                    if let Err(e) =
+                        state::run_stage_set(&pool, id, Some(STAGE_LOG_UNAUTHORIZED)).await
+                    {
+                        warn!(error = %e, "setting webhook run stage failed");
+                    }
                 }
-                Ok(Ok(LogOutcome::TransientMiss { reason })) => {
-                    warn!(repo = %ev.repo, run = ev.index_in_repo, %reason, "failing job log not available (transient miss)");
-                    (
-                        String::new(),
-                        false,
-                        None,
-                        Some(format!("log not available after retries: {reason}")),
-                    )
-                }
-                Ok(Err(e)) => {
-                    warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch failed");
-                    (
-                        String::new(),
-                        false,
-                        None,
-                        Some(format!("log fetch failed: {e}")),
-                    )
-                }
-                Err(e) => {
-                    warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch task panicked");
-                    (
-                        String::new(),
-                        false,
-                        None,
-                        Some(format!("log fetch task panicked: {e}")),
-                    )
-                }
+                (
+                    String::new(),
+                    false,
+                    None,
+                    Some(format!("log token rejected ({reason})")),
+                    Vec::new(),
+                )
+            }
+            Ok(Ok(LogOutcome::Failed { reason })) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, %reason, "log fetch failed");
+                (
+                    String::new(),
+                    false,
+                    None,
+                    Some(format!("log fetch failed: {reason}")),
+                    Vec::new(),
+                )
+            }
+            Ok(Err(e)) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch failed");
+                (
+                    String::new(),
+                    false,
+                    None,
+                    Some(format!("log fetch failed: {e}")),
+                    Vec::new(),
+                )
+            }
+            Err(e) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "log fetch task panicked");
+                (
+                    String::new(),
+                    false,
+                    None,
+                    Some(format!("log fetch task panicked: {e}")),
+                    Vec::new(),
+                )
             }
         };
 
@@ -508,13 +502,14 @@ pub async fn consume_events(
             continue;
         };
         let artifact = log_artifact.clone();
-        // CLAUDE-190: resolve the failing job's name/index via the jobs API so
-        // the root-cause dedupe key is job-scoped (best-effort: an unavailable
-        // endpoint degrades to a job-agnostic key, which still collapses the
-        // storm). The branch and the failure signature are derived from the log
-        // inside `decide_mint`.
-        let (job_name, job_index) =
-            resolve_failing_job_meta(&pool, &webhook_cfg, &cfg, transport.clone(), &ev).await;
+        // CLAUDE-190/204: the failing job's name comes from the jobs `fj` already
+        // returned with the log, so the root-cause dedupe key is job-scoped with
+        // no extra request. A logless failure degrades to a job-agnostic key,
+        // which still collapses the storm. The branch and the failure signature
+        // are derived from the log inside `decide_mint`.
+        let job_name = crate::forge_log::resolve_failing_job(&jobs)
+            .map(|j| j.name.clone())
+            .unwrap_or_default();
         let result = triage_and_mint(
             ctx,
             run_id,
@@ -525,7 +520,6 @@ pub async fn consume_events(
             log_unavailable_reason,
             webhook_cfg.auto_fix,
             job_name,
-            job_index,
         )
         .await;
         finish_webhook_run(
@@ -544,155 +538,13 @@ pub async fn consume_events(
 /// the run-detail page (Stage row + the running job's LIVE column) via
 /// `runs.stage`. `run_finish` clears the column, so no label outlives its run.
 pub const STAGE_FETCHING_LOGS: &str = "fetching action logs";
-/// CLAUDE-92: shown while a private-repo event is decided (no fetch possible);
-/// the lasting record is the triage analysis and journal line, since the run
-/// finishes within milliseconds and `run_finish` clears the stage.
-pub const STAGE_PRIVATE_UNAUTHORIZED: &str = "private repo: unauthorized";
+/// CLAUDE-92/204: shown when the log token was rejected, so the run-detail page
+/// names the actionable cause; the lasting record is the triage analysis and
+/// journal line, since `run_finish` clears the stage.
+pub const STAGE_LOG_UNAUTHORIZED: &str = "log fetch: unauthorized";
 pub const STAGE_TRIAGING: &str = "triaging";
 pub const STAGE_CLASSIFYING: &str = "classifying with claude";
 pub const STAGE_MINTING: &str = "minting issue";
-
-/// CLAUDE-96: outcome of the private-repo log path.
-enum PrivateLogOutcome {
-    Fetched(crate::forge_log::RedactedLog),
-    /// Why there is no log; feeds the no-log triage rule's analysis (CLAUDE-92).
-    Unavailable(String),
-}
-
-/// CLAUDE-96: try to fetch a private repo's logs through the v16 REST endpoint
-/// using the event source's `log_token_ref`. "No token configured" decides with
-/// ZERO requests; success, 401/403, and 404 decide with exactly ONE (the run
-/// already finished, so there is nothing to wait for); only transport errors
-/// and 5xx use the small retry budget. Every miss returns a reason string for
-/// the bucket-2 analysis.
-async fn fetch_private_log(
-    pool: &SqlitePool,
-    webhook_cfg: &WebhookConfig,
-    fetch_cfg: &crate::forge_log::LogFetchConfig,
-    transport: Arc<dyn crate::forge_log::LogTransport>,
-    out_dir: PathBuf,
-    ev: &VerifiedFailureEvent,
-    run_id: Option<i64>,
-) -> PrivateLogOutcome {
-    let token_ref = webhook_cfg
-        .sources
-        .get(&ev.source)
-        .and_then(|s| s.log_token_ref.clone());
-    let Some(token_ref) = token_ref else {
-        info!(
-            repo = %ev.repo,
-            run = ev.index_in_repo,
-            source = %ev.source,
-            "private repository; log fetch skipped (no log_token_ref configured for this source)"
-        );
-        return PrivateLogOutcome::Unavailable(
-            "private repo: unauthorized (no log token configured for this source)".to_string(),
-        );
-    };
-    let token = match resolve_log_token(pool, &token_ref).await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(
-                repo = %ev.repo,
-                run = ev.index_in_repo,
-                source = %ev.source,
-                token_ref = %token_ref,
-                error = %e,
-                "private repository; log token unresolvable"
-            );
-            return PrivateLogOutcome::Unavailable(format!(
-                "private repo: unauthorized (log token '{token_ref}' unresolvable)"
-            ));
-        }
-    };
-    if ev.run_global_id <= 0 {
-        warn!(
-            repo = %ev.repo,
-            run = ev.index_in_repo,
-            "private repository; payload carried no run id, cannot address the logs API"
-        );
-        return PrivateLogOutcome::Unavailable(
-            "private repo: payload carried no run id; the v16 logs API cannot be addressed"
-                .to_string(),
-        );
-    }
-    let Some(target) = crate::forge_log::RunLogsApiTarget::for_run(
-        &ev.html_url,
-        &ev.repo,
-        ev.index_in_repo,
-        ev.run_global_id,
-        token,
-    ) else {
-        warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge origin from html_url; skipping log fetch");
-        return PrivateLogOutcome::Unavailable(
-            "could not derive forge origin from html_url; log fetch skipped".to_string(),
-        );
-    };
-    if let Some(id) = run_id {
-        if let Err(e) = state::run_stage_set(pool, id, Some(STAGE_FETCHING_LOGS)).await {
-            warn!(error = %e, "setting webhook run stage failed");
-        }
-    }
-
-    let fetch_cfg = fetch_cfg.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        crate::forge_log::fetch_run_logs_api(
-            transport.as_ref(),
-            &fetch_cfg,
-            &target,
-            &out_dir,
-            &[],
-            std::thread::sleep,
-        )
-    })
-    .await;
-
-    use crate::forge_log::ApiLogOutcome;
-    match outcome {
-        Ok(Ok(ApiLogOutcome::Fetched(log))) => {
-            info!(
-                repo = %ev.repo,
-                run = ev.index_in_repo,
-                bytes = log.text.len(),
-                artifact = %log.artifact.display(),
-                "fetched and redacted private-repo run logs via the REST API"
-            );
-            PrivateLogOutcome::Fetched(log)
-        }
-        Ok(Ok(ApiLogOutcome::AuthDenied(status))) => {
-            warn!(repo = %ev.repo, run = ev.index_in_repo, status, "private repository; log token rejected");
-            // CLAUDE-146: Forgejo distinguishes 401 from 403, so name the
-            // actionable cause. 401 = the credential was not accepted (the log
-            // token is not a valid Forgejo user PAT: wrong value, expired, or
-            // not a `token`-scheme PAT). 403 = the token is valid but lacks
-            // `read:repository` scope or Actions read access on this repo.
-            let detail = if status == 401 {
-                "HTTP 401: the log token is not a valid Forgejo user PAT (wrong value, expired, or not a token-scheme PAT)"
-            } else {
-                "HTTP 403: the log token is valid but lacks read:repository scope or Actions read access on this repo"
-            };
-            PrivateLogOutcome::Unavailable(format!("private repo: log token rejected ({detail})"))
-        }
-        Ok(Ok(ApiLogOutcome::NotFound)) => {
-            warn!(repo = %ev.repo, run = ev.index_in_repo, "private repository; logs API returned 404 (Forgejo < 16, or run pruned)");
-            PrivateLogOutcome::Unavailable(
-                "private repo: log API unavailable (Forgejo < 16) or run pruned".to_string(),
-            )
-        }
-        Ok(Ok(ApiLogOutcome::Failed(reason))) => {
-            warn!(repo = %ev.repo, run = ev.index_in_repo, %reason, "private repository; log fetch via API failed");
-            PrivateLogOutcome::Unavailable(format!("log fetch via API failed: {reason}"))
-        }
-        Ok(Err(e)) => {
-            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "private repository; writing the log artifact failed");
-            PrivateLogOutcome::Unavailable(format!("log fetch via API failed: {e}"))
-        }
-        Err(e) => {
-            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "private repository; log fetch task panicked");
-            PrivateLogOutcome::Unavailable(format!("log fetch task panicked: {e}"))
-        }
-    }
-}
 
 /// CLAUDE-96: decrypt the named log token from the secrets store (same age-key
 /// mechanism as the HMAC refs).
@@ -704,9 +556,9 @@ async fn resolve_log_token(pool: &SqlitePool, name: &str) -> crate::error::Resul
     Ok(token.trim().to_string())
 }
 
-/// CLAUDE-190: the source's `log_token_ref` decrypted, or `None` when the source
-/// has no token configured or it cannot be resolved. Used for the jobs-API fetch
-/// on a private repo (a public repo reads the endpoint unauthenticated).
+/// CLAUDE-190/204: the source's `log_token_ref` decrypted, or `None` when the
+/// source has no token configured or it cannot be resolved. Authorizes the
+/// `fj actions logs` read; a public repo's run reads without one.
 async fn source_log_token(
     pool: &SqlitePool,
     webhook_cfg: &WebhookConfig,
@@ -721,62 +573,6 @@ async fn source_log_token(
         Err(e) => {
             warn!(source = %source, token_ref = %token_ref, error = %e, "resolving log token for job resolution failed");
             None
-        }
-    }
-}
-
-/// CLAUDE-190: resolve the failing job's `(name, index)` for the root-cause
-/// dedupe key via the jobs API. Best-effort: `("", DEFAULT_JOB_INDEX)` on any
-/// miss (no run global id, no token on a private repo, pre-v16, transport
-/// error), so the key degrades to a job-agnostic form that still collapses a
-/// branch-broken storm onto one issue. Resolution stays in Rust (no raw REST
-/// from a nu snippet, per the tooling-gap rule).
-async fn resolve_failing_job_meta(
-    pool: &SqlitePool,
-    webhook_cfg: &WebhookConfig,
-    fetch_cfg: &crate::forge_log::LogFetchConfig,
-    transport: Arc<dyn crate::forge_log::LogTransport>,
-    ev: &VerifiedFailureEvent,
-) -> (String, u64) {
-    use crate::forge_log::{JobsOutcome, RunJobsApiTarget, DEFAULT_JOB_INDEX};
-    let miss = (String::new(), DEFAULT_JOB_INDEX);
-    if ev.run_global_id <= 0 {
-        return miss;
-    }
-    let token = if ev.private {
-        source_log_token(pool, webhook_cfg, &ev.source).await
-    } else {
-        None
-    };
-    let Some(target) = RunJobsApiTarget::for_run(&ev.html_url, &ev.repo, ev.run_global_id, token)
-    else {
-        return miss;
-    };
-    let fetch_cfg = fetch_cfg.clone();
-    let out = tokio::task::spawn_blocking(move || {
-        crate::forge_log::fetch_run_jobs(
-            transport.as_ref(),
-            &fetch_cfg,
-            &target,
-            std::thread::sleep,
-        )
-    })
-    .await;
-    match out {
-        Ok(Ok(JobsOutcome::Resolved(jobs))) => {
-            crate::forge_log::resolve_failing_job(&jobs).unwrap_or(miss)
-        }
-        Ok(Ok(other)) => {
-            debug!(repo = %ev.repo, run = ev.index_in_repo, outcome = ?other, "jobs endpoint did not resolve; root-cause key is job-agnostic");
-            miss
-        }
-        Ok(Err(e)) => {
-            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "jobs-list fetch failed; root-cause key is job-agnostic");
-            miss
-        }
-        Err(e) => {
-            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "jobs-list fetch task panicked; root-cause key is job-agnostic");
-            miss
         }
     }
 }
@@ -935,7 +731,6 @@ async fn triage_and_mint(
     log_unavailable_reason: Option<String>,
     auto_fix_enabled: bool,
     job_name: String,
-    job_index: u64,
 ) -> WebhookRunSummary {
     // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
     // run's (repo, index); the daily ledger is per synthetic action. The
@@ -1002,7 +797,6 @@ async fn triage_and_mint(
             has_open_pr,
             auto_fix_enabled,
             &job_name,
-            job_index,
             &report_stage,
         )
     })
@@ -1057,7 +851,6 @@ fn decide_mint(
     has_open_pr: bool,
     auto_fix_enabled: bool,
     job_name: &str,
-    job_index: u64,
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
 ) -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
     // CLAUDE-190: derive the deterministic failure signature and the branch from
@@ -1089,12 +882,10 @@ fn decide_mint(
     let req = MintRequest {
         repo: &ev.repo,
         index_in_repo: ev.index_in_repo,
-        run_global_id: ev.run_global_id,
         commit_sha: &ev.commit_sha,
         workflow_id: &ev.workflow_id,
         branch: &branch,
         job_name,
-        job_index,
         failure_signature: failure_signature.as_deref(),
         html_url: &ev.html_url,
         trigger_user: &ev.trigger_user,
@@ -1428,7 +1219,6 @@ pub fn verified_failure_event(
         commit_sha: payload.run.commit_sha.clone(),
         workflow_id: payload.run.workflow_id.clone(),
         private: payload.run.repository.private,
-        run_global_id: payload.run.id,
         source: source.to_string(),
         trigger_user: payload.run.trigger_user.login.clone(),
         html_url: payload.run.html_url.clone(),
@@ -1556,7 +1346,6 @@ mod tests {
                 commit_sha: "abc123".to_string(),
                 workflow_id: "ci.yml".to_string(),
                 private: false,
-                run_global_id: 0,
                 source: "test-source".to_string(),
                 trigger_user: "alice".to_string(),
                 html_url: "https://dev.a8n.run/contoso/claude-run/actions/runs/7".to_string(),
@@ -1840,7 +1629,6 @@ mod tests {
             commit_sha: "abc123def456".to_string(),
             workflow_id: "ci.yml".to_string(),
             private: false,
-            run_global_id: 4242,
             source: "test-source".to_string(),
             trigger_user: "alice".to_string(),
             html_url: "https://dev.a8n.run/fabrikam/forgejo-cli/actions/runs/7".to_string(),
@@ -1893,7 +1681,6 @@ mod tests {
             false,
             true, // auto_fix_enabled
             "",
-            0,
             &|_| {},
         )
         .unwrap();
@@ -1935,7 +1722,6 @@ mod tests {
             true,
             true, // auto_fix_enabled
             "",
-            0,
             &|_| {},
         )
         .unwrap();
@@ -1966,7 +1752,6 @@ mod tests {
             false, // has_open_pr: no PR, so the code_fix route still queues
             true,  // auto_fix_enabled
             "",
-            0,
             &|_| {},
         )
         .unwrap();
@@ -2012,7 +1797,6 @@ mod tests {
             false,
             true, // auto_fix_enabled
             "",
-            0,
             &|_| {},
         )
         .unwrap();
@@ -2057,7 +1841,6 @@ mod tests {
             false, // has_open_pr: push to main, no PR
             true,  // auto_fix_enabled
             "",
-            0,
             &|_| {},
         )
         .unwrap();
@@ -2113,7 +1896,6 @@ mod tests {
             true, // has_open_pr: a failing open PR
             true, // auto_fix_enabled
             "",
-            0,
             &|_| {},
         )
         .unwrap();
@@ -2152,7 +1934,6 @@ mod tests {
             false, // has_open_pr: no PR; the toggle, not open-PR, does the gating
             false, // auto_fix_enabled: OFF
             "",
-            0,
             &|_| {},
         )
         .unwrap();
@@ -2204,19 +1985,22 @@ mod tests {
 
     // ---- CLAUDE-61: webhook runs are recorded ----------------------------
 
-    /// Canned [`LogTransport`] returning a fixed 200 body, so the fetch is
-    /// `Ready` on the first attempt and the backoff loop never sleeps.
-    struct ReadyTransport;
-    impl crate::forge_log::LogTransport for ReadyTransport {
-        fn get(
+    /// Canned [`ActionLogClient`] returning one failing job, so the fetch is
+    /// `Fetched` on the first attempt and the backoff loop never sleeps.
+    struct ReadyLogs;
+    impl crate::forge_log::ActionLogClient for ReadyLogs {
+        fn run_logs(
             &self,
-            _url: &str,
+            _host: &str,
+            _repo: &str,
+            _run_number: i64,
             _token: Option<&str>,
-        ) -> std::result::Result<crate::forge_log::HttpResponse, String> {
-            Ok(crate::forge_log::HttpResponse {
-                status: 200,
-                body: "assertion failed: expected 1 got 2".to_string(),
-            })
+        ) -> crate::forge_log::RunLogsOutcome {
+            crate::forge_log::RunLogsOutcome::Fetched(vec![crate::forge_log::JobLog {
+                name: "check".to_string(),
+                status: "failure".to_string(),
+                log: "assertion failed: expected 1 got 2".to_string(),
+            }])
         }
     }
 
@@ -2230,16 +2014,18 @@ mod tests {
         pool
     }
 
-    /// CLAUDE-85: a transport that fails the test on any GET, proving the
+    /// CLAUDE-85: a client that fails the test on any call, proving the
     /// skipped-run short-circuit never attempts a log fetch.
-    struct PanicTransport;
-    impl crate::forge_log::LogTransport for PanicTransport {
-        fn get(
+    struct PanicLogs;
+    impl crate::forge_log::ActionLogClient for PanicLogs {
+        fn run_logs(
             &self,
-            url: &str,
+            _host: &str,
+            repo: &str,
+            run_number: i64,
             _token: Option<&str>,
-        ) -> std::result::Result<crate::forge_log::HttpResponse, String> {
-            panic!("log fetch attempted for a non-failure run: {url}");
+        ) -> crate::forge_log::RunLogsOutcome {
+            panic!("log fetch attempted for a non-failure run: {repo}#{run_number}");
         }
     }
 
@@ -2262,7 +2048,7 @@ mod tests {
             consume_events(
                 rx,
                 pool.clone(),
-                Arc::new(PanicTransport),
+                Arc::new(PanicLogs),
                 out_dir.path().to_path_buf(),
                 None,
                 Arc::new(RwLock::new(WebhookConfig::default())),
@@ -2321,90 +2107,55 @@ mod tests {
         assert!(!event.private, "absent field defaults to public");
     }
 
-    #[tokio::test]
-    async fn private_repo_event_never_touches_the_log_route() {
-        // CLAUDE-92: the payload says the repo is private and this Forgejo has
-        // no token auth for the internal logs route, so the consumer must make
-        // ZERO fetch requests (no 60s retry burn) and still record the run.
-        let pool = memory_pool().await;
-        let out_dir = tempfile::tempdir().unwrap();
-        let (tx, rx) = mpsc::channel(4);
-        let mut ev = event();
-        ev.private = true;
-        tx.send(ev).await.unwrap();
-        drop(tx);
+    /// One recorded `run_logs` call: `(host, repo, run_number, token)`.
+    type LoggedCall = (String, String, i64, Option<String>);
 
-        consume_events(
-            rx,
-            pool.clone(),
-            Arc::new(PanicTransport),
-            out_dir.path().to_path_buf(),
-            None,
-            Arc::new(RwLock::new(WebhookConfig::default())),
-        )
-        .await;
-
-        let (jobs, exit): (i64, Option<i64>) =
-            sqlx::query_as("SELECT jobs_processed, exit_code FROM runs")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(jobs, 1);
-        assert_eq!(exit, Some(crate::exit::OK as i64));
-
-        let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let summary = summary.expect("summary recorded");
-        assert!(summary.contains("log unavailable"), "{summary}");
+    /// CLAUDE-204: a scripted `fj actions logs` client recording every call's
+    /// arguments, so the tests assert the run number, the token scoping, and the
+    /// call count without spawning a process.
+    struct ScriptedLogs {
+        outcome: crate::forge_log::RunLogsOutcome,
+        calls: std::sync::Mutex<Vec<LoggedCall>>,
     }
 
-    /// CLAUDE-96: bytes-only transport for the REST run-logs endpoint. `get`
-    /// panics so the private path can never fall back to the internal text
-    /// route; `get_bytes` serves one fixed response and counts calls.
-    struct ApiBytesTransport {
-        status: u16,
-        body: Vec<u8>,
-        calls: std::sync::Mutex<u32>,
-    }
-
-    impl ApiBytesTransport {
-        fn new(status: u16, body: Vec<u8>) -> Self {
+    impl ScriptedLogs {
+        fn new(outcome: crate::forge_log::RunLogsOutcome) -> Self {
             Self {
-                status,
-                body,
-                calls: std::sync::Mutex::new(0),
+                outcome,
+                calls: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
 
-    impl crate::forge_log::LogTransport for ApiBytesTransport {
-        fn get(
+    impl crate::forge_log::ActionLogClient for ScriptedLogs {
+        fn run_logs(
             &self,
-            url: &str,
-            _token: Option<&str>,
-        ) -> std::result::Result<crate::forge_log::HttpResponse, String> {
-            panic!("internal text route used for a private repo: {url}");
-        }
-        fn get_bytes(
-            &self,
-            url: &str,
+            host: &str,
+            repo: &str,
+            run_number: i64,
             token: Option<&str>,
-        ) -> std::result::Result<(u16, Vec<u8>), String> {
-            assert!(
-                url.contains("/api/v1/repos/fabrikam/forgejo-cli/actions/runs/4242/logs"),
-                "API URL addressed by the global run id: {url}"
-            );
-            assert_eq!(token, Some("test-pat"), "token sent");
-            *self.calls.lock().unwrap() += 1;
-            Ok((self.status, self.body.clone()))
+        ) -> crate::forge_log::RunLogsOutcome {
+            self.calls.lock().unwrap().push((
+                host.to_string(),
+                repo.to_string(),
+                run_number,
+                token.map(str::to_string),
+            ));
+            self.outcome.clone()
         }
     }
 
-    /// Shared scaffolding for the private+token consume tests: age key file,
-    /// stored `log-token` secret, and a webhook config whose `test-source`
-    /// (the `event()` fixture's source) carries the `log_token_ref`.
+    fn one_failing_job() -> crate::forge_log::RunLogsOutcome {
+        crate::forge_log::RunLogsOutcome::Fetched(vec![crate::forge_log::JobLog {
+            name: "check".to_string(),
+            status: "failure".to_string(),
+            log: "assertion failed: expected 1 got 2\n".to_string(),
+        }])
+    }
+
+    /// Shared scaffolding for the log-token consume tests: age key file, stored
+    /// `log-token` secret, and a webhook config whose `test-source` (the
+    /// `event()` fixture's source) carries the `log_token_ref`.
     async fn log_token_setup(tmp: &std::path::Path) -> (SqlitePool, Arc<RwLock<WebhookConfig>>) {
         use age::secrecy::ExposeSecret;
         let key_path = tmp.join("key.txt");
@@ -2430,28 +2181,69 @@ mod tests {
         (pool, Arc::new(RwLock::new(cfg)))
     }
 
-    fn run_logs_zip() -> Vec<u8> {
-        use std::io::Write;
-        let mut buf = std::io::Cursor::new(Vec::new());
-        let mut w = zip::ZipWriter::new(&mut buf);
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        w.start_file("check-8-attempt-1.log", opts).unwrap();
-        w.write_all(b"assertion failed: expected 1 got 2\n")
-            .unwrap();
-        w.finish().unwrap();
-        buf.into_inner()
+    #[tokio::test]
+    async fn public_and_private_repos_share_one_fetch_path() {
+        // CLAUDE-204: the public/private split is gone. Both visibilities reach
+        // `fj actions logs` with the same arguments, addressed by the per-repo
+        // run number, and the source's `log_token_ref` scopes both.
+        for private in [false, true] {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (pool, cfg) = log_token_setup(tmp.path()).await;
+            let logs = Arc::new(ScriptedLogs::new(one_failing_job()));
+
+            let (tx, rx) = mpsc::channel(4);
+            let mut ev = event();
+            ev.private = private;
+            tx.send(ev).await.unwrap();
+            drop(tx);
+
+            consume_events(
+                rx,
+                pool.clone(),
+                logs.clone(),
+                tmp.path().to_path_buf(),
+                None,
+                cfg,
+            )
+            .await;
+
+            let calls = logs.calls.lock().unwrap().clone();
+            assert_eq!(calls.len(), 1, "exactly one fetch (private={private})");
+            assert_eq!(
+                calls[0],
+                (
+                    "dev.a8n.run".to_string(),
+                    "fabrikam/forgejo-cli".to_string(),
+                    7,
+                    Some("test-pat".to_string())
+                ),
+                "private={private}"
+            );
+
+            let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let summary = summary.expect("summary recorded");
+            assert!(
+                summary.contains("log fetched and redacted"),
+                "private={private}: {summary}"
+            );
+            assert!(summary.contains("log="), "artifact referenced: {summary}");
+        }
     }
 
     #[tokio::test]
-    async fn private_repo_with_token_fetches_logs_via_the_api() {
-        // CLAUDE-96: token configured + v16 endpoint available -> exactly one
-        // authenticated request, log redacted to an artifact, pipeline behaves
-        // like a public fetch.
+    async fn a_rejected_log_token_degrades_to_a_no_log_outcome() {
+        // CLAUDE-204: an auth denial is terminal after ONE call (no retry burn)
+        // and the failure still surfaces through the no-log path.
         let _env = crate::secrets::key_file_env_lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let (pool, cfg) = log_token_setup(tmp.path()).await;
-        let transport = Arc::new(ApiBytesTransport::new(200, run_logs_zip()));
+        let logs = Arc::new(ScriptedLogs::new(
+            crate::forge_log::RunLogsOutcome::AuthDenied("HTTP 403: no scope".to_string()),
+        ));
 
         let (tx, rx) = mpsc::channel(4);
         let mut ev = event();
@@ -2462,49 +2254,14 @@ mod tests {
         consume_events(
             rx,
             pool.clone(),
-            transport.clone(),
+            logs.clone(),
             tmp.path().to_path_buf(),
             None,
             cfg,
         )
         .await;
 
-        assert_eq!(*transport.calls.lock().unwrap(), 1, "exactly one request");
-        let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let summary = summary.expect("summary recorded");
-        assert!(summary.contains("log fetched and redacted"), "{summary}");
-        assert!(summary.contains("log="), "artifact referenced: {summary}");
-    }
-
-    #[tokio::test]
-    async fn private_repo_with_token_degrades_on_a_pre_v16_instance() {
-        // CLAUDE-96: the endpoint 404s on Forgejo < 16; exactly one request,
-        // no retry burn, and the failure still surfaces as a no-log outcome.
-        let _env = crate::secrets::key_file_env_lock().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let (pool, cfg) = log_token_setup(tmp.path()).await;
-        let transport = Arc::new(ApiBytesTransport::new(404, Vec::new()));
-
-        let (tx, rx) = mpsc::channel(4);
-        let mut ev = event();
-        ev.private = true;
-        tx.send(ev).await.unwrap();
-        drop(tx);
-
-        consume_events(
-            rx,
-            pool.clone(),
-            transport.clone(),
-            tmp.path().to_path_buf(),
-            None,
-            cfg,
-        )
-        .await;
-
-        assert_eq!(*transport.calls.lock().unwrap(), 1, "exactly one request");
+        assert_eq!(logs.calls.lock().unwrap().len(), 1, "exactly one call");
         let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
             .fetch_one(&pool)
             .await
@@ -2526,7 +2283,7 @@ mod tests {
         consume_events(
             rx,
             pool.clone(),
-            Arc::new(ReadyTransport),
+            Arc::new(ReadyLogs),
             out_dir.path().to_path_buf(),
             None,
             Arc::new(RwLock::new(WebhookConfig::default())),
@@ -2607,7 +2364,6 @@ mod tests {
             true,
             true, // auto_fix_enabled
             "",
-            0,
             &report,
         )
         .unwrap();
@@ -2639,7 +2395,6 @@ mod tests {
             true,
             true, // auto_fix_enabled
             "",
-            0,
             &report,
         )
         .unwrap();

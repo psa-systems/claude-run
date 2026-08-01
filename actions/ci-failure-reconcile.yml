@@ -24,10 +24,11 @@
 #              comment. Idempotent: an already-closed issue is skipped.
 #
 # Only the LATEST run decides: a newer failure after an older green run leaves the
-# job red and the issue open. All runs-list / jobs / log reads go through
-# `forge_log` (Rust), never a raw REST call from a nu snippet (tooling-gap rule,
-# FJ-22). The reconciler performs no git/PR actions and does not depend on the
-# CLAUDE-189 analysis having run.
+# job red and the issue open. Log and per-job status reads shell out to
+# `fj actions logs`; the runs list stays on the REST API until `fj` gains an
+# `actions runs` command (FJ-66). Both go through `forge_log` (Rust), never a raw
+# REST call from a nu snippet (tooling-gap rule). The reconciler performs no
+# git/PR actions and does not depend on the CLAUDE-189 analysis having run.
 
 name: ci-failure-reconcile
 
@@ -52,9 +53,10 @@ native:
     - contoso/*
     - fabrikam/*
     - initech/*
-  # Forgejo PAT (`read:repository` scope) used to page the runs list, read the jobs
-  # endpoint, and resolve a null-branch run's branch from its log. Picked per repo
-  # (CLAUDE-200). Omitted here: the mapping is derived from
+  # Forgejo PAT (`read:repository` scope) used to page the runs list and to read
+  # each latest run's per-job status and log (which also resolves a null-branch
+  # run's branch). It reaches `fj` in a temp single-host `keys.json` carrying that
+  # one secret and nothing else. Picked per repo (CLAUDE-200). Omitted here: the mapping is derived from
   # `config.webhook.sources`, which already holds one `log_token_ref` per org, so a
   # token is rotated in one place. A repo that maps to no token is skipped with a
   # warning rather than read with another org's token.

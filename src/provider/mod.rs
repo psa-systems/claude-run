@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-pub use cli::{CliBackend, CmdOutput, CommandRunner, ProcessRunner};
+pub use cli::{CliBackend, CmdOutput, CommandRunner, FjActionLogs, ProcessRunner};
 pub use github::{is_github_host, GithubForge, HttpMcpTransport, McpTransport};
 
 /// One project-to-repo binding flattened from a YouTrack project's enabled VCS
@@ -155,9 +155,8 @@ pub struct IssueLink {
 
 /// CLAUDE-189: an issue's body plus its comment texts, from
 /// `yt issue inspect --json`. Backs the ci-failure-analysis action, which parses
-/// the `## Failure` block and `Run-Global-Id:` marker out of `description` and
-/// detects its own hidden analyzed-marker (to stay idempotent) across
-/// `description` + `comments`.
+/// the `## Failure` block out of `description` and detects its own hidden
+/// analyzed-marker (to stay idempotent) across `description` + `comments`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IssueInspect {
     /// The issue's Markdown description / body.

@@ -45,11 +45,6 @@ toml = "0.8"
 tower = "0.5"
 tracing = "0.1"
 
-[dependencies.zip]
-version = "2"
-default-features = false
-features = ["deflate"]
-
 [dependencies.pulldown-cmark]
 version = "0.13.4"
 default-features = false
