@@ -155,9 +155,8 @@ pub struct IssueLink {
 
 /// CLAUDE-189: an issue's body plus its comment texts, from
 /// `yt issue inspect --json`. Backs the ci-failure-analysis action, which parses
-/// the `## Failure` block and `Run-Global-Id:` marker out of `description` and
-/// detects its own hidden analyzed-marker (to stay idempotent) across
-/// `description` + `comments`.
+/// the `## Failure` block out of `description` and detects its own hidden
+/// analyzed-marker (to stay idempotent) across `description` + `comments`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IssueInspect {
     /// The issue's Markdown description / body.
