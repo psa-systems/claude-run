@@ -149,7 +149,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     let (gather_backend, gather_guard) = if creds.is_empty() {
         (CliBackend::new(runner.clone()), None)
     } else {
-        let dir = cred_base.join(format!("gather-{}", std::process::id()));
+        let dir = gather_cred_dir(&cred_base);
         let guard = JobCredentials::materialize(&dir, &creds, None)?;
         let backend = credentialed_backend(&runner, &guard);
         (backend, Some(guard))
@@ -323,6 +323,8 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
             // forge keys.json keyed by the issue's resolved VCS host). The guard
             // scrubs them when the job's provider calls finish; concurrent jobs
             // never share a credential file. No token_ref -> host auth, no files.
+            // CLAUDE-209: `run-{run_id}/{job_key}` is already unique per run and
+            // job, so this site needs no extra sequence.
             let (job_backend, _job_creds): (CliBackend, Option<JobCredentials>) =
                 if creds.is_empty() {
                     (CliBackend::new(runner.clone()), None)
@@ -487,6 +489,21 @@ fn sanitize_key(key: &str) -> String {
     key.replace(['/', '\\', '.'], "_")
 }
 
+/// CLAUDE-209: the gather step's credential directory, unique per poll.
+///
+/// Every [`JobCredentials::materialize`] path must be unique per guard, because
+/// the guard's `Drop` removes the whole directory. The three call sites:
+///
+/// - gather (here): `gather-{pid}-{seq}`, unique per poll via
+///   [`secrets::unique_suffix`].
+/// - preflight ([`ForgeAccessCheck::check`]): `access-{pid}-{seq}-{host}-{repo}`,
+///   unique per probe by the same suffix.
+/// - per-job (`run-{run_id}/{job_key}`): already unique per run and job,
+///   unchanged.
+fn gather_cred_dir(cred_base: &Path) -> PathBuf {
+    cred_base.join(format!("gather-{}", secrets::unique_suffix()))
+}
+
 /// CLAUDE-194: the gather-time forge repo-access preflight, injected so `gather`
 /// can probe the FORGE identity (which needs a per-host credential store) without
 /// owning credential materialization.
@@ -527,9 +544,11 @@ impl RepoAccess for ForgeAccessCheck {
         if self.creds.fj_token.is_none() {
             return Ok(());
         }
+        // CLAUDE-209: `{pid}-{seq}`, so two concurrent polls probing the same
+        // repo get separate directories (see [`gather_cred_dir`]).
         let dir = self.cred_base.join(format!(
             "access-{}-{}-{}",
-            std::process::id(),
+            secrets::unique_suffix(),
             sanitize_key(host),
             sanitize_key(repo)
         ));
@@ -2490,6 +2509,104 @@ mod tests {
         .unwrap();
         check.check("dev.a8n.run", "contoso/claude-run").unwrap();
         assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    /// CLAUDE-209: two overlapping polls of one action gather concurrently. Each
+    /// gets its own credential directory, so the first guard's `Drop` (which
+    /// `remove_dir_all`s the directory) cannot scrub the still-running poll's
+    /// `yt` config. With the old `gather-{pid}` name both polls shared a path and
+    /// the survivor's `YOUTRACK_CLI_CONFIG` pointed at a deleted file.
+    #[test]
+    fn concurrent_gather_credentials_do_not_share_a_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let cred_base = base.path().join("YouTrack");
+        let creds = secrets::ResolvedCredentials {
+            yt: Some(("https://yt.test".into(), "tok".into())),
+            ..Default::default()
+        };
+
+        let first_dir = gather_cred_dir(&cred_base);
+        let second_dir = gather_cred_dir(&cred_base);
+        assert_ne!(first_dir, second_dir, "two polls shared a credential dir");
+
+        let first = JobCredentials::materialize(&first_dir, &creds, None).unwrap();
+        let second = JobCredentials::materialize(&second_dir, &creds, None).unwrap();
+        let second_cfg = second
+            .yt_env
+            .iter()
+            .find(|(k, _)| k == "YOUTRACK_CLI_CONFIG")
+            .map(|(_, v)| PathBuf::from(v))
+            .expect("yt env carries YOUTRACK_CLI_CONFIG");
+
+        // The first poll finishes and its guard scrubs its own directory only.
+        drop(first);
+        assert!(!first_dir.exists());
+        assert!(second_dir.join("yt-config.yml").exists());
+        assert!(second_cfg.exists(), "{second_cfg:?} was scrubbed");
+    }
+
+    /// CLAUDE-209: the CLAUDE-194 preflight carries the same uniqueness. Two
+    /// probes of the SAME host and repo (the overlapping-poll case) run against
+    /// separate credential stores, visible as distinct `XDG_DATA_HOME` values.
+    #[test]
+    fn concurrent_preflight_probes_do_not_share_a_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let repo = "contoso/claude-run";
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "fj",
+                    &["--host", "dev.a8n.run", "repo", "view", repo, "--json"],
+                    r#"{"full_name":"contoso/claude-run"}"#,
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        repo,
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+        let fj_creds = Arc::new(secrets::ResolvedCredentials {
+            fj_token: Some("t".into()),
+            ..Default::default()
+        });
+        let check = forge_access_check(
+            &dyn_runner,
+            &fj_creds,
+            base.path(),
+            &crate::action::GithubTarget::default(),
+        )
+        .unwrap();
+        check.check("dev.a8n.run", repo).unwrap();
+        check.check("dev.a8n.run", repo).unwrap();
+
+        let stores: Vec<String> = runner
+            .envs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(bin, _)| bin == "fj")
+            .filter_map(|(_, env)| {
+                env.iter()
+                    .find(|(k, _)| k == "XDG_DATA_HOME")
+                    .map(|(_, v)| v.clone())
+            })
+            .collect();
+        assert_eq!(stores.len(), 4, "two probes, two fj calls each: {stores:?}");
+        assert_ne!(stores[0], stores[2], "probes shared a credential dir");
+        // Within one probe both fj calls read the same store.
+        assert_eq!(stores[0], stores[1]);
+        assert_eq!(stores[2], stores[3]);
     }
 
     /// CLAUDE-131: a configured assignee is written via `yt issue update

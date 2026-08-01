@@ -283,6 +283,19 @@ pub(crate) fn write_fj_keys(xdg_data_home: &Path, host: &str, token: &str) -> Re
     Ok(keys_path)
 }
 
+/// CLAUDE-209: a process-wide unique path segment, `{pid}-{seq}`. The pid alone
+/// is NOT unique: two concurrent polls in one daemon would build the same path
+/// and the first guard to drop would `remove_dir_all` the other's live files.
+pub(crate) fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// CLAUDE-204: a throwaway `$XDG_DATA_HOME` holding a single-host `keys.json`,
 /// removed on drop so a decrypted `log_token_ref` lives only for the one `fj`
 /// call that needs it.
@@ -293,13 +306,7 @@ pub(crate) struct TempFjKeys {
 impl TempFjKeys {
     /// Create the temp store for `host` -> `token`.
     pub(crate) fn create(host: &str, token: &str) -> Result<Self> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "claude-run-fj-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
+        let dir = std::env::temp_dir().join(format!("claude-run-fj-{}", unique_suffix()));
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         write_fj_keys(&dir, host, token)?;

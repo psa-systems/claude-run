@@ -340,7 +340,7 @@ exported, or logged. When a block sets `token_ref`, the runner decrypts the secr
 mode-`0600` credential files (a single-file `yt` config and a temp forgejo `keys.json`), injecting them into the `yt` /
 `fj` children for that job only and scrubbing them when the job finishes. The GitHub PAT (`github.token_ref`) is
 injected as the `gh` child's `GH_TOKEN`, the MCP bearer, and the authenticated push URL for that job only; being an
-env-var / URL component it leaves no on-disk plaintext to scrub and is dropped with the job. When no block sets
+env-var / URL component it leaves no on-disk plaintext to scrub and is dropped with the job. The gather step and the forge preflight materialize their own short-lived stores; every such directory carries a process-wide unique suffix, so two overlapping polls of one action never share a path and one poll finishing can never scrub another's live credential files (CLAUDE-209). When no block sets
 `token_ref`, the CLIs fall back to host-configured credentials (`gh` host auth / `GH_TOKEN` for GitHub) exactly as the
 scripted action did.
 
