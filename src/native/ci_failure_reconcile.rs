@@ -13,9 +13,11 @@
 //!   with no parseable branch/job is skipped (left for manual close); an issue
 //!   already carrying the auto-closed marker is skipped (idempotency).
 //! - gather (Forgejo): for each allow-listed repo, page the runs list
-//!   ([`crate::forge_log::fetch_runs`]) and reduce it to the LATEST run per
-//!   `(branch, workflow_id)`. When the runs list returns `head_branch` null (the
-//!   deployed Forgejo), the branch is resolved from the run's log environment dump
+//!   (`fj actions runs`, [`crate::forge_log::ActionRunsClient`]) and reduce it to
+//!   the LATEST run per `(branch, workflow_id)`. When the runs list carries no
+//!   plain branch name (`fj`'s `head_branch` is Forgejo's `prettyref`, which is
+//!   `#<pr-number>` for a PR run and the bare sha for a ref-deleted push), the
+//!   branch is resolved from the run's log environment dump
 //!   ([`crate::forge_log::resolve_branch`]), bounded by `max_branch_resolves`.
 //! - now-green: read each latest run's per-job status from the jobs
 //!   `fj actions logs` returns ([`crate::forge_log::fetch_run_log`]); a job whose
@@ -29,10 +31,11 @@
 //! - close: every open issue whose `(repo, branch, workflow, job)` exactly matches
 //!   a now-green job is set to `resolved_state` and gets a run-linked comment.
 //!
-//! All Forgejo reads go through `forge_log` (Rust): logs via `fj actions logs`,
-//! the runs list still over REST until FJ-66 ships a CLI command. Never a raw
-//! REST call from a nu snippet (tooling-gap rule). The reconciler performs no
-//! git/PR actions and does not depend on the CLAUDE-189 analysis having run.
+//! All Forgejo reads go through `forge_log` (Rust) and shell out to `fj`: the
+//! runs list via `fj actions runs`, the logs via `fj actions logs` (CLAUDE-205).
+//! Never a raw REST call, and never one from a nu snippet (tooling-gap rule). The
+//! reconciler performs no git/PR actions and does not depend on the CLAUDE-189
+//! analysis having run.
 
 use std::collections::{HashMap, HashSet};
 
@@ -43,8 +46,7 @@ use crate::action::{CiFailureReconcileConfig, NativeConfig};
 use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::error::{Error, Result};
 use crate::forge_log::{
-    self, ActionLogClient, HttpLogTransport, JobLog, LogFetchConfig, LogOutcome, LogTarget,
-    RunEntry, RunsListOutcome,
+    self, ForgeReads, JobLog, LogFetchConfig, LogOutcome, LogTarget, RunEntry, RunsListOutcome,
 };
 use crate::provider::{self, Backend, IssueInspect};
 use crate::secrets::{self, SecretsKey};
@@ -184,12 +186,11 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
         targets.retain(|t| !dup_keys.contains(t.key.as_str()));
     }
 
-    // CLAUDE-204: `fj actions logs` for every log read; the HTTP transport is
-    // only for the runs list `fj` has no command for (TODO(FJ-66)).
-    let logs = crate::provider::FjActionLogs::new(std::sync::Arc::new(
+    // CLAUDE-205: ONE forge client: `fj actions runs` for the runs list and
+    // `fj actions logs` for every log read.
+    let fj = crate::provider::FjForgeReads::new(std::sync::Arc::new(
         crate::provider::ProcessRunner::new(),
     ));
-    let transport = HttpLogTransport::new();
     // Scan one repo at a time; each repo's targets drive which runs matter.
     for repo in repos_in_order(&targets) {
         if cancel.is_cancelled() {
@@ -211,7 +212,7 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
                 continue;
             }
         };
-        let green = gather_now_green(&logs, &transport, &cfg, &token, &repo, &repo_targets);
+        let green = gather_now_green(&fj, &cfg, &token, &repo, &repo_targets);
 
         for gt in &repo_targets {
             if green.iter().any(|g| issue_matches(&gt.coords, &repo, g)) {
@@ -487,46 +488,34 @@ fn build_duplicate_comment(template: &str, dup: &DuplicateClose) -> String {
 /// Best-effort: any Forgejo miss logs and yields no green jobs for the affected
 /// group (the issue stays open), never an error.
 fn gather_now_green(
-    logs: &dyn ActionLogClient,
-    transport: &dyn forge_log::LogTransport,
+    fj: &dyn ForgeReads,
     cfg: &CiFailureReconcileConfig,
     token: &str,
     repo: &str,
     repo_targets: &[&IssueTarget],
 ) -> Vec<GreenJob> {
-    // A representative run URL for the repo (to derive the forge origin).
+    // A representative run URL for the repo (to derive the forge host).
     let Some(any_url) = repo_targets.first().map(|t| t.coords.html_url.clone()) else {
         return Vec::new();
     };
-    let Some(base_url) = forge_log::base_from_html_url(&any_url, repo) else {
-        warn!(repo = %repo, "could not derive the forge origin from the issue run URL; skipping repo");
+    let Some(host) = forge_log::host_from_html_url(&any_url) else {
+        warn!(repo = %repo, "could not derive the forge host from the issue run URL; skipping repo");
         return Vec::new();
     };
 
-    // TODO(FJ-66): the runs list is the one read still on REST; `fj` has no
-    // `actions runs` command to enumerate a repo's workflow runs.
-    let mut runs = match forge_log::fetch_runs(
-        transport,
-        &base_url,
-        repo,
-        token,
-        RECONCILE_MAX_PAGES,
-    ) {
-        Ok(RunsListOutcome::Resolved(runs)) => runs,
-        Ok(RunsListOutcome::AuthDenied(status)) => {
+    // CLAUDE-205: the runs list through `fj actions runs`, paged by the client.
+    let mut runs = match fj.list_runs(&host, repo, RECONCILE_MAX_PAGES, Some(token)) {
+        RunsListOutcome::Resolved(runs) => runs,
+        RunsListOutcome::AuthDenied(status) => {
             warn!(repo = %repo, status, "runs-list auth denied; skipping repo");
             return Vec::new();
         }
-        Ok(RunsListOutcome::NotFound) => {
-            warn!(repo = %repo, "runs list not found (endpoint absent or empty); skipping repo");
+        RunsListOutcome::NotFound => {
+            warn!(repo = %repo, "runs list not found (repo not visible or empty); skipping repo");
             return Vec::new();
         }
-        Ok(RunsListOutcome::Failed(reason)) => {
+        RunsListOutcome::Failed(reason) => {
             warn!(repo = %repo, %reason, "runs-list fetch failed; skipping repo");
-            return Vec::new();
-        }
-        Err(e) => {
-            warn!(repo = %repo, error = %e, "runs-list fetch errored; skipping repo");
             return Vec::new();
         }
     };
@@ -543,15 +532,7 @@ fn gather_now_green(
         .map(|t| t.coords.workflow_id.as_str())
         .collect();
 
-    resolve_missing_branches(
-        logs,
-        cfg,
-        token,
-        repo,
-        &out_dir,
-        &mut runs,
-        &target_workflows,
-    );
+    resolve_missing_branches(fj, cfg, token, repo, &out_dir, &mut runs, &target_workflows);
 
     // The set of (branch, workflow) pairs a target tracks, to skip jobs reads for
     // runs no open issue references.
@@ -566,7 +547,7 @@ fn gather_now_green(
         if !target_pairs.contains(&(run.branch.as_str(), run.workflow_id.as_str())) {
             continue;
         }
-        match fetch_run(logs, token, repo, run, &out_dir) {
+        match fetch_run(fj, token, repo, run, &out_dir) {
             Some(jobs) => green.extend(now_green_jobs(run, &jobs)),
             None => {
                 info!(repo = %repo, run = run.index, "run logs did not resolve; group left open")
@@ -580,7 +561,7 @@ fn gather_now_green(
 /// Fetch one run's redacted per-job logs through `fj actions logs`. `None` on any
 /// miss (the caller leaves the affected group open); never errors.
 fn fetch_run(
-    logs: &dyn ActionLogClient,
+    fj: &dyn ForgeReads,
     token: &str,
     repo: &str,
     run: &RunEntry,
@@ -588,7 +569,7 @@ fn fetch_run(
 ) -> Option<Vec<JobLog>> {
     let target = LogTarget::for_run(&run.html_url, repo, run.index, Some(token.to_string()))?;
     match forge_log::fetch_run_log(
-        logs,
+        fj,
         // CLAUDE-204: these runs finished long ago; one call decides.
         &LogFetchConfig::no_retry(),
         &target,
@@ -612,7 +593,7 @@ fn fetch_run(
 /// deployed Forgejo). Only runs of a target workflow are resolved, newest-first,
 /// bounded by `max_branch_resolves`; reaching the cap is logged (never silent).
 fn resolve_missing_branches(
-    logs: &dyn ActionLogClient,
+    fj: &dyn ForgeReads,
     cfg: &CiFailureReconcileConfig,
     token: &str,
     repo: &str,
@@ -632,7 +613,7 @@ fn resolve_missing_branches(
         }
         resolved += 1;
         let snapshot = run.clone();
-        if let Some(jobs) = fetch_run(logs, token, repo, &snapshot, out_dir) {
+        if let Some(jobs) = fetch_run(fj, token, repo, &snapshot, out_dir) {
             // The environment dump is in whichever job printed it; take the first hit.
             if let Some(b) = jobs
                 .iter()

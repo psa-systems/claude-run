@@ -22,10 +22,10 @@
 #   finalize-> post the analysis as a YouTrack comment and mark the issue analyzed
 #              so it is never analyzed twice (idempotent).
 #
-# Log reads shell out to `fj actions logs`; the workflow-YAML read stays on the
-# REST API until `fj` gains a raw-file command (FJ-67). Both go through
-# `forge_log` (Rust), never a raw REST call from a nu snippet (tooling-gap rule).
-# Redaction is preserved end to end via `forge_log::redact`.
+# Log reads shell out to `fj actions logs` and the workflow-YAML read to
+# `fj repo file` (CLAUDE-205). Both go through `forge_log` (Rust), never a raw
+# REST call and never one from a nu snippet (tooling-gap rule). Redaction is
+# preserved end to end via `forge_log::redact`.
 
 name: ci-failure-analysis
 
@@ -42,7 +42,7 @@ native:
     - "CI failure:"
     - "Auto-fix:"
   # Forgejo PAT (`read:repository` scope) used to fetch the run log through
-  # `fj actions logs` and to read the workflow YAML. It reaches `fj` in a temp
+  # `fj actions logs` and the workflow YAML through `fj repo file`. It reaches `fj` in a temp
   # single-host `keys.json` carrying that one secret and nothing else, never a
   # process argument. The candidate query spans every org, so the token is picked
   # per repo (CLAUDE-200).
