@@ -45,8 +45,9 @@ Runtime dependencies (host-installed, not bundled):
 action names in `forgejo.token_ref` - must carry both **`write:repository`** and **`write:issue`**. Forgejo scopes its
 API by endpoint category rather than by `fj` command name, and the PR path crosses both: `pr create`, `pr merge`,
 `pr status`, `pr view`, and `repo view` are repository-category, while the open-PR lookup (`fj pr search`) and PR
-comments / labels (`fj pr comment`, `fj pr edit labels`) go through the issues API. A repository-only token opens PRs
-until it hits the open-PR lookup and then fails with `403 Forbidden`. The read-only log-fetch token
+comments / labels (`fj pr comment`, `fj pr edit labels`) go through the issues API. A repository-only token is rejected
+at gather time by the repo-access preflight, which probes one read per category (`repo view` and `pr search`) so the
+missing scope is named before a Claude run is paid for. The read-only log-fetch token
 (`log_token_ref`, used by the CI-failure actions) needs only `read:repository`. Per-command breakdown with the endpoint
 each call maps to: `actions/SCHEMA.md`, "Forgejo token scopes".
 
