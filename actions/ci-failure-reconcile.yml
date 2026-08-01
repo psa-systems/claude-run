@@ -45,14 +45,28 @@ native:
     - "Auto-fix:"
   # Allow-list of `owner/repo` full names whose runs are scanned. Each entry is an
   # exact `owner/repo`, a per-owner `owner/*`, or the global `*`. Empty scans
-  # nothing.
+  # nothing. One copy covers every org (CLAUDE-200): the log token is picked per
+  # repo, so a cross-org allow-list no longer reads another org with the wrong PAT.
   repos:
-    - contoso/claude-run
-  # Name of the encrypted secret (CLAUDE-26) holding a Forgejo PAT with the
-  # `read:repository` scope, used to page the runs list, read the jobs endpoint, and resolve a
-  # null-branch run's branch from its log. Required; without it the handler
-  # no-ops.
-  log_token_ref: forgejo-log-pat
+    - globex/*
+    - contoso/*
+    - fabrikam/*
+    - initech/*
+  # Forgejo PAT (`read:repository` scope) used to page the runs list, read the jobs
+  # endpoint, and resolve a null-branch run's branch from its log. Picked per repo
+  # (CLAUDE-200). Omitted here: the mapping is derived from
+  # `config.webhook.sources`, which already holds one `log_token_ref` per org, so a
+  # token is rotated in one place. A repo that maps to no token is skipped with a
+  # warning rather than read with another org's token.
+  #
+  # To override, either name one secret for every repo:
+  #   log_token_ref: forgejo-logs-contoso
+  # or map per repo (exact `owner/repo`, `owner/*`, or `*`; first match wins):
+  #   log_token_ref:
+  #     - repos: ["contoso/*"]
+  #       token_ref: forgejo-logs-contoso
+  #     - repos: ["initech/*", "globex/*"]
+  #       token_ref: forgejo-logs-initech
   # State set on a closed issue (the CLAUDE project's only resolved State).
   resolved_state: Done
   # Run-linked auto-close comment template. {run_index} / {branch} / {run_url} /

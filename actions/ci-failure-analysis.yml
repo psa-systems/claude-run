@@ -41,11 +41,22 @@ native:
   summary_prefixes:
     - "CI failure:"
     - "Auto-fix:"
-  # Name of the encrypted secret (CLAUDE-26) holding a Forgejo PAT with
-  # the `read:repository` scope, used to fetch the run log, resolve the run global id,
-  # and read the workflow YAML through the v16 REST API. Required; without it the
-  # handler no-ops.
-  log_token_ref: forgejo-log-pat
+  # Forgejo PAT (`read:repository` scope) used to fetch the run log, resolve the
+  # run global id, and read the workflow YAML through the v16 REST API. The
+  # candidate query spans every org, so the token is picked per repo (CLAUDE-200).
+  # Omitted here: the mapping is derived from `config.webhook.sources`, which
+  # already holds one `log_token_ref` per org, so a token is rotated in one place
+  # and ONE copy of this action serves every org. An issue whose repo maps to no
+  # token is skipped with a warning (no "log unavailable" note is posted).
+  #
+  # To override, either name one secret for every repo:
+  #   log_token_ref: forgejo-logs-contoso
+  # or map per repo (exact `owner/repo`, `owner/*`, or `*`; first match wins):
+  #   log_token_ref:
+  #     - repos: ["contoso/*"]
+  #       token_ref: forgejo-logs-contoso
+  #     - repos: ["initech/*", "globex/*"]
+  #       token_ref: forgejo-logs-initech
   # Cap (bytes) on the posted analysis comment.
   max_analysis_bytes: 24576
 
