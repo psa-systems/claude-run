@@ -412,7 +412,11 @@ native:
   summary_prefixes: # summary prefixes an issue must start with
     - "CI failure:"
     - "Auto-fix:"
-  log_token_ref: forgejo-log-pat      # encrypted secret: Forgejo PAT (read:repository scope). Required.
+  log_token_ref:                      # per-repo Forgejo PAT; omit to inherit config.webhook.sources
+    - repos: ["contoso/*"]          # exact owner/repo, owner/*, or *; first match wins
+      token_ref: forgejo-logs-contoso
+    - repos: ["initech/*", "globex/*"]
+      token_ref: forgejo-logs-initech
   max_analysis_bytes: 24576           # cap on the posted analysis comment
 ```
 
@@ -421,12 +425,41 @@ native:
 | `enabled`            | `true`                         | Master toggle. While false the handler no-ops.                       |
 | `query`              | `#Unresolved`                  | YouTrack candidate query. MUST NOT filter by `AI Agent` (see above). |
 | `summary_prefixes`   | `["CI failure:", "Auto-fix:"]` | Summary prefixes an issue must start with to be analyzed.            |
-| `log_token_ref`      | none                           | Encrypted-secret name (CLAUDE-26) of a Forgejo PAT with the **`read:repository`** scope, used to fetch the log, resolve the run global id, and read the workflow YAML. Read-only and repository-category only: every endpoint it touches (`/repos/{o}/{r}/actions/runs/{id}/logs`, `.../jobs`, `/repos/{o}/{r}/raw/{path}`) is in Forgejo's repository group, so unlike `forgejo.token_ref` this one needs no issue scope (CLAUDE-196). Required; without it the handler no-ops. |
+| `log_token_ref`      | the webhook sources            | Forgejo PAT with the **`read:repository`** scope, used to fetch the log, resolve the run global id, and read the workflow YAML. Either one encrypted-secret name (CLAUDE-26) for every repo or a per-repo mapping (CLAUDE-200, see **Per-repo log tokens**). Read-only and repository-category only: every endpoint it touches (`/repos/{o}/{r}/actions/runs/{id}/logs`, `.../jobs`, `/repos/{o}/{r}/raw/{path}`) is in Forgejo's repository group, so unlike `forgejo.token_ref` this one needs no issue scope (CLAUDE-196). Omitted, the mapping is derived from `config.webhook.sources`. |
 | `max_analysis_bytes` | `24576`                        | Cap (bytes) on the posted analysis comment.                          |
 
 **Deployment prerequisite:** the runner's Forgejo must expose the v16 REST run-logs endpoint
 (`GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_id}/logs`, Forgejo PR 12666) and the runs-list endpoint. On a
 pre-v16 instance both 404 and the handler posts an "unavailable" note rather than crashing.
+
+##### Per-repo log tokens (CLAUDE-200)
+
+Both CI-failure actions select issues across a global `#Unresolved` query, so their candidate set spans every org and no
+single PAT can serve it. `log_token_ref` therefore takes either form:
+
+```yaml
+log_token_ref: forgejo-logs-contoso   # one secret for every repo
+```
+
+```yaml
+log_token_ref:                          # per-repo; the first matching entry wins
+  - repos: ["contoso/*"]              # exact owner/repo, per-owner owner/*, or the global *
+    token_ref: forgejo-logs-contoso
+  - repos: ["initech/*", "globex/*"]
+    token_ref: forgejo-logs-initech
+```
+
+The scalar form is exactly a single `*` entry, so a pre-CLAUDE-200 config keeps working. Patterns use the same three
+literal forms as the webhook allow-list (`crate::config::repo_matches`); ordering, not specificity, decides, so put the
+exact entries first.
+
+**Omitting the key** derives the mapping from `config.webhook.sources`: each source contributes its `allowed_repos` and
+its own `log_token_ref` (a source carrying no log token contributes nothing), in source-name order. That keeps one place
+to rotate a token and lets ONE deployed copy of each action cover every org.
+
+A repo that matches no entry is **skipped with a warning**: `ci-failure-analysis` leaves the issue untouched and posts no
+"log unavailable" note (that note is reserved for a real log miss on a repo the deployment does hold a token for), and
+`ci-failure-reconcile` skips the repo before any Forgejo read rather than spending a request that would 401.
 
 #### `kind: ci-failure-reconcile`
 
@@ -459,7 +492,11 @@ native:
     - "Auto-fix:"
   repos: # allow-list: exact owner/repo, owner/*, or *
     - contoso/claude-run
-  log_token_ref: forgejo-log-pat      # encrypted secret: Forgejo PAT (read:repository scope). Required.
+  log_token_ref:                      # per-repo Forgejo PAT; omit to inherit config.webhook.sources
+    - repos: ["contoso/*"]          # exact owner/repo, owner/*, or *; first match wins
+      token_ref: forgejo-logs-contoso
+    - repos: ["initech/*", "globex/*"]
+      token_ref: forgejo-logs-initech
   resolved_state: Done                # State set on a closed issue
   close_comment: "Auto-closed: run #{run_index} on `{branch}` succeeded ({run_url}); the failing `{job}` is green, root cause resolved."
   max_branch_resolves: 40             # cap on per-repo branch-from-log resolutions
@@ -471,7 +508,7 @@ native:
 | `query`               | `#Unresolved`                  | YouTrack candidate query. MUST NOT filter by `AI Agent`.                                 |
 | `summary_prefixes`    | `["CI failure:", "Auto-fix:"]` | Summary prefixes an issue must start with to be reconciled.                              |
 | `repos`               | `[]`                           | Allow-list of `owner/repo` full names to scan: exact `owner/repo`, `owner/*`, or `*`. Empty scans nothing. |
-| `log_token_ref`       | none                           | Encrypted-secret name (CLAUDE-26) of a Forgejo PAT with the **`read:repository`** scope, used to page the runs list, read the jobs endpoint, and resolve a null-branch run's branch from its log. Repository-category only, same as the `ci-failure-analysis` log token (CLAUDE-196). Required; without it the handler no-ops. |
+| `log_token_ref`       | the webhook sources            | Forgejo PAT with the **`read:repository`** scope, used to page the runs list, read the jobs endpoint, and resolve a null-branch run's branch from its log. Either one encrypted-secret name (CLAUDE-26) for every repo or a per-repo mapping (CLAUDE-200, see **Per-repo log tokens**). Repository-category only, same as the `ci-failure-analysis` log token (CLAUDE-196). Omitted, the mapping is derived from `config.webhook.sources`. |
 | `resolved_state`      | `Done`                         | State set on a closed issue (the CLAUDE project's only resolved State).                  |
 | `close_comment`       | (the auto-closed sentence)     | Run-linked close-comment template; `{run_index}` / `{branch}` / `{run_url}` / `{job}` are substituted, and a hidden auto-closed marker is appended. |
 | `max_branch_resolves` | `40`                           | Cap on per-repo branch-from-log resolutions when the runs list returns `head_branch` null. Reaching it is logged, never silent. |

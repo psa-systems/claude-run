@@ -183,6 +183,23 @@ impl Default for WebhookConfig {
     }
 }
 
+/// True when `repo` (an `owner/repo` full name) matches one of the allow-list
+/// patterns (CLAUDE-79): exact `owner/repo`, per-owner `owner/*`, or the global
+/// `*`. Only these three literal forms - no general globbing - so a typo cannot
+/// silently widen what a consumer acts on. Matching is case-sensitive; an empty
+/// list matches nothing (fail closed). Shared by the webhook allow-list, the
+/// reconciler's `repos`, and the CLAUDE-200 per-repo log-token mapping so all
+/// three read a pattern the same way.
+pub fn repo_matches(patterns: &[String], repo: &str) -> bool {
+    patterns.iter().any(|pat| match pat.as_str() {
+        "*" => true,
+        p => match p.strip_suffix("/*") {
+            Some(owner) => repo.split_once('/').is_some_and(|(o, _)| o == owner),
+            None => p == repo,
+        },
+    })
+}
+
 /// True when `name` is a clean source name (lowercase `[a-z0-9_-]`, non-empty)
 /// usable verbatim as a URL path segment with no escaping. Source names outside
 /// this set still work as map keys but produce an ambiguous / escaped URL, so

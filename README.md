@@ -449,8 +449,8 @@ the code-fix runner, so analysis, a read-only enrichment, must not collide with 
 pre-v16 endpoint) posts a short "unavailable" note once and leaves the issue un-marked so a later run retries; it never
 crashes or marks analyzed on a miss. Log / runs-list / workflow-YAML reads stay inside `forge_log` (Rust), never a raw
 REST call from a nu snippet (FJ-22), and redaction is preserved end to end via `forge_log::redact`, so no token lands in a
-posted comment. Configure it in `actions/ci-failure-analysis.yml` (`log_token_ref` names the Forgejo PAT secret;
-`query` / `summary_prefixes` / `max_analysis_bytes` tune selection and the comment cap). See `actions/SCHEMA.md`
+posted comment. Configure it in `actions/ci-failure-analysis.yml` (`log_token_ref` picks the Forgejo PAT per repo, see
+below; `query` / `summary_prefixes` / `max_analysis_bytes` tune selection and the comment cap). See `actions/SCHEMA.md`
 (`kind: ci-failure-analysis`).
 
 ### Auto-close of fixed CI-failure issues (CLAUDE-191)
@@ -473,8 +473,18 @@ the run's log checkout section, bounded by `max_branch_resolves`. The reconciler
 can be missed or arrive out of order, and success events are dropped at the ingress; polling reflects current truth); it
 performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. All runs-list / jobs / log reads stay
 inside `forge_log` (Rust), never a raw REST call from a nu snippet (FJ-22). Configure it in
-`actions/ci-failure-reconcile.yml` (`repos` names the allow-list, `log_token_ref` the Forgejo PAT secret). See
-`actions/SCHEMA.md` (`kind: ci-failure-reconcile`).
+`actions/ci-failure-reconcile.yml` (`repos` names the allow-list, `log_token_ref` picks the Forgejo PAT per repo, see
+below). See `actions/SCHEMA.md` (`kind: ci-failure-reconcile`).
+
+### Per-repo log tokens for the CI-failure actions (CLAUDE-200)
+
+Both CI-failure actions scan a global `#Unresolved` query, so their candidate issues span every org while each org has its
+own Forgejo PAT. `log_token_ref` therefore accepts either one secret name for every repo or an ordered per-repo mapping
+(`repos:` patterns in the webhook allow-list forms plus a `token_ref:`, first match wins). Omitting the key derives the
+mapping from `config.webhook.sources`, which already carries one `log_token_ref` per org: a token is rotated in one place
+and ONE deployed copy of each action covers every org. A repo that matches no entry is skipped with a warning, never read
+with another org's token, so `ci-failure-analysis` posts no "log unavailable" note on an issue it holds no token for and
+`ci-failure-reconcile` spends no request that would 401. See `actions/SCHEMA.md` ("Per-repo log tokens").
 
 ### Migration from the single-source listener (CLAUDE-87)
 

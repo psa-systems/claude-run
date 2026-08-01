@@ -578,6 +578,84 @@ impl Default for ForgejoCiFixConfig {
     }
 }
 
+/// CLAUDE-200: how a native CI-failure action picks the Forgejo log token for the
+/// repo an issue names. Both actions select issues across a global `#Unresolved`
+/// query, so their candidate set spans every org and one token cannot serve them
+/// all.
+///
+/// Two YAML forms:
+///
+/// ```yaml
+/// log_token_ref: forgejo-logs-contoso    # one token for every repo
+/// ```
+///
+/// ```yaml
+/// log_token_ref:                          # first matching entry wins
+///   - repos: ["contoso/*"]
+///     token_ref: forgejo-logs-contoso
+///   - repos: ["initech/*"]
+///     token_ref: forgejo-logs-initech
+/// ```
+///
+/// The scalar form behaves exactly like a single `*` entry, so a pre-CLAUDE-200
+/// config keeps working. A repo matching no entry resolves to `None`, and the
+/// handler skips that repo (or issue) with a warning rather than attempting it
+/// with another org's token.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum LogTokenRef {
+    /// One secret for every repo (the pre-CLAUDE-200 scalar form).
+    Global(String),
+    /// Ordered per-repo entries; the first whose pattern matches wins.
+    PerRepo(Vec<LogTokenEntry>),
+}
+
+/// One entry of a [`LogTokenRef::PerRepo`] mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogTokenEntry {
+    /// Repo patterns this entry serves, in the webhook allow-list forms: exact
+    /// `owner/repo`, per-owner `owner/*`, or the global `*`.
+    pub repos: Vec<String>,
+    /// Name of the encrypted secret (CLAUDE-26) holding the Forgejo PAT used for
+    /// a repo this entry matches.
+    pub token_ref: String,
+}
+
+impl LogTokenRef {
+    /// The secret name to use for `repo` (an `owner/repo` full name), or `None`
+    /// when no entry matches (the caller skips the repo instead of guessing).
+    pub fn resolve(&self, repo: &str) -> Option<&str> {
+        match self {
+            LogTokenRef::Global(name) => Some(name.as_str()),
+            LogTokenRef::PerRepo(entries) => entries
+                .iter()
+                .find(|e| crate::config::repo_matches(&e.repos, repo))
+                .map(|e| e.token_ref.as_str()),
+        }
+    }
+
+    /// The mapping derived from the webhook sources, used when an action
+    /// configures none: one entry per source that carries a `log_token_ref`,
+    /// serving that source's `allowed_repos`, in source-name order. Keeps a token
+    /// rotation in one place (the Webhook settings section) instead of duplicated
+    /// per action.
+    pub fn from_webhook_sources(webhook: &crate::config::WebhookConfig) -> LogTokenRef {
+        LogTokenRef::PerRepo(
+            webhook
+                .sources
+                .values()
+                .filter_map(|src| {
+                    src.log_token_ref.as_ref().map(|token_ref| LogTokenEntry {
+                        repos: src.allowed_repos.clone(),
+                        token_ref: token_ref.clone(),
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
 /// Config for the native CI-failure-analysis handler (CLAUDE-189). Supplied under
 /// the action's `native:` key when `kind: ci-failure-analysis`.
 ///
@@ -608,12 +686,12 @@ pub struct CiFailureAnalysisConfig {
     /// Summary prefixes an issue must start with to be analyzed. Default
     /// `["CI failure:", "Auto-fix:"]`, matching the mint summaries.
     pub summary_prefixes: Vec<String>,
-    /// Name of the encrypted secret (CLAUDE-26) holding a Forgejo PAT with
-    /// repository read scope, used to fetch the run log, resolve the run global
-    /// id, and read the workflow YAML through the v16 REST API. When unset the
-    /// handler no-ops with a warning (private-repo logs cannot be fetched
-    /// anonymously).
-    pub log_token_ref: Option<String>,
+    /// Forgejo PAT (repository read scope) used to fetch the run log, resolve the
+    /// run global id, and read the workflow YAML through the v16 REST API. Either
+    /// one secret name for every repo or a per-repo mapping (CLAUDE-200). When
+    /// unset the mapping is derived from `config.webhook.sources`; an issue whose
+    /// repo resolves to no token is skipped with a warning.
+    pub log_token_ref: Option<LogTokenRef>,
     /// Cap (bytes) on the posted analysis comment, so a runaway agent reply cannot
     /// blow the comment. Default 24 KiB.
     pub max_analysis_bytes: usize,
@@ -667,11 +745,13 @@ pub struct CiFailureReconcileConfig {
     /// (the same three literal forms the webhook allow-list accepts). Empty (the
     /// default) scans nothing, so the reconciler must be given the repos to poll.
     pub repos: Vec<String>,
-    /// Name of the encrypted secret (CLAUDE-26) holding a Forgejo PAT with
-    /// repository read scope, used to page the runs list, read the jobs endpoint,
-    /// and (when `head_branch` is null) fetch a run's log to resolve its branch.
-    /// When unset the handler no-ops with a warning.
-    pub log_token_ref: Option<String>,
+    /// Forgejo PAT (repository read scope) used to page the runs list, read the
+    /// jobs endpoint, and (when `head_branch` is null) fetch a run's log to
+    /// resolve its branch. Either one secret name for every repo or a per-repo
+    /// mapping (CLAUDE-200). When unset the mapping is derived from
+    /// `config.webhook.sources`; a repo that resolves to no token is skipped with
+    /// a warning.
+    pub log_token_ref: Option<LogTokenRef>,
     /// The State value set on a closed issue. Default `Done` (the CLAUDE project's
     /// only resolved State).
     pub resolved_state: String,
@@ -1285,7 +1365,7 @@ name: ci-failure-analysis
 kind: ci-failure-analysis
 native:
   query: \"#Unresolved\"
-  log_token_ref: forgejo-log-pat
+  log_token_ref: forgejo-logs-contoso
 ";
         let loaded = validate_str(raw, "<candidate>").unwrap();
         assert_eq!(loaded.action.kind, ActionKind::CiFailureAnalysis);
@@ -1295,7 +1375,11 @@ native:
         };
         assert!(cfg.enabled);
         assert_eq!(cfg.query, "#Unresolved");
-        assert_eq!(cfg.log_token_ref.as_deref(), Some("forgejo-log-pat"));
+        // Scalar form: one token for every repo (CLAUDE-200 back-compat).
+        assert_eq!(
+            cfg.log_token_ref,
+            Some(LogTokenRef::Global("forgejo-logs-contoso".to_string()))
+        );
         // Unset fields fall back to the documented defaults.
         assert_eq!(
             cfg.summary_prefixes,
@@ -1377,7 +1461,7 @@ kind: ci-failure-reconcile
 native:
   repos:
     - contoso/claude-run
-  log_token_ref: forgejo-log-pat
+  log_token_ref: forgejo-logs-contoso
 ";
         let loaded = validate_str(raw, "<candidate>").unwrap();
         assert_eq!(loaded.action.kind, ActionKind::CiFailureReconcile);
@@ -1387,7 +1471,11 @@ native:
         };
         assert!(cfg.enabled);
         assert_eq!(cfg.repos, vec!["contoso/claude-run".to_string()]);
-        assert_eq!(cfg.log_token_ref.as_deref(), Some("forgejo-log-pat"));
+        // Scalar form: one token for every repo (CLAUDE-200 back-compat).
+        assert_eq!(
+            cfg.log_token_ref,
+            Some(LogTokenRef::Global("forgejo-logs-contoso".to_string()))
+        );
         // Unset fields fall back to the documented defaults.
         assert_eq!(cfg.query, "#Unresolved");
         assert_eq!(
@@ -1436,6 +1524,212 @@ native:
             validate_str(&bogus, "<candidate>").unwrap_err(),
             Error::Yaml(_)
         ));
+    }
+
+    // ---- CLAUDE-200: per-repo log-token mapping ---------------------------
+
+    fn per_repo_tokens() -> LogTokenRef {
+        LogTokenRef::PerRepo(vec![
+            LogTokenEntry {
+                repos: vec!["contoso/claude-run".to_string()],
+                token_ref: "forgejo-logs-claude-run".to_string(),
+            },
+            LogTokenEntry {
+                repos: vec!["contoso/*".to_string()],
+                token_ref: "forgejo-logs-contoso".to_string(),
+            },
+            LogTokenEntry {
+                repos: vec!["initech/*".to_string(), "globex/*".to_string()],
+                token_ref: "forgejo-logs-initech".to_string(),
+            },
+        ])
+    }
+
+    /// Exact, per-owner and multi-pattern entries each resolve their own token.
+    #[test]
+    fn per_repo_mapping_matches_exact_and_owner_globs() {
+        let t = per_repo_tokens();
+        assert_eq!(
+            t.resolve("contoso/claude-run"),
+            Some("forgejo-logs-claude-run")
+        );
+        assert_eq!(
+            t.resolve("contoso/governance"),
+            Some("forgejo-logs-contoso")
+        );
+        assert_eq!(
+            t.resolve("initech/chat"),
+            Some("forgejo-logs-initech")
+        );
+        assert_eq!(
+            t.resolve("globex/runner"),
+            Some("forgejo-logs-initech")
+        );
+    }
+
+    /// First match wins: the exact entry precedes the owner glob that also covers
+    /// the repo, so ordering (not specificity) decides.
+    #[test]
+    fn per_repo_mapping_takes_the_first_matching_entry() {
+        assert_eq!(
+            per_repo_tokens().resolve("contoso/claude-run"),
+            Some("forgejo-logs-claude-run")
+        );
+        // Reversed order: the owner glob now wins for the same repo.
+        let reversed = LogTokenRef::PerRepo(vec![
+            LogTokenEntry {
+                repos: vec!["contoso/*".to_string()],
+                token_ref: "forgejo-logs-contoso".to_string(),
+            },
+            LogTokenEntry {
+                repos: vec!["contoso/claude-run".to_string()],
+                token_ref: "forgejo-logs-claude-run".to_string(),
+            },
+        ]);
+        assert_eq!(
+            reversed.resolve("contoso/claude-run"),
+            Some("forgejo-logs-contoso")
+        );
+    }
+
+    /// A repo no entry covers resolves to `None`, so the handler skips it instead
+    /// of reading Forgejo with another org's token.
+    #[test]
+    fn per_repo_mapping_returns_none_for_an_unmatched_repo() {
+        assert!(per_repo_tokens().resolve("someone-else/repo").is_none());
+        assert!(LogTokenRef::PerRepo(Vec::new())
+            .resolve("contoso/claude-run")
+            .is_none());
+    }
+
+    /// The scalar form and an explicit `*` entry both serve every repo.
+    #[test]
+    fn scalar_and_global_entry_serve_every_repo() {
+        let scalar = LogTokenRef::Global("forgejo-logs-contoso".to_string());
+        assert_eq!(
+            scalar.resolve("contoso/claude-run"),
+            Some("forgejo-logs-contoso")
+        );
+        assert_eq!(
+            scalar.resolve("whoever/whatever"),
+            Some("forgejo-logs-contoso")
+        );
+        let star = LogTokenRef::PerRepo(vec![LogTokenEntry {
+            repos: vec!["*".to_string()],
+            token_ref: "forgejo-logs-contoso".to_string(),
+        }]);
+        assert_eq!(
+            star.resolve("whoever/whatever"),
+            Some("forgejo-logs-contoso")
+        );
+    }
+
+    /// Both YAML forms parse into the same type, so an existing action keeps
+    /// working while a new one can map per repo.
+    #[test]
+    fn both_log_token_yaml_forms_parse() {
+        let raw = "\
+name: cfa
+kind: ci-failure-analysis
+native:
+  query: \"#Unresolved\"
+  log_token_ref:
+    - repos: [\"contoso/*\"]
+      token_ref: forgejo-logs-contoso
+    - repos: [\"initech/*\", \"fabrikam/*\"]
+      token_ref: forgejo-logs-initech
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::CiFailureAnalysis(cfg)) = loaded.action.native else {
+            panic!("expected ci-failure-analysis native config");
+        };
+        let tokens = cfg.log_token_ref.expect("mapping parsed");
+        assert_eq!(
+            tokens.resolve("contoso/claude-run"),
+            Some("forgejo-logs-contoso")
+        );
+        assert_eq!(
+            tokens.resolve("fabrikam/forgejo-cli"),
+            Some("forgejo-logs-initech")
+        );
+        assert!(tokens.resolve("elsewhere/repo").is_none());
+
+        // An unknown key inside an entry is rejected, not silently ignored.
+        let bogus = raw.replace("token_ref: forgejo-logs-contoso", "tokenref: typo");
+        assert!(matches!(
+            validate_str(&bogus, "<candidate>").unwrap_err(),
+            Error::Yaml(_)
+        ));
+    }
+
+    /// With no mapping on the action, the webhook sources supply one: each source
+    /// serves its own `allowed_repos` with its own `log_token_ref`, so ONE
+    /// deployed action copy covers every org (a source with no token is skipped).
+    #[test]
+    fn webhook_sources_supply_the_default_mapping() {
+        use crate::config::{WebhookConfig, WebhookSource};
+        let mut webhook = WebhookConfig::default();
+        webhook.sources.insert(
+            "contoso".to_string(),
+            WebhookSource {
+                allowed_repos: vec!["contoso/*".to_string()],
+                log_token_ref: Some("forgejo-logs-contoso".to_string()),
+                ..WebhookSource::default()
+            },
+        );
+        webhook.sources.insert(
+            "initech".to_string(),
+            WebhookSource {
+                allowed_repos: vec!["initech/*".to_string()],
+                log_token_ref: Some("forgejo-logs-initech".to_string()),
+                ..WebhookSource::default()
+            },
+        );
+        webhook.sources.insert(
+            "tokenless".to_string(),
+            WebhookSource {
+                allowed_repos: vec!["someone-else/*".to_string()],
+                log_token_ref: None,
+                ..WebhookSource::default()
+            },
+        );
+
+        let tokens = LogTokenRef::from_webhook_sources(&webhook);
+        // Issues from two different orgs, one mapping.
+        assert_eq!(
+            tokens.resolve("contoso/claude-run"),
+            Some("forgejo-logs-contoso")
+        );
+        assert_eq!(
+            tokens.resolve("initech/chat"),
+            Some("forgejo-logs-initech")
+        );
+        // A source carrying no log token contributes no entry, so its repos are
+        // skipped rather than attempted with another org's token.
+        assert!(tokens.resolve("someone-else/repo").is_none());
+        assert!(tokens.resolve("unmapped/repo").is_none());
+    }
+
+    /// CLAUDE-200: `forgejo-log-pat` never existed in the deployed secrets store,
+    /// so neither shipped action nor the schema doc may name it again.
+    #[test]
+    fn shipped_ci_failure_config_does_not_name_the_nonexistent_log_secret() {
+        for (path, src) in [
+            (
+                "actions/ci-failure-analysis.yml",
+                include_str!("../actions/ci-failure-analysis.yml"),
+            ),
+            (
+                "actions/ci-failure-reconcile.yml",
+                include_str!("../actions/ci-failure-reconcile.yml"),
+            ),
+            ("actions/SCHEMA.md", include_str!("../actions/SCHEMA.md")),
+        ] {
+            assert!(
+                !src.contains("forgejo-log-pat"),
+                "{path} still names the nonexistent secret forgejo-log-pat"
+            );
+        }
     }
 
     /// The default query must NEVER select by `AI Agent`: reconcile is independent

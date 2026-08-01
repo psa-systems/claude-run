@@ -1401,18 +1401,11 @@ pub fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
 }
 
 /// True when `repo` (an `owner/repo` full name) matches one of the allow-list
-/// patterns (CLAUDE-79): exact `owner/repo`, per-owner `owner/*`, or the global
-/// `*`. Only these three literal forms - no general globbing - so a typo cannot
-/// silently widen what the issue-minting pipeline acts on. Matching is
-/// case-sensitive, like the original exact match. An empty list denies all.
+/// patterns (CLAUDE-79). The three literal forms and the case-sensitive,
+/// empty-denies-all semantics live in [`crate::config::repo_matches`], shared with
+/// the reconciler's `repos` and the per-repo log-token mapping (CLAUDE-200).
 fn repo_allowed(allowed: &[String], repo: &str) -> bool {
-    allowed.iter().any(|pat| match pat.as_str() {
-        "*" => true,
-        p => match p.strip_suffix("/*") {
-            Some(owner) => repo.split_once('/').is_some_and(|(o, _)| o == owner),
-            None => p == repo,
-        },
-    })
+    crate::config::repo_matches(allowed, repo)
 }
 
 /// Build a [`VerifiedFailureEvent`] when the payload is an `action_run_failure`

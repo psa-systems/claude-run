@@ -24,7 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::action::{ActionKind, LoadedAction};
+use crate::action::{ActionKind, LoadedAction, LogTokenRef};
 use crate::cancel::RunRegistry;
 use crate::claude::ClaudeInvoker;
 use crate::concurrency::{KeyGate, Limiter};
@@ -87,6 +87,28 @@ pub async fn dispatch(ctx: NativeContext<'_>) -> Result<()> {
         None => Err(Error::NativeUnimplemented {
             kind: kind.as_str().to_string(),
         }),
+    }
+}
+
+/// CLAUDE-200: the per-repo Forgejo log-token mapping a CI-failure handler runs
+/// with: the action's own mapping when it configures one, else the mapping
+/// derived from `config.webhook.sources`, so a token is rotated in one place. An
+/// unreadable webhook section yields an empty mapping (every repo skipped with a
+/// warning) rather than a wrong token.
+pub(crate) async fn effective_log_tokens(
+    pool: &SqlitePool,
+    paths: &Paths,
+    configured: Option<&LogTokenRef>,
+) -> LogTokenRef {
+    if let Some(tokens) = configured {
+        return tokens.clone();
+    }
+    match crate::settings::effective_webhook(pool, paths).await {
+        Ok(webhook) => LogTokenRef::from_webhook_sources(&webhook),
+        Err(e) => {
+            tracing::warn!(error = %e, "reading the webhook sources for the log-token fallback failed; no repo will resolve a token");
+            LogTokenRef::PerRepo(Vec::new())
+        }
     }
 }
 
