@@ -18,7 +18,7 @@
 #     `mod tests` on the library target, which common's default `--bins` skips.
 #   - dockerfile defaults to oci-build/Dockerfile, which is where it lives here.
 #
-# Inherited from common/common.just: default, install-hooks, pre-commit
+# Inherited from common/common.just: install-hooks, pre-commit
 # (+ -compose / -docker), check-fmt, check-clippy, check-build, check-docker,
 # fmt, lint, typecheck, build, test, build-docker, build-docker-export,
 # dev-clean, dev-clean-all, create-release (+ -generic / -workspace). Cargo.toml
@@ -32,8 +32,12 @@
 # left unused); dev-clean detects the missing compose.dev.yml and skips its
 # teardown, so it needs no override.
 #
-# Only two recipes below override a common recipe (`check`, `run`); the rest
-# have no common counterpart.
+# Three recipes below override a common recipe (`default`, `check`, `run`); the
+# rest have no common counterpart.
+#
+# Recipe ORDER matters here: just picks the default recipe by source order and a
+# top-level definition outranks an imported one, so `default` must stay the
+# FIRST recipe in this file. Do not move it down or add a recipe above it.
 
 # A recipe defined here overrides the imported one of the same name. common
 # already sets allow-duplicate-variables (which lets `app` below override its
@@ -55,6 +59,13 @@ dev_image := "dev.a8n.run/pandoras-box/rust-builder-musl:v1.0.0-rust1.94-alpine"
 # Run the full test suite in pre-commit: the unit tests are library-target
 # tests in src/**, which common's default `--bins` would skip.
 test_args := ""
+
+# -- Default (override) -------------------------------------------------------
+
+# List available recipes. Must stay the FIRST recipe in this file: just resolves the default recipe by source order, and a top-level definition outranks the imported one, so whatever appears first here wins over common's `default`.
+[group: 'dev']
+default:
+    @just --list
 
 # -- Checks (override) --------------------------------------------------------
 
