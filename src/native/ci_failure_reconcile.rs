@@ -17,17 +17,18 @@
 //!   `(branch, workflow_id)`. When the runs list returns `head_branch` null (the
 //!   deployed Forgejo), the branch is resolved from the run's log checkout section
 //!   ([`crate::forge_log::resolve_branch`]), bounded by `max_branch_resolves`.
-//! - now-green: read each latest run's per-job status from the jobs endpoint
-//!   ([`crate::forge_log::fetch_run_jobs`]); a job whose status is `success` is a
-//!   now-green `(branch, workflow_id, job)`. Because the reduction keeps the
-//!   LATEST run, a newer failure after an older green run leaves the job red and
-//!   the issue open.
+//! - now-green: read each latest run's per-job status from the jobs
+//!   `fj actions logs` returns ([`crate::forge_log::fetch_run_log`]); a job whose
+//!   status is `success` is a now-green `(branch, workflow_id, job)`. Because the
+//!   reduction keeps the LATEST run, a newer failure after an older green run
+//!   leaves the job red and the issue open.
 //! - close: every open issue whose `(repo, branch, workflow, job)` exactly matches
 //!   a now-green job is set to `resolved_state` and gets a run-linked comment.
 //!
-//! All Forgejo reads go through `forge_log` (Rust), never a raw REST call from a
-//! nu snippet (tooling-gap rule, FJ-22). The reconciler performs no git/PR actions
-//! and does not depend on the CLAUDE-189 analysis having run.
+//! All Forgejo reads go through `forge_log` (Rust): logs via `fj actions logs`,
+//! the runs list still over REST until FJ-66 ships a CLI command. Never a raw
+//! REST call from a nu snippet (tooling-gap rule). The reconciler performs no
+//! git/PR actions and does not depend on the CLAUDE-189 analysis having run.
 
 use std::collections::{HashMap, HashSet};
 
@@ -38,8 +39,8 @@ use crate::action::{CiFailureReconcileConfig, NativeConfig};
 use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::error::{Error, Result};
 use crate::forge_log::{
-    self, HttpLogTransport, JobInfo, JobsOutcome, LogFetchConfig, RunEntry, RunJobsApiTarget,
-    RunLogsApiTarget, RunsListApiTarget, RunsListOutcome,
+    self, ActionLogClient, HttpLogTransport, JobLog, LogFetchConfig, LogOutcome, LogTarget,
+    RunEntry, RunsListOutcome,
 };
 use crate::provider::{self, Backend, IssueInspect};
 use crate::secrets::{self, SecretsKey};
@@ -157,6 +158,11 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
         warn!(run_id, error = %e, "recording planned keys failed (continuing)");
     }
 
+    // CLAUDE-204: `fj actions logs` for every log read; the HTTP transport is
+    // only for the runs list `fj` has no command for (TODO(FJ-66)).
+    let logs = crate::provider::FjActionLogs::new(std::sync::Arc::new(
+        crate::provider::ProcessRunner::new(),
+    ));
     let transport = HttpLogTransport::new();
     let mut closed: u32 = 0;
     // Scan one repo at a time; each repo's targets drive which runs matter.
@@ -180,7 +186,7 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
                 continue;
             }
         };
-        let green = gather_now_green(&transport, &cfg, &token, &repo, &repo_targets);
+        let green = gather_now_green(&logs, &transport, &cfg, &token, &repo, &repo_targets);
 
         for gt in &repo_targets {
             if green.iter().any(|g| issue_matches(&gt.coords, &repo, g)) {
@@ -354,10 +360,11 @@ fn parse_issue_coords(inspect: &IssueInspect) -> IssueParse {
 /// Gather every now-green `(branch, workflow, job)` for `repo` that a target issue
 /// tracks. Pages the runs list, resolves any null branch from the run's log
 /// (bounded), reduces to the latest run per `(branch, workflow_id)`, and reads
-/// each latest run's per-job success from the jobs endpoint. Best-effort: any
-/// Forgejo miss logs and yields no green jobs for the affected group (the issue
-/// stays open), never an error.
+/// each latest run's per-job success from the jobs `fj actions logs` returns.
+/// Best-effort: any Forgejo miss logs and yields no green jobs for the affected
+/// group (the issue stays open), never an error.
 fn gather_now_green(
+    logs: &dyn ActionLogClient,
     transport: &dyn forge_log::LogTransport,
     cfg: &CiFailureReconcileConfig,
     token: &str,
@@ -368,12 +375,20 @@ fn gather_now_green(
     let Some(any_url) = repo_targets.first().map(|t| t.coords.html_url.clone()) else {
         return Vec::new();
     };
-    let Some(runs_target) = RunsListApiTarget::for_run(&any_url, repo, token.to_string()) else {
+    let Some(base_url) = forge_log::base_from_html_url(&any_url, repo) else {
         warn!(repo = %repo, "could not derive the forge origin from the issue run URL; skipping repo");
         return Vec::new();
     };
 
-    let mut runs = match forge_log::fetch_runs(transport, &runs_target, RECONCILE_MAX_PAGES) {
+    // TODO(FJ-66): the runs list is the one read still on REST; `fj` has no
+    // `actions runs` command to enumerate a repo's workflow runs.
+    let mut runs = match forge_log::fetch_runs(
+        transport,
+        &base_url,
+        repo,
+        token,
+        RECONCILE_MAX_PAGES,
+    ) {
         Ok(RunsListOutcome::Resolved(runs)) => runs,
         Ok(RunsListOutcome::AuthDenied(status)) => {
             warn!(repo = %repo, status, "runs-list auth denied; skipping repo");
@@ -393,6 +408,11 @@ fn gather_now_green(
         }
     };
 
+    // Scratch dir for the redacted log artifacts the fetch writes; removed below
+    // so no run log outlives the scan.
+    let out_dir =
+        std::env::temp_dir().join(format!("claude-run-reconcile-{repo}").replace('/', "_"));
+
     // The workflows any open issue on this repo tracks: only these need branch
     // resolution / jobs reads, so an unrelated workflow's runs are not fetched.
     let target_workflows: HashSet<&str> = repo_targets
@@ -400,7 +420,15 @@ fn gather_now_green(
         .map(|t| t.coords.workflow_id.as_str())
         .collect();
 
-    resolve_missing_branches(transport, cfg, token, repo, &mut runs, &target_workflows);
+    resolve_missing_branches(
+        logs,
+        cfg,
+        token,
+        repo,
+        &out_dir,
+        &mut runs,
+        &target_workflows,
+    );
 
     // The set of (branch, workflow) pairs a target tracks, to skip jobs reads for
     // runs no open issue references.
@@ -410,44 +438,65 @@ fn gather_now_green(
         .collect();
 
     let latest = reduce_latest_runs(&runs);
-    let fetch_cfg = LogFetchConfig::default();
     let mut green = Vec::new();
     for run in &latest {
         if !target_pairs.contains(&(run.branch.as_str(), run.workflow_id.as_str())) {
             continue;
         }
-        let Some(jobs_target) =
-            RunJobsApiTarget::for_run(&run.html_url, repo, run.global_id, Some(token.to_string()))
-        else {
-            continue;
-        };
-        match forge_log::fetch_run_jobs(transport, &fetch_cfg, &jobs_target, std::thread::sleep) {
-            Ok(JobsOutcome::Resolved(jobs)) => green.extend(now_green_jobs(run, &jobs)),
-            Ok(other) => {
-                info!(repo = %repo, run = run.index, outcome = ?other, "jobs endpoint did not resolve; group left open")
-            }
-            Err(e) => {
-                warn!(repo = %repo, run = run.index, error = %e, "jobs-list fetch failed; group left open")
+        match fetch_run(logs, token, repo, run, &out_dir) {
+            Some(jobs) => green.extend(now_green_jobs(run, &jobs)),
+            None => {
+                info!(repo = %repo, run = run.index, "run logs did not resolve; group left open")
             }
         }
     }
+    let _ = std::fs::remove_dir_all(&out_dir);
     green
+}
+
+/// Fetch one run's redacted per-job logs through `fj actions logs`. `None` on any
+/// miss (the caller leaves the affected group open); never errors.
+fn fetch_run(
+    logs: &dyn ActionLogClient,
+    token: &str,
+    repo: &str,
+    run: &RunEntry,
+    out_dir: &std::path::Path,
+) -> Option<Vec<JobLog>> {
+    let target = LogTarget::for_run(&run.html_url, repo, run.index, Some(token.to_string()))?;
+    match forge_log::fetch_run_log(
+        logs,
+        // CLAUDE-204: these runs finished long ago; one call decides.
+        &LogFetchConfig::no_retry(),
+        &target,
+        out_dir,
+        &[],
+        std::thread::sleep,
+    ) {
+        Ok(LogOutcome::Fetched(log)) => Some(log.jobs),
+        Ok(other) => {
+            info!(repo = %repo, run = run.index, outcome = ?other, "run-log fetch did not resolve");
+            None
+        }
+        Err(e) => {
+            warn!(repo = %repo, run = run.index, error = %e, "run-log fetch failed");
+            None
+        }
+    }
 }
 
 /// Resolve the branch for runs the runs list left null (`head_branch` null on the
 /// deployed Forgejo). Only runs of a target workflow are resolved, newest-first,
 /// bounded by `max_branch_resolves`; reaching the cap is logged (never silent).
 fn resolve_missing_branches(
-    transport: &dyn forge_log::LogTransport,
+    logs: &dyn ActionLogClient,
     cfg: &CiFailureReconcileConfig,
     token: &str,
     repo: &str,
+    out_dir: &std::path::Path,
     runs: &mut [RunEntry],
     target_workflows: &HashSet<&str>,
 ) {
-    let fetch_cfg = LogFetchConfig::default();
-    let out_dir =
-        std::env::temp_dir().join(format!("claude-run-reconcile-{repo}").replace('/', "_"));
     let mut resolved = 0usize;
     let mut cap_hit = false;
     for run in runs.iter_mut() {
@@ -459,32 +508,17 @@ fn resolve_missing_branches(
             break;
         }
         resolved += 1;
-        let Some(log_target) = RunLogsApiTarget::for_run(
-            &run.html_url,
-            repo,
-            run.index,
-            run.global_id,
-            token.to_string(),
-        ) else {
-            continue;
-        };
-        match forge_log::fetch_run_logs_api(
-            transport,
-            &fetch_cfg,
-            &log_target,
-            &out_dir,
-            &[],
-            std::thread::sleep,
-        ) {
-            Ok(forge_log::ApiLogOutcome::Fetched(log)) => {
-                if let Some(b) = forge_log::resolve_branch(None, &log.text) {
-                    run.branch = b;
-                }
+        let snapshot = run.clone();
+        if let Some(jobs) = fetch_run(logs, token, repo, &snapshot, out_dir) {
+            // The checkout section is in whichever job ran it; take the first hit.
+            if let Some(b) = jobs
+                .iter()
+                .find_map(|j| forge_log::resolve_branch(None, &j.log))
+            {
+                run.branch = b;
             }
-            _ => { /* a log miss leaves the branch empty; the group stays open. */ }
         }
     }
-    let _ = std::fs::remove_dir_all(&out_dir);
     if cap_hit {
         warn!(repo = %repo, cap = cfg.max_branch_resolves, "branch-resolve cap reached; some runs left ungrouped (raise max_branch_resolves to cover them)");
     }
@@ -519,7 +553,7 @@ fn is_success_status(s: &str) -> bool {
 
 /// The now-green jobs of `run`: every job whose status is success, expanded to a
 /// [`GreenJob`] carrying the run's branch / workflow / index / URL.
-fn now_green_jobs(run: &RunEntry, jobs: &[JobInfo]) -> Vec<GreenJob> {
+fn now_green_jobs(run: &RunEntry, jobs: &[JobLog]) -> Vec<GreenJob> {
     jobs.iter()
         .filter(|j| !j.name.is_empty() && is_success_status(&j.status))
         .map(|j| GreenJob {
@@ -600,10 +634,11 @@ mod tests {
         }
     }
 
-    fn job(name: &str, status: &str) -> JobInfo {
-        JobInfo {
+    fn job(name: &str, status: &str) -> JobLog {
+        JobLog {
             name: name.to_string(),
             status: status.to_string(),
+            log: String::new(),
         }
     }
 

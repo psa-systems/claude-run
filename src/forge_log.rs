@@ -1,52 +1,47 @@
 //! Forgejo Action log fetch with retry and secret redaction (CLAUDE-44).
 //!
-//! The sanctioned REST log API (FJ-22 / Forgejo PR 12666) is not in the deployed
-//! Forgejo, so a failing job's log is pulled from the internal web route:
+//! A run's logs are read through the `fj` CLI (CLAUDE-204):
 //!
 //! ```text
-//! GET /{owner}/{repo}/actions/runs/{index}/jobs/{job}/attempt/{n}/logs
+//! fj --host <host> actions logs --repo <owner>/<repo> --json <run_number>
 //! ```
 //!
-//! which returns `200 text/plain`. The `/attempt/{n}/` segment is required
-//! (omitting it 404s). Logs are pruned after a retention window, and a freshly
-//! finished run can briefly 404 / return `resource does not exist` before its
-//! logs flush, so the fetch retries with exponential backoff and a persistent
-//! miss is surfaced as a *transient* outcome ([`LogOutcome::TransientMiss`]),
-//! never an error or a panic (triage bucket 3 in the epic). Before any value is
-//! returned or written to disk the text is run through [`redact`] so CI tokens
-//! (a failed publish step can echo one) do not land in storage or a YouTrack
-//! attachment.
+//! `fj` resolves the per-repo run number to the internal run id, enumerates the
+//! run's jobs, and returns each job's plaintext log, so ONE path serves public
+//! and private repos alike and nothing guesses a job index or an attempt
+//! number. `<run_number>` is the webhook payload's `index_in_repo`.
 //!
-//! This internal route stays off-limits to the `fj` CLI (FJ-22) until PR 12666
-//! ships a REST endpoint; it is sanctioned for this service only.
+//! Logs are pruned after a retention window, and a freshly finished run can
+//! briefly read as missing before its logs flush, so the fetch retries with
+//! exponential backoff and a persistent miss is surfaced as a *transient*
+//! outcome ([`LogOutcome::TransientMiss`]), never an error or a panic (triage
+//! bucket 3 in the epic). A job `fj` returns with an empty log is NOT a miss; a
+//! run `fj` cannot find is. Before any value is returned or written to disk the
+//! text is run through [`redact`] so CI tokens (a failed publish step can echo
+//! one) do not land in storage or a YouTrack attachment.
 //!
-//! ## Private-repo auth (CLAUDE-92 / CLAUDE-96)
+//! ## Auth (CLAUDE-92 / CLAUDE-96 / CLAUDE-200)
 //!
-//! The internal route needs no auth for a *public* repo and accepts ONLY a
-//! browser session for a private one: `services/auth/{basic,oauth2}.go`
-//! `Verify` both bail on non-API web paths (which is why an
-//! `Authorization: token` probe 404'd), so [`LogTarget::token`] stays `None`.
-//! Private repos are served by [`fetch_run_logs_api`] instead: the v16 REST
-//! endpoint (`/api/v1/.../actions/runs/{run_id}/logs`, Forgejo PR 12666, on
-//! the API router where PATs work), addressed by the run's GLOBAL id and
-//! authenticated with the webhook source's `log_token_ref`. On a pre-v16
-//! instance that endpoint 404s and the consumer degrades to the CLAUDE-92
-//! no-log human-action outcome after exactly one request.
+//! A private repo's read is authorized by the `log_token_ref` mapped to that
+//! repo. The resolved PAT reaches the `fj` child through a temp single-host
+//! `keys.json` ([`crate::provider::cli::FjActionLogs`]), never a process
+//! argument and never a log line. A public repo's run reads without a token, so
+//! a deployment that configures no token still analyzes public failures.
+//! `read:repository` is the only scope needed: the three endpoints `fj` calls
+//! all sit in Forgejo's repository group behind `reqRepoReader(unit.TypeActions)`.
+//!
+//! ## Endpoints still on HTTP
+//!
+//! `fj` has no command for the runs list or for reading a raw file at a ref, so
+//! [`fetch_runs`] and [`fetch_workflow_yaml`] keep the [`LogTransport`] seam and
+//! their direct REST calls, each with a `TODO` naming its tracking issue.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::Deserialize;
+
 use crate::error::Result;
-
-/// Job index probed for a run. The fast-path targets single-job CI workflows
-/// (the pilot), whose failing job is index 0. Multi-job resolution is a future
-/// refinement; documented as an explicit assumption per the issue.
-pub const DEFAULT_JOB_INDEX: u64 = 0;
-
-/// Attempt number probed for a run. A run's first execution is attempt 1; a
-/// re-run increments it. The webhook payload carries no attempt, so the
-/// first-run value is assumed.
-pub const DEFAULT_ATTEMPT: u64 = 1;
 
 /// Marker substituted for any redacted secret.
 const REDACTED: &str = "[REDACTED]";
@@ -75,35 +70,18 @@ const MIN_KNOWN_SECRET_LEN: usize = 8;
 /// this keeps ordinary prose ("the token implementation") from being redacted.
 const MIN_VALUE_LEN: usize = 16;
 
-/// A single HTTP response from the log route: status code plus the body text.
-#[derive(Debug, Clone)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub body: String,
-}
-
-/// Transport seam for the GET against the internal log route. Abstracted so the
-/// retry/redaction logic is unit-testable without a network (mirrors the
-/// `McpTransport` seam in [`crate::provider::github`]).
+/// Transport seam for the two REST reads `fj` has no command for. Abstracted so
+/// the parsing is unit-testable without a network (mirrors the `McpTransport`
+/// seam in [`crate::provider::github`]).
 pub trait LogTransport: Send + Sync {
-    /// GET `url`, optionally bearing `token`. Returns the status + body on a
+    /// GET `url`, optionally bearing `token`. Returns the status + raw body on a
     /// completed request, or a human-readable error string on a transport
-    /// failure (DNS, connect, TLS, ...). The retry loop treats a transport
-    /// error the same as a not-ready body: retry, then surface as transient.
-    fn get(&self, url: &str, token: Option<&str>) -> std::result::Result<HttpResponse, String>;
-
-    /// CLAUDE-96: GET returning raw bytes, for the v16 REST run-logs endpoint
-    /// (`application/zip`). The default impl adapts [`LogTransport::get`] so
-    /// text-only test stubs keep compiling; the real transport overrides it
-    /// with a binary-safe request.
+    /// failure (DNS, connect, TLS, ...).
     fn get_bytes(
         &self,
         url: &str,
         token: Option<&str>,
-    ) -> std::result::Result<(u16, Vec<u8>), String> {
-        self.get(url, token)
-            .map(|r| (r.status, r.body.into_bytes()))
-    }
+    ) -> std::result::Result<(u16, Vec<u8>), String>;
 }
 
 /// Real transport: a blocking `reqwest` GET run on a dedicated thread so it
@@ -118,31 +96,6 @@ impl HttpLogTransport {
 }
 
 impl LogTransport for HttpLogTransport {
-    fn get(&self, url: &str, token: Option<&str>) -> std::result::Result<HttpResponse, String> {
-        let url = url.to_string();
-        let token = token.map(str::to_string);
-        std::thread::spawn(move || -> std::result::Result<HttpResponse, String> {
-            let client = reqwest::blocking::Client::builder()
-                .build()
-                .map_err(|e| format!("log http client: {e}"))?;
-            let mut req = client.get(&url).header("Accept", "text/plain");
-            if let Some(t) = &token {
-                // The day private-repo auth is resolved (see module docs) this is
-                // the header to populate; today it is never set for the pilot.
-                req = req.header("Authorization", format!("token {t}"));
-            }
-            let resp = req
-                .send()
-                .map_err(|e| format!("log request to {url}: {e}"))?;
-            let status = resp.status().as_u16();
-            let body = resp.text().map_err(|e| format!("log response body: {e}"))?;
-            Ok(HttpResponse { status, body })
-        })
-        .join()
-        .map_err(|_| "log transport thread panicked".to_string())?
-    }
-
-    /// Binary-safe variant for the v16 REST run-logs ZIP (CLAUDE-96).
     fn get_bytes(
         &self,
         url: &str,
@@ -173,51 +126,95 @@ impl LogTransport for HttpLogTransport {
     }
 }
 
-/// Where to fetch a failing job's log from.
+/// One job of a run as `fj actions logs --json` reports it. The vector order is
+/// the run order, so a job's position IS its job index.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct JobLog {
+    /// The job's display name.
+    #[serde(default)]
+    pub name: String,
+    /// The job's outcome (`success`, `failure`, ...).
+    #[serde(default)]
+    pub status: String,
+    /// The job's plaintext log. Empty for a job that never started (`fj` maps
+    /// that 404 to an empty log); an empty log is NOT a fetch miss.
+    #[serde(default)]
+    pub log: String,
+}
+
+/// The `fj actions logs --json` document: the run number plus its jobs.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RunLogsDoc {
+    #[serde(default)]
+    jobs: Vec<JobLog>,
+}
+
+/// Outcome of ONE `fj actions logs` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunLogsOutcome {
+    /// The run's jobs in run order, with raw (unredacted) logs.
+    Fetched(Vec<JobLog>),
+    /// `fj` cannot see the run: its logs have not flushed yet, it was pruned, or
+    /// it is not visible to the credential. Retried by [`fetch_run_log`].
+    NotFound(String),
+    /// The token was rejected (401) or lacks the scope (403). Terminal.
+    AuthDenied(String),
+    /// Anything else: `fj` absent, unparseable output, an unexpected status.
+    Failed(String),
+}
+
+/// Seam over `fj actions logs`, implemented by
+/// [`crate::provider::cli::FjActionLogs`]. Abstracted so the retry / redaction
+/// logic is unit-testable without spawning a process.
+pub trait ActionLogClient: Send + Sync {
+    /// Read `run_number`'s per-job logs for `repo` (`owner/repo`) on forge
+    /// `host`. `token` is the resolved `log_token_ref`; `None` reads
+    /// unauthenticated, which is enough for a public repo.
+    fn run_logs(
+        &self,
+        host: &str,
+        repo: &str,
+        run_number: i64,
+        token: Option<&str>,
+    ) -> RunLogsOutcome;
+}
+
+/// Parse a `fj actions logs --json` document into its jobs.
+pub fn parse_run_logs(stdout: &str) -> std::result::Result<Vec<JobLog>, String> {
+    let doc: RunLogsDoc = serde_json::from_str(stdout.trim()).map_err(|e| e.to_string())?;
+    Ok(doc.jobs)
+}
+
+/// Which run's logs to fetch.
 #[derive(Debug, Clone)]
 pub struct LogTarget {
-    /// Forge origin, e.g. `https://dev.a8n.run` (no trailing slash needed).
-    pub base_url: String,
+    /// Forge host, e.g. `dev.a8n.run` (what `fj --host` takes).
+    pub host: String,
     /// `owner/repo`.
     pub repo: String,
-    /// Run index within the repo (`index_in_repo` from the webhook).
-    pub run_index: i64,
-    /// Job index within the run.
-    pub job_index: u64,
-    /// Attempt number.
-    pub attempt: u64,
-    /// Token for a private repo. `None` for a public repo (the pilot). See the
-    /// module docs: private-repo auth on this route is an unresolved follow-up.
+    /// Run index within the repo (`index_in_repo` from the webhook), which is
+    /// exactly the run number `fj actions logs` takes.
+    pub run_number: i64,
+    /// The `log_token_ref` resolved for this repo; `None` reads unauthenticated.
     pub token: Option<String>,
 }
 
 impl LogTarget {
-    /// Build a target for `(repo, run_index)` from the failure event's
-    /// `html_url`, deriving the forge origin from it. Defaults to the first job
-    /// and first attempt (see [`DEFAULT_JOB_INDEX`] / [`DEFAULT_ATTEMPT`]).
-    /// Returns `None` when the origin cannot be derived from `html_url`.
-    pub fn for_run(html_url: &str, repo: &str, run_index: i64) -> Option<Self> {
-        let base_url = base_from_html_url(html_url, repo)?;
+    /// Build a target for `(repo, run_number)` from the failure event's
+    /// `html_url`, deriving the forge host from it. `None` when the host cannot
+    /// be derived.
+    pub fn for_run(
+        html_url: &str,
+        repo: &str,
+        run_number: i64,
+        token: Option<String>,
+    ) -> Option<Self> {
         Some(Self {
-            base_url,
+            host: host_from_html_url(html_url)?,
             repo: repo.to_string(),
-            run_index,
-            job_index: DEFAULT_JOB_INDEX,
-            attempt: DEFAULT_ATTEMPT,
-            token: None,
+            run_number,
+            token,
         })
-    }
-
-    /// The internal log-route URL for this target.
-    pub fn logs_url(&self) -> String {
-        format!(
-            "{}/{}/actions/runs/{}/jobs/{}/attempt/{}/logs",
-            self.base_url.trim_end_matches('/'),
-            self.repo,
-            self.run_index,
-            self.job_index,
-            self.attempt,
-        )
     }
 }
 
@@ -242,14 +239,32 @@ impl Default for LogFetchConfig {
     }
 }
 
-/// A successfully fetched and redacted log.
+impl LogFetchConfig {
+    /// One call, no backoff. For the polling actions (CLAUDE-189 / CLAUDE-191),
+    /// which read runs that finished long ago: a run `fj` cannot see there is
+    /// pruned, not un-flushed, so waiting only burns the budget per issue. The
+    /// webhook consumer keeps the retrying default, since its event arrives the
+    /// moment the run finishes.
+    pub fn no_retry() -> Self {
+        Self {
+            max_retries: 0,
+            ..Self::default()
+        }
+    }
+}
+
+/// A successfully fetched and redacted run log.
 #[derive(Debug, Clone)]
 pub struct RedactedLog {
-    /// Redacted log text, usable in a summary.
+    /// Every job's redacted log concatenated under a `===== name =====` header,
+    /// usable in a summary.
     pub text: String,
-    /// Path to the redacted log written to disk, for a YouTrack attachment (one
-    /// job can exceed an inline-comment size limit).
+    /// Path to the redacted text written to disk, for a YouTrack attachment (one
+    /// run can exceed an inline-comment size limit).
     pub artifact: PathBuf,
+    /// The run's jobs in run order, each carrying its REDACTED log. The failing
+    /// job is selected from this with [`resolve_failing_job`].
+    pub jobs: Vec<JobLog>,
 }
 
 /// Outcome of a fetch. A persistent miss is `TransientMiss`, not an error, so
@@ -257,214 +272,77 @@ pub struct RedactedLog {
 #[derive(Debug, Clone)]
 pub enum LogOutcome {
     Fetched(RedactedLog),
-    TransientMiss { reason: String },
+    TransientMiss {
+        reason: String,
+    },
+    /// The token was rejected or lacks the scope. Terminal after ONE call: the
+    /// event arrives once the run finished, so there is nothing to wait for.
+    AuthDenied {
+        reason: String,
+    },
+    /// A fault that survived the retries (`fj` absent, unparseable output).
+    Failed {
+        reason: String,
+    },
 }
 
-/// One classified attempt: the log is ready, or it is not (missing / pruned /
-/// not-yet-flushed / a transport error), with a reason for the latter.
-enum Probe {
-    Ready(String),
-    NotReady(String),
+/// The last classified attempt, so an exhausted budget reports the right kind:
+/// a run that stayed invisible is a miss, a broken `fj` call is a fault.
+enum LastProbe {
+    Miss(String),
+    Fault(String),
 }
 
-/// Fetch the failing job's log for `target`, retrying on not-ready logs, redact
-/// it, and write the redacted text to an artifact file under `out_dir`. Returns
-/// [`LogOutcome::Fetched`] on success or [`LogOutcome::TransientMiss`] after the
-/// retries are exhausted. `known_secrets` are masked verbatim in addition to the
-/// pattern-based redaction (pass the values the service itself knows leaked).
+/// Fetch every job's log for `target` through `fj actions logs`, retrying while
+/// the run is not visible yet, redact each job's log, and write the concatenated
+/// redacted text to an artifact file under `out_dir`. Returns
+/// [`LogOutcome::Fetched`] on success, [`LogOutcome::AuthDenied`] immediately on
+/// a rejected token, and [`LogOutcome::TransientMiss`] / [`LogOutcome::Failed`]
+/// after the retries are exhausted. `known_secrets` are masked verbatim in
+/// addition to the pattern-based redaction (pass the values the service itself
+/// knows leaked).
 ///
 /// `sleep` is injected so tests drive the backoff without waiting; production
 /// passes `std::thread::sleep`. The only hard error this returns is an I/O
 /// failure writing the artifact; a missing log is a `TransientMiss`, never `Err`.
-pub fn fetch_failing_job_log<S: FnMut(Duration)>(
-    transport: &dyn LogTransport,
+pub fn fetch_run_log<S: FnMut(Duration)>(
+    client: &dyn ActionLogClient,
     cfg: &LogFetchConfig,
     target: &LogTarget,
     out_dir: &Path,
     known_secrets: &[String],
     mut sleep: S,
 ) -> Result<LogOutcome> {
-    let url = target.logs_url();
     let mut backoff = cfg.initial_backoff;
-    let mut last_reason = "no attempt made".to_string();
+    let mut last = LastProbe::Miss("no attempt made".to_string());
 
     for attempt_no in 0..=cfg.max_retries {
-        let resp = transport.get(&url, target.token.as_deref());
-        match classify(resp) {
-            Probe::Ready(body) => {
-                let text = redact(&body, known_secrets);
+        match client.run_logs(
+            &target.host,
+            &target.repo,
+            target.run_number,
+            target.token.as_deref(),
+        ) {
+            RunLogsOutcome::Fetched(jobs) => {
+                // Redact BEFORE anything is rendered, stored, or handed back.
+                let jobs: Vec<JobLog> = jobs
+                    .into_iter()
+                    .map(|j| {
+                        let log = redact(&j.log, known_secrets);
+                        JobLog { log, ..j }
+                    })
+                    .collect();
+                let text = render_run_log(&jobs);
                 let artifact = write_artifact(out_dir, target, &text)?;
-                return Ok(LogOutcome::Fetched(RedactedLog { text, artifact }));
+                return Ok(LogOutcome::Fetched(RedactedLog {
+                    text,
+                    artifact,
+                    jobs,
+                }));
             }
-            Probe::NotReady(reason) => {
-                last_reason = reason;
-                if attempt_no < cfg.max_retries {
-                    sleep(backoff);
-                    backoff = (backoff * 2).min(cfg.max_backoff);
-                }
-            }
-        }
-    }
-
-    Ok(LogOutcome::TransientMiss {
-        reason: last_reason,
-    })
-}
-
-/// Classify a transport result. A `200` with a non-empty body that is not the
-/// not-found sentinel is ready; everything else (non-200, empty body, the
-/// `resource does not exist` sentinel, or a transport error) is not-ready.
-fn classify(resp: std::result::Result<HttpResponse, String>) -> Probe {
-    match resp {
-        Ok(r) if r.status == 200 && is_ready_body(&r.body) => Probe::Ready(r.body),
-        Ok(r) => Probe::NotReady(format!(
-            "status {}, {} body bytes (logs not ready or pruned)",
-            r.status,
-            r.body.len()
-        )),
-        Err(e) => Probe::NotReady(format!("transport error: {e}")),
-    }
-}
-
-/// True when a body is real log content (non-empty and not the route's
-/// `resource does not exist` miss sentinel).
-fn is_ready_body(body: &str) -> bool {
-    let t = body.trim();
-    !t.is_empty() && !t.to_ascii_lowercase().contains("resource does not exist")
-}
-
-/// Derive the forge origin (scheme + host[:port]) from a run's `html_url` by
-/// stripping the `/{repo}/...` tail. Returns `None` if `html_url` does not
-/// contain the repo segment.
-fn base_from_html_url(html_url: &str, repo: &str) -> Option<String> {
-    let needle = format!("/{repo}/");
-    html_url
-        .split_once(&needle)
-        .map(|(base, _)| base.to_string())
-        .filter(|b| !b.is_empty())
-}
-
-/// Write `text` to a per-(repo, run, job, attempt) artifact file under `out_dir`
-/// and return its path. `out_dir` is created if absent.
-fn write_artifact(out_dir: &Path, target: &LogTarget, text: &str) -> Result<PathBuf> {
-    std::fs::create_dir_all(out_dir)?;
-    let stem = target.repo.replace('/', "_");
-    let name = format!(
-        "{stem}-run{}-job{}-attempt{}.log",
-        target.run_index, target.job_index, target.attempt
-    );
-    let path = out_dir.join(name);
-    std::fs::write(&path, text)?;
-    Ok(path)
-}
-
-/// CLAUDE-96: where to fetch a PRIVATE repo's action logs from - the v16 REST
-/// endpoint (`GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_id}/logs`,
-/// Forgejo PR 12666), which honors `Authorization: token <PAT>` because it
-/// lives on the API router (unlike the internal web route, which is
-/// session-only). `{run_id}` is the run's GLOBAL id (`GetRunByID` in the
-/// upstream handler), i.e. the payload's `run.id`, NOT `index_in_repo`.
-#[derive(Debug, Clone)]
-pub struct RunLogsApiTarget {
-    /// Forge origin, e.g. `https://dev.a8n.run`.
-    pub base_url: String,
-    /// `owner/repo`.
-    pub repo: String,
-    /// Run index within the repo; used only for the artifact filename so it
-    /// sorts next to the internal-route artifacts.
-    pub run_index: i64,
-    /// The run's global id from the payload (`run.id`).
-    pub run_global_id: i64,
-    /// PAT with repository read scope (resolved from the source's
-    /// `log_token_ref`).
-    pub token: String,
-}
-
-impl RunLogsApiTarget {
-    /// Build a target from the failure event, deriving the forge origin from
-    /// `html_url` like [`LogTarget::for_run`]. `None` when the origin cannot be
-    /// derived.
-    pub fn for_run(
-        html_url: &str,
-        repo: &str,
-        run_index: i64,
-        run_global_id: i64,
-        token: String,
-    ) -> Option<Self> {
-        let base_url = base_from_html_url(html_url, repo)?;
-        Some(Self {
-            base_url,
-            repo: repo.to_string(),
-            run_index,
-            run_global_id,
-            token,
-        })
-    }
-
-    /// The REST run-logs URL for this target.
-    pub fn logs_url(&self) -> String {
-        format!(
-            "{}/api/v1/repos/{}/actions/runs/{}/logs",
-            self.base_url.trim_end_matches('/'),
-            self.repo,
-            self.run_global_id,
-        )
-    }
-}
-
-/// CLAUDE-96: outcome of a REST run-logs fetch. Auth-class and not-found
-/// responses are terminal after ONE request (the event arrives after the run
-/// completed, so there is nothing to wait for); only transport errors and 5xx
-/// retry within the configured budget.
-#[derive(Debug, Clone)]
-pub enum ApiLogOutcome {
-    Fetched(RedactedLog),
-    /// 401/403: the token was rejected.
-    AuthDenied(u16),
-    /// 404: the endpoint is absent (Forgejo < 16) or the run was pruned.
-    NotFound,
-    /// Transport/5xx after the retry budget, or a corrupt archive.
-    Failed(String),
-}
-
-/// CLAUDE-96: fetch the run's logs through the v16 REST endpoint. The 200 body
-/// is a ZIP with one entry per job (`{job-name}-{job-id}-attempt-{N}.log`); the
-/// entries are concatenated (sorted by name, each under a `===== name =====`
-/// header), redacted, and written to one artifact. Exactly one request decides
-/// 200/401/403/404; only transport errors and other statuses retry.
-pub fn fetch_run_logs_api<S: FnMut(Duration)>(
-    transport: &dyn LogTransport,
-    cfg: &LogFetchConfig,
-    target: &RunLogsApiTarget,
-    out_dir: &Path,
-    known_secrets: &[String],
-    mut sleep: S,
-) -> Result<ApiLogOutcome> {
-    let url = target.logs_url();
-    let mut backoff = cfg.initial_backoff;
-    let mut last_reason = "no attempt made".to_string();
-
-    for attempt_no in 0..=cfg.max_retries {
-        match transport.get_bytes(&url, Some(&target.token)) {
-            Ok((200, bytes)) => {
-                let text = match unzip_run_logs(&bytes) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        return Ok(ApiLogOutcome::Failed(format!(
-                            "unpacking run-logs archive: {e}"
-                        )))
-                    }
-                };
-                let text = redact(&text, known_secrets);
-                let artifact = write_api_artifact(out_dir, target, &text)?;
-                return Ok(ApiLogOutcome::Fetched(RedactedLog { text, artifact }));
-            }
-            Ok((status @ (401 | 403), _)) => return Ok(ApiLogOutcome::AuthDenied(status)),
-            Ok((404, _)) => return Ok(ApiLogOutcome::NotFound),
-            Ok((status, body)) => {
-                last_reason = format!("status {status}, {} body bytes", body.len());
-            }
-            Err(e) => last_reason = e,
+            RunLogsOutcome::AuthDenied(reason) => return Ok(LogOutcome::AuthDenied { reason }),
+            RunLogsOutcome::NotFound(reason) => last = LastProbe::Miss(reason),
+            RunLogsOutcome::Failed(reason) => last = LastProbe::Fault(reason),
         }
         if attempt_no < cfg.max_retries {
             sleep(backoff);
@@ -472,99 +350,54 @@ pub fn fetch_run_logs_api<S: FnMut(Duration)>(
         }
     }
 
-    Ok(ApiLogOutcome::Failed(last_reason))
+    Ok(match last {
+        LastProbe::Miss(reason) => LogOutcome::TransientMiss { reason },
+        LastProbe::Fault(reason) => LogOutcome::Failed { reason },
+    })
 }
 
-/// Concatenate every entry of the run-logs ZIP, sorted by entry name, each
-/// under a `===== name =====` header. Non-UTF-8 bytes are replaced rather than
-/// erroring: these are CI logs and a stray escape must not lose the archive.
-fn unzip_run_logs(bytes: &[u8]) -> std::result::Result<String, String> {
-    use std::io::Read;
-    let mut archive =
-        zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("zip open: {e}"))?;
-    let mut names: Vec<String> = archive.file_names().map(str::to_string).collect();
-    names.sort();
+/// Concatenate every job's log under a `===== {name} ({status}) =====` header,
+/// in run order.
+fn render_run_log(jobs: &[JobLog]) -> String {
     let mut out = String::new();
-    for name in names {
-        let mut file = archive
-            .by_name(&name)
-            .map_err(|e| format!("zip entry {name}: {e}"))?;
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw)
-            .map_err(|e| format!("zip entry {name}: {e}"))?;
-        out.push_str(&format!("===== {name} =====\n"));
-        out.push_str(&String::from_utf8_lossy(&raw));
+    for job in jobs {
+        out.push_str(&format!("===== {} ({}) =====\n", job.name, job.status));
+        out.push_str(&job.log);
         if !out.ends_with('\n') {
             out.push('\n');
         }
     }
-    Ok(out)
+    out
 }
 
-/// Artifact path for an API-fetched run log: one file for ALL jobs of the run,
-/// named to sort next to the internal-route per-job artifacts.
-fn write_api_artifact(out_dir: &Path, target: &RunLogsApiTarget, text: &str) -> Result<PathBuf> {
+/// Authority (`host[:port]`) of a forge URL, the bare host `fj --host` takes
+/// (e.g. `dev.a8n.run`). `None` when the URL has no host segment.
+fn host_from_html_url(url: &str) -> Option<String> {
+    let after = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = after.split('/').next().unwrap_or("");
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Derive the forge origin (scheme + host[:port]) from a run's `html_url` by
+/// stripping the `/{repo}/...` tail, for the two endpoints still on HTTP.
+/// Returns `None` if `html_url` does not contain the repo segment.
+pub fn base_from_html_url(html_url: &str, repo: &str) -> Option<String> {
+    let needle = format!("/{repo}/");
+    html_url
+        .split_once(&needle)
+        .map(|(base, _)| base.to_string())
+        .filter(|b| !b.is_empty())
+}
+
+/// Write `text` to a per-(repo, run) artifact file under `out_dir` and return
+/// its path. `out_dir` is created if absent.
+fn write_artifact(out_dir: &Path, target: &LogTarget, text: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(out_dir)?;
     let stem = target.repo.replace('/', "_");
-    let name = format!("{stem}-run{}-all-jobs.log", target.run_index);
+    let name = format!("{stem}-run{}-all-jobs.log", target.run_number);
     let path = out_dir.join(name);
     std::fs::write(&path, text)?;
     Ok(path)
-}
-
-/// CLAUDE-189: where to list a repo's Action runs from, to resolve a run's
-/// GLOBAL id from its per-repo `index_in_repo`. The run web URL
-/// (`/actions/runs/{index}`) uses `index_in_repo`, but the v16 run-logs endpoint
-/// keys by the global `run.id`; a pre-existing "CI failure" issue (minted before
-/// the `Run-Global-Id:` marker shipped) carries only the index, so the analysis
-/// action resolves it here. Reads the API runs-list endpoint
-/// (`GET /api/v1/repos/{owner}/{repo}/actions/runs`), which lives on the API
-/// router where PATs work.
-#[derive(Debug, Clone)]
-pub struct RunsListApiTarget {
-    /// Forge origin, e.g. `https://dev.a8n.run`.
-    pub base_url: String,
-    /// `owner/repo`.
-    pub repo: String,
-    /// PAT with repository read scope.
-    pub token: String,
-}
-
-impl RunsListApiTarget {
-    /// Build a target from the run's `html_url`, deriving the forge origin like
-    /// [`RunLogsApiTarget::for_run`]. `None` when the origin cannot be derived.
-    pub fn for_run(html_url: &str, repo: &str, token: String) -> Option<Self> {
-        let base_url = base_from_html_url(html_url, repo)?;
-        Some(Self {
-            base_url,
-            repo: repo.to_string(),
-            token,
-        })
-    }
-
-    /// The runs-list URL for one page.
-    pub fn runs_url(&self, page: u32, limit: u32) -> String {
-        format!(
-            "{}/api/v1/repos/{}/actions/runs?page={}&limit={}",
-            self.base_url.trim_end_matches('/'),
-            self.repo,
-            page,
-            limit,
-        )
-    }
-}
-
-/// CLAUDE-189: outcome of resolving a run's global id from its per-repo index.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunIdOutcome {
-    /// The global id for the requested `index_in_repo`.
-    Resolved(i64),
-    /// 401/403: the token was rejected.
-    AuthDenied(u16),
-    /// 404 (endpoint absent), or the index was not found in any page.
-    NotFound,
-    /// Transport / 5xx / unparseable body.
-    Failed(String),
 }
 
 /// Number of runs requested per page and the paging ceiling. `50 * 40 = 2000`
@@ -572,88 +405,27 @@ pub enum RunIdOutcome {
 /// issue's run; a run older than that resolves `NotFound` and the caller notes
 /// the log as unavailable rather than crashing.
 const RUNS_PAGE_LIMIT: u32 = 50;
-const RUNS_MAX_PAGES: u32 = 40;
 
-/// CLAUDE-189: resolve the GLOBAL run id for `index_in_repo` by paging the
-/// repo's Action runs list and matching each run's per-repo index. Terminal on
-/// 401/403/404 after one request; a transport error / 5xx / unparseable body is
-/// `Failed`. Pages until a match, an empty/short page (the last page), or the
-/// paging ceiling.
-pub fn resolve_run_global_id(
-    transport: &dyn LogTransport,
-    target: &RunsListApiTarget,
-    index_in_repo: i64,
-) -> Result<RunIdOutcome> {
-    for page in 1..=RUNS_MAX_PAGES {
-        let url = target.runs_url(page, RUNS_PAGE_LIMIT);
-        match transport.get_bytes(&url, Some(&target.token)) {
-            Ok((200, bytes)) => {
-                let runs = match parse_runs_list(&bytes) {
-                    Ok(r) => r,
-                    Err(e) => return Ok(RunIdOutcome::Failed(format!("parsing runs list: {e}"))),
-                };
-                if let Some(id) = runs.iter().find(|r| r.index == index_in_repo).map(|r| r.id) {
-                    return Ok(RunIdOutcome::Resolved(id));
-                }
-                // An empty or short page is the last page: the index is not here.
-                if runs.len() < RUNS_PAGE_LIMIT as usize {
-                    return Ok(RunIdOutcome::NotFound);
-                }
-            }
-            Ok((status @ (401 | 403), _)) => return Ok(RunIdOutcome::AuthDenied(status)),
-            Ok((404, _)) => return Ok(RunIdOutcome::NotFound),
-            Ok((status, body)) => {
-                return Ok(RunIdOutcome::Failed(format!(
-                    "status {status}, {} body bytes",
-                    body.len()
-                )))
-            }
-            Err(e) => return Ok(RunIdOutcome::Failed(e)),
-        }
-    }
-    Ok(RunIdOutcome::NotFound)
-}
-
-/// One run's (global id, per-repo index) pulled from the runs-list JSON.
-struct RunRef {
-    id: i64,
-    index: i64,
-}
-
-/// Parse the runs-list body into `(id, index)` pairs, tolerant of Forgejo's
-/// field naming: the per-repo index is `index_in_repo` (webhook shape) or one of
-/// `index` / `run_number` / `number`. Runs missing an `id` are skipped.
-fn parse_runs_list(bytes: &[u8]) -> std::result::Result<Vec<RunRef>, String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    // The endpoint returns `{ "workflow_runs": [...] }`; tolerate a bare array.
-    let arr = value
-        .get("workflow_runs")
-        .and_then(|v| v.as_array())
-        .or_else(|| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut out = Vec::new();
-    for run in arr {
-        let Some(id) = run.get("id").and_then(serde_json::Value::as_i64) else {
-            continue;
-        };
-        let index = ["index_in_repo", "index", "run_number", "number"]
-            .iter()
-            .find_map(|k| run.get(*k).and_then(serde_json::Value::as_i64));
-        if let Some(index) = index {
-            out.push(RunRef { id, index });
-        }
-    }
-    Ok(out)
+/// One page of the API runs-list endpoint
+/// (`GET /api/v1/repos/{owner}/{repo}/actions/runs`), which lives on the API
+/// router where PATs work.
+fn runs_url(base_url: &str, repo: &str, page: u32, limit: u32) -> String {
+    format!(
+        "{}/api/v1/repos/{}/actions/runs?page={}&limit={}",
+        base_url.trim_end_matches('/'),
+        repo,
+        page,
+        limit,
+    )
 }
 
 /// CLAUDE-191: one run pulled from the runs-list JSON with the full set of fields
 /// the auto-close reconciler needs to group and evaluate runs. The reconciler
 /// reduces these to the LATEST run per `(branch, workflow_id)` and reads each
-/// latest run's per-job status from the jobs endpoint.
+/// latest run's per-job status from the jobs `fj actions logs` returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunEntry {
-    /// The run's GLOBAL id (`run.id`); addresses the jobs / run-logs endpoints.
+    /// The run's GLOBAL id (`run.id`); orders runs by recency.
     pub global_id: i64,
     /// The run's per-repo index (`index_in_repo`); the `/actions/runs/<N>` URL.
     pub index: i64,
@@ -733,15 +505,20 @@ pub enum RunsListOutcome {
 /// up to `max_pages` pages of [`RUNS_PAGE_LIMIT`] each (or until a short/empty
 /// page, the last one). Terminal on 401/403/404 on the first page; once some
 /// entries are collected, a later-page error stops paging and returns them.
+///
+/// TODO(FJ-66): stays on the REST API because `fj` has no `actions runs` command
+/// to list a repo's workflow runs. Move it onto the CLI once FJ-66 ships.
 pub fn fetch_runs(
     transport: &dyn LogTransport,
-    target: &RunsListApiTarget,
+    base_url: &str,
+    repo: &str,
+    token: &str,
     max_pages: u32,
 ) -> Result<RunsListOutcome> {
     let mut all: Vec<RunEntry> = Vec::new();
     for page in 1..=max_pages {
-        let url = target.runs_url(page, RUNS_PAGE_LIMIT);
-        match transport.get_bytes(&url, Some(&target.token)) {
+        let url = runs_url(base_url, repo, page, RUNS_PAGE_LIMIT);
+        match transport.get_bytes(&url, Some(token)) {
             Ok((200, bytes)) => {
                 let entries = match parse_runs_list_entries(&bytes) {
                     Ok(e) => e,
@@ -805,6 +582,9 @@ const WORKFLOW_DIRS: &[&str] = &[
 /// first that resolves 200, redacted. `None` when none resolve (the analysis
 /// proceeds over the log alone and says the YAML was unavailable). Never errors
 /// on a miss.
+///
+/// TODO(FJ-67): stays on the REST API because `fj` has no command to read a raw
+/// file at a ref. Move it onto the CLI once FJ-67 ships.
 pub fn fetch_workflow_yaml(
     transport: &dyn LogTransport,
     base_url: &str,
@@ -877,113 +657,14 @@ pub fn resolve_branch(run_detail_branch: Option<&str>, log: &str) -> Option<Stri
     }
 }
 
-/// CLAUDE-190: where to list a run's jobs, to resolve the failing job's name and
-/// index for the root-cause dedupe key. Reads the API jobs endpoint
-/// (`GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_global_id}/jobs`), keyed
-/// by the run's GLOBAL id (like the run-logs endpoint). A public repo needs no
-/// token; a private repo passes the source's `log_token_ref`.
-#[derive(Debug, Clone)]
-pub struct RunJobsApiTarget {
-    /// Forge origin, e.g. `https://dev.a8n.run`.
-    pub base_url: String,
-    /// `owner/repo`.
-    pub repo: String,
-    /// The run's global id from the payload (`run.id`).
-    pub run_global_id: i64,
-    /// PAT for a private repo; `None` for a public repo.
-    pub token: Option<String>,
-}
-
-impl RunJobsApiTarget {
-    /// Build a target from the failure event, deriving the forge origin from
-    /// `html_url`. `None` when the origin cannot be derived.
-    pub fn for_run(
-        html_url: &str,
-        repo: &str,
-        run_global_id: i64,
-        token: Option<String>,
-    ) -> Option<Self> {
-        let base_url = base_from_html_url(html_url, repo)?;
-        Some(Self {
-            base_url,
-            repo: repo.to_string(),
-            run_global_id,
-            token,
-        })
-    }
-
-    /// The jobs-list URL for this target.
-    pub fn jobs_url(&self) -> String {
-        format!(
-            "{}/api/v1/repos/{}/actions/runs/{}/jobs",
-            self.base_url.trim_end_matches('/'),
-            self.repo,
-            self.run_global_id,
-        )
-    }
-}
-
-/// One job pulled from the jobs-list JSON: its display `name` and outcome
-/// `status` (the `conclusion` when present, else the `status`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JobInfo {
-    pub name: String,
-    pub status: String,
-}
-
-/// CLAUDE-190: outcome of a jobs-list fetch. Auth-class / not-found responses are
-/// terminal after one request; only transport errors and 5xx retry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobsOutcome {
-    Resolved(Vec<JobInfo>),
-    AuthDenied(u16),
-    NotFound,
-    Failed(String),
-}
-
-/// Parse the jobs-list body into `JobInfo`s, tolerant of Forgejo's field naming:
-/// the array is `workflow_jobs` (webhook shape) or `jobs`, or a bare array. The
-/// outcome is `conclusion` when present, else `status`.
-fn parse_jobs_list(bytes: &[u8]) -> std::result::Result<Vec<JobInfo>, String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    let arr = value
-        .get("workflow_jobs")
-        .and_then(|v| v.as_array())
-        .or_else(|| value.get("jobs").and_then(|v| v.as_array()))
-        .or_else(|| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut out = Vec::new();
-    for job in arr {
-        let name = job
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let status = job
-            .get("conclusion")
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
-            .or_else(|| job.get("status").and_then(serde_json::Value::as_str))
-            .unwrap_or("")
-            .to_string();
-        out.push(JobInfo { name, status });
-    }
-    Ok(out)
-}
-
-/// CLAUDE-190: the failing job's `(name, index)` for the root-cause key: the
-/// first job whose status is a failure, else the first job (index 0). `None`
-/// for an empty list. The index is the job's position in the run's jobs list.
-pub fn resolve_failing_job(jobs: &[JobInfo]) -> Option<(String, u64)> {
-    if let Some((i, j)) = jobs
-        .iter()
-        .enumerate()
-        .find(|(_, j)| is_failure_status(&j.status))
-    {
-        return Some((j.name.clone(), i as u64));
-    }
-    jobs.first().map(|j| (j.name.clone(), 0))
+/// CLAUDE-190/204: the failing job of a run, selected from the jobs `fj actions
+/// logs` returned: the first job whose status denotes a failure, else the first
+/// job. `None` for a run with no jobs. The job's position in the slice is its
+/// job index in run order, so nothing has to assume index 0.
+pub fn resolve_failing_job(jobs: &[JobLog]) -> Option<&JobLog> {
+    jobs.iter()
+        .find(|j| is_failure_status(&j.status))
+        .or_else(|| jobs.first())
 }
 
 /// True for a job status/conclusion that denotes a failure.
@@ -992,43 +673,6 @@ fn is_failure_status(s: &str) -> bool {
         s.to_ascii_lowercase().as_str(),
         "failure" | "failed" | "error"
     )
-}
-
-/// CLAUDE-190: fetch the run's jobs list. One request decides 200/401/403/404;
-/// only transport errors and other statuses retry within the configured budget.
-/// Best-effort: the caller degrades to a job-agnostic key on any non-`Resolved`.
-pub fn fetch_run_jobs<S: FnMut(Duration)>(
-    transport: &dyn LogTransport,
-    cfg: &LogFetchConfig,
-    target: &RunJobsApiTarget,
-    mut sleep: S,
-) -> Result<JobsOutcome> {
-    let url = target.jobs_url();
-    let mut backoff = cfg.initial_backoff;
-    let mut last_reason = "no attempt made".to_string();
-
-    for attempt_no in 0..=cfg.max_retries {
-        match transport.get_bytes(&url, target.token.as_deref()) {
-            Ok((200, bytes)) => {
-                return match parse_jobs_list(&bytes) {
-                    Ok(jobs) => Ok(JobsOutcome::Resolved(jobs)),
-                    Err(e) => Ok(JobsOutcome::Failed(format!("parsing jobs list: {e}"))),
-                };
-            }
-            Ok((status @ (401 | 403), _)) => return Ok(JobsOutcome::AuthDenied(status)),
-            Ok((404, _)) => return Ok(JobsOutcome::NotFound),
-            Ok((status, body)) => {
-                last_reason = format!("status {status}, {} body bytes", body.len());
-            }
-            Err(e) => last_reason = e,
-        }
-        if attempt_no < cfg.max_retries {
-            sleep(backoff);
-            backoff = (backoff * 2).min(cfg.max_backoff);
-        }
-    }
-
-    Ok(JobsOutcome::Failed(last_reason))
 }
 
 /// Redact secrets from `input`: first mask each known secret value verbatim,
@@ -1111,235 +755,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    /// Scripted transport: pops queued responses in order, defaulting to a
-    /// not-ready 404 once drained so an "always not ready" run is easy to set up.
-    struct StubTransport {
-        responses: Mutex<VecDeque<std::result::Result<HttpResponse, String>>>,
-        calls: Mutex<u32>,
-    }
-
-    impl StubTransport {
-        fn new(responses: Vec<std::result::Result<HttpResponse, String>>) -> Self {
-            Self {
-                responses: Mutex::new(responses.into_iter().collect()),
-                calls: Mutex::new(0),
-            }
-        }
-        fn calls(&self) -> u32 {
-            *self.calls.lock().unwrap()
-        }
-    }
-
-    impl LogTransport for StubTransport {
-        fn get(
-            &self,
-            _url: &str,
-            _token: Option<&str>,
-        ) -> std::result::Result<HttpResponse, String> {
-            *self.calls.lock().unwrap() += 1;
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(Ok(HttpResponse {
-                    status: 404,
-                    body: "resource does not exist".to_string(),
-                }))
-        }
-    }
-
-    fn ready(body: &str) -> std::result::Result<HttpResponse, String> {
-        Ok(HttpResponse {
-            status: 200,
-            body: body.to_string(),
-        })
-    }
-
-    fn not_ready() -> std::result::Result<HttpResponse, String> {
-        Ok(HttpResponse {
-            status: 404,
-            body: "resource does not exist".to_string(),
-        })
-    }
-
-    fn target() -> LogTarget {
-        LogTarget {
-            base_url: "https://dev.a8n.run".to_string(),
-            repo: "contoso/claude-run".to_string(),
-            run_index: 7,
-            job_index: 0,
-            attempt: 1,
-            token: None,
-        }
-    }
-
-    // ---- CLAUDE-96: v16 REST run-logs fetch -------------------------------
-
-    /// Scripted bytes transport for the API endpoint: one fixed response,
-    /// counting calls. `get` panics so a private fetch can never fall back to
-    /// the text route.
-    struct BytesTransport {
-        status: u16,
-        body: Vec<u8>,
-        calls: Mutex<u32>,
-    }
-
-    impl BytesTransport {
-        fn new(status: u16, body: Vec<u8>) -> Self {
-            Self {
-                status,
-                body,
-                calls: Mutex::new(0),
-            }
-        }
-        fn calls(&self) -> u32 {
-            *self.calls.lock().unwrap()
-        }
-    }
-
-    impl LogTransport for BytesTransport {
-        fn get(
-            &self,
-            url: &str,
-            _token: Option<&str>,
-        ) -> std::result::Result<HttpResponse, String> {
-            panic!("text route used for an API fetch: {url}");
-        }
-        fn get_bytes(
-            &self,
-            _url: &str,
-            token: Option<&str>,
-        ) -> std::result::Result<(u16, Vec<u8>), String> {
-            assert_eq!(token, Some("test-pat"), "API fetch must send the token");
-            *self.calls.lock().unwrap() += 1;
-            Ok((self.status, self.body.clone()))
-        }
-    }
-
-    fn api_target() -> RunLogsApiTarget {
-        RunLogsApiTarget {
-            base_url: "https://dev.a8n.run".to_string(),
-            repo: "Contoso/website".to_string(),
-            run_index: 39,
-            run_global_id: 4242,
-            token: "test-pat".to_string(),
-        }
-    }
-
-    fn zip_of(entries: &[(&str, &str)]) -> Vec<u8> {
-        use std::io::Write;
-        let mut buf = std::io::Cursor::new(Vec::new());
-        let mut w = zip::ZipWriter::new(&mut buf);
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        for (name, body) in entries {
-            w.start_file(*name, opts).unwrap();
-            w.write_all(body.as_bytes()).unwrap();
-        }
-        w.finish().unwrap();
-        buf.into_inner()
-    }
-
-    #[test]
-    fn api_fetch_unpacks_sorted_entries_under_headers() {
-        // Entries land sorted by name, each under a ===== header, redacted and
-        // written to one artifact; exactly one request, zero sleeps.
-        let zip = zip_of(&[
-            ("b-build-9-attempt-1.log", "boom: assertion failed\n"),
-            ("a-check-8-attempt-1.log", "checking...\n"),
-        ]);
-        let transport = BytesTransport::new(200, zip);
-        let tmp = tempfile::tempdir().unwrap();
-        let mut sleeps = 0;
-        let out = fetch_run_logs_api(
-            &transport,
-            &LogFetchConfig::default(),
-            &api_target(),
-            tmp.path(),
-            &[],
-            |_| sleeps += 1,
-        )
-        .unwrap();
-        let ApiLogOutcome::Fetched(log) = out else {
-            panic!("expected Fetched, got {out:?}");
-        };
-        let a = log
-            .text
-            .find("===== a-check-8-attempt-1.log =====")
-            .unwrap();
-        let b = log
-            .text
-            .find("===== b-build-9-attempt-1.log =====")
-            .unwrap();
-        assert!(a < b, "entries sorted by name");
-        assert!(log.text.contains("boom: assertion failed"));
-        assert!(log.artifact.exists());
-        assert_eq!(transport.calls(), 1);
-        assert_eq!(sleeps, 0);
-    }
-
-    #[test]
-    fn api_fetch_auth_denied_decides_after_one_request() {
-        for status in [401_u16, 403] {
-            let transport = BytesTransport::new(status, Vec::new());
-            let tmp = tempfile::tempdir().unwrap();
-            let mut sleeps = 0;
-            let out = fetch_run_logs_api(
-                &transport,
-                &LogFetchConfig::default(),
-                &api_target(),
-                tmp.path(),
-                &[],
-                |_| sleeps += 1,
-            )
-            .unwrap();
-            assert!(
-                matches!(out, ApiLogOutcome::AuthDenied(s) if s == status),
-                "{out:?}"
-            );
-            assert_eq!(transport.calls(), 1, "exactly one request for {status}");
-            assert_eq!(sleeps, 0, "no backoff for auth-class responses");
-        }
-    }
-
-    #[test]
-    fn api_fetch_not_found_decides_after_one_request() {
-        // 404 = endpoint absent (Forgejo < 16) or run pruned; nothing to wait for.
-        let transport = BytesTransport::new(404, Vec::new());
-        let tmp = tempfile::tempdir().unwrap();
-        let mut sleeps = 0;
-        let out = fetch_run_logs_api(
-            &transport,
-            &LogFetchConfig::default(),
-            &api_target(),
-            tmp.path(),
-            &[],
-            |_| sleeps += 1,
-        )
-        .unwrap();
-        assert!(matches!(out, ApiLogOutcome::NotFound), "{out:?}");
-        assert_eq!(transport.calls(), 1);
-        assert_eq!(sleeps, 0);
-    }
-
-    #[test]
-    fn api_fetch_corrupt_archive_fails_with_reason() {
-        let transport = BytesTransport::new(200, b"this is not a zip".to_vec());
-        let tmp = tempfile::tempdir().unwrap();
-        let out = fetch_run_logs_api(
-            &transport,
-            &LogFetchConfig::default(),
-            &api_target(),
-            tmp.path(),
-            &[],
-            |_| {},
-        )
-        .unwrap();
-        assert!(
-            matches!(&out, ApiLogOutcome::Failed(r) if r.contains("archive")),
-            "{out:?}"
-        );
-    }
+    /// One recorded `run_logs` call: `(host, repo, run_number, token)`.
+    type LoggedCall = (String, String, i64, Option<String>);
 
     fn cfg() -> LogFetchConfig {
         LogFetchConfig {
@@ -1349,13 +766,269 @@ mod tests {
         }
     }
 
-    // ---- CLAUDE-189: runs-list global-id resolution ----------------------
+    // ---- CLAUDE-204: `fj actions logs` fetch ------------------------------
+
+    /// Scripted [`ActionLogClient`]: pops queued outcomes in order, defaulting
+    /// to a not-found once drained so an "always missing" run is easy to set up.
+    /// Records the arguments so the call shape is asserted.
+    struct StubLogClient {
+        outcomes: Mutex<VecDeque<RunLogsOutcome>>,
+        calls: Mutex<Vec<LoggedCall>>,
+    }
+
+    impl StubLogClient {
+        fn new(outcomes: Vec<RunLogsOutcome>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    impl ActionLogClient for StubLogClient {
+        fn run_logs(
+            &self,
+            host: &str,
+            repo: &str,
+            run_number: i64,
+            token: Option<&str>,
+        ) -> RunLogsOutcome {
+            self.calls.lock().unwrap().push((
+                host.to_string(),
+                repo.to_string(),
+                run_number,
+                token.map(str::to_string),
+            ));
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| RunLogsOutcome::NotFound("no action run #7".to_string()))
+        }
+    }
+
+    fn job(name: &str, status: &str, log: &str) -> JobLog {
+        JobLog {
+            name: name.to_string(),
+            status: status.to_string(),
+            log: log.to_string(),
+        }
+    }
+
+    fn target() -> LogTarget {
+        LogTarget {
+            host: "dev.a8n.run".to_string(),
+            repo: "contoso/claude-run".to_string(),
+            run_number: 7,
+            token: Some("test-pat".to_string()),
+        }
+    }
+
+    #[test]
+    fn fetch_returns_redacted_text_and_artifact_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = StubLogClient::new(vec![RunLogsOutcome::Fetched(vec![job(
+            "check",
+            "failure",
+            "step 1 ok\nAuthorization: token ghp_abcdefghij0123456789ABCDEFG\nstep 2 failed",
+        )])]);
+        let out = fetch_run_log(&client, &cfg(), &target(), tmp.path(), &[], |_| {}).unwrap();
+        let LogOutcome::Fetched(log) = out else {
+            panic!("expected Fetched, got {out:?}");
+        };
+        // The artifact exists and matches the returned text.
+        assert!(log.artifact.exists());
+        let on_disk = std::fs::read_to_string(&log.artifact).unwrap();
+        assert_eq!(on_disk, log.text);
+        // The secret is gone from the summary text, the file, AND the per-job
+        // log handed back to the caller.
+        assert!(!log.text.contains("ghp_abcdefghij0123456789ABCDEFG"));
+        assert!(!on_disk.contains("ghp_abcdefghij0123456789ABCDEFG"));
+        assert!(!log.jobs[0].log.contains("ghp_abcdefghij0123456789ABCDEFG"));
+        assert!(log.text.contains(REDACTED));
+        assert!(log.text.contains("step 2 failed"));
+        assert!(log.text.contains("===== check (failure) ====="));
+        assert_eq!(client.calls(), 1);
+    }
+
+    #[test]
+    fn fetch_passes_the_host_repo_run_and_token_to_fj() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = StubLogClient::new(vec![RunLogsOutcome::Fetched(vec![job(
+            "c", "failure", "x",
+        )])]);
+        fetch_run_log(&client, &cfg(), &target(), tmp.path(), &[], |_| {}).unwrap();
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            (
+                "dev.a8n.run".to_string(),
+                "contoso/claude-run".to_string(),
+                7,
+                Some("test-pat".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn retries_then_succeeds_when_logs_flush_late() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = StubLogClient::new(vec![
+            RunLogsOutcome::NotFound("no action run #7".to_string()),
+            RunLogsOutcome::NotFound("no action run #7".to_string()),
+            RunLogsOutcome::Fetched(vec![job("check", "failure", "the logs")]),
+        ]);
+        let mut sleeps = 0u32;
+        let out =
+            fetch_run_log(&client, &cfg(), &target(), tmp.path(), &[], |_| sleeps += 1).unwrap();
+        assert!(matches!(out, LogOutcome::Fetched(_)));
+        assert_eq!(client.calls(), 3, "two misses then a hit");
+        assert_eq!(sleeps, 2, "backed off before each retry");
+    }
+
+    #[test]
+    fn persistent_miss_is_transient_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty queue -> the stub's drained default (not found) every time.
+        let client = StubLogClient::new(vec![]);
+        let out = fetch_run_log(&client, &cfg(), &target(), tmp.path(), &[], |_| {}).unwrap();
+        match out {
+            LogOutcome::TransientMiss { reason } => assert!(reason.contains("no action run")),
+            other => panic!("expected TransientMiss, got {other:?}"),
+        }
+        // 1 initial attempt + max_retries.
+        assert_eq!(client.calls(), 1 + cfg().max_retries as usize);
+    }
+
+    #[test]
+    fn auth_denied_is_terminal_after_one_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = StubLogClient::new(vec![RunLogsOutcome::AuthDenied(
+            "HTTP 403: lacks read:repository".to_string(),
+        )]);
+        let mut sleeps = 0u32;
+        let out =
+            fetch_run_log(&client, &cfg(), &target(), tmp.path(), &[], |_| sleeps += 1).unwrap();
+        assert!(
+            matches!(&out, LogOutcome::AuthDenied { reason } if reason.contains("403")),
+            "{out:?}"
+        );
+        assert_eq!(client.calls(), 1, "no retry on a rejected token");
+        assert_eq!(sleeps, 0);
+    }
+
+    #[test]
+    fn a_fault_survives_the_retries_as_failed_not_a_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = StubLogClient::new(vec![
+            RunLogsOutcome::Failed("fj not found on PATH".to_string()),
+            RunLogsOutcome::Failed("fj not found on PATH".to_string()),
+            RunLogsOutcome::Failed("fj not found on PATH".to_string()),
+            RunLogsOutcome::Failed("fj not found on PATH".to_string()),
+        ]);
+        let out = fetch_run_log(&client, &cfg(), &target(), tmp.path(), &[], |_| {}).unwrap();
+        assert!(
+            matches!(&out, LogOutcome::Failed { reason } if reason.contains("fj not found")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_job_with_an_empty_log_is_not_a_miss() {
+        // `fj` maps a never-started job's 404 to an empty log; the run itself was
+        // found, so this is a successful fetch, not a transient miss.
+        let tmp = tempfile::tempdir().unwrap();
+        let client = StubLogClient::new(vec![RunLogsOutcome::Fetched(vec![
+            job("build", "failure", "boom\n"),
+            job("deploy", "skipped", ""),
+        ])]);
+        let out = fetch_run_log(&client, &cfg(), &target(), tmp.path(), &[], |_| {}).unwrap();
+        let LogOutcome::Fetched(log) = out else {
+            panic!("expected Fetched, got {out:?}");
+        };
+        assert_eq!(log.jobs.len(), 2);
+        assert_eq!(client.calls(), 1, "no retry for an empty job log");
+        assert!(log.text.contains("===== deploy (skipped) ====="));
+    }
+
+    #[test]
+    fn artifact_is_named_per_repo_and_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = StubLogClient::new(vec![RunLogsOutcome::Fetched(vec![job(
+            "c", "failure", "x",
+        )])]);
+        let out = fetch_run_log(&client, &cfg(), &target(), tmp.path(), &[], |_| {}).unwrap();
+        let LogOutcome::Fetched(log) = out else {
+            panic!("expected Fetched");
+        };
+        assert_eq!(
+            log.artifact.file_name().unwrap().to_string_lossy(),
+            "contoso_claude-run-run7-all-jobs.log"
+        );
+    }
+
+    #[test]
+    fn parse_run_logs_reads_the_fj_json_document() {
+        // The shape `fj actions logs --json` emits.
+        let stdout = r#"{"run_number":889,"jobs":[{"name":"fmt + clippy","status":"failure","log":"boom\n"}]}"#;
+        let jobs = parse_run_logs(stdout).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "fmt + clippy");
+        assert_eq!(jobs[0].status, "failure");
+        assert_eq!(jobs[0].log, "boom\n");
+        assert!(parse_run_logs("not json").is_err());
+    }
+
+    // ---- URL / host derivation -------------------------------------------
+
+    #[test]
+    fn host_derived_from_html_url() {
+        let t = LogTarget::for_run(
+            "https://dev.a8n.run/contoso/claude-run/actions/runs/7",
+            "contoso/claude-run",
+            7,
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.host, "dev.a8n.run");
+        assert_eq!(t.run_number, 7);
+        assert!(t.token.is_none());
+
+        let t =
+            LogTarget::for_run("http://localhost:3000/o/r/actions/runs/1", "o/r", 1, None).unwrap();
+        assert_eq!(t.host, "localhost:3000", "port preserved");
+    }
+
+    #[test]
+    fn host_none_when_url_has_no_host() {
+        assert!(LogTarget::for_run("", "contoso/claude-run", 7, None).is_none());
+    }
+
+    #[test]
+    fn base_url_derived_for_the_http_endpoints() {
+        assert_eq!(
+            base_from_html_url(
+                "https://dev.a8n.run/contoso/claude-run/actions/runs/7",
+                "contoso/claude-run"
+            )
+            .as_deref(),
+            Some("https://dev.a8n.run")
+        );
+        assert!(
+            base_from_html_url("https://dev.a8n.run/other/repo", "contoso/claude-run").is_none()
+        );
+    }
+
+    // ---- CLAUDE-191: full runs-list entries + paging (still on HTTP) -------
 
     /// One queued bytes response: `(status, body)` or a transport error.
     type BytesResponse = std::result::Result<(u16, Vec<u8>), String>;
 
-    /// A bytes transport that maps each request URL to a queued response by the
-    /// order requested. `get` panics so the resolver never uses the text route.
+    /// A bytes transport that serves queued responses in request order and
+    /// records the URLs, for the two endpoints `fj` has no command for.
     struct SeqBytesTransport {
         responses: Mutex<VecDeque<BytesResponse>>,
         urls: Mutex<Vec<String>>,
@@ -1374,9 +1047,6 @@ mod tests {
     }
 
     impl LogTransport for SeqBytesTransport {
-        fn get(&self, url: &str, _t: Option<&str>) -> std::result::Result<HttpResponse, String> {
-            panic!("text route used for an API fetch: {url}");
-        }
         fn get_bytes(
             &self,
             url: &str,
@@ -1392,90 +1062,9 @@ mod tests {
         }
     }
 
-    fn runs_target() -> RunsListApiTarget {
-        RunsListApiTarget {
-            base_url: "https://dev.a8n.run".to_string(),
-            repo: "initech/chat".to_string(),
-            token: "test-pat".to_string(),
-        }
-    }
-
-    fn runs_page(runs: &[(i64, i64)]) -> Vec<u8> {
-        let items: Vec<String> = runs
-            .iter()
-            .map(|(id, index)| format!(r#"{{"id":{id},"index_in_repo":{index}}}"#))
-            .collect();
-        format!(r#"{{"workflow_runs":[{}]}}"#, items.join(",")).into_bytes()
-    }
-
-    #[test]
-    fn resolve_matches_index_to_global_id_on_first_page() {
-        // The CLAUDE-185 shape: index 4034 -> global id 21077.
-        let body = runs_page(&[(21099, 4036), (21077, 4034), (21050, 4030)]);
-        let transport = SeqBytesTransport::new(vec![Ok((200, body))]);
-        let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
-        assert_eq!(out, RunIdOutcome::Resolved(21077));
-        assert_eq!(
-            transport.urls().len(),
-            1,
-            "found on page 1, no further pages"
-        );
-    }
-
-    #[test]
-    fn resolve_pages_until_the_index_is_found() {
-        // A full page (50 entries) that misses, then a second page with the hit.
-        let mut full: Vec<(i64, i64)> = (0..50).map(|n| (90000 + n, 5000 + n)).collect();
-        // Ensure none on page 1 matches index 4034.
-        assert!(!full.iter().any(|(_, idx)| *idx == 4034));
-        let page1 = runs_page(&full);
-        full.clear();
-        let page2 = runs_page(&[(21077, 4034)]);
-        let transport = SeqBytesTransport::new(vec![Ok((200, page1)), Ok((200, page2))]);
-        let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
-        assert_eq!(out, RunIdOutcome::Resolved(21077));
-        assert_eq!(
-            transport.urls().len(),
-            2,
-            "paged once past the full first page"
-        );
-        assert!(transport.urls()[0].contains("page=1"));
-        assert!(transport.urls()[1].contains("page=2"));
-    }
-
-    #[test]
-    fn resolve_short_page_without_match_is_not_found() {
-        let body = runs_page(&[(1, 10), (2, 11)]); // short page, no 4034
-        let transport = SeqBytesTransport::new(vec![Ok((200, body))]);
-        let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
-        assert_eq!(out, RunIdOutcome::NotFound);
-        assert_eq!(
-            transport.urls().len(),
-            1,
-            "stopped at the last (short) page"
-        );
-    }
-
-    #[test]
-    fn resolve_auth_and_not_found_are_terminal() {
-        for status in [401_u16, 403] {
-            let transport = SeqBytesTransport::new(vec![Ok((status, Vec::new()))]);
-            let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
-            assert_eq!(out, RunIdOutcome::AuthDenied(status));
-        }
-        let transport = SeqBytesTransport::new(vec![Ok((404, Vec::new()))]);
-        let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
-        assert_eq!(out, RunIdOutcome::NotFound);
-    }
-
-    #[test]
-    fn resolve_transport_error_is_failed() {
-        let transport = SeqBytesTransport::new(vec![Err("connect refused".to_string())]);
-        let out = resolve_run_global_id(&transport, &runs_target(), 4034).unwrap();
-        assert!(matches!(out, RunIdOutcome::Failed(r) if r.contains("connect refused")));
-    }
-
-    // ---- CLAUDE-191: full runs-list entries + paging ----------------------
+    const TEST_BASE: &str = "https://dev.a8n.run";
+    const TEST_REPO: &str = "initech/chat";
+    const TEST_MAX_PAGES: u32 = 40;
 
     /// A runs-list page carrying the reconciler's full field set.
     fn runs_page_full(runs: &[(i64, i64, &str, &str, &str)]) -> Vec<u8> {
@@ -1518,18 +1107,21 @@ mod tests {
         let page1 = runs_page_full(&full);
         let page2 = runs_page_full(&[(21077, 4034, "ci.yml", "feature", "failure")]);
         let transport = SeqBytesTransport::new(vec![Ok((200, page1)), Ok((200, page2))]);
-        let out = fetch_runs(&transport, &runs_target(), RUNS_MAX_PAGES).unwrap();
+        let out = fetch_runs(&transport, TEST_BASE, TEST_REPO, "test-pat", TEST_MAX_PAGES).unwrap();
         let RunsListOutcome::Resolved(entries) = out else {
             panic!("expected Resolved");
         };
         assert_eq!(entries.len(), 51);
         assert_eq!(transport.urls().len(), 2, "stopped at the short page");
+        assert!(
+            transport.urls()[0].contains("/api/v1/repos/initech/chat/actions/runs?page=1")
+        );
     }
 
     #[test]
     fn fetch_runs_auth_denied_on_first_page_is_terminal() {
         let transport = SeqBytesTransport::new(vec![Ok((403, Vec::new()))]);
-        let out = fetch_runs(&transport, &runs_target(), RUNS_MAX_PAGES).unwrap();
+        let out = fetch_runs(&transport, TEST_BASE, TEST_REPO, "test-pat", TEST_MAX_PAGES).unwrap();
         assert_eq!(out, RunsListOutcome::AuthDenied(403));
     }
 
@@ -1542,14 +1134,14 @@ mod tests {
         let page1 = runs_page_full(&full);
         let transport =
             SeqBytesTransport::new(vec![Ok((200, page1)), Err("connect refused".to_string())]);
-        let out = fetch_runs(&transport, &runs_target(), RUNS_MAX_PAGES).unwrap();
+        let out = fetch_runs(&transport, TEST_BASE, TEST_REPO, "test-pat", TEST_MAX_PAGES).unwrap();
         let RunsListOutcome::Resolved(entries) = out else {
             panic!("expected Resolved with the collected page-1 entries");
         };
         assert_eq!(entries.len(), 50);
     }
 
-    // ---- CLAUDE-189: workflow YAML fetch ---------------------------------
+    // ---- CLAUDE-189: workflow YAML fetch (still on HTTP) -----------------
 
     #[test]
     fn workflow_yaml_tries_dirs_and_returns_first_hit_redacted() {
@@ -1563,8 +1155,8 @@ mod tests {
         ]);
         let out = fetch_workflow_yaml(
             &transport,
-            "https://dev.a8n.run",
-            "initech/chat",
+            TEST_BASE,
+            TEST_REPO,
             "a456a957",
             "check.yml",
             "test-pat",
@@ -1592,120 +1184,14 @@ mod tests {
         ]);
         let out = fetch_workflow_yaml(
             &transport,
-            "https://dev.a8n.run",
-            "initech/chat",
+            TEST_BASE,
+            TEST_REPO,
             "a456a957",
             "check.yml",
             "test-pat",
             &[],
         );
         assert!(out.is_none());
-    }
-
-    // ---- URL / base derivation -------------------------------------------
-
-    #[test]
-    fn logs_url_has_required_attempt_segment() {
-        assert_eq!(
-            target().logs_url(),
-            "https://dev.a8n.run/contoso/claude-run/actions/runs/7/jobs/0/attempt/1/logs"
-        );
-    }
-
-    #[test]
-    fn base_url_derived_from_html_url() {
-        let t = LogTarget::for_run(
-            "https://dev.a8n.run/contoso/claude-run/actions/runs/7",
-            "contoso/claude-run",
-            7,
-        )
-        .unwrap();
-        assert_eq!(t.base_url, "https://dev.a8n.run");
-        assert_eq!(t.job_index, DEFAULT_JOB_INDEX);
-        assert_eq!(t.attempt, DEFAULT_ATTEMPT);
-        assert!(t.token.is_none());
-    }
-
-    #[test]
-    fn base_url_none_when_repo_absent() {
-        assert!(
-            LogTarget::for_run("https://dev.a8n.run/other/repo", "contoso/claude-run", 7)
-                .is_none()
-        );
-    }
-
-    // ---- AC 1: fetch returns redacted text + a file artifact -------------
-
-    #[test]
-    fn fetch_returns_redacted_text_and_artifact_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let transport = StubTransport::new(vec![ready(
-            "step 1 ok\nAuthorization: token ghp_abcdefghij0123456789ABCDEFG\nstep 2 failed",
-        )]);
-        let secrets: Vec<String> = vec![];
-        let out =
-            fetch_failing_job_log(&transport, &cfg(), &target(), tmp.path(), &secrets, |_| {})
-                .unwrap();
-        let LogOutcome::Fetched(log) = out else {
-            panic!("expected Fetched, got {out:?}");
-        };
-        // The artifact exists and matches the returned text.
-        assert!(log.artifact.exists());
-        let on_disk = std::fs::read_to_string(&log.artifact).unwrap();
-        assert_eq!(on_disk, log.text);
-        // The secret is gone from both the summary text and the file.
-        assert!(!log.text.contains("ghp_abcdefghij0123456789ABCDEFG"));
-        assert!(log.text.contains(REDACTED));
-        assert!(log.text.contains("step 2 failed"));
-        assert_eq!(transport.calls(), 1);
-    }
-
-    // ---- AC 2: retries on not-ready; persistent miss is transient --------
-
-    #[test]
-    fn retries_then_succeeds_when_logs_flush_late() {
-        let tmp = tempfile::tempdir().unwrap();
-        let transport = StubTransport::new(vec![not_ready(), not_ready(), ready("the logs")]);
-        let mut sleeps = 0u32;
-        let out = fetch_failing_job_log(&transport, &cfg(), &target(), tmp.path(), &[], |_| {
-            sleeps += 1
-        })
-        .unwrap();
-        assert!(matches!(out, LogOutcome::Fetched(_)));
-        assert_eq!(transport.calls(), 3, "two misses then a hit");
-        assert_eq!(sleeps, 2, "backed off before each retry");
-    }
-
-    #[test]
-    fn persistent_miss_is_transient_not_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Empty queue -> the stub's drained default (not-ready) every time.
-        let transport = StubTransport::new(vec![]);
-        let out =
-            fetch_failing_job_log(&transport, &cfg(), &target(), tmp.path(), &[], |_| {}).unwrap();
-        match out {
-            LogOutcome::TransientMiss { reason } => assert!(reason.contains("not ready")),
-            other => panic!("expected TransientMiss, got {other:?}"),
-        }
-        // 1 initial attempt + max_retries.
-        assert_eq!(transport.calls(), 1 + cfg().max_retries);
-    }
-
-    #[test]
-    fn transport_error_is_retried_and_surfaced_as_transient() {
-        let tmp = tempfile::tempdir().unwrap();
-        let transport = StubTransport::new(vec![
-            Err("connect refused".to_string()),
-            Err("connect refused".to_string()),
-            Err("connect refused".to_string()),
-            Err("connect refused".to_string()),
-        ]);
-        let out =
-            fetch_failing_job_log(&transport, &cfg(), &target(), tmp.path(), &[], |_| {}).unwrap();
-        match out {
-            LogOutcome::TransientMiss { reason } => assert!(reason.contains("transport error")),
-            other => panic!("expected TransientMiss, got {other:?}"),
-        }
     }
 
     // ---- AC 3: secret redaction ------------------------------------------
@@ -1797,78 +1283,33 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-190: jobs-list resolution ---------------------------------
-
-    fn jobs_body(jobs: &[(&str, &str)]) -> Vec<u8> {
-        let items: Vec<String> = jobs
-            .iter()
-            .map(|(name, status)| format!(r#"{{"name":"{name}","status":"{status}"}}"#))
-            .collect();
-        format!(r#"{{"workflow_jobs":[{}]}}"#, items.join(",")).into_bytes()
-    }
+    // ---- CLAUDE-204: failing-job selection over the fj job list -----------
 
     #[test]
     fn resolve_failing_job_picks_the_failing_one() {
-        let jobs = parse_jobs_list(&jobs_body(&[
-            ("build", "success"),
-            ("test", "failure"),
-            ("lint", "waiting"),
-        ]))
-        .unwrap();
-        assert_eq!(
-            resolve_failing_job(&jobs),
-            Some(("test".to_string(), 1)),
-            "the failing job's name and its index"
-        );
-    }
-
-    #[test]
-    fn resolve_failing_job_reads_conclusion_over_status() {
-        // A finished job carries a `conclusion`; prefer it over `status`.
-        let body =
-            br#"{"workflow_jobs":[{"name":"check","status":"completed","conclusion":"failure"}]}"#;
-        let jobs = parse_jobs_list(body).unwrap();
-        assert_eq!(resolve_failing_job(&jobs), Some(("check".to_string(), 0)));
+        let jobs = vec![
+            job("build", "success", ""),
+            job("test", "failure", "boom"),
+            job("lint", "waiting", ""),
+        ];
+        let failing = resolve_failing_job(&jobs).expect("a job");
+        assert_eq!(failing.name, "test");
+        assert_eq!(failing.log, "boom");
     }
 
     #[test]
     fn resolve_failing_job_defaults_to_first_when_none_failed() {
-        let jobs = parse_jobs_list(&jobs_body(&[("only", "success")])).unwrap();
-        assert_eq!(resolve_failing_job(&jobs), Some(("only".to_string(), 0)));
+        let jobs = vec![job("only", "success", "")];
+        assert_eq!(resolve_failing_job(&jobs).unwrap().name, "only");
         // Empty list -> no job.
-        assert_eq!(resolve_failing_job(&[]), None);
-    }
-
-    fn jobs_target() -> RunJobsApiTarget {
-        RunJobsApiTarget {
-            base_url: "https://dev.a8n.run".to_string(),
-            repo: "contoso/claude-run".to_string(),
-            run_global_id: 4242,
-            token: Some("test-pat".to_string()),
-        }
+        assert!(resolve_failing_job(&[]).is_none());
     }
 
     #[test]
-    fn fetch_run_jobs_resolves_the_failing_job() {
-        let body = jobs_body(&[("build", "success"), ("test", "failure")]);
-        let transport = SeqBytesTransport::new(vec![Ok((200, body))]);
-        let out = fetch_run_jobs(&transport, &cfg(), &jobs_target(), |_| {}).unwrap();
-        let JobsOutcome::Resolved(jobs) = out else {
-            panic!("expected Resolved, got {out:?}");
-        };
-        assert_eq!(resolve_failing_job(&jobs), Some(("test".to_string(), 1)));
-        assert!(transport.urls()[0].contains("/actions/runs/4242/jobs"));
-    }
-
-    #[test]
-    fn fetch_run_jobs_auth_and_not_found_are_terminal() {
-        for status in [401_u16, 403] {
-            let transport = SeqBytesTransport::new(vec![Ok((status, Vec::new()))]);
-            let out = fetch_run_jobs(&transport, &cfg(), &jobs_target(), |_| {}).unwrap();
-            assert_eq!(out, JobsOutcome::AuthDenied(status));
+    fn resolve_failing_job_matches_every_failure_spelling() {
+        for status in ["failure", "FAILED", "error"] {
+            let jobs = vec![job("build", "success", ""), job("test", status, "")];
+            assert_eq!(resolve_failing_job(&jobs).unwrap().name, "test", "{status}");
         }
-        let transport = SeqBytesTransport::new(vec![Ok((404, Vec::new()))]);
-        let out = fetch_run_jobs(&transport, &cfg(), &jobs_target(), |_| {}).unwrap();
-        assert_eq!(out, JobsOutcome::NotFound);
     }
 }

@@ -52,11 +52,6 @@ pub struct MintRequest<'a> {
     pub repo: &'a str,
     /// The run's per-repo index (one half of the primary dedupe key).
     pub index_in_repo: i64,
-    /// CLAUDE-189: the run's GLOBAL id (`run.id`), embedded as a hidden
-    /// `Run-Global-Id:` marker so the ci-failure-analysis action can address the
-    /// v16 REST run-logs endpoint (keyed by the global id) without re-resolving
-    /// it from the runs-list API. `0` when unknown (never emitted then).
-    pub run_global_id: i64,
     /// Failing commit SHA (part of the secondary dedupe key).
     pub commit_sha: &'a str,
     /// Workflow filename, e.g. `ci.yml` (part of the secondary dedupe key).
@@ -69,11 +64,6 @@ pub struct MintRequest<'a> {
     /// CLAUDE-190: the failing job's name, resolved from the jobs endpoint.
     /// Empty when unresolvable. Part of the root-cause dedupe key.
     pub job_name: &'a str,
-    /// CLAUDE-190: the failing job's index within the run (the jobs endpoint
-    /// position). Defaults to [`crate::forge_log::DEFAULT_JOB_INDEX`] when
-    /// unresolvable. Surfaced as a hidden marker; not part of the key (the
-    /// job name is the stable identity across runs).
-    pub job_index: u64,
     /// CLAUDE-190: a deterministic, pure-string signature of the first
     /// diagnostic line in the redacted log (paths / numbers stripped), so the
     /// same root cause across commits yields the same key. `None` when no
@@ -690,18 +680,14 @@ fn build_description(
     lines.join("\n")
 }
 
-/// CLAUDE-190/189: append the hidden reconciler markers under the dedupe-marker
+/// CLAUDE-190: append the hidden reconciler markers under the dedupe-marker
 /// comment block. `Root-Cause-Key:` / `Branch:` / `Job:` let the auto-close
 /// reconciler (CLAUDE-191) find every issue for a `(repo, branch, workflow,
-/// job)` by full-text search; `Run-Global-Id:` (when known) lets the
-/// ci-failure-analysis action address the v16 run-logs endpoint directly.
+/// job)` by full-text search.
 fn push_reconciler_markers(lines: &mut Vec<String>, req: &MintRequest, root_cause: &str) {
     lines.push(format!("Root-Cause-Key: {root_cause}"));
     lines.push(format!("Branch: {}", req.branch));
     lines.push(format!("Job: {}", req.job_name));
-    if req.run_global_id > 0 {
-        lines.push(format!("Run-Global-Id: {}", req.run_global_id));
-    }
 }
 
 /// CLAUDE-104: the implementation-spec body for an auto-fixable failure. Names
@@ -999,12 +985,10 @@ mod tests {
         MintRequest {
             repo,
             index_in_repo: 7,
-            run_global_id: 0,
             commit_sha: "abc123def456",
             workflow_id: "ci.yml",
             branch: "main",
             job_name: "check",
-            job_index: 0,
             failure_signature: None,
             html_url: "https://dev.a8n.run/owner/repo/actions/runs/7",
             trigger_user: user,
@@ -1174,47 +1158,23 @@ mod tests {
         assert_eq!(p, primary_marker(&r));
     }
 
-    // ---- CLAUDE-189: the hidden Run-Global-Id marker ----------------------
+    // ---- CLAUDE-204: no Run-Global-Id marker ------------------------------
 
     #[test]
-    fn description_embeds_run_global_id_marker_when_known() {
+    fn description_emits_no_run_global_id_marker() {
+        // CLAUDE-204: `fj actions logs` addresses a run by its per-repo number,
+        // so nothing reads a global id and the marker is gone from every body.
         let t = triage(TriageBucket::CodeFix);
-        let mut r = req("owner/repo", &t, "alice");
-        r.run_global_id = 21077;
+        let r = req("owner/repo", &t, "alice");
         let p = primary_marker(&r);
         let s = secondary_marker(&r);
         let rc = root_cause_marker(&r);
-        let body = build_description(&r, &p, &s, &rc);
-        assert!(
-            body.contains("Run-Global-Id: 21077"),
-            "known global id is embedded as a hidden marker: {body}"
-        );
+        assert!(!build_description(&r, &p, &s, &rc).contains("Run-Global-Id"));
 
-        // The auto-fix body carries it too.
+        // The auto-fix body carries none either.
         let af = auto_fix_triage(cargo_fmt_detail());
-        let mut r = req("owner/repo", &af, "alice");
-        r.run_global_id = 21077;
-        let body = build_description(&r, &p, &s, &rc);
-        assert!(
-            body.contains("Run-Global-Id: 21077"),
-            "auto-fix body embeds the marker too: {body}"
-        );
-    }
-
-    #[test]
-    fn description_omits_run_global_id_marker_when_unknown() {
-        // Pre-existing / index-only issues (global id 0) emit no marker; the
-        // analysis action falls back to runs-list resolution for them.
-        let t = triage(TriageBucket::CodeFix);
-        let r = req("owner/repo", &t, "alice"); // run_global_id: 0
-        let p = primary_marker(&r);
-        let s = secondary_marker(&r);
-        let rc = root_cause_marker(&r);
-        let body = build_description(&r, &p, &s, &rc);
-        assert!(
-            !body.contains("Run-Global-Id"),
-            "no marker when unknown: {body}"
-        );
+        let r = req("owner/repo", &af, "alice");
+        assert!(!build_description(&r, &p, &s, &rc).contains("Run-Global-Id"));
     }
 
     // ---- AC 5: bucket 3 mints nothing -------------------------------------
