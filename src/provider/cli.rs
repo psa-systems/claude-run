@@ -1339,6 +1339,115 @@ impl Backend for CliBackend {
     }
 }
 
+/// CLAUDE-204: the Action-log client, `fj actions logs` behind the
+/// [`ActionLogClient`] seam. The ONE path a run's logs are read through, for
+/// public and private repos alike: `fj` resolves the per-repo run number to the
+/// internal run id, enumerates the run's jobs, and returns each job's log, so
+/// nothing here pages a runs list or guesses a job index.
+///
+/// A resolved `log_token_ref` is injected the same way the per-job forge
+/// credentials are (CLAUDE-26): a temp `$XDG_DATA_HOME` holding a single-host
+/// `keys.json` that carries that one secret and nothing else, removed when the
+/// call returns. The token is never a process argument and never logged.
+pub struct FjActionLogs {
+    runner: Arc<dyn CommandRunner>,
+    fj: String,
+}
+
+impl FjActionLogs {
+    /// Client using the default `fj` binary name.
+    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self {
+            runner,
+            fj: "fj".to_string(),
+        }
+    }
+
+    /// Override the binary name (tests point this at a stub on `PATH`).
+    pub fn with_binary(mut self, fj: impl Into<String>) -> Self {
+        self.fj = fj.into();
+        self
+    }
+}
+
+/// Map a failed `fj actions logs` invocation onto an outcome. `fj` reports a run
+/// it cannot resolve as `no action run #<n> on <repo>` and everything else as
+/// `unexpected status code <code> <reason>`, so the code is the discriminator:
+/// 401/403 is a rejected or under-scoped token (terminal), 404 is "not visible"
+/// (a private repo read without a token, or a pruned run), and anything else is
+/// a fault. Only `fj`'s own stderr is quoted; it carries no token.
+fn classify_fj_log_error(stderr: &str, exit_code: i32) -> crate::forge_log::RunLogsOutcome {
+    use crate::forge_log::RunLogsOutcome;
+    let lower = stderr.to_ascii_lowercase();
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no stderr")
+        .to_string();
+    if lower.contains("no action run") {
+        return RunLogsOutcome::NotFound(detail);
+    }
+    if lower.contains("status code 401") {
+        return RunLogsOutcome::AuthDenied(
+            "HTTP 401: the log token is not a valid Forgejo user PAT (wrong value, expired, or not a token-scheme PAT)"
+                .to_string(),
+        );
+    }
+    if lower.contains("status code 403") {
+        return RunLogsOutcome::AuthDenied(
+            "HTTP 403: the log token is valid but lacks read:repository scope or Actions read access on this repo"
+                .to_string(),
+        );
+    }
+    if lower.contains("status code 404") {
+        return RunLogsOutcome::NotFound(format!(
+            "HTTP 404: the run is not visible (private repo without a log token, or pruned): {detail}"
+        ));
+    }
+    RunLogsOutcome::Failed(format!("fj actions logs exited {exit_code}: {detail}"))
+}
+
+impl crate::forge_log::ActionLogClient for FjActionLogs {
+    fn run_logs(
+        &self,
+        host: &str,
+        repo: &str,
+        run_number: i64,
+        token: Option<&str>,
+    ) -> crate::forge_log::RunLogsOutcome {
+        use crate::forge_log::RunLogsOutcome;
+        let keys = match token {
+            Some(t) => match crate::secrets::TempFjKeys::create(host, t) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    return RunLogsOutcome::Failed(format!(
+                        "writing the temp fj key store failed: {e}"
+                    ))
+                }
+            },
+            None => None,
+        };
+        let xdg = keys.as_ref().map(|k| k.xdg_data_home());
+        let envs: Vec<(&str, &str)> = match &xdg {
+            Some(v) => vec![("XDG_DATA_HOME", v.as_str())],
+            None => Vec::new(),
+        };
+        let run = run_number.to_string();
+        let args = [
+            "--host", host, "actions", "logs", "--repo", repo, "--json", &run,
+        ];
+        match self.runner.run_in_env(None, &self.fj, &args, &envs) {
+            Ok(out) if out.ok => match crate::forge_log::parse_run_logs(&out.stdout) {
+                Ok(jobs) => RunLogsOutcome::Fetched(jobs),
+                Err(e) => RunLogsOutcome::Failed(format!("parsing fj actions logs --json: {e}")),
+            },
+            Ok(out) => classify_fj_log_error(&out.stderr, out.exit_code),
+            Err(e) => RunLogsOutcome::Failed(format!("running {} actions logs: {e}", self.fj)),
+        }
+    }
+}
+
 /// Test helper: a [`CommandRunner`] returning canned outcomes keyed by
 /// `(binary, args)`, or a missing-binary error for configured binaries.
 #[cfg(test)]
@@ -2966,5 +3075,159 @@ mod tests {
         std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
         let b = CliBackend::new(Arc::new(StubRunner::new())).with_keys_path(&keys);
         assert!(b.clone_url("dev.a8n.run", "x/y").is_err());
+    }
+
+    // ---- CLAUDE-204: `fj actions logs` ------------------------------------
+
+    use crate::forge_log::{ActionLogClient, RunLogsOutcome};
+
+    const LOGS_ARGS: &[&str] = &[
+        "--host",
+        "dev.a8n.run",
+        "actions",
+        "logs",
+        "--repo",
+        "contoso/claude-run",
+        "--json",
+        "889",
+    ];
+
+    /// The document `fj actions logs --json` emits, verified against
+    /// `fj v0.13.0` on dev.a8n.run.
+    const LOGS_JSON: &str = r#"{"run_number":889,"jobs":[{"name":"fmt + clippy","status":"failure","log":"boom\n"},{"name":"deploy","status":"skipped","log":""}]}"#;
+
+    #[test]
+    fn action_logs_parses_the_json_document() {
+        let runner = Arc::new(StubRunner::new().ok("fj", LOGS_ARGS, LOGS_JSON));
+        let logs = FjActionLogs::new(runner);
+        let out = logs.run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
+        let RunLogsOutcome::Fetched(jobs) = out else {
+            panic!("expected Fetched, got {out:?}");
+        };
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].name, "fmt + clippy");
+        assert_eq!(jobs[0].status, "failure");
+        assert_eq!(jobs[0].log, "boom\n");
+        // A never-started job's empty log rides along; it is not a miss.
+        assert_eq!(jobs[1].log, "");
+    }
+
+    #[test]
+    fn action_logs_injects_the_token_through_a_temp_single_host_keys_json() {
+        // CLAUDE-204: the resolved `log_token_ref` reaches the `fj` child only,
+        // through a temp `keys.json` carrying that one secret and nothing else.
+        // It is never a process argument.
+        let runner = Arc::new(StubRunner::new().ok("fj", LOGS_ARGS, LOGS_JSON));
+        let logs = FjActionLogs::new(runner.clone());
+        let out = logs.run_logs("dev.a8n.run", "contoso/claude-run", 889, Some("test-pat"));
+        assert!(matches!(out, RunLogsOutcome::Fetched(_)), "{out:?}");
+
+        let envs = runner.envs.lock().unwrap();
+        let (_, env) = envs.iter().find(|(b, _)| b == "fj").expect("fj child ran");
+        let (_, xdg) = env
+            .iter()
+            .find(|(k, _)| k == "XDG_DATA_HOME")
+            .expect("XDG_DATA_HOME injected");
+        assert_eq!(env.len(), 1, "only the key-store override is injected");
+        // The store the child would read carries the one host and one token. It
+        // is removed when the call returns, so read it back from the recorded
+        // path only to prove the path shape; the content check is on the writer.
+        assert!(xdg.contains("claude-run-fj-"), "temp store path: {xdg}");
+        // No argument carries the token.
+        assert!(
+            !LOGS_ARGS.iter().any(|a| a.contains("test-pat")),
+            "token is never a process argument"
+        );
+    }
+
+    #[test]
+    fn temp_fj_keys_carries_only_that_host_and_token() {
+        // The store the log fetch writes has exactly one host entry, and its
+        // token is the per-call one (CLAUDE-123 shape: type / name / token).
+        let keys = crate::secrets::TempFjKeys::create("dev.a8n.run", "test-pat").unwrap();
+        let path = std::path::PathBuf::from(keys.xdg_data_home())
+            .join("forgejo-cli")
+            .join("keys.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let hosts = doc.get("hosts").unwrap().as_object().unwrap();
+        assert_eq!(hosts.len(), 1, "one host only: {raw}");
+        assert_eq!(
+            hosts["dev.a8n.run"]["token"].as_str(),
+            Some("test-pat"),
+            "{raw}"
+        );
+        drop(keys);
+        assert!(!path.exists(), "the temp store is removed on drop");
+    }
+
+    #[test]
+    fn a_run_fj_cannot_find_is_not_found_so_the_fetch_retries() {
+        // `fj` reports an unresolvable run as `no action run #N on <repo>`; that
+        // is the retryable "logs have not flushed yet / pruned" case.
+        let runner = Arc::new(StubRunner::new().fail(
+            "fj",
+            LOGS_ARGS,
+            1,
+            "Error: no action run #889 on contoso/claude-run\n",
+        ));
+        let out =
+            FjActionLogs::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
+        assert!(
+            matches!(&out, RunLogsOutcome::NotFound(r) if r.contains("no action run")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_or_unscoped_token_is_auth_denied() {
+        for (code, needle) in [(401, "401"), (403, "403")] {
+            let runner = Arc::new(StubRunner::new().fail(
+                "fj",
+                LOGS_ARGS,
+                1,
+                &format!("Error: unexpected status code {code} Unauthorized\n"),
+            ));
+            let out = FjActionLogs::new(runner).run_logs(
+                "dev.a8n.run",
+                "contoso/claude-run",
+                889,
+                None,
+            );
+            assert!(
+                matches!(&out, RunLogsOutcome::AuthDenied(r) if r.contains(needle)),
+                "{out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_404_is_not_found_not_a_fault() {
+        // A private repo read without a token 404s; so does a pruned run.
+        let runner = Arc::new(StubRunner::new().fail(
+            "fj",
+            LOGS_ARGS,
+            1,
+            "Error: unexpected status code 404 Not Found\n",
+        ));
+        let out =
+            FjActionLogs::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
+        assert!(matches!(out, RunLogsOutcome::NotFound(_)), "{out:?}");
+    }
+
+    #[test]
+    fn a_missing_fj_or_unparseable_output_is_a_fault() {
+        let runner = Arc::new(StubRunner::new().missing("fj"));
+        let out =
+            FjActionLogs::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
+        assert!(matches!(out, RunLogsOutcome::Failed(_)), "{out:?}");
+
+        let runner = Arc::new(StubRunner::new().ok("fj", LOGS_ARGS, "not json"));
+        let out =
+            FjActionLogs::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
+        assert!(
+            matches!(&out, RunLogsOutcome::Failed(r) if r.contains("parsing")),
+            "{out:?}"
+        );
     }
 }

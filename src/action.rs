@@ -662,7 +662,7 @@ impl LogTokenRef {
 /// The handler scans the tracker for open, unresolved issues whose summary starts
 /// with one of `summary_prefixes` and that are not yet marked analyzed, then for
 /// each: resolves the run coordinates from the issue's `## Failure` block, fetches
-/// the complete redacted run log (v16 REST endpoint, PAT from `log_token_ref`)
+/// the complete redacted run log (`fj actions logs`, PAT from `log_token_ref`)
 /// plus the failing workflow YAML, runs one agentic `claude` session over both,
 /// and posts a deep root-cause comment before marking the issue analyzed
 /// (idempotent). Selection is by summary prefix + analyzed-marker ONLY; it never
@@ -686,8 +686,8 @@ pub struct CiFailureAnalysisConfig {
     /// Summary prefixes an issue must start with to be analyzed. Default
     /// `["CI failure:", "Auto-fix:"]`, matching the mint summaries.
     pub summary_prefixes: Vec<String>,
-    /// Forgejo PAT (repository read scope) used to fetch the run log, resolve the
-    /// run global id, and read the workflow YAML through the v16 REST API. Either
+    /// Forgejo PAT (`read:repository` scope) used to fetch the run log through
+    /// `fj actions logs` and to read the workflow YAML. Either
     /// one secret name for every repo or a per-repo mapping (CLAUDE-200). When
     /// unset the mapping is derived from `config.webhook.sources`; an issue whose
     /// repo resolves to no token is skipped with a warning.

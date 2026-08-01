@@ -390,19 +390,20 @@ Review flag.
 
 A single flat config record (no sub-records). The handler scans the tracker for open, unresolved issues whose summary
 starts with one of `summary_prefixes` and that are not yet marked analyzed, then for each: parses the run coordinates from
-the issue's `## Failure` block (reading the run GLOBAL id from a hidden `Run-Global-Id:` marker when present, else
-resolving it by matching `index_in_repo` against the runs-list API), fetches the complete redacted run log (v16 REST
-endpoint, PAT from `log_token_ref`) plus the failing workflow YAML into the workdir, runs one agentic `claude` session
+the issue's `## Failure` block, fetches the complete redacted run log through `fj actions logs <run_number>` (the
+per-repo run number the block already carries; PAT from `log_token_ref`) plus the failing workflow YAML into the workdir,
+runs one agentic `claude` session
 (tools `Read,Grep,Bash`) over both files, and posts a deep root-cause comment before marking the issue analyzed (a hidden
 comment marker) so it is never analyzed twice. The dedup / attempt key is the issue id. The generic blocks
 (`workdir_base`, `claude`, `limits`, `schedule`, `output`) stay at the top level of the action, not inside `native`.
 
 **Selection is by summary prefix + analyzed-marker ONLY; it NEVER selects by `AI Agent: Queued`.** That field belongs to
 the code-fix runner in `actions/youtrack.yml`; analysis is read-only enrichment and must not collide with it, so `query`
-must not filter on `AI Agent`. A log miss (`AuthDenied` / `NotFound` / `Failed`) posts a short "unavailable" note once and
-leaves the issue un-marked so a later run retries; it never crashes or marks analyzed on a miss. Redaction is preserved
-end to end via `forge_log::redact`, and all log / runs-list / workflow-YAML reads go through `forge_log` (Rust), never a
-raw REST call from a nu snippet (tooling-gap rule, FJ-22).
+must not filter on `AI Agent`. A log miss (`AuthDenied` / `TransientMiss` / `Failed`) posts a short "unavailable" note
+once and leaves the issue un-marked so a later run retries; it never crashes or marks analyzed on a miss. Redaction is
+preserved end to end via `forge_log::redact`. Log reads shell out to `fj actions logs`; the workflow-YAML read stays on
+the REST API until `fj` gains a raw-file command (FJ-67). Both go through `forge_log` (Rust), never a raw REST call from a
+nu snippet (tooling-gap rule).
 
 ```yaml
 kind: ci-failure-analysis
@@ -425,12 +426,12 @@ native:
 | `enabled`            | `true`                         | Master toggle. While false the handler no-ops.                       |
 | `query`              | `#Unresolved`                  | YouTrack candidate query. MUST NOT filter by `AI Agent` (see above). |
 | `summary_prefixes`   | `["CI failure:", "Auto-fix:"]` | Summary prefixes an issue must start with to be analyzed.            |
-| `log_token_ref`      | the webhook sources            | Forgejo PAT with the **`read:repository`** scope, used to fetch the log, resolve the run global id, and read the workflow YAML. Either one encrypted-secret name (CLAUDE-26) for every repo or a per-repo mapping (CLAUDE-200, see **Per-repo log tokens**). Read-only and repository-category only: every endpoint it touches (`/repos/{o}/{r}/actions/runs/{id}/logs`, `.../jobs`, `/repos/{o}/{r}/raw/{path}`) is in Forgejo's repository group, so unlike `forgejo.token_ref` this one needs no issue scope (CLAUDE-196). Omitted, the mapping is derived from `config.webhook.sources`. |
+| `log_token_ref`      | the webhook sources            | Forgejo PAT with the **`read:repository`** scope, used to fetch the log and read the workflow YAML. Either one encrypted-secret name (CLAUDE-26) for every repo or a per-repo mapping (CLAUDE-200, see **Per-repo log tokens**). Reaches `fj` through a temp single-host `keys.json` carrying that one secret and nothing else (CLAUDE-204), never a process argument. Read-only and repository-category only: every endpoint it touches (the three `fj actions logs` calls `/repos/{o}/{r}/actions/runs`, `.../runs/{id}/jobs`, `.../jobs/{id}/logs`, plus `/repos/{o}/{r}/raw/{path}`) is in Forgejo's repository group behind `reqRepoReader(unit.TypeActions)`, so unlike `forgejo.token_ref` this one needs no issue scope (CLAUDE-196). Omitted, the mapping is derived from `config.webhook.sources`. |
 | `max_analysis_bytes` | `24576`                        | Cap (bytes) on the posted analysis comment.                          |
 
-**Deployment prerequisite:** the runner's Forgejo must expose the v16 REST run-logs endpoint
-(`GET /api/v1/repos/{owner}/{repo}/actions/runs/{run_id}/logs`, Forgejo PR 12666) and the runs-list endpoint. On a
-pre-v16 instance both 404 and the handler posts an "unavailable" note rather than crashing.
+**Deployment prerequisite:** a host `fj` (`forgejo-cli` 0.13.0+, which ships `fj actions logs`) on `PATH`, and a Forgejo
+exposing the Actions read endpoints it calls. Where they are absent the fetch reports a miss and the handler posts an
+"unavailable" note rather than crashing.
 
 ##### Per-repo log tokens (CLAUDE-200)
 
@@ -479,8 +480,9 @@ is exact on all four of `(repo, branch, workflow, job)`, so a green sibling bran
 issue. The close is idempotent: an already-closed issue (its resolved State drops it from `#Unresolved`, and a hidden
 auto-closed comment marker) is never re-closed or re-commented. **Selection is by summary prefix + markers ONLY; it NEVER
 selects by `AI Agent`** (reconcile is independent of the code-fix runner), so `query` must not filter on `AI Agent`. The
-reconciler performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. All runs-list / jobs /
-log reads go through `forge_log` (Rust), never a raw REST call from a nu snippet (tooling-gap rule, FJ-22).
+reconciler performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. Log and per-job status
+reads shell out to `fj actions logs`; the runs list stays on the REST API until `fj` gains an `actions runs` command
+(FJ-66). Both go through `forge_log` (Rust), never a raw REST call from a nu snippet (tooling-gap rule).
 
 ```yaml
 kind: ci-failure-reconcile
@@ -508,7 +510,7 @@ native:
 | `query`               | `#Unresolved`                  | YouTrack candidate query. MUST NOT filter by `AI Agent`.                                 |
 | `summary_prefixes`    | `["CI failure:", "Auto-fix:"]` | Summary prefixes an issue must start with to be reconciled.                              |
 | `repos`               | `[]`                           | Allow-list of `owner/repo` full names to scan: exact `owner/repo`, `owner/*`, or `*`. Empty scans nothing. |
-| `log_token_ref`       | the webhook sources            | Forgejo PAT with the **`read:repository`** scope, used to page the runs list, read the jobs endpoint, and resolve a null-branch run's branch from its log. Either one encrypted-secret name (CLAUDE-26) for every repo or a per-repo mapping (CLAUDE-200, see **Per-repo log tokens**). Repository-category only, same as the `ci-failure-analysis` log token (CLAUDE-196). Omitted, the mapping is derived from `config.webhook.sources`. |
+| `log_token_ref`       | the webhook sources            | Forgejo PAT with the **`read:repository`** scope, used to page the runs list and to read each latest run's per-job status and log (which also resolves a null-branch run's branch). Either one encrypted-secret name (CLAUDE-26) for every repo or a per-repo mapping (CLAUDE-200, see **Per-repo log tokens**). Reaches `fj` through a temp single-host `keys.json` (CLAUDE-204). Repository-category only, same as the `ci-failure-analysis` log token (CLAUDE-196). Omitted, the mapping is derived from `config.webhook.sources`. |
 | `resolved_state`      | `Done`                         | State set on a closed issue (the CLAUDE project's only resolved State).                  |
 | `close_comment`       | (the auto-closed sentence)     | Run-linked close-comment template; `{run_index}` / `{branch}` / `{run_url}` / `{job}` are substituted, and a hidden auto-closed marker is appended. |
 | `max_branch_resolves` | `40`                           | Cap on per-repo branch-from-log resolutions when the runs list returns `head_branch` null. Reaching it is logged, never silent. |
@@ -517,10 +519,9 @@ native:
 the untagged `native:` block, so a shipped action must set at least one of them (the shipped `ci-failure-reconcile.yml`
 sets both). The generic blocks (`schedule`, `output`, `limits`) stay at the top level of the action.
 
-**Deployment prerequisite:** the runner's Forgejo must expose the runs-list endpoint
-(`GET /api/v1/repos/{owner}/{repo}/actions/runs`) and the per-run jobs endpoint
-(`GET .../actions/runs/{run_id}/jobs`); a null-branch run additionally needs the v16 REST run-logs endpoint to resolve its
-branch. On an instance lacking them a repo scan is skipped with a warning rather than crashing.
+**Deployment prerequisite:** a host `fj` (`forgejo-cli` 0.13.0+) on `PATH` for the log reads, and a Forgejo exposing the
+runs-list endpoint (`GET /api/v1/repos/{owner}/{repo}/actions/runs`), which is the one read still made directly (FJ-66).
+On an instance lacking it a repo scan is skipped with a warning rather than crashing.
 
 ### `workdir_base` (string, optional)
 
@@ -901,7 +902,7 @@ The inbound Forgejo webhook (`POST /webhooks/forgejo/<source>`) surfaces on the 
 - **Read-only:** edit, export, and delete are rejected (HTTP 403); there is no backing YAML to operate on, and a manual trigger is rejected (HTTP 400) because it is event-driven, not scheduled.
 - **Pausable (CLAUDE-153):** it participates in the same per-action Pause as every other action. Pause/Resume controls and a Paused badge appear on the dashboard, and `POST /api/actions/webhook-forgejo/pause` / `/resume` write and clear its `paused_actions` row. While paused, an inbound delivery is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, then dropped without minting or queuing, so Forgejo does not treat it as a failed delivery and retry.
 - **Auto-fix toggle (CLAUDE-153):** the `Webhook` settings section carries an `auto_fix` boolean, default `false` (opt-in). When off, a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) mints nothing and queues no corrective fixup PR: the failure stays reported on the original PR for its author. A `human_action` failure still mints. When on, the corrective-fixup behavior applies (subject to the CLAUDE-149 open-PR suppression). This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. It is DB-backed (`config.webhook`) and edited live on the Settings page or via `PUT /api/settings/webhook`.
-- **Dedupe (root-cause keying, CLAUDE-190):** the cross-run collapse key is `hash(repo, branch, workflow_id, job_name, failure_signature)`, not the commit SHA, so N commits that each fail the same job on the same branch with the same failure collapse onto ONE open issue (the second and later runs append a run-association comment instead of minting a sibling), while a different failure signature on the same job stays a separate issue. The `failure_signature` is a deterministic, pure-string signature of the first diagnostic line in the redacted log (lowercased, path prefixes dropped, digit runs masked to `#`, whitespace collapsed): no LLM, no I/O. When no signature is derivable (truncated / diagnostic-free / logless failure) the key falls back to `hash(repo, branch, workflow_id, job_name)`, which still collapses a "branch is broken" storm onto one issue (a logless failure cannot distinguish two root causes on the same job, so it intentionally groups them; the CLAUDE-189 analysis can later split a mis-grouped issue). `branch` is resolved from the run's log checkout section (`GITHUB_REF=refs/heads/<branch>`; run detail returns `head_branch: null` on the deployed Forgejo), `job_name`/`job_index` from the jobs API endpoint, both in Rust (never a raw REST call from a nu snippet). The issue body carries hidden `Dedupe-Key:`, `Root-Cause-Key:`, `Branch:`, `Job:`, and (when known) `Run-Global-Id:` markers; a per-run key is retained only for webhook-redelivery idempotency, and a resolved issue is never reopened.
+- **Dedupe (root-cause keying, CLAUDE-190):** the cross-run collapse key is `hash(repo, branch, workflow_id, job_name, failure_signature)`, not the commit SHA, so N commits that each fail the same job on the same branch with the same failure collapse onto ONE open issue (the second and later runs append a run-association comment instead of minting a sibling), while a different failure signature on the same job stays a separate issue. The `failure_signature` is a deterministic, pure-string signature of the first diagnostic line in the redacted log (lowercased, path prefixes dropped, digit runs masked to `#`, whitespace collapsed): no LLM, no I/O. When no signature is derivable (truncated / diagnostic-free / logless failure) the key falls back to `hash(repo, branch, workflow_id, job_name)`, which still collapses a "branch is broken" storm onto one issue (a logless failure cannot distinguish two root causes on the same job, so it intentionally groups them; the CLAUDE-189 analysis can later split a mis-grouped issue). `branch` is resolved from the run's log checkout section (`GITHUB_REF=refs/heads/<branch>`; run detail returns `head_branch: null` on the deployed Forgejo), `job_name` from the jobs `fj actions logs` returns with the log, both in Rust (never a raw REST call from a nu snippet). The issue body carries hidden `Dedupe-Key:`, `Root-Cause-Key:`, `Branch:`, and `Job:` markers; a per-run key is retained only for webhook-redelivery idempotency, and a resolved issue is never reopened.
 
 ## Deleting an action
 
