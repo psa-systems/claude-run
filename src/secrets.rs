@@ -233,22 +233,7 @@ impl JobCredentials {
         if let (Some(token), Some(host)) = (&creds.fj_token, fj_host) {
             // `fj` reads `$XDG_DATA_HOME/forgejo-cli/keys.json`; point its child
             // at this dir and write the store with the host's token.
-            let fj_dir = dir.join("forgejo-cli");
-            std::fs::create_dir_all(&fj_dir)?;
-            std::fs::set_permissions(&fj_dir, std::fs::Permissions::from_mode(0o700))?;
-            let keys_path = fj_dir.join("keys.json");
-
-            // CLAUDE-123: the current `fj` (`forgejo-cli`) deserializes each host
-            // entry with required `type`/`name` fields, so a `token`-only entry
-            // fails to parse (`missing field \`type\``) before `fj` ever contacts
-            // the server, breaking `fj pr create` for every branch-strategy job.
-            // Build a complete entry, cloning the operator's real store entry when
-            // present so we never re-derive `fj`'s schema by hand.
-            let host_obj = fj_host_entry(&operator_fj_keys_path(), host, token);
-            let mut hosts = serde_json::Map::new();
-            hosts.insert(host.to_string(), serde_json::Value::Object(host_obj));
-            let payload = serde_json::json!({ "hosts": hosts });
-            write_0600(&keys_path, serde_json::to_vec(&payload)?.as_slice())?;
+            let keys_path = write_fj_keys(dir, host, token)?;
 
             fj_env.push((
                 "XDG_DATA_HOME".to_string(),
@@ -270,6 +255,65 @@ impl JobCredentials {
 impl Drop for JobCredentials {
     fn drop(&mut self) {
         // Best-effort: scrub the plaintext credential files when the job ends.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Write a `forgejo-cli/keys.json` under `xdg_data_home` carrying `host` ->
+/// `token` and NOTHING else, and return its path. The directory is `0700` and
+/// the file `0600`. Shared by the per-job credential store (CLAUDE-26) and the
+/// per-call Action-log store (CLAUDE-204), so both stay on one schema.
+///
+/// CLAUDE-123: the current `fj` (`forgejo-cli`) deserializes each host entry
+/// with required `type`/`name` fields, so a `token`-only entry fails to parse
+/// (``missing field `type` ``) before `fj` ever contacts the server. The entry
+/// is built complete, cloning the operator's real store entry when present so
+/// `fj`'s schema is never re-derived by hand.
+pub(crate) fn write_fj_keys(xdg_data_home: &Path, host: &str, token: &str) -> Result<PathBuf> {
+    let fj_dir = xdg_data_home.join("forgejo-cli");
+    std::fs::create_dir_all(&fj_dir)?;
+    std::fs::set_permissions(&fj_dir, std::fs::Permissions::from_mode(0o700))?;
+    let keys_path = fj_dir.join("keys.json");
+
+    let host_obj = fj_host_entry(&operator_fj_keys_path(), host, token);
+    let mut hosts = serde_json::Map::new();
+    hosts.insert(host.to_string(), serde_json::Value::Object(host_obj));
+    let payload = serde_json::json!({ "hosts": hosts });
+    write_0600(&keys_path, serde_json::to_vec(&payload)?.as_slice())?;
+    Ok(keys_path)
+}
+
+/// CLAUDE-204: a throwaway `$XDG_DATA_HOME` holding a single-host `keys.json`,
+/// removed on drop so a decrypted `log_token_ref` lives only for the one `fj`
+/// call that needs it.
+pub(crate) struct TempFjKeys {
+    dir: PathBuf,
+}
+
+impl TempFjKeys {
+    /// Create the temp store for `host` -> `token`.
+    pub(crate) fn create(host: &str, token: &str) -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "claude-run-fj-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        write_fj_keys(&dir, host, token)?;
+        Ok(Self { dir })
+    }
+
+    /// The value to set as the `fj` child's `XDG_DATA_HOME`.
+    pub(crate) fn xdg_data_home(&self) -> String {
+        self.dir.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for TempFjKeys {
+    fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

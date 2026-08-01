@@ -228,23 +228,24 @@ impl Daemon {
         });
 
         // CLAUDE-43: drain verified webhook failure events for the lifetime of
-        // the daemon. CLAUDE-44: each event triggers an internal-route log fetch
-        // with retry + secret redaction; the redacted artifacts land under
+        // the daemon. CLAUDE-44/204: each event triggers an `fj actions logs`
+        // fetch with retry + secret redaction; the redacted artifacts land under
         // `state_dir/webhook-logs/`. CLAUDE-47: each event is then triaged
         // (CLAUDE-45) and minted / declined (CLAUDE-46) when a provider backend
         // is usable.
         let webhook_log_dir = self.paths.state_dir.join("webhook-logs");
-        let webhook_transport: Arc<dyn crate::forge_log::LogTransport> =
-            Arc::new(crate::forge_log::HttpLogTransport::new());
+        let webhook_logs: Arc<dyn crate::forge_log::ActionLogClient> = Arc::new(
+            crate::provider::FjActionLogs::new(Arc::new(crate::provider::ProcessRunner::new())),
+        );
         let mint_ctx = build_mint_context(&pool, settings.mint_handle(), &claude, &webhook_log_dir);
         let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(
             webhook_rx,
             pool.clone(),
-            webhook_transport,
+            webhook_logs,
             webhook_log_dir,
             mint_ctx,
             // CLAUDE-96: the consumer resolves each event source's
-            // `log_token_ref` for private-repo log fetches. CLAUDE-101: the live
+            // `log_token_ref` to authorize the log fetch. CLAUDE-101: the live
             // handle so a Settings save is picked up by the next event.
             settings.webhook_handle(),
         ));

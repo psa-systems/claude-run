@@ -13,22 +13,21 @@
 //!   analyzed-marker ONLY; it never selects by `AI Agent: Queued` (that field
 //!   belongs to the code-fix runner, `actions/youtrack.yml`).
 //! - resolve coordinates: parse repo / index / run URL / commit / workflow from
-//!   the issue's `## Failure` block; read the run GLOBAL id from a hidden
-//!   `Run-Global-Id:` marker when present, else resolve it by matching
-//!   `index_in_repo` against the runs-list API ([`crate::forge_log`]).
-//! - fetch: reuse [`crate::forge_log::fetch_run_logs_api`] to pull the complete
-//!   redacted run log, plus the failing workflow YAML, into the workdir. A log
-//!   miss (`AuthDenied` / `NotFound` / `Failed`) posts a short "unavailable" note
-//!   (once) and leaves the issue un-marked so a later run retries; it never
-//!   crashes or marks analyzed.
+//!   the issue's `## Failure` block. The per-repo run index is all the fetch
+//!   needs; `fj` resolves it to the run internally.
+//! - fetch: reuse [`crate::forge_log::fetch_run_log`] to pull the complete
+//!   redacted run log through `fj actions logs`, plus the failing workflow YAML,
+//!   into the workdir. A log miss (`AuthDenied` / `TransientMiss` / `Failed`)
+//!   posts a short "unavailable" note (once) and leaves the issue un-marked so a
+//!   later run retries; it never crashes or marks analyzed.
 //! - analyze: one agentic `claude` session (tools `Read,Grep,Bash`) over the
 //!   redacted full-log file plus the workflow YAML.
 //! - finalize: post the analysis as a comment (carrying the hidden analyzed
 //!   marker) so the issue is never analyzed twice.
 //!
-//! Log fetching stays inside `forge_log` (Rust), never a raw REST call from a nu
-//! snippet, per the tooling-gap rule and FJ-22. Redaction is preserved end to end
-//! by reusing `forge_log::redact`.
+//! Log fetching stays inside `forge_log` (Rust) and shells out to `fj`, never a
+//! raw REST call from a nu snippet, per the tooling-gap rule. Redaction is
+//! preserved end to end by reusing `forge_log::redact`.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -41,8 +40,7 @@ use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::claude::ClaudeInvoker;
 use crate::error::{Error, Result};
 use crate::forge_log::{
-    self, ApiLogOutcome, HttpLogTransport, LogFetchConfig, LogTransport, RunIdOutcome,
-    RunLogsApiTarget, RunsListApiTarget,
+    self, ActionLogClient, HttpLogTransport, LogFetchConfig, LogOutcome, LogTarget, LogTransport,
 };
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
 use crate::provider::{self, Backend, IssueInspect};
@@ -85,8 +83,8 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
         return Ok(());
     }
 
-    // A PAT is required to fetch private-repo logs through the v16 REST endpoint.
-    // CLAUDE-200: one mapping, resolved per issue against the repo it names.
+    // A PAT authorizes the `fj actions logs` read on a private repo. CLAUDE-200:
+    // one mapping, resolved per issue against the repo it names.
     let tokens = super::effective_log_tokens(pool, ctx.paths, cfg.log_token_ref.as_ref()).await;
 
     let defaults = RunnerDefaults::default();
@@ -153,6 +151,11 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
         warn!(run_id, error = %e, "recording planned keys failed (continuing)");
     }
 
+    // CLAUDE-204: `fj actions logs` for the run log; the HTTP transport is only
+    // for the workflow-YAML read `fj` has no command for (TODO(FJ-67)).
+    let logs = crate::provider::FjActionLogs::new(std::sync::Arc::new(
+        crate::provider::ProcessRunner::new(),
+    ));
     let transport = HttpLogTransport::new();
     let mut processed: u32 = 0;
     for key in &keys {
@@ -181,6 +184,7 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
             backend.as_ref(),
             &cfg,
             &limits,
+            &logs,
             &transport,
             &tokens,
             key,
@@ -205,11 +209,13 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
 
 /// Analyze one issue. Idempotent: an already-analyzed issue is skipped; a log
 /// miss posts an "unavailable" note (once) and leaves the issue un-marked.
+#[allow(clippy::too_many_arguments)]
 async fn process_job(
     ctx: &NativeContext<'_>,
     backend: &dyn Backend,
     cfg: &CiFailureAnalysisConfig,
     limits: &EffectiveLimits,
+    logs: &dyn ActionLogClient,
     transport: &dyn LogTransport,
     tokens: &LogTokenRef,
     key: &str,
@@ -269,8 +275,8 @@ async fn process_job(
         });
     }
 
-    // Fetch the complete redacted log (+ workflow YAML), resolving the global id.
-    let fetched = fetch_analysis_inputs(transport, &coords, &token, &workdir_path);
+    // Fetch the complete redacted log (+ workflow YAML).
+    let fetched = fetch_analysis_inputs(logs, transport, &coords, &token, &workdir_path);
     let inputs = match fetched {
         FetchResult::Ready(inputs) => inputs,
         FetchResult::Unavailable(reason) => {
@@ -350,8 +356,6 @@ struct AnalysisInputs {
     log_path: PathBuf,
     /// Path to the failing workflow YAML, or `None` if it could not be fetched.
     workflow_path: Option<PathBuf>,
-    /// The resolved run global id (for the analysis header).
-    global_id: i64,
 }
 
 /// Fetch result: inputs ready, or the log is unavailable (with a reason).
@@ -360,87 +364,62 @@ enum FetchResult {
     Unavailable(String),
 }
 
-/// Resolve the run global id, fetch the complete redacted log, and (best-effort)
+/// Fetch the complete redacted run log through `fj actions logs` and, best-effort,
 /// the failing workflow YAML into `out_dir`. Never errors: any miss becomes
 /// [`FetchResult::Unavailable`].
 fn fetch_analysis_inputs(
+    logs: &dyn ActionLogClient,
     transport: &dyn LogTransport,
     coords: &RunCoordinates,
     token: &str,
     out_dir: &Path,
 ) -> FetchResult {
-    let fetch_cfg = LogFetchConfig::default();
+    // CLAUDE-204: the issue names a run that finished long ago, so one call decides.
+    let fetch_cfg = LogFetchConfig::no_retry();
 
-    // 1. Resolve the global id: prefer the hidden marker, else the runs-list.
-    let global_id = match coords.run_global_id {
-        Some(id) if id > 0 => id,
-        _ => {
-            let Some(target) =
-                RunsListApiTarget::for_run(&coords.html_url, &coords.repo, token.to_string())
-            else {
-                return FetchResult::Unavailable(
-                    "could not derive the forge origin from the run URL".to_string(),
-                );
-            };
-            match forge_log::resolve_run_global_id(transport, &target, coords.index_in_repo) {
-                Ok(RunIdOutcome::Resolved(id)) => id,
-                Ok(RunIdOutcome::AuthDenied(s)) => {
-                    return FetchResult::Unavailable(format!("runs-list auth denied (HTTP {s})"))
-                }
-                Ok(RunIdOutcome::NotFound) => {
-                    return FetchResult::Unavailable(
-                        "run not found in the runs list (pruned or endpoint absent)".to_string(),
-                    )
-                }
-                Ok(RunIdOutcome::Failed(reason)) => {
-                    return FetchResult::Unavailable(format!(
-                        "resolving the run id failed: {reason}"
-                    ))
-                }
-                Err(e) => {
-                    return FetchResult::Unavailable(format!("resolving the run id errored: {e}"))
-                }
-            }
-        }
-    };
-
-    // 2. Fetch the complete redacted log.
-    let Some(log_target) = RunLogsApiTarget::for_run(
+    // 1. Fetch the complete redacted log. CLAUDE-204: `fj` takes the per-repo run
+    // number the `## Failure` block already carries, so there is no id to resolve.
+    let Some(log_target) = LogTarget::for_run(
         &coords.html_url,
         &coords.repo,
         coords.index_in_repo,
-        global_id,
-        token.to_string(),
+        Some(token.to_string()),
     ) else {
         return FetchResult::Unavailable(
-            "could not derive the forge origin from the run URL".to_string(),
+            "could not derive the forge host from the run URL".to_string(),
         );
     };
-    let base_url = log_target.base_url.clone();
-    let log_path = match forge_log::fetch_run_logs_api(
-        transport,
+    let log_path = match forge_log::fetch_run_log(
+        logs,
         &fetch_cfg,
         &log_target,
         out_dir,
         &[],
         std::thread::sleep,
     ) {
-        Ok(ApiLogOutcome::Fetched(log)) => log.artifact,
-        Ok(ApiLogOutcome::AuthDenied(s)) => {
-            return FetchResult::Unavailable(format!("run-logs auth denied (HTTP {s})"))
+        Ok(LogOutcome::Fetched(log)) => log.artifact,
+        Ok(LogOutcome::AuthDenied { reason }) => {
+            return FetchResult::Unavailable(format!("run-logs auth denied ({reason})"))
         }
-        Ok(ApiLogOutcome::NotFound) => {
-            return FetchResult::Unavailable(
-                "run logs not found (pruned or endpoint absent)".to_string(),
-            )
+        Ok(LogOutcome::TransientMiss { reason }) => {
+            return FetchResult::Unavailable(format!(
+                "run logs not available yet or pruned: {reason}"
+            ))
         }
-        Ok(ApiLogOutcome::Failed(reason)) => {
+        Ok(LogOutcome::Failed { reason }) => {
             return FetchResult::Unavailable(format!("fetching the run logs failed: {reason}"))
         }
         Err(e) => return FetchResult::Unavailable(format!("fetching the run logs errored: {e}")),
     };
 
-    // 3. Best-effort workflow YAML at the failing commit.
+    // 2. Best-effort workflow YAML at the failing commit. TODO(FJ-67): still a
+    // REST read because `fj` has no raw-file command.
+    let Some(base_url) = forge_log::base_from_html_url(&coords.html_url, &coords.repo) else {
+        return FetchResult::Ready(AnalysisInputs {
+            log_path,
+            workflow_path: None,
+        });
+    };
     let workflow_path = forge_log::fetch_workflow_yaml(
         transport,
         &base_url,
@@ -458,7 +437,6 @@ fn fetch_analysis_inputs(
     FetchResult::Ready(AnalysisInputs {
         log_path,
         workflow_path,
-        global_id,
     })
 }
 
@@ -477,8 +455,6 @@ struct RunCoordinates {
     commit_sha: String,
     workflow_id: String,
     html_url: String,
-    /// The run GLOBAL id from the hidden `Run-Global-Id:` marker, when present.
-    run_global_id: Option<i64>,
 }
 
 /// True when `summary` starts with any of `prefixes` (both trimmed).
@@ -506,7 +482,6 @@ fn parse_failure_block(description: &str) -> Option<RunCoordinates> {
     let mut commit_sha = String::new();
     let mut workflow_id = String::new();
     let mut html_url = None;
-    let mut run_global_id = None;
     for line in description.lines() {
         let t = line.trim();
         if let Some(v) = t.strip_prefix("- Repo:") {
@@ -517,8 +492,6 @@ fn parse_failure_block(description: &str) -> Option<RunCoordinates> {
             commit_sha = unbacktick(v);
         } else if let Some(v) = t.strip_prefix("- Run:") {
             html_url = Some(v.trim().to_string());
-        } else if let Some(v) = t.strip_prefix("Run-Global-Id:") {
-            run_global_id = v.trim().parse::<i64>().ok();
         }
     }
     let repo = repo?;
@@ -530,7 +503,6 @@ fn parse_failure_block(description: &str) -> Option<RunCoordinates> {
         commit_sha,
         workflow_id,
         html_url,
-        run_global_id,
     })
 }
 
@@ -583,8 +555,8 @@ fn build_prompt(inputs: &AnalysisInputs, coords: &RunCoordinates) -> String {
     [
         "You are analyzing a failed CI run to produce a deep, log-grounded root-cause report.".to_string(),
         format!(
-            "The complete redacted run log is at `./{log_name}` (repo `{}`, workflow `{}`, commit `{}`, run #{}, global id {}).",
-            coords.repo, coords.workflow_id, coords.commit_sha, coords.index_in_repo, inputs.global_id
+            "The complete redacted run log is at `./{log_name}` (repo `{}`, workflow `{}`, commit `{}`, run #{}).",
+            coords.repo, coords.workflow_id, coords.commit_sha, coords.index_in_repo
         ),
         format!("Run URL: {}", coords.html_url),
         workflow_line,
@@ -680,7 +652,7 @@ async fn record_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forge_log::HttpResponse;
+    use crate::forge_log::{JobLog, RunLogsOutcome};
     use std::sync::Mutex;
 
     fn inspect(description: &str, comments: &[&str]) -> IssueInspect {
@@ -690,8 +662,8 @@ mod tests {
         }
     }
 
-    /// A bytes transport that returns a queued response per call. The log fetch
-    /// uses the byte route; a workflow-YAML miss returns 404.
+    /// A bytes transport that returns a queued response per call, for the
+    /// workflow-YAML read; a miss returns 404.
     struct StubTransport {
         responses: Mutex<std::collections::VecDeque<(u16, Vec<u8>)>>,
     }
@@ -703,9 +675,6 @@ mod tests {
         }
     }
     impl LogTransport for StubTransport {
-        fn get(&self, url: &str, _t: Option<&str>) -> std::result::Result<HttpResponse, String> {
-            panic!("text route used: {url}");
-        }
         fn get_bytes(
             &self,
             _url: &str,
@@ -720,16 +689,36 @@ mod tests {
         }
     }
 
-    fn zip_log(name: &str, body: &str) -> Vec<u8> {
-        use std::io::Write;
-        let mut buf = std::io::Cursor::new(Vec::new());
-        let mut w = zip::ZipWriter::new(&mut buf);
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        w.start_file(name, opts).unwrap();
-        w.write_all(body.as_bytes()).unwrap();
-        w.finish().unwrap();
-        buf.into_inner()
+    /// A canned `fj actions logs` client returning one fixed outcome and
+    /// asserting the token the fetch was scoped with.
+    struct StubLogs {
+        outcome: Mutex<Option<RunLogsOutcome>>,
+    }
+    impl StubLogs {
+        fn new(outcome: RunLogsOutcome) -> Self {
+            Self {
+                outcome: Mutex::new(Some(outcome)),
+            }
+        }
+    }
+    impl ActionLogClient for StubLogs {
+        fn run_logs(
+            &self,
+            host: &str,
+            repo: &str,
+            run_number: i64,
+            token: Option<&str>,
+        ) -> RunLogsOutcome {
+            assert_eq!(host, "dev.a8n.run");
+            assert_eq!(repo, "initech/chat");
+            assert_eq!(run_number, 4034);
+            assert_eq!(token, Some("test-pat"), "the log token scopes the fetch");
+            self.outcome
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(RunLogsOutcome::NotFound("no action run #4034".to_string()))
+        }
     }
 
     /// AC (redaction): a log fixture containing a token is redacted before it is
@@ -742,17 +731,18 @@ mod tests {
             commit_sha: "a456a957".to_string(),
             workflow_id: "check.yml".to_string(),
             html_url: "https://dev.a8n.run/initech/chat/actions/runs/4034".to_string(),
-            // Global id known: no runs-list resolution, so the first fetch is the log.
-            run_global_id: Some(21077),
         };
         let log = "step ok\nAuthorization: token ghp_abcdefghij0123456789ABCDEFG\nboom";
-        let transport = StubTransport::new(vec![
-            (200, zip_log("check-1-attempt-1.log", log)), // the run-logs ZIP
-                                                          // workflow-YAML candidates all 404 (default), so no yaml is written.
-        ]);
+        let logs = StubLogs::new(RunLogsOutcome::Fetched(vec![JobLog {
+            name: "check".to_string(),
+            status: "failure".to_string(),
+            log: log.to_string(),
+        }]));
+        // Workflow-YAML candidates all 404 (the stub's default), so no yaml is written.
+        let transport = StubTransport::new(vec![]);
         let tmp = tempfile::tempdir().unwrap();
         let FetchResult::Ready(inputs) =
-            fetch_analysis_inputs(&transport, &coords, "test-pat", tmp.path())
+            fetch_analysis_inputs(&logs, &transport, &coords, "test-pat", tmp.path())
         else {
             panic!("expected Ready");
         };
@@ -763,14 +753,13 @@ mod tests {
         );
         assert!(on_disk.contains("[REDACTED]"));
         assert!(on_disk.contains("boom"));
-        assert_eq!(inputs.global_id, 21077);
         assert!(
             inputs.workflow_path.is_none(),
             "workflow YAML missing -> None"
         );
     }
 
-    /// AC (graceful log miss): a 404 run-logs fetch yields Unavailable (never a
+    /// AC (graceful log miss): a run `fj` cannot find yields Unavailable (never a
     /// panic), so the caller posts a note and leaves the issue un-marked.
     #[test]
     fn fetch_reports_unavailable_on_a_log_miss() {
@@ -780,13 +769,34 @@ mod tests {
             commit_sha: "a456a957".to_string(),
             workflow_id: "check.yml".to_string(),
             html_url: "https://dev.a8n.run/initech/chat/actions/runs/4034".to_string(),
-            run_global_id: Some(21077),
         };
-        let transport = StubTransport::new(vec![(404, Vec::new())]);
+        let logs = StubLogs::new(RunLogsOutcome::NotFound("no action run #4034".to_string()));
+        let transport = StubTransport::new(vec![]);
         let tmp = tempfile::tempdir().unwrap();
-        match fetch_analysis_inputs(&transport, &coords, "test-pat", tmp.path()) {
-            FetchResult::Unavailable(reason) => assert!(reason.contains("not found")),
-            FetchResult::Ready(_) => panic!("a 404 must not be Ready"),
+        match fetch_analysis_inputs(&logs, &transport, &coords, "test-pat", tmp.path()) {
+            FetchResult::Unavailable(reason) => {
+                assert!(reason.contains("no action run"), "{reason}")
+            }
+            FetchResult::Ready(_) => panic!("a missing run must not be Ready"),
+        }
+    }
+
+    /// A rejected token is reported as an auth denial, not a transient miss.
+    #[test]
+    fn fetch_reports_unavailable_on_auth_denial() {
+        let coords = RunCoordinates {
+            repo: "initech/chat".to_string(),
+            index_in_repo: 4034,
+            commit_sha: "a456a957".to_string(),
+            workflow_id: "check.yml".to_string(),
+            html_url: "https://dev.a8n.run/initech/chat/actions/runs/4034".to_string(),
+        };
+        let logs = StubLogs::new(RunLogsOutcome::AuthDenied("HTTP 403: ...".to_string()));
+        let transport = StubTransport::new(vec![]);
+        let tmp = tempfile::tempdir().unwrap();
+        match fetch_analysis_inputs(&logs, &transport, &coords, "test-pat", tmp.path()) {
+            FetchResult::Unavailable(reason) => assert!(reason.contains("auth denied"), "{reason}"),
+            FetchResult::Ready(_) => panic!("an auth denial must not be Ready"),
         }
     }
 
@@ -890,15 +900,6 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
             coords.html_url,
             "https://dev.a8n.run/initech/chat/actions/runs/4034"
         );
-        // Pre-existing issue: no Run-Global-Id marker -> falls back to resolution.
-        assert!(coords.run_global_id.is_none());
-    }
-
-    #[test]
-    fn parses_the_run_global_id_marker_when_present() {
-        let body = format!("{CLAUDE_185_BODY}\nRun-Global-Id: 21077");
-        let coords = parse_failure_block(&body).expect("parsed");
-        assert_eq!(coords.run_global_id, Some(21077));
     }
 
     #[test]
@@ -923,7 +924,6 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
         let inputs = AnalysisInputs {
             log_path: PathBuf::from("/wd/initech_chat-run4034-all-jobs.log"),
             workflow_path: Some(PathBuf::from("/wd/failing-workflow.yml")),
-            global_id: 21077,
         };
         let p = build_prompt(&inputs, &coords);
         // References both files by name.
@@ -945,7 +945,6 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
         let inputs = AnalysisInputs {
             log_path: PathBuf::from("/wd/run.log"),
             workflow_path: None,
-            global_id: 21077,
         };
         let p = build_prompt(&inputs, &coords);
         assert!(p.contains("could not be fetched"));

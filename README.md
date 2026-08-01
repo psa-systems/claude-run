@@ -356,10 +356,10 @@ diagnostic line is derivable (a truncated / diagnostic-free / logless failure) t
 `hash(repo, branch, workflow_id, job_name)`, which still collapses a "branch is broken" storm onto one issue (two
 indistinguishable logless failures on the same job are intentionally grouped; the CLAUDE-189 analysis can later split a
 mis-grouped issue). The branch is read from the run's log checkout section (`GITHUB_REF=refs/heads/<branch>`; the deployed
-Forgejo returns `head_branch: null` from run detail) and the job name/index from the jobs API, both resolved in Rust. The
-issue body carries hidden `Dedupe-Key:`, `Root-Cause-Key:`, `Branch:`, `Job:`, and `Run-Global-Id:` markers so the
-CLAUDE-191 auto-close reconciler can find every issue for a `(repo, branch, workflow, job)`; a resolved issue is never
-reopened.
+Forgejo returns `head_branch: null` from run detail) and the job name from the jobs `fj actions logs` returns with the
+log, both resolved in Rust. The issue body carries hidden `Dedupe-Key:`, `Root-Cause-Key:`, `Branch:`, and `Job:`
+markers so the CLAUDE-191 auto-close reconciler can find every issue for a `(repo, branch, workflow, job)`; a resolved
+issue is never reopened.
 
 The listener is multi-source (CLAUDE-87): each `<source>` is a `[webhook.sources.<source>]` config block with its own
 HMAC secret and allow-list, served at its own URL path. One Forgejo org webhook per source means a leaked org secret
@@ -435,21 +435,20 @@ truncated / diagnostic-free log from a real compiler/clippy/test error. The `ci-
 unresolved "CI failure" / "Auto-fix" issue with a deep, log-grounded root-cause comment, produced automatically and
 idempotently, including for issues already open when the feature ships (the CLAUDE-185 backfill case).
 
-For each issue it: parses the run coordinates from the `## Failure` block; resolves the run GLOBAL id from a hidden
-`Run-Global-Id:` marker the mint now embeds (`run.id`), or, for a pre-existing issue with no marker, by matching
-`index_in_repo` against the runs-list API (the run web URL uses the per-repo index, but the v16 run-logs endpoint keys by
-the global id); fetches the complete redacted run log plus the failing workflow YAML into a workdir; runs one agentic
+For each issue it: parses the run coordinates from the `## Failure` block; fetches the complete redacted run log
+through `fj actions logs <run_number>` (the per-repo run number the block already carries, which is what `fj` takes)
+plus the failing workflow YAML into a workdir; runs one agentic
 `claude` session (tools `Read,Grep,Bash`) over both; and posts the analysis as a YouTrack comment carrying a hidden marker
 so the issue is never analyzed twice. The analysis names the exact failing workflow step (by mapping log position to
 workflow step order), the root-cause diagnostic or an explicit statement that the stored log is truncated / diagnostic
 -free, and concrete remediation.
 
 Selection is by summary prefix + analyzed-marker ONLY; it **never** selects by `AI Agent: Queued` (that field belongs to
-the code-fix runner, so analysis, a read-only enrichment, must not collide with it). A log miss (auth denied, pruned, or a
-pre-v16 endpoint) posts a short "unavailable" note once and leaves the issue un-marked so a later run retries; it never
-crashes or marks analyzed on a miss. Log / runs-list / workflow-YAML reads stay inside `forge_log` (Rust), never a raw
-REST call from a nu snippet (FJ-22), and redaction is preserved end to end via `forge_log::redact`, so no token lands in a
-posted comment. Configure it in `actions/ci-failure-analysis.yml` (`log_token_ref` picks the Forgejo PAT per repo, see
+the code-fix runner, so analysis, a read-only enrichment, must not collide with it). A log miss (auth denied or a pruned
+run) posts a short "unavailable" note once and leaves the issue un-marked so a later run retries; it never crashes or
+marks analyzed on a miss. Log reads go through `fj actions logs`; the workflow-YAML read stays on the REST API until
+`fj` gains a raw-file command (FJ-67). Either way the read is in Rust inside `forge_log`, never a raw REST call from a nu
+snippet, and redaction is preserved end to end via `forge_log::redact`, so no token lands in a posted comment. Configure it in `actions/ci-failure-analysis.yml` (`log_token_ref` picks the Forgejo PAT per repo, see
 below; `query` / `summary_prefixes` / `max_analysis_bytes` tune selection and the comment cap). See `actions/SCHEMA.md`
 (`kind: ci-failure-analysis`).
 
@@ -471,8 +470,9 @@ The close is idempotent (a resolved issue drops out of the `#Unresolved` scan, a
 against a re-comment). When the runs list returns `head_branch` null (the deployed Forgejo), the branch is resolved from
 the run's log checkout section, bounded by `max_branch_resolves`. The reconciler is polling by design (a success webhook
 can be missed or arrive out of order, and success events are dropped at the ingress; polling reflects current truth); it
-performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. All runs-list / jobs / log reads stay
-inside `forge_log` (Rust), never a raw REST call from a nu snippet (FJ-22). Configure it in
+performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. Log and per-job status reads go
+through `fj actions logs`; the runs list stays on the REST API until `fj` gains an `actions runs` command (FJ-66). Both
+stay inside `forge_log` (Rust), never a raw REST call from a nu snippet. Configure it in
 `actions/ci-failure-reconcile.yml` (`repos` names the allow-list, `log_token_ref` picks the Forgejo PAT per repo, see
 below). See `actions/SCHEMA.md` (`kind: ci-failure-reconcile`).
 

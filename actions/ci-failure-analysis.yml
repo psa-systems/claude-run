@@ -13,19 +13,19 @@
 #              by `AI Agent: Queued` (that field belongs to the code-fix runner in
 #              actions/youtrack.yml).
 #   resolve -> parse repo / run index / run URL / commit / workflow from the
-#              issue's `## Failure` block; read the run GLOBAL id from a hidden
-#              `Run-Global-Id:` marker when present, else resolve it by matching
-#              index_in_repo against the runs-list API.
-#   fetch   -> pull the complete redacted run log (v16 REST endpoint) plus the
-#              failing workflow YAML into the workdir. A log miss posts a short
+#              issue's `## Failure` block. The run index is the number
+#              `fj actions logs` takes, so nothing else has to be resolved.
+#   fetch   -> pull the complete redacted run log (`fj actions logs --json`) plus
+#              the failing workflow YAML into the workdir. A log miss posts a short
 #              "unavailable" note once and leaves the issue un-marked for retry.
 #   analyze -> one agentic `claude` session (Read,Grep,Bash) over both files.
 #   finalize-> post the analysis as a YouTrack comment and mark the issue analyzed
 #              so it is never analyzed twice (idempotent).
 #
-# All log / runs-list / workflow-YAML reads go through `forge_log` (Rust), never a
-# raw REST call from a nu snippet (tooling-gap rule, FJ-22). Redaction is
-# preserved end to end via `forge_log::redact`.
+# Log reads shell out to `fj actions logs`; the workflow-YAML read stays on the
+# REST API until `fj` gains a raw-file command (FJ-67). Both go through
+# `forge_log` (Rust), never a raw REST call from a nu snippet (tooling-gap rule).
+# Redaction is preserved end to end via `forge_log::redact`.
 
 name: ci-failure-analysis
 
@@ -41,9 +41,11 @@ native:
   summary_prefixes:
     - "CI failure:"
     - "Auto-fix:"
-  # Forgejo PAT (`read:repository` scope) used to fetch the run log, resolve the
-  # run global id, and read the workflow YAML through the v16 REST API. The
-  # candidate query spans every org, so the token is picked per repo (CLAUDE-200).
+  # Forgejo PAT (`read:repository` scope) used to fetch the run log through
+  # `fj actions logs` and to read the workflow YAML. It reaches `fj` in a temp
+  # single-host `keys.json` carrying that one secret and nothing else, never a
+  # process argument. The candidate query spans every org, so the token is picked
+  # per repo (CLAUDE-200).
   # Omitted here: the mapping is derived from `config.webhook.sources`, which
   # already holds one `log_token_ref` per org, so a token is rotated in one place
   # and ONE copy of this action serves every org. An issue whose repo maps to no
