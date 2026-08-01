@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}{{ heading }} - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a>{% if let Some(n) = name %}<span class="sep">/</span><a href="/actions/{{ n }}">{{ n }}</a><span class="sep">/</span><span class="current">Edit (form)</span>{% else %}<span class="sep">/</span><a href="/actions/new">New action</a><span class="sep">/</span><span class="current">forgejo-ci-fix</span>{% endif %}{% endblock %}
+
+{% import "form_macros.html" as m %}
+
+{% block main %}
+
+{% call m::form_styles() %}
+
+<h2>{{ heading }}</h2>
+
+<div class="card" style="margin-bottom: 16px;">
+  <span class="dim">Structured editor for a native <code>kind: forgejo-ci-fix</code> action: it fixes
+  failing CI on the bot's own Forgejo PRs. Fields this form does not cover are preserved untouched on
+  save - use the <a href="{{ raw_url }}">raw YAML editor</a> for those.</span>
+</div>
+
+{% if let Some(e) = error %}
+<div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
+  <strong style="color: var(--bad);">Not saved - validation failed</strong>
+  <pre class="stream" style="max-height: 240px; margin: 8px 0 0;">{{ e }}</pre>
+</div>
+{% endif %}
+
+<form method="post" action="{{ post_url }}" class="yt-form">
+
+  {% call m::identity_block(form.common.name, "forgejo-ci-fix", form.common.enabled, form.common.workdir_base) %}
+
+  <div class="card">
+    <h3>Scan</h3>
+    {% call m::checkbox("native_enabled", form.native_enabled, "Enabled (master toggle; off turns the handler off entirely)") %}
+    <div class="grid2" style="margin-top: 8px;">
+      {% call m::textfield("Forgejo host", "host", form.host, "dev.a8n.run") %}
+      {% call m::numfield("Window (minutes)", "window_minutes", form.window_minutes, "45", "1") %}
+    </div>
+    {% call m::linesfield("Repos", "repos", form.repos, "owner/name", "One owner/name per line. Empty scans nothing.") %}
+    <p class="hint dim">Only PRs updated within the window, whose head-commit CI is failing, and that
+    are authored by the bot login below are picked up; a human's failing PR is left to its author.</p>
+  </div>
+
+  <div class="card">
+    <h3>Decision gate</h3>
+    <div class="grid2">
+      {% call m::numfield("Max files", "max_files", form.max_files, "10", "1") %}
+      {% call m::numfield("Max lines", "max_lines", form.max_lines, "300", "1") %}
+      {% call m::numfield("Max PR attempts", "max_pr_attempts", form.max_pr_attempts, "3", "1") %}
+    </div>
+    <p class="hint dim">A fix diff over either size cap is <code>too_big</code> and is never pushed.
+    <em>Max PR attempts</em> is the per-PR fix-push ceiling; past it the PR is flagged Needs Review
+    instead of pushed again.</p>
+  </div>
+
+  <div class="card">
+    <h3>Bot identity</h3>
+    <div class="grid2">
+      {% call m::textfield("Bot author", "bot_author", form.bot_author, "claude-run") %}
+      {% call m::textfield("Bot email", "bot_email", form.bot_email, "claude-run@a8n.run") %}
+      {% call m::textfield("Skip marker", "skip_marker", form.skip_marker, "[skip claude]") %}
+    </div>
+    <p class="hint dim">Only PRs authored by <em>bot author</em> are auto-fixed; it is also the git
+    author of the fix commit. The skip marker is appended to that commit message so the bot's own
+    push does not re-trigger this action.</p>
+  </div>
+
+  <div class="card">
+    <h3>Needs review</h3>
+    <div class="grid2">
+      {% call m::textfield("PR label", "needs_review_label", form.needs_review_label, "needs-review") %}
+      {% call m::textfield("Issue state", "needs_review_state", form.needs_review_state, "Needs Review") %}
+      {% call m::textfield("Issue assignee (optional)", "review_assignee", form.review_assignee, "blank = leave the Assignee untouched") %}
+    </div>
+    <p class="hint dim">Applied when the per-PR ceiling is reached: the label goes on the PR, and the
+    State (plus the optional assignee) on the source issue the PR body references, best-effort.</p>
+  </div>
+
+  <div class="card">
+    <h3>Forgejo token</h3>
+    <div class="grid2">
+      <label class="fld">
+        <span>Inline token{% if form.token_set %} (one is stored){% endif %}</span>
+        <input type="password" name="token" value="" placeholder="blank = keep the stored value"
+               autocomplete="off" autocapitalize="off" spellcheck="false">
+      </label>
+    </div>
+    {% call m::checkbox("token_clear", false, "Clear the stored token") %}
+    <p class="hint dim">Inline plaintext placeholder, ignored by the CLI backend, which authenticates
+    from <code>fj</code>'s own credential store. A stored value is never rendered here: leave the box
+    blank to keep it, type a new value to replace it, or tick the box to remove the key.</p>
+  </div>
+
+  {% call m::claude_block(form.common.claude_cwd, form.common.claude_allowed_tools, form.common.claude_permission_mode) %}
+
+  {% call m::schedule_block(form.common.schedule_kind, form.common.schedule_spec) %}
+
+  {% call m::output_block(form.common.output_file) %}
+
+  {% call m::limits_block(form.common.limit_max_attempts_per_key, form.common.limit_max_runs_per_day, form.common.limit_claude_timeout_seconds, form.common.limit_daily_budget_usd) %}
+
+  <div class="row-actions" style="margin-top: 12px;">
+    <button class="btn" type="submit">Save</button>
+    {% if let Some(n) = name %}
+      <a class="btn" href="/actions/{{ n }}">Cancel</a>
+    {% else %}
+      <a class="btn" href="/actions/new">Cancel</a>
+    {% endif %}
+    <a class="btn" href="{{ raw_url }}">Raw YAML</a>
+  </div>
+</form>
+
+{% endblock %}

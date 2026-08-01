@@ -2,55 +2,11 @@
 {% block title %}{{ heading }} - claude-run{% endblock %}
 {% block breadcrumb %}<a href="/">Dashboard</a>{% if let Some(n) = name %}<span class="sep">/</span><a href="/actions/{{ n }}">{{ n }}</a><span class="sep">/</span><span class="current">Edit (form)</span>{% else %}<span class="sep">/</span><span class="current">New YouTrack action</span>{% endif %}{% endblock %}
 
-{% macro textfield(label, fname, value, placeholder) %}
-<label class="fld">
-  <span>{{ label }}</span>
-  <input type="text" name="{{ fname }}" value="{{ value }}" placeholder="{{ placeholder }}"
-         autocomplete="off" autocapitalize="off" spellcheck="false">
-</label>
-{% endmacro %}
-
-{% macro numfield(label, fname, value, placeholder, step) %}
-<label class="fld">
-  <span>{{ label }}</span>
-  <input type="number" name="{{ fname }}" value="{{ value }}" placeholder="{{ placeholder }}"
-         step="{{ step }}" min="0" autocomplete="off">
-</label>
-{% endmacro %}
-
-{% macro tokenfield(label, fname, value) %}
-<label class="fld">
-  <span>{{ label }}</span>
-  <select name="{{ fname }}">
-    <option value="">(host auth / none)</option>
-    {% for sname in secrets %}
-    <option value="{{ sname }}"{% if value.as_str() == sname.as_str() %} selected{% endif %}>{{ sname }}</option>
-    {% endfor %}
-  </select>
-</label>
-{% endmacro %}
+{% import "form_macros.html" as m %}
 
 {% block main %}
 
-<style>
-  .yt-form .grid2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px 20px; }
-  .yt-form .fld { display: flex; flex-direction: column; gap: 4px; }
-  .yt-form .fld > span { color: var(--fg-dim); font-size: 12px; }
-  .yt-form .fld input, .yt-form .fld select {
-    background: #0a0c10; color: var(--fg); border: 1px solid var(--border);
-    border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px; width: 100%;
-  }
-  .yt-form .fld-inline { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
-  .yt-form .fld-inline span { font-size: 13px; }
-  .yt-form .card { margin-bottom: 16px; }
-  .yt-form .card h3 { color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.05em; font-size: 12px; }
-  .yt-form .hint { font-size: 12px; margin: 8px 0 0; }
-  .yt-form textarea {
-    background: #0a0c10; color: var(--fg); border: 1px solid var(--border);
-    border-radius: 4px; padding: 8px 10px; font-family: var(--mono); font-size: 13px;
-    width: 100%; min-height: 360px; resize: vertical; box-sizing: border-box; line-height: 1.5;
-  }
-</style>
+{% call m::form_styles() %}
 
 <h2>{{ heading }}</h2>
 
@@ -73,9 +29,9 @@
   <div class="card">
     <h3>Identity</h3>
     <div class="grid2">
-      {% call textfield("Name", "name", form.name, "youtrack") %}
-      {% call textfield("Workdir base", "workdir_base", form.workdir_base, "~/.local/share/claude-run/workdirs") %}
-      {% call textfield("Link template", "link_template", form.link_template, "https://youtrack.example.com/issue/{key}") %}
+      {% call m::textfield("Name", "name", form.name, "youtrack") %}
+      {% call m::textfield("Workdir base", "workdir_base", form.workdir_base, "~/.local/share/claude-run/workdirs") %}
+      {% call m::textfield("Link template", "link_template", form.link_template, "https://youtrack.example.com/issue/{key}") %}
     </div>
     <label class="fld-inline">
       <input type="checkbox" name="enabled"{% if form.is_enabled() %} checked{% endif %}>
@@ -86,11 +42,11 @@
   <div class="card">
     <h3>YouTrack source</h3>
     <div class="grid2">
-      {% call textfield("Base URL", "yt_base_url", form.yt_base_url, "https://youtrack.example.com (blank = host yt auth)") %}
-      {% call tokenfield("Token secret", "yt_token_ref", form.yt_token_ref) %}
-      {% call textfield("Issue query", "yt_query", form.yt_query, "-Resolved AI Agent: Queued") %}
-      {% call textfield("Custom field", "yt_custom_field", form.yt_custom_field, "AI Agent") %}
-      {% call textfield("Assignee (optional)", "yt_assignee", form.yt_assignee, "login, me, or unassigned (blank = leave Assignee untouched)") %}
+      {% call m::textfield("Base URL", "yt_base_url", form.yt_base_url, "https://youtrack.example.com (blank = host yt auth)") %}
+      {% call m::tokenfield("Token secret", "yt_token_ref", form.yt_token_ref, secrets) %}
+      {% call m::textfield("Issue query", "yt_query", form.yt_query, "-Resolved AI Agent: Queued") %}
+      {% call m::textfield("Custom field", "yt_custom_field", form.yt_custom_field, "AI Agent") %}
+      {% call m::textfield("Assignee (optional)", "yt_assignee", form.yt_assignee, "login, me, or unassigned (blank = leave Assignee untouched)") %}
     </div>
     <p class="hint dim">When set, the issue is assigned to this user during pickup. A literal <code>yt</code> assignee argument: a login, <code>me</code>, or <code>unassigned</code>. Leave blank to never touch the Assignee.</p>
   </div>
@@ -98,14 +54,14 @@
   <div class="card">
     <h3>AI Agent state labels</h3>
     <div class="grid2">
-      {% call textfield("Queued", "state_queued", form.state_queued, "Queued") %}
-      {% call textfield("Working", "state_working", form.state_working, "Working") %}
-      {% call textfield("Code review", "state_code_review", form.state_code_review, "Code Review") %}
-      {% call textfield("Needs review", "state_needs_review", form.state_needs_review, "Needs Review") %}
-      {% call textfield("Failed", "state_failed", form.state_failed, "Failed") %}
-      {% call textfield("In progress (State field)", "state_in_progress", form.state_in_progress, "In Progress") %}
-      {% call textfield("Done", "state_done", form.state_done, "Done") %}
-      {% call textfield("Done (State field)", "state_state_done", form.state_state_done, "Done") %}
+      {% call m::textfield("Queued", "state_queued", form.state_queued, "Queued") %}
+      {% call m::textfield("Working", "state_working", form.state_working, "Working") %}
+      {% call m::textfield("Code review", "state_code_review", form.state_code_review, "Code Review") %}
+      {% call m::textfield("Needs review", "state_needs_review", form.state_needs_review, "Needs Review") %}
+      {% call m::textfield("Failed", "state_failed", form.state_failed, "Failed") %}
+      {% call m::textfield("In progress (State field)", "state_in_progress", form.state_in_progress, "In Progress") %}
+      {% call m::textfield("Done", "state_done", form.state_done, "Done") %}
+      {% call m::textfield("Done (State field)", "state_state_done", form.state_state_done, "Done") %}
     </div>
   </div>
 
@@ -116,8 +72,8 @@
       <span>Enabled (wait for the PR's CI to go green, then merge and advance the issue to Done)</span>
     </label>
     <div class="grid2" style="margin-top: 8px;">
-      {% call numfield("Wait (seconds)", "automerge_wait_seconds", form.automerge_wait_seconds, "1800", "1") %}
-      {% call numfield("Check interval (seconds)", "automerge_check_interval_seconds", form.automerge_check_interval_seconds, "30", "1") %}
+      {% call m::numfield("Wait (seconds)", "automerge_wait_seconds", form.automerge_wait_seconds, "1800", "1") %}
+      {% call m::numfield("Check interval (seconds)", "automerge_check_interval_seconds", form.automerge_check_interval_seconds, "30", "1") %}
     </div>
     <p class="hint dim">When enabled, finalize polls the opened PR's combined CI status every <em>check interval</em> seconds, up to <em>wait</em> seconds total. On green (with an up-to-date branch) it merges the PR and sets the AI Agent / State to the Done labels above. Disabled (the default) leaves finalize stopping at Code Review. Blank timings fall back to 1800 / 30.</p>
   </div>
@@ -138,8 +94,8 @@
   <div class="card">
     <h3>Forgejo target</h3>
     <div class="grid2">
-      {% call textfield("Base URL", "fj_base_url", form.fj_base_url, "blank = derive from each issue's VCS") %}
-      {% call tokenfield("Token secret", "fj_token_ref", form.fj_token_ref) %}
+      {% call m::textfield("Base URL", "fj_base_url", form.fj_base_url, "blank = derive from each issue's VCS") %}
+      {% call m::tokenfield("Token secret", "fj_token_ref", form.fj_token_ref, secrets) %}
       <label class="fld">
         <span>PR strategy</span>
         <select name="fj_pr_strategy">
@@ -154,51 +110,22 @@
   <div class="card">
     <h3>GitHub target</h3>
     <div class="grid2">
-      {% call tokenfield("Token secret", "github_token_ref", form.github_token_ref) %}
+      {% call m::tokenfield("Token secret", "github_token_ref", form.github_token_ref, secrets) %}
     </div>
     <p class="hint dim"><code>github.com</code> repos need no token (host <code>gh</code> auth is the fallback). The PAT needs <code>repo</code> + <code>pull_request</code> scope. <code>hosts</code> (GitHub Enterprise) and <code>mcp_endpoint</code> are advanced fields edited via the raw-YAML editor; they are preserved on save.</p>
   </div>
 
-  <div class="card">
-    <h3>Schedule</h3>
-    <div class="grid2">
-      <label class="fld">
-        <span>Kind</span>
-        <select name="schedule_kind">
-          <option value=""{% if form.schedule_kind.is_empty() %} selected{% endif %}>(none)</option>
-          <option value="interval"{% if form.schedule_kind.as_str() == "interval" %} selected{% endif %}>interval</option>
-          <option value="cron"{% if form.schedule_kind.as_str() == "cron" %} selected{% endif %}>cron</option>
-          <option value="manual"{% if form.schedule_kind.as_str() == "manual" %} selected{% endif %}>manual</option>
-        </select>
-      </label>
-      {% call textfield("Spec", "schedule_spec", form.schedule_spec, "e.g. 5m or 0 */2 * * *") %}
-    </div>
-  </div>
+  {% call m::schedule_block(form.schedule_kind, form.schedule_spec) %}
 
-  <div class="card">
-    <h3>Claude</h3>
-    <div class="grid2">
-      {% call textfield("CWD", "claude_cwd", form.claude_cwd, "working directory override") %}
-      {% call textfield("Allowed tools", "claude_allowed_tools", form.claude_allowed_tools, "e.g. Edit,Bash") %}
-      {% call textfield("Permission mode", "claude_permission_mode", form.claude_permission_mode, "e.g. acceptEdits") %}
-    </div>
-  </div>
+  {% call m::claude_block(form.claude_cwd, form.claude_allowed_tools, form.claude_permission_mode) %}
 
-  <div class="card">
-    <h3>Limits</h3>
-    <div class="grid2">
-      {% call numfield("Max attempts per key", "limit_max_attempts_per_key", form.limit_max_attempts_per_key, "unset = no cap", "1") %}
-      {% call numfield("Max runs per day", "limit_max_runs_per_day", form.limit_max_runs_per_day, "unset = no cap", "1") %}
-      {% call numfield("Claude timeout (seconds)", "limit_claude_timeout_seconds", form.limit_claude_timeout_seconds, "unset = no timeout", "1") %}
-      {% call numfield("Daily budget (USD)", "limit_daily_budget_usd", form.limit_daily_budget_usd, "unset = no budget", "0.01") %}
-    </div>
-  </div>
+  {% call m::limits_block(form.limit_max_attempts_per_key, form.limit_max_runs_per_day, form.limit_claude_timeout_seconds, form.limit_daily_budget_usd) %}
 
   <div class="card">
     <h3>Concurrency</h3>
     <div class="grid2">
-      {% call numfield("Max parallel", "concurrency_max_parallel", form.concurrency_max_parallel, "1 = strictly sequential", "1") %}
-      {% call textfield("Concurrency key", "concurrency_key", form.concurrency_key, "project, repo, workflow") %}
+      {% call m::numfield("Max parallel", "concurrency_max_parallel", form.concurrency_max_parallel, "1 = strictly sequential", "1") %}
+      {% call m::textfield("Concurrency key", "concurrency_key", form.concurrency_key, "project, repo, workflow") %}
     </div>
     <span class="dim" style="font-size: 12px; margin-top: 4px; display: block;">Max parallel is the per-run cap on distinct-key jobs in flight. The comma-separated key names the job fields whose values compose the per-key serialization scope (per-key concurrency is fixed at 1). The defaults (max parallel 1, key <code>project, repo, workflow</code>) are omitted from the saved file.</span>
   </div>

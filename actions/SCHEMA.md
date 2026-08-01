@@ -122,6 +122,12 @@ The dispatch discriminator (CLAUDE-30). Selects how the runner executes the acti
 `scripted` and native kinds share all the run accounting (locking, daily caps, per-job attempt caps, budget, job-outcome
 records); only job production and the per-job pipeline differ.
 
+Every native kind is editable from the web UI through a structured form (CLAUDE-211): pick it at `/actions/new` to
+create one, or open `/actions/<name>/form` for an existing action. `scripted` has no form and is **raw YAML only** (its
+fields are nu snippets); the raw editor at `/actions/<name>/edit` remains available for every kind, and for the few
+advanced fields a form does not surface (they are preserved untouched when the form saves). Forms and the raw editor
+share one validation and write path, so neither accepts what the other would reject.
+
 ### `native` (record, required for native kinds)
 
 Typed configuration for a native `kind`. Required when `kind` names a native handler, validated against that handler.
@@ -479,6 +485,9 @@ exact entries first.
 **Omitting the key** derives the mapping from `config.webhook.sources`: each source contributes its `allowed_repos` and
 its own `log_token_ref` (a source carrying no log token contributes nothing), in source-name order. That keeps one place
 to rotate a token and lets ONE deployed copy of each action cover every org.
+
+Both shapes are editable in each CI-failure kind's structured web form (CLAUDE-211): a source selector picks derive
+(writes no key), one secret for every repo, or repeatable `{repos, token_ref}` rows.
 
 A repo that matches no entry is **skipped with a warning**: `ci-failure-analysis` leaves the issue untouched and posts no
 "log unavailable" note (that note is reserved for a real log miss on a repo the deployment does hold a token for), and

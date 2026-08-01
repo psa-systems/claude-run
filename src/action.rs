@@ -98,6 +98,16 @@ pub enum ActionKind {
 }
 
 impl ActionKind {
+    /// Every kind, in the order the web UI's new-action picker lists them
+    /// (CLAUDE-211). `scripted` last: it is deprecated and raw-YAML only.
+    pub const ALL: [ActionKind; 5] = [
+        ActionKind::Youtrack,
+        ActionKind::ForgejoCiFix,
+        ActionKind::CiFailureAnalysis,
+        ActionKind::CiFailureReconcile,
+        ActionKind::Scripted,
+    ];
+
     /// True for any kind routed to a built-in Rust handler (everything but
     /// `scripted`).
     pub fn is_native(self) -> bool {
@@ -872,6 +882,27 @@ pub fn render_link(template: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_kind_all_lists_every_variant() {
+        // CLAUDE-211: the web UI's new-action picker iterates `ALL`, so a kind
+        // missing from it would be uncreatable from the UI. The match below is
+        // exhaustive, so adding a variant breaks this test until `ALL` grows.
+        for kind in ActionKind::ALL {
+            match kind {
+                ActionKind::Scripted
+                | ActionKind::Youtrack
+                | ActionKind::ForgejoCiFix
+                | ActionKind::CiFailureAnalysis
+                | ActionKind::CiFailureReconcile => {}
+            }
+        }
+        let mut names: Vec<&str> = ActionKind::ALL.iter().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ActionKind::ALL.len(), "duplicate kind in ALL");
+        assert_eq!(names.len(), 5, "a new ActionKind must be added to ALL");
+    }
 
     #[test]
     fn render_link_substitutes_key() {

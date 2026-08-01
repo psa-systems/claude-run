@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}{{ heading }} - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a>{% if let Some(n) = name %}<span class="sep">/</span><a href="/actions/{{ n }}">{{ n }}</a><span class="sep">/</span><span class="current">Edit (form)</span>{% else %}<span class="sep">/</span><a href="/actions/new">New action</a><span class="sep">/</span><span class="current">ci-failure-analysis</span>{% endif %}{% endblock %}
+
+{% import "form_macros.html" as m %}
+
+{% block main %}
+
+{% call m::form_styles() %}
+
+<h2>{{ heading }}</h2>
+
+<div class="card" style="margin-bottom: 16px;">
+  <span class="dim">Structured editor for a native <code>kind: ci-failure-analysis</code> action: it
+  posts a log-grounded root-cause comment on each open CI-failure issue. Token fields reference a
+  stored <a href="/secrets">secret</a> by name; values are never shown here. Fields this form does
+  not cover are preserved untouched on save - use the
+  <a href="{{ raw_url }}">raw YAML editor</a> for those.</span>
+</div>
+
+{% if let Some(e) = error %}
+<div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
+  <strong style="color: var(--bad);">Not saved - validation failed</strong>
+  <pre class="stream" style="max-height: 240px; margin: 8px 0 0;">{{ e }}</pre>
+</div>
+{% endif %}
+
+<form method="post" action="{{ post_url }}" class="yt-form">
+
+  {% call m::identity_block(form.common.name, "ci-failure-analysis", form.common.enabled, form.common.workdir_base) %}
+
+  <div class="card">
+    <h3>Analysis</h3>
+    {% call m::checkbox("native_enabled", form.native_enabled, "Enabled (master toggle; off makes a run a no-op)") %}
+    <div class="grid2" style="margin-top: 8px;">
+      {% call m::textfield("Issue query", "query", form.query, "#Unresolved") %}
+      {% call m::numfield("Max analysis bytes", "max_analysis_bytes", form.max_analysis_bytes, "24576", "1") %}
+    </div>
+    <p class="hint dim">The query MUST NOT filter by <code>AI Agent</code>: analysis is read-only
+    enrichment and must not collide with the code-fix runner's <code>AI Agent: Queued</code>
+    selector. Summary-prefix and analyzed-marker filtering happens in the handler.</p>
+    {% call m::linesfield("Summary prefixes", "summary_prefixes", form.summary_prefixes, "CI failure:", "One prefix per line. An issue is analyzed only when its summary starts with one of them.") %}
+  </div>
+
+  {% call m::log_token_block(form.log_token.mode, form.log_token.global, form.log_token.rows, secrets) %}
+
+  {% call m::claude_block(form.common.claude_cwd, form.common.claude_allowed_tools, form.common.claude_permission_mode) %}
+
+  {% call m::schedule_block(form.common.schedule_kind, form.common.schedule_spec) %}
+
+  {% call m::output_block(form.common.output_file) %}
+
+  {% call m::limits_block(form.common.limit_max_attempts_per_key, form.common.limit_max_runs_per_day, form.common.limit_claude_timeout_seconds, form.common.limit_daily_budget_usd) %}
+
+  <div class="row-actions" style="margin-top: 12px;">
+    <button class="btn" type="submit">Save</button>
+    {% if let Some(n) = name %}
+      <a class="btn" href="/actions/{{ n }}">Cancel</a>
+    {% else %}
+      <a class="btn" href="/actions/new">Cancel</a>
+    {% endif %}
+    <a class="btn" href="{{ raw_url }}">Raw YAML</a>
+  </div>
+</form>
+
+{% endblock %}
