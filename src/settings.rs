@@ -393,6 +393,17 @@ pub async fn effective_update(pool: &SqlitePool, file: &OnDiskConfig) -> Result<
         .unwrap_or_else(|| file.update.clone()))
 }
 
+/// CLAUDE-200: resolve the effective [`WebhookConfig`] for a consumer that holds
+/// no parsed `config.toml` (the native CI-failure handlers, which reach the
+/// webhook sources only for their per-repo log-token fallback). Same order as
+/// [`effective`]: the DB document, else the on-disk file, else the default.
+pub async fn effective_webhook(pool: &SqlitePool, paths: &Paths) -> Result<WebhookConfig> {
+    match get_json::<WebhookConfig>(pool, Section::Webhook.key()).await? {
+        Some(webhook) => Ok(webhook),
+        None => Ok(OnDiskConfig::load(paths)?.0.webhook),
+    }
+}
+
 // ---- one-time import + breaking migration --------------------------------
 
 /// CLAUDE-101 migration. Parse `config.toml` raw and, for every moved section

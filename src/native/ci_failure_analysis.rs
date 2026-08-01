@@ -36,7 +36,7 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 use super::{HandlerFuture, NativeContext, NativeHandler};
-use crate::action::{CiFailureAnalysisConfig, NativeConfig};
+use crate::action::{CiFailureAnalysisConfig, LogTokenRef, NativeConfig};
 use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::claude::ClaudeInvoker;
 use crate::error::{Error, Result};
@@ -86,17 +86,8 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
     }
 
     // A PAT is required to fetch private-repo logs through the v16 REST endpoint.
-    let Some(token_ref) = cfg.log_token_ref.clone() else {
-        warn!(action = %action.name, "ci-failure-analysis has no log_token_ref; skipping run (cannot fetch logs)");
-        return Ok(());
-    };
-    let token = match resolve_token(pool, &token_ref).await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(action = %action.name, error = %e, "resolving the log token failed; skipping run");
-            return Ok(());
-        }
-    };
+    // CLAUDE-200: one mapping, resolved per issue against the repo it names.
+    let tokens = super::effective_log_tokens(pool, ctx.paths, cfg.log_token_ref.as_ref()).await;
 
     let defaults = RunnerDefaults::default();
     let limits = job::effective_limits(&defaults, loaded);
@@ -191,7 +182,7 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
             &cfg,
             &limits,
             &transport,
-            &token,
+            &tokens,
             key,
         )
         .await;
@@ -220,7 +211,7 @@ async fn process_job(
     cfg: &CiFailureAnalysisConfig,
     limits: &EffectiveLimits,
     transport: &dyn LogTransport,
-    token: &str,
+    tokens: &LogTokenRef,
     key: &str,
 ) -> Result<ProcessedJob> {
     let action = &ctx.action.action;
@@ -248,6 +239,25 @@ async fn process_job(
         });
     };
 
+    // CLAUDE-200: the token for THIS issue's repo. A repo the mapping does not
+    // cover is skipped here, before any fetch, so no "log unavailable" note is
+    // posted on an issue this deployment holds no token for.
+    let Some(token_ref) = tokens.resolve(&coords.repo) else {
+        warn!(action = %action.name, key, repo = %coords.repo, "no log token maps to this repo; skipping (no note posted)");
+        return Ok(ProcessedJob::Filtered {
+            key: key.to_string(),
+        });
+    };
+    let token = match resolve_token(ctx.pool, token_ref).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(action = %action.name, key, repo = %coords.repo, token_ref, error = %e, "resolving the log token failed; skipping");
+            return Ok(ProcessedJob::Filtered {
+                key: key.to_string(),
+            });
+        }
+    };
+
     // Per-job workdir (the log + workflow YAML are written here for claude).
     let wb_base = workdir::resolve_workdir_base(action.workdir_base.as_deref(), ctx.paths);
     let workdir_path = workdir::job_workdir(&wb_base, &action.name, key);
@@ -260,7 +270,7 @@ async fn process_job(
     }
 
     // Fetch the complete redacted log (+ workflow YAML), resolving the global id.
-    let fetched = fetch_analysis_inputs(transport, &coords, token, &workdir_path);
+    let fetched = fetch_analysis_inputs(transport, &coords, &token, &workdir_path);
     let inputs = match fetched {
         FetchResult::Ready(inputs) => inputs,
         FetchResult::Unavailable(reason) => {
@@ -939,6 +949,63 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
         };
         let p = build_prompt(&inputs, &coords);
         assert!(p.contains("could not be fetched"));
+    }
+
+    // ---- CLAUDE-200: per-repo log token -----------------------------------
+
+    /// An issue on a repo the mapping does not cover resolves to no token, and
+    /// `process_job` returns Filtered at that point (before the workdir is created
+    /// and before `fetch_analysis_inputs`, the only path that posts the
+    /// "unavailable" note), so no note lands on another org's issue.
+    #[test]
+    fn an_unmapped_repo_resolves_to_no_token_so_the_issue_is_skipped() {
+        use crate::action::LogTokenEntry;
+        let tokens = LogTokenRef::PerRepo(vec![LogTokenEntry {
+            repos: vec!["contoso/*".to_string()],
+            token_ref: "forgejo-logs-contoso".to_string(),
+        }]);
+        // The fixture issue is on initech, which this deployment's mapping
+        // does not cover.
+        let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        assert_eq!(coords.repo, "initech/chat");
+        assert!(tokens.resolve(&coords.repo).is_none());
+        // The same mapping still serves its own org's issues.
+        assert_eq!(
+            tokens.resolve("contoso/claude-run"),
+            Some("forgejo-logs-contoso")
+        );
+    }
+
+    /// One mapping serves issues from two different orgs, each with its own PAT:
+    /// one deployed copy of the action covers both.
+    #[test]
+    fn one_mapping_serves_issues_from_two_orgs() {
+        use crate::action::LogTokenEntry;
+        let tokens = LogTokenRef::PerRepo(vec![
+            LogTokenEntry {
+                repos: vec!["contoso/*".to_string()],
+                token_ref: "forgejo-logs-contoso".to_string(),
+            },
+            LogTokenEntry {
+                repos: vec!["initech/*".to_string()],
+                token_ref: "forgejo-logs-initech".to_string(),
+            },
+        ]);
+        let psa = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        let contoso = parse_failure_block(
+            &CLAUDE_185_BODY.replace("initech/chat", "contoso/claude-run"),
+        )
+        .unwrap();
+        assert_eq!(
+            tokens.resolve(&psa.repo),
+            Some("forgejo-logs-initech"),
+            "initech issue"
+        );
+        assert_eq!(
+            tokens.resolve(&contoso.repo),
+            Some("forgejo-logs-contoso"),
+            "contoso issue"
+        );
     }
 
     // ---- comment cap -------------------------------------------------------
