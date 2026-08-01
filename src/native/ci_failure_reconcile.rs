@@ -22,6 +22,10 @@
 //!   status is `success` is a now-green `(branch, workflow_id, job)`. Because the
 //!   reduction keeps the LATEST run, a newer failure after an older green run
 //!   leaves the job red and the issue open.
+//! - dedupe (CLAUDE-198): before any Forgejo read, open issues sharing a hidden
+//!   `Root-Cause-Key:` marker are collapsed onto the oldest of the group; the rest
+//!   are closed as duplicates. Mint's cross-run collapse is a tracker full-text
+//!   search, so a lagging index lets two failures of the same job mint two issues.
 //! - close: every open issue whose `(repo, branch, workflow, job)` exactly matches
 //!   a now-green job is set to `resolved_state` and gets a run-linked comment.
 //!
@@ -158,13 +162,34 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
         warn!(run_id, error = %e, "recording planned keys failed (continuing)");
     }
 
+    let mut closed: u32 = 0;
+
+    // CLAUDE-198: collapse duplicates first. It needs no Forgejo read, so a
+    // duplicate is closed even for a repo whose runs cannot be scanned, and the
+    // survivor alone goes on to the now-green check below.
+    if cfg.close_duplicates {
+        let dups = plan_duplicates(&targets);
+        for dup in &dups {
+            match close_duplicate(backend.as_ref(), &cfg, dup) {
+                Ok(()) => {
+                    info!(action = %action.name, key = %dup.key, canonical = %dup.canonical, "auto-closed duplicate CI-failure issue");
+                    closed += 1;
+                }
+                Err(e) => {
+                    warn!(action = %action.name, key = %dup.key, error = %e, "closing the duplicate failed (continuing)");
+                }
+            }
+        }
+        let dup_keys: HashSet<&str> = dups.iter().map(|d| d.key.as_str()).collect();
+        targets.retain(|t| !dup_keys.contains(t.key.as_str()));
+    }
+
     // CLAUDE-204: `fj actions logs` for every log read; the HTTP transport is
     // only for the runs list `fj` has no command for (TODO(FJ-66)).
     let logs = crate::provider::FjActionLogs::new(std::sync::Arc::new(
         crate::provider::ProcessRunner::new(),
     ));
     let transport = HttpLogTransport::new();
-    let mut closed: u32 = 0;
     // Scan one repo at a time; each repo's targets drive which runs matter.
     for repo in repos_in_order(&targets) {
         if cancel.is_cancelled() {
@@ -232,6 +257,17 @@ struct IssueCoords {
     job_name: String,
     /// The run web URL, used to derive the forge origin for the runs-list scan.
     html_url: String,
+    /// CLAUDE-190 `Root-Cause-Key:` marker; empty on a pre-rekey issue, which is
+    /// then never treated as a duplicate of anything.
+    root_cause_key: String,
+}
+
+/// CLAUDE-198: one duplicate issue and the canonical issue it collapses onto.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DuplicateClose {
+    key: String,
+    canonical: String,
+    root_cause_key: String,
 }
 
 /// The result of parsing an open issue for reconciliation.
@@ -317,9 +353,12 @@ fn parse_issue_coords(inspect: &IssueInspect) -> IssueParse {
     let mut branch_marker = String::new();
     let mut branch_bullet = String::new();
     let mut job_name = String::new();
+    let mut root_cause_key = String::new();
     for line in inspect.description.lines() {
         let t = line.trim();
-        if let Some(v) = t.strip_prefix("- Repo:") {
+        if let Some(v) = t.strip_prefix("Root-Cause-Key:") {
+            root_cause_key = v.trim().to_string();
+        } else if let Some(v) = t.strip_prefix("- Repo:") {
             repo = unbacktick(v);
         } else if let Some(v) = t.strip_prefix("- Workflow:") {
             workflow_id = unbacktick(v);
@@ -354,7 +393,91 @@ fn parse_issue_coords(inspect: &IssueInspect) -> IssueParse {
         workflow_id,
         job_name,
         html_url,
+        root_cause_key,
     })
+}
+
+/// CLAUDE-198: the duplicates among `targets`. Issues sharing a `(repo,
+/// root_cause_key)` are the same failure by construction (mint derives the key
+/// from repo / branch / workflow / job / failure signature), so all but the
+/// canonical one are duplicates. The canonical is the OLDEST of the group: it
+/// carries the earliest history and is the issue mint's association comments
+/// already append to. An issue with no `Root-Cause-Key:` marker (pre-rekey) is
+/// never grouped, so it is never closed as a duplicate of anything.
+fn plan_duplicates(targets: &[IssueTarget]) -> Vec<DuplicateClose> {
+    let mut groups: HashMap<(&str, &str), Vec<&IssueTarget>> = HashMap::new();
+    for t in targets {
+        if t.coords.root_cause_key.is_empty() {
+            continue;
+        }
+        groups
+            .entry((t.coords.repo.as_str(), t.coords.root_cause_key.as_str()))
+            .or_default()
+            .push(t);
+    }
+    let mut out = Vec::new();
+    for group in groups.values_mut() {
+        if group.len() < 2 {
+            continue;
+        }
+        group.sort_by_key(|t| issue_order(&t.key));
+        let canonical = group[0].key.clone();
+        for dup in &group[1..] {
+            out.push(DuplicateClose {
+                key: dup.key.clone(),
+                canonical: canonical.clone(),
+                root_cause_key: dup.coords.root_cause_key.clone(),
+            });
+        }
+    }
+    // Deterministic order regardless of the HashMap iteration order.
+    out.sort_by(|a, b| issue_order(&a.key).cmp(&issue_order(&b.key)));
+    out
+}
+
+/// Sort key for an issue id: `(project, number)` for a `KEY-123` id, so
+/// `CLAUDE-9` sorts before `CLAUDE-10`. An id with no numeric suffix falls back
+/// to the whole string with number 0, keeping the ordering total.
+fn issue_order(key: &str) -> (String, i64) {
+    match key.rsplit_once('-') {
+        Some((project, num)) => match num.parse::<i64>() {
+            Ok(n) => (project.to_string(), n),
+            Err(_) => (key.to_string(), 0),
+        },
+        None => (key.to_string(), 0),
+    }
+}
+
+/// Close one duplicate: set `resolved_state` and post the duplicate comment.
+/// State is set FIRST, exactly as [`close_issue`] does, so a failed comment can
+/// never leave the issue open and re-processed.
+fn close_duplicate(
+    backend: &dyn Backend,
+    cfg: &CiFailureReconcileConfig,
+    dup: &DuplicateClose,
+) -> Result<()> {
+    backend.set_state(&dup.key, &cfg.resolved_state)?;
+    let body = build_duplicate_comment(&cfg.duplicate_comment, dup);
+    if let Err(e) = backend.comment(&dup.key, &body) {
+        warn!(key = %dup.key, error = %e, "posting the duplicate comment failed (issue already resolved)");
+    }
+    Ok(())
+}
+
+/// The duplicate close comment: the rendered `duplicate_comment` template plus
+/// the same hidden marker the now-green close uses, so a duplicate is never
+/// re-closed or re-commented.
+fn build_duplicate_comment(template: &str, dup: &DuplicateClose) -> String {
+    let rendered = template
+        .replace("{canonical}", &dup.canonical)
+        .replace("{root_cause_key}", &dup.root_cause_key);
+    [
+        rendered,
+        String::new(),
+        "<!-- claude-run ci-failure-reconcile; do not edit -->".to_string(),
+        format!("Auto-Closed: {AUTO_CLOSED_MARKER}"),
+    ]
+    .join("\n")
 }
 
 /// Gather every now-green `(branch, workflow, job)` for `repo` that a target issue
@@ -832,6 +955,7 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
             workflow_id: "check.yml".to_string(),
             job_name: "check".to_string(),
             html_url: String::new(),
+            root_cause_key: String::new(),
         };
         assert!(!green
             .iter()
@@ -848,6 +972,7 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
             workflow_id: "check.yml".to_string(),
             job_name: "check".to_string(),
             html_url: String::new(),
+            root_cause_key: String::new(),
         };
         let exact = GreenJob {
             branch: "main".to_string(),
@@ -940,5 +1065,178 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
             &prefixes
         ));
         assert!(!matches_prefix("Implement the events page", &prefixes));
+    }
+
+    // ---- CLAUDE-198: duplicate collapse -----------------------------------
+
+    /// A reconcile target built from an issue id and a body, as the gather step
+    /// produces it.
+    fn target(key: &str, body: &str) -> IssueTarget {
+        let IssueParse::Matched(coords) = parse_issue_coords(&inspect(body, &[])) else {
+            panic!("{key}: expected Matched");
+        };
+        IssueTarget {
+            key: key.to_string(),
+            coords,
+        }
+    }
+
+    /// `REKEY_BODY` with its root-cause key (and, optionally, its run index)
+    /// swapped, so a fixture can vary only the field under test.
+    fn body_with(root_cause: &str, run_index: i64) -> String {
+        REKEY_BODY
+            .replace(
+                "Root-Cause-Key: crdedupecccc",
+                &format!("Root-Cause-Key: {root_cause}"),
+            )
+            .replace("actions/runs/4034", &format!("actions/runs/{run_index}"))
+    }
+
+    #[test]
+    fn the_root_cause_key_marker_is_parsed() {
+        let IssueParse::Matched(coords) = parse_issue_coords(&inspect(REKEY_BODY, &[])) else {
+            panic!("expected Matched");
+        };
+        assert_eq!(coords.root_cause_key, "crdedupecccc");
+    }
+
+    #[test]
+    fn duplicates_collapse_onto_the_oldest_issue() {
+        // Three open issues for the same root-cause key (a lagging tracker index
+        // let mint create siblings) plus one for a different key.
+        let targets = vec![
+            target("CLAUDE-310", &body_with("crdedupeaaaa", 11)),
+            target("CLAUDE-9", &body_with("crdedupeaaaa", 9)),
+            target("CLAUDE-42", &body_with("crdedupeaaaa", 10)),
+            target("CLAUDE-50", &body_with("crdedupezzzz", 12)),
+        ];
+        let dups = plan_duplicates(&targets);
+        // The oldest (CLAUDE-9, not the lexicographically smallest CLAUDE-310)
+        // survives; the other two of its group close onto it.
+        assert_eq!(
+            dups,
+            vec![
+                DuplicateClose {
+                    key: "CLAUDE-42".to_string(),
+                    canonical: "CLAUDE-9".to_string(),
+                    root_cause_key: "crdedupeaaaa".to_string(),
+                },
+                DuplicateClose {
+                    key: "CLAUDE-310".to_string(),
+                    canonical: "CLAUDE-9".to_string(),
+                    root_cause_key: "crdedupeaaaa".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_issue_per_root_cause_key_is_never_a_duplicate() {
+        let targets = vec![
+            target("CLAUDE-1", &body_with("crdedupeaaaa", 1)),
+            target("CLAUDE-2", &body_with("crdedupebbbb", 2)),
+        ];
+        assert!(plan_duplicates(&targets).is_empty());
+    }
+
+    #[test]
+    fn the_same_key_on_two_repos_is_not_a_duplicate() {
+        // Grouping is on (repo, key), so a marker collision across repos (or a
+        // hand-copied body) never closes another repo's issue.
+        let a = body_with("crdedupeaaaa", 1);
+        let b = a.replace("contoso/claude-run", "initech/chat");
+        let targets = vec![target("CLAUDE-1", &a), target("LC-2", &b)];
+        assert!(plan_duplicates(&targets).is_empty());
+    }
+
+    #[test]
+    fn a_pre_rekey_issue_without_a_root_cause_key_is_never_a_duplicate() {
+        // Two pre-rekey issues (Branch/Job markers, no Root-Cause-Key) are both
+        // left open: an empty key groups nothing.
+        let body = REKEY_BODY.replace("Root-Cause-Key: crdedupecccc\n", "");
+        let targets = vec![target("CLAUDE-1", &body), target("CLAUDE-2", &body)];
+        assert!(targets.iter().all(|t| t.coords.root_cause_key.is_empty()));
+        assert!(plan_duplicates(&targets).is_empty());
+    }
+
+    #[test]
+    fn duplicate_comment_renders_template_and_embeds_marker() {
+        let dup = DuplicateClose {
+            key: "CLAUDE-42".to_string(),
+            canonical: "CLAUDE-9".to_string(),
+            root_cause_key: "crdedupeaaaa".to_string(),
+        };
+        let body =
+            build_duplicate_comment(&CiFailureReconcileConfig::default().duplicate_comment, &dup);
+        assert!(body.contains("CLAUDE-9"));
+        assert!(body.contains("crdedupeaaaa"));
+        assert!(!body.contains("{canonical}"));
+        assert!(!body.contains("{root_cause_key}"));
+        // Same hidden marker as the now-green close: a closed duplicate is never
+        // re-processed even if it is later reopened by hand.
+        assert!(matches!(
+            parse_issue_coords(&inspect(REKEY_BODY, &[&body])),
+            IssueParse::AlreadyClosed
+        ));
+    }
+
+    #[test]
+    fn issue_order_sorts_by_project_then_number() {
+        assert!(issue_order("CLAUDE-9") < issue_order("CLAUDE-10"));
+        assert!(issue_order("CLAUDE-10") < issue_order("CLAUDE-310"));
+        assert!(issue_order("CLAUDE-1") < issue_order("LC-1"));
+        // An id with no numeric suffix still orders totally (no panic).
+        assert_eq!(issue_order("weird"), ("weird".to_string(), 0));
+    }
+
+    /// AC 4: replay of a real failing-then-passing CI sequence, with a duplicate
+    /// pair in the mix, asserting NO issue of the sequence stays open.
+    ///
+    /// Sequence: run #10 of `check.yml` on `main` fails at job `check`, minting
+    /// CLAUDE-9; a tracker-index lag lets a second failure mint CLAUDE-42 for the
+    /// same root-cause key. Run #11 then passes. The reconciler must close
+    /// CLAUDE-42 as a duplicate of CLAUDE-9 and CLAUDE-9 as now-green.
+    #[test]
+    fn failing_then_passing_sequence_leaves_no_duplicate_open() {
+        let open = vec![
+            target("CLAUDE-9", &body_with("crdedupeaaaa", 10)),
+            target("CLAUDE-42", &body_with("crdedupeaaaa", 10)),
+        ];
+
+        // 1. Duplicate collapse: CLAUDE-42 closes onto CLAUDE-9.
+        let dups = plan_duplicates(&open);
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].key, "CLAUDE-42");
+        assert_eq!(dups[0].canonical, "CLAUDE-9");
+        let dup_keys: HashSet<&str> = dups.iter().map(|d| d.key.as_str()).collect();
+        let remaining: Vec<&IssueTarget> = open
+            .iter()
+            .filter(|t| !dup_keys.contains(t.key.as_str()))
+            .collect();
+        assert_eq!(remaining.len(), 1, "only the canonical issue is scanned");
+
+        // 2. Forgejo sequence: run #10 failed, run #11 passed, same branch and
+        // workflow. Reduction keeps #11, whose `check` job is success.
+        let runs = vec![
+            run(100, 10, "check.yml", "main", "failure"),
+            run(105, 11, "check.yml", "main", "success"),
+        ];
+        let latest = reduce_latest_runs(&runs);
+        assert_eq!(latest.len(), 1);
+        let green = now_green_jobs(&latest[0], &[job("check", "success")]);
+
+        // 3. The canonical issue matches the now-green job, so it closes too.
+        let canonical = remaining[0];
+        assert!(green
+            .iter()
+            .any(|g| issue_matches(&canonical.coords, "contoso/claude-run", g)));
+
+        // Nothing from the sequence is left open.
+        let closed: HashSet<&str> = dup_keys
+            .iter()
+            .copied()
+            .chain(std::iter::once(canonical.key.as_str()))
+            .collect();
+        assert_eq!(closed.len(), open.len(), "every open issue was closed");
     }
 }
