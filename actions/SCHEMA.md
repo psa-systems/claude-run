@@ -236,11 +236,11 @@ Every `fj` command the runner issues, the fj-source call it makes, and the categ
 | `repo view <repo> --json` (`:1284`)              | `fj_core::repo::get` -> `repo_get`                          | `GET /repos/{o}/{r}`                                   | repository (read)  |
 | `pr create <title> --body-file .. --head <b> --json` (`:771`) | `fj_core::prs::create` -> `repo_create_pull_request` | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
 | `pr create -aA --json` (AGit, `:843`)            | same as above                                                | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
-| `pr search --repo <r> --state open --json` (`:1317`) | `fj_core::issues::list_page` -> `issue_list_issues` (`type=pulls`), then one `prs::get` per hit | `GET /repos/{o}/{r}/issues?type=pulls`, `GET /repos/{o}/{r}/pulls/{i}` | **issue (read)** + repository (read) |
+| `pr search --repo <r> --state open --json` (`:1316`) | `fj_core::issues::list_page` -> `issue_list_issues` (`type=pulls`), then one `prs::get` per hit | `GET /repos/{o}/{r}/issues?type=pulls`, `GET /repos/{o}/{r}/pulls/{i}` | **issue (read)** + repository (read) |
 | `pr status <id> --json` (`:1335`)                | `prs::get` + `prs::get_commit_statuses`                      | `GET /repos/{o}/{r}/pulls/{i}`, `GET /repos/{o}/{r}/commits/{sha}/status` | repository (read)  |
 | `pr merge <id> --method merge --delete` (`:1365`) | `repo::get` + `prs::get` + `prs::merge` -> `repo_merge_pull_request` | `POST /repos/{o}/{r}/pulls/{i}/merge`          | repository (write) |
 | `pr comment <id> --body-file <f>` (`:1407`)      | `fj_core::issues::create_comment` -> `issue_create_comment`  | `POST /repos/{o}/{r}/issues/{i}/comments`              | **issue (write)**  |
-| `pr edit <id> labels --add <label>` (`:1428`)    | `fj_core::issues::edit_labels` -> `issue_list_labels` + `issue_add_label` | `GET /repos/{o}/{r}/labels`, `POST /repos/{o}/{r}/issues/{i}/labels` | **issue (write)**  |
+| `pr edit <id> labels --add <label>` (`:1427`)    | `fj_core::issues::edit_labels` -> `issue_list_labels` + `issue_add_label` | `GET /repos/{o}/{r}/labels`, `POST /repos/{o}/{r}/issues/{i}/labels` | **issue (write)**  |
 | `pr view <id> --json` (`:1443`)                  | `prs::get` + `prs::list_files` + `repo::get`                 | `GET /repos/{o}/{r}/pulls/{i}`, `.../files`            | repository (read)  |
 
 Two things the token does **not** have to cover: the `git push` in front of `pr create` authenticates with the daemon
@@ -322,7 +322,7 @@ When either probe fails, every issue of that repo is dropped for the poll and on
 
 The probe is skipped entirely when the action sets no forge `token_ref`, and skipped per host when the action carries no token for that host's forge: `fj` / `gh` then read the operator's own credential store, so the probe would test the wrong identity. A permission change *after* gather still fails at `pr create`, so that error is also restated with the repo, the host, and the possible-permission cause instead of the bare CLI text. A permission change that costs only the open-PR lookup is handled by the degradation below.
 
-#### Open-PR lookup degradation (CLAUDE-206)
+##### Open-PR lookup degradation (CLAUDE-206)
 
 The CLAUDE-170 idempotency reconcile asks the forge for an already-open PR on the branch before creating one (`fj pr search`, an issue-category call). That lookup is an optimization: `fj pr create` (repository-category) is what delivers the work, and the two can fail independently, so a failed lookup must not discard a paid Claude run.
 
