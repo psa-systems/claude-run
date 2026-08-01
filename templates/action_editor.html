@@ -7,7 +7,7 @@
 
 {% if let Some(u) = form_url %}
 <div class="card" style="margin-bottom: 16px;">
-  <span class="dim">{% if is_new %}Prefer a guided form? <a href="{{ u }}">Create a YouTrack action with the structured editor</a>.{% else %}This is a YouTrack action. <a href="{{ u }}">Edit it with the structured form</a> instead of raw YAML.{% endif %}</span>
+  <span class="dim">{% if is_new %}Prefer a guided form? <a href="{{ u }}">Pick an action kind</a>: every native kind has a structured editor.{% else %}This is a native action. <a href="{{ u }}">Edit it with the structured form</a> instead of raw YAML.{% endif %}</span>
 </div>
 {% endif %}
 
