@@ -451,9 +451,9 @@ workflow step order), the root-cause diagnostic or an explicit statement that th
 Selection is by summary prefix + analyzed-marker ONLY; it **never** selects by `AI Agent: Queued` (that field belongs to
 the code-fix runner, so analysis, a read-only enrichment, must not collide with it). A log miss (auth denied or a pruned
 run) posts a short "unavailable" note once and leaves the issue un-marked so a later run retries; it never crashes or
-marks analyzed on a miss. Log reads go through `fj actions logs`; the workflow-YAML read stays on the REST API until
-`fj` gains a raw-file command (FJ-67). Either way the read is in Rust inside `forge_log`, never a raw REST call from a nu
-snippet, and redaction is preserved end to end via `forge_log::redact`, so no token lands in a posted comment. Configure it in `actions/ci-failure-analysis.yml` (`log_token_ref` picks the Forgejo PAT per repo, see
+marks analyzed on a miss. Log reads go through `fj actions logs` and the workflow-YAML read through `fj repo file`
+(CLAUDE-205); both are in Rust inside `forge_log`, never a raw REST call and never one from a nu snippet, and redaction
+is preserved end to end via `forge_log::redact`, so no token lands in a posted comment. Configure it in `actions/ci-failure-analysis.yml` (`log_token_ref` picks the Forgejo PAT per repo, see
 below; `query` / `summary_prefixes` / `max_analysis_bytes` tune selection and the comment cap). See `actions/SCHEMA.md`
 (`kind: ci-failure-analysis`).
 
@@ -472,12 +472,13 @@ latest run is closed: State set to `resolved_state` (default `Done`) and a run-l
 Only the LATEST run decides, so a newer failure after an older green run leaves the job red and the issue open; matching is
 exact on all four of `(repo, branch, workflow, job)`, so a green sibling branch or job never closes a still-broken issue.
 The close is idempotent (a resolved issue drops out of the `#Unresolved` scan, and a hidden auto-closed marker guards
-against a re-comment). When the runs list returns `head_branch` null (the deployed Forgejo), the branch is resolved from
-the run's log environment dump, bounded by `max_branch_resolves`. The reconciler is polling by design (a success webhook
+against a re-comment). When the runs list carries no plain branch name (`fj`'s `head_branch` is Forgejo's `prettyref`,
+which is `#<pr-number>` for a PR run and the bare commit sha for a ref-deleted push), the branch is resolved from the
+run's log environment dump, bounded by `max_branch_resolves`. The reconciler is polling by design (a success webhook
 can be missed or arrive out of order, and success events are dropped at the ingress; polling reflects current truth); it
 performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. Log and per-job status reads go
-through `fj actions logs`; the runs list stays on the REST API until `fj` gains an `actions runs` command (FJ-66). Both
-stay inside `forge_log` (Rust), never a raw REST call from a nu snippet.
+through `fj actions logs` and the runs list through `fj actions runs` (CLAUDE-205). Both stay inside `forge_log` (Rust),
+never a raw REST call and never one from a nu snippet.
 
 Duplicates are collapsed in the same pass (CLAUDE-198). Mint already declines to create a second issue for a root cause
 that has an open one, but that check is a tracker full-text search on the hidden `Root-Cause-Key:` marker, so a lagging
@@ -542,8 +543,11 @@ fails loudly naming the path (run `claude` once to log in first). On macOS crede
 **Image.** `oci-build/Dockerfile` has a `runtime` target built on the CI image (`dev.a8n.run/pandoras-box/rust-builder-musl`).
 It carries `claude-run` plus the pinned runtime toolchain: `nu`, the `claude` CLI, coreutils `timeout`, `git`, `yt` (
 youtrack-cli), and `fj` (forgejo-cli). Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VERSION`, `YT_VERSION`,
-`FJ_VERSION`); override any one with `--build-arg`. The container runs as the non-root user `claudebot` with
-`$HOME=/home/claudebot`.
+`FJ_VERSION`); override any one with `--build-arg`. The two CI-failure actions read the forge only through `fj`, so they
+need an `fj` carrying `fj actions logs`, `fj actions runs` (FJ-66), and `fj repo file` (FJ-67); the latter two landed on
+`pandoras-box/forgejo-cli` `main` after the `v0.13.0` tag (merge `b08d8bc`) and are in no released version yet, so
+`FJ_VERSION` must point at a build from that commit or newer for those actions to work. The container runs as the
+non-root user `claudebot` with `$HOME=/home/claudebot`.
 
 **Published image (CLAUDE-88).** CI publishes the runtime image to the Forgejo OCI registry on every push to main (
 `:latest`) and every release tag (`:vX.Y.Z`), the same tag set as the binary's Generic Package. The image publish runs

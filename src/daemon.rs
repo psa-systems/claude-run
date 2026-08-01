@@ -235,7 +235,7 @@ impl Daemon {
         // is usable.
         let webhook_log_dir = self.paths.state_dir.join("webhook-logs");
         let webhook_logs: Arc<dyn crate::forge_log::ActionLogClient> = Arc::new(
-            crate::provider::FjActionLogs::new(Arc::new(crate::provider::ProcessRunner::new())),
+            crate::provider::FjForgeReads::new(Arc::new(crate::provider::ProcessRunner::new())),
         );
         let mint_ctx = build_mint_context(&pool, settings.mint_handle(), &claude, &webhook_log_dir);
         let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(

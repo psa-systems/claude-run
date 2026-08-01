@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-pub use cli::{CliBackend, CmdOutput, CommandRunner, FjActionLogs, ProcessRunner};
+pub use cli::{CliBackend, CmdOutput, CommandRunner, FjForgeReads, ProcessRunner};
 pub use github::{is_github_host, GithubForge, HttpMcpTransport, McpTransport};
 
 /// One project-to-repo binding flattened from a YouTrack project's enabled VCS
