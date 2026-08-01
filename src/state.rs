@@ -413,6 +413,36 @@ pub async fn run_events_record(
     Ok(())
 }
 
+/// CLAUDE-206: persist run-phase events that already know their run row (the
+/// forge notices a job accumulates, e.g. a degraded open-PR lookup). Unlike
+/// [`run_events_record`] these need no [`run_events_attach`] backfill, so a
+/// concurrent poll's NULL-`run_id` rows can never be attached by mistake.
+pub async fn run_events_record_for_run(
+    pool: &SqlitePool,
+    run_id: i64,
+    action: &str,
+    events: &[InputEvent],
+) -> Result<()> {
+    let ts = now_iso();
+    for e in events {
+        sqlx::query(
+            r#"
+            INSERT INTO run_events (run_id, action_name, ts, level, context, message)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(run_id)
+        .bind(action)
+        .bind(&ts)
+        .bind(&e.level)
+        .bind(&e.context)
+        .bind(&e.message)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 /// CLAUDE-147: backfill `run_id` onto this poll's still-unattached events once
 /// `run_begin` has created the run row, so the run-detail / action pages can tie
 /// them to the run. Matches on `action_name` + the poll `ts` used at record
@@ -1006,6 +1036,56 @@ mod tests {
             .unwrap();
         let read = run_events_for_action(&pool, "youtrack", 50).await.unwrap();
         assert!(read.iter().all(|e| e.run_id == Some(run)));
+    }
+
+    #[tokio::test]
+    async fn run_phase_event_attaches_to_its_run_and_reads_on_the_action_page() {
+        // CLAUDE-206: a degraded open-PR lookup is recorded mid-run, so it knows
+        // its run row already and needs no attach backfill. It reads back on the
+        // action page carrying that run id, and a concurrent poll's
+        // NULL-run_id event is left alone.
+        let pool = mem_pool().await;
+        run_events_record(
+            &pool,
+            "youtrack",
+            &now_iso(),
+            &[InputEvent {
+                level: "info".into(),
+                context: Some("ZZ".into()),
+                message: "unrelated poll event".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let run = run_begin(&pool, "youtrack", "cli").await.unwrap();
+        run_events_record_for_run(
+            &pool,
+            run,
+            "youtrack",
+            &[InputEvent {
+                level: "warn".into(),
+                context: Some("CLAUDE-206".into()),
+                message: "open-PR lookup for `contoso/claude-run` failed (403); created anyway"
+                    .into(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let read = run_events_for_action(&pool, "youtrack", 50).await.unwrap();
+        let degraded = read
+            .iter()
+            .find(|e| e.message.contains("open-PR lookup"))
+            .expect("degraded-lookup event present on the action page");
+        assert_eq!(degraded.run_id, Some(run));
+        assert_eq!(degraded.context.as_deref(), Some("CLAUDE-206"));
+        assert_eq!(degraded.level, "warn");
+        // The poll event recorded before the run row stays unattached.
+        let poll_event = read
+            .iter()
+            .find(|e| e.message == "unrelated poll event")
+            .unwrap();
+        assert!(poll_event.run_id.is_none());
     }
 
     #[tokio::test]

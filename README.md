@@ -47,7 +47,9 @@ API by endpoint category rather than by `fj` command name, and the PR path cross
 `pr status`, `pr view`, and `repo view` are repository-category, while the open-PR lookup (`fj pr search`) and PR
 comments / labels (`fj pr comment`, `fj pr edit labels`) go through the issues API. A repository-only token is rejected
 at gather time by the repo-access preflight, which probes one read per category (`repo view` and `pr search`) so the
-missing scope is named before a Claude run is paid for. The read-only log-fetch token
+missing scope is named before a Claude run is paid for. If the open-PR lookup fails anyway (a mid-run permission
+change, or a transient forge error) the runner creates the PR instead of failing the run, logging a `warn` run event
+with the CLI error. The read-only log-fetch token
 (`log_token_ref`, used by the CI-failure actions) needs only `read:repository`. Per-command breakdown with the endpoint
 each call maps to: `actions/SCHEMA.md`, "Forgejo token scopes".
 
