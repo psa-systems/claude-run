@@ -746,6 +746,75 @@ fn is_failure_status(s: &str) -> bool {
     )
 }
 
+/// CLAUDE-208: job statuses that mean the run was stopped rather than broken. A
+/// push that supersedes an in-flight run leaves every job `cancelled`, and a
+/// server-side skipped job never ran; neither is a defect in the repository.
+const STOPPED_STATUSES: &[&str] = &["cancelled", "skipped"];
+
+/// CLAUDE-208: what a run's job list says about whether anything actually
+/// failed. Forgejo reports run-level `failure` for a run whose jobs were merely
+/// cancelled (a newer push superseded it), so the payload status alone cannot
+/// tell a broken build from a stopped one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobsVerdict {
+    /// At least one job matched [`is_failure_status`]; carries its name and its
+    /// position in run order.
+    Failed { name: String, index: usize },
+    /// The job list resolved and no job is a failure; carries every observed
+    /// status in run order.
+    NoFailure { statuses: Vec<String> },
+    /// The job list did not resolve (miss, auth denial, fault, panicked task),
+    /// so nothing is known about the jobs. Callers fail open on this.
+    Unknown { reason: String },
+}
+
+impl JobsVerdict {
+    /// The verdict for one fetch. `unavailable_reason` is the caller's cause for
+    /// a fetch that returned no job list (transient miss, auth denial, fault,
+    /// panicked task); when it is set the verdict is [`JobsVerdict::Unknown`]
+    /// regardless of `jobs`.
+    pub fn resolve(unavailable_reason: Option<&str>, jobs: &[JobLog]) -> Self {
+        if let Some(reason) = unavailable_reason {
+            return Self::Unknown {
+                reason: reason.to_string(),
+            };
+        }
+        match jobs.iter().position(|j| is_failure_status(&j.status)) {
+            Some(index) => Self::Failed {
+                name: jobs[index].name.clone(),
+                index,
+            },
+            None => Self::NoFailure {
+                statuses: jobs.iter().map(|j| j.status.clone()).collect(),
+            },
+        }
+    }
+
+    /// True when the run was stopped rather than broken: it has jobs, none
+    /// failed, and every one ended in [`STOPPED_STATUSES`]. False for an empty
+    /// job list, so a run that resolved with no jobs at all still mints.
+    pub fn stopped(&self) -> bool {
+        match self {
+            Self::NoFailure { statuses } => {
+                !statuses.is_empty()
+                    && statuses
+                        .iter()
+                        .all(|s| STOPPED_STATUSES.contains(&s.to_ascii_lowercase().as_str()))
+            }
+            _ => false,
+        }
+    }
+
+    /// The observed statuses as one comma-separated string, for a log line and
+    /// the run summary. Empty for a verdict that carries no status list.
+    pub fn statuses_display(&self) -> String {
+        match self {
+            Self::NoFailure { statuses } => statuses.join(", "),
+            _ => String::new(),
+        }
+    }
+}
+
 /// Redact secrets from `input`: first mask each known secret value verbatim,
 /// then redact token *shapes* (known prefixes, and high-entropy values that
 /// follow an auth keyword). Pure; the unit of the AC's redaction test.
@@ -1455,5 +1524,99 @@ mod tests {
             let jobs = vec![job("build", "success", ""), job("test", status, "")];
             assert_eq!(resolve_failing_job(&jobs).unwrap().name, "test", "{status}");
         }
+    }
+
+    // ---- CLAUDE-208: run-level verdict over the job list ------------------
+
+    #[test]
+    fn jobs_verdict_all_cancelled_is_a_stopped_run() {
+        let jobs = vec![job("build", "cancelled", ""), job("test", "cancelled", "")];
+        let v = JobsVerdict::resolve(None, &jobs);
+        assert_eq!(
+            v,
+            JobsVerdict::NoFailure {
+                statuses: vec!["cancelled".to_string(), "cancelled".to_string()],
+            }
+        );
+        assert!(v.stopped());
+        assert_eq!(v.statuses_display(), "cancelled, cancelled");
+    }
+
+    #[test]
+    fn jobs_verdict_all_skipped_is_a_stopped_run() {
+        let jobs = vec![job("build", "SKIPPED", "")];
+        let v = JobsVerdict::resolve(None, &jobs);
+        assert!(v.stopped(), "status match is case-insensitive");
+    }
+
+    #[test]
+    fn jobs_verdict_cancelled_plus_a_failure_is_a_failure() {
+        let jobs = vec![
+            job("build", "cancelled", ""),
+            job("test", "failure", "boom"),
+            job("lint", "cancelled", ""),
+        ];
+        let v = JobsVerdict::resolve(None, &jobs);
+        assert_eq!(
+            v,
+            JobsVerdict::Failed {
+                name: "test".to_string(),
+                index: 1,
+            }
+        );
+        assert!(!v.stopped());
+    }
+
+    #[test]
+    fn jobs_verdict_all_success_is_no_failure_but_not_stopped() {
+        let jobs = vec![job("build", "success", ""), job("test", "success", "")];
+        let v = JobsVerdict::resolve(None, &jobs);
+        assert!(matches!(v, JobsVerdict::NoFailure { .. }));
+        // Not in the skip set, so this still mints and the statuses are logged.
+        assert!(!v.stopped());
+        assert_eq!(v.statuses_display(), "success, success");
+    }
+
+    #[test]
+    fn jobs_verdict_empty_list_is_not_stopped() {
+        let v = JobsVerdict::resolve(None, &[]);
+        assert_eq!(
+            v,
+            JobsVerdict::NoFailure {
+                statuses: Vec::new()
+            }
+        );
+        // A run that resolved with no jobs at all says nothing about a cancel,
+        // so it must not be swallowed: fail open and mint.
+        assert!(!v.stopped());
+    }
+
+    #[test]
+    fn jobs_verdict_unresolved_endpoint_is_unknown_and_never_stopped() {
+        // The four ways `consume_events` ends up with no job list: a transient
+        // miss, a rejected token, a fetch fault, and a panicked fetch task.
+        for reason in [
+            "log not available after retries: run not found",
+            "log token rejected (401)",
+            "log fetch failed: fj not on PATH",
+            "log fetch task panicked: task panicked",
+        ] {
+            let v = JobsVerdict::resolve(Some(reason), &[]);
+            assert_eq!(
+                v,
+                JobsVerdict::Unknown {
+                    reason: reason.to_string(),
+                }
+            );
+            assert!(!v.stopped(), "{reason}");
+            assert_eq!(v.statuses_display(), "");
+        }
+        // A reason wins even if a job list somehow came with it.
+        let v = JobsVerdict::resolve(
+            Some("log token rejected (403)"),
+            &[job("b", "cancelled", "")],
+        );
+        assert!(matches!(v, JobsVerdict::Unknown { .. }));
+        assert!(!v.stopped());
     }
 }
