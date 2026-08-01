@@ -15,7 +15,7 @@
 //! - gather (Forgejo): for each allow-listed repo, page the runs list
 //!   ([`crate::forge_log::fetch_runs`]) and reduce it to the LATEST run per
 //!   `(branch, workflow_id)`. When the runs list returns `head_branch` null (the
-//!   deployed Forgejo), the branch is resolved from the run's log checkout section
+//!   deployed Forgejo), the branch is resolved from the run's log environment dump
 //!   ([`crate::forge_log::resolve_branch`]), bounded by `max_branch_resolves`.
 //! - now-green: read each latest run's per-job status from the jobs
 //!   `fj actions logs` returns ([`crate::forge_log::fetch_run_log`]); a job whose
@@ -510,7 +510,7 @@ fn resolve_missing_branches(
         resolved += 1;
         let snapshot = run.clone();
         if let Some(jobs) = fetch_run(logs, token, repo, &snapshot, out_dir) {
-            // The checkout section is in whichever job ran it; take the first hit.
+            // The environment dump is in whichever job printed it; take the first hit.
             if let Some(b) = jobs
                 .iter()
                 .find_map(|j| forge_log::resolve_branch(None, &j.log))

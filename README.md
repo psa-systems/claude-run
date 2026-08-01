@@ -355,7 +355,7 @@ a duplicate), while a genuinely different failure signature on the same job stay
 diagnostic line is derivable (a truncated / diagnostic-free / logless failure) the key falls back to
 `hash(repo, branch, workflow_id, job_name)`, which still collapses a "branch is broken" storm onto one issue (two
 indistinguishable logless failures on the same job are intentionally grouped; the CLAUDE-189 analysis can later split a
-mis-grouped issue). The branch is read from the run's log checkout section (`GITHUB_REF=refs/heads/<branch>`; the deployed
+mis-grouped issue). The branch is read from the run's log environment dump (`GITHUB_HEAD_REF` on a PR run, else the `refs/heads/` short name, in either the `setupEnv => map[...]` or the `KEY=value` form; the deployed
 Forgejo returns `head_branch: null` from run detail) and the job name from the jobs `fj actions logs` returns with the
 log, both resolved in Rust. The issue body carries hidden `Dedupe-Key:`, `Root-Cause-Key:`, `Branch:`, and `Job:`
 markers so the CLAUDE-191 auto-close reconciler can find every issue for a `(repo, branch, workflow, job)`; a resolved
@@ -468,7 +468,7 @@ Only the LATEST run decides, so a newer failure after an older green run leaves 
 exact on all four of `(repo, branch, workflow, job)`, so a green sibling branch or job never closes a still-broken issue.
 The close is idempotent (a resolved issue drops out of the `#Unresolved` scan, and a hidden auto-closed marker guards
 against a re-comment). When the runs list returns `head_branch` null (the deployed Forgejo), the branch is resolved from
-the run's log checkout section, bounded by `max_branch_resolves`. The reconciler is polling by design (a success webhook
+the run's log environment dump, bounded by `max_branch_resolves`. The reconciler is polling by design (a success webhook
 can be missed or arrive out of order, and success events are dropped at the ingress; polling reflects current truth); it
 performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. Log and per-job status reads go
 through `fj actions logs`; the runs list stays on the REST API until `fj` gains an `actions runs` command (FJ-66). Both
