@@ -2859,7 +2859,7 @@ mod tests {
     fn finalize_success_agit_strategy_creates_pr_and_sets_code_review() {
         // CLAUDE-103 opt-in: the AGit strategy invokes `fj pr create -aA`.
         let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(
+        let runner = Arc::new(with_one_branch_ahead(
             StubRunner::new()
                 .ok(
                     "fj",
@@ -2871,7 +2871,7 @@ mod tests {
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
                     "",
                 ),
-        );
+        ));
         let backend = CliBackend::new(runner.clone());
         let res = finalize(
             &backend,
@@ -2932,6 +2932,26 @@ mod tests {
     fn set_identity(dir: &Path) {
         git_in(dir, &["config", "user.email", "test@test"]);
         git_in(dir, &["config", "user.name", "test"]);
+    }
+
+    /// CLAUDE-212: the ahead check runs for every PR strategy, so a finalize
+    /// test that expects PR creation to happen must register the branch
+    /// resolution plumbing: `origin/HEAD`, the local branch list, and one
+    /// `rev-list <base>..<branch>` per non-base branch. Here `feat/x` is the
+    /// single branch ahead of `origin/main`.
+    fn with_one_branch_ahead(runner: StubRunner) -> StubRunner {
+        runner
+            .ok(
+                "git",
+                &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                "origin/main",
+            )
+            .ok(
+                "git",
+                &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                "main\nfeat/x",
+            )
+            .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
     }
 
     fn repo_with_commit(dir: &Path) {
@@ -3309,6 +3329,64 @@ mod tests {
     }
 
     #[test]
+    fn finalize_agit_with_no_commits_fails_instead_of_code_review() {
+        // CLAUDE-212: claude "succeeded" but produced no branch ahead of base.
+        // Under the AGit strategy this used to open an empty autofilled PR and
+        // move the issue to Code Review. The hoisted ahead check now fails the
+        // finalize: AI Agent=Failed, no PR link commented, `fj` never invoked.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Failed"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Agit,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::Failed);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("fj ")),
+            "no PR may be opened for a run with no commits: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("set-field MK-16 AI Agent Code Review")),
+            "must not move to Code Review: {calls:?}"
+        );
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .expect("failure comment posted");
+        assert!(comment.contains("no feature branch"), "{comment}");
+        assert!(!comment.contains("/pulls/"), "no PR link: {comment}");
+    }
+
+    #[test]
     fn finalize_github_job_opens_pr_via_forge_and_sets_code_review() {
         // CLAUDE-50: a GitHub job finalizes through the GitHub `Forge`. The PR's
         // real html_url is linked exactly as the Forgejo path links its PR, and
@@ -3420,7 +3498,7 @@ mod tests {
             },
             ..YoutrackSource::default()
         };
-        let runner = Arc::new(
+        let runner = Arc::new(with_one_branch_ahead(
             StubRunner::new()
                 .ok(
                     "fj",
@@ -3438,7 +3516,7 @@ mod tests {
                     ],
                     "",
                 ),
-        );
+        ));
         let backend = CliBackend::new(runner.clone());
         let res = finalize(
             &backend,
@@ -3639,7 +3717,7 @@ mod tests {
         // whose branch is up to date is merged as a merge-commit; the issue is
         // advanced to State=Done + AI Agent=Done and the outcome is Merged.
         let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(
+        let runner = Arc::new(with_one_branch_ahead(
             StubRunner::new()
                 .ok(
                     "fj",
@@ -3683,7 +3761,7 @@ mod tests {
                     &["issue", "set-field", "MK-16", "AI Agent", "Done"],
                     "",
                 ),
-        );
+        ));
         let backend = CliBackend::new(runner.clone());
         let res = finalize(
             &backend,
@@ -3725,7 +3803,7 @@ mod tests {
         // CLAUDE-126: a CI failure means no merge; the PR stays open and the
         // issue stays at Code Review (the create-time state).
         let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(
+        let runner = Arc::new(with_one_branch_ahead(
             StubRunner::new()
                 .ok(
                     "fj",
@@ -3749,7 +3827,7 @@ mod tests {
                     ],
                     r#"{"pr":7,"state":"failure","mergeable":false,"merged":false}"#,
                 ),
-        );
+        ));
         let backend = CliBackend::new(runner.clone());
         let res = finalize(
             &backend,
@@ -3783,7 +3861,7 @@ mod tests {
         // merge; the PR stays open at Code Review. `wait_seconds: 0` exhausts the
         // budget after the first (pending) poll.
         let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(
+        let runner = Arc::new(with_one_branch_ahead(
             StubRunner::new()
                 .ok(
                     "fj",
@@ -3807,7 +3885,7 @@ mod tests {
                     ],
                     r#"{"pr":7,"state":"pending","mergeable":false,"merged":false}"#,
                 ),
-        );
+        ));
         let backend = CliBackend::new(runner.clone());
         let res = finalize(
             &backend,
@@ -3835,7 +3913,7 @@ mod tests {
         // CLAUDE-126: the default (disabled) automerge never polls or merges; the
         // success path is exactly the pre-CLAUDE-126 Code Review behavior.
         let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(
+        let runner = Arc::new(with_one_branch_ahead(
             StubRunner::new()
                 .ok(
                     "fj",
@@ -3847,7 +3925,7 @@ mod tests {
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
                     "",
                 ),
-        );
+        ));
         let backend = CliBackend::new(runner.clone());
         let res = finalize(
             &backend,

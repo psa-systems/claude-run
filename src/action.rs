@@ -399,6 +399,10 @@ impl Default for YoutrackStates {
 /// moment it falls behind a base that requires an up-to-date branch. AGit is
 /// kept as an explicit opt-in, never a silent fallback (the selected strategy
 /// is authoritative).
+///
+/// CLAUDE-212: both variants are gated by the same ahead check before PR
+/// creation (exactly one local branch ahead of the base), so neither can open a
+/// PR for a run that produced no commits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PrStrategy {
