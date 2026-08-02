@@ -485,6 +485,11 @@ impl CliBackend {
     /// below rather than delegating to `fj`'s opaque "no changes between head and
     /// base". The workdir is named in the errors so the branch stays recoverable
     /// (the failure comment in `src/native/youtrack.rs` preserves it).
+    ///
+    /// CLAUDE-212: called from [`Forge::create_pr`] BEFORE the strategy dispatch,
+    /// so the ahead check guards AGit too. AGit discards the resolved name (`fj
+    /// pr create -aA` pushes `HEAD`), it only needs the zero/multiple-candidate
+    /// rejection.
     fn resolve_feature_branch(&self, workdir: &Path) -> Result<String> {
         // The base branch is whatever `origin/HEAD` points at, e.g. `origin/main`.
         let base_args = ["rev-parse", "--abbrev-ref", "origin/HEAD"];
@@ -560,7 +565,8 @@ impl CliBackend {
     /// `HEAD`, or an agent bug can no longer strand the work and open a silent
     /// `main`-vs-`main` PR. The push, title, and body all target the resolved
     /// branch; `fj pr create` is invoked with an explicit `--head`, mirroring the
-    /// GitHub backend (`github.rs`).
+    /// GitHub backend (`github.rs`). CLAUDE-212: `branch` is resolved by the
+    /// caller ([`Forge::create_pr`]) so both strategies share the ahead check.
     ///
     /// CLAUDE-170: idempotent against a pre-existing `origin/<branch>`. The
     /// feature-branch name is deterministic per issue key, so a re-run, a
@@ -577,28 +583,26 @@ impl CliBackend {
     /// work in the workdir is preserved; branches already pushed remain on the
     /// remote"), never a flat outcome, because `cleanup_or_preserve` makes the
     /// keep-or-delete decision later and can legitimately delete the directory.
-    fn create_pr_branch(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
-        let branch = self.resolve_feature_branch(workdir)?;
-
+    fn create_pr_branch(&self, workdir: &Path, host: &str, branch: &str) -> Result<PullRequest> {
         // Repo path (`owner/repo`) for the open-PR lookup, derived from the
         // workdir's `origin` remote (the form `list_open_prs` expects).
         let repo = self.origin_repo_path(workdir)?;
 
         // Local tip of the resolved branch, and the remote branch's tip (if the
         // branch already exists on `origin`), read BEFORE any push.
-        let local_sha = self.rev_parse(workdir, &branch)?;
-        let remote_sha = self.remote_branch_sha(workdir, &branch)?;
+        let local_sha = self.rev_parse(workdir, branch)?;
+        let remote_sha = self.remote_branch_sha(workdir, branch)?;
 
         match remote_sha {
             // Absent: unchanged happy path (push `<branch>:<branch>`, create the
             // PR with `--head <branch>`).
             None => {
-                self.push_branch(workdir, &branch)?;
-                self.find_or_create_pr(workdir, host, &repo, &branch)
+                self.push_branch(workdir, branch)?;
+                self.find_or_create_pr(workdir, host, &repo, branch)
             }
             // Equal to local: nothing to push; find-or-create the PR.
             Some(ref remote_sha) if *remote_sha == local_sha => {
-                self.find_or_create_pr(workdir, host, &repo, &branch)
+                self.find_or_create_pr(workdir, host, &repo, branch)
             }
             // Present and not equal. A fast-forward push is legal only when the
             // remote tip is an ancestor of the local tip; then push (never force)
@@ -607,15 +611,15 @@ impl CliBackend {
             // else fail loudly.
             Some(remote_sha) => {
                 if self.is_ancestor(workdir, &remote_sha, &local_sha)? {
-                    self.push_branch(workdir, &branch)?;
-                    self.find_or_create_pr(workdir, host, &repo, &branch)
+                    self.push_branch(workdir, branch)?;
+                    self.find_or_create_pr(workdir, host, &repo, branch)
                 } else {
                     // CLAUDE-206: the lookup stays FATAL on this arm only. Here
                     // its result decides between adopting and refusing, so an
                     // "assume none" would raise the refusal for the wrong
                     // reason; a failed search and a genuine "no open PR" are
                     // reported as the different conditions they are.
-                    match self.find_open_pr(host, &repo, &branch) {
+                    match self.find_open_pr(host, &repo, branch) {
                         Ok(Some(pr)) => Ok(pr),
                         Ok(None) => Err(Error::Other(anyhow::anyhow!(
                             "remote branch `{branch}` has diverged from the local work \
@@ -839,6 +843,11 @@ impl CliBackend {
     /// PR (head at `refs/pull/<N>/head`), deriving the title/body from the
     /// commit messages. No server branch is produced. A failure errors loudly;
     /// there is no silent switch to the branch path.
+    ///
+    /// CLAUDE-212: reached only after [`Forge::create_pr`] resolved exactly one
+    /// branch ahead of base. Without that guard a run with no commits still
+    /// succeeded here (`-aA` pushes the base tip and autofills from an unrelated
+    /// commit), and the issue was moved to `AI Agent = Code Review`.
     fn create_pr_agit(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
         let args = ["--host", host, "pr", "create", "-aA", "--json"];
         let stdout = self
@@ -1247,6 +1256,11 @@ impl Forge for CliBackend {
         strategy: crate::action::PrStrategy,
     ) -> Result<PullRequest> {
         use crate::action::PrStrategy;
+        // CLAUDE-212: the CLAUDE-166 ahead check runs BEFORE the dispatch, so
+        // both strategies reject a run that produced no commits (zero
+        // candidates) or an ambiguous workdir (multiple candidates) with the
+        // same loud, workdir-naming error, before `fj` is invoked.
+        let branch = self.resolve_feature_branch(workdir)?;
         match strategy {
             // CLAUDE-103 default: push a real server branch with the git CLI
             // (proven https-capable, it performed the clone) and open the PR
@@ -1255,7 +1269,7 @@ impl Forge for CliBackend {
             // The selected strategy is authoritative: a failure errors loudly
             // (the finalize step preserves the workdir) rather than silently
             // emitting a branchless AGit PR.
-            PrStrategy::Branch => self.create_pr_branch(workdir, host),
+            PrStrategy::Branch => self.create_pr_branch(workdir, host, &branch),
             // Opt-in AGit + autofill: fj derives the title/body from the local
             // commit messages, which already carry the bare #<KEY>-N reference.
             // No server branch (head lives only at `refs/pull/<N>/head`).
@@ -2199,10 +2213,17 @@ mod tests {
     #[test]
     fn create_pr_agit_strategy_parses_number() {
         // CLAUDE-103: `pr_strategy: agit` invokes `fj pr create -aA` as before.
-        let runner = Arc::new(StubRunner::new().ok(
-            "fj",
-            &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
-            r#"{"number":42,"html_url":"https://dev.a8n.run/n/c/pulls/42"}"#,
+        // CLAUDE-212: with exactly one branch ahead of base the guard passes and
+        // the AGit call is unchanged.
+        let runner = Arc::new(with_branch_resolution(
+            StubRunner::new().ok(
+                "fj",
+                &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+                r#"{"number":42,"html_url":"https://dev.a8n.run/n/c/pulls/42"}"#,
+            ),
+            "origin/main",
+            &["main", "fix/x"],
+            &[("fix/x", "aaa\n")],
         ));
         let b = CliBackend::new(runner.clone());
         let pr = b
@@ -2210,12 +2231,12 @@ mod tests {
             .unwrap();
         assert_eq!(pr.number, Some(42));
         assert_eq!(pr.url, "https://dev.a8n.run/n/c/pulls/42");
-        // The AGit path issues `-aA --json` and never pushes a branch.
+        // The AGit path issues exactly `-aA --json` and never pushes a branch.
         let calls = runner.calls.lock().unwrap();
-        assert!(
-            calls
-                .iter()
-                .any(|c| c == "fj --host dev.a8n.run pr create -aA --json"),
+        let fj_calls: Vec<&String> = calls.iter().filter(|c| c.starts_with("fj ")).collect();
+        assert_eq!(
+            fj_calls,
+            vec!["fj --host dev.a8n.run pr create -aA --json"],
             "{calls:?}"
         );
         assert!(
@@ -2547,6 +2568,71 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         assert!(
             !calls.iter().any(|c| c.contains("pr create")),
+            "must not delegate to fj on multiple candidates: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_agit_zero_candidates_is_distinct_actionable_error() {
+        // CLAUDE-212: the guardrail is strategy-independent. With no branch ahead
+        // of base, AGit gets the same loud, workdir-naming error the branch
+        // strategy gives, and `fj` is never invoked (so no empty PR is opened
+        // from the base tip and the run finalizes as Failed).
+        let wd = tempfile::tempdir().unwrap();
+        let runner = Arc::new(with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main"],
+            &[],
+        ));
+        let b = CliBackend::new(runner.clone());
+        match b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Agit)
+            .unwrap_err()
+        {
+            Error::Other(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("no feature branch"), "{msg}");
+                assert!(msg.contains("origin/main"), "{msg}");
+                assert!(msg.contains("preserved"), "{msg}");
+                assert!(msg.contains(&wd.path().display().to_string()), "{msg}");
+            }
+            other => panic!("expected Other actionable error, got {other:?}"),
+        }
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("fj ")),
+            "must not delegate to fj on zero candidates: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_agit_multiple_candidates_names_them_and_refuses() {
+        // CLAUDE-212: two branches ahead of base would let `fj pr create -aA`
+        // silently pick whatever `HEAD` happens to be; refuse and name them.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = Arc::new(with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/a", "feat/b"],
+            &[("feat/a", "aaa\n"), ("feat/b", "bbb\n")],
+        ));
+        let b = CliBackend::new(runner.clone());
+        match b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Agit)
+            .unwrap_err()
+        {
+            Error::Other(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("multiple candidate"), "{msg}");
+                assert!(msg.contains("feat/a"), "{msg}");
+                assert!(msg.contains("feat/b"), "{msg}");
+            }
+            other => panic!("expected Other actionable error, got {other:?}"),
+        }
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("fj ")),
             "must not delegate to fj on multiple candidates: {calls:?}"
         );
     }
@@ -3488,7 +3574,7 @@ mod tests {
         // CLAUDE-26: a credentialed backend injects YOUTRACK_CLI_CONFIG onto the
         // yt child and an XDG_DATA_HOME override onto the fj child, each on its
         // own child only.
-        let runner = Arc::new(
+        let runner = Arc::new(with_branch_resolution(
             StubRunner::new()
                 .ok(
                     "yt",
@@ -3500,7 +3586,10 @@ mod tests {
                     &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/n/c/pulls/7"}"#,
                 ),
-        );
+            "origin/main",
+            &["main", "fix/x"],
+            &[("fix/x", "aaa\n")],
+        ));
         let backend = CliBackend::new(runner.clone())
             .with_yt_env(vec![(
                 "YOUTRACK_CLI_CONFIG".to_string(),
@@ -3706,7 +3795,7 @@ mod tests {
     fn agit_pr_create_failure_also_names_repo_host_and_cause() {
         // CLAUDE-194: the AGit create path is the sibling of the branch path and
         // gets the same restatement; the repo is read from `origin` on failure.
-        let b = CliBackend::new(Arc::new(
+        let b = CliBackend::new(Arc::new(with_branch_resolution(
             StubRunner::new()
                 .fail(
                     "fj",
@@ -3719,7 +3808,10 @@ mod tests {
                     &["remote", "get-url", "origin"],
                     "https://dev.a8n.run/contoso/gadgets.git",
                 ),
-        ));
+            "origin/main",
+            &["main", "fix/x"],
+            &[("fix/x", "aaa\n")],
+        )));
         let err = b
             .create_pr(Path::new("/tmp/wd"), "dev.a8n.run", PrStrategy::Agit)
             .unwrap_err()
