@@ -244,6 +244,35 @@ and `regather_interval_secs` (default `60`, must be `>= 1`). Both apply on the n
 > `claude-run run <action>` path still takes it as a cross-process guard; running standalone `run` for an action the
 > daemon also schedules is unsupported concurrent use.
 
+## Scheduled repository audits (CLAUDE-214, CLAUDE-215)
+
+Two actions share `kind: youtrack` and partition the queued issues between them:
+
+- `actions/youtrack.yml` works code issues. Query: `-Resolved AI Agent: Queued project: -AUD`.
+- `actions/audit-run.yml` works read-only repository audits. Query: `-Resolved AI Agent: Queued project: AUD`.
+
+The split exists because the handler resolves a job's repository from the triggering issue's project VCS processor, one
+project to one repo, and an audit writes its deliverable into a **different** repo from the one it reads. Audit issues
+live in the `AUD` project, whose processor points at the audits repo (e.g. `owner/audits`), so the handler clones the audits repo into the
+job workdir and finalize opens the pull request there; the agent clones the audited repo read-only to a path outside the
+workdir and never writes to it. An audit issue picked up by the code-issue action would clone the audited repo and open
+a pull request against it, which is why the exclusion is not optional: both actions poll on the same interval, so
+without it the winner is a race. Note the query syntax - YouTrack rejects `-project: AUD` with a parse error, so the
+negation sits on the value (`project: -AUD`).
+
+`audit-run.yml` carries a full-replacement prompt (CLAUDE-125) rather than the built-in one, to permit exactly three
+tracker writes the default prompt forbids outright: the run-summary comment on the parent issue, a `## Result` block on
+the run's own Epic description, and the standing table on the anchor issue. Everything else stays banned, **including
+issue creation**: an unattended run proposes findings in its report and a human asks for the filing separately. `AI
+Agent` and `State` remain the runner's alone, exactly as for the code-issue action. The procedure itself (audit phases,
+the coverage and carry-forward ledgers, the per-target cap) lives in the audits repo under `prompts/`, not in this
+prompt, so it changes by pull request there.
+
+The dependency gate (CLAUDE-161) is left enabled, which is what sequences a daily rotation: the workflow files one
+parent plus one Epic per target and queues all of them, and `parent for` keeps the parent blocked until every Epic
+resolves, so the run summary has something to summarize. `concurrency.max_parallel: 1` keeps one audit in flight at a
+time; per-target caps and the coverage ledger, not serialization, are what keep a rotation affordable.
+
 ## Self-update (release trains)
 
 `claude-run version {show,check,update}` self-updates the binary from the Forgejo Generic Package registry. CI publishes

@@ -71,7 +71,12 @@ native:
   youtrack:
     # --query value the handler passes to `yt list`. Starts with `-Resolved`, which the handler sends as
     # `--query=<value>` so it is not mistaken for a flag.
-    query: "-Resolved AI Agent: Queued"
+    #
+    # `project: -AUD` excludes audit issues (CLAUDE-215): they are picked up by `audit-run.yml`, which clones the
+    # audits repo rather than the audited one, so a match here would clone the wrong repo and open a pull request
+    # against it. Both actions poll on the same interval, so without the exclusion the winner is a race. The negation
+    # goes on the VALUE: YouTrack rejects `-project: AUD` with a parse error.
+    query: "-Resolved AI Agent: Queued project: -AUD"
     custom_field: "AI Agent"
     # base_url / token_ref (CLAUDE-26): omitted here, so the host-configured yt CLI is used. To inject a token, set
     # base_url plus token_ref: <secret-name>.
