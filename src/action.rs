@@ -1298,7 +1298,13 @@ native:
         let Some(NativeConfig::Youtrack(cfg)) = &action.native else {
             panic!("expected youtrack native config");
         };
-        assert_eq!(cfg.youtrack.query, "-Resolved AI Agent: Queued");
+        // CLAUDE-215: the shipped query excludes the audit project, which
+        // `audit-run.yml` owns. It therefore differs from `default_query()`,
+        // which stays site-agnostic.
+        assert_eq!(
+            cfg.youtrack.query,
+            "-Resolved AI Agent: Queued project: -AUD"
+        );
         assert_eq!(cfg.youtrack.custom_field, "AI Agent");
         // Generic blocks stay on the Action, not in the native config.
         assert_eq!(action.workdir_base.as_deref(), Some("~/workspace"));
@@ -1309,6 +1315,101 @@ native:
         let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
         assert_eq!(reloaded.action.native, action.native);
         assert_eq!(reloaded.action.kind, action.kind);
+    }
+
+    /// The shipped `actions/audit-run.yml` (CLAUDE-214): a second youtrack-kind
+    /// action whose only structural difference is the `AUD` query and the
+    /// full-replacement prompt that permits the three audit tracker writes.
+    #[test]
+    fn shipped_audit_run_action_is_native_and_round_trips() {
+        const SHIPPED: &str = include_str!("../actions/audit-run.yml");
+        let loaded = validate_str(SHIPPED, "actions/audit-run.yml").expect("shipped action valid");
+        let action = loaded.action;
+
+        assert_eq!(action.name, "audit-run");
+        assert_eq!(action.kind, ActionKind::Youtrack);
+        // Config only: no script-bearing fields on a native action.
+        assert!(action.input.is_none());
+        assert!(action.filter.is_none());
+        assert!(action.pre.is_empty());
+        assert!(action.prompt.is_none());
+        assert!(action.post.is_empty());
+
+        let Some(NativeConfig::Youtrack(cfg)) = &action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert_eq!(
+            cfg.youtrack.query,
+            "-Resolved AI Agent: Queued project: AUD"
+        );
+        // The prompt override is the reason this action exists (CLAUDE-125).
+        let prompt = cfg
+            .youtrack
+            .prompt
+            .as_deref()
+            .expect("audit action carries a prompt override");
+        assert!(prompt.contains("{{key}}"));
+        assert!(prompt.contains("{{workdir}}"));
+        assert!(prompt.contains("{{needs_review_marker}}"));
+        assert!(prompt.contains("{{skip_attempt_marker}}"));
+        // Exactly three tracker writes are permitted; creation stays banned.
+        assert!(prompt.contains("yt issue add-comment"));
+        assert!(prompt.contains("no `yt issue create`"));
+        assert!(prompt.contains("no `yt issue set-field`"));
+        assert!(prompt.contains("no `yt issue set-state`"));
+        // The parent gate is what makes the daily summary run last, so it must
+        // not be disabled here.
+        assert!(cfg.youtrack.dependencies.enabled);
+        // One audit at a time: the cost-control property.
+        assert_eq!(action.concurrency.max_parallel, 1);
+
+        let reserialized = serde_yaml::to_string(&action).unwrap();
+        let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
+        assert_eq!(reloaded.action.native, action.native);
+        assert_eq!(reloaded.action.kind, action.kind);
+    }
+
+    /// CLAUDE-215: the two youtrack-kind actions partition the queued issues
+    /// rather than racing for them. Both poll on the same interval, so an issue
+    /// matching both would be cloned by whichever action polled first, and for
+    /// an audit issue that means the wrong repo and a pull request against it.
+    ///
+    /// The queries execute server-side, so this asserts the static half: the
+    /// default action excludes `AUD` and the audit action selects only `AUD`.
+    /// Note the syntax - YouTrack rejects `-project: AUD` as a parse error, so
+    /// the negation has to sit on the value (`project: -AUD`).
+    #[test]
+    fn shipped_youtrack_actions_partition_audit_issues() {
+        fn query_of(raw: &str, path: &str) -> String {
+            let loaded = validate_str(raw, path).expect("shipped action valid");
+            let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+                panic!("expected youtrack native config in {path}");
+            };
+            cfg.youtrack.query
+        }
+
+        let default_query = query_of(
+            include_str!("../actions/youtrack.yml"),
+            "actions/youtrack.yml",
+        );
+        let audit_query = query_of(
+            include_str!("../actions/audit-run.yml"),
+            "actions/audit-run.yml",
+        );
+
+        assert!(
+            default_query.contains("project: -AUD"),
+            "default action must exclude the audit project, got {default_query:?}"
+        );
+        assert!(
+            !default_query.contains("-project:"),
+            "`-project:` is a YouTrack parse error; negate the value instead, got {default_query:?}"
+        );
+        assert!(
+            audit_query.contains("project: AUD") && !audit_query.contains("project: -AUD"),
+            "audit action must select only the audit project, got {audit_query:?}"
+        );
+        assert_ne!(default_query, audit_query);
     }
 
     #[test]
