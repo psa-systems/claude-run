@@ -16,8 +16,8 @@ use serde_json::json;
 use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
 use claude_run::{
-    action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db, exit,
-    jsonfmt, lock, migrate, paint, secrets, settings, snippet, state, update,
+    access, action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db,
+    exit, jsonfmt, lock, migrate, paint, secrets, settings, snippet, state, update,
 };
 
 /// `--color` choices. Maps to both `anstream` (our own output) and clap's
@@ -108,6 +108,11 @@ enum Cmd {
     /// Action management subcommands.
     #[command(subcommand)]
     Action(ActionCmd),
+    /// Check the runner's access: every credential's identity, and whether a
+    /// named repo / YouTrack project is workable by the credential that would
+    /// actually be used for it. Read-only.
+    #[command(subcommand)]
+    Access(AccessCmd),
     /// Manage encrypted secrets (the web auth token, action `token_ref`s).
     /// Operates directly on the local state DB and the age key file
     /// (`CLAUDE_RUN_SECRETS_KEY_FILE`); no daemon required.
@@ -174,6 +179,29 @@ enum ActionCmd {
     /// (paused/counters/ledger). Run history is kept. Refuses with
     /// `exit::CONFLICT` when a run for the action is in flight.
     Delete { name: String },
+}
+
+#[derive(Subcommand)]
+enum AccessCmd {
+    /// Run the access check and print the typed report as JSON. With no target
+    /// it checks every enabled `youtrack` action's credentials, the projects its
+    /// query reaches, and the repos those projects bind to. Exits non-zero when
+    /// any probe fails, so it works as a deployment smoke test.
+    Check {
+        /// Repo to probe, as `owner/name`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Forge host for `--repo` (e.g. dev.a8n.run). Defaults to the host the
+        /// project's VCS binding resolves to.
+        #[arg(long)]
+        host: Option<String>,
+        /// YouTrack project short name to probe (e.g. CLAUDE).
+        #[arg(long)]
+        project: Option<String>,
+        /// Restrict to actions referencing this secret name.
+        #[arg(long)]
+        secret: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -388,6 +416,7 @@ async fn real_main(
         Cmd::Resume { action } => resume(action, &paths).await,
         Cmd::Status => status(&paths).await,
         Cmd::Action(c) => action_cmd(c, &paths, &actions_dir).await,
+        Cmd::Access(c) => access_cmd(c, &paths).await,
         Cmd::Secret(c) => secret_cmd(c, &paths).await,
         Cmd::Migrate { from } => {
             let pool = db::open(&paths.state_db()).await?;
@@ -856,6 +885,48 @@ async fn action_cmd(
     Ok(exit::OK)
 }
 
+/// CLAUDE-216: `claude-run access check`. Delegates to the daemon over the unix
+/// socket when it is up (so the check runs as the daemon's identity, with its
+/// PATH and env) and runs the same service directly against the DB when it is
+/// not. Prints the typed report as JSON either way, and exits `CONFIG_ERROR`
+/// when any probe failed so it is usable as a deployment smoke test.
+async fn access_cmd(cmd: AccessCmd, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+    let AccessCmd::Check {
+        repo,
+        host,
+        project,
+        secret,
+    } = cmd;
+    let req = access::AccessRequest {
+        secret,
+        host,
+        repo,
+        project,
+    }
+    .normalized();
+
+    let sock = daemon::daemon_socket_path(paths);
+    let report: access::AccessReport = if DaemonClient::is_reachable(&sock) {
+        let c = DaemonClient::new(&sock);
+        c.post("/access/check", Some(&serde_json::to_value(&req)?))
+            .await?
+    } else {
+        let pool = db::open(&paths.state_db()).await?;
+        match access::check(&pool, &api::access_cred_base(paths), &req).await {
+            Ok(r) => r,
+            Err(e) => access::AccessReport::from_error(&e),
+        }
+    };
+
+    jsonfmt::print_json(&report)?;
+    if report.ok() {
+        Ok(exit::OK)
+    } else {
+        paint::error(&format!("{} access probe(s) failed", report.failures()));
+        Ok(exit::CONFIG_ERROR)
+    }
+}
+
 async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     let pool = db::open(&paths.state_db()).await?;
     match cmd {
@@ -958,6 +1029,39 @@ mod tests {
                 .expect("global flag accepted after the subcommand too");
             assert_eq!(cli_eq.color, expected, "--color={arg}");
         }
+    }
+
+    /// CLAUDE-216: `access check` parses its targets, and each flag is optional
+    /// (no flags at all is the aggregate check).
+    #[test]
+    fn access_check_parses_its_targets() {
+        let cli = Cli::try_parse_from([
+            "claude-run",
+            "access",
+            "check",
+            "--repo",
+            "contoso/claude-run",
+            "--host",
+            "dev.a8n.run",
+            "--project",
+            "CLAUDE",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Access(AccessCmd::Check {
+                repo,
+                host,
+                project,
+                secret,
+            }) => {
+                assert_eq!(repo.as_deref(), Some("contoso/claude-run"));
+                assert_eq!(host.as_deref(), Some("dev.a8n.run"));
+                assert_eq!(project.as_deref(), Some("CLAUDE"));
+                assert_eq!(secret, None);
+            }
+            _ => panic!("expected access check"),
+        }
+        assert!(Cli::try_parse_from(["claude-run", "access", "check"]).is_ok());
     }
 
     #[test]

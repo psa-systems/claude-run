@@ -1,0 +1,41 @@
+{# CLAUDE-216: the access-check result table, swapped in by HTMX and also
+   rendered inline by the page. A row names the secret, the probe, and the
+   failure text; a secret VALUE never reaches this template. #}
+{% if let Some(rep) = report %}
+  {% if rep.rows.is_empty() %}
+  <p class="dim">Nothing to check.</p>
+  {% else %}
+  <div class="card" style="margin-bottom: 12px; border-color: {% if rep.ok() %}var(--ok){% else %}var(--bad){% endif %};">
+    <strong style="color: {% if rep.ok() %}var(--ok){% else %}var(--bad){% endif %};">
+      {% if rep.ok() %}All {{ rep.rows.len() }} probes passed{% else %}{{ rep.failures() }} of {{ rep.rows.len() }} probes failed{% endif %}
+    </strong>
+    <div class="dim" style="margin-top: 6px;">Read-only probes: a row marked
+    <span class="badge warn">unverifiable</span> names a capability only a write could prove,
+    and is deliberately not reported as a pass.</div>
+  </div>
+  <table>
+    <thead>
+      <tr><th>Target</th><th>Check</th><th>Credential</th><th>Probe</th><th>Result</th><th>Detail</th></tr>
+    </thead>
+    <tbody>
+      {% for row in rep.rows %}
+      <tr>
+        <td class="mono">{{ row.target }}</td>
+        <td class="dim">{{ row.kind.as_str() }}</td>
+        <td class="mono">{{ row.credential }}</td>
+        <td class="mono dim">{{ row.probe }}</td>
+        <td><span class="badge {{ row.outcome.badge() }}">{{ row.outcome.as_str() }}</span></td>
+        <td>
+          {{ row.detail }}
+          {% if let Some(rem) = row.remediation %}
+          <div class="dim" style="margin-top: 4px;">{{ rem }}</div>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+{% else %}
+<p class="dim">No check run yet.</p>
+{% endif %}

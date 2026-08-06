@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Access - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><span class="current">Access</span>{% endblock %}
+{% block main %}
+
+<h2>Access check</h2>
+
+<div class="card" style="margin-bottom: 16px;">
+  <span class="dim">Verifies, on demand and without queueing a job, every configured
+  credential's identity and whether a named repo or YouTrack project is workable by the
+  credential that would actually be used for it. Credentials are materialized exactly as a
+  job materializes them and scrubbed straight after; probes are read-only, and no secret
+  value is ever read back or shown.</span>
+</div>
+
+<div class="row-actions" style="align-items: flex-start; gap: 24px; flex-wrap: wrap;">
+  <form hx-post="/access/check" hx-target="#access-results" hx-swap="innerHTML"
+        hx-disabled-elt="find button" class="row-actions" style="align-items: center;">
+    <input type="text" name="repo" placeholder="owner/name" value="{{ form.repo_value() }}"
+           style="background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px;">
+    <input type="text" name="host" placeholder="forge host (optional)" value="{{ form.host_value() }}"
+           style="background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px;">
+    <input type="text" name="project" placeholder="project key (e.g. CLAUDE)" value="{{ form.project_value() }}"
+           style="background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: var(--mono); font-size: 13px;">
+    <button class="btn" type="submit">Check</button>
+  </form>
+
+  <form hx-post="/access/check" hx-target="#access-results" hx-swap="innerHTML"
+        hx-disabled-elt="find button">
+    <button class="btn" type="submit">Check all</button>
+  </form>
+</div>
+
+<h2>Results</h2>
+<div id="access-results">
+{% include "access_rows.html" %}
+</div>
+
+{% endblock %}
