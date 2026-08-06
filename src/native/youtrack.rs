@@ -25,6 +25,9 @@
 //! post    -> finalize state machine, runs on EVERY path (success, claude
 //!            error, timeout, pre/post failure, cancel):
 //!              blocker  (.claude-run-needs-review) -> AI Agent=Needs Review, no PR
+//!              no-code  (.claude-run-no-code-change, CLAUDE-214) -> AI Agent=
+//!                       states.no_code (default Done), marker text commented,
+//!                       no PR
 //!              success  -> Forge::create_pr, AI Agent=Code Review
 //!                          (PR-create failure -> AI Agent=Failed)
 //!              failure  -> AI Agent=Failed, no PR
@@ -33,8 +36,12 @@
 //! State is never set to Done here; it stays In Progress until a human merges
 //! the PR. Every external mutation (PR, comment, AI Agent transition) happens
 //! in [`finalize`], after claude exits, gated on the outcome - matching the
-//! merged CLAUDE-24 runner-creates-PR contract. The agent itself does only
-//! local engineering work (no push, no PR, no YouTrack write).
+//! merged CLAUDE-24 runner-creates-PR contract. The agent itself does local
+//! engineering work only (no push, no PR) and, since CLAUDE-214, the bounded
+//! tracker writes [`default_youtrack_prompt`] permits: creating issues in the
+//! configured `write_projects`, updating / commenting / linking the issues it
+//! created, and one `subtask of` link onto the triggering issue. `AI Agent` on
+//! any issue, and every other write to the triggering issue, stay the runner's.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -61,6 +68,12 @@ use crate::workdir;
 const NEEDS_REVIEW_MARKER: &str = ".claude-run-needs-review";
 /// Workdir marker that suppresses attempt counting for this run.
 const SKIP_ATTEMPT_MARKER: &str = ".claude-run-skip-attempt";
+/// Workdir marker the agent writes when it deliberately finishes a run that
+/// produces tracker output rather than code (CLAUDE-214). Its contents are the
+/// human-facing summary, posted verbatim as the issue comment. Never an escape
+/// hatch for a code task the agent could not finish: that stays
+/// [`NEEDS_REVIEW_MARKER`].
+const NO_CODE_MARKER: &str = ".claude-run-no-code-change";
 
 /// A typed YouTrack job: an eligible issue plus the repo resolved from its
 /// project's enabled VCS integration.
@@ -1301,11 +1314,17 @@ fn clone_repo(clone_url: &str, workdir: &Path) -> Result<()> {
 }
 
 /// The built-in YouTrack agent prompt as a placeholder template (CLAUDE-125).
-/// Returns the default instruction text - local-only work: no push, no PR, no
-/// YouTrack write, matching the merged CLAUDE-24 prompt from the scripted
-/// `actions/youtrack.yml` - with the documented `{{...}}` placeholders that
-/// [`render_prompt_template`] substitutes per job. Exposed crate-wide so the web
-/// form can prefill the prompt editor with the live default.
+/// Returns the default instruction text - local-only code work (no push, no PR)
+/// plus the bounded tracker writes CLAUDE-214 permits - with the documented
+/// `{{...}}` placeholders that [`render_prompt_template`] substitutes per job.
+/// Exposed crate-wide so the web form can prefill the prompt editor with the
+/// live default.
+///
+/// CLAUDE-214 replaced the blanket YouTrack ban with an explicit permission
+/// block, because the `No orphan notes` directive requires a run that discovers
+/// a gap to file it as a tracked, linked issue rather than mention it in prose.
+/// The ban that stays absolute is `AI Agent` on ANY issue: setting it queues
+/// work, so an agent that could set it could spawn runs.
 pub(crate) fn default_youtrack_prompt() -> String {
     [
         "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.",
@@ -1314,7 +1333,19 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "Repo: {{clone_url}}",
         "Working directory: {{workdir}} - the repo is already cloned here, you are inside it.",
         "",
-        "Do ONLY local engineering work. Do NOT push, do NOT open a PR, and do NOT touch YouTrack (no 'yt issue set-field', no 'yt issue set-state', no comments). The runner finalizes the issue after you exit: it opens the PR from your local commits and sets the AI Agent field based on the run outcome.",
+        "Do ONLY local engineering work on code: do NOT push and do NOT open a PR. The runner finalizes the issue after you exit: it opens the PR from your local commits and sets the AI Agent field based on the run outcome.",
+        "",
+        "YouTrack writes. You MAY do exactly the following, and nothing else:",
+        "- Read anything the token can see, across every project: 'yt list --query=...', 'yt search', 'yt issue inspect <KEY>', 'yt project list' / 'yt project show' / 'yt project vcs list'.",
+        "- Create issues with 'yt issue create', but ONLY in these projects: {{write_projects}}. This is how the CLAUDE.md 'No orphan notes' rule is satisfied: a gap, deferred item, or descoped piece you find mid-task becomes its own tracked issue instead of a sentence in the PR body that nobody owns.",
+        "- Update, comment on, and link ONLY the issues you created during THIS run: 'yt issue update', 'yt issue comment', 'yt issue link'.",
+        "- On the triggering issue {{key}}, exactly ONE write: 'yt issue link <new-issue> \"subtask of\" {{key}}', hanging an issue you created off the issue that asked for it. Nothing else on {{key}}.",
+        "",
+        "HARD BANS on YouTrack, no exceptions:",
+        "- NEVER set the 'AI Agent' field on ANY issue, including issues you created yourself: no 'yt issue set-field ... \"AI Agent\" ...', and no equivalent through 'yt issue update' or 'yt issue apply'. Setting that field queues an agent run, so an agent that can set it can spawn runs. It belongs to the runner alone.",
+        "- No other write to {{key}}: no description or summary edit, no comment, no tag, no assignee change, no 'yt issue set-state', no 'yt issue set-field'. The runner owns the outcome comment and the fields on {{key}}, and its State stays In Progress until a human merges the PR.",
+        "- No write of any kind to an issue you did not create during this run.",
+        "- Never run 'yt issue delete' anywhere.",
         "",
         "Steps:",
         "1. Run 'yt issue inspect {{key}}' to read the full description and acceptance criteria.",
@@ -1324,7 +1355,14 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "5. Commit with a message that references the issue on its own line as '#{{key}}' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
         "6. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop.",
         "7. Verify completion against the acceptance criteria before stopping. Re-read each criterion and state the concrete evidence that it is met: the file:line you changed, the command and its output, or the test that now passes. For any criterion that REMOVES or DELETES something, prove absence with a search (grep for the symbol or file) and confirm zero hits - never assert a removal you have not grep-verified - and add or extend a test or CI guard that fails if it reappears, so the removal is enforced mechanically. A green check suite is necessary but NOT sufficient: green checks do not prove the acceptance criteria are met. If you cannot produce objective evidence for EVERY criterion, you have NOT completed the issue - take the blocker path below instead of stopping as done.",
-        "8. Stop. Do not push, do not open a PR, do not touch YouTrack. The runner opens the PR from your commits and transitions the issue.",
+        "8. Stop. Do not push and do not open a PR; beyond the YouTrack writes permitted above, do not touch the tracker. The runner opens the PR from your commits and transitions the issue.",
+        "",
+        "If the issue asks for tracker output rather than code - a survey across repos, a report, issues to file - and you therefore finish DELIBERATELY with no commits:",
+        "  a. Do the permitted YouTrack writes above: create the issue(s), and link each one as a subtask of {{key}}.",
+        "  b. Write the human-facing summary of what you produced, naming every issue you created, to this file (the file contents are posted verbatim as the issue comment by the runner):",
+        "       {{workdir}}/{{no_code_marker}}",
+        "  c. Do NOT write the blocker markers below; this is a successful outcome, not a parked one. The runner skips the PR entirely, posts your summary, and sets the AI Agent field to its no-code label.",
+        "  This path is ONLY for a run whose deliverable is tracker output rather than code. It is NEVER an escape hatch for a code task you could not finish - that is the blocker path below. A run that was supposed to change code and leaves no commits without this marker is failed by the runner, which is intended.",
         "",
         "If you CANNOT safely complete the issue - missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue, or you cannot produce objective evidence that every acceptance criterion is met:",
         "  a. Do NOT change any code.",
@@ -1332,7 +1370,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "       {{workdir}}/{{needs_review_marker}}",
         "  c. Touch this marker file so the runner does NOT count this attempt toward the per-key cap (the job is parked pending human input, not failed):",
         "       {{workdir}}/{{skip_attempt_marker}}",
-        "  d. Do NOT touch YouTrack yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.",
+        "  d. Do NOT set any YouTrack field yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.",
         "",
         "When you finish, summarize what you did as an acceptance-criteria checklist: one line per criterion with the concrete evidence that proves it is met. Do not include a PR URL - the runner creates the PR.",
     ]
@@ -1345,21 +1383,40 @@ pub(crate) fn default_youtrack_prompt() -> String {
 /// are substituted with this job's values.
 fn build_prompt(src: &YoutrackSource, job: &YoutrackJob, workdir: &Path) -> String {
     let template = src.prompt.clone().unwrap_or_else(default_youtrack_prompt);
-    render_prompt_template(&template, job, workdir)
+    render_prompt_template(&template, job, workdir, &write_projects(src, job))
+}
+
+/// The project list `{{write_projects}}` renders to (CLAUDE-214): the configured
+/// `native.youtrack.write_projects`, or the triggering issue's own project when
+/// that list is empty, so filing a deferred item works with no site-specific
+/// configuration and none is baked into the binary.
+fn write_projects(src: &YoutrackSource, job: &YoutrackJob) -> String {
+    if src.write_projects.is_empty() {
+        project_key(&job.key)
+    } else {
+        src.write_projects.join(", ")
+    }
 }
 
 /// Substitute the documented `{{...}}` placeholders in `template` with this
 /// job's values. An unknown `{{name}}` is left literal and logged at warn
 /// (forgiving per CLAUDE-125), as is an unterminated `{{`.
-fn render_prompt_template(template: &str, job: &YoutrackJob, workdir: &Path) -> String {
+fn render_prompt_template(
+    template: &str,
+    job: &YoutrackJob,
+    workdir: &Path,
+    write_projects: &str,
+) -> String {
     let workdir = workdir.display().to_string();
-    let vars: [(&str, &str); 6] = [
+    let vars: [(&str, &str); 8] = [
         ("key", job.key.as_str()),
         ("summary", job.summary.as_str()),
         ("clone_url", job.clone_url.as_str()),
         ("workdir", workdir.as_str()),
         ("needs_review_marker", NEEDS_REVIEW_MARKER),
         ("skip_attempt_marker", SKIP_ATTEMPT_MARKER),
+        ("no_code_marker", NO_CODE_MARKER),
+        ("write_projects", write_projects),
     ];
 
     let mut out = String::with_capacity(template.len());
@@ -1396,6 +1453,11 @@ fn render_prompt_template(template: &str, job: &YoutrackJob, workdir: &Path) -> 
 enum Finalized {
     /// Blocker: agent parked the job; AI Agent=Needs Review, no PR.
     NeedsReview,
+    /// CLAUDE-214: a successful run that deliberately produced tracker output
+    /// rather than code and left `.claude-run-no-code-change`. No PR, the marker
+    /// text is commented, AI Agent=`states.no_code` (default the `done` label),
+    /// State untouched.
+    NoCodeChange,
     /// Success: PR opened; AI Agent=Code Review.
     CodeReview { pr_url: String },
     /// CLAUDE-126: automerge succeeded - the PR's checks went green, the branch
@@ -1416,6 +1478,7 @@ impl Finalized {
     fn as_str(&self) -> &'static str {
         match self {
             Finalized::NeedsReview => "Needs Review",
+            Finalized::NoCodeChange => "No Code Change",
             Finalized::CodeReview { .. } => "Code Review",
             Finalized::Merged { .. } => "Merged",
             Finalized::Failed => "Failed",
@@ -1443,6 +1506,7 @@ fn finalize(
 ) -> Result<Finalized> {
     let needs_review = workdir.join(NEEDS_REVIEW_MARKER);
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
+    let no_code = workdir.join(NO_CODE_MARKER);
 
     if needs_review.exists() {
         // Blocker: ensure the skip marker is present so this attempt is not
@@ -1453,6 +1517,19 @@ fn finalize(
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
         comment_then_field(backend, src, &job.key, &reason, &src.states.needs_review)?;
         Ok(Finalized::NeedsReview)
+    } else if claude_result.ok && no_code.exists() {
+        // CLAUDE-214: the run deliberately produced tracker output rather than
+        // code, so there are no commits and nothing to open a PR from. Skip the
+        // forge entirely, post the marker text verbatim, and finish on the
+        // no-code label. State is left alone, so the issue stays In Progress
+        // until a human closes it. Without the marker a zero-commit run keeps
+        // the CLAUDE-212 behavior below: the ahead check fails and AI Agent goes
+        // to Failed.
+        let summary = std::fs::read_to_string(&no_code)?.trim().to_string();
+        let label = src.states.no_code_label().to_string();
+        comment_then_field(backend, src, &job.key, &summary, &label)?;
+        info!(key = %job.key, %label, "no-code-change marker present; skipping PR");
+        Ok(Finalized::NoCodeChange)
     } else if claude_result.ok {
         // Success: open the PR from the agent's local commits via the resolved
         // Forge (CLAUDE-50: `fj` agit+autofill for Forgejo hosts, the GitHub
@@ -2218,11 +2295,11 @@ mod tests {
 
     #[test]
     fn render_substitutes_all_documented_placeholders() {
-        let t = "{{key}}|{{summary}}|{{clone_url}}|{{workdir}}|{{needs_review_marker}}|{{skip_attempt_marker}}";
-        let p = render_prompt_template(t, &job(), std::path::Path::new("/wd"));
+        let t = "{{key}}|{{summary}}|{{clone_url}}|{{workdir}}|{{needs_review_marker}}|{{skip_attempt_marker}}|{{no_code_marker}}|{{write_projects}}";
+        let p = render_prompt_template(t, &job(), std::path::Path::new("/wd"), "MK");
         assert_eq!(
             p,
-            "MK-16|Do the thing|https://dev.a8n.run/contoso/claude-run.git|/wd|.claude-run-needs-review|.claude-run-skip-attempt"
+            "MK-16|Do the thing|https://dev.a8n.run/contoso/claude-run.git|/wd|.claude-run-needs-review|.claude-run-skip-attempt|.claude-run-no-code-change|MK"
         );
     }
 
@@ -2234,8 +2311,86 @@ mod tests {
             "{{key}} {{bogus}} {{oops",
             &job(),
             std::path::Path::new("/wd"),
+            "MK",
         );
         assert_eq!(p, "MK-16 {{bogus}} {{oops");
+    }
+
+    /// CLAUDE-214: an empty `write_projects` resolves to the triggering issue's
+    /// own project, so filing a deferred item works with no site-specific
+    /// configuration; a configured list replaces it verbatim.
+    #[test]
+    fn write_projects_defaults_to_the_issue_project() {
+        assert!(src().write_projects.is_empty(), "the default is empty");
+        assert_eq!(write_projects(&src(), &job()), "MK");
+
+        let mut s = src();
+        s.write_projects = vec!["AUD".into(), "DEV".into()];
+        assert_eq!(write_projects(&s, &job()), "AUD, DEV");
+    }
+
+    /// CLAUDE-214: the built-in prompt permits the bounded tracker writes the
+    /// `No orphan notes` directive needs, and states the bans that make them
+    /// safe. The `AI Agent` ban is the load-bearing one: an agent that could set
+    /// it could queue further agent runs.
+    #[test]
+    fn build_prompt_default_permits_bounded_tracker_writes() {
+        let wd = std::path::Path::new("/tmp/wd");
+        let p = build_prompt(&src(), &job(), wd);
+
+        // Permitted: read across projects, create, then update/comment/link what
+        // this run created.
+        assert!(p.contains("yt issue create"), "{p}");
+        assert!(p.contains("yt issue inspect <KEY>"), "{p}");
+        assert!(
+            p.contains("ONLY the issues you created during THIS run"),
+            "{p}"
+        );
+        assert!(p.contains("No orphan notes"), "{p}");
+        // The create scope renders from `{{write_projects}}`, defaulting to the
+        // triggering issue's own project.
+        assert!(
+            p.contains("ONLY in these projects: MK."),
+            "create scope must render the project list: {p}"
+        );
+        // The single permitted write to the triggering issue.
+        assert!(
+            p.contains("yt issue link <new-issue> \"subtask of\" MK-16"),
+            "{p}"
+        );
+
+        // Banned, including on issues the run created.
+        assert!(
+            p.contains("NEVER set the 'AI Agent' field on ANY issue, including issues you created yourself"),
+            "the AI Agent ban must be present verbatim: {p}"
+        );
+        assert!(p.contains("No other write to MK-16"), "{p}");
+        assert!(
+            p.contains("No write of any kind to an issue you did not create during this run"),
+            "{p}"
+        );
+        assert!(p.contains("Never run 'yt issue delete' anywhere"), "{p}");
+        // The code contract is unchanged.
+        assert!(p.contains("do NOT push and do NOT open a PR"), "{p}");
+        // The blanket ban this replaced must not creep back: it contradicts the
+        // `No orphan notes` directive, which is what drove the relaxation.
+        assert!(
+            !p.contains("do NOT touch YouTrack"),
+            "the blanket YouTrack ban must stay removed: {p}"
+        );
+    }
+
+    /// CLAUDE-214: the no-code path is advertised in the prompt, with the marker
+    /// path rendered, and is fenced off from the blocker path.
+    #[test]
+    fn build_prompt_default_documents_the_no_code_path() {
+        let p = build_prompt(&src(), &job(), std::path::Path::new("/tmp/wd"));
+        assert!(p.contains("/tmp/wd/.claude-run-no-code-change"), "{p}");
+        assert!(
+            p.contains("NEVER an escape hatch for a code task you could not finish"),
+            "{p}"
+        );
+        assert!(!p.contains("{{"), "unresolved placeholder:\n{p}");
     }
 
     #[test]
@@ -2738,6 +2893,133 @@ mod tests {
         );
         // No PR on the park path.
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    /// CLAUDE-214: a successful run that deliberately produced tracker output
+    /// rather than code leaves `.claude-run-no-code-change`. Finalize skips the
+    /// PR entirely, posts the marker text verbatim as the issue comment, and
+    /// sets AI Agent to the no-code label (defaulting to the `done` label).
+    /// `State` is never touched, so the issue stays In Progress for a human.
+    #[test]
+    fn finalize_no_code_marker_skips_pr_and_sets_no_code_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        std::fs::write(wd.join(NO_CODE_MARKER), "Filed MK-99 for the gap.\n").unwrap();
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["issue", "set-field", "MK-16", "AI Agent", "Done"],
+            "",
+        ));
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            wd,
+            &ok_result(),
+            PrStrategy::Branch,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::NoCodeChange);
+
+        let calls = runner.calls.lock().unwrap();
+        // No forge call at all, and no git branch resolution ahead of one.
+        assert!(
+            !calls.iter().any(|c| c.starts_with("fj ")),
+            "no PR may be opened for a no-code run: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git ")),
+            "the PR path is skipped entirely: {calls:?}"
+        );
+        // The marker text is the comment, verbatim.
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .expect("summary comment posted");
+        assert!(comment.contains("Filed MK-99 for the gap."), "{comment}");
+        // AI Agent goes to the no-code label; State is left alone.
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Done"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("set-state")),
+            "State must stay In Progress: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("AI Agent Failed")),
+            "a deliberate no-code run must not be Failed: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-214: `states.no_code` is configurable per action and overrides the
+    /// `done` default.
+    #[test]
+    fn finalize_no_code_marker_honours_configured_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        std::fs::write(wd.join(NO_CODE_MARKER), "report only").unwrap();
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["issue", "set-field", "MK-16", "AI Agent", "Reported"],
+            "",
+        ));
+        let backend = CliBackend::new(runner.clone());
+        let mut s = src();
+        s.states.no_code = Some("Reported".into());
+        let res = finalize(
+            &backend,
+            &backend,
+            &s,
+            &job(),
+            wd,
+            &ok_result(),
+            PrStrategy::Branch,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::NoCodeChange);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Reported"),
+            "{calls:?}"
+        );
+    }
+
+    /// CLAUDE-214: the blocker marker still wins over the no-code marker. A run
+    /// that parks itself must land on Needs Review, never on the success-shaped
+    /// no-code outcome, even if it wrote both files.
+    #[test]
+    fn finalize_needs_review_wins_over_no_code_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        std::fs::write(wd.join(NEEDS_REVIEW_MARKER), "need a decision on X").unwrap();
+        std::fs::write(wd.join(NO_CODE_MARKER), "filed nothing").unwrap();
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+            "",
+        ));
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            wd,
+            &ok_result(),
+            PrStrategy::Branch,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::NeedsReview);
     }
 
     #[test]
@@ -3334,8 +3616,16 @@ mod tests {
         // Under the AGit strategy this used to open an empty autofilled PR and
         // move the issue to Code Review. The hoisted ahead check now fails the
         // finalize: AI Agent=Failed, no PR link commented, `fj` never invoked.
+        //
+        // CLAUDE-214 must not relax this: only the explicit
+        // `.claude-run-no-code-change` marker buys a zero-commit run a
+        // non-failure outcome, and this run writes no marker.
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
+        assert!(
+            !dir.path().join(NO_CODE_MARKER).exists(),
+            "this regression covers the no-marker case"
+        );
         let runner = Arc::new(
             StubRunner::new()
                 .ok(
