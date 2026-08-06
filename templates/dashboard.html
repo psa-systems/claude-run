@@ -23,6 +23,32 @@
         so the poll does not wipe text selection / scroll / focus. #}
      hx-swap="morph:outerHTML">
 
+{# CLAUDE-216: poll-time access failures. The preflight leaves the affected
+   issues Queued with no field change, so this banner is the only place the
+   operator is told rather than having to go looking. #}
+{% if !access_failures.is_empty() %}
+  <div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
+    <strong style="color: var(--bad);">Access failures in the last 24h</strong>
+    <div class="dim" style="margin-top: 6px;">Issues for these repos are skipped each poll and
+    left Queued. Run an <a href="/access">access check</a> to see which credential and scope
+    is short.</div>
+    <table style="margin-top: 8px;">
+      <thead><tr><th>Action</th><th>Context</th><th>Last seen</th><th>Count</th><th>Message</th></tr></thead>
+      <tbody>
+        {% for f in access_failures %}
+        <tr>
+          <td class="mono">{{ f.action_name }}</td>
+          <td class="mono">{% if let Some(c) = f.context %}{{ c }}{% else %}-{% endif %}</td>
+          <td class="dim">{{ f.last_ts|datetime }}</td>
+          <td class="dim">{{ f.count }}</td>
+          <td>{{ f.message }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
 {% if let Some(g) = global_pause %}
   <h2>Globally paused</h2>
   <div class="card">

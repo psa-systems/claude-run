@@ -450,6 +450,26 @@ impl Forge for GithubForge {
         Ok(())
     }
 
+    /// CLAUDE-216: `gh api user --jq .login`, run with the action's PAT as
+    /// `GH_TOKEN` so the row names the identity `repo_access` just probed with.
+    fn identity(&self, _host: &str) -> Result<String> {
+        let envs: Vec<(&str, &str)> = match &self.token {
+            Some(t) => vec![("GH_TOKEN", t.as_str())],
+            None => Vec::new(),
+        };
+        let args = ["api", "user", "--jq", ".login"];
+        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        if !out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: args.join(" "),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(out.stdout.trim().to_string())
+    }
+
     // The CI-fix-only operations are Forgejo-specific. A GitHub repo never enters
     // the Forgejo-only CI-fix scan (auto-route-by-host), so these are unsupported
     // on the GitHub backend; split the `Forge` trait later if a GitHub CI-fix

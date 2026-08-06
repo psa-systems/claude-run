@@ -15,6 +15,7 @@
 //! See `actions/SCHEMA.md` for the user-facing schema, `README.md` for the
 //! runtime contract.
 
+pub mod access;
 pub mod action;
 pub mod agent_home;
 pub mod api;

@@ -81,6 +81,11 @@ printf %s $token | claude-run secret set web-ui-token
 claude-run secret list
 claude-run secret delete web-ui-token
 
+# Access check (read-only). No target checks every credential, project, and repo the actions reach.
+claude-run access check
+claude-run access check --project CLAUDE
+claude-run access check --repo owner/repo --host forgejo.example.com
+
 # Self-update. `check` reports whether a newer build is published; `update` swaps the binary in place.
 claude-run version                         # print the build-stamped banner (same as `version show`)
 claude-run version check                   # uses the [update].train default (release)
@@ -110,10 +115,61 @@ will want to know about:
   `run_events` row, undeduplicated and paginated (50 per page), filterable by a whitelisted Level / Action / Context /
   message substring and an optional "since boot" bound. `<name>` seeds the Action filter, which can be widened to any
   action or all.
+- **Access** (`/access`, CLAUDE-216) runs the access check on demand: "Check all" probes every enabled `youtrack`
+  action, and the form probes a named repo (`owner/name`, optional host) and/or a YouTrack project key. Results are one
+  row per probe. `/secrets` grows a per-secret **Check** button that lands here with that credential's identity probe
+  already run. See "Access check".
 - **Reports** (`/reports`, CLAUDE-117) is the historical reporting page (spend / runs / time-of-day / day-of-week),
   global by default and narrowable with `action` + `range` query params.
 - **About** (`/about`, CLAUDE-129) shows version + build info and drives the on-demand self-update check / apply (see
   "Self-update").
+
+## Access check (CLAUDE-216)
+
+`/secrets` lists secret NAMES only, so an expired, revoked, or under-scoped token looks exactly like a healthy one, and
+the poll-time repo-access preflight leaves its issues Queued with no field change. The access check answers, on demand
+and without queueing a job, both halves: is each credential still valid, and is a named repo or YouTrack project
+workable by the credential that would actually be used for it.
+
+One service (`src/access.rs`) backs three surfaces, so they cannot drift:
+
+- **Page** `/access` (see "Web UI pages").
+- **API** `POST /api/access/check` with `{"secret"?, "host"?, "repo"?, "project"?}` (an empty body checks everything),
+  returning the typed report as JSON.
+- **CLI** `claude-run access check [--repo owner/name] [--host <host>] [--project <KEY>] [--secret <name>]`, which
+  delegates to the daemon over the unix socket when it is up and runs the same service against the DB when it is not.
+  It prints the report and **exits non-zero when any probe failed**, so it works as a deployment smoke test.
+
+The probes, per enabled `youtrack` action:
+
+| Probe | Command | What it proves |
+|---|---|---|
+| Tracker identity | `yt auth verify` | the token is valid; the row names the authenticated login |
+| Project read | `yt project show <KEY>` | the project is readable by that token |
+| VCS binding | `yt project vcs list <KEY> --enabled-only` | an enabled binding exists, and which host / repo it resolves to |
+| Query | `yt list --query="<action query> project: <KEY>" --top 1` | the action's own query executes under that credential |
+| Forge identity | `fj whoami` (or the GitHub identity read) | which forge account the PR would be opened as |
+| Repo access | `Forge::repo_access` | both scope categories the PR path crosses, the same probe the poll-time preflight runs |
+
+With no target named, the check resolves the projects the action's own query reaches (up to 10; a larger set says so in
+its own row rather than truncating silently) and the repos those projects bind to. Credentials are materialized exactly
+as a job materializes them (`JobCredentials::materialize`, keyed by the resolved host) and scrubbed when the probe ends,
+so the check exercises the real per-job credential path instead of quietly falling back to host auth. **No secret value
+is ever returned or rendered**: a row names the secret, the probe command, and the failure text only.
+
+Every probe is read-only. A capability only a write could prove (opening a PR, writing the `AI Agent` field, commenting)
+is reported as **`unverifiable`** with the reason, never as a pass; a write probe would leave real PRs and real issue
+edits behind. `unverifiable` rows do not count as failures for the CLI exit code.
+
+A YouTrack project the token cannot read comes back as HTTP 400 `invalid_query`, not a 401, which reads as a broken
+query; the row's remediation says what it really is. A failed repo probe carries the `probe_denied` text verbatim, which
+names the scope or the permission grant to add (see "Forge repo-access preflight" in `actions/SCHEMA.md`).
+
+**Dashboard banner.** A poll-time repo-access preflight failure is recorded as a `run_events` row (CLAUDE-147); the
+Dashboard now surfaces those from the last 24 hours in a banner linking to `/access`, so the operator is told rather
+than having to find the action's event list. A later poll whose preflight passes records a recovery marker for the same
+repo and the banner clears itself; the marker is written only on that fail -> pass transition, so a healthy poll adds
+nothing to the event log.
 
 ## Filesystem layout
 

@@ -155,6 +155,7 @@ impl Daemon {
             runs: runs.clone(),
             in_flight: in_flight.clone(),
             settings: settings.clone(),
+            paths: self.paths.clone(),
         });
 
         // Unix-socket router: bare paths (`/status`, `/actions`, ...). CLI

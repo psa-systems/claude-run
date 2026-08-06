@@ -124,6 +124,13 @@ pub fn router(api: Arc<AppState>, paths: Paths, webhook_enabled: bool) -> Router
         .route("/secrets", get(secrets_page).post(secret_create))
         .route("/secrets/:name/rotate", post(secret_rotate))
         .route("/secrets/:name/delete", post(secret_delete))
+        // CLAUDE-216: on-demand access check. GET renders the page (no probing);
+        // POST runs the check and swaps the result table in. The per-secret
+        // Check button on /secrets lands on the same page with that credential's
+        // identity probe already run.
+        .route("/access", get(access_page))
+        .route("/access/check", post(access_check))
+        .route("/secrets/:name/check", post(secret_check))
         // CLAUDE-101: runtime settings page. GET renders all sections; POST saves
         // one section (re-rendering inline serde errors on rejection). Behind the
         // CLAUDE-48 auth gate like every other TCP route.
@@ -889,6 +896,9 @@ struct DashboardTpl {
     /// bounds, and the "X-Y of N" indicator). Computed even while a search is
     /// active so the hidden `page` input keeps the morph poll on the right page.
     page: PageNav,
+    /// CLAUDE-216: poll-time access failures from the last 24h that no later
+    /// successful preflight superseded. Empty renders no banner.
+    access_failures: Vec<state::AccessFailure>,
     /// CLAUDE-141: whitelisted sort + filter selection, echoed into the header
     /// sort links, filter dropdowns, poll URL, and pagination links so the
     /// chosen view survives the morph poll.
@@ -1181,6 +1191,15 @@ async fn dashboard(
             .unwrap_or(0);
 
     let (today_runs, today_cost) = totals.unwrap_or((0, 0.0));
+
+    // CLAUDE-216: the poll-time repo-access preflight leaves its issues Queued
+    // with no field change, so without this banner the only symptom is issues
+    // that never move. 24h window; a later passing preflight for the same repo
+    // clears it (`state::access_failures_recent`).
+    let since = (chrono::Utc::now() - chrono::Duration::hours(24))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let access_failures = state::access_failures_recent(pool, &since, 10).await?;
+
     let tpl = DashboardTpl {
         version: s.api.version,
         global_pause,
@@ -1194,6 +1213,7 @@ async fn dashboard(
         in_stream: q.in_stream,
         search,
         page: page_nav,
+        access_failures,
         view,
         action_options,
         triggered_options,
@@ -3091,6 +3111,84 @@ async fn secret_delete(
     Ok(Redirect::to("/secrets").into_response())
 }
 
+// ---- CLAUDE-216: access check --------------------------------------------
+//
+// One service (`crate::access`) backs this page, `POST /api/access/check`, and
+// `claude-run access check`. A row names the secret, the probe, and the failure
+// text; a secret VALUE is never read back here, exactly as on `/secrets`.
+
+#[derive(Template)]
+#[template(path = "access.html")]
+struct AccessTpl {
+    version: &'static str,
+    /// The form's current values, echoed back so a check keeps its inputs.
+    form: crate::access::AccessRequest,
+    /// `None` until a check has been run (the bare GET).
+    report: Option<crate::access::AccessReport>,
+}
+
+/// The result table alone, for the HTMX swap.
+#[derive(Template)]
+#[template(path = "access_rows.html")]
+struct AccessRowsTpl {
+    report: Option<crate::access::AccessReport>,
+}
+
+/// Run the check, rendering a setup failure as a report row rather than a 500:
+/// "the daemon cannot invoke `yt` / `fj`" is itself the answer.
+async fn run_access_check(
+    s: &WebState,
+    req: &crate::access::AccessRequest,
+) -> crate::access::AccessReport {
+    let base = crate::api::access_cred_base(&s.paths);
+    match crate::access::check(&s.api.pool, &base, req).await {
+        Ok(report) => report,
+        Err(e) => crate::access::AccessReport::from_error(&e),
+    }
+}
+
+async fn access_page(
+    State(s): State<WebState>,
+    Query(q): Query<crate::access::AccessRequest>,
+) -> Result<Response, WebError> {
+    let tpl = AccessTpl {
+        version: s.api.version,
+        form: q.normalized(),
+        report: None,
+    };
+    Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
+async fn access_check(
+    State(s): State<WebState>,
+    Form(form): Form<crate::access::AccessRequest>,
+) -> Result<Response, WebError> {
+    let report = run_access_check(&s, &form.normalized()).await;
+    let tpl = AccessRowsTpl {
+        report: Some(report),
+    };
+    Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
+/// The per-secret Check button on `/secrets`: run the identity probe of every
+/// action that references this secret, and land on `/access` with the result.
+async fn secret_check(
+    State(s): State<WebState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Response, WebError> {
+    let req = crate::access::AccessRequest {
+        secret: Some(name),
+        ..Default::default()
+    };
+    let report = run_access_check(&s, &req).await;
+    let tpl = AccessTpl {
+        version: s.api.version,
+        form: req,
+        report: Some(report),
+    };
+    Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
 // ---- CLAUDE-101: Settings page -------------------------------------------
 
 #[derive(Template)]
@@ -4505,6 +4603,7 @@ mod tests {
                 has_prev: false,
                 has_next: false,
             },
+            access_failures: vec![],
             view,
             action_options: vec!["YouTrack".to_string(), "forgejo".to_string()],
             triggered_options: vec!["schedule".to_string(), "webhook".to_string()],
@@ -4602,6 +4701,7 @@ mod tests {
                 runs: Arc::new(RunRegistry::new()),
                 in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
+                paths: Paths::resolve().unwrap(),
             });
             let paths = Paths {
                 config_dir: tmp.join("config"),
@@ -6512,6 +6612,116 @@ mod tests {
         }
     }
 
+    // ---- access check UI (CLAUDE-216) -------------------------------------
+
+    mod access_ui {
+        use super::super::{access_page, AccessRowsTpl, AccessTpl};
+        use crate::access::{AccessReport, AccessRequest, CheckKind, CheckRow, Outcome};
+        use askama::Template;
+        use axum::extract::{Query, State};
+
+        fn report() -> AccessReport {
+            AccessReport {
+                rows: vec![
+                    CheckRow {
+                        target: "youtrack".into(),
+                        kind: CheckKind::Identity,
+                        credential: "secret `yt-prod`".into(),
+                        probe: "yt auth verify".into(),
+                        outcome: Outcome::Pass,
+                        detail: "authenticated as `claude-run`".into(),
+                        remediation: None,
+                    },
+                    CheckRow {
+                        target: "dev.a8n.run/contoso/claude-run".into(),
+                        kind: CheckKind::Repo,
+                        credential: "secret `fj-prod`".into(),
+                        probe: "fj repo view + pr search (Forge::repo_access)".into(),
+                        outcome: Outcome::Fail,
+                        detail: "HTTP 403: add `read:issue` to the token".into(),
+                        remediation: Some("grant read:issue".into()),
+                    },
+                    CheckRow {
+                        target: "dev.a8n.run/contoso/claude-run".into(),
+                        kind: CheckKind::Write,
+                        credential: "secret `fj-prod`".into(),
+                        probe: "not probed (read-only check)".into(),
+                        outcome: Outcome::Unverifiable,
+                        detail: "opening a PR is a write".into(),
+                        remediation: None,
+                    },
+                ],
+            }
+        }
+
+        /// The result table renders each outcome distinctly, shows the
+        /// `probe_denied` text verbatim, and names the secret without its value.
+        #[test]
+        fn rows_render_every_outcome_and_no_secret_value() {
+            let html = AccessRowsTpl {
+                report: Some(report()),
+            }
+            .render()
+            .unwrap();
+            assert!(html.contains("1 of 3 probes failed"), "{html}");
+            assert!(html.contains("badge ok"), "{html}");
+            assert!(html.contains("badge bad"), "{html}");
+            assert!(html.contains("badge warn"), "{html}");
+            assert!(html.contains("read:issue"), "{html}");
+            assert!(html.contains("secret `yt-prod`"), "{html}");
+            assert!(html.contains("unverifiable"), "{html}");
+        }
+
+        /// The bare page has the form and no results yet.
+        #[tokio::test]
+        async fn page_renders_the_form_before_any_check() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = super::secrets_ui::web_state(tmp.path()).await;
+            let resp = access_page(State(s), Query(AccessRequest::default()))
+                .await
+                .unwrap();
+            let body = super::secrets_ui::body_string(resp).await;
+            assert!(body.contains("Check all"), "{body}");
+            assert!(body.contains("No check run yet."), "{body}");
+            // The targeted form takes a repo, a host, and a project key.
+            for field in ["name=\"repo\"", "name=\"host\"", "name=\"project\""] {
+                assert!(body.contains(field), "{field} missing: {body}");
+            }
+            // And the page is reachable from the nav on every page.
+            assert!(body.contains("<a href=\"/access\">Access</a>"), "{body}");
+        }
+
+        /// CLAUDE-216: `/secrets` offers a per-secret identity probe.
+        #[tokio::test]
+        async fn secrets_page_offers_a_per_secret_check() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = super::secrets_ui::web_state(tmp.path()).await;
+            crate::state::secret_create(&s.api.pool, "yt-prod", b"ciphertext")
+                .await
+                .unwrap();
+            let resp = super::super::secrets_page(State(s)).await.unwrap();
+            let body = super::secrets_ui::body_string(resp).await;
+            assert!(body.contains("/secrets/yt-prod/check"), "{body}");
+        }
+
+        /// A report on the full page renders through the same fragment.
+        #[test]
+        fn page_renders_the_report_inline() {
+            let html = AccessTpl {
+                version: "test",
+                form: AccessRequest {
+                    project: Some("CLAUDE".into()),
+                    ..Default::default()
+                },
+                report: Some(report()),
+            }
+            .render()
+            .unwrap();
+            assert!(html.contains("value=\"CLAUDE\""), "{html}");
+            assert!(html.contains("1 of 3 probes failed"), "{html}");
+        }
+    }
+
     // ---- secrets UI (CLAUDE-26) -------------------------------------------
     //
     // One test owns the `CLAUDE_RUN_SECRETS_KEY_FILE` env (no other test reads
@@ -6535,7 +6745,7 @@ mod tests {
         use sqlx::sqlite::SqlitePoolOptions;
         use std::sync::Arc;
 
-        async fn web_state(tmp: &std::path::Path) -> WebState {
+        pub(super) async fn web_state(tmp: &std::path::Path) -> WebState {
             let pool = SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect("sqlite::memory:")
@@ -6550,6 +6760,7 @@ mod tests {
                 runs: Arc::new(RunRegistry::new()),
                 in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
+                paths: Paths::resolve().unwrap(),
             });
             let paths = Paths {
                 config_dir: tmp.join("config"),
@@ -6564,7 +6775,7 @@ mod tests {
             }
         }
 
-        async fn body_string(resp: axum::response::Response) -> String {
+        pub(super) async fn body_string(resp: axum::response::Response) -> String {
             let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
@@ -6800,6 +7011,7 @@ mod tests {
                 runs: Arc::new(RunRegistry::new()),
                 in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
+                paths: Paths::resolve().unwrap(),
             });
             WebState {
                 api,
