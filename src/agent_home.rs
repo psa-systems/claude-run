@@ -96,9 +96,15 @@ mod tests {
     fn embedded_bot_file_carries_the_local_only_contract() {
         // The embedded file is the actual slim bot memory, not the operator's
         // interactive global file: it states the local-only contract and carries
-        // no Git/YouTrack workflow section.
+        // no Git workflow section.
         assert!(BOT_CLAUDE_MD.contains("claude-run bot agent memory"));
         assert!(BOT_CLAUDE_MD.contains("You perform NO external mutation"));
+        // CLAUDE-214: the bot file must match the relaxed prompt, so it carries
+        // the `No orphan notes` obligation and the `AI Agent` ban that keeps a
+        // filing agent from queueing further agent runs.
+        assert!(BOT_CLAUDE_MD.contains("No orphan notes"));
+        assert!(BOT_CLAUDE_MD.contains("NEVER set the `AI Agent` field on ANY issue"));
+        assert!(BOT_CLAUDE_MD.contains(".claude-run-no-code-change"));
     }
 
     #[test]

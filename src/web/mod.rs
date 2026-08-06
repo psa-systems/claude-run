@@ -2506,6 +2506,24 @@ fn youtrack_form_to_yaml(
         .cloned()
         .and_then(|d| serde_yaml::from_value::<crate::action::Dependencies>(d).ok())
         .unwrap_or_default();
+    // CLAUDE-214: same carry-forward for `write_projects` and `states.no_code`,
+    // neither of which the structured form exposes. Without this, saving any
+    // other field would silently narrow the agent's create scope back to the
+    // triggering issue's project and reset the no-code label.
+    youtrack.write_projects = map
+        .get("native")
+        .and_then(|n| n.get("youtrack"))
+        .and_then(|y| y.get("write_projects"))
+        .cloned()
+        .and_then(|w| serde_yaml::from_value::<Vec<String>>(w).ok())
+        .unwrap_or_default();
+    youtrack.states.no_code = map
+        .get("native")
+        .and_then(|n| n.get("youtrack"))
+        .and_then(|y| y.get("states"))
+        .and_then(|s| s.get("no_code"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     // CLAUDE-54: preserve a hand-written `github` block. The form exposes only
     // `token_ref`, so read the existing `native.github` sub-block off the parsed
     // on-disk action (before we overwrite the `native` key below) to carry its
@@ -5582,6 +5600,44 @@ mod tests {
             assert!(!deps.enabled, "hand-written enabled:false must survive");
             assert_eq!(deps.recheck_timeout, "30s");
             assert_eq!(deps.block_on, vec!["depends on".to_string()]);
+        }
+
+        #[test]
+        fn write_projects_and_no_code_label_preserved_on_save() {
+            // CLAUDE-214 no-wipe regression: `write_projects` and
+            // `states.no_code` have no structured-form UI, so a save that edits
+            // any other field must carry them forward rather than silently
+            // narrowing the agent's create scope back to the issue's own project.
+            let base: serde_yaml::Value = serde_yaml::from_str(
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    write_projects:\n      - AUD\n      - DEV\n    states:\n      no_code: Reported\n",
+            )
+            .unwrap();
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            let yaml = youtrack_form_to_yaml(base, &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(
+                yt.youtrack.write_projects,
+                vec!["AUD".to_string(), "DEV".to_string()]
+            );
+            assert_eq!(yt.youtrack.states.no_code_label(), "Reported");
+        }
+
+        #[test]
+        fn write_projects_and_no_code_default_omit_keys() {
+            // The untouched defaults write neither key, so existing action YAML
+            // is byte-unchanged by this feature.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            assert!(
+                !yaml.contains("write_projects"),
+                "write_projects leaked:\n{yaml}"
+            );
+            assert!(!yaml.contains("no_code"), "no_code leaked:\n{yaml}");
         }
 
         #[test]

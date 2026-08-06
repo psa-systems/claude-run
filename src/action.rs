@@ -220,8 +220,15 @@ pub struct YoutrackSource {
     /// `DEFAULT_YOUTRACK_PROMPT` from [`crate::native::youtrack`]. When set, the
     /// text fully replaces the default and is rendered with the documented
     /// `{{...}}` placeholders (`{{key}}`, `{{summary}}`, `{{clone_url}}`,
-    /// `{{workdir}}`, `{{needs_review_marker}}`, `{{skip_attempt_marker}}`).
+    /// `{{workdir}}`, `{{needs_review_marker}}`, `{{skip_attempt_marker}}`,
+    /// `{{no_code_marker}}`, `{{write_projects}}`).
     pub prompt: Option<String>,
+    /// Projects the agent may create issues in (CLAUDE-214), rendered into the
+    /// prompt as `{{write_projects}}`. Empty (the default) resolves to the
+    /// triggering issue's own project, so filing a deferred item needs no
+    /// site-specific configuration and none is baked into the binary.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub write_projects: Vec<String>,
     /// Optional CI-gated automerge of the opened PR (CLAUDE-126). Disabled by
     /// default, so finalize stops at Code Review exactly as before; when enabled
     /// the runner waits for the PR's checks to go green and merges it.
@@ -247,6 +254,7 @@ impl Default for YoutrackSource {
             custom_field: default_custom_field(),
             states: YoutrackStates::default(),
             prompt: None,
+            write_projects: Vec::new(),
             automerge: Automerge::default(),
             assignee: None,
             dependencies: Dependencies::default(),
@@ -365,6 +373,12 @@ pub struct YoutrackStates {
     pub failed: String,
     /// AI Agent value set after the runner automerges the PR (CLAUDE-126).
     pub done: String,
+    /// AI Agent value set when a successful run deliberately produced no commits
+    /// and left the `.claude-run-no-code-change` marker (CLAUDE-214). `None` (the
+    /// default) resolves to `done`: there is no PR for a human to review. Read
+    /// through [`YoutrackStates::no_code_label`], never directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_code: Option<String>,
     /// Standard `State` field value set in the pre step.
     pub in_progress: String,
     /// Standard `State` field value set after the runner automerges the PR
@@ -381,9 +395,18 @@ impl Default for YoutrackStates {
             needs_review: "Needs Review".to_string(),
             failed: "Failed".to_string(),
             done: "Done".to_string(),
+            no_code: None,
             in_progress: "In Progress".to_string(),
             state_done: "Done".to_string(),
         }
+    }
+}
+
+impl YoutrackStates {
+    /// AI Agent label for a deliberate no-code run (CLAUDE-214): the configured
+    /// `no_code` when set, otherwise the configured `done` label.
+    pub fn no_code_label(&self) -> &str {
+        self.no_code.as_deref().unwrap_or(&self.done)
     }
 }
 
@@ -1298,7 +1321,13 @@ native:
         let Some(NativeConfig::Youtrack(cfg)) = &action.native else {
             panic!("expected youtrack native config");
         };
-        assert_eq!(cfg.youtrack.query, "-Resolved AI Agent: Queued");
+        // CLAUDE-215: the shipped query excludes the audit project, which
+        // `audit-run.yml` owns. It therefore differs from `default_query()`,
+        // which stays site-agnostic.
+        assert_eq!(
+            cfg.youtrack.query,
+            "-Resolved AI Agent: Queued project: -AUD"
+        );
         assert_eq!(cfg.youtrack.custom_field, "AI Agent");
         // Generic blocks stay on the Action, not in the native config.
         assert_eq!(action.workdir_base.as_deref(), Some("~/workspace"));
@@ -1309,6 +1338,136 @@ native:
         let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
         assert_eq!(reloaded.action.native, action.native);
         assert_eq!(reloaded.action.kind, action.kind);
+    }
+
+    /// The shipped `actions/audit-run.yml` (CLAUDE-214): a second youtrack-kind
+    /// action whose only structural difference is the `AUD` query and the
+    /// full-replacement prompt that permits the three audit tracker writes.
+    #[test]
+    fn shipped_audit_run_action_is_native_and_round_trips() {
+        const SHIPPED: &str = include_str!("../actions/audit-run.yml");
+        let loaded = validate_str(SHIPPED, "actions/audit-run.yml").expect("shipped action valid");
+        let action = loaded.action;
+
+        assert_eq!(action.name, "audit-run");
+        assert_eq!(action.kind, ActionKind::Youtrack);
+        // Config only: no script-bearing fields on a native action.
+        assert!(action.input.is_none());
+        assert!(action.filter.is_none());
+        assert!(action.pre.is_empty());
+        assert!(action.prompt.is_none());
+        assert!(action.post.is_empty());
+
+        let Some(NativeConfig::Youtrack(cfg)) = &action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert_eq!(
+            cfg.youtrack.query,
+            "-Resolved AI Agent: Queued project: AUD"
+        );
+        // The prompt override is the reason this action exists (CLAUDE-125).
+        let prompt = cfg
+            .youtrack
+            .prompt
+            .as_deref()
+            .expect("audit action carries a prompt override");
+        assert!(prompt.contains("{{key}}"));
+        assert!(prompt.contains("{{workdir}}"));
+        assert!(prompt.contains("{{needs_review_marker}}"));
+        assert!(prompt.contains("{{skip_attempt_marker}}"));
+        // Exactly three tracker writes are permitted; creation stays banned.
+        assert!(prompt.contains("yt issue add-comment"));
+        assert!(prompt.contains("no `yt issue create`"));
+        assert!(prompt.contains("no `yt issue set-field`"));
+        assert!(prompt.contains("no `yt issue set-state`"));
+        // The parent gate is what makes the daily summary run last, so it must
+        // not be disabled here.
+        assert!(cfg.youtrack.dependencies.enabled);
+        // One audit at a time: the cost-control property.
+        assert_eq!(action.concurrency.max_parallel, 1);
+
+        let reserialized = serde_yaml::to_string(&action).unwrap();
+        let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
+        assert_eq!(reloaded.action.native, action.native);
+        assert_eq!(reloaded.action.kind, action.kind);
+    }
+
+    /// CLAUDE-214 addendum: relaxing the built-in prompt must not widen the
+    /// audit action underneath it. `audit-run.yml` keeps its own override, and
+    /// that override stays the tighter policy: it bans issue creation, which the
+    /// built-in prompt now permits, and it names its three permitted writes.
+    #[test]
+    fn audit_prompt_override_stays_narrower_than_the_builtin() {
+        const SHIPPED: &str = include_str!("../actions/audit-run.yml");
+        let loaded = validate_str(SHIPPED, "actions/audit-run.yml").expect("shipped action valid");
+        let Some(NativeConfig::Youtrack(cfg)) = &loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        let audit = cfg
+            .youtrack
+            .prompt
+            .as_deref()
+            .expect("audit action carries a prompt override");
+        let builtin = crate::native::youtrack::default_youtrack_prompt();
+
+        assert_ne!(audit, builtin, "the override must not become the default");
+        // The built-in permits creation; the audit override forbids it.
+        assert!(
+            builtin.contains("Create issues with 'yt issue create'"),
+            "built-in must permit creation: {builtin}"
+        );
+        assert!(
+            audit.contains("no `yt issue create`"),
+            "audit override must still ban creation: {audit}"
+        );
+        // Both keep `AI Agent` and `State` the runner's alone.
+        for p in [audit, builtin.as_str()] {
+            assert!(p.contains("set-field"), "{p}");
+            assert!(p.contains("set-state"), "{p}");
+        }
+    }
+
+    /// CLAUDE-215: the two youtrack-kind actions partition the queued issues
+    /// rather than racing for them. Both poll on the same interval, so an issue
+    /// matching both would be cloned by whichever action polled first, and for
+    /// an audit issue that means the wrong repo and a pull request against it.
+    ///
+    /// The queries execute server-side, so this asserts the static half: the
+    /// default action excludes `AUD` and the audit action selects only `AUD`.
+    /// Note the syntax - YouTrack rejects `-project: AUD` as a parse error, so
+    /// the negation has to sit on the value (`project: -AUD`).
+    #[test]
+    fn shipped_youtrack_actions_partition_audit_issues() {
+        fn query_of(raw: &str, path: &str) -> String {
+            let loaded = validate_str(raw, path).expect("shipped action valid");
+            let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+                panic!("expected youtrack native config in {path}");
+            };
+            cfg.youtrack.query
+        }
+
+        let default_query = query_of(
+            include_str!("../actions/youtrack.yml"),
+            "actions/youtrack.yml",
+        );
+        let audit_query = query_of(
+            include_str!("../actions/audit-run.yml"),
+            "actions/audit-run.yml",
+        );
+
+        assert!(
+            default_query.contains("project: -AUD"),
+            "default action must exclude the audit project, got {default_query:?}"
+        );
+        assert!(
+            !default_query.contains("-project:"),
+            "`-project:` is a YouTrack parse error; negate the value instead, got {default_query:?}"
+        );
+        assert!(
+            audit_query.contains("project: AUD") && !audit_query.contains("project: -AUD"),
+            "audit action must select only the audit project, got {audit_query:?}"
+        );
+        assert_ne!(default_query, audit_query);
     }
 
     #[test]
