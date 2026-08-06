@@ -244,6 +244,42 @@ and `regather_interval_secs` (default `60`, must be `>= 1`). Both apply on the n
 > `claude-run run <action>` path still takes it as a cross-process guard; running standalone `run` for an action the
 > daemon also schedules is unsupported concurrent use.
 
+## What the agent may write to the tracker (CLAUDE-214)
+
+The agent never publishes code: no `git push`, no pull request. The runner's finalize step opens the PR from the local
+commits and owns every field it sets. What the agent *may* do to YouTrack used to be nothing at all; the built-in
+prompt now permits a bounded set, because the `No orphan notes` rule requires a run that finds a gap to file it as a
+tracked issue rather than bury it in prose in a PR body.
+
+Permitted by the built-in prompt (`default_youtrack_prompt`, `src/native/youtrack.rs`):
+
+- Read anything the token can see, across every project.
+- Create issues with `yt issue create`, restricted to `native.youtrack.write_projects`. That list defaults to empty,
+  which resolves to the **triggering issue's own project**, so the common case needs no configuration and no site
+  specifics are baked into the binary.
+- Update, comment on and link **only the issues the run itself created** during that attempt.
+- On the triggering issue, exactly one write: `yt issue link <new-issue> "subtask of" <KEY>`, so a report issue hangs
+  off the issue that asked for it.
+
+Banned outright, stated as hard rules in the prompt: setting `AI Agent` on **any** issue including ones the run created
+(setting it queues an agent run, so an agent that could set it could spawn runs), every other write to the triggering
+issue (description, summary, comment, tag, assignee, `State`), any write to an issue the run did not create, and
+`yt issue delete` anywhere.
+
+The permitted list is a prompt instruction. The enforced boundary is the YouTrack token's own permissions: a create the
+token cannot perform fails loudly and the run parks at Needs Review quoting the rejected command. An action that wants a
+tighter policy than the built-in one overrides `native.youtrack.prompt` wholesale (`actions/audit-run.yml` does exactly
+that, permitting three named writes and banning issue creation).
+
+**No-code completion path.** A run whose deliverable is tracker output rather than code makes no commits, and the
+CLAUDE-212 ahead check fails such a run (`AI Agent = Failed`, no PR) so a silently-empty engineering run cannot look
+successful. To finish deliberately with no commits, the agent writes its human-facing summary to
+`$workdir/.claude-run-no-code-change`. Finalize then skips the PR, posts that text verbatim as the issue comment, and
+sets `AI Agent` to `native.youtrack.states.no_code` (defaulting to the `done` label, since there is no PR to review).
+`State` is left untouched, so the issue stays In Progress until a human closes it. Without the marker the CLAUDE-212
+guard is unchanged, and the marker is never an escape hatch for a code task the agent could not finish: that stays
+`.claude-run-needs-review`.
+
 ## Scheduled repository audits (CLAUDE-214, CLAUDE-215)
 
 Two actions share `kind: youtrack` and partition the queued issues between them:
@@ -604,10 +640,11 @@ docker compose up --detach
 ```
 
 **Slim bot CLAUDE.md.** `deploy/bot-CLAUDE.md` is versioned in this repo and `COPY`d to
-`/home/claudebot/.claude/CLAUDE.md`. It contains only the local-only agent contract (no push, no PR, no YouTrack writes;
-leave the feature branch as HEAD; the runner finalizes), the em-dash ban, the Nushell 0.112.2 note, and the
-simplest-solution preference. It has no Git/YouTrack workflow and no lifecycle section, so the agent is never told to
-push, open PRs, or transition issue state.
+`/home/claudebot/.claude/CLAUDE.md`. It contains only the local-only agent contract (no push, no PR; leave the feature
+branch as HEAD; the runner finalizes), the bounded tracker writes from
+[What the agent may write to the tracker](#what-the-agent-may-write-to-the-tracker-claude-214), the em-dash ban, the
+Nushell 0.112.2 note, and the simplest-solution preference. It has no Git workflow and no lifecycle section, so the
+agent is never told to push, open PRs, or transition issue state.
 
 **compose.yml.** Consumes the published image (`image: dev.a8n.run/psa-systems/claude-run:latest`; the local `build:`block
 stays as a commented development alternative). App-prefixed names (service `claude-bot`, network`claude-bot-private`,

@@ -220,8 +220,15 @@ pub struct YoutrackSource {
     /// `DEFAULT_YOUTRACK_PROMPT` from [`crate::native::youtrack`]. When set, the
     /// text fully replaces the default and is rendered with the documented
     /// `{{...}}` placeholders (`{{key}}`, `{{summary}}`, `{{clone_url}}`,
-    /// `{{workdir}}`, `{{needs_review_marker}}`, `{{skip_attempt_marker}}`).
+    /// `{{workdir}}`, `{{needs_review_marker}}`, `{{skip_attempt_marker}}`,
+    /// `{{no_code_marker}}`, `{{write_projects}}`).
     pub prompt: Option<String>,
+    /// Projects the agent may create issues in (CLAUDE-214), rendered into the
+    /// prompt as `{{write_projects}}`. Empty (the default) resolves to the
+    /// triggering issue's own project, so filing a deferred item needs no
+    /// site-specific configuration and none is baked into the binary.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub write_projects: Vec<String>,
     /// Optional CI-gated automerge of the opened PR (CLAUDE-126). Disabled by
     /// default, so finalize stops at Code Review exactly as before; when enabled
     /// the runner waits for the PR's checks to go green and merges it.
@@ -247,6 +254,7 @@ impl Default for YoutrackSource {
             custom_field: default_custom_field(),
             states: YoutrackStates::default(),
             prompt: None,
+            write_projects: Vec::new(),
             automerge: Automerge::default(),
             assignee: None,
             dependencies: Dependencies::default(),
@@ -365,6 +373,12 @@ pub struct YoutrackStates {
     pub failed: String,
     /// AI Agent value set after the runner automerges the PR (CLAUDE-126).
     pub done: String,
+    /// AI Agent value set when a successful run deliberately produced no commits
+    /// and left the `.claude-run-no-code-change` marker (CLAUDE-214). `None` (the
+    /// default) resolves to `done`: there is no PR for a human to review. Read
+    /// through [`YoutrackStates::no_code_label`], never directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_code: Option<String>,
     /// Standard `State` field value set in the pre step.
     pub in_progress: String,
     /// Standard `State` field value set after the runner automerges the PR
@@ -381,9 +395,18 @@ impl Default for YoutrackStates {
             needs_review: "Needs Review".to_string(),
             failed: "Failed".to_string(),
             done: "Done".to_string(),
+            no_code: None,
             in_progress: "In Progress".to_string(),
             state_done: "Done".to_string(),
         }
+    }
+}
+
+impl YoutrackStates {
+    /// AI Agent label for a deliberate no-code run (CLAUDE-214): the configured
+    /// `no_code` when set, otherwise the configured `done` label.
+    pub fn no_code_label(&self) -> &str {
+        self.no_code.as_deref().unwrap_or(&self.done)
     }
 }
 
@@ -1367,6 +1390,41 @@ native:
         let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
         assert_eq!(reloaded.action.native, action.native);
         assert_eq!(reloaded.action.kind, action.kind);
+    }
+
+    /// CLAUDE-214 addendum: relaxing the built-in prompt must not widen the
+    /// audit action underneath it. `audit-run.yml` keeps its own override, and
+    /// that override stays the tighter policy: it bans issue creation, which the
+    /// built-in prompt now permits, and it names its three permitted writes.
+    #[test]
+    fn audit_prompt_override_stays_narrower_than_the_builtin() {
+        const SHIPPED: &str = include_str!("../actions/audit-run.yml");
+        let loaded = validate_str(SHIPPED, "actions/audit-run.yml").expect("shipped action valid");
+        let Some(NativeConfig::Youtrack(cfg)) = &loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        let audit = cfg
+            .youtrack
+            .prompt
+            .as_deref()
+            .expect("audit action carries a prompt override");
+        let builtin = crate::native::youtrack::default_youtrack_prompt();
+
+        assert_ne!(audit, builtin, "the override must not become the default");
+        // The built-in permits creation; the audit override forbids it.
+        assert!(
+            builtin.contains("Create issues with 'yt issue create'"),
+            "built-in must permit creation: {builtin}"
+        );
+        assert!(
+            audit.contains("no `yt issue create`"),
+            "audit override must still ban creation: {audit}"
+        );
+        // Both keep `AI Agent` and `State` the runner's alone.
+        for p in [audit, builtin.as_str()] {
+            assert!(p.contains("set-field"), "{p}");
+            assert!(p.contains("set-state"), "{p}");
+        }
     }
 
     /// CLAUDE-215: the two youtrack-kind actions partition the queued issues

@@ -24,11 +24,18 @@
 #   Needs Review -> claude couldn't proceed and parked the job by writing .claude-run-needs-review; the issue needs
 #                   human input (finalize step) - the attempt counter is NOT incremented
 #   Failed       -> claude or a step had a hard failure (finalize step)
+#   Done         -> a run that deliberately produced tracker output rather than code and wrote
+#                   .claude-run-no-code-change; no PR is opened and State is left alone (CLAUDE-214, label configurable
+#                   as native.youtrack.states.no_code)
 #
-# The agent does ONLY local engineering work (read issue, branch, change, commit locally, run the repo's checks). It
-# performs NO external mutation: no git push, no PR, no YouTrack write. The handler's finalize step owns every external
-# mutation - PR creation and the AI Agent transition - and runs them after the claude process exits, gated on the run
-# outcome. The agent signals a blocker by writing .claude-run-needs-review (reason text) + .claude-run-skip-attempt.
+# The agent does ONLY local engineering work on code (read issue, branch, change, commit locally, run the repo's
+# checks): no git push and no PR. Since CLAUDE-214 it may also make bounded tracker writes - create issues in
+# native.youtrack.write_projects (defaulting to the triggering issue's own project), update / comment on / link the
+# issues it created this run, and link one of them as a subtask of the triggering issue - so a gap it finds becomes a
+# tracked issue rather than a line of prose. Everything else stays the handler's: the AI Agent field on ANY issue, and
+# every other write to the triggering issue. The finalize step owns PR creation and the AI Agent transition and runs
+# them after the claude process exits, gated on the run outcome. The agent signals a blocker by writing
+# .claude-run-needs-review (reason text) + .claude-run-skip-attempt.
 #
 # State (the standard YouTrack field) is independent of AI Agent. The pre step sets State=In Progress. Submitting a PR
 # does NOT move State to Done: the commit links the PR to the issue but carries no State command, so the issue stays In
