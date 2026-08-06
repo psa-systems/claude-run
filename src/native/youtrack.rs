@@ -52,6 +52,7 @@ use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use super::{HandlerFuture, NativeContext, NativeHandler};
+use crate::access;
 use crate::action::{NativeConfig, YoutrackSource};
 use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::claude::{raw_event_details, ClaudeInvoker, ClaudeResult};
@@ -180,6 +181,18 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     // survive even if no run row is ever created. Non-fatal: a bookkeeping
     // failure must not abort the poll.
     if !input_events.is_empty() {
+        // CLAUDE-216: keep a preflight-passed marker only when it clears an open
+        // failure; a query failure here leaves the events untouched rather than
+        // dropping diagnostics.
+        let input_events = match access::retain_access_recoveries(pool, &action.name, &input_events)
+            .await
+        {
+            Ok(kept) => kept,
+            Err(e) => {
+                warn!(error = %e, "access recovery filter failed (non-fatal); recording every event");
+                input_events.clone()
+            }
+        };
         if let Err(e) = state::run_events_record(pool, &action.name, &poll_ts, &input_events).await
         {
             warn!(error = %e, "run_events_record failed (non-fatal)");
@@ -482,7 +495,10 @@ fn concurrency_key(fields: &[String], job: &YoutrackJob) -> String {
 /// CLAUDE-26: build a [`CliBackend`] from `runner`, applying a job's materialized
 /// credentials (yt config env, fj store env, and the temp `keys.json` path so
 /// `clone_url` reads the same store). An empty credential set leaves host auth.
-fn credentialed_backend(runner: &Arc<dyn CommandRunner>, creds: &JobCredentials) -> CliBackend {
+pub(crate) fn credentialed_backend(
+    runner: &Arc<dyn CommandRunner>,
+    creds: &JobCredentials,
+) -> CliBackend {
     let mut backend = CliBackend::new(runner.clone());
     if !creds.yt_env.is_empty() {
         backend = backend.with_yt_env(creds.yt_env.clone());
@@ -679,7 +695,22 @@ fn gather(
             let cache_key = format!("{host}/{}", repo.repo_path);
             if !access_cache.contains_key(&cache_key) {
                 let readable = match access.check(&host, &repo.repo_path) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        // CLAUDE-216: the recovery marker that clears the
+                        // dashboard's access banner. Kept only when this repo was
+                        // actually failing (`access::retain_access_recoveries`),
+                        // so a healthy poll records nothing.
+                        events.push(state::InputEvent {
+                            level: "info".into(),
+                            context: Some(project.clone()),
+                            message: format!(
+                                "{} for `{}` on {host}",
+                                state::ACCESS_RECOVERY_PREFIX,
+                                repo.repo_path
+                            ),
+                        });
+                        true
+                    }
                     Err(e) => {
                         warn!(project = %project, host = %host, repo = %repo.repo_path, error = %e, "forge repo-access preflight failed; skipping the repo's issues this poll");
                         events.push(state::InputEvent {
@@ -1792,7 +1823,7 @@ fn comment_then_field(
 
 /// Bare host of a forge server URL: `https://dev.a8n.run` -> `dev.a8n.run`,
 /// for `fj --host <host>`.
-fn host_only(repo_host: &str) -> String {
+pub(crate) fn host_only(repo_host: &str) -> String {
     repo_host
         .trim_start_matches("https://")
         .trim_start_matches("http://")
@@ -2565,7 +2596,16 @@ mod tests {
         let access = StubAccess::allow();
         let (jobs, events) = gather(&backend, &src().query, Some(&access)).unwrap();
         assert_eq!(jobs.len(), 2);
-        assert!(events.is_empty(), "{events:?}");
+        // CLAUDE-216: a pass emits only the recovery marker, once per repo. It is
+        // dropped before recording unless it clears an open failure
+        // (`access::retain_access_recoveries`), so a healthy poll logs nothing.
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].level, "info");
+        assert!(
+            events[0].message.starts_with(state::ACCESS_RECOVERY_PREFIX),
+            "{}",
+            events[0].message
+        );
         assert_eq!(
             *access.calls.lock().unwrap(),
             vec!["dev.a8n.run/contoso/claude-run".to_string()]
@@ -2618,7 +2658,14 @@ mod tests {
         let granted = StubAccess::allow();
         let (jobs, events) = gather(&backend, &src().query, Some(&granted)).unwrap();
         assert_eq!(jobs.len(), 2);
-        assert!(events.is_empty(), "{events:?}");
+        // CLAUDE-216: and the poll that recovers records the marker that clears
+        // the dashboard's access banner for this repo.
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].message.starts_with(state::ACCESS_RECOVERY_PREFIX),
+            "{}",
+            events[0].message
+        );
     }
 
     #[test]

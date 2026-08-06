@@ -16,6 +16,7 @@
 //! | POST | `/pause` | global pause |
 //! | POST | `/resume` | global resume |
 //! | GET | `/report/{summary,daily,weekly,by-weekday,by-hour}` | historical aggregations (CLAUDE-117) |
+//! | POST | `/access/check` | on-demand credential / repo / project access check (CLAUDE-216) |
 //!
 //! `POST /actions/<name>/delete` removes the YAML file, the `actions` index
 //! row, and the action's control state (`paused_actions`, `attempt_counters`,
@@ -68,6 +69,9 @@ pub struct AppState {
     /// CLAUDE-101: live runtime settings (mint/update/webhook/log_filter) backing
     /// the Settings page and the `/api/settings/<section>` endpoints.
     pub settings: Arc<crate::settings::LiveSettings>,
+    /// CLAUDE-216: resolved on-disk locations, so the access check can write its
+    /// throwaway credential files under the runtime dir the daemon already owns.
+    pub paths: crate::config::Paths,
 }
 
 /// JSON API router. Phase 2 mounted it at root over the unix socket;
@@ -99,6 +103,10 @@ pub fn router(state: AppState) -> Router {
         .route("/report/weekly", get(report_weekly))
         .route("/report/by-weekday", get(report_by_weekday))
         .route("/report/by-hour", get(report_by_hour))
+        // CLAUDE-216: on-demand access check. Same typed report the `/access`
+        // page renders and `claude-run access check` prints, so the three
+        // surfaces cannot drift.
+        .route("/access/check", post(access_check))
         .with_state(Arc::new(state))
 }
 
@@ -464,6 +472,35 @@ async fn report_by_hour(
     ))
 }
 
+// ---- CLAUDE-216: access check ---------------------------------------------
+
+/// The credential base directory every access check materializes into: the same
+/// `credentials` tree the per-job path uses, under its own `access` namespace.
+/// Each probe still gets a unique subdirectory and scrubs it on drop.
+pub fn access_cred_base(paths: &crate::config::Paths) -> std::path::PathBuf {
+    paths.runtime_dir.join("credentials").join("access")
+}
+
+/// `POST /access/check`: run the on-demand access check and return the typed
+/// report. An absent / empty body checks everything. No secret value is ever
+/// part of the response (see `crate::access`).
+async fn access_check(
+    State(s): State<Arc<AppState>>,
+    body: String,
+) -> Result<Json<crate::access::AccessReport>, AppError> {
+    let req: crate::access::AccessRequest = if body.trim().is_empty() {
+        crate::access::AccessRequest::default()
+    } else {
+        serde_json::from_str(&body).map_err(|e| AppError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("invalid access check request: {e}"),
+        })?
+    };
+    let report =
+        crate::access::check(&s.pool, &access_cred_base(&s.paths), &req.normalized()).await?;
+    Ok(Json(report))
+}
+
 #[derive(Debug)]
 struct AppError {
     status: StatusCode,
@@ -515,7 +552,29 @@ mod tests {
             runs: Arc::new(RunRegistry::new()),
             in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
+            paths: crate::config::Paths::resolve().unwrap(),
         })
+    }
+
+    /// CLAUDE-216: `POST /access/check` returns the typed report as JSON. With
+    /// no indexed action there is nothing to probe, and the endpoint says so as
+    /// a failing row rather than an empty 200 that reads as "all good".
+    #[tokio::test]
+    async fn access_check_returns_the_typed_report() {
+        let s = app_state().await;
+        let Json(report) = access_check(State(s.clone()), String::new()).await.unwrap();
+        assert!(!report.ok(), "{report:?}");
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].kind, crate::access::CheckKind::Setup);
+        assert!(report.rows[0]
+            .detail
+            .contains("no enabled `youtrack` action"));
+
+        // A malformed body is a 400, not a 500.
+        let err = access_check(State(s), "{ not json".to_string())
+            .await
+            .expect_err("malformed body must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
     /// CLAUDE-101: an unknown section path 404s; a valid one round-trips JSON

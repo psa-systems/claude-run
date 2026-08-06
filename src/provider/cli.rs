@@ -313,6 +313,27 @@ struct VcsProcessor {
     path: String,
 }
 
+/// CLAUDE-216: `yt auth verify --json`, whose `user` object carries the
+/// authenticated login. Only the login is consumed; no token is present in the
+/// payload.
+#[derive(Debug, Deserialize)]
+struct AuthVerify {
+    user: AuthUser,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthUser {
+    #[serde(default)]
+    login: String,
+}
+
+/// CLAUDE-216: `yt project show <KEY> --json`. Only the display name is read.
+#[derive(Debug, Deserialize)]
+struct ProjectShow {
+    #[serde(default)]
+    name: String,
+}
+
 /// One project as `yt project list --json` emits it. Only the short name and the
 /// archived flag are consumed; unknown fields are ignored.
 #[derive(Debug, Deserialize)]
@@ -1114,6 +1135,25 @@ impl IssueTracker for CliBackend {
         })
     }
 
+    fn auth_verify(&self) -> Result<String> {
+        let stdout = self.yt_ok(&["auth", "verify", "--json"])?;
+        let parsed: AuthVerify = Self::parse_json(&self.yt, "yt auth verify --json", &stdout)?;
+        Ok(parsed.user.login)
+    }
+
+    fn list_query_top(&self, query: &str, top: u32) -> Result<Vec<serde_json::Value>> {
+        let query_arg = format!("--query={query}");
+        let top_arg = top.to_string();
+        let stdout = self.yt_ok(&["list", &query_arg, "--top", &top_arg, "--json"])?;
+        Self::parse_json(&self.yt, "yt list --json", &stdout)
+    }
+
+    fn project_show(&self, project_key: &str) -> Result<String> {
+        let stdout = self.yt_ok(&["project", "show", project_key, "--json"])?;
+        let parsed: ProjectShow = Self::parse_json(&self.yt, "yt project show --json", &stdout)?;
+        Ok(parsed.name)
+    }
+
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo> {
         // `vcs` is a command group; `list` is the subcommand that takes the
         // project short-name positional. Omitting it makes the project land in
@@ -1324,6 +1364,22 @@ impl Forge for CliBackend {
             ));
         }
         Ok(())
+    }
+
+    /// CLAUDE-216: `fj --host <host> whoami`. `fj` wraps each name in Unicode
+    /// bidi isolates (U+2066..U+2069), stripped so the row renders as plain text.
+    fn identity(&self, host: &str) -> Result<String> {
+        let args = ["--host", host, "whoami"];
+        let out = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        let stdout = Self::checked(&self.fj, out, &args)?;
+        Ok(stdout
+            .chars()
+            .filter(|c| !matches!(c, '\u{2066}'..='\u{2069}'))
+            .collect::<String>()
+            .trim()
+            .to_string())
     }
 
     fn list_open_prs(&self, host: &str, repo: &str) -> Result<Vec<super::ForgePullRequest>> {
