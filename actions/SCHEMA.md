@@ -187,11 +187,13 @@ native:
 |-------------------------|------------------------------------|-----------------------------------------------------------------------------------------------------|
 | `youtrack.base_url`     | host-configured `yt`               | YouTrack base URL. Required when `token_ref` is set (the injected `yt` config needs a `url`).       |
 | `youtrack.token_ref`    | none                               | Name of an encrypted secret holding the YouTrack API token (CLAUDE-26). `None` uses host `yt` auth. |
-| `youtrack.query`        | `-Resolved AI Agent: Queued`       | Issue query selecting the jobs this action picks up.                                                |
+| `youtrack.query`        | `-Resolved AI Agent: Queued`       | Issue query selecting the jobs this action picks up. Two youtrack actions must never both match one issue: they poll on the same interval, so the winner is a race and the loser's repo is the wrong one. The shipped pair partitions on project (`project: -AUD` versus `project: AUD`, CLAUDE-215); note that YouTrack rejects `-project: AUD` as a parse error, so the negation goes on the value. |
 | `youtrack.custom_field` | `AI Agent`                         | Custom field holding the AI Agent state machine.                                                    |
 | `youtrack.assignee`     | none                               | Optional Assignee set on the issue during pickup (CLAUDE-131). A literal `yt` assignee argument: a login, `me`, or `unassigned`. When unset (default), the Assignee is never touched. An assignee write failure aborts pickup before the clone. Editable in the structured web form. |
-| `youtrack.prompt`       | built-in default                   | Full-replacement agent prompt (CLAUDE-125). When unset, the built-in CLAUDE-24 prompt is used. When set, the text fully replaces it (so the operator owns the runner contract: bare `#<KEY>` commit reference, the `.claude-run-needs-review` / `.claude-run-skip-attempt` blocker markers, no push / no PR / no YouTrack write). Editable in the structured web form. See the placeholders below. |
+| `youtrack.prompt`       | built-in default                   | Full-replacement agent prompt (CLAUDE-125). When unset, the built-in CLAUDE-24 prompt is used. When set, the text fully replaces it (so the operator owns the runner contract: bare `#<KEY>` commit reference, the `.claude-run-needs-review` / `.claude-run-skip-attempt` blocker markers, the `.claude-run-no-code-change` no-code marker, no push / no PR, and whichever tracker writes the operator chooses to permit). Editable in the structured web form. See the placeholders below. |
+| `youtrack.write_projects` | empty                            | Projects the agent may create issues in (CLAUDE-214), rendered into the prompt as `{{write_projects}}`. Empty (the default) resolves to the **triggering issue's own project**, so filing a deferred item satisfies the `No orphan notes` rule with no site-specific configuration and none is baked into the binary. The list is a prompt instruction, not an enforced grant: the hard boundary is the YouTrack token's own permissions. No structured-form UI; a hand-written list is carried forward across form saves. |
 | `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value. `done` (AI Agent) and `state_done` (State) are set only when automerge merges the PR (CLAUDE-126). |
+| `youtrack.states.no_code` | the `done` label                 | AI Agent label set when a successful run deliberately produced no commits and left `.claude-run-no-code-change` (CLAUDE-214). Defaults to whatever `states.done` is, because there is no PR for a human to review. `State` is left untouched, so the issue stays In Progress until a human closes it. No structured-form UI; a hand-written value is carried forward across form saves. |
 | `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge (CLAUDE-126). When `false`, finalize stops at Code Review with no CI wait and no merge (unchanged behavior). |
 | `youtrack.automerge.wait_seconds` | `1800`                   | Maximum total seconds to wait for the PR's checks to go green (and the branch to be up to date) before giving up and leaving the PR open. |
 | `youtrack.automerge.check_interval_seconds` | `30`           | Seconds between combined-CI-status polls.                                                            |
@@ -218,6 +220,27 @@ prompt is sent to the agent; an unknown placeholder (or an unterminated `{{`) is
 | `{{workdir}}`            | Absolute path of the per-job working directory (the repo is cloned here).     |
 | `{{needs_review_marker}}`| The `.claude-run-needs-review` marker filename.                               |
 | `{{skip_attempt_marker}}`| The `.claude-run-skip-attempt` marker filename.                               |
+| `{{no_code_marker}}`     | The `.claude-run-no-code-change` marker filename (CLAUDE-214).                |
+| `{{write_projects}}`     | Comma-separated `youtrack.write_projects`, or the triggering issue's own project when that list is empty (CLAUDE-214). |
+
+##### The no-code completion path (CLAUDE-214)
+
+A run whose deliverable is tracker output rather than code (survey several repos, file the findings as issues, link them
+under the triggering issue) makes zero commits by design. The CLAUDE-212 ahead check would fail such a run
+(`AI Agent = Failed`, no PR), so the agent marks the outcome deliberate by writing
+`$workdir/.claude-run-no-code-change`. Its contents are the human-facing summary.
+
+When `finalize` sees a **successful** claude result and that marker, it skips the PR entirely, posts the marker text
+verbatim as the issue comment, and sets `AI Agent` to `states.no_code`. `State` is never touched. The blocker marker
+still wins: a workdir carrying both parks at `Needs Review`.
+
+Without the marker, a zero-commit run keeps the CLAUDE-212 behaviour unchanged (`AI Agent = Failed`, no PR). That guard
+is what stops a silently-empty engineering run from looking successful, so the marker is the only thing that relaxes it,
+and never an escape hatch for a code task the agent could not finish (that stays `.claude-run-needs-review`).
+
+The built-in prompt correspondingly permits a bounded set of tracker writes: read across projects; create issues in
+`write_projects`; update, comment on and link the issues the run itself created; and one `subtask of` link onto the
+triggering issue. Setting `AI Agent` on **any** issue stays banned, since setting it queues an agent run.
 
 ##### Forgejo token scopes (CLAUDE-196)
 
