@@ -227,6 +227,37 @@ pub trait IssueTracker: Send + Sync {
     /// Upload `file` as an attachment on issue `key`. Backs attaching the
     /// redacted failing-job log to a minted issue (CLAUDE-46).
     fn attach_file(&self, key: &str, file: &std::path::Path) -> Result<()>;
+
+    /// CLAUDE-216: verify the tracker token and return the authenticated login
+    /// (`yt auth verify`, GET /api/users/me). The single read-only answer to "is
+    /// this token still valid". Never returns the token itself.
+    fn auth_verify(&self) -> Result<String> {
+        Err(Error::Other(anyhow::anyhow!(
+            "auth_verify not supported by this tracker backend"
+        )))
+    }
+
+    /// CLAUDE-216: run an arbitrary issue query, bounded to `top` results. Backs
+    /// the access check's "does the action's query execute under this
+    /// credential" probe, where only the exit status matters and the full result
+    /// set would be wasted work.
+    fn list_query_top(&self, query: &str, top: u32) -> Result<Vec<serde_json::Value>> {
+        let _ = (query, top);
+        Err(Error::Other(anyhow::anyhow!(
+            "list_query_top not supported by this tracker backend"
+        )))
+    }
+
+    /// CLAUDE-216: read a project's metadata by short name (`yt project show`),
+    /// returning its full name. Errors when the project is absent OR unreadable
+    /// by this token; YouTrack reports both the same way, so the caller renders
+    /// the failure as a permission gap rather than a missing project.
+    fn project_show(&self, project_key: &str) -> Result<String> {
+        let _ = project_key;
+        Err(Error::Other(anyhow::anyhow!(
+            "project_show not supported by this tracker backend"
+        )))
+    }
 }
 
 /// CLAUDE-207: render a failed [`Forge::repo_access`] probe as an error an
@@ -324,6 +355,16 @@ pub trait Forge: Send + Sync {
     /// the first open-PR lookup. Implementations report which probe failed and
     /// the scope label the operator has to add (see [`probe_denied`]).
     fn repo_access(&self, host: &str, repo: &str) -> Result<()>;
+
+    /// CLAUDE-216: the forge identity this backend authenticates as on `host`
+    /// (`fj whoami`, or the GitHub identity read). Read-only, and it never
+    /// returns the token. Backs the access check's "which account is this?" row.
+    fn identity(&self, host: &str) -> Result<String> {
+        let _ = host;
+        Err(Error::Other(anyhow::anyhow!(
+            "identity not supported by this forge backend"
+        )))
+    }
 
     /// List open PRs for `repo` (`owner/name`) on `host`. Backs the CI-fix scan
     /// (`fj pr search --repo <repo> --state open --json`, FJ-1).

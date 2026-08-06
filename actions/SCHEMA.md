@@ -349,6 +349,8 @@ A failing probe is reported with the capability that failed (`repo view` / `pr s
 
 When either probe fails, every issue of that repo is dropped for the poll and one `warn` input event (visible on the action page) records the host, the `owner/repo`, and the CLI's cause. `AI Agent` is left at **`Queued`**: the condition is a missing permission grant, not a defect in the issue, so the next poll after the grant picks the issues up with no manual field change. This is deliberately unlike the `Failed` path a mid-run failure takes.
 
+CLAUDE-216: the same failure also raises a banner on the Dashboard for 24 hours, linking to the `/access` page, so the silent skip is announced rather than waiting to be found on the action page. When a later poll's preflight passes for that repo, the runner records a one-off `forge repo-access preflight passed` info event, which supersedes the open failure and clears the banner; it is written only on that fail -> pass transition, so a healthy poll adds nothing to the event log. `/access` (and `claude-run access check`) runs this exact probe on demand against a named repo, so the check and the preflight can never disagree; see README, "Access check".
+
 The probe is skipped entirely when the action sets no forge `token_ref`, and skipped per host when the action carries no token for that host's forge: `fj` / `gh` then read the operator's own credential store, so the probe would test the wrong identity. A permission change *after* gather still fails at `pr create`, so that error is also restated with the repo, the host, and the possible-permission cause instead of the bare CLI text. A permission change that costs only the open-PR lookup is handled by the degradation below.
 
 ##### Open-PR lookup degradation (CLAUDE-206)

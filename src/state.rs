@@ -533,6 +533,95 @@ pub async fn run_events_summary_for_action(
     Ok(rows)
 }
 
+/// CLAUDE-216: message prefix of the poll-time forge repo-access preflight
+/// failure (`src/native/youtrack.rs`). The dashboard banner and the recovery
+/// filter both key off it, so the two agree on what counts as an access event.
+pub const ACCESS_FAILURE_PREFIX: &str = "forge repo-access preflight failed";
+/// CLAUDE-216: message prefix of the recovery marker recorded when a repo that
+/// was failing passes the preflight again. It clears the banner.
+pub const ACCESS_RECOVERY_PREFIX: &str = "forge repo-access preflight passed";
+
+/// CLAUDE-216: one still-open access failure, as the dashboard banner shows it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
+pub struct AccessFailure {
+    pub action_name: String,
+    /// The project key whose issues were skipped.
+    pub context: Option<String>,
+    pub message: String,
+    pub last_ts: String,
+    /// Occurrences in the window (the preflight re-fires every poll).
+    pub count: i64,
+}
+
+/// CLAUDE-216: poll-time access failures recorded at or after `since` that no
+/// later successful preflight has superseded, newest first. A repo whose grant
+/// lands mid-window records a recovery marker, which drops its failures here, so
+/// the banner clears itself without an operator acknowledging anything.
+pub async fn access_failures_recent(
+    pool: &SqlitePool,
+    since: &str,
+    limit: i64,
+) -> Result<Vec<AccessFailure>> {
+    let rows = sqlx::query_as::<_, AccessFailure>(
+        r#"
+        SELECT action_name, context, message,
+               MAX(ts) AS last_ts,
+               COUNT(*) AS count
+        FROM run_events e
+        WHERE e.ts >= ?1
+          AND e.message LIKE ?2 || '%'
+          AND NOT EXISTS (
+            SELECT 1 FROM run_events r
+            WHERE r.action_name = e.action_name
+              AND IFNULL(r.context, '') = IFNULL(e.context, '')
+              AND r.message LIKE ?3 || '%'
+              AND r.ts > e.ts
+          )
+        GROUP BY action_name, context, message
+        ORDER BY last_ts DESC
+        LIMIT ?4
+        "#,
+    )
+    .bind(since)
+    .bind(ACCESS_FAILURE_PREFIX)
+    .bind(ACCESS_RECOVERY_PREFIX)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// CLAUDE-216: true when the newest access event recorded for `(action,
+/// context)` is a failure, i.e. a passing preflight now is a recovery worth
+/// recording. Keeps the success marker off the event log in the normal case,
+/// where every poll passes and nothing changed.
+pub async fn access_failure_is_open(
+    pool: &SqlitePool,
+    action: &str,
+    context: Option<&str>,
+) -> Result<bool> {
+    let newest: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT message
+        FROM run_events
+        WHERE action_name = ?1
+          AND IFNULL(context, '') = IFNULL(?2, '')
+          AND (message LIKE ?3 || '%' OR message LIKE ?4 || '%')
+        ORDER BY ts DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(action)
+    .bind(context)
+    .bind(ACCESS_FAILURE_PREFIX)
+    .bind(ACCESS_RECOVERY_PREFIX)
+    .fetch_optional(pool)
+    .await?;
+    Ok(newest
+        .map(|m| m.starts_with(ACCESS_FAILURE_PREFIX))
+        .unwrap_or(false))
+}
+
 pub async fn run_finish(
     pool: &SqlitePool,
     run_id: i64,
@@ -1476,5 +1565,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys, vec!["MAPPS".to_string()]);
+    }
+
+    /// CLAUDE-216: the dashboard banner shows a poll-time access failure and
+    /// stops showing it once a later poll for the same repo passes.
+    #[tokio::test]
+    async fn access_failures_surface_until_a_later_pass_supersedes_them() {
+        let pool = mem_pool().await;
+        let fail = InputEvent {
+            level: "warn".into(),
+            context: Some("CLAUDE".into()),
+            message: format!(
+                "{ACCESS_FAILURE_PREFIX} for `contoso/claude-run` on dev.a8n.run; issues skipped"
+            ),
+        };
+        run_events_record(
+            &pool,
+            "youtrack",
+            "2026-08-01T00:00:00Z",
+            std::slice::from_ref(&fail),
+        )
+        .await
+        .unwrap();
+        run_events_record(&pool, "youtrack", "2026-08-01T00:00:05Z", &[fail])
+            .await
+            .unwrap();
+
+        let open = access_failures_recent(&pool, "2026-07-31T00:00:00Z", 10)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].action_name, "youtrack");
+        assert_eq!(open[0].context.as_deref(), Some("CLAUDE"));
+        assert_eq!(open[0].count, 2);
+        assert!(access_failure_is_open(&pool, "youtrack", Some("CLAUDE"))
+            .await
+            .unwrap());
+
+        // The recovery marker recorded on the next passing poll clears it.
+        run_events_record(
+            &pool,
+            "youtrack",
+            "2026-08-01T00:00:10Z",
+            &[InputEvent {
+                level: "info".into(),
+                context: Some("CLAUDE".into()),
+                message: format!(
+                    "{ACCESS_RECOVERY_PREFIX} for `contoso/claude-run` on dev.a8n.run"
+                ),
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(access_failures_recent(&pool, "2026-07-31T00:00:00Z", 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!access_failure_is_open(&pool, "youtrack", Some("CLAUDE"))
+            .await
+            .unwrap());
+
+        // Outside the window it does not surface at all.
+        assert!(access_failures_recent(&pool, "2026-09-01T00:00:00Z", 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
