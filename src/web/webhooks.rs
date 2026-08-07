@@ -207,16 +207,26 @@ pub struct WebhookState {
 /// the live-apply rebuild in [`crate::settings::LiveSettings`], keeping the
 /// limiter map and the routed source map in lock-step.
 pub fn build_rate_map(config: &WebhookConfig) -> HashMap<String, Mutex<RateLimiter>> {
-    config
-        .sources
-        .iter()
-        .map(|(name, src)| {
+    rate_map_from(
+        config
+            .sources
+            .iter()
+            .map(|(n, s)| (n, s.rate_limit_per_min)),
+    )
+}
+
+/// CLAUDE-220: the source-name-to-limiter build itself, over any `(name, limit)`
+/// pairs. The comment listener ([`super::comment_webhooks`]) has its own source
+/// map with the same per-source bucket semantics, so it shares this builder (and
+/// the [`RateLimiter`] type) rather than forking a parallel implementation.
+pub fn rate_map_from<'a>(
+    sources: impl Iterator<Item = (&'a String, u32)>,
+) -> HashMap<String, Mutex<RateLimiter>> {
+    sources
+        .map(|(name, limit)| {
             (
                 name.clone(),
-                Mutex::new(RateLimiter::new(
-                    src.rate_limit_per_min,
-                    Duration::from_secs(60),
-                )),
+                Mutex::new(RateLimiter::new(limit, Duration::from_secs(60))),
             )
         })
         .collect()
@@ -259,6 +269,13 @@ impl WebhookState {
             seen: Arc::new(Mutex::new(seen)),
             rate,
         }
+    }
+
+    /// CLAUDE-220: the SHARED replay store handle. The comment listener records
+    /// its deliveries in this same instance, so one `X-Forgejo-Delivery` id
+    /// fanned out to both endpoints is still caught as a replay.
+    pub fn seen_handle(&self) -> Arc<Mutex<SeenDeliveries>> {
+        self.seen.clone()
     }
 }
 
@@ -333,7 +350,7 @@ pub async fn consume_events(
         // activity. `run_id` is `None` only if `run_begin` itself failed; the
         // pipeline still runs, it just goes unrecorded.
         let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
-        let run_id = begin_webhook_run(&pool, &job_key, &ev.html_url).await;
+        let run_id = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
 
         // CLAUDE-85: Forgejo fires `action_run_failure` for every non-success
         // done status (`failure`, `cancelled`, `skipped`; bare `else` in
@@ -627,8 +644,16 @@ async fn source_log_token(
 /// Forgejo Actions run. Returns the run id, or `None` when `run_begin` failed
 /// (the pipeline still runs, just unrecorded). Failures are logged, not
 /// propagated: a DB hiccup must never strand the event consumer.
-async fn begin_webhook_run(pool: &SqlitePool, job_key: &str, html_url: &str) -> Option<i64> {
-    match state::run_begin(pool, WEBHOOK_MINT_ACTION, WEBHOOK_TRIGGERED_BY).await {
+///
+/// CLAUDE-220: `action` is a parameter so the comment listener records its runs
+/// through this same accounting rather than a forked copy.
+pub(crate) async fn begin_webhook_run(
+    pool: &SqlitePool,
+    action: &str,
+    job_key: &str,
+    html_url: &str,
+) -> Option<i64> {
+    match state::run_begin(pool, action, WEBHOOK_TRIGGERED_BY).await {
         Ok(id) => {
             if let Err(e) =
                 state::run_set_job_keys(pool, id, std::slice::from_ref(&job_key.to_string())).await
@@ -1237,7 +1262,7 @@ pub fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
 /// patterns (CLAUDE-79). The three literal forms and the case-sensitive,
 /// empty-denies-all semantics live in [`crate::config::repo_matches`], shared with
 /// the reconciler's `repos` and the per-repo log-token mapping (CLAUDE-200).
-fn repo_allowed(allowed: &[String], repo: &str) -> bool {
+pub(crate) fn repo_allowed(allowed: &[String], repo: &str) -> bool {
     crate::config::repo_matches(allowed, repo)
 }
 

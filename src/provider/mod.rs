@@ -376,6 +376,22 @@ pub trait Forge: Send + Sync {
     /// needed to resolve the repo.
     fn pr_ci_state(&self, host: &str, repo: &str, pr_number: u64) -> Result<String>;
 
+    /// CLAUDE-220: the commenter's EFFECTIVE repository permission on `repo` at
+    /// `host`, read live from the forge
+    /// (`fj repo collaborator <repo> permission <username> --format json`, whose
+    /// `permission` field is returned verbatim, e.g. `read` / `write` / `admin`).
+    /// Backs the `/claude` comment-command authorization gate, which accepts only
+    /// a permission in the source's configured `allowed_permissions`. An error is
+    /// a DENY at the call site (fail closed); no raw REST anywhere on this path.
+    /// The default errors so a backend without the read denies rather than
+    /// silently allowing.
+    fn repo_permission(&self, host: &str, repo: &str, username: &str) -> Result<String> {
+        let _ = (host, repo, username);
+        Err(Error::Other(anyhow::anyhow!(
+            "repo_permission not supported by this forge backend"
+        )))
+    }
+
     /// Post a comment on PR `pr_number` in `repo` on `host`, body read from
     /// `body_file` (`fj pr comment <repo>#<n> --body-file <path>`).
     fn pr_comment(
