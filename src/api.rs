@@ -184,10 +184,11 @@ async fn trigger_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AckResponse>, AppError> {
-    // CLAUDE-61: the synthetic `webhook-forgejo` action is event-driven; it has
-    // no input/prompt and the scheduler never dispatches it, so a manual trigger
-    // is meaningless. Reject it explicitly rather than 404 as "unknown".
-    if name == crate::web::webhooks::WEBHOOK_MINT_ACTION {
+    // CLAUDE-61 / CLAUDE-220: a synthetic action is event-driven; it has no
+    // input/prompt and the scheduler never dispatches it, so a manual trigger is
+    // meaningless. Reject it explicitly rather than 404 as "unknown". Both
+    // reserved names come from the one shared predicate.
+    if crate::web::is_synthetic_action(&name) {
         return Err(AppError {
             status: StatusCode::BAD_REQUEST,
             message: format!(
@@ -254,9 +255,9 @@ async fn delete_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AckResponse>, AppError> {
-    // CLAUDE-61: the synthetic `webhook-forgejo` action has no backing YAML to
-    // remove; refuse deletion explicitly.
-    if name == crate::web::webhooks::WEBHOOK_MINT_ACTION {
+    // CLAUDE-61 / CLAUDE-220: a synthetic action has no backing YAML to remove;
+    // refuse deletion explicitly, for every reserved name.
+    if crate::web::is_synthetic_action(&name) {
         return Err(AppError {
             status: StatusCode::FORBIDDEN,
             message: format!("`{name}` is a synthetic event-driven action and cannot be deleted"),
@@ -612,26 +613,74 @@ mod tests {
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
-    /// CLAUDE-61: the event-driven synthetic action cannot be triggered.
+    /// CLAUDE-220: the comment-webhook section round-trips over the JSON API at
+    /// `GET` / `PUT /api/settings/webhook_comment` and applies live on the handle
+    /// the listener routes against, with no daemon restart.
     #[tokio::test]
-    async fn trigger_rejects_synthetic_action() {
+    async fn webhook_comment_section_round_trips_and_applies_live() {
         let s = app_state().await;
-        let name = crate::web::webhooks::WEBHOOK_MINT_ACTION.to_string();
-        let err = trigger_action(State(s.clone()), AxumPath(name))
+        let cfg = s.settings.webhook_comment_handle();
+        let rate = s.settings.webhook_comment_rate_handle();
+        assert!(cfg.read().await.sources.is_empty());
+
+        let _ = put_settings_section(
+            State(s.clone()),
+            AxumPath("webhook_comment".into()),
+            r#"{"trigger":"/claude","max_instruction_chars":4000,
+               "sources":{"ng":{"secret_ref":"hmac","allowed_repos":["Contoso/*"],
+               "rate_limit_per_min":30,"write_token_ref":"write-pat"}}}"#
+                .to_string(),
+        )
+        .await
+        .expect("valid put");
+
+        // Live on BOTH shared handles: the routed sources and the limiters.
+        assert!(cfg.read().await.sources.contains_key("ng"));
+        assert!(rate.read().await.contains_key("ng"));
+
+        let resp = get_settings_section(State(s.clone()), AxumPath("webhook_comment".into()))
             .await
-            .expect_err("synthetic trigger must error");
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("event-driven"), "{}", err.message);
+            .expect("get");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Invalid payloads 400 and persist nothing.
+        for body in [r#"{"trigger":""}"#, r#"{"nope":true}"#] {
+            let err = put_settings_section(
+                State(s.clone()),
+                AxumPath("webhook_comment".into()),
+                body.to_string(),
+            )
+            .await
+            .expect_err("invalid put must 400");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        }
+        assert!(cfg.read().await.sources.contains_key("ng"));
     }
 
-    /// CLAUDE-61: the synthetic action cannot be deleted (no backing YAML).
+    /// CLAUDE-61 / CLAUDE-220: no event-driven synthetic action can be
+    /// triggered, for EVERY reserved name.
     #[tokio::test]
-    async fn delete_rejects_synthetic_action() {
+    async fn trigger_rejects_every_synthetic_action() {
         let s = app_state().await;
-        let name = crate::web::webhooks::WEBHOOK_MINT_ACTION.to_string();
-        let err = delete_action(State(s.clone()), AxumPath(name))
-            .await
-            .expect_err("synthetic delete must error");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        for name in crate::web::SYNTHETIC_ACTIONS {
+            let err = trigger_action(State(s.clone()), AxumPath(name.to_string()))
+                .await
+                .expect_err("synthetic trigger must error");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{name}");
+            assert!(err.message.contains("event-driven"), "{}", err.message);
+        }
+    }
+
+    /// CLAUDE-61 / CLAUDE-220: no synthetic action can be deleted (none has a
+    /// backing YAML).
+    #[tokio::test]
+    async fn delete_rejects_every_synthetic_action() {
+        let s = app_state().await;
+        for name in crate::web::SYNTHETIC_ACTIONS {
+            let err = delete_action(State(s.clone()), AxumPath(name.to_string()))
+                .await
+                .expect_err("synthetic delete must error");
+            assert_eq!(err.status, StatusCode::FORBIDDEN, "{name}");
+        }
     }
 }

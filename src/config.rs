@@ -273,6 +273,114 @@ impl Default for WebhookSource {
     }
 }
 
+/// CLAUDE-220: `/claude <instruction>` pull-request comment commands. A SECOND,
+/// independent listener from [`WebhookConfig`]: comment handling needs a WRITE
+/// token (post comments, push a branch) while the CI-failure sources need only a
+/// read-only log token, so the two credential kinds never share a config block.
+///
+/// DB-only from day one (settings key `config.webhook_comment`, edited on the web
+/// Settings page / via `PUT /api/settings/webhook_comment`). It is deliberately
+/// absent from [`OnDiskConfig`], so a `config.toml` declaring `[webhook_comment]`
+/// fails to parse as an unknown key, and there is no file-to-DB import path.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommentWebhookConfig {
+    /// Command prefix the first line of a comment must start with, e.g.
+    /// `/claude fix the clippy lint`. Configurable so an operator can rename the
+    /// command without a code change.
+    pub trigger: String,
+    /// Maximum accepted instruction length in characters. A longer body is
+    /// refused with a reply naming the limit rather than handed to the agent.
+    pub max_instruction_chars: usize,
+    /// Per-source comment endpoints, keyed by source name. The key is the
+    /// `<name>` path segment of `/webhooks/forgejo-comment/<name>`, read the same
+    /// way [`WebhookConfig::sources`] keys are. An empty map disables the
+    /// listener (no endpoints, fail closed).
+    pub sources: BTreeMap<String, CommentWebhookSource>,
+}
+
+impl Default for CommentWebhookConfig {
+    fn default() -> Self {
+        Self {
+            trigger: "/claude".to_string(),
+            max_instruction_chars: 4000,
+            sources: BTreeMap::new(),
+        }
+    }
+}
+
+impl CommentWebhookConfig {
+    /// Warn at load for any source name needing URL escaping, exactly as
+    /// [`WebhookConfig::warn_unusual_source_names`] does for the CI-failure
+    /// sources (same predicate, same reasoning).
+    pub fn warn_unusual_source_names(&self) {
+        for name in self.sources.keys() {
+            if !source_name_is_clean(name) {
+                tracing::warn!(
+                    source = %name,
+                    "comment webhook source name is not lowercase [a-z0-9_-]; the URL path segment will need escaping"
+                );
+            }
+        }
+    }
+}
+
+/// CLAUDE-220: one comment-webhook source. Same isolation model as
+/// [`WebhookSource`] (own HMAC secret, own allow-list, own rate bucket) plus the
+/// write-scoped PAT and the authorization / decision-gate knobs the comment
+/// pipeline needs.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommentWebhookSource {
+    /// Name of the secret holding this source's Forgejo webhook HMAC secret.
+    /// Unset means the endpoint fails closed and 401s every request.
+    pub secret_ref: Option<String>,
+    /// Allow-list of repo patterns, read by [`repo_matches`] (the same three
+    /// forms as the CI-failure sources; empty denies all).
+    pub allowed_repos: Vec<String>,
+    /// Fixed-window rate limit: max accepted requests per minute for this source.
+    pub rate_limit_per_min: u32,
+    /// Name of the secret holding a Forgejo PAT with WRITE scope. It authorizes
+    /// the commenter's permission read, the PR replies, and the branch push, and
+    /// reaches `fj` in a temp single-host `keys.json` carrying that one secret.
+    /// Unset means no command can be served (every delivery is refused).
+    pub write_token_ref: Option<String>,
+    /// Effective repository permissions that may run a command. Configurable
+    /// because Forgejo's role model keeps growing; adding a role is a settings
+    /// edit, not a code change. Matched case-insensitively.
+    pub allowed_permissions: Vec<String>,
+    /// Decision-gate cap: a working-tree diff touching more files than this is
+    /// commented on rather than pushed (the `forgejo-ci-fix` shape).
+    pub max_files: u64,
+    /// Decision-gate cap: a working-tree diff changing more lines than this is
+    /// commented on rather than pushed.
+    pub max_lines: u64,
+    /// Git identity the corrective commit is authored as.
+    pub bot_author: String,
+    /// Git email the corrective commit is authored as.
+    pub bot_email: String,
+    /// Marker appended to the commit message so the bot's own push does not
+    /// re-trigger the CI-fix action.
+    pub skip_marker: String,
+}
+
+impl Default for CommentWebhookSource {
+    fn default() -> Self {
+        Self {
+            secret_ref: None,
+            allowed_repos: Vec::new(),
+            rate_limit_per_min: 60,
+            write_token_ref: None,
+            allowed_permissions: vec!["write".to_string(), "admin".to_string()],
+            max_files: 10,
+            max_lines: 300,
+            bot_author: "claude-run".to_string(),
+            bot_email: "claude-run@a8n.run".to_string(),
+            skip_marker: "[skip claude]".to_string(),
+        }
+    }
+}
+
 /// CLAUDE-46: settings for minting (or updating) a YouTrack issue from a triaged
 /// failure. Lives in `config.toml` because the daemon's webhook consumer needs it
 /// at startup. Routing (CLAUDE-86) sends an issue to the project whose enabled VCS
@@ -803,6 +911,60 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("secret"));
+    }
+
+    // ---- CLAUDE-220: comment webhook section is DB-only --------------------
+
+    #[test]
+    fn comment_webhook_section_cannot_be_declared_in_config_toml() {
+        // The section is deliberately absent from `OnDiskConfig`, so
+        // `deny_unknown_fields` rejects it and names the offending key. There is
+        // no file-to-DB import path: the Settings page is the only source.
+        let err = toml::from_str::<OnDiskConfig>(
+            r#"
+            [webhook_comment]
+            trigger = "/claude"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("webhook_comment"),
+            "error names the section: {err}"
+        );
+    }
+
+    #[test]
+    fn comment_webhook_defaults_are_the_documented_ones() {
+        let d = CommentWebhookConfig::default();
+        assert_eq!(d.trigger, "/claude");
+        assert_eq!(d.max_instruction_chars, 4000);
+        assert!(d.sources.is_empty());
+        let s = CommentWebhookSource::default();
+        assert_eq!(s.allowed_permissions, vec!["write", "admin"]);
+        assert_eq!(s.rate_limit_per_min, 60);
+        assert!(s.secret_ref.is_none());
+        assert!(s.write_token_ref.is_none());
+        assert!(s.allowed_repos.is_empty(), "empty allow-list denies all");
+    }
+
+    #[test]
+    fn comment_webhook_section_round_trips_as_json() {
+        // The section is stored as a JSON settings document, so the serde shape
+        // (not TOML) is what has to round-trip.
+        let raw = r#"{"trigger":"/bot","max_instruction_chars":10,
+            "sources":{"ng":{"secret_ref":"s","allowed_repos":["Contoso/*"],
+            "write_token_ref":"w","allowed_permissions":["admin"]}}}"#;
+        let cfg: CommentWebhookConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(cfg.trigger, "/bot");
+        assert_eq!(cfg.max_instruction_chars, 10);
+        let src = &cfg.sources["ng"];
+        assert_eq!(src.write_token_ref.as_deref(), Some("w"));
+        assert_eq!(src.allowed_permissions, vec!["admin"]);
+        // Unset per-source fields fall back to the defaults.
+        assert_eq!(src.rate_limit_per_min, 60);
+        assert_eq!(src.max_files, 10);
+        // An unknown field is rejected (deny_unknown_fields), like every section.
+        assert!(serde_json::from_str::<CommentWebhookConfig>(r#"{"bogus":1}"#).is_err());
     }
 
     #[test]

@@ -1,20 +1,21 @@
 //! CLAUDE-101: runtime-tunable configuration stored in the DB instead of
 //! `config.toml`.
 //!
-//! The four sections that do NOT have to be known before the daemon binds -
-//! `[mint]`, `[update]`, `[webhook]`, and `[daemon].log_filter` - live as one
-//! JSON document each in the existing `settings` key/value table
-//! (`migrations/0001_init.sql`), keyed `config.mint` / `config.update` /
-//! `config.webhook` / `config.log_filter`. The serde structs in
+//! Every runtime-tunable section lives as one JSON document in the existing
+//! `settings` key/value table (`migrations/0001_init.sql`), keyed
+//! `config.<section>`; [`Section::ALL`] is the list. The serde structs in
 //! [`crate::config`] are the schema, so saving a section is exactly the
 //! file-parser's validation (`deny_unknown_fields`), and the web Settings page
 //! and the `/api/settings/<section>` JSON endpoints share this one path.
 //!
-//! `config.toml` keeps only bootstrap keys (`[web]`, `[daemon]` binary
-//! overrides). On serve start [`migrate_config_file`] imports any moved section
-//! still present in the file (once), then a later start that finds the section in
-//! BOTH the file and the DB refuses to run, naming the section - the
-//! CLAUDE-87-style breaking-migration signal that prevents two sources of truth.
+//! Four of them were MOVED out of `config.toml` (`[mint]`, `[update]`,
+//! `[webhook]`, `[daemon].log_filter`); the rest are DB-only from birth and have
+//! no import path at all. `config.toml` keeps only bootstrap keys (`[web]`,
+//! `[daemon]` binary overrides). On serve start [`migrate_config_file`] imports
+//! any MOVED section still present in the file (once), then a later start that
+//! finds one in BOTH the file and the DB refuses to run, naming the section -
+//! the CLAUDE-87-style breaking-migration signal that prevents two sources of
+//! truth.
 //!
 //! [`LiveSettings`] holds the runtime copy behind `RwLock`s shared with the
 //! webhook listener, the webhook consumer, and the mint context, so a save
@@ -31,14 +32,14 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
-    ConcurrencyConfig, DbRetentionConfig, MintConfig, OnDiskConfig, Paths, PreferencesConfig,
-    UpdateConfig, WebhookConfig, WorkdirGcConfig,
+    CommentWebhookConfig, ConcurrencyConfig, DbRetentionConfig, MintConfig, OnDiskConfig, Paths,
+    PreferencesConfig, UpdateConfig, WebhookConfig, WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
-use crate::web::webhooks::{build_rate_map, RateLimiter};
+use crate::web::webhooks::{build_rate_map, rate_map_from, RateLimiter};
 
-/// One of the four runtime-tunable config sections moved out of `config.toml`.
+/// One DB-backed runtime-tunable config section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Mint,
@@ -53,14 +54,18 @@ pub enum Section {
     Concurrency,
     /// CLAUDE-175: DB history-table retention window (Phase 6).
     DbRetention,
+    /// CLAUDE-220: `/claude` pull-request comment listener. DB-only from day one
+    /// (never a `config.toml` section, so `migrate_config_file` never touches it).
+    WebhookComment,
 }
 
 impl Section {
     /// Every section, in display order (used by the Settings page).
-    pub const ALL: [Section; 8] = [
+    pub const ALL: [Section; 9] = [
         Section::Mint,
         Section::Update,
         Section::Webhook,
+        Section::WebhookComment,
         Section::LogFilter,
         Section::WorkdirGc,
         Section::Preferences,
@@ -79,6 +84,7 @@ impl Section {
             Section::Preferences => "config.preferences",
             Section::Concurrency => "config.concurrency",
             Section::DbRetention => "config.db_retention",
+            Section::WebhookComment => "config.webhook_comment",
         }
     }
 
@@ -93,6 +99,7 @@ impl Section {
             Section::Preferences => "preferences",
             Section::Concurrency => "concurrency",
             Section::DbRetention => "db_retention",
+            Section::WebhookComment => "webhook_comment",
         }
     }
 
@@ -112,6 +119,7 @@ impl Section {
             Section::Preferences => "Display preferences",
             Section::Concurrency => "Concurrency",
             Section::DbRetention => "DB retention",
+            Section::WebhookComment => "Comment webhook",
         }
     }
 
@@ -125,6 +133,7 @@ impl Section {
             Section::Preferences => "live",
             Section::Concurrency => "next tick",
             Section::DbRetention => "next sweep",
+            Section::WebhookComment => "live",
         }
     }
 }
@@ -315,6 +324,9 @@ pub struct EffectiveRuntime {
     /// CLAUDE-175: DB history-table retention window. Brand-new section (never in
     /// `config.toml`), so the DB value or the built-in default (180 days).
     pub db_retention: DbRetentionConfig,
+    /// CLAUDE-220: `/claude` comment-command listener. DB-only from day one, so
+    /// there is no file fallback: the DB value or the built-in default.
+    pub webhook_comment: CommentWebhookConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
@@ -345,6 +357,9 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
     let db_retention = get_json::<DbRetentionConfig>(pool, Section::DbRetention.key())
         .await?
         .unwrap_or_default();
+    let webhook_comment = get_json::<CommentWebhookConfig>(pool, Section::WebhookComment.key())
+        .await?
+        .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
         update,
@@ -354,6 +369,7 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
         preferences,
         concurrency,
         db_retention,
+        webhook_comment,
     })
 }
 
@@ -556,6 +572,10 @@ pub struct LiveSettings {
     preferences: Arc<RwLock<PreferencesConfig>>,
     concurrency: Arc<RwLock<ConcurrencyConfig>>,
     db_retention: Arc<RwLock<DbRetentionConfig>>,
+    /// CLAUDE-220: live comment-webhook config + its own per-source limiter map,
+    /// rebuilt in lock-step on save exactly like the `webhook` section.
+    webhook_comment: Arc<RwLock<CommentWebhookConfig>>,
+    webhook_comment_rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
 }
 
 impl LiveSettings {
@@ -564,6 +584,7 @@ impl LiveSettings {
     /// already applied), unless `log_apply` is `None` (env wins / no handle).
     pub fn new(pool: SqlitePool, eff: EffectiveRuntime, log_apply: Option<LogFilterApply>) -> Self {
         let webhook_rate = build_rate_map(&eff.webhook);
+        let webhook_comment_rate = comment_rate_map(&eff.webhook_comment);
         // CLAUDE-154: seed the process-global snapshot the Askama `datetime`
         // filter reads, so display formatting is live from startup.
         set_preferences_snapshot(eff.preferences.clone());
@@ -579,6 +600,8 @@ impl LiveSettings {
             preferences: Arc::new(RwLock::new(eff.preferences)),
             concurrency: Arc::new(RwLock::new(eff.concurrency)),
             db_retention: Arc::new(RwLock::new(eff.db_retention)),
+            webhook_comment: Arc::new(RwLock::new(eff.webhook_comment)),
+            webhook_comment_rate: Arc::new(RwLock::new(webhook_comment_rate)),
         };
         if let (Some(apply), Some(filter)) = (s.log_apply.as_ref(), eff.log_filter.as_ref()) {
             match apply(filter) {
@@ -610,6 +633,17 @@ impl LiveSettings {
     /// Shared handle to the live per-source rate-limiter map.
     pub fn webhook_rate_handle(&self) -> Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>> {
         self.webhook_rate.clone()
+    }
+
+    /// CLAUDE-220: shared handle to the live comment-webhook config, read per
+    /// request by the comment listener so a Settings save routes immediately.
+    pub fn webhook_comment_handle(&self) -> Arc<RwLock<CommentWebhookConfig>> {
+        self.webhook_comment.clone()
+    }
+
+    /// CLAUDE-220: shared handle to the live comment per-source limiter map.
+    pub fn webhook_comment_rate_handle(&self) -> Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>> {
+        self.webhook_comment_rate.clone()
     }
 
     /// CLAUDE-106: shared handle to the live workdir-GC config, read by the
@@ -651,6 +685,7 @@ impl LiveSettings {
             Section::Preferences => to_pretty(&*self.preferences.read().await),
             Section::Concurrency => to_pretty(&*self.concurrency.read().await),
             Section::DbRetention => to_pretty(&*self.db_retention.read().await),
+            Section::WebhookComment => to_pretty(&*self.webhook_comment.read().await),
         }
     }
 
@@ -727,9 +762,45 @@ impl LiveSettings {
                 set_json(&self.pool, section.key(), &v).await?;
                 *self.db_retention.write().await = v;
             }
+            Section::WebhookComment => {
+                let v: CommentWebhookConfig = parse(json)?;
+                validate_comment_webhook(&v).map_err(SaveError::Invalid)?;
+                v.warn_unusual_source_names();
+                set_json(&self.pool, section.key(), &v).await?;
+                // Same live-apply as the `webhook` section: rebuild the limiters
+                // from the new map, then swap the config the handler routes on.
+                *self.webhook_comment_rate.write().await = comment_rate_map(&v);
+                *self.webhook_comment.write().await = v;
+            }
         }
         Ok(())
     }
+}
+
+/// CLAUDE-220: per-source limiter map for the comment listener, built through the
+/// SHARED [`rate_map_from`] so both listeners keep identical bucket semantics.
+fn comment_rate_map(cfg: &CommentWebhookConfig) -> HashMap<String, Mutex<RateLimiter>> {
+    rate_map_from(cfg.sources.iter().map(|(n, s)| (n, s.rate_limit_per_min)))
+}
+
+/// CLAUDE-220: validate a [`CommentWebhookConfig`] before it is persisted. An
+/// empty trigger would match every comment and a zero instruction cap would
+/// refuse every command, so both are rejected rather than stored.
+pub fn validate_comment_webhook(cfg: &CommentWebhookConfig) -> std::result::Result<(), String> {
+    if cfg.trigger.trim().is_empty() {
+        return Err("trigger must not be empty".to_string());
+    }
+    if cfg.max_instruction_chars == 0 {
+        return Err("max_instruction_chars must be >= 1".to_string());
+    }
+    for (name, src) in &cfg.sources {
+        if src.allowed_permissions.is_empty() {
+            return Err(format!(
+                "source `{name}`: allowed_permissions must not be empty (it would deny everyone)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse<T: DeserializeOwned>(json: &str) -> std::result::Result<T, SaveError> {
@@ -766,6 +837,7 @@ mod tests {
             preferences: PreferencesConfig::default(),
             concurrency: ConcurrencyConfig::default(),
             db_retention: DbRetentionConfig::default(),
+            webhook_comment: CommentWebhookConfig::default(),
         }
     }
 
@@ -854,6 +926,94 @@ mod tests {
         // The handler routes against this exact map, so the new source is live.
         assert!(cfg.read().await.sources.contains_key("ng"));
         assert!(rate.read().await.contains_key("ng"));
+    }
+
+    // ---- CLAUDE-220: comment webhook section ------------------------------
+
+    #[tokio::test]
+    async fn comment_webhook_save_swaps_config_and_rebuilds_limiters() {
+        // The listener routes against these exact handles, so a Settings save is
+        // live with no daemon restart (same contract as the `webhook` section).
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+        let cfg = live.webhook_comment_handle();
+        let rate = live.webhook_comment_rate_handle();
+        assert!(cfg.read().await.sources.is_empty());
+        assert!(rate.read().await.is_empty());
+
+        live.save_section(
+            Section::WebhookComment,
+            r#"{"trigger":"/claude","max_instruction_chars":4000,
+               "sources":{"ng":{"secret_ref":"hmac","allowed_repos":["Contoso/*"],
+               "rate_limit_per_min":120,"write_token_ref":"write-pat"}}}"#,
+        )
+        .await
+        .unwrap();
+
+        assert!(cfg.read().await.sources.contains_key("ng"));
+        assert!(rate.read().await.contains_key("ng"));
+        // Persisted under the documented DB key.
+        let stored: crate::config::CommentWebhookConfig =
+            get_json(&pool, Section::WebhookComment.key())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored.sources["ng"].rate_limit_per_min, 120);
+        assert_eq!(Section::WebhookComment.key(), "config.webhook_comment");
+        assert_eq!(Section::WebhookComment.as_path(), "webhook_comment");
+        assert_eq!(
+            Section::from_path("webhook_comment"),
+            Some(Section::WebhookComment)
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_webhook_save_rejects_degenerate_config() {
+        let pool = pool().await;
+        let live = LiveSettings::detached(pool.clone());
+        for (json, needle) in [
+            (r#"{"trigger":"  "}"#, "trigger"),
+            (r#"{"max_instruction_chars":0}"#, "max_instruction_chars"),
+            (
+                r#"{"sources":{"ng":{"allowed_permissions":[]}}}"#,
+                "allowed_permissions",
+            ),
+            (r#"{"bogus":1}"#, "bogus"),
+        ] {
+            let err = live
+                .save_section(Section::WebhookComment, json)
+                .await
+                .expect_err("must reject");
+            match err {
+                SaveError::Invalid(m) => assert!(m.contains(needle), "{m}"),
+                other => panic!("expected Invalid, got {other}"),
+            }
+        }
+        // Nothing was persisted by any rejected save.
+        assert!(get_raw(&pool, Section::WebhookComment.key())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn comment_webhook_is_never_imported_from_config_toml() {
+        // DB-only from day one: the migration has no arm for it, so a file that
+        // somehow carries the table leaves the DB key absent (and the file itself
+        // fails `OnDiskConfig` parsing, covered in `config.rs`).
+        let pool = pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::write(
+            paths.config_file(),
+            "[web]\nbind = \"127.0.0.1\"\n\n[webhook_comment]\ntrigger = \"/claude\"\n",
+        )
+        .unwrap();
+        migrate_config_file(&pool, &paths).await.unwrap();
+        assert!(get_raw(&pool, Section::WebhookComment.key())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
