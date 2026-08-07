@@ -1471,6 +1471,45 @@ impl Forge for CliBackend {
         Ok(())
     }
 
+    fn repo_permission(&self, host: &str, repo: &str, username: &str) -> Result<String> {
+        // CLAUDE-220: `fj repo collaborator <owner>/<repo> permission <user>
+        // --format json` answers `{"username":..,"permission":..,"role_name":..}`.
+        // Only `permission` is consumed; the finer-grained `role_name` is left
+        // for a future allow-list without changing this call.
+        let args = [
+            "--host",
+            host,
+            "repo",
+            "collaborator",
+            repo,
+            "permission",
+            username,
+            "--format",
+            "json",
+        ];
+        let out = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        let stdout = Self::checked(&self.fj, out, &args)?;
+        #[derive(Deserialize)]
+        struct Collaborator {
+            #[serde(default)]
+            permission: String,
+        }
+        let parsed: Collaborator = Self::parse_json(
+            &self.fj,
+            "fj repo collaborator permission --format json",
+            stdout.trim(),
+        )?;
+        if parsed.permission.trim().is_empty() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "`{} repo collaborator {repo} permission {username}` returned no `permission` field",
+                self.fj
+            )));
+        }
+        Ok(parsed.permission.trim().to_string())
+    }
+
     fn pr_comment(&self, host: &str, repo: &str, pr_number: u64, body_file: &Path) -> Result<()> {
         let id = format!("{repo}#{pr_number}");
         let body = body_file.to_string_lossy();
@@ -3448,6 +3487,68 @@ mod tests {
                 == "fj --host dev.a8n.run pr comment contoso/claude-run#52 --body-file /tmp/body.md"),
             "{calls:?}"
         );
+    }
+
+    /// CLAUDE-220: the comment-command authorization gate reads the commenter's
+    /// effective permission through `fj repo collaborator ... --format json` and
+    /// nothing else (no raw REST). A failing lookup surfaces as an error so the
+    /// caller can deny.
+    #[test]
+    fn repo_permission_reads_the_collaborator_permission() {
+        let args = [
+            "--host",
+            "dev.a8n.run",
+            "repo",
+            "collaborator",
+            "contoso/claude-run",
+            "permission",
+            "alice",
+            "--format",
+            "json",
+        ];
+        let runner = std::sync::Arc::new(StubRunner::new().ok(
+            "fj",
+            &args,
+            r#"{"username":"alice","permission":"write","role_name":"write"}"#,
+        ));
+        let b = CliBackend::new(runner.clone());
+        assert_eq!(
+            b.repo_permission("dev.a8n.run", "contoso/claude-run", "alice")
+                .unwrap(),
+            "write"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c
+                == "fj --host dev.a8n.run repo collaborator contoso/claude-run permission alice --format json"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn repo_permission_errors_when_the_lookup_fails() {
+        // A non-collaborator / unreadable repo makes `fj` exit non-zero; the gate
+        // treats that as a DENY, so the error must propagate rather than default.
+        let runner = std::sync::Arc::new(StubRunner::new().fail(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "repo",
+                "collaborator",
+                "contoso/claude-run",
+                "permission",
+                "mallory",
+                "--format",
+                "json",
+            ],
+            1,
+            "not found",
+        ));
+        let b = CliBackend::new(runner);
+        assert!(b
+            .repo_permission("dev.a8n.run", "contoso/claude-run", "mallory")
+            .is_err());
     }
 
     #[test]

@@ -35,6 +35,7 @@ use crate::claude::ClaudeInvoker;
 use crate::config::Paths;
 use crate::state;
 
+pub mod comment_webhooks;
 pub mod native_forms;
 pub mod webhooks;
 
@@ -66,13 +67,23 @@ pub struct WebState {
     /// read-only `webhook-forgejo` action so its runs are visible; when false
     /// the entry is absent (historical runs stay queryable on the dashboard).
     pub webhook_enabled: bool,
+    /// CLAUDE-220: whether the `/claude` comment listener has at least one
+    /// configured source. When true the web layer injects the synthetic
+    /// read-only `webhook-forgejo-comment` action alongside `webhook-forgejo`.
+    pub comment_webhook_enabled: bool,
 }
 
-pub fn router(api: Arc<AppState>, paths: Paths, webhook_enabled: bool) -> Router {
+pub fn router(
+    api: Arc<AppState>,
+    paths: Paths,
+    webhook_enabled: bool,
+    comment_webhook_enabled: bool,
+) -> Router {
     let st = WebState {
         api,
         paths,
         webhook_enabled,
+        comment_webhook_enabled,
     };
     Router::new()
         .route("/", get(dashboard))
@@ -438,6 +449,7 @@ fn build_duration_chart(series: &[(String, i64)]) -> DurationChart {
 async fn enriched_actions(
     pool: &SqlitePool,
     webhook_enabled: bool,
+    comment_webhook_enabled: bool,
 ) -> Result<Vec<ActionView>, WebError> {
     let rows = state::action_index_list(pool).await?;
     let mut out = Vec::with_capacity(rows.len() + 1);
@@ -468,7 +480,12 @@ async fn enriched_actions(
     // dashboard / action-detail surfaces other actions have. It has no backing
     // YAML and is never indexed in the `actions` table; it lives only here.
     if webhook_enabled {
-        out.push(synthetic_webhook_action(pool).await?);
+        out.push(synthetic_action_view(pool, webhooks::WEBHOOK_MINT_ACTION).await?);
+    }
+    // CLAUDE-220: the same treatment for the `/claude` comment listener, so both
+    // event-driven listeners surface (and pause) like any other action.
+    if comment_webhook_enabled {
+        out.push(synthetic_action_view(pool, comment_webhooks::WEBHOOK_COMMENT_ACTION).await?);
     }
     Ok(out)
 }
@@ -483,8 +500,8 @@ async fn enriched_actions(
 /// `paused_actions` row like every other action, so the dashboard shows a
 /// Paused badge and the Pause/Resume controls act on it; a paused delivery is
 /// accepted-and-dropped by the inbound endpoint.
-async fn synthetic_webhook_action(pool: &SqlitePool) -> Result<ActionView, WebError> {
-    let name = webhooks::WEBHOOK_MINT_ACTION.to_string();
+async fn synthetic_action_view(pool: &SqlitePool, name: &str) -> Result<ActionView, WebError> {
+    let name = name.to_string();
     let last = state::action_last_run_started(pool, &name).await?;
     let paused = state::action_pause_status(pool, &name)
         .await?
@@ -509,8 +526,29 @@ async fn synthetic_webhook_action(pool: &SqlitePool) -> Result<ActionView, WebEr
 
 /// CLAUDE-61: true for the reserved synthetic action name. Mutating endpoints
 /// (edit / export / delete) reject it: it has no backing YAML to operate on.
-fn is_synthetic_action(name: &str) -> bool {
-    name == webhooks::WEBHOOK_MINT_ACTION
+pub fn is_synthetic_action(name: &str) -> bool {
+    SYNTHETIC_ACTIONS.contains(&name)
+}
+
+/// CLAUDE-61 / CLAUDE-220: every reserved synthetic action name, in ONE place.
+/// The daemon's scan guard, the API's trigger / delete rejections, and the web
+/// layer's edit / export / delete rejections all read this set, so a new
+/// event-driven listener is reserved everywhere by adding one entry here.
+pub const SYNTHETIC_ACTIONS: &[&str] = &[
+    webhooks::WEBHOOK_MINT_ACTION,
+    comment_webhooks::WEBHOOK_COMMENT_ACTION,
+];
+
+/// CLAUDE-220: true when `name` is a synthetic action whose listener is actually
+/// configured this run, so the action-detail / durations pages render it instead
+/// of 404ing. An unconfigured listener keeps its historical runs queryable but
+/// has no live entry.
+fn synthetic_enabled(s: &WebState, name: &str) -> bool {
+    match name {
+        n if n == webhooks::WEBHOOK_MINT_ACTION => s.webhook_enabled,
+        n if n == comment_webhooks::WEBHOOK_COMMENT_ACTION => s.comment_webhook_enabled,
+        _ => false,
+    }
 }
 
 /// CLAUDE-61: a 403 response rejecting a mutating operation on the synthetic
@@ -1118,7 +1156,7 @@ async fn dashboard(
             paused_at: a,
             reason: r,
         });
-    let actions = enriched_actions(pool, s.webhook_enabled).await?;
+    let actions = enriched_actions(pool, s.webhook_enabled, s.comment_webhook_enabled).await?;
 
     // CLAUDE-141: whitelist the sort/filter selections before they reach SQL or
     // the page. `sort`/`dir`/`exit` are checked against fixed allow-lists; the
@@ -1260,7 +1298,7 @@ async fn action_detail(
     Query(q): Query<ActionDetailQuery>,
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
-    let actions = enriched_actions(pool, s.webhook_enabled).await?;
+    let actions = enriched_actions(pool, s.webhook_enabled, s.comment_webhook_enabled).await?;
     let Some(action) = actions.into_iter().find(|a| a.name == name) else {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
@@ -1331,7 +1369,7 @@ async fn action_durations(
     // 404 unknown actions cleanly; only names the daemon has indexed resolve.
     // CLAUDE-61: the synthetic webhook action is not indexed but charts its
     // recorded runs like any action, so accept it when webhook is configured.
-    let known_synthetic = s.webhook_enabled && is_synthetic_action(&name);
+    let known_synthetic = synthetic_enabled(&s, &name);
     if !known_synthetic && indexed_action_path(pool, &name).await?.is_none() {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     }
@@ -1627,7 +1665,7 @@ async fn action_events(
     let pool = &s.api.pool;
     // 404 unknown actions cleanly, like the durations chart: only names the
     // daemon has indexed (plus the synthetic webhook action) resolve.
-    let known_synthetic = s.webhook_enabled && is_synthetic_action(&name);
+    let known_synthetic = synthetic_enabled(&s, &name);
     if !known_synthetic && indexed_action_path(pool, &name).await?.is_none() {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     }
@@ -3284,6 +3322,23 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref.",
             },
         ],
+        WebhookComment => vec![
+            FieldDoc {
+                name: "trigger",
+                badge: "live",
+                note: "command prefix the first line of a PR comment must open with (default /claude).",
+            },
+            FieldDoc {
+                name: "max_instruction_chars",
+                badge: "live",
+                note: "longer instructions are refused with a reply naming the limit.",
+            },
+            FieldDoc {
+                name: "sources",
+                badge: "live",
+                note: "per-source secret_ref, allowed_repos, rate_limit_per_min, write_token_ref (WRITE scope), allowed_permissions, max_files, max_lines.",
+            },
+        ],
         LogFilter => vec![FieldDoc {
             name: "filter",
             badge: "live",
@@ -4660,11 +4715,11 @@ mod tests {
     // actions directory.
     mod editor {
         use super::super::{
-            action_create, action_delete, action_detail, action_edit_save, action_events,
-            action_export, action_to_youtrack_form, youtrack_create, youtrack_edit_page,
-            youtrack_edit_save, youtrack_form_to_yaml, youtrack_new_page, ActionDetailQuery,
-            ActionEventsQuery, ActionForm, EventsView, WebState, YoutrackEditForm,
-            ACTION_EVENT_SUMMARY_LIMIT,
+            action_create, action_delete, action_detail, action_edit_page, action_edit_save,
+            action_events, action_export, action_to_youtrack_form, settings_page, settings_save,
+            youtrack_create, youtrack_edit_page, youtrack_edit_save, youtrack_form_to_yaml,
+            youtrack_new_page, ActionDetailQuery, ActionEventsQuery, ActionForm, EventsView,
+            SettingsForm, WebState, YoutrackEditForm, ACTION_EVENT_SUMMARY_LIMIT,
         };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
@@ -4713,6 +4768,7 @@ mod tests {
                 api,
                 paths,
                 webhook_enabled: false,
+                comment_webhook_enabled: false,
             }
         }
 
@@ -6085,7 +6141,7 @@ mod tests {
             let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION;
 
             // Webhook unconfigured: the synthetic entry is absent.
-            let without = super::super::enriched_actions(&s.api.pool, false)
+            let without = super::super::enriched_actions(&s.api.pool, false, false)
                 .await
                 .unwrap();
             assert!(
@@ -6094,7 +6150,7 @@ mod tests {
             );
 
             // Webhook configured: a single read-only synthetic entry appears.
-            let with = super::super::enriched_actions(&s.api.pool, true)
+            let with = super::super::enriched_actions(&s.api.pool, true, false)
                 .await
                 .unwrap();
             let entry = with
@@ -6110,17 +6166,163 @@ mod tests {
         async fn synthetic_action_rejects_mutations() {
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
-            let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION.to_string();
 
-            // Export, edit, and delete all 403 the synthetic name (no YAML backs it).
-            let export = action_export(State(s.clone()), AxumPath(synthetic.clone()))
+            // CLAUDE-220: export, edit, and delete all 403 EVERY reserved
+            // synthetic name (no YAML backs any of them).
+            for synthetic in crate::web::SYNTHETIC_ACTIONS {
+                let export = action_export(State(s.clone()), AxumPath(synthetic.to_string()))
+                    .await
+                    .unwrap();
+                assert_eq!(export.status(), StatusCode::FORBIDDEN, "{synthetic}");
+                let edit = action_edit_page(State(s.clone()), AxumPath(synthetic.to_string()))
+                    .await
+                    .unwrap();
+                assert_eq!(edit.status(), StatusCode::FORBIDDEN, "{synthetic}");
+                let del = action_delete(State(s.clone()), AxumPath(synthetic.to_string()))
+                    .await
+                    .unwrap();
+                assert_eq!(del.status(), StatusCode::FORBIDDEN, "{synthetic}");
+            }
+        }
+
+        /// CLAUDE-220: the `Comment webhook` section renders on `/settings` and a
+        /// POST to `/settings/webhook_comment` saves it, so the section is editable
+        /// in the app (the JSON API round-trip is covered in `api.rs`).
+        #[tokio::test]
+        async fn settings_page_renders_and_saves_the_comment_webhook_section() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let page = settings_page(State(s.clone())).await.unwrap();
+            assert_eq!(page.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(page.into_body(), usize::MAX)
                 .await
                 .unwrap();
-            assert_eq!(export.status(), StatusCode::FORBIDDEN);
-            let del = action_delete(State(s.clone()), AxumPath(synthetic.clone()))
+            let html = String::from_utf8_lossy(&body);
+            assert!(
+                html.contains("Comment webhook"),
+                "the section card is rendered"
+            );
+            assert!(html.contains("/settings/webhook_comment"), "with its form");
+            assert!(html.contains("write_token_ref"), "and its field reference");
+
+            // Saving persists through the same live-settings path every section
+            // uses, so the listener routes the new source without a restart.
+            let form = Form(SettingsForm {
+                json: r#"{"trigger":"/claude","max_instruction_chars":4000,
+                    "sources":{"ng":{"secret_ref":"hmac","allowed_repos":["Contoso/*"],
+                    "write_token_ref":"write-pat"}}}"#
+                    .to_string(),
+            });
+            let saved = settings_save(
+                State(s.clone()),
+                AxumPath("webhook_comment".to_string()),
+                form,
+            )
+            .await
+            .unwrap();
+            assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+            assert!(s
+                .api
+                .settings
+                .webhook_comment_handle()
+                .read()
+                .await
+                .sources
+                .contains_key("ng"));
+
+            // An invalid payload is rejected inline and persists nothing.
+            let bad = settings_save(
+                State(s.clone()),
+                AxumPath("webhook_comment".to_string()),
+                Form(SettingsForm {
+                    json: r#"{"trigger":""}"#.to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(s
+                .api
+                .settings
+                .webhook_comment_handle()
+                .read()
+                .await
+                .sources
+                .contains_key("ng"));
+        }
+
+        /// CLAUDE-220: the comment listener gets its own synthetic entry, injected
+        /// on the same rule (at least one configured source) and independent of
+        /// the CI-failure listener's.
+        #[tokio::test]
+        async fn comment_listener_has_its_own_synthetic_entry() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let comment = crate::web::comment_webhooks::WEBHOOK_COMMENT_ACTION;
+            let failure = crate::web::webhooks::WEBHOOK_MINT_ACTION;
+
+            // Neither configured: no synthetic entries at all.
+            let none = super::super::enriched_actions(&s.api.pool, false, false)
                 .await
                 .unwrap();
-            assert_eq!(del.status(), StatusCode::FORBIDDEN);
+            assert!(!none.iter().any(|a| a.name == comment));
+
+            // Only the comment listener configured: only its entry appears.
+            let only_comment = super::super::enriched_actions(&s.api.pool, false, true)
+                .await
+                .unwrap();
+            assert!(
+                !only_comment.iter().any(|a| a.name == failure),
+                "the CI-failure entry must not ride along"
+            );
+            let entry = only_comment
+                .iter()
+                .find(|a| a.name == comment)
+                .expect("comment synthetic action present");
+            assert!(entry.synthetic);
+            assert!(entry.enabled, "event-driven actions show as enabled");
+            assert!(entry.schedule_kind.is_none(), "event-driven: no schedule");
+
+            // Both configured: both entries appear.
+            let both = super::super::enriched_actions(&s.api.pool, true, true)
+                .await
+                .unwrap();
+            assert!(both.iter().any(|a| a.name == comment));
+            assert!(both.iter().any(|a| a.name == failure));
+        }
+
+        /// CLAUDE-220: Pause / Resume works on the comment listener exactly like
+        /// on the CI-failure one (the shared `paused_actions` row drives both the
+        /// badge here and the accept-and-drop in the endpoint).
+        #[tokio::test]
+        async fn comment_synthetic_action_reflects_pause_state() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let comment = crate::web::comment_webhooks::WEBHOOK_COMMENT_ACTION;
+
+            state::action_pause_set(&s.api.pool, comment, Some("maintenance"))
+                .await
+                .unwrap();
+            let paused = super::super::enriched_actions(&s.api.pool, false, true)
+                .await
+                .unwrap();
+            let entry = paused.iter().find(|a| a.name == comment).unwrap();
+            let info = entry.paused.as_ref().expect("paused badge shown");
+            assert_eq!(info.reason.as_deref(), Some("maintenance"));
+
+            state::action_pause_clear(&s.api.pool, comment)
+                .await
+                .unwrap();
+            let resumed = super::super::enriched_actions(&s.api.pool, false, true)
+                .await
+                .unwrap();
+            assert!(resumed
+                .iter()
+                .find(|a| a.name == comment)
+                .unwrap()
+                .paused
+                .is_none());
         }
 
         #[tokio::test]
@@ -6133,7 +6335,7 @@ mod tests {
             let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION;
 
             // Unpaused: the synthetic entry reports no pause.
-            let before = super::super::enriched_actions(&s.api.pool, true)
+            let before = super::super::enriched_actions(&s.api.pool, true, false)
                 .await
                 .unwrap();
             let entry = before.iter().find(|a| a.name == synthetic).unwrap();
@@ -6143,7 +6345,7 @@ mod tests {
             state::action_pause_set(&s.api.pool, synthetic, Some("maintenance"))
                 .await
                 .unwrap();
-            let paused = super::super::enriched_actions(&s.api.pool, true)
+            let paused = super::super::enriched_actions(&s.api.pool, true, false)
                 .await
                 .unwrap();
             let entry = paused.iter().find(|a| a.name == synthetic).unwrap();
@@ -6154,7 +6356,7 @@ mod tests {
             state::action_pause_clear(&s.api.pool, synthetic)
                 .await
                 .unwrap();
-            let after = super::super::enriched_actions(&s.api.pool, true)
+            let after = super::super::enriched_actions(&s.api.pool, true, false)
                 .await
                 .unwrap();
             let entry = after.iter().find(|a| a.name == synthetic).unwrap();
@@ -6176,7 +6378,12 @@ mod tests {
             std::fs::write(&file, "name: youtrack\nkind: youtrack\nnative: {}\n").unwrap();
             index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
 
-            let app = super::super::router(s.api.clone(), s.paths.clone(), s.webhook_enabled);
+            let app = super::super::router(
+                s.api.clone(),
+                s.paths.clone(),
+                s.webhook_enabled,
+                s.comment_webhook_enabled,
+            );
             let resp = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -6772,6 +6979,7 @@ mod tests {
                 api,
                 paths,
                 webhook_enabled: false,
+                comment_webhook_enabled: false,
             }
         }
 
@@ -7022,6 +7230,7 @@ mod tests {
                     runtime_dir: "/tmp/x/runtime".into(),
                 },
                 webhook_enabled: false,
+                comment_webhook_enabled: false,
             }
         }
 
