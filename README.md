@@ -50,8 +50,13 @@ at gather time by the repo-access preflight, which probes one read per category 
 missing scope is named before a Claude run is paid for. If the open-PR lookup fails anyway (a mid-run permission
 change, or a transient forge error) the runner creates the PR instead of failing the run, logging a `warn` run event
 with the CLI error. The read-only log-fetch token
-(`log_token_ref`, used by the CI-failure actions) needs only `read:repository`. Per-command breakdown with the endpoint
-each call maps to: `actions/SCHEMA.md`, "Forgejo token scopes".
+(`log_token_ref`, used by the CI-failure actions) needs only `read:repository`. The comment-command token
+(`write_token_ref`, CLAUDE-220) is a third, separate credential: it reads the commenter's effective repository
+permission (`fj repo collaborator ... permission`), posts the PR replies, and authenticates the branch push, so it needs
+`write:repository` plus `write:issue` (PR comments go through the issues API). Keeping it in its own settings section is
+the whole reason the comment listener is a separate section from `webhook`: the CI-failure sources never hold a
+write-scoped token. Per-command breakdown with the endpoint each call maps to: `actions/SCHEMA.md`, "Forgejo token
+scopes".
 
 ## Use
 
@@ -200,14 +205,17 @@ configuration.
 Each section is one JSON document validated against the same serde struct the file parser used (`deny_unknown_fields`),
 so an invalid edit is rejected inline with the parser's own error and nothing is persisted. Secret values are never
 shown or stored on the page: fields ending in `_ref` (`auth_token_ref`, a webhook source's `secret_ref` /
-`log_token_ref`, `[update].token_ref`) name a credential in the Secrets store and are rendered as that name only. Each
+`log_token_ref`, a comment source's `write_token_ref`, `[update].token_ref`) name a credential in the Secrets store and
+are rendered as that name only. Each
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
 secret refs, adding a source), `next event` for mint / update, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
-`GET` / `PUT /api/settings/{mint,update,webhook,log_filter,workdir_gc,preferences,concurrency,db_retention}`. The
-`workdir_gc` (CLAUDE-106), `preferences` (CLAUDE-154), `concurrency` (CLAUDE-162), and `db_retention` (CLAUDE-175)
-sections are DB-only from birth (never `config.toml` keys), so they are not part of the one-time import below; each
-simply defaults until edited.
+`GET` / `PUT /api/settings/{mint,update,webhook,webhook_comment,log_filter,workdir_gc,preferences,concurrency,db_retention}`.
+The `webhook_comment` (CLAUDE-220), `workdir_gc` (CLAUDE-106), `preferences` (CLAUDE-154), `concurrency` (CLAUDE-162),
+and `db_retention` (CLAUDE-175) sections are DB-only from birth (never `config.toml` keys), so they are not part of the
+one-time import below; each simply defaults until edited. `webhook_comment` is additionally rejected by the file parser:
+a `config.toml` declaring `[webhook_comment]` fails to start with serde's unknown-field error naming the section, so
+there is no way to end up with two sources of truth for it.
 
 **One-time import, then breaking.** The first daemon start after upgrading imports any of the four moved sections still
 present in `config.toml` into the database and logs a warning naming each one and telling you to remove it from the
@@ -650,6 +658,71 @@ migration signal. To switch from the single SITE-level system webhook to one ORG
 4. Delete the SITE-level system webhook (and any old per-repo pilot webhook).
 5. Verify: one failing run per org produces a `verified action_run_failure received` log line carrying the right`source`
    field. The old shared secret can be deleted after a burn-in period.
+
+## Comment commands on a pull request (CLAUDE-220)
+
+A second inbound listener turns a `/claude <instruction>` comment on a Forgejo pull request into a bounded Claude run
+against that PR's head branch. The endpoint is `POST /webhooks/forgejo-comment/<source>`, served alongside (and
+independently of) the CI-failure webhook above.
+
+It is a SEPARATE listener, section, and synthetic action rather than a second event type on `webhook-forgejo`, because
+the credentials differ in kind: comment handling needs a WRITE token (post replies, push a branch) while the CI-failure
+sources need only a read-only log token. Separate sections keep the write token out of the block holding the read-only
+one, and each listener gets its own Pause switch. What the two DO share, by reference rather than by copy: HMAC
+verification, the single replay-store instance (so one `X-Forgejo-Delivery` id fanned out to both endpoints is still
+caught), the per-source rate-limiter type and builder, and the `owner/repo` allow-list matcher.
+
+**Request pipeline**, in the same order as the CI-failure endpoint: unknown source `404` -> per-source rate limit `429`
+-> missing / unresolvable `secret_ref` `401` -> bad or missing signature `401` -> missing `X-Forgejo-Delivery` `400` ->
+replayed delivery id `409` -> Pause check (accept-and-drop with `2xx`) -> parse. Every post-authentication drop is acked
+with `2xx` (so Forgejo does not retry) and logged with its reason: a comment `action` other than `created`, a comment
+that is not on a pull request, a repo outside `allowed_repos`, a first line that does not open with the trigger, or an
+author in the mint config's loop-safety `bot_logins` (so the bot's own reply can never re-trigger a run).
+
+**Trigger.** The FIRST line of the comment, trimmed, must start with the configured `trigger` (default `/claude`)
+followed by whitespace or end-of-line; everything after it on that line plus the remaining lines is the instruction.
+`/claude help` (and a bare `/claude`) replies with usage and runs nothing, counting no attempt. An instruction over
+`max_instruction_chars` (default 4000) is refused with a reply naming the limit. An edited or deleted comment does
+nothing: re-running work from an edit expresses no new human intent, so post a new comment instead. Plain (non-PR)
+issue comments are out of scope here and are tracked in CLAUDE-221.
+
+**Authorization** is a LIVE read of the commenter's effective repository permission through
+`fj repo collaborator <owner>/<repo> permission <username> --format json` (a new `Forge::repo_permission`; no raw REST
+anywhere on this path). The command runs only when the returned permission is in the source's `allowed_permissions`
+(default `["write", "admin"]`, matched case-insensitively and configurable because Forgejo's role model keeps growing).
+A permission lookup that ERRORS denies (fail closed) and replies "could not verify permission". A denied commenter gets
+ONE reply stating the required set, then the delivery is acked and dropped; denial replies are throttled per
+`(repo, login)` so a scripted denied commenter cannot flood a PR.
+
+**Execution** reuses the `forgejo-ci-fix` pipeline shape: shallow-clone the PR head branch, write the human's
+instruction VERBATIM to `.claude-run-instruction.md` in the checkout (it is never interpolated into a shell command or
+a command line: the agent is told to read the file), run Claude, then apply the decision gate. A run that made no
+changes, or whose diff exceeds the source's `max_files` / `max_lines`, is reported on the PR and nothing is pushed;
+within the caps the runner commits as the bot identity with the CI skip marker (so the push does not re-trigger
+`forgejo-ci-fix`) and pushes the branch. A PR comment is posted on EVERY outcome path: pushed, push failed, no changes,
+too big, and agent error.
+
+**Accounting and concurrency.** Runs are recorded under the synthetic action `webhook-forgejo-comment` with the same
+per-key attempt counter and daily run ledger every other action uses, so caps, the durations chart, and run history all
+work. The attempt key is `hash(repo, pr_number, comment_id)`, and because a comment is a one-shot request its effective
+per-key cap is one attempt: a redelivery of the same comment never runs the work twice. At most one comment job per
+`(repo, PR)` is in flight, through the daemon-wide key gate; a second command while one is running gets a reply saying
+so and is dropped.
+
+**Configuration** is the `Comment webhook` section on the Settings page (`GET` / `PUT
+/api/settings/webhook_comment`, DB key `config.webhook_comment`). Top level: `trigger`, `max_instruction_chars`, and
+`sources`. Per source: `secret_ref` (HMAC; unset means the endpoint `401`s everything), `allowed_repos` (the same three
+pattern forms as the CI-failure allow-list; empty denies all), `rate_limit_per_min`, `write_token_ref`,
+`allowed_permissions`, the `max_files` / `max_lines` decision-gate caps, and the commit identity (`bot_author`,
+`bot_email`, `skip_marker`). Source and rate-limiter changes apply live, with no daemon restart. The `write_token_ref`
+secret reaches `fj` exactly the way `log_token_ref` does: a temp single-host `keys.json` carrying that one secret and
+nothing else, removed when the command finishes. The token is never in YAML, never an env var in the daemon's own
+environment, never a process argument, and never rendered in a settings response.
+
+**Forgejo setup.** On the repo or org's Settings -> Webhooks, add a **Forgejo** webhook with URL
+`https://<daemon-host>/webhooks/forgejo-comment/<source>`, the Secret set to that source's stored `secret_ref` value,
+and **only** the Issue Comment event selected. Store the write PAT first, e.g.
+`printf %s '<pat>' | claude-run secret set forgejo-write-<org>`, and name it in the source's `write_token_ref`.
 
 ## Containerized deployment
 

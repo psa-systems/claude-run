@@ -81,6 +81,9 @@ impl Daemon {
         crate::settings::migrate_config_file(&pool, &self.paths).await?;
         let effective = crate::settings::effective(&pool, &self.on_disk).await?;
         let webhook_enabled = !effective.webhook.sources.is_empty();
+        // CLAUDE-220: the `/claude` comment listener is enabled by the same rule
+        // (at least one configured source) on its own DB-backed section.
+        let comment_webhook_enabled = !effective.webhook_comment.sources.is_empty();
         let replay_window_secs = effective.webhook.replay_window_secs;
         let settings = Arc::new(crate::settings::LiveSettings::new(
             pool.clone(),
@@ -171,7 +174,12 @@ impl Daemon {
         // is now any configured source (an empty `sources` map disables it).
         // CLAUDE-101: `webhook_enabled` reflects the effective (DB-resolved)
         // config at start.
-        let web_router = crate::web::router(api_state.clone(), self.paths.clone(), webhook_enabled);
+        let web_router = crate::web::router(
+            api_state.clone(),
+            self.paths.clone(),
+            webhook_enabled,
+            comment_webhook_enabled,
+        );
 
         // CLAUDE-43: Forgejo webhook listener. Verified `action_run_failure`
         // events are emitted onto a channel drained by `consume_events`, which
@@ -188,11 +196,28 @@ impl Daemon {
             replay_window_secs,
             webhook_tx,
         );
+        // CLAUDE-220: the `/claude` comment listener is a SECOND endpoint with
+        // its own config section, write-scoped token, and Pause switch. It shares
+        // the CI-failure listener's replay-store INSTANCE (so one delivery id
+        // fanned out to both endpoints is still caught) and reuses the mint
+        // config's loop-safety bot logins.
+        let (comment_tx, comment_rx) =
+            mpsc::channel::<crate::web::comment_webhooks::VerifiedCommentCommand>(64);
+        let comment_state = crate::web::comment_webhooks::CommentWebhookState::from_shared(
+            pool.clone(),
+            settings.webhook_comment_handle(),
+            settings.mint_handle(),
+            settings.webhook_comment_rate_handle(),
+            webhook_state.seen_handle(),
+            comment_tx,
+        );
         let webhook_router = crate::web::webhooks::router(webhook_state);
+        let comment_router = crate::web::comment_webhooks::router(comment_state);
 
         let tcp_app = axum::Router::new()
             .merge(web_router)
             .merge(webhook_router)
+            .merge(comment_router)
             .nest("/api", api_for_tcp);
 
         // CLAUDE-48 (Phase 5): gate the TCP surface (web UI + /api/*) behind a
@@ -251,6 +276,30 @@ impl Daemon {
             settings.webhook_handle(),
         ));
 
+        // CLAUDE-28: one daemon-wide key gate, shared across every dispatch, so
+        // two executions sharing a concurrency key never overlap even across a
+        // scheduled run and a manual trigger. CLAUDE-220: the comment consumer
+        // takes the same gate on its per-(repo, PR) key.
+        let keygate = KeyGate::new();
+
+        // CLAUDE-220: serve accepted `/claude` comment commands off the request
+        // path for the daemon's lifetime. Each command authorizes against a live
+        // permission read, then clones / runs / pushes / replies; the shared key
+        // gate keeps at most one comment job per (repo, PR) in flight.
+        let comment_ctx = Arc::new(crate::web::comment_webhooks::CommentContext {
+            pool: pool.clone(),
+            paths: self.paths.clone(),
+            claude: claude.clone(),
+            config: settings.webhook_comment_handle(),
+            defaults: crate::job::RunnerDefaults::default(),
+            keygate: keygate.clone(),
+            denials: Arc::new(crate::web::comment_webhooks::DenialReplyLimiter::new()),
+        });
+        let comment_consumer = tokio::spawn(crate::web::comment_webhooks::consume_commands(
+            comment_rx,
+            comment_ctx,
+        ));
+
         // CLAUDE-162: one daemon-wide concurrency limiter (global + per-action
         // semaphores), shared across every run so caps hold across overlapping
         // runs. The initial global cap is resolved from the concurrency setting
@@ -270,10 +319,7 @@ impl Daemon {
             snippet: Arc::new(snippet),
             claude: claude.clone(),
             in_flight,
-            // CLAUDE-28: one daemon-wide key gate, shared across every dispatch,
-            // so two executions sharing a concurrency key never overlap even
-            // across a scheduled run and a manual trigger.
-            keygate: KeyGate::new(),
+            keygate,
             runs,
             // CLAUDE-162: daemon-wide caps + continuous-pickup state.
             limiter,
@@ -366,6 +412,7 @@ impl Daemon {
             t.abort();
         }
         webhook_consumer.abort();
+        comment_consumer.abort();
         // pidfile lock released on drop
         let _ = std::fs::remove_file(&sock_path);
         Ok(())
@@ -785,16 +832,17 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
         }
         match action::load_from_path(&path) {
             Ok(la) => {
-                // CLAUDE-61: `webhook-forgejo` is a reserved synthetic action
-                // name the web layer injects for the event-driven webhook runs.
-                // An on-disk YAML claiming it would be editable / schedulable and
+                // CLAUDE-61 / CLAUDE-220: `webhook-forgejo` and
+                // `webhook-forgejo-comment` are reserved synthetic action names
+                // the web layer injects for the event-driven listeners. An
+                // on-disk YAML claiming one would be editable / schedulable and
                 // would collide with the synthetic entry, so refuse to index it.
-                if la.action.name == crate::web::webhooks::WEBHOOK_MINT_ACTION {
+                // The reserved set is the one shared predicate.
+                if crate::web::is_synthetic_action(&la.action.name) {
                     warn!(
                         path = %path.display(),
                         name = %la.action.name,
-                        "refusing to index action: `{}` is a reserved synthetic name",
-                        crate::web::webhooks::WEBHOOK_MINT_ACTION
+                        "refusing to index action: the name is reserved for a synthetic event-driven action"
                     );
                     continue;
                 }
@@ -833,13 +881,14 @@ pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("invalid");
-                // CLAUDE-61: same reservation as the parse-ok branch - never let a
-                // file (even an unparseable one) occupy the synthetic name's slot.
-                if stem == crate::web::webhooks::WEBHOOK_MINT_ACTION {
+                // CLAUDE-61 / CLAUDE-220: same reservation as the parse-ok
+                // branch - never let a file (even an unparseable one) occupy a
+                // synthetic name's slot.
+                if crate::web::is_synthetic_action(stem) {
                     warn!(
                         path = %path.display(),
-                        "refusing to index file: `{}` is a reserved synthetic name",
-                        crate::web::webhooks::WEBHOOK_MINT_ACTION
+                        name = stem,
+                        "refusing to index file: the name is reserved for a synthetic event-driven action"
                     );
                     continue;
                 }
@@ -1663,33 +1712,47 @@ mod tests {
         assert_eq!(runs, 1, "run history is retained across a prune");
     }
 
-    // CLAUDE-61: an on-disk YAML claiming the reserved synthetic name
-    // `webhook-forgejo` must not be indexed (it would collide with the
-    // synthetic action the web layer injects, and become editable/schedulable).
+    // CLAUDE-61 / CLAUDE-220: an on-disk YAML claiming EITHER reserved synthetic
+    // name must not be indexed (it would collide with the synthetic action the
+    // web layer injects, and become editable/schedulable). Both names come from
+    // the one shared predicate, so this loops over the whole reserved set.
     #[tokio::test]
-    async fn scan_actions_refuses_reserved_synthetic_name() {
+    async fn scan_actions_refuses_every_reserved_synthetic_name() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_runtime(tmp.path());
         let pool = crate::db::open(&paths.state_db()).await.unwrap();
         let actions_dir = tmp.path().join("actions");
         std::fs::create_dir_all(&actions_dir).unwrap();
-        // A perfectly valid action that simply claims the reserved name.
-        let file = actions_dir.join("webhook-forgejo.yml");
-        std::fs::write(
-            &file,
-            "name: webhook-forgejo\ninput:\n  command: print '[]'\nprompt: print 'hi'\nenabled: false\n",
-        )
-        .unwrap();
-
-        scan_actions(&pool, &actions_dir).await.unwrap();
         assert!(
-            !state::action_index_list(&pool)
-                .await
-                .unwrap()
-                .iter()
-                .any(|r| r.name == crate::web::webhooks::WEBHOOK_MINT_ACTION),
-            "a YAML using the reserved synthetic name must not be indexed"
+            crate::web::SYNTHETIC_ACTIONS.contains(&"webhook-forgejo")
+                && crate::web::SYNTHETIC_ACTIONS.contains(&"webhook-forgejo-comment"),
+            "both listeners are reserved"
         );
+        for name in crate::web::SYNTHETIC_ACTIONS {
+            // A perfectly valid action that simply claims the reserved name.
+            let file = actions_dir.join(format!("{name}.yml"));
+            std::fs::write(
+                &file,
+                format!("name: {name}\ninput:\n  command: print '[]'\nprompt: print 'hi'\nenabled: false\n"),
+            )
+            .unwrap();
+            // And an unparseable file whose STEM claims it, covering the other
+            // branch of the scan.
+            let broken = actions_dir.join(format!("{name}.yaml"));
+            std::fs::write(&broken, ":\n  not: [valid").unwrap();
+
+            scan_actions(&pool, &actions_dir).await.unwrap();
+            assert!(
+                !state::action_index_list(&pool)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| &r.name == name),
+                "a YAML using the reserved synthetic name `{name}` must not be indexed"
+            );
+            std::fs::remove_file(&file).unwrap();
+            std::fs::remove_file(&broken).unwrap();
+        }
     }
 
     // CLAUDE-164: unit-level collision detection over synthetic identities.
