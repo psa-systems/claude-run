@@ -284,6 +284,10 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         registry: ctx.registry,
         run_id,
     };
+    // CLAUDE-223: run-scoped global-pause gate. Consulted by the executor before
+    // each job pickup, by `process_job` before it spends a claude call, and by
+    // the automerge CI wait; any trip makes the run finish with `exit::PAUSED`.
+    let run_pause = ctx.pause.for_action_run(&action.name);
 
     // CLAUDE-1: record planned job keys so the web UI shows what is queued.
     let planned_keys: Vec<String> = jobs.iter().map(|j| j.key.clone()).collect();
@@ -333,6 +337,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         let src = src_owned.clone();
         let gh = gh_owned.clone();
         let job_cancel = cancel.clone();
+        let job_pause = run_pause.clone();
         let fut: crate::concurrency::JobFuture = Box::pin(async move {
             let action = &loaded.action;
             // CLAUDE-28: best-effort cap/budget check before launch; bounded
@@ -396,6 +401,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 &src,
                 &limits,
                 &job_cancel,
+                &job_pause,
                 &job,
                 pr_strategy,
                 bypass_backoff,
@@ -437,6 +443,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         limiter: ctx.limiter.clone(),
         gate: ctx.keygate.clone(),
         cancel: cancel.clone(),
+        pause: run_pause.clone(),
     };
     let results = exec.run(items).await;
     let mut processed: u32 = 0;
@@ -453,11 +460,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         }
     }
 
-    let exit_code = if cancel.is_cancelled() {
-        crate::exit::CANCELLED
-    } else {
-        crate::exit::OK
-    };
+    let exit_code = run_pause.exit_code(cancel.is_cancelled());
     state::run_finish(pool, run_id, exit_code, processed).await?;
     if let Some(e) = first_err {
         warn!(action = %action.name, error = %e, "one or more jobs errored during the run");
@@ -862,6 +865,7 @@ async fn process_job(
     src: &YoutrackSource,
     limits: &EffectiveLimits,
     cancel: &CancellationToken,
+    pause: &crate::pause::RunPause,
     job: &YoutrackJob,
     pr_strategy: crate::action::PrStrategy,
     bypass_backoff: bool,
@@ -946,7 +950,10 @@ async fn process_job(
     // ---- pre: mark Working / In Progress, then clone ----
     let pre_result = run_pre(backend, src, job, &workdir_path);
 
-    // ---- prompt + claude (skipped on pre failure / cancel) ----
+    // ---- prompt + claude (skipped on pre failure / cancel / global pause) ----
+    // CLAUDE-223: the gate is read once here (not in a match guard, which cannot
+    // `await`) and reused below so a paused job's attempt is not counted.
+    let paused_before_claude = pre_result.is_ok() && !cancel.is_cancelled() && pause.stop().await;
     let (claude_result, claude_ran) = match pre_result {
         Err(reason) => {
             warn!(action = %action.name, key = %key, %reason, "pre step failed (finalize still runs)");
@@ -958,6 +965,16 @@ async fn process_job(
                 ClaudeResult::synthesized(
                     "run cancelled by operator",
                     "cancelled before claude started",
+                ),
+                false,
+            )
+        }
+        Ok(()) if paused_before_claude => {
+            warn!(action = %action.name, key = %key, "globally paused before claude started (finalize still runs)");
+            (
+                ClaudeResult::synthesized(
+                    "run stopped by global pause",
+                    "globally paused before claude started",
                 ),
                 false,
             )
@@ -1021,6 +1038,7 @@ async fn process_job(
         &claude_result,
         pr_strategy,
         cancel,
+        pause,
     );
     let post_failed = match &finalize_res {
         Ok(Finalized::CodeReview { pr_url }) => {
@@ -1037,12 +1055,12 @@ async fn process_job(
         }
     };
 
-    // ---- skip-attempt marker (parked / blocker) or cancel ----
+    // ---- skip-attempt marker (parked / blocker), cancel, or pause (CLAUDE-223) ----
     let skip_marker = workdir_path.join(SKIP_ATTEMPT_MARKER);
     let cancelled = cancel.is_cancelled();
-    let skip_attempt = skip_marker.exists() || cancelled;
+    let skip_attempt = skip_marker.exists() || cancelled || paused_before_claude;
     if skip_attempt {
-        info!(action = %action.name, key = %key, cancelled, "not counting attempt");
+        info!(action = %action.name, key = %key, cancelled, paused = paused_before_claude, "not counting attempt");
     }
 
     let ok = claude_result.ok && !post_failed;
@@ -1534,6 +1552,10 @@ fn finalize(
     claude_result: &ClaudeResult,
     pr_strategy: crate::action::PrStrategy,
     cancel: &CancellationToken,
+    // CLAUDE-223: the run's global-pause gate, forwarded to the automerge CI
+    // wait so a pause stops the wait instead of holding the reboot window open
+    // for the whole `automerge.wait_seconds` budget.
+    pause: &crate::pause::RunPause,
 ) -> Result<Finalized> {
     let needs_review = workdir.join(NEEDS_REVIEW_MARKER);
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
@@ -1580,7 +1602,7 @@ fn finalize(
                     match pr.number {
                         Some(pr_number) => {
                             match automerge(
-                                backend, forge, src, job, workdir, &url, pr_number, cancel,
+                                backend, forge, src, job, workdir, &url, pr_number, cancel, pause,
                             ) {
                                 Ok(Some(merged)) => return Ok(merged),
                                 // Failure / timeout / cancel: the PR is left open
@@ -1670,6 +1692,7 @@ fn automerge(
     pr_url: &str,
     pr_number: u64,
     cancel: &CancellationToken,
+    pause: &crate::pause::RunPause,
 ) -> Result<Option<Finalized>> {
     let host = host_only(&job.repo_host);
     let repo = job.repo_path.as_str();
@@ -1685,6 +1708,14 @@ fn automerge(
     loop {
         if cancel.is_cancelled() {
             info!(key = %job.key, "automerge: run cancelled; leaving PR at Code Review");
+            return Ok(None);
+        }
+        // CLAUDE-223: a global pause stops the wait. `stop_cached` reads the
+        // gate's last known value (this loop is blocking and cannot `await`);
+        // the scheduler tick refreshes it every cycle, so it is at most one tick
+        // stale. The PR is left open at Code Review exactly as on cancel.
+        if pause.stop_cached() {
+            info!(key = %job.key, "automerge: globally paused; leaving PR at Code Review");
             return Ok(None);
         }
         let status = forge.pr_status(&host, repo, pr_number)?;
@@ -1738,16 +1769,18 @@ fn automerge(
             info!(key = %job.key, pr = pr_number, "automerge: timed out waiting for green checks; leaving PR at Code Review");
             return Ok(None);
         }
-        sleep_with_cancel(cfg.check_interval_seconds, cancel);
+        sleep_with_cancel(cfg.check_interval_seconds, cancel, pause);
     }
 }
 
 /// Sleep up to `secs` seconds, waking early (in <=500ms) if the run is
 /// cancelled so a `claude-run stop` never hangs on a long `check_interval`.
-fn sleep_with_cancel(secs: u64, cancel: &CancellationToken) {
+/// CLAUDE-223: a global pause wakes it the same way, so the operator's restart
+/// window is not held open by an automerge poll interval.
+fn sleep_with_cancel(secs: u64, cancel: &CancellationToken, pause: &crate::pause::RunPause) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || pause.stop_cached() {
             return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2926,6 +2959,7 @@ mod tests {
             &ClaudeResult::synthesized("e", "s"),
             PrStrategy::Branch,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -2967,6 +3001,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -3028,6 +3063,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -3064,6 +3100,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -3157,6 +3194,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(
@@ -3211,6 +3249,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(
@@ -3632,6 +3671,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -3701,6 +3741,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -3803,6 +3844,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(
@@ -3864,6 +3906,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
@@ -3904,6 +3947,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -3936,6 +3980,7 @@ mod tests {
             &claude,
             PrStrategy::Branch,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -3977,6 +4022,7 @@ mod tests {
             &timed_out_result(),
             PrStrategy::Branch,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(res, Finalized::TimedOut);
@@ -4018,6 +4064,7 @@ mod tests {
             &timed_out_result(),
             PrStrategy::Branch,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(res, Finalized::TimedOut);
@@ -4109,6 +4156,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(
@@ -4175,6 +4223,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(
@@ -4233,6 +4282,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert_eq!(
@@ -4273,6 +4323,7 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             &CancellationToken::new(),
+            &crate::pause::RunPause::never(),
         )
         .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));

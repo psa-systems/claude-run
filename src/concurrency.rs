@@ -52,6 +52,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Se
 pub use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
+use crate::pause::RunPause;
 
 /// The boxed per-job future the [`Executor`] runs. Each resolves to `Ok(true)`
 /// when the job was processed, `Ok(false)` when it was skipped before doing work
@@ -234,6 +235,12 @@ pub struct Executor {
     /// started yet (their future is dropped unpolled); jobs already running tear
     /// down through their own clone of the token inside the job pipeline.
     pub cancel: CancellationToken,
+    /// CLAUDE-223: the run-scoped global-pause gate. Checked at the same points
+    /// as `cancel`, so a pause taken mid-run stops the NEXT job pickup instead
+    /// of letting the run drain every queued job. A skipped job defers exactly
+    /// like a key-contended one (`Ok(false)`): no attempt, re-gathered after
+    /// Resume. The run finishes with `exit::PAUSED`, not `exit::CANCELLED`.
+    pub pause: RunPause,
 }
 
 impl Executor {
@@ -248,6 +255,7 @@ impl Executor {
             let limiter = self.limiter.clone();
             let action = self.action.clone();
             let max_parallel = self.max_parallel;
+            let pause = self.pause.clone();
             handles.push(tokio::spawn(async move {
                 // CLAUDE-163: gate on the concurrency key FIRST, with a
                 // non-blocking try, before taking any permit. A job whose key is
@@ -259,7 +267,7 @@ impl Executor {
                 // only ever taken by this non-blocking try, no job waits on a
                 // permit while another waits on that key: no lock-order inversion,
                 // the pipeline stays deadlock-free.
-                if cancel.is_cancelled() {
+                if cancel.is_cancelled() || pause.stop().await {
                     return Ok(false);
                 }
                 let _key_guard = match gate.try_acquire(&key) {
@@ -271,7 +279,7 @@ impl Executor {
                     Ok(p) => p,
                     Err(_) => return Ok(false),
                 };
-                if cancel.is_cancelled() {
+                if cancel.is_cancelled() || pause.stop().await {
                     return Ok(false);
                 }
                 let action_sem = limiter.action(&action, max_parallel);
@@ -279,7 +287,7 @@ impl Executor {
                     Ok(p) => p,
                     Err(_) => return Ok(false),
                 };
-                if cancel.is_cancelled() {
+                if cancel.is_cancelled() || pause.stop().await {
                     return Ok(false);
                 }
                 fut.await
@@ -355,11 +363,67 @@ mod tests {
             limiter: Limiter::new(4),
             gate: KeyGate::new(),
             cancel: CancellationToken::new(),
+            pause: RunPause::never(),
         };
         let results = exec.run(items).await;
         assert!(results.iter().all(|r| matches!(r, Ok(true))));
         // All four distinct keys overlapped under a cap of 4.
         assert_eq!(peak.load(Ordering::SeqCst), 4);
+    }
+
+    /// CLAUDE-223: a global pause stops the executor from picking up any job.
+    /// Each defers as `Ok(false)` (no work, no attempt, re-gathered after
+    /// Resume) and the run's gate is left tripped, so it finishes with
+    /// `exit::PAUSED` rather than `exit::OK` or `exit::CANCELLED`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_global_pause_stops_the_next_job_pickup() {
+        use crate::db::MIGRATOR;
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        crate::state::global_pause_set(&pool, Some("reboot"))
+            .await
+            .unwrap();
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let dummy = Arc::new(AtomicUsize::new(0));
+        let items: Vec<(String, JobFuture)> = (0..3)
+            .map(|i| {
+                (
+                    format!("key-{i}"),
+                    probe(
+                        live.clone(),
+                        peak.clone(),
+                        dummy.clone(),
+                        dummy.clone(),
+                        false,
+                    ),
+                )
+            })
+            .collect();
+        let pause = crate::pause::PauseGate::new(pool).for_action_run("a");
+        let exec = Executor {
+            action: "a".into(),
+            max_parallel: 4,
+            limiter: Limiter::new(4),
+            gate: KeyGate::new(),
+            cancel: CancellationToken::new(),
+            pause: pause.clone(),
+        };
+        let results = exec.run(items).await;
+        assert!(
+            results.iter().all(|r| matches!(r, Ok(false))),
+            "a paused run must pick up nothing: {results:?}"
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), 0, "no job body ran");
+        assert!(pause.tripped());
+        assert_eq!(pause.exit_code(false), crate::exit::PAUSED);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -389,6 +453,7 @@ mod tests {
             limiter: Limiter::new(4),
             gate: KeyGate::new(),
             cancel: CancellationToken::new(),
+            pause: RunPause::never(),
         };
         let results = exec.run(items).await;
         // Never more than one same-key job in flight at a time.
@@ -431,6 +496,7 @@ mod tests {
             limiter: limiter.clone(),
             gate: KeyGate::new(),
             cancel: CancellationToken::new(),
+            pause: RunPause::never(),
         };
         let results = exec.run(items).await;
         // Exactly one same-key job ran; the other six deferred without a permit.
@@ -475,6 +541,7 @@ mod tests {
             limiter: Limiter::new(5),
             gate: KeyGate::new(),
             cancel: CancellationToken::new(),
+            pause: RunPause::never(),
         };
         let results = exec.run(items).await;
         // The unrelated key ran despite the backlog holding the youtrack key.
@@ -504,6 +571,7 @@ mod tests {
             limiter: Limiter::new(2),
             gate: KeyGate::new(),
             cancel: CancellationToken::new(),
+            pause: RunPause::never(),
         };
         let results = tokio::time::timeout(Duration::from_secs(5), exec.run(items))
             .await
@@ -539,6 +607,7 @@ mod tests {
             limiter: Limiter::new(6),
             gate: KeyGate::new(),
             cancel: CancellationToken::new(),
+            pause: RunPause::never(),
         };
         exec.run(items).await;
         // Six distinct keys, but the cap holds the peak at 2.
@@ -566,6 +635,7 @@ mod tests {
             limiter: Limiter::new(2),
             gate: KeyGate::new(),
             cancel,
+            pause: RunPause::never(),
         };
         let results = exec.run(items).await;
         // Pre-cancelled: every job skips before its body runs.
@@ -605,6 +675,7 @@ mod tests {
                 limiter: limiter.clone(),
                 gate: gate.clone(),
                 cancel: CancellationToken::new(),
+                pause: RunPause::never(),
             };
             async move { exec.run(items).await }
         };
@@ -646,6 +717,7 @@ mod tests {
                 limiter: limiter.clone(),
                 gate: gate.clone(),
                 cancel: CancellationToken::new(),
+                pause: RunPause::never(),
             };
             async move { exec.run(items).await }
         };
@@ -683,6 +755,7 @@ mod tests {
                 limiter: limiter.clone(),
                 gate: gate.clone(),
                 cancel: CancellationToken::new(),
+                pause: RunPause::never(),
             };
             async move { exec.run(items).await }
         };

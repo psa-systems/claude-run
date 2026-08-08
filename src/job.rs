@@ -90,6 +90,11 @@ pub struct JobContext<'a> {
     /// to synthesize a cancelled `$claude_result` (so `post` still runs) and
     /// to skip attempt counting.
     pub cancel: CancellationToken,
+    /// CLAUDE-223: the run-scoped global-pause gate. Checked at the same
+    /// pre-claude point as `cancel`, so a pause taken after this job started
+    /// still stops it before it spends a `claude --print` call. The job's
+    /// attempt is not counted, exactly as on the cancel path.
+    pub pause: crate::pause::RunPause,
 }
 
 /// Compute the job key for a job. If `dedup_key` is set on the action, look
@@ -242,6 +247,10 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     }
 
     // ---- prompt + claude (skipped on pre failure; synthesize claude_result) ----
+    // CLAUDE-223: set when the global-pause gate stopped this job before claude
+    // started, so its attempt is not counted (the job is re-gathered on the
+    // first run after Resume).
+    let mut paused_before_claude = false;
     let (claude_result, claude_ran) = if let Some((step_idx, exit_code, stderr)) = pre_failed {
         (
             ClaudeResult::synthesized(format!("pre step {step_idx} exited {exit_code}"), stderr),
@@ -290,6 +299,20 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                     ClaudeResult::synthesized(
                         "run cancelled by operator",
                         "cancelled before claude started",
+                    ),
+                    false,
+                )
+            } else if ctx.pause.stop().await {
+                // CLAUDE-223: globally paused after this job started but before
+                // it reached claude. Don't spend an API call; synthesize a
+                // result so post still runs, and leave the attempt uncounted so
+                // the job is retried after Resume.
+                paused_before_claude = true;
+                warn!(action = %action.name, key = %key, "globally paused before claude started (post still runs)");
+                (
+                    ClaudeResult::synthesized(
+                        "run stopped by global pause",
+                        "globally paused before claude started",
                     ),
                     false,
                 )
@@ -369,11 +392,12 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     // ---- skip-attempt marker (parked / blocker outcomes) ----
     // A cancelled run also skips attempt counting: an operator cancel is not a
     // genuine attempt, so the job retries cleanly on the next firing.
+    // CLAUDE-223: a job the global pause stopped is not an attempt either.
     let skip_marker = workdir_path.join(".claude-run-skip-attempt");
     let cancelled = ctx.cancel.is_cancelled();
-    let skip_attempt = skip_marker.exists() || cancelled;
+    let skip_attempt = skip_marker.exists() || cancelled || paused_before_claude;
     if skip_attempt {
-        info!(action = %action.name, key = %key, cancelled, "not counting attempt");
+        info!(action = %action.name, key = %key, cancelled, paused = paused_before_claude, "not counting attempt");
     }
 
     let ok = claude_result.ok && !post_failed;

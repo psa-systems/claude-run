@@ -1,0 +1,34 @@
+{# CLAUDE-223: the live quiet indicator. Polls itself every 2s and swaps its own
+   outer element, so the Activity card updates with no page reload. Exactly one of
+   three states renders, and the error state never reads as idle: telling an
+   operator "safe to restart" because the query failed is how a reboot lands
+   mid-run. #}
+<div id="activity-indicator"
+     hx-get="/about/activity"
+     hx-trigger="every 2s, refreshNow from:body"
+     hx-select="#activity-indicator"
+     hx-swap="morph:outerHTML">
+  {% if activity.state() == "idle" %}
+    <span class="badge ok">idle</span>
+    <span class="dim">No run is active. Safe to restart or reboot the service.</span>
+  {% else if activity.state() == "busy" %}
+    <span class="badge warn">busy</span>
+    <span class="dim">{{ activity.runs().len() }} run(s) still active. Wait for this to read
+    <strong>idle</strong> before restarting or rebooting.</span>
+    <ul style="margin: 8px 0 0;">
+      {% for r in activity.runs() %}
+      <li><a href="/runs/{{ r.id }}">Run #{{ r.id }}</a> - <span class="mono">{{ r.action_name }}</span>
+          <span class="dim">started {{ r.started_at|datetime }}</span></li>
+      {% endfor %}
+      {# Dispatched but not yet recorded as a run row: still live work. #}
+      {% for name in activity.dispatched_only() %}
+      <li><span class="mono">{{ name }}</span> <span class="dim">dispatched, run row not written yet</span></li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <span class="badge bad">unknown</span>
+    <span class="dim">The activity check failed, so whether work is in flight is
+    <strong>unknown</strong>. Do not treat this as idle.</span>
+    <pre class="stream" style="max-height: 120px; margin: 8px 0 0;">{{ activity.error() }}</pre>
+  {% endif %}
+</div>

@@ -15,7 +15,7 @@ long-running daemon.
 - **Cost ledger + caps**: per-day Claude-invocation cap, per-day USD budget, per-job attempt cap. All in SQLite.
 - **Skip-attempt marker**: an action's post step can write `$workdir/.claude-run-skip-attempt` for outcomes that park a
   job pending human input (so the attempt cap doesn't trip).
-- **Pause / resume**: globally or per-action; persisted in SQLite, takes effect on the next scheduler tick.
+- **Pause / resume**: globally or per-action; persisted in SQLite, takes effect on the next scheduler tick. The global switch is also on the **About** page's Activity card, next to a live quiet indicator (see "Global pause and the restart-safety workflow").
 - **Duplicate-source guardrail**: at scan time the daemon flags (but never merges or disables) two enabled actions that
   do redundant work - names that differ only by case, or two native actions of the same `kind` polling the same source.
   Both would gather the same jobs and silently compete on the shared concurrency caps; you get a WARN log and a notice
@@ -70,9 +70,11 @@ claude-run trigger youtrack
 # Status (delegates to daemon if it's up, else reads DB directly).
 claude-run status
 
-# Pause / resume.
+# Pause / resume. With no action name, it is the GLOBAL pause.
 claude-run pause youtrack --reason "addressing a blocker"
 claude-run resume youtrack
+claude-run pause --reason "rebooting the host"
+claude-run resume
 
 # Cancel an in-flight run by id (needs a running daemon; the run lives in the daemon's process table).
 claude-run cancel 42
@@ -128,7 +130,8 @@ will want to know about:
 - **Reports** (`/reports`, CLAUDE-117) is the historical reporting page (spend / runs / time-of-day / day-of-week),
   global by default and narrowable with `action` + `range` query params.
 - **About** (`/about`, CLAUDE-129) shows version + build info and drives the on-demand self-update check / apply (see
-  "Self-update").
+  "Self-update"). Its **Activity** card (CLAUDE-223) carries the global Pause / Resume control and the live quiet
+  indicator (see "Global pause and the restart-safety workflow").
 
 ## Access check (CLAUDE-216)
 
@@ -374,6 +377,40 @@ parent plus one Epic per target and queues all of them, and `parent for` keeps t
 resolves, so the run summary has something to summarize. `concurrency.max_parallel: 1` keeps one audit in flight at a
 time; per-target caps and the coverage ledger, not serialization, are what keep a rotation affordable.
 
+## Global pause and the restart-safety workflow (CLAUDE-223)
+
+Applying an update does not restart the service, and restarting while jobs are running kills them mid-flight. The
+**Activity** card at the top of `/about` is the control for doing it safely, and it is the same state
+`claude-run pause` / `claude-run resume` / `claude-run status` read and write.
+
+The workflow:
+
+1. **Pause all activity.** The card's button posts to `/api/pause` with an optional free-text reason. From then on
+   nothing new starts: the scheduler tick returns immediately, a manual trigger is refused with `409` naming the pause
+   (instead of the old "queued trigger" ack for a run that was then silently dropped), an inbound delivery to either
+   webhook listener is accepted with a `2xx` and dropped, and any run still in flight stops picking up its NEXT job.
+2. **Watch the indicator drain.** It polls itself every 2s and reads exactly one of three states: **busy** (each active
+   run listed and linked), **idle** ("safe to restart or reboot"), or **unknown**. `unknown` means the activity check
+   itself failed; it is never rendered as idle, and the underlying error is logged at `error`. Do not restart on
+   `unknown`.
+3. **Restart / reboot** once it reads idle.
+4. **Resume all activity**, from the same card or from the "Globally paused" banner on the Dashboard.
+
+Two properties worth knowing:
+
+- **Pause never interrupts a `claude --print` child that is already executing.** Gating the next job pickup bounds the
+  wait to that one child rather than to every job still queued in the run; the indicator is what tells you when it has
+  finished. A run that stops this way ends with exit code `1` and badges as **paused** in the run list, distinct from an
+  operator cancel (`130`) and from a clean finish (`0`). Its unprocessed jobs consume no attempt and are re-gathered on
+  the first run after Resume.
+- **The pause is stored in the database, so it survives a restart.** A daemon that comes up paused logs one `info` line
+  saying so and stays idle until you resume; the Dashboard banner and the About card are the visual reminder.
+
+Scripting a reboot instead of clicking: `/api/status` (and `claude-run status`) carries an `activity` block with
+`quiet`, `active_runs`, and `dispatched_actions`. `quiet` is true only when BOTH signals are clear: the daemon's
+in-flight map is empty AND no `runs` row has `ended_at IS NULL`. Neither alone is sufficient, because the map catches a
+run dispatched before its row exists and the row catches a run started by a daemonless `claude-run run`.
+
 ## Self-update (release trains)
 
 `claude-run version {show,check,update}` self-updates the binary from the Forgejo Generic Package registry. CI publishes
@@ -526,7 +563,7 @@ keeps pushing corrective commits until CI passes; after `max_pr_attempts` distin
 Needs Review (a PR comment, the `needs-review` label, and best-effort sets the source issue's State and assignee). The
 `enabled` toggle defaults to `true` and is a master kill switch.
 
-**CLAUDE-153: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings gates whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) queues a corrective fixup PR. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check mints nothing and queues no fixup PR, so the failure stays reported on the original PR for its author to fix in place (a `human_action` failure still mints); with it on, the corrective-fixup behavior above applies, still subject to the CLAUDE-149 open-PR suppression. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
+**CLAUDE-153: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings gates whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) queues a corrective fixup PR. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check mints nothing and queues no fixup PR, so the failure stays reported on the original PR for its author to fix in place (a `human_action` failure still mints); with it on, the corrective-fixup behavior above applies, still subject to the CLAUDE-149 open-PR suppression. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
 
 A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then
 the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the
@@ -702,11 +739,12 @@ the credentials differ in kind: comment handling needs a WRITE token (post repli
 sources need only a read-only log token. Separate sections keep the write token out of the block holding the read-only
 one, and each listener gets its own Pause switch. What the two DO share, by reference rather than by copy: HMAC
 verification, the single replay-store instance (so one `X-Forgejo-Delivery` id fanned out to both endpoints is still
-caught), the per-source rate-limiter type and builder, and the `owner/repo` allow-list matcher.
+caught), the per-source rate-limiter type and builder, the `owner/repo` allow-list matcher, and the accept-and-drop
+pause gate (CLAUDE-223), which checks the GLOBAL pause before each listener's own synthetic action.
 
 **Request pipeline**, in the same order as the CI-failure endpoint: unknown source `404` -> per-source rate limit `429`
 -> missing / unresolvable `secret_ref` `401` -> bad or missing signature `401` -> missing `X-Forgejo-Delivery` `400` ->
-replayed delivery id `409` -> Pause check (accept-and-drop with `2xx`) -> parse. Every post-authentication drop is acked
+replayed delivery id `409` -> Pause check, global then per-action, accept-and-drop with `2xx` (CLAUDE-223) -> parse. Every post-authentication drop is acked
 with `2xx` (so Forgejo does not retry) and logged with its reason: a comment `action` other than `created`, a repo
 outside `allowed_repos`, a first line that does not open with the trigger, or an author in the mint config's
 loop-safety `bot_logins` (so the bot's own reply can never re-trigger a run).
