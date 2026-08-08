@@ -491,6 +491,16 @@ impl Forge for GithubForge {
     ) -> Result<()> {
         Err(unsupported("pr_comment"))
     }
+
+    fn issue_comment(
+        &self,
+        _host: &str,
+        _repo: &str,
+        _issue_number: u64,
+        _body_file: &Path,
+    ) -> Result<()> {
+        Err(unsupported("issue_comment"))
+    }
 }
 
 /// CLAUDE-194: restate a PR-create failure with the repo, the host, and the
