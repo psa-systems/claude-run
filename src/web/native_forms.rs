@@ -134,7 +134,8 @@ fn parse_opt_u32(label: &str, raw: &str) -> Result<Option<u32>, String> {
 // ---- blocks shared by every kind ------------------------------------------
 
 /// The generic `Action` blocks every structured editor surfaces: identity,
-/// `workdir_base`, `schedule`, `claude`, `output`, and `limits`. Kinds that run
+/// `workdir_base`, `link_template`, `schedule`, `claude`, `output`, and
+/// `limits`. Kinds that run
 /// no agent session (`ci-failure-reconcile`) render no claude fields and pass
 /// `with_claude: false` so a hand-written block is left untouched.
 #[derive(Debug, Clone, Default)]
@@ -142,6 +143,7 @@ pub struct CommonForm {
     pub name: String,
     pub enabled: bool,
     pub workdir_base: String,
+    pub link_template: String,
     pub schedule_kind: String,
     pub schedule_spec: String,
     pub output_file: String,
@@ -160,6 +162,7 @@ impl CommonForm {
             name: p.get("name"),
             enabled: p.checked("enabled"),
             workdir_base: p.get("workdir_base"),
+            link_template: p.get("link_template"),
             schedule_kind: p.get("schedule_kind"),
             schedule_spec: p.get("schedule_spec"),
             output_file: p.get("output_file"),
@@ -180,6 +183,7 @@ impl CommonForm {
             name: a.name.clone(),
             enabled: a.enabled,
             workdir_base: s(&a.workdir_base),
+            link_template: s(&a.link_template),
             schedule_kind: a
                 .schedule
                 .as_ref()
@@ -224,6 +228,7 @@ fn apply_common(
 
     map.insert(Value::from("name"), Value::from(c.name.trim()));
     set_scalar_or_remove(map, "workdir_base", opt(&c.workdir_base));
+    set_scalar_or_remove(map, "link_template", opt(&c.link_template));
     map.insert(Value::from("enabled"), Value::from(c.enabled));
 
     match c.schedule_kind.trim() {
@@ -2069,6 +2074,119 @@ limits:
         };
         assert!(!cfg.enabled);
         assert!(!cfg.close_duplicates);
+    }
+
+    /// CLAUDE-222: every native structured editor renders the shared identity
+    /// block, so all four expose the `link_template` field with its saved value.
+    #[test]
+    fn every_native_editor_renders_the_link_template_field() {
+        let common = CommonForm {
+            link_template: "https://youtrack.example.com/issue/{key}".to_string(),
+            ..CommonForm::default()
+        };
+        let mut rendered: Vec<String> = Vec::new();
+        rendered.push(
+            ForgejoCiFixTpl {
+                version: "test",
+                heading: "h".to_string(),
+                post_url: "/p".to_string(),
+                raw_url: "/r".to_string(),
+                form: ForgejoCiFixForm {
+                    common: common.clone(),
+                    ..ForgejoCiFixForm::defaults()
+                },
+                error: None,
+                name: None,
+            }
+            .render()
+            .unwrap(),
+        );
+        rendered.push(
+            CiFailureAnalysisTpl {
+                version: "test",
+                heading: "h".to_string(),
+                post_url: "/p".to_string(),
+                raw_url: "/r".to_string(),
+                form: CiFailureAnalysisForm {
+                    common: common.clone(),
+                    ..CiFailureAnalysisForm::defaults()
+                },
+                secrets: Vec::new(),
+                error: None,
+                name: None,
+            }
+            .render()
+            .unwrap(),
+        );
+        rendered.push(
+            CiFailureReconcileTpl {
+                version: "test",
+                heading: "h".to_string(),
+                post_url: "/p".to_string(),
+                raw_url: "/r".to_string(),
+                form: CiFailureReconcileForm {
+                    common: common.clone(),
+                    ..CiFailureReconcileForm::defaults()
+                },
+                secrets: Vec::new(),
+                error: None,
+                name: None,
+            }
+            .render()
+            .unwrap(),
+        );
+        rendered.push(
+            ClosedIssueSummaryTpl {
+                version: "test",
+                heading: "h".to_string(),
+                post_url: "/p".to_string(),
+                raw_url: "/r".to_string(),
+                form: ClosedIssueSummaryForm {
+                    common,
+                    ..ClosedIssueSummaryForm::defaults()
+                },
+                error: None,
+                name: None,
+            }
+            .render()
+            .unwrap(),
+        );
+        for html in rendered {
+            assert!(html.contains("name=\"link_template\""), "{html}");
+            assert!(
+                html.contains("https://youtrack.example.com/issue/{key}"),
+                "{html}"
+            );
+        }
+    }
+
+    /// CLAUDE-222: `link_template` is a `CommonForm` field, so a native editor
+    /// can both set it and clear it (a blank box removes the key).
+    #[test]
+    fn link_template_round_trips_through_the_common_block() {
+        let existing = "name: analysis\nkind: ci-failure-analysis\nnative:\n  query: \"#Unresolved\"\nlink_template: \"https://youtrack.example.com/issue/{key}\"\n";
+        let loaded = crate::action::validate_str(existing, "<test>").unwrap();
+        let form = action_to_ci_failure_analysis_form(&loaded.action).unwrap();
+        assert_eq!(
+            form.common.link_template,
+            "https://youtrack.example.com/issue/{key}"
+        );
+
+        // Set: the prefilled value survives the save.
+        let yaml = ci_failure_analysis_form_to_yaml(parsed(existing), &form).unwrap();
+        let after = crate::action::validate_str(&yaml, "<test>").unwrap();
+        assert_eq!(
+            after.action.link_template.as_deref(),
+            Some("https://youtrack.example.com/issue/{key}")
+        );
+
+        // Cleared: the key is removed rather than written as an empty string.
+        let mut cleared = form.clone();
+        cleared.common.link_template = String::new();
+        let yaml = ci_failure_analysis_form_to_yaml(parsed(existing), &cleared).unwrap();
+        assert!(!yaml.contains("link_template"), "{yaml}");
+        let after = crate::action::validate_str(&yaml, "<test>").unwrap();
+        assert_eq!(after.action.link_template, None);
     }
 
     #[test]
