@@ -1761,6 +1761,10 @@ native:
         let Some(NativeConfig::CiFailureAnalysis(_)) = &action.native else {
             panic!("expected ci-failure-analysis native config");
         };
+        // CLAUDE-222: job keys are YouTrack issue ids, so the run screens link
+        // them out through the action's link template.
+        let link = action.link_template.as_deref().expect("link_template");
+        assert!(link.contains("{key}"), "link_template: {link}");
         let reserialized = serde_yaml::to_string(&action).unwrap();
         let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
         assert_eq!(reloaded.action.native, action.native);
@@ -2102,6 +2106,10 @@ native:
         let Some(NativeConfig::CiFailureReconcile(_)) = &action.native else {
             panic!("expected ci-failure-reconcile native config");
         };
+        // CLAUDE-222: job keys are YouTrack issue ids, so the run screens link
+        // them out through the action's link template.
+        let link = action.link_template.as_deref().expect("link_template");
+        assert!(link.contains("{key}"), "link_template: {link}");
         let reserialized = serde_yaml::to_string(&action).unwrap();
         let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
         assert_eq!(reloaded.action.native, action.native);

@@ -4439,6 +4439,80 @@ mod tests {
         );
     }
 
+    // ---- run-detail link_template links (CLAUDE-222) ----------------------
+
+    /// A CI-failure run links every key from the shipped action's
+    /// `link_template`: the planned-jobs table, the outcomes table, and the
+    /// summary-modal heading. The template comes from the shipped YAML, so a
+    /// run screen and the config it ships with are checked together.
+    #[test]
+    fn ci_failure_run_links_every_key_from_the_shipped_link_template() {
+        use super::{JobOutcomeRow, PlannedJob, RunDetailTpl, RunRow};
+        use askama::Template;
+
+        const SHIPPED: &str = include_str!("../../actions/ci-failure-analysis.yml");
+        let template = crate::action::validate_str(SHIPPED, "<test>")
+            .unwrap()
+            .action
+            .link_template
+            .expect("shipped link_template");
+        let href = crate::action::render_link(&template, "CLAUDE-222");
+        assert_eq!(href, "https://example.myjetbrains.com/issue/CLAUDE-222");
+
+        let run = RunRow {
+            id: 3,
+            action_name: "ci-failure-analysis".to_string(),
+            started_at: "2026-08-08T00:00:00Z".to_string(),
+            ended_at: Some("2026-08-08T00:01:00Z".to_string()),
+            exit_code: Some(0),
+            jobs_processed: 1,
+            triggered_by: "schedule".to_string(),
+            current_job_key: None,
+            stage: None,
+            failed_jobs: 0,
+        };
+        let outcome = JobOutcomeRow {
+            job_key: "CLAUDE-222".to_string(),
+            attempt: 1,
+            ts: "2026-08-08T00:00:30Z".to_string(),
+            ok: true,
+            claude_ran: true,
+            claude_ok: true,
+            claude_cost_usd: 0.0,
+            attempt_counted: true,
+            duration_ms: Some(1000),
+            timed_out: false,
+            summary: Some("analyzed".to_string()),
+        };
+        let planned = PlannedJob {
+            key: "CLAUDE-222".to_string(),
+            href: Some(href.clone()),
+            status: "ok".to_string(),
+            watch_attempt: None,
+        };
+        let tpl = RunDetailTpl {
+            version: "test",
+            run,
+            outcomes: vec![outcome],
+            planned_jobs: vec![planned],
+            link_template: Some(template),
+            // No per-run links: the action's template is the only source.
+            job_links: std::collections::BTreeMap::new(),
+            sort: super::RunDetailSort::default(),
+            has_planned: true,
+            has_outcomes: true,
+        };
+        let html = tpl.render().expect("render run_detail");
+        let anchor =
+            format!("<a href=\"{href}\" target=\"_blank\" rel=\"noopener\">CLAUDE-222</a>");
+        // Planned-jobs table, outcomes table, and the modal heading.
+        assert_eq!(
+            html.matches(anchor.as_str()).count(),
+            3,
+            "every key should link out: {html}"
+        );
+    }
+
     // ---- run-detail sort/filter (CLAUDE-140) ------------------------------
 
     /// Unknown sort columns and filter values are rejected by the whitelist,
