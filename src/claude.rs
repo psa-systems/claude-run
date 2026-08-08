@@ -620,7 +620,6 @@ mod tests {
     /// forwards the child's own exit status, so other `invoke` tests are
     /// unaffected.
     fn ensure_coreutils_timeout_on_path() {
-        use std::os::unix::fs::PermissionsExt;
         use std::sync::OnceLock;
 
         static SHIM_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -655,8 +654,7 @@ fi
 rm -f "$fired"
 exit "$code"
 "#;
-            std::fs::write(&shim, body).unwrap();
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_stub(&shim, body);
             dir
         });
         let current = std::env::var_os("PATH").unwrap_or_default();
@@ -676,9 +674,6 @@ exit "$code"
 
     #[test]
     fn invoke_timeout_sets_timed_out() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
         // Pin a coreutils-faithful `timeout` (exit 124 on timeout) so the assertion
         // holds even on hosts whose `timeout` is busybox (exits 143). See the
         // helper for the full rationale.
@@ -687,11 +682,7 @@ exit "$code"
         let dir = tempfile::tempdir().unwrap();
         // Stub "claude": sleep well past the 1s budget so the wrapper kills it.
         let stub = dir.path().join("claude-stub.sh");
-        {
-            let mut f = std::fs::File::create(&stub).unwrap();
-            writeln!(f, "#!/bin/sh\nexec sleep 30").unwrap();
-        }
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_stub(&stub, "#!/bin/sh\nexec sleep 30\n");
 
         let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
         let cancel = CancellationToken::new();
@@ -714,10 +705,79 @@ exit "$code"
 
     const RESULT_LINE: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.42}"#;
 
+    /// CLAUDE-224: write an executable stub WITHOUT ever holding a writable fd
+    /// in this process. `cargo test` runs tests on many threads; a fork from any
+    /// other thread inherits our open write fd, and the later `execve` of this
+    /// stub then fails with ETXTBSY ("Text file busy"). Letting an external `sh`
+    /// own the write keeps that fd out of our fd table entirely, so the exec
+    /// cannot race. Every test stub the suite goes on to exec must use this.
     fn write_stub(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, body).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("cat > \"$1\" && chmod 0755 \"$1\"")
+            .arg("sh")
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "writing stub {} failed", path.display());
+    }
+
+    /// CLAUDE-224 guard: hammer write-then-exec while sibling threads fork, the
+    /// exact shape that failed CI run #1008. An in-process write reproduces
+    /// ETXTBSY within a few dozen iterations here; with `write_stub` the fd
+    /// never enters our fd table, so the exec cannot fail that way at all.
+    #[test]
+    fn write_stub_survives_concurrent_forks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const ETXTBSY: i32 = 26;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let forkers: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        // Best-effort noise: a failed spawn is one fork fewer this
+                        // tick, so report it and keep hammering rather than flaking
+                        // the assertion on a transient EAGAIN.
+                        if let Err(e) = Command::new("sh").arg("-c").arg("exit 0").status() {
+                            eprintln!("forker spawn failed: {e}");
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        let mut busy = 0usize;
+        for _ in 0..80 {
+            write_stub(&stub, "#!/bin/sh\nexit 0\n");
+            match Command::new(&stub).status() {
+                Ok(_) => {}
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) => busy += 1,
+                Err(e) => panic!("unexpected exec error: {e}"),
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for f in forkers {
+            f.join().unwrap();
+        }
+        assert_eq!(
+            busy, 0,
+            "stub exec hit ETXTBSY: a writable fd leaked to a forked child"
+        );
     }
 
     /// CLAUDE-165: when the invoker carries a `config_dir`, the spawned child
@@ -908,18 +968,11 @@ exit "$code"
     /// group, so `invoke` returns long before the (30s) stub/timeout would.
     #[test]
     fn invoke_cancellation_terminates_promptly() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         // Stub "claude": ignore the flags invoke passes and sleep well past the
         // test budget. SIGTERM to the group ends it immediately.
         let stub = dir.path().join("claude-stub.sh");
-        {
-            let mut f = std::fs::File::create(&stub).unwrap();
-            writeln!(f, "#!/bin/sh\nexec sleep 30").unwrap();
-        }
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_stub(&stub, "#!/bin/sh\nexec sleep 30\n");
 
         let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
         let cancel = CancellationToken::new();
