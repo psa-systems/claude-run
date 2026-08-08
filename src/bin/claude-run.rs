@@ -561,8 +561,12 @@ async fn run_action(
     let limiter = claude_run::concurrency::Limiter::new(
         loaded.action.concurrency.max_parallel.max(1) as usize,
     );
+    // CLAUDE-223: the standalone path takes the same live global-pause gate as
+    // the daemon, so a pause taken while it works stops it picking up new jobs
+    // (the up-front check above only covers the moment the run started).
+    let pause = claude_run::pause::PauseGate::new(pool.clone());
     daemon::run_action_inner(
-        &loaded, paths, &pool, snippet, claude, "cli", None, &keygate, &limiter,
+        &loaded, paths, &pool, snippet, claude, "cli", None, &keygate, &limiter, &pause,
     )
     .await?;
     Ok(exit::OK)
@@ -802,10 +806,19 @@ async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     let pool = db::open(&paths.state_db()).await?;
     let global = state::global_pause_status(&pool).await?;
     let actions = state::action_index_list(&pool).await?;
+    // CLAUDE-223: the same activity block `/status` carries, so a reboot script
+    // reads `quiet` whether or not the daemon is up. With no daemon there is no
+    // in-flight map to consult, so the open `runs` rows are the whole signal.
+    let active_runs = state::active_runs(&pool).await?;
     let report = json!({
         "daemon": "not running",
         "socket_expected_at": sock.display().to_string(),
         "global_paused": global.map(|(a, r)| json!({"paused_at": a, "reason": r})),
+        "activity": {
+            "quiet": active_runs.is_empty(),
+            "active_runs": active_runs,
+            "dispatched_actions": Vec::<String>::new(),
+        },
         "actions": actions,
     });
     jsonfmt::print_json(&report)?;

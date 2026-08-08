@@ -39,6 +39,8 @@
     <dd>
       {% match run.exit_code %}
         {% when Some(0) %}<span class="badge ok">0</span>
+        {# CLAUDE-223: stopped by the global pause, distinct from cancelled. #}
+        {% when Some(1) %}<span class="badge pause">paused</span>
         {% when Some(130) %}<span class="badge cancel">cancelled</span>
         {% when Some(c) %}<span class="badge bad">{{ c }}</span>
         {% when None %}

@@ -114,7 +114,52 @@ pub fn router(state: AppState) -> Router {
 struct StatusResponse {
     version: String,
     global_paused: Option<PauseInfo>,
+    /// CLAUDE-223: live-work snapshot, so an operator scripting a reboot polls
+    /// `/status` instead of scraping the About page.
+    activity: Activity,
     actions: Vec<ActionStatus>,
+}
+
+/// CLAUDE-223: the daemon's live-work snapshot. One type behind `/api/status`,
+/// `claude-run status`, and the About page's quiet indicator, so the three
+/// surfaces cannot disagree about whether a restart is safe.
+#[derive(Debug, Serialize)]
+pub struct Activity {
+    /// True only when NOTHING is live. Both signals must be clear: the
+    /// in-flight map catches a run dispatched before `run_begin` wrote its row,
+    /// and the open `runs` row catches a run started by a daemonless
+    /// `claude-run run`. Neither alone is sufficient.
+    pub quiet: bool,
+    /// Open `runs` rows (id, action, start), for the busy listing.
+    pub active_runs: Vec<state::ActiveRun>,
+    /// Action names the daemon has dispatched a run for, whether or not the row
+    /// exists yet. Sorted, so the rendering is stable across polls.
+    pub dispatched_actions: Vec<String>,
+}
+
+/// CLAUDE-223: build the [`Activity`] snapshot. A DB failure propagates rather
+/// than degrading to an empty list: reporting "idle, safe to restart" because
+/// the query failed is exactly the mistake this indicator exists to prevent.
+pub async fn activity(
+    pool: &SqlitePool,
+    in_flight: &InFlight,
+) -> Result<Activity, crate::error::Error> {
+    let active_runs = state::active_runs(pool).await?;
+    let dispatched_actions = {
+        let g = in_flight.lock().await;
+        let mut names: Vec<String> = g
+            .iter()
+            .filter(|(_, &n)| n > 0)
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    };
+    Ok(Activity {
+        quiet: active_runs.is_empty() && dispatched_actions.is_empty(),
+        active_runs,
+        dispatched_actions,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -164,6 +209,7 @@ async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusRespons
     Ok(Json(StatusResponse {
         version: s.version.to_string(),
         global_paused: global,
+        activity: activity(&s.pool, &s.in_flight).await?,
         actions: out,
     }))
 }
@@ -202,6 +248,21 @@ async fn trigger_action(
         return Err(AppError {
             status: StatusCode::NOT_FOUND,
             message: format!("unknown action `{name}`"),
+        });
+    }
+    // CLAUDE-223: `Dispatcher::execute` drops a globally-paused run silently, so
+    // queueing here would answer `{"ok":true,"message":"queued trigger"}` for
+    // work that never runs. Refuse with 409 naming the pause instead; the read
+    // error propagates as a 500 rather than being swallowed into a false accept.
+    if let Some((paused_at, reason)) = state::global_pause_status(&s.pool).await? {
+        let because = reason
+            .map(|r| format!(" ({r})"))
+            .unwrap_or_else(String::new);
+        return Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "globally paused since {paused_at}{because}; resume before triggering `{name}`"
+            ),
         });
     }
     s.trigger_tx
@@ -332,11 +393,40 @@ async fn cancel_run(
     }
 }
 
+/// CLAUDE-223: the optional pause reason, from either encoding. The CLI and
+/// API clients send `{"reason": "..."}`; the About page's Pause form posts
+/// `reason=...` urlencoded, which is what htmx serializes a form to without an
+/// extension. An unparseable body is logged at `warn` and pauses with no reason
+/// rather than refusing: losing the annotation is recoverable, refusing the
+/// pause the operator asked for is not.
+fn pause_reason(headers: &axum::http::HeaderMap, body: &str) -> Option<String> {
+    if body.trim().is_empty() {
+        return None;
+    }
+    let json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    let parsed = if json {
+        serde_json::from_str::<PauseRequest>(body).map_err(|e| e.to_string())
+    } else {
+        serde_urlencoded::from_str::<PauseRequest>(body).map_err(|e| e.to_string())
+    };
+    match parsed {
+        Ok(r) => r.reason.filter(|s| !s.trim().is_empty()),
+        Err(e) => {
+            tracing::warn!(error = %e, json_body = json, "pause request body could not be parsed; pausing with no reason");
+            None
+        }
+    }
+}
+
 async fn global_pause_handler(
     State(s): State<Arc<AppState>>,
-    body: Option<Json<PauseRequest>>,
+    headers: axum::http::HeaderMap,
+    body: String,
 ) -> Result<Json<AckResponse>, AppError> {
-    let reason = body.and_then(|b| b.0.reason);
+    let reason = pause_reason(&headers, &body);
     state::global_pause_set(&s.pool, reason.as_deref()).await?;
     Ok(Json(AckResponse {
         ok: true,
@@ -539,14 +629,21 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn app_state() -> Arc<AppState> {
+        app_state_with_triggers().await.0
+    }
+
+    /// The same state, plus the trigger receiver. A test that sends a trigger
+    /// must hold the receiver: dropping it closes the channel and every send
+    /// fails with a 503 that has nothing to do with what is under test.
+    async fn app_state_with_triggers() -> (Arc<AppState>, mpsc::Receiver<String>) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        let (trigger_tx, _rx) = mpsc::channel(8);
-        Arc::new(AppState {
+        let (trigger_tx, rx) = mpsc::channel(8);
+        let state = Arc::new(AppState {
             pool: pool.clone(),
             trigger_tx,
             version: "test",
@@ -554,7 +651,8 @@ mod tests {
             in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
             paths: crate::config::Paths::resolve().unwrap(),
-        })
+        });
+        (state, rx)
     }
 
     /// CLAUDE-216: `POST /access/check` returns the typed report as JSON. With
@@ -669,6 +767,95 @@ mod tests {
             assert_eq!(err.status, StatusCode::BAD_REQUEST, "{name}");
             assert!(err.message.contains("event-driven"), "{}", err.message);
         }
+    }
+
+    /// CLAUDE-223: while globally paused a trigger is refused with 409 naming
+    /// the pause, instead of the old "queued trigger" ack for a run that
+    /// `Dispatcher::execute` would then drop on the floor. Resuming restores it.
+    #[tokio::test]
+    async fn trigger_is_refused_while_globally_paused() {
+        let (s, _rx) = app_state_with_triggers().await;
+        state::action_index_upsert(
+            &s.pool,
+            &state::ActionIndexRow {
+                name: "act".into(),
+                file_path: "/dev/null".into(),
+                yaml_sha256: String::new(),
+                enabled: true,
+                schedule_kind: Some("manual".into()),
+                schedule_spec: None,
+                last_seen_at: state::now_iso(),
+                parse_error: None,
+                link_template: None,
+                max_parallel: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Not paused: the trigger is accepted.
+        let Json(ack) = trigger_action(State(s.clone()), AxumPath("act".into()))
+            .await
+            .expect("trigger accepted while running");
+        assert!(ack.ok);
+
+        state::global_pause_set(&s.pool, Some("rebooting"))
+            .await
+            .unwrap();
+        let err = trigger_action(State(s.clone()), AxumPath("act".into()))
+            .await
+            .expect_err("a paused trigger must be refused");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(err.message.contains("globally paused"), "{}", err.message);
+        assert!(err.message.contains("rebooting"), "{}", err.message);
+
+        state::global_pause_clear(&s.pool).await.unwrap();
+        let Json(ack) = trigger_action(State(s.clone()), AxumPath("act".into()))
+            .await
+            .expect("resume restores the trigger");
+        assert!(ack.ok);
+    }
+
+    /// CLAUDE-223: quiet needs BOTH signals clear. An open `runs` row makes it
+    /// false, and so does a non-empty in-flight map with no row yet written.
+    #[tokio::test]
+    async fn quiet_requires_both_signals_clear() {
+        let s = app_state().await;
+        let a = activity(&s.pool, &s.in_flight).await.unwrap();
+        assert!(a.quiet);
+        assert!(a.active_runs.is_empty() && a.dispatched_actions.is_empty());
+
+        // An open run row alone makes it busy, and is listed for the UI.
+        let run = state::run_begin(&s.pool, "act", "cli").await.unwrap();
+        let a = activity(&s.pool, &s.in_flight).await.unwrap();
+        assert!(!a.quiet);
+        assert_eq!(a.active_runs.len(), 1);
+        assert_eq!(a.active_runs[0].id, run);
+        state::run_finish(&s.pool, run, crate::exit::OK, 0)
+            .await
+            .unwrap();
+        assert!(activity(&s.pool, &s.in_flight).await.unwrap().quiet);
+
+        // A dispatched-but-not-yet-recorded run alone also makes it busy.
+        s.in_flight.lock().await.insert("act".into(), 1);
+        let a = activity(&s.pool, &s.in_flight).await.unwrap();
+        assert!(!a.quiet);
+        assert_eq!(a.dispatched_actions, vec!["act".to_string()]);
+        assert!(a.active_runs.is_empty());
+    }
+
+    /// CLAUDE-223: `/status` carries the activity block, so `claude-run status`
+    /// and a reboot script read the same snapshot the About page renders.
+    #[tokio::test]
+    async fn status_reports_the_activity_block() {
+        let s = app_state().await;
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert!(status.activity.quiet);
+
+        let run = state::run_begin(&s.pool, "act", "cli").await.unwrap();
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert!(!status.activity.quiet);
+        assert_eq!(status.activity.active_runs[0].id, run);
     }
 
     /// CLAUDE-61 / CLAUDE-220: no synthetic action can be deleted (none has a

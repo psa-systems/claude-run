@@ -99,6 +99,18 @@ impl Daemon {
             info!(count = cancelled, "cancelled orphaned runs on startup");
         }
 
+        // CLAUDE-223: the global pause is DB-persisted, so it survives a restart
+        // and the daemon can come up already paused. Say so at `info`, otherwise
+        // a daemon that schedules nothing looks broken rather than paused. The
+        // dashboard banner and the About Activity card are the visual reminder.
+        if let Some((paused_at, reason)) = state::global_pause_status(&pool).await? {
+            info!(
+                paused_at = %paused_at,
+                reason = reason.as_deref().unwrap_or("(none)"),
+                "starting up GLOBALLY PAUSED; no action will be dispatched until Resume"
+            );
+        }
+
         // CLAUDE-171: stamp this serve's start. The action-detail input-error
         // summary and the error-log page's default window are bounded to it, so
         // each serve gets a fresh diagnostics window instead of replaying every
@@ -329,6 +341,7 @@ impl Daemon {
             // CLAUDE-162: daemon-wide caps + continuous-pickup state.
             limiter,
             concurrency,
+            pause: crate::pause::PauseGate::new(pool.clone()),
             last_fire: Mutex::new(HashMap::new()),
         });
 
@@ -984,6 +997,10 @@ struct Dispatcher {
     /// CLAUDE-162: live handle to the concurrency settings (global cap + regather
     /// cadence), read each scheduler tick so a Settings save applies live.
     concurrency: Arc<RwLock<ConcurrencyConfig>>,
+    /// CLAUDE-223: daemon-wide global-pause reader. Refreshed every scheduler
+    /// tick (which has to read the flag anyway) and handed to every run so the
+    /// per-job gates share one TTL-cached read instead of querying per job.
+    pause: crate::pause::PauseGate,
     /// CLAUDE-162: in-memory per-action timestamp of the last pickup fire. Drives
     /// the `regather_interval` cadence decoupled from run rows, so an action whose
     /// re-gather finds no fresh work (and thus creates no run row) is still not
@@ -1060,6 +1077,7 @@ impl Dispatcher {
             Some(&self.runs),
             &self.keygate,
             &self.limiter,
+            &self.pause,
         )
         .await
     }
@@ -1081,6 +1099,7 @@ pub async fn run_action_inner(
     registry: Option<&RunRegistry>,
     keygate: &KeyGate,
     limiter: &Limiter,
+    pause: &crate::pause::PauseGate,
 ) -> Result<()> {
     // CLAUDE-30: native kinds route to a built-in Rust handler. Scripted
     // actions fall through to the generic nu-snippet pipeline below, unchanged.
@@ -1095,6 +1114,7 @@ pub async fn run_action_inner(
             registry,
             keygate: keygate.clone(),
             limiter: limiter.clone(),
+            pause: pause.clone(),
         })
         .await;
     }
@@ -1161,6 +1181,9 @@ pub async fn run_action_inner(
         None => CancellationToken::new(),
     };
     let _registry_guard = RegistryGuard { registry, run_id };
+    // CLAUDE-223: run-scoped view of the global-pause gate. Any job it stops
+    // makes the run finish with `exit::PAUSED`.
+    let run_pause = pause.for_action_run(&loaded.action.name);
 
     // CLAUDE-1: record the planned job keys so the web UI shows what's
     // queued / in-flight before any outcome record lands (fresh subset only).
@@ -1195,6 +1218,7 @@ pub async fn run_action_inner(
         let snippet = snippet.clone();
         let claude = claude.clone();
         let job_cancel = cancel.clone();
+        let job_pause = run_pause.clone();
         let fut: crate::concurrency::JobFuture = Box::pin(async move {
             // CLAUDE-28: best-effort cap/budget check before launch. Up to
             // `max_parallel` tasks can pass this before any of them increments
@@ -1222,6 +1246,7 @@ pub async fn run_action_inner(
                 pool: &pool,
                 run_id,
                 cancel: job_cancel,
+                pause: job_pause,
             };
             let outcome = job::process_job(&ctx, &job, idx).await;
             if let Err(e) = state::run_inflight_remove(&pool, run_id, &job_key).await {
@@ -1276,6 +1301,7 @@ pub async fn run_action_inner(
         limiter: limiter.clone(),
         gate: keygate.clone(),
         cancel: cancel.clone(),
+        pause: run_pause.clone(),
     };
     let results = exec.run(items).await;
     let mut processed: u32 = 0;
@@ -1292,11 +1318,7 @@ pub async fn run_action_inner(
         }
     }
 
-    let exit_code = if cancel.is_cancelled() {
-        crate::exit::CANCELLED
-    } else {
-        crate::exit::OK
-    };
+    let exit_code = run_pause.exit_code(cancel.is_cancelled());
     state::run_finish(pool, run_id, exit_code, processed).await?;
     if let Some(e) = first_err {
         warn!(action = %loaded.action.name, error = %e, "one or more jobs errored during the run");
@@ -1414,7 +1436,12 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
     // without a daemon restart.
     scan_actions(&dispatch.pool, &dispatch.paths.actions_dir()).await?;
 
-    if state::global_pause_status(&dispatch.pool).await?.is_some() {
+    // CLAUDE-223: refresh through the shared gate rather than reading the flag
+    // directly, so the value the blocking per-job checkpoints read is never more
+    // than one tick stale. A read failure is logged at `error` inside the gate
+    // and reported as not paused, so a transient DB error cannot silently stop
+    // the daemon.
+    if dispatch.pause.refresh().await {
         return Ok(());
     }
     let now = Utc::now();
@@ -1649,6 +1676,62 @@ mod tests {
         assert_eq!(read_pidfile(&paths), None);
     }
 
+    /// CLAUDE-223: a globally paused daemon does no scheduler work at all. The
+    /// tick returns at the pause gate, BEFORE it recomputes the global
+    /// concurrency cap, so an unchanged cap is the observable proof that
+    /// nothing downstream (including dispatch) ran. Resuming lets the same tick
+    /// through; the action is `manual`, so it is still never dispatched and the
+    /// test spawns no run.
+    #[tokio::test]
+    async fn a_global_pause_blocks_the_scheduler_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        std::fs::create_dir_all(paths.actions_dir()).unwrap();
+        std::fs::write(
+            paths.actions_dir().join("act.yml"),
+            "name: act\nkind: youtrack\nnative: {}\nschedule:\n  kind: manual\nconcurrency:\n  max_parallel: 7\n",
+        )
+        .unwrap();
+        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        state::global_pause_set(&pool, Some("rebooting"))
+            .await
+            .unwrap();
+
+        let dispatch = Arc::new(Dispatcher {
+            paths: paths.clone(),
+            pool: pool.clone(),
+            snippet: Arc::new(SnippetRunner::new(None)),
+            claude: Arc::new(ClaudeInvoker::new(None)),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            keygate: KeyGate::new(),
+            runs: Arc::new(RunRegistry::new()),
+            limiter: Limiter::new(1),
+            concurrency: Arc::new(RwLock::new(ConcurrencyConfig::default())),
+            pause: crate::pause::PauseGate::new(pool.clone()),
+            last_fire: Mutex::new(HashMap::new()),
+        });
+
+        scheduler_tick(&dispatch).await.unwrap();
+        assert_eq!(
+            dispatch.limiter.global_max(),
+            1,
+            "a paused tick must return before it touches the limiter, let alone dispatch"
+        );
+        assert!(state::active_runs(&pool).await.unwrap().is_empty());
+
+        state::global_pause_clear(&pool).await.unwrap();
+        scheduler_tick(&dispatch).await.unwrap();
+        assert_eq!(
+            dispatch.limiter.global_max(),
+            7,
+            "the resumed tick runs the whole body again"
+        );
+        assert!(
+            state::active_runs(&pool).await.unwrap().is_empty(),
+            "a manual action is still never auto-dispatched"
+        );
+    }
+
     // CLAUDE-30/CLAUDE-32: a native action routes to the native-handler seam
     // (`crate::native::dispatch`) instead of the scripted gather + per-job loop.
     // With `max_runs_per_day: 0` the youtrack handler trips its own daily cap
@@ -1676,6 +1759,7 @@ mod tests {
             None,
             &KeyGate::new(),
             &Limiter::new(1),
+            &crate::pause::PauseGate::never(),
         )
         .await
         .expect("native handler caps out cleanly");

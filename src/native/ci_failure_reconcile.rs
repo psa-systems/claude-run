@@ -164,6 +164,9 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
         warn!(run_id, error = %e, "recording planned keys failed (continuing)");
     }
 
+    // CLAUDE-223: run-scoped global-pause gate, checked alongside cancel at the
+    // per-repo pickup so a mid-run pause stops the next repo scan.
+    let run_pause = ctx.pause.for_action_run(&action.name);
     let mut closed: u32 = 0;
 
     // CLAUDE-198: collapse duplicates first. It needs no Forgejo read, so a
@@ -194,6 +197,9 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
     // Scan one repo at a time; each repo's targets drive which runs matter.
     for repo in repos_in_order(&targets) {
         if cancel.is_cancelled() {
+            break;
+        }
+        if run_pause.stop().await {
             break;
         }
         let repo_targets: Vec<&IssueTarget> =
@@ -233,11 +239,7 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
         }
     }
 
-    let exit_code = if cancel.is_cancelled() {
-        crate::exit::CANCELLED
-    } else {
-        crate::exit::OK
-    };
+    let exit_code = run_pause.exit_code(cancel.is_cancelled());
     state::run_finish(pool, run_id, exit_code, closed).await?;
     Ok(())
 }

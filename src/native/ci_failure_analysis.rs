@@ -156,9 +156,15 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
     let fj = crate::provider::FjForgeReads::new(std::sync::Arc::new(
         crate::provider::ProcessRunner::new(),
     ));
+    // CLAUDE-223: run-scoped global-pause gate, checked alongside cancel at the
+    // per-job pickup so a mid-run pause bounds the operator's restart window.
+    let run_pause = ctx.pause.for_action_run(&action.name);
     let mut processed: u32 = 0;
     for key in &keys {
         if cancel.is_cancelled() {
+            break;
+        }
+        if run_pause.stop().await {
             break;
         }
         // Mid-run daily caps.
@@ -187,11 +193,7 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
         processed += 1;
     }
 
-    let exit_code = if cancel.is_cancelled() {
-        crate::exit::CANCELLED
-    } else {
-        crate::exit::OK
-    };
+    let exit_code = run_pause.exit_code(cancel.is_cancelled());
     state::run_finish(pool, run_id, exit_code, processed).await?;
     Ok(())
 }

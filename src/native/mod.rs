@@ -52,6 +52,11 @@ pub struct NativeContext<'a> {
     /// CLAUDE-162: daemon-wide concurrency limiter (global + per-action caps),
     /// used by the handler's executor so caps hold across overlapping runs.
     pub limiter: Limiter,
+    /// CLAUDE-223: daemon-wide global-pause reader. Each handler derives a
+    /// run-scoped [`crate::pause::RunPause`] after `run_begin` and consults it
+    /// at its per-job checkpoints, so a pause taken mid-run stops the next
+    /// pickup and the run finishes with `exit::PAUSED`.
+    pub pause: crate::pause::PauseGate,
 }
 
 /// Boxed future returned by a [`NativeHandler`]. Hand-rolled (rather than
