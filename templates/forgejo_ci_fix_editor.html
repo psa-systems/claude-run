@@ -25,7 +25,7 @@
 
 <form method="post" action="{{ post_url }}" class="yt-form">
 
-  {% call m::identity_block(form.common.name, "forgejo-ci-fix", form.common.enabled, form.common.workdir_base) %}
+  {% call m::identity_block(form.common.name, "forgejo-ci-fix", form.common.enabled, form.common.workdir_base, form.common.link_template) %}
 
   <div class="card">
     <h3>Scan</h3>
