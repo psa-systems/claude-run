@@ -228,6 +228,16 @@ pub trait IssueTracker: Send + Sync {
     /// redacted failing-job log to a minted issue (CLAUDE-46).
     fn attach_file(&self, key: &str, file: &std::path::Path) -> Result<()>;
 
+    /// CLAUDE-218: link `key` to `target` with `link_type`, read source-first
+    /// (`("CLAUDE-99", "subtask of", "CLAUDE-1")` makes CLAUDE-99 a subtask of
+    /// CLAUDE-1). Backs hanging a filed report off its nominated parent.
+    fn link_issue(&self, key: &str, link_type: &str, target: &str) -> Result<()> {
+        let _ = (key, link_type, target);
+        Err(Error::Other(anyhow::anyhow!(
+            "link_issue not supported by this tracker backend"
+        )))
+    }
+
     /// CLAUDE-216: verify the tracker token and return the authenticated login
     /// (`yt auth verify`, GET /api/users/me). The single read-only answer to "is
     /// this token still valid". Never returns the token itself.

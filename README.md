@@ -107,8 +107,9 @@ will want to know about:
 
 - **New action** (`/actions/new`, CLAUDE-211) is a kind picker: it lists every action kind with a one-line description
   and a link to its editor. Every native kind (`youtrack`, `forgejo-ci-fix`, `ci-failure-analysis`,
-  `ci-failure-reconcile`) has a structured form at `/actions/new/<kind>`, so no native action has to be hand-written as
-  YAML. `scripted` is **raw YAML only** (its fields are nu snippets, which a form cannot structure); the raw editor is
+  `ci-failure-reconcile`, `closed-issue-summary`) has a structured form at `/actions/new/<kind>`, so no native action
+  has to be hand-written as YAML. `scripted` is **raw YAML only** (its fields are nu snippets, which a form cannot
+  structure); the raw editor is
   the explicit escape hatch at `/actions/new/raw` and also handles the few advanced fields no form covers. An existing
   native action's form is at `/actions/<name>/form` (offered from the raw editor, which stays at
   `/actions/<name>/edit`). Every form saves through the same validation and write path as the raw editor, so a form can
@@ -628,6 +629,30 @@ Set `close_duplicates: false` to leave duplicates open.
 
 Configure it in `actions/ci-failure-reconcile.yml` (`repos` names the allow-list, `log_token_ref` picks the Forgejo PAT
 per repo, see below). See `actions/SCHEMA.md` (`kind: ci-failure-reconcile`).
+
+### Cross-project closed-issue summaries (CLAUDE-218)
+
+The same runner can be used as a reporting tool rather than as an issue worker. The `closed-issue-summary` native action
+(`kind: closed-issue-summary`, `src/native/closed_issue_summary.rs`) answers "what did we close this week, across these
+projects" and files the answer where the record already lives: it queries each configured project for the issues
+resolved inside a rolling window, renders per-project counts plus a total and a per-project listing, creates that report
+as a new issue, and links it to a nominated parent (typically the milestone being reported against) as a subtask.
+
+It changes no code and opens no pull request. The run clones no repository and starts no agent session, so there is no
+forge call and no git call on any path, and the only writes are the tracker's: one `issue create`, one `issue link`, and
+one marker comment on the parent. That contract is why it is a separate action rather than a second job taught to
+`actions/youtrack.yml`, following the audit split of CLAUDE-215.
+
+Parents come from `parents` (nominated by id, never field-written) unioned with whatever the optional `query` selects. A
+`query` must select an `AI Agent` value that `actions/youtrack.yml` does not, or the two actions race for the same
+issue; the shipped reporting action leaves `query` empty, and `shipped_action_queries_are_disjoint` in `src/action.rs`
+guards the partition. Counts are exact and `max_listed_per_project` caps only the listing, which then states how many
+rows it did not print. The marker comment on the parent carries a hidden `Report-Window:` line and a parent already
+carrying the current window's marker is skipped, so a poll interval shorter than the window still files one report per
+window.
+
+Configure it in `actions/closed-issue-summary.yml` (`parents` nominates the milestone, `projects` names what to count,
+`window_days` sets the window). See `actions/SCHEMA.md` (`kind: closed-issue-summary`).
 
 ### Per-repo log tokens for the CI-failure actions (CLAUDE-200)
 
