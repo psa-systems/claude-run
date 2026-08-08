@@ -65,6 +65,10 @@ native:
 # /home has more space than /tmp.
 workdir_base: ~/workspace
 
+# Per-action link template (CLAUDE-222). Job keys are YouTrack issue ids, so they
+# render as clickable links to the issue in the web UI.
+link_template: "https://example.myjetbrains.com/issue/{key}"
+
 # The analysis session reads local files only.
 claude:
   allowed_tools: "Read,Grep,Bash"

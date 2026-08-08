@@ -90,6 +90,10 @@ native:
   # {root_cause_key} the shared marker; the hidden auto-closed marker is appended.
   duplicate_comment: "Auto-closed as a duplicate of {canonical}: both issues track the same failing job (root-cause key `{root_cause_key}`). Follow {canonical} for the fix."
 
+# Per-action link template (CLAUDE-222). Job keys are YouTrack issue ids, so they
+# render as clickable links to the issue in the web UI.
+link_template: "https://example.myjetbrains.com/issue/{key}"
+
 output:
   file: ci-failure-reconcile.jsonl
 
