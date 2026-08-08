@@ -279,6 +279,7 @@
             <option value="success"{% if view.exit == "success" %} selected{% endif %}>success</option>
             <option value="failed"{% if view.exit == "failed" %} selected{% endif %}>failed</option>
             <option value="cancelled"{% if view.exit == "cancelled" %} selected{% endif %}>cancelled</option>
+            <option value="paused"{% if view.exit == "paused" %} selected{% endif %}>paused</option>
             <option value="running"{% if view.exit == "running" %} selected{% endif %}>running</option>
           </select>
         </th>
@@ -296,6 +297,9 @@
             <td class="mono">
               {% match r.exit_code %}
                 {% when Some(0) %}<span class="badge ok">0</span>
+                {# CLAUDE-223: a run the global pause stopped is neither a
+                   failure nor an operator cancel; badge it as its own outcome. #}
+                {% when Some(1) %}<span class="badge pause">paused</span>
                 {% when Some(130) %}<span class="badge cancel">cancelled</span>
                 {% when Some(c) %}<span class="badge bad">{{ c }}</span>
                 {% when None %}

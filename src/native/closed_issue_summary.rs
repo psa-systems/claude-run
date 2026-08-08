@@ -173,9 +173,15 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
         warn!(run_id, error = %e, "recording planned keys failed (continuing)");
     }
 
+    // CLAUDE-223: run-scoped global-pause gate, checked alongside cancel at the
+    // per-parent pickup so a mid-run pause stops the next report.
+    let run_pause = ctx.pause.for_action_run(&action.name);
     let mut filed: u32 = 0;
     for parent in &targets {
         if cancel.is_cancelled() {
+            break;
+        }
+        if run_pause.stop().await {
             break;
         }
         match file_report(backend.as_ref(), &cfg, parent, window) {
@@ -200,11 +206,7 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
         }
     }
 
-    let exit_code = if cancel.is_cancelled() {
-        crate::exit::CANCELLED
-    } else {
-        crate::exit::OK
-    };
+    let exit_code = run_pause.exit_code(cancel.is_cancelled());
     state::run_finish(pool, run_id, exit_code, filed).await?;
     Ok(())
 }

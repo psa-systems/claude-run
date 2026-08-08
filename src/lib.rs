@@ -38,6 +38,7 @@ pub mod migrate;
 pub mod mint;
 pub mod native;
 pub mod paint;
+pub mod pause;
 pub mod provider;
 pub mod report;
 pub mod retention;
@@ -68,6 +69,11 @@ pub const VERSION: &str = concat!(
 /// systemd units behave the same after the port.
 pub mod exit {
     pub const OK: i32 = 0;
+    /// Work was refused or stopped because of a pause. Used both by the
+    /// standalone `claude-run run` (refused up front) and, since CLAUDE-223, as
+    /// the `runs.exit_code` of a run that stopped picking up new jobs when the
+    /// operator paused globally mid-run. Distinct from [`OK`] and [`CANCELLED`]
+    /// so the run list can badge it separately.
     pub const PAUSED: i32 = 1;
     pub const LOCKED: i32 = 2;
     pub const CONFIG_ERROR: i32 = 3;

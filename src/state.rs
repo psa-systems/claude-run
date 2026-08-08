@@ -925,6 +925,39 @@ pub async fn action_has_active_run(pool: &SqlitePool, action: &str) -> Result<bo
     Ok(row.is_some())
 }
 
+/// CLAUDE-223: one still-open run, for the About page's quiet indicator and the
+/// `/api/status` activity block.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActiveRun {
+    pub id: i64,
+    pub action_name: String,
+    pub started_at: String,
+}
+
+/// CLAUDE-223: every run row with no `ended_at`, oldest first. Trustworthy as a
+/// liveness signal because `cancel_orphaned_runs` closes every leftover row at
+/// daemon startup, so an open row means a run really is executing. Returns the
+/// rows (not a count) so the busy indicator can list and link each one.
+///
+/// This is only HALF the quiet signal: it misses a run dispatched but not yet
+/// past `run_begin`. The daemon's in-flight map covers that, and the two are
+/// combined in `crate::api::activity`.
+pub async fn active_runs(pool: &SqlitePool) -> Result<Vec<ActiveRun>> {
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT id, action_name, started_at FROM runs WHERE ended_at IS NULL ORDER BY started_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, action_name, started_at)| ActiveRun {
+            id,
+            action_name,
+            started_at,
+        })
+        .collect())
+}
+
 /// CLAUDE-162: the set of job keys currently in flight across every still-open
 /// (not-yet-finished) run of `action`. A re-gather started while a prior run is
 /// working an issue dedups its gathered jobs against this set, so an overlapping
@@ -1469,6 +1502,30 @@ mod tests {
             !action_has_active_run(&pool, "act").await.unwrap(),
             "a finished run is no longer in flight"
         );
+    }
+
+    /// CLAUDE-223: `active_runs` lists every open run (id, action, start) and
+    /// empties as each finishes, so the quiet indicator can both decide and list.
+    #[tokio::test]
+    async fn active_runs_lists_open_runs_only() {
+        let pool = mem_pool().await;
+        assert!(active_runs(&pool).await.unwrap().is_empty());
+
+        let a = run_begin(&pool, "act-a", "cli").await.unwrap();
+        let b = run_begin(&pool, "act-b", "scheduler").await.unwrap();
+        let open = active_runs(&pool).await.unwrap();
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].id, a);
+        assert_eq!(open[0].action_name, "act-a");
+        assert!(!open[0].started_at.is_empty());
+
+        run_finish(&pool, a, crate::exit::OK, 0).await.unwrap();
+        let open = active_runs(&pool).await.unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, b);
+
+        run_finish(&pool, b, crate::exit::PAUSED, 0).await.unwrap();
+        assert!(active_runs(&pool).await.unwrap().is_empty());
     }
 
     // CLAUDE-162: with two OVERLAPPING open runs for one action,

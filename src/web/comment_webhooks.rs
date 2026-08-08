@@ -493,21 +493,17 @@ async fn forgejo_comment_webhook(
     );
 
     // 5. Pause: accept-and-drop, matching every other action's "paused = does not
-    // run" and keeping Forgejo from retrying.
-    match state::action_pause_status(&st.pool, WEBHOOK_COMMENT_ACTION).await {
-        Ok(Some(_)) => {
-            info!(
-                source = %source,
-                delivery,
-                "webhook-forgejo-comment action is paused; delivery accepted and dropped"
-            );
-            return StatusCode::OK.into_response();
-        }
-        Ok(None) => {}
-        Err(e) => {
-            warn!(source = %source, delivery, error = %e, "webhook-forgejo-comment pause-status read failed; accepting and dropping");
-            return StatusCode::OK.into_response();
-        }
+    // run" and keeping Forgejo from retrying. CLAUDE-223: the GLOBAL pause is
+    // checked first, through the same shared gate the CI-failure listener takes.
+    if crate::web::webhooks::paused_accept_and_drop(
+        &st.pool,
+        WEBHOOK_COMMENT_ACTION,
+        &source,
+        delivery,
+    )
+    .await
+    {
+        return StatusCode::OK.into_response();
     }
 
     // 6. Parse only after the request is authenticated and de-duplicated.
@@ -2855,6 +2851,36 @@ mod tests {
             StatusCode::ACCEPTED
         );
         assert!(rx.try_recv().is_ok());
+    }
+
+    /// CLAUDE-223: the GLOBAL pause accepts-and-drops here too, through the
+    /// same shared gate the CI-failure listener takes, so neither endpoint can
+    /// start work on a paused daemon.
+    #[tokio::test]
+    async fn global_pause_accepts_and_drops() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, mut rx) = state_for(tmp.path()).await;
+        state::global_pause_set(&st.pool, Some("rebooting"))
+            .await
+            .unwrap();
+        let raw = payload_json("created", REPO, "/claude fix it", "alice", true);
+        let sig = sign(SECRET.as_bytes(), raw.as_bytes());
+        assert_eq!(
+            post(&st, SOURCE, &raw, Some(&sig), Some("gp-1")).await,
+            StatusCode::OK
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a globally paused daemon emits nothing"
+        );
+
+        state::global_pause_clear(&st.pool).await.unwrap();
+        assert_eq!(
+            post(&st, SOURCE, &raw, Some(&sig), Some("gp-2")).await,
+            StatusCode::ACCEPTED
+        );
+        assert!(rx.try_recv().is_ok(), "resume restores the accepted path");
     }
 
     #[tokio::test]

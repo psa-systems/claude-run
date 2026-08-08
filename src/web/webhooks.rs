@@ -73,6 +73,63 @@ use crate::triage::{self, FailureClassifier, TriageInput};
 /// the log-dir rename in [`crate::daemon`]) carries existing history across.
 pub const WEBHOOK_MINT_ACTION: &str = "webhook-forgejo";
 
+/// CLAUDE-153 / CLAUDE-223: the pause gate both webhook listeners take, once
+/// signature / replay / rate-limit have passed. True means "accept the delivery
+/// and drop it": return 2xx without parsing, minting, or emitting anything.
+///
+/// Three ways it returns true, all logged:
+///
+/// - the GLOBAL pause is set (CLAUDE-223), which until now only the scheduler
+///   and dispatcher honoured, so a webhook could still start work on a paused
+///   daemon;
+/// - the listener's own synthetic action (`action`) is paused (CLAUDE-153);
+/// - either read failed, in which case we fail safe and drop rather than start
+///   work against a pause we could not read.
+///
+/// 2xx (not 4xx/5xx) because a retry cannot help: the delivery id is already in
+/// the replay store, so a same-id retry would 409, and the scheduled `youtrack`
+/// / `forgejo-ci-fix` poll is the backstop that re-finds the work after Resume.
+pub(crate) async fn paused_accept_and_drop(
+    pool: &SqlitePool,
+    action: &str,
+    source: &str,
+    delivery: &str,
+) -> bool {
+    match state::global_pause_status(pool).await {
+        Ok(Some((paused_at, _))) => {
+            info!(
+                source = %source,
+                delivery,
+                action,
+                paused_at = %paused_at,
+                "globally paused; delivery accepted and dropped"
+            );
+            return true;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(source = %source, delivery, action, error = %e, "global pause read failed; accepting and dropping the delivery (scheduled poll is the backstop)");
+            return true;
+        }
+    }
+    match state::action_pause_status(pool, action).await {
+        Ok(Some(_)) => {
+            info!(
+                source = %source,
+                delivery,
+                action,
+                "action is paused; delivery accepted and dropped"
+            );
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            warn!(source = %source, delivery, action, error = %e, "pause-status read failed; accepting and dropping the delivery (scheduled poll is the backstop)");
+            true
+        }
+    }
+}
+
 /// `runs.triggered_by` value for the event-driven webhook, alongside
 /// the existing `scheduler` / `trigger` / `cli` sources (CLAUDE-61). Each
 /// consumed verified failure becomes one run recorded under this source so the
@@ -1166,30 +1223,8 @@ async fn forgejo_webhook(
         "forgejo webhook authenticated"
     );
 
-    // CLAUDE-153: when the synthetic `webhook-forgejo` action is paused, accept
-    // the delivery and drop it (no parse, no event, no mint). A 2xx keeps
-    // Forgejo from treating it as a failed delivery and retrying; signature,
-    // replay, and rate-limit already ran above, so pause short-circuits only the
-    // mint step, matching every other action's "paused = does not run".
-    match state::action_pause_status(&st.pool, WEBHOOK_MINT_ACTION).await {
-        Ok(Some(_)) => {
-            info!(
-                source = %source,
-                delivery,
-                "webhook-forgejo action is paused; delivery accepted and dropped"
-            );
-            return StatusCode::OK.into_response();
-        }
-        Ok(None) => {}
-        Err(e) => {
-            // Pause state is unknown. Fail safe: do NOT mint against a possible
-            // pause. Ack (2xx) so Forgejo does not retry (the delivery id is
-            // already in the replay store, so a same-id retry would 409 anyway);
-            // the scheduled `youtrack` / `forgejo-ci-fix` poll is the backstop
-            // that still catches this failure on its next run.
-            warn!(source = %source, delivery, error = %e, "webhook-forgejo pause-status read failed; accepting and dropping (scheduled poll is the backstop)");
-            return StatusCode::OK.into_response();
-        }
+    if paused_accept_and_drop(&st.pool, WEBHOOK_MINT_ACTION, &source, delivery).await {
+        return StatusCode::OK.into_response();
     }
 
     // Parse only after the request is authenticated and de-duplicated.
@@ -2864,6 +2899,49 @@ mod tests {
                 rx.try_recv().is_err(),
                 "paused action must not emit a mint event"
             );
+        }
+
+        /// CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment
+        /// as the per-action one. Before this the listener only checked the
+        /// synthetic action, so a globally-paused daemon still minted from a
+        /// webhook. Resuming restores the emit.
+        #[tokio::test]
+        async fn global_pause_accepts_and_drops_without_emitting() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            state::global_pause_set(&st.pool, Some("rebooting"))
+                .await
+                .unwrap();
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st.clone()),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig), Some("gp-1")),
+                Bytes::from(raw.clone()),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "2xx so Forgejo does not retry"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "a globally paused daemon must not emit a mint event"
+            );
+
+            state::global_pause_clear(&st.pool).await.unwrap();
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig), Some("gp-2")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            assert!(rx.try_recv().is_ok(), "resume restores the emit");
         }
 
         #[tokio::test]

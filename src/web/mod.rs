@@ -162,6 +162,11 @@ pub fn router(
         .route("/about", get(about_page))
         .route("/about/check", post(about_check))
         .route("/about/update", post(about_update))
+        // CLAUDE-223: the Activity card's live quiet indicator polls this
+        // fragment every 2s. Its own route (rather than an `hx-select` off
+        // `/about`) so the busy / idle / unknown states are rendered by one
+        // handler and an activity-query failure cannot be mistaken for idle.
+        .route("/about/activity", get(about_activity))
         .route("/runs/:id", get(run_detail))
         .route("/runs/:id/jobs/:key/attempt/:attempt", get(job_stream_page))
         .route(
@@ -1038,12 +1043,15 @@ impl RunsView {
             binds.push(self.triggered.clone());
         }
         // Derived outcome states, mirroring the Exit-column badges: 0 = success,
-        // 130 = cancelled, any other non-NULL = failed, NULL = still running.
+        // 1 = stopped by the global pause (CLAUDE-223), 130 = cancelled, any
+        // other non-NULL = failed, NULL = still running. A paused run is
+        // excluded from "failed": it did not fail, it was told to stop.
         match self.exit.as_str() {
             "success" => conds.push("exit_code = 0".to_string()),
             "cancelled" => conds.push("exit_code = 130".to_string()),
+            "paused" => conds.push("exit_code = 1".to_string()),
             "failed" => {
-                conds.push("exit_code IS NOT NULL AND exit_code NOT IN (0, 130)".to_string())
+                conds.push("exit_code IS NOT NULL AND exit_code NOT IN (0, 1, 130)".to_string())
             }
             "running" => conds.push("exit_code IS NULL".to_string()),
             _ => {}
@@ -1180,7 +1188,10 @@ async fn dashboard(
         dir: if q.dir == "asc" { "asc" } else { "desc" }.to_string(),
         action: whitelist_member(&q.action, &action_options),
         triggered: whitelist_member(&q.triggered, &triggered_options),
-        exit: whitelisted(&q.exit, &["success", "failed", "cancelled", "running"]),
+        exit: whitelisted(
+            &q.exit,
+            &["success", "failed", "cancelled", "paused", "running"],
+        ),
     };
 
     // CLAUDE-142: page the Recent runs table. `total` is a COUNT over the same
@@ -3536,10 +3547,131 @@ impl CheckView {
     }
 }
 
+/// CLAUDE-223: the Activity card's live indicator, in exactly one of three
+/// states. `Unknown` exists because the alternative (rendering an empty list as
+/// idle) would tell an operator it is safe to reboot BECAUSE the query failed.
+#[derive(Serialize)]
+enum ActivityView {
+    /// Nothing is live: no dispatched run, no open `runs` row. Safe to restart.
+    Idle,
+    /// Live work, listed so the operator can follow each run.
+    Busy {
+        runs: Vec<ActiveRunView>,
+        /// Actions dispatched but with no `runs` row yet (the map-only signal).
+        dispatched_only: Vec<String>,
+    },
+    /// The activity query itself failed. NEVER rendered as idle; the underlying
+    /// error is logged at `error` where it is produced.
+    Unknown { error: String },
+}
+
+impl ActivityView {
+    /// The state label the template branches on. `busy` and `idle` are named
+    /// explicitly and anything else renders as unknown, so a variant added
+    /// later can never fall through to "safe to restart".
+    fn state(&self) -> &'static str {
+        match self {
+            ActivityView::Idle => "idle",
+            ActivityView::Busy { .. } => "busy",
+            ActivityView::Unknown { .. } => "unknown",
+        }
+    }
+    fn runs(&self) -> &[ActiveRunView] {
+        match self {
+            ActivityView::Busy { runs, .. } => runs,
+            _ => &[],
+        }
+    }
+    fn dispatched_only(&self) -> &[String] {
+        match self {
+            ActivityView::Busy {
+                dispatched_only, ..
+            } => dispatched_only,
+            _ => &[],
+        }
+    }
+    fn error(&self) -> &str {
+        match self {
+            ActivityView::Unknown { error } => error,
+            _ => "",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ActiveRunView {
+    id: i64,
+    action_name: String,
+    started_at: String,
+}
+
+/// CLAUDE-223: resolve the current activity for the Activity card. A failed
+/// query is logged at `error` here and converted to [`ActivityView::Unknown`],
+/// so the failure reaches both the log and the operator's screen instead of
+/// being collapsed into an empty (idle-looking) list.
+async fn activity_view(s: &WebState) -> ActivityView {
+    match crate::api::activity(&s.api.pool, &s.api.in_flight).await {
+        Ok(a) if a.quiet => ActivityView::Idle,
+        Ok(a) => {
+            let listed: std::collections::HashSet<&str> = a
+                .active_runs
+                .iter()
+                .map(|r| r.action_name.as_str())
+                .collect();
+            let dispatched_only = a
+                .dispatched_actions
+                .iter()
+                .filter(|name| !listed.contains(name.as_str()))
+                .cloned()
+                .collect();
+            ActivityView::Busy {
+                runs: a
+                    .active_runs
+                    .into_iter()
+                    .map(|r| ActiveRunView {
+                        id: r.id,
+                        action_name: r.action_name,
+                        started_at: r.started_at,
+                    })
+                    .collect(),
+                dispatched_only,
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "activity query failed; the About page reports UNKNOWN, not idle");
+            ActivityView::Unknown {
+                error: e.to_string(),
+            }
+        }
+    }
+}
+
+/// CLAUDE-223: the polled Activity fragment (`GET /about/activity`). Rendered
+/// standalone every 2s and included in the full About page, so both surfaces
+/// agree by construction.
+#[derive(Template)]
+#[template(path = "activity.html")]
+struct ActivityTpl {
+    activity: ActivityView,
+}
+
+async fn about_activity(State(s): State<WebState>) -> Result<Response, WebError> {
+    let tpl = ActivityTpl {
+        activity: activity_view(&s).await,
+    };
+    Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
+}
+
 #[derive(Template)]
 #[template(path = "about.html")]
 struct AboutTpl {
     version: &'static str,
+    /// CLAUDE-223: the global pause, so the Activity card offers Pause when
+    /// running and Resume (with since / reason) when paused.
+    global_pause: Option<PauseInfo>,
+    /// CLAUDE-223: the first render of the live indicator; the 2s poll then
+    /// replaces it from `/about/activity`.
+    activity: ActivityView,
     /// Configured update train (`release` / `latest`), changed on Settings.
     train: String,
     /// Whether a registry `token_ref` is configured (informational note).
@@ -3576,8 +3708,16 @@ async fn render_about(
     error: Option<String>,
 ) -> Result<Response, WebError> {
     let cfg = s.api.settings.update_config().await;
+    let global_pause = state::global_pause_status(&s.api.pool)
+        .await?
+        .map(|(a, r)| PauseInfo {
+            paused_at: a,
+            reason: r,
+        });
     let tpl = AboutTpl {
         version: s.api.version,
+        global_pause,
+        activity: activity_view(s).await,
         train: cfg.train,
         token_ref_set: cfg.token_ref.is_some(),
         check,
@@ -4668,7 +4808,7 @@ mod tests {
         let (w, b) = v.where_clause(false);
         assert_eq!(
             w,
-            " WHERE (jobs_processed > 0 OR exit_code IS NULL) AND action_name = ? AND triggered_by = ? AND exit_code IS NOT NULL AND exit_code NOT IN (0, 130)"
+            " WHERE (jobs_processed > 0 OR exit_code IS NULL) AND action_name = ? AND triggered_by = ? AND exit_code IS NOT NULL AND exit_code NOT IN (0, 1, 130)"
         );
         assert_eq!(b, vec!["YouTrack".to_string(), "schedule".to_string()]);
 
@@ -7376,6 +7516,67 @@ mod tests {
             assert!(body.contains("release"), "{body}");
             assert!(body.contains("/about/check"), "{body}");
             assert!(body.contains("/about/update"), "{body}");
+        }
+
+        /// CLAUDE-223: the Activity card carries the global Pause control and
+        /// the live indicator, and flips to Resume (with since / reason) once
+        /// paused.
+        #[tokio::test]
+        async fn activity_card_offers_pause_then_resume() {
+            let s = web_state().await;
+            let body = body_string(about_page(State(s.clone())).await.unwrap()).await;
+            assert!(body.contains("Pause all activity"), "{body}");
+            assert!(body.contains(r#"hx-post="/api/pause""#), "{body}");
+            assert!(body.contains(r#"hx-get="/about/activity""#), "{body}");
+            assert!(!body.contains("Resume all activity"), "{body}");
+
+            crate::state::global_pause_set(&s.api.pool, Some("rebooting"))
+                .await
+                .unwrap();
+            let body = body_string(about_page(State(s)).await.unwrap()).await;
+            assert!(body.contains("Resume all activity"), "{body}");
+            assert!(body.contains(r#"hx-post="/api/resume""#), "{body}");
+            assert!(body.contains("rebooting"), "{body}");
+            assert!(!body.contains("Pause all activity"), "{body}");
+        }
+
+        /// CLAUDE-223: the indicator's three states. Idle says it is safe to
+        /// restart; an open run row lists the run and links it; and a failed
+        /// activity query renders UNKNOWN, never idle.
+        #[tokio::test]
+        async fn activity_indicator_renders_idle_busy_and_unknown() {
+            let s = web_state().await;
+            let body = body_string(
+                super::super::about_activity(State(s.clone()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(body.contains("idle"), "{body}");
+            assert!(body.contains("Safe to restart"), "{body}");
+
+            let run = crate::state::run_begin(&s.api.pool, "act", "cli")
+                .await
+                .unwrap();
+            let body = body_string(
+                super::super::about_activity(State(s.clone()))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(body.contains("busy"), "{body}");
+            assert!(body.contains(&format!("/runs/{run}")), "{body}");
+            assert!(body.contains("act"), "{body}");
+            assert!(!body.contains("Safe to restart"), "{body}");
+
+            // A failed activity query (closed pool) must render UNKNOWN, not
+            // idle: "safe to restart" because the query broke is the bug this
+            // state exists to prevent.
+            s.api.pool.close().await;
+            let body = body_string(super::super::about_activity(State(s)).await.unwrap()).await;
+            assert!(body.contains("unknown"), "{body}");
+            assert!(body.contains("Do not treat this as idle"), "{body}");
+            assert!(!body.contains("Safe to restart"), "{body}");
         }
 
         /// An invalid configured train is surfaced as a rendered, non-fatal

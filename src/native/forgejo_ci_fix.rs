@@ -171,10 +171,16 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
         warn!(error = %e, "run_set_job_keys failed (non-fatal)");
     }
 
+    // CLAUDE-223: run-scoped global-pause gate, checked alongside cancel at both
+    // per-job checkpoints so a mid-run pause stops the next PR pickup.
+    let run_pause = ctx.pause.for_action_run(&action.name);
     let mut processed: u32 = 0;
     for (idx, job) in jobs.iter().enumerate() {
         if cancel.is_cancelled() {
             info!(action = %action.name, "run cancelled, stopping before next job");
+            break;
+        }
+        if run_pause.stop().await {
             break;
         }
         let current = state::daily_count_get(pool, &action.name).await?;
@@ -193,7 +199,7 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
         // Both permits and the key guard release at the end of this iteration.
         let _permits = ctx.limiter.acquire(&action.name, max_parallel).await;
         let _key_guard = ctx.keygate.acquire(&job.key).await;
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || run_pause.stop().await {
             break;
         }
         // CLAUDE-14: exactly one job shows as "running" at a time.
@@ -209,7 +215,16 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
         {
             warn!(error = %e, "run_inflight_add failed (non-fatal)");
         }
-        let outcome = process_job(&ctx, backend.as_ref(), &cfg, &limits, &cancel, job).await;
+        let outcome = process_job(
+            &ctx,
+            backend.as_ref(),
+            &cfg,
+            &limits,
+            &cancel,
+            &run_pause,
+            job,
+        )
+        .await;
         if let Err(e) = state::run_inflight_remove(pool, run_id, &planned_keys[idx]).await {
             warn!(error = %e, "run_inflight_remove failed (non-fatal)");
         }
@@ -218,11 +233,7 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
         processed += 1;
     }
 
-    let exit_code = if cancel.is_cancelled() {
-        crate::exit::CANCELLED
-    } else {
-        crate::exit::OK
-    };
+    let exit_code = run_pause.exit_code(cancel.is_cancelled());
     state::run_finish(pool, run_id, exit_code, processed).await?;
     info!(action = %action.name, processed, exit_code, "run complete");
     Ok(())
@@ -299,6 +310,7 @@ async fn process_job(
     cfg: &ForgejoCiFixConfig,
     limits: &EffectiveLimits,
     cancel: &CancellationToken,
+    pause: &crate::pause::RunPause,
     job: &ForgejoCiFixJob,
 ) -> Result<ProcessedJob> {
     let started = Instant::now();
@@ -353,7 +365,10 @@ async fn process_job(
     // ---- pre: clone the PR branch ----
     let pre_result = run_pre(backend, job, &workdir_path);
 
-    // ---- prompt + claude (skipped on pre failure / cancel) ----
+    // ---- prompt + claude (skipped on pre failure / cancel / global pause) ----
+    // CLAUDE-223: the gate is read once here (not in a match guard, which cannot
+    // `await`) and reused below so a paused job's attempt is not counted.
+    let paused_before_claude = pre_result.is_ok() && !cancel.is_cancelled() && pause.stop().await;
     let (claude_result, claude_ran) = match pre_result {
         Err(reason) => {
             warn!(action = %action.name, key = %key, %reason, "pre step failed (finalize still runs)");
@@ -365,6 +380,16 @@ async fn process_job(
                 ClaudeResult::synthesized(
                     "run cancelled by operator",
                     "cancelled before claude started",
+                ),
+                false,
+            )
+        }
+        Ok(()) if paused_before_claude => {
+            warn!(action = %action.name, key = %key, "globally paused before claude started (finalize still runs)");
+            (
+                ClaudeResult::synthesized(
+                    "run stopped by global pause",
+                    "globally paused before claude started",
                 ),
                 false,
             )
@@ -443,12 +468,12 @@ async fn process_job(
         state::attempts_increment(ctx.pool, &action.name, &pr_key).await?;
     }
 
-    // ---- skip-attempt marker (parked) or cancel ----
+    // ---- skip-attempt marker (parked), cancel, or global pause (CLAUDE-223) ----
     let skip_marker = workdir_path.join(SKIP_ATTEMPT_MARKER);
     let cancelled = cancel.is_cancelled();
-    let skip_attempt = skip_marker.exists() || cancelled;
+    let skip_attempt = skip_marker.exists() || cancelled || paused_before_claude;
     if skip_attempt {
-        info!(action = %action.name, key = %key, cancelled, "not counting attempt");
+        info!(action = %action.name, key = %key, cancelled, paused = paused_before_claude, "not counting attempt");
     }
 
     let ok = claude_result.ok && !post_failed;

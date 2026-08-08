@@ -133,6 +133,9 @@
           <td class="mono">
             {% match r.exit_code %}
               {% when Some(0) %}<span class="badge ok">0</span>
+              {# CLAUDE-223: stopped by the global pause, not a failure. #}
+              {% when Some(1) %}<span class="badge pause">paused</span>
+              {% when Some(130) %}<span class="badge cancel">cancelled</span>
               {% when Some(c) %}<span class="badge bad">{{ c }}</span>
               {% when None %}<span class="badge warn">running</span>
             {% endmatch %}

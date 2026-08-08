@@ -114,8 +114,35 @@
     <nav class="breadcrumb" aria-label="Breadcrumb">
       {% block breadcrumb %}{% endblock %}
     </nav>
+    {# CLAUDE-223: page-level failure banner for every hx-post control. Nearly all
+       of them use hx-swap="none", which discards the response body, so before
+       this a refused action (a 409 from a trigger on a paused daemon, a 500 from
+       a pause write) looked exactly like a successful one. htmx does not swap a
+       non-2xx, so one delegated listener is the only place that has to know. #}
+    <div id="op-error" class="card" hidden
+         style="border-color: var(--bad); margin-bottom: 16px;">
+      <strong style="color: var(--bad);">Action failed:</strong>
+      <span id="op-error-text"></span>
+    </div>
     {% block main %}{% endblock %}
   </main>
+  <script>
+    // Show the server's own message; fall back to the status line when the body
+    // is empty or not the JSON error envelope the API returns.
+    document.body.addEventListener('htmx:responseError', function (e) {
+      var xhr = e.detail.xhr, msg = '';
+      try { msg = JSON.parse(xhr.responseText).error || ''; } catch (_) { msg = xhr.responseText || ''; }
+      if (!msg) { msg = 'HTTP ' + xhr.status + ' ' + xhr.statusText; }
+      document.getElementById('op-error-text').textContent = msg;
+      document.getElementById('op-error').hidden = false;
+    });
+    // A request that never reached the server is just as invisible otherwise.
+    document.body.addEventListener('htmx:sendError', function () {
+      document.getElementById('op-error-text').textContent =
+        'The request did not reach the server (network error).';
+      document.getElementById('op-error').hidden = false;
+    });
+  </script>
   <footer>
     claude-run v{{ version }} - <a href="https://dev.a8n.run/psa-systems/claude-run">source</a>
   </footer>
