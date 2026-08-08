@@ -684,11 +684,18 @@ migration signal. To switch from the single SITE-level system webhook to one ORG
 5. Verify: one failing run per org produces a `verified action_run_failure received` log line carrying the right`source`
    field. The old shared secret can be deleted after a burn-in period.
 
-## Comment commands on a pull request (CLAUDE-220)
+## Comment commands on a pull request or an issue (CLAUDE-220, CLAUDE-221)
 
-A second inbound listener turns a `/claude <instruction>` comment on a Forgejo pull request into a bounded Claude run
-against that PR's head branch. The endpoint is `POST /webhooks/forgejo-comment/<source>`, served alongside (and
-independently of) the CI-failure webhook above.
+A second inbound listener turns a `/claude <instruction>` comment on a Forgejo thread into work. The endpoint is
+`POST /webhooks/forgejo-comment/<source>`, served alongside (and independently of) the CI-failure webhook above. It has
+two routes, chosen by whether the comment's thread is a pull request:
+
+- **Pull request (CLAUDE-220):** a bounded Claude run against that PR's head branch, pushed back to the branch.
+- **Plain issue (CLAUDE-221):** an issue has no head branch to clone or push, so nothing runs here. The command mints a
+  YouTrack issue carrying the instruction and a link back to the Forgejo issue, queued for the agent.
+
+The second route is a ROUTE, not a second listener: the request pipeline, authorization gate, trigger parsing,
+bot-login loop drop, dedupe key, and caps ledger are the same implementations both paths run through.
 
 It is a SEPARATE listener, section, and synthetic action rather than a second event type on `webhook-forgejo`, because
 the credentials differ in kind: comment handling needs a WRITE token (post replies, push a branch) while the CI-failure
@@ -700,16 +707,16 @@ caught), the per-source rate-limiter type and builder, and the `owner/repo` allo
 **Request pipeline**, in the same order as the CI-failure endpoint: unknown source `404` -> per-source rate limit `429`
 -> missing / unresolvable `secret_ref` `401` -> bad or missing signature `401` -> missing `X-Forgejo-Delivery` `400` ->
 replayed delivery id `409` -> Pause check (accept-and-drop with `2xx`) -> parse. Every post-authentication drop is acked
-with `2xx` (so Forgejo does not retry) and logged with its reason: a comment `action` other than `created`, a comment
-that is not on a pull request, a repo outside `allowed_repos`, a first line that does not open with the trigger, or an
-author in the mint config's loop-safety `bot_logins` (so the bot's own reply can never re-trigger a run).
+with `2xx` (so Forgejo does not retry) and logged with its reason: a comment `action` other than `created`, a repo
+outside `allowed_repos`, a first line that does not open with the trigger, or an author in the mint config's
+loop-safety `bot_logins` (so the bot's own reply can never re-trigger a run).
 
 **Trigger.** The FIRST line of the comment, trimmed, must start with the configured `trigger` (default `/claude`)
 followed by whitespace or end-of-line; everything after it on that line plus the remaining lines is the instruction.
-`/claude help` (and a bare `/claude`) replies with usage and runs nothing, counting no attempt. An instruction over
-`max_instruction_chars` (default 4000) is refused with a reply naming the limit. An edited or deleted comment does
-nothing: re-running work from an edit expresses no new human intent, so post a new comment instead. Plain (non-PR)
-issue comments are out of scope here and are tracked in CLAUDE-221.
+`/claude help` (and a bare `/claude`) replies with usage and runs nothing, counting no attempt (the usage text differs
+by route). An instruction over `max_instruction_chars` (default 4000) is refused with a reply naming the limit. An
+edited or deleted comment does nothing: re-running work from an edit expresses no new human intent, so post a new
+comment instead.
 
 **Authorization** is a LIVE read of the commenter's effective repository permission through
 `fj repo collaborator <owner>/<repo> permission <username> --format json` (a new `Forge::repo_permission`; no raw REST
@@ -719,7 +726,7 @@ A permission lookup that ERRORS denies (fail closed) and replies "could not veri
 ONE reply stating the required set, then the delivery is acked and dropped; denial replies are throttled per
 `(repo, login)` so a scripted denied commenter cannot flood a PR.
 
-**Execution** reuses the `forgejo-ci-fix` pipeline shape: shallow-clone the PR head branch, write the human's
+**Execution on a pull request** reuses the `forgejo-ci-fix` pipeline shape: shallow-clone the PR head branch, write the human's
 instruction VERBATIM to `.claude-run-instruction.md` in the checkout (it is never interpolated into a shell command or
 a command line: the agent is told to read the file), run Claude, then apply the decision gate. A run that made no
 changes, or whose diff exceeds the source's `max_files` / `max_lines`, is reported on the PR and nothing is pushed;
@@ -727,26 +734,44 @@ within the caps the runner commits as the bot identity with the CI skip marker (
 `forgejo-ci-fix`) and pushes the branch. A PR comment is posted on EVERY outcome path: pushed, push failed, no changes,
 too big, and agent error.
 
+**Execution on a plain issue (CLAUDE-221)** clones nothing, starts no agent session, and pushes nothing. It resolves
+the repo's YouTrack project through the SAME routing the CI-failure mint uses (the `[mint]` `repo_project_map`
+override, then the project whose enabled VCS integration claims the repo via the TTL-cached inverse map, then
+`fallback_project`), creates an issue whose summary names the Forgejo issue and whose body carries the instruction
+verbatim in a fenced block plus a link back and the requester, sets `State` to `[mint].target_state`, and then sets
+`[mint].ai_agent_field` to `[mint].queued_value` (`AI Agent = Queued`) LAST so the `youtrack` native action only picks
+the issue up once it is fully formed. The work then arrives as that action's own pull request. A comment is posted on
+the Forgejo issue on EVERY outcome path: minted (naming the key and project), created-but-not-queued (naming the key
+and the field to set by hand, so the request is never lost), and create-failed. Replies on this route go through
+`fj issue comment <owner>/<repo>#<n> --body-file <path>` (`Forge::issue_comment`), never `fj pr comment` and never raw
+REST.
+
 **Accounting and concurrency.** Runs are recorded under the synthetic action `webhook-forgejo-comment` with the same
 per-key attempt counter and daily run ledger every other action uses, so caps, the durations chart, and run history all
-work. The attempt key is `hash(repo, pr_number, comment_id)`, and because a comment is a one-shot request its effective
-per-key cap is one attempt: a redelivery of the same comment never runs the work twice. At most one comment job per
-`(repo, PR)` is in flight, through the daemon-wide key gate; a second command while one is running gets a reply saying
-so and is dropped.
+work. The attempt key is `hash(repo, number, comment_id)` on both routes (a Forgejo comment id is unique across a
+repo's issues and pull requests), and because a comment is a one-shot request its effective per-key cap is one attempt:
+a redelivery of the same comment never runs the work twice, and never mints a second YouTrack issue. The daily run
+ledger advances for a mint as well as for a Claude run, so a flood of plain-issue commands is bounded by the same cap.
+At most one comment job per thread is in flight, through the daemon-wide key gate; the gate key carries the thread kind,
+so a plain issue can never block the like-numbered pull request. A second command while one is running gets a reply
+saying so and is dropped.
 
 **Configuration** is the `Comment webhook` section on the Settings page (`GET` / `PUT
 /api/settings/webhook_comment`, DB key `config.webhook_comment`). Top level: `trigger`, `max_instruction_chars`, and
 `sources`. Per source: `secret_ref` (HMAC; unset means the endpoint `401`s everything), `allowed_repos` (the same three
 pattern forms as the CI-failure allow-list; empty denies all), `rate_limit_per_min`, `write_token_ref`,
 `allowed_permissions`, the `max_files` / `max_lines` decision-gate caps, and the commit identity (`bot_author`,
-`bot_email`, `skip_marker`). Source and rate-limiter changes apply live, with no daemon restart. The `write_token_ref`
+`bot_email`, `skip_marker`). The plain-issue route adds no settings of its own: it reads the existing `Mint` section
+(`config.mint`) for project routing, target state, and the `AI Agent` field / queued value. Source and rate-limiter
+changes apply live, with no daemon restart. The `write_token_ref`
 secret reaches `fj` exactly the way `log_token_ref` does: a temp single-host `keys.json` carrying that one secret and
 nothing else, removed when the command finishes. The token is never in YAML, never an env var in the daemon's own
 environment, never a process argument, and never rendered in a settings response.
 
 **Forgejo setup.** On the repo or org's Settings -> Webhooks, add a **Forgejo** webhook with URL
 `https://<daemon-host>/webhooks/forgejo-comment/<source>`, the Secret set to that source's stored `secret_ref` value,
-and **only** the Issue Comment event selected. Store the write PAT first, e.g.
+and **only** the Issue Comment event selected (Forgejo delivers pull-request and plain-issue comments through that one
+event; the listener tells them apart from the payload). Store the write PAT first, e.g.
 `printf %s '<pat>' | claude-run secret set forgejo-write-<org>`, and name it in the source's `write_token_ref`.
 
 ## Containerized deployment
