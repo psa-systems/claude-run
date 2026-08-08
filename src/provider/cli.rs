@@ -1286,6 +1286,13 @@ impl IssueTracker for CliBackend {
         self.yt_ok(&["issue", "attachment", "add", key, &file_arg])?;
         Ok(())
     }
+
+    fn link_issue(&self, key: &str, link_type: &str, target: &str) -> Result<()> {
+        // `yt issue link <source> <target> --type <link-type>`; the type is a
+        // flag with a `relates` default, so it is always passed explicitly.
+        self.yt_ok(&["issue", "link", key, target, "--type", link_type])?;
+        Ok(())
+    }
 }
 
 impl Forge for CliBackend {
@@ -2053,6 +2060,26 @@ mod tests {
             }
             other => panic!("expected CliParse, got {other:?}"),
         }
+    }
+
+    /// CLAUDE-218: the link is source-first and the type is always passed
+    /// explicitly, since `yt issue link` defaults `--type` to `relates`.
+    #[test]
+    fn link_issue_passes_the_type_explicitly() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &[
+                "issue",
+                "link",
+                "CLAUDE-230",
+                "CLAUDE-100",
+                "--type",
+                "subtask of",
+            ],
+            "",
+        ));
+        b.link_issue("CLAUDE-230", "subtask of", "CLAUDE-100")
+            .unwrap();
     }
 
     #[test]

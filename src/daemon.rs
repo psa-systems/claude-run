@@ -740,6 +740,21 @@ fn native_source_key(action: &crate::action::Action) -> Option<String> {
                 repos.join(",")
             ))
         }
+        NativeConfig::ClosedIssueSummary(cfg) => {
+            // Two reporters produce the same report iff they select the same
+            // parents (nominated ids plus query) over the same project set. Both
+            // lists are sets, so they are sorted before joining.
+            let mut parents = cfg.parents.clone();
+            parents.sort();
+            let mut projects = cfg.projects.clone();
+            projects.sort();
+            Some(format!(
+                "closed-issue-summary\u{1f}{}\u{1f}{}\u{1f}{}",
+                cfg.query,
+                parents.join(","),
+                projects.join(",")
+            ))
+        }
     }
 }
 

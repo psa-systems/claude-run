@@ -1,0 +1,94 @@
+---
+# Cross-project closed-issue summary (CLAUDE-218).
+#
+# Native action (`kind: closed-issue-summary`) routing to the built-in Rust
+# handler in `src/native/closed_issue_summary.rs`. This file is config only and
+# carries no script-bearing fields (input.command / filter / pre / prompt /
+# post).
+#
+# This is the automation used as a REPORTING tool rather than as an issue worker,
+# which is why it is its own action rather than a second job taught to
+# `youtrack.yml` (same reasoning as the audit split in CLAUDE-215): the contract
+# differs on every axis. It reads many projects, writes an issue, and touches no
+# code.
+#   targets -> the `parents` listed below, unioned with whatever `query` selects
+#              (empty here, so no query runs at all).
+#   gather  -> one `yt list --query="project: <P> resolved date: <start> .. <end>"`
+#              per configured project. Fully paginated, so the counts are exact.
+#   render  -> per-project counts, a total, and a per-project listing of every
+#              closed issue. `max_listed_per_project` caps the LISTING only, and a
+#              capped section states how many rows it did not print.
+#   file    -> `yt issue create` in the parent's project, then
+#              `yt issue link <report> <parent> --type "subtask of"`, then a
+#              marker comment on the parent.
+#
+# The run clones no repository, starts no agent session, and opens no pull
+# request: there is no forge call and no git call on any path. That is the
+# contract, and `report_run_makes_no_code_change_and_opens_no_pr` in the handler
+# holds it.
+#
+# Idempotency: the marker comment carries a hidden `Report-Window:` line, and a
+# parent already carrying the current window's marker is skipped. That is what
+# makes a poll interval shorter than the window safe: one report per window, not
+# one per poll.
+
+name: closed-issue-summary
+
+kind: closed-issue-summary
+
+native:
+  # Master enable toggle (default true).
+  enabled: true
+  # Issues each report hangs off, nominated by id: typically the milestone being
+  # reported against. Reported for on every run, subject to the window marker.
+  # These are never field-written; the marker alone keeps the run idempotent.
+  parents: []
+  # Optional tracker query selecting further parents dynamically. Empty here, so
+  # no query is run and this action cannot collide with `youtrack.yml`.
+  #
+  # When set it MUST select an `AI Agent` value the worker action does not.
+  # `youtrack.yml` owns `AI Agent: Queued`, so a reporting query needs its own
+  # distinct value (e.g. `-Resolved AI Agent: Reporting`), and that value has to
+  # exist in the YouTrack `AI Agent` bundle first: YouTrack rejects a query naming
+  # an unknown enum value with HTTP 400 rather than returning an empty result, so
+  # naming it here (or negating it in `youtrack.yml`) before it exists breaks both
+  # actions' polls.
+  query: ""
+  # Field advanced on a query-selected parent once its report is filed, which is
+  # what drops it back out of `query`. Unused while `query` is empty.
+  custom_field: "AI Agent"
+  done_label: Done
+  failed_label: Failed
+  # Project short names the report counts closed issues across.
+  projects:
+    - CLAUDE
+  # Rolling window length in days, ending today inclusive: 7 covers today plus
+  # the previous six days.
+  window_days: 7
+  # Project the report issue is created in. Omitted, so it is created in the
+  # parent's own project and no site-specific project has to be configured.
+  # report_project: RPT
+  # How the report is attached to its parent, applied as `<report> subtask of <parent>`.
+  link_type: "subtask of"
+  # Summary line of the report issue. {start} / {end} / {days} / {total} /
+  # {parent} are substituted.
+  summary_template: "Closed-issue summary: {start} .. {end}"
+  # Cap on how many issues are LISTED per project. Counts stay exact; a project
+  # over the cap renders the cap plus an explicit "and N more" line.
+  max_listed_per_project: 100
+
+# Per-action link template (CLAUDE-1). Job keys are parent issue ids, so they
+# render as clickable links to the YouTrack issue in the web UI.
+link_template: "https://example.myjetbrains.com/issue/{key}"
+
+output:
+  file: closed-issue-summary.jsonl
+
+# Poll daily. The window marker makes a shorter interval safe, but there is
+# nothing to gain from re-checking a 7-day window every few minutes.
+schedule:
+  kind: interval
+  spec: 24h
+
+limits:
+  max_runs_per_day: 5

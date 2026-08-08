@@ -112,6 +112,11 @@ pub fn router(
             get(native_forms::ci_failure_reconcile_new_page)
                 .post(native_forms::ci_failure_reconcile_create),
         )
+        .route(
+            "/actions/new/closed-issue-summary",
+            get(native_forms::closed_issue_summary_new_page)
+                .post(native_forms::closed_issue_summary_create),
+        )
         .route("/actions", post(action_create))
         .route("/actions/:name", get(action_detail))
         .route("/actions/:name/durations", get(action_durations))
@@ -2094,6 +2099,12 @@ fn kind_card(kind: ActionKind) -> KindCard {
             "Close each open CI-failure issue whose failing job is green again on its latest run, \
              and collapse issues that share a root-cause key.",
             "/actions/new/ci-failure-reconcile",
+            "Structured form",
+        ),
+        ActionKind::ClosedIssueSummary => (
+            "Report rather than work: count and list every issue closed in a rolling window across \
+             a set of projects, and file the summary as a subtask of a nominated parent.",
+            "/actions/new/closed-issue-summary",
             "Structured form",
         ),
         ActionKind::Scripted => (
@@ -6449,6 +6460,7 @@ mod tests {
             assert!(body.contains("/actions/new/forgejo-ci-fix"));
             assert!(body.contains("/actions/new/ci-failure-analysis"));
             assert!(body.contains("/actions/new/ci-failure-reconcile"));
+            assert!(body.contains("/actions/new/closed-issue-summary"));
             assert!(body.contains("/actions/new/raw"));
             // The raw textarea is not the default any more.
             assert!(!body.contains("<textarea"), "{body}");
@@ -6498,7 +6510,7 @@ mod tests {
                 "claude_permission_mode",
             ];
             let log_token_inputs = ["log_token_global", "log_token_repos", "log_token_ref"];
-            let cases: [(Response, &str, &str, Vec<&str>); 3] = [
+            let cases: [(Response, &str, &str, Vec<&str>); 4] = [
                 (
                     native_forms::forgejo_ci_fix_new_page(State(s.clone()))
                         .await
@@ -6557,16 +6569,41 @@ mod tests {
                     .chain(log_token_inputs)
                     .collect(),
                 ),
+                (
+                    native_forms::closed_issue_summary_new_page(State(s.clone()))
+                        .await
+                        .unwrap(),
+                    "closed-issue-summary",
+                    "/actions/new/closed-issue-summary",
+                    [
+                        "parents",
+                        "query",
+                        "custom_field",
+                        "done_label",
+                        "failed_label",
+                        "projects",
+                        "window_days",
+                        "report_project",
+                        "link_type",
+                        "summary_template",
+                        "max_listed_per_project",
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
             ];
             for (resp, kind, post_url, fields) in cases {
                 assert_eq!(resp.status(), StatusCode::OK, "{kind}");
                 let body = body_string(resp).await;
-                // `ci-failure-reconcile` runs no agent session, so it exposes no
-                // claude block; every other input is required of every kind.
+                // `ci-failure-reconcile` and `closed-issue-summary` run no agent
+                // session, so they expose no claude block; every other input is
+                // required of every kind. `closed-issue-summary` reads no forge
+                // logs either, so it has no log-token block.
                 let expected = fields.into_iter().chain(
                     COMMON_INPUTS
                         .into_iter()
-                        .filter(|f| *f != "log_token_mode" || kind != "forgejo-ci-fix"),
+                        .filter(|f| *f != "log_token_mode" || kind != "forgejo-ci-fix")
+                        .filter(|f| *f != "log_token_mode" || kind != "closed-issue-summary"),
                 );
                 for field in expected {
                     assert!(
@@ -6592,6 +6629,10 @@ mod tests {
                     "ci-failure-reconcile",
                     "name=reconcile&enabled=on&native_enabled=on",
                 ),
+                (
+                    "closed-issue-summary",
+                    "name=report&enabled=on&native_enabled=on&window_days=7&projects=CLAUDE",
+                ),
             ] {
                 let tmp = tempfile::tempdir().unwrap();
                 let s = web_state(tmp.path()).await;
@@ -6604,8 +6645,12 @@ mod tests {
                         native_forms::ci_failure_analysis_create(State(s.clone()), raw_form(body))
                             .await
                     }
-                    _ => {
+                    "ci-failure-reconcile" => {
                         native_forms::ci_failure_reconcile_create(State(s.clone()), raw_form(body))
+                            .await
+                    }
+                    _ => {
+                        native_forms::closed_issue_summary_create(State(s.clone()), raw_form(body))
                             .await
                     }
                 }
@@ -6781,6 +6826,10 @@ mod tests {
                 (
                     "reconcile",
                     "name: reconcile\nkind: ci-failure-reconcile\nnative:\n  resolved_state: Done\n",
+                ),
+                (
+                    "report",
+                    "name: report\nkind: closed-issue-summary\nnative:\n  window_days: 7\n  projects: [CLAUDE]\n",
                 ),
             ] {
                 let tmp = tempfile::tempdir().unwrap();
