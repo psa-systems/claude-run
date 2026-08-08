@@ -95,16 +95,24 @@ pub enum ActionKind {
     /// [`NativeConfig::CiFailureReconcile`].
     #[serde(rename = "ci-failure-reconcile")]
     CiFailureReconcile,
+    /// Built-in cross-project closed-issue reporter (CLAUDE-218): counts and
+    /// lists every issue closed in a rolling window across a configured project
+    /// list, files the summary as a new issue, and hangs it off a nominated
+    /// parent as a subtask. Config lives in `native` as
+    /// [`NativeConfig::ClosedIssueSummary`].
+    #[serde(rename = "closed-issue-summary")]
+    ClosedIssueSummary,
 }
 
 impl ActionKind {
     /// Every kind, in the order the web UI's new-action picker lists them
     /// (CLAUDE-211). `scripted` last: it is deprecated and raw-YAML only.
-    pub const ALL: [ActionKind; 5] = [
+    pub const ALL: [ActionKind; 6] = [
         ActionKind::Youtrack,
         ActionKind::ForgejoCiFix,
         ActionKind::CiFailureAnalysis,
         ActionKind::CiFailureReconcile,
+        ActionKind::ClosedIssueSummary,
         ActionKind::Scripted,
     ];
 
@@ -122,6 +130,7 @@ impl ActionKind {
             ActionKind::ForgejoCiFix => "forgejo-ci-fix",
             ActionKind::CiFailureAnalysis => "ci-failure-analysis",
             ActionKind::CiFailureReconcile => "ci-failure-reconcile",
+            ActionKind::ClosedIssueSummary => "closed-issue-summary",
         }
     }
 }
@@ -155,6 +164,13 @@ pub enum NativeConfig {
     /// enum's variants size-balanced (`clippy::large_enum_variant`), matching the
     /// other native variants.
     CiFailureReconcile(Box<CiFailureReconcileConfig>),
+    /// Cross-project closed-issue reporter config (CLAUDE-218). Listed LAST, so
+    /// the untagged probe reaches it only after the four older variants have
+    /// rejected the block; its `projects` / `window_days` keys are unknown to
+    /// every one of them, so a reporting config can never be mis-parsed as one.
+    /// Boxed to keep the enum's variants size-balanced
+    /// (`clippy::large_enum_variant`), matching the other native variants.
+    ClosedIssueSummary(Box<ClosedIssueSummaryConfig>),
 }
 
 impl NativeConfig {
@@ -165,6 +181,7 @@ impl NativeConfig {
             NativeConfig::ForgejoCiFix(_) => ActionKind::ForgejoCiFix,
             NativeConfig::CiFailureAnalysis(_) => ActionKind::CiFailureAnalysis,
             NativeConfig::CiFailureReconcile(_) => ActionKind::CiFailureReconcile,
+            NativeConfig::ClosedIssueSummary(_) => ActionKind::ClosedIssueSummary,
         }
     }
 }
@@ -834,6 +851,94 @@ impl Default for CiFailureReconcileConfig {
     }
 }
 
+/// Config for the native cross-project closed-issue reporter (CLAUDE-218).
+/// Supplied under the action's `native:` key when `kind: closed-issue-summary`.
+///
+/// The run is a REPORT, not a code job: it clones no repository, starts no agent
+/// session, and opens no pull request. For each nominated parent it queries
+/// `projects` for the issues resolved inside a rolling `window_days` window,
+/// renders counts plus a per-project listing, creates that report as a new issue
+/// in `report_project` (defaulting to the parent's own project), and links it to
+/// the parent with `link_type`. A hidden window marker on the parent makes the
+/// whole thing idempotent, so a poll interval shorter than the window files one
+/// report per window rather than one per poll.
+///
+/// Parents come from two independent sources, unioned: `parents` (nominated by
+/// id, the mode that needs no tracker configuration) and `query` (a tracker
+/// query, empty by default). `query` MUST select a `custom_field` value the
+/// worker action does not, or the two race for the same issue: `actions/
+/// youtrack.yml` owns `AI Agent: Queued`, so a reporting query needs its own
+/// distinct value. Only query-selected parents get `custom_field` advanced to
+/// `done_label` / `failed_label`; a parent nominated by id is never field-written.
+///
+/// `projects` and `window_days` are the distinctive keys that disambiguate this
+/// variant from the other native configs under the untagged `native:` block, so
+/// a shipped action MUST set at least one of them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClosedIssueSummaryConfig {
+    /// Master enable toggle. `true` (the default) runs the handler; `false` makes
+    /// a run a no-op.
+    pub enabled: bool,
+    /// Issues to hang each report off, nominated by id (e.g. `["CLAUDE-100"]`),
+    /// typically the milestone being reported against. Reported for on every run,
+    /// subject to the idempotency marker. Empty by default.
+    pub parents: Vec<String>,
+    /// Optional tracker query selecting further parents dynamically. Empty (the
+    /// default) means no query is run at all. See the type docs for the
+    /// partitioning rule this query must obey.
+    pub query: String,
+    /// Custom field advanced on a query-selected parent once its report is filed.
+    pub custom_field: String,
+    /// Value written to `custom_field` after a query-selected parent's report is
+    /// filed, which is what drops it back out of `query`.
+    pub done_label: String,
+    /// Value written to `custom_field` when a query-selected parent's report
+    /// could not be filed.
+    pub failed_label: String,
+    /// Project short names the report counts closed issues across, e.g.
+    /// `["CLAUDE", "LC"]`. Empty reports nothing, so the action must be given the
+    /// projects to read.
+    pub projects: Vec<String>,
+    /// Length of the rolling reporting window in days, counting back from today
+    /// inclusive (7 covers today plus the previous six days).
+    pub window_days: u32,
+    /// Project short name the report issue is created in. `None` (the default)
+    /// creates it in the parent's own project, so no site-specific project has to
+    /// be configured.
+    pub report_project: Option<String>,
+    /// Link type used to attach the report to its parent. Default `subtask of`,
+    /// applied as `<report> subtask of <parent>`.
+    pub link_type: String,
+    /// Summary line of the report issue. `{start}`, `{end}`, `{days}`, `{total}`
+    /// and `{parent}` are substituted.
+    pub summary_template: String,
+    /// Cap on how many issues are LISTED per project in the report body. Counts
+    /// are always exact (the query is fully paginated); a project over the cap
+    /// renders the cap plus an explicit "and N more" line, never a silent
+    /// truncation.
+    pub max_listed_per_project: usize,
+}
+
+impl Default for ClosedIssueSummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            parents: Vec::new(),
+            query: String::new(),
+            custom_field: default_custom_field(),
+            done_label: "Done".to_string(),
+            failed_label: "Failed".to_string(),
+            projects: Vec::new(),
+            window_days: 7,
+            report_project: None,
+            link_type: "subtask of".to_string(),
+            summary_template: "Closed-issue summary: {start} .. {end}".to_string(),
+            max_listed_per_project: 100,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Action {
@@ -921,14 +1026,15 @@ mod tests {
                 | ActionKind::Youtrack
                 | ActionKind::ForgejoCiFix
                 | ActionKind::CiFailureAnalysis
-                | ActionKind::CiFailureReconcile => {}
+                | ActionKind::CiFailureReconcile
+                | ActionKind::ClosedIssueSummary => {}
             }
         }
         let mut names: Vec<&str> = ActionKind::ALL.iter().map(|k| k.as_str()).collect();
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), ActionKind::ALL.len(), "duplicate kind in ALL");
-        assert_eq!(names.len(), 5, "a new ActionKind must be added to ALL");
+        assert_eq!(names.len(), 6, "a new ActionKind must be added to ALL");
     }
 
     #[test]
@@ -2000,6 +2106,129 @@ native:
         let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
         assert_eq!(reloaded.action.native, action.native);
         assert_eq!(reloaded.action.kind, action.kind);
+    }
+
+    // ---- CLAUDE-218: closed-issue-summary native config -------------------
+
+    #[test]
+    fn closed_issue_summary_native_parses_and_defaults() {
+        let raw = "\
+name: closed-issue-summary
+kind: closed-issue-summary
+native:
+  projects: [CLAUDE, LC]
+  window_days: 7
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        assert_eq!(loaded.action.kind, ActionKind::ClosedIssueSummary);
+        let Some(NativeConfig::ClosedIssueSummary(cfg)) = loaded.action.native else {
+            panic!("expected closed-issue-summary native config");
+        };
+        assert!(cfg.enabled);
+        assert_eq!(cfg.projects, vec!["CLAUDE".to_string(), "LC".to_string()]);
+        assert_eq!(cfg.window_days, 7);
+        // Defaults: no parents, no query, subtask linkage, the parent's project.
+        assert!(cfg.parents.is_empty());
+        assert!(cfg.query.is_empty());
+        assert_eq!(cfg.link_type, "subtask of");
+        assert_eq!(cfg.custom_field, "AI Agent");
+        assert_eq!(cfg.report_project, None);
+        assert_eq!(cfg.max_listed_per_project, 100);
+    }
+
+    #[test]
+    fn closed_issue_summary_native_overrides_and_rejects_unknown_keys() {
+        let raw = "\
+name: report
+kind: closed-issue-summary
+native:
+  parents: [CLAUDE-100]
+  projects: [CLAUDE]
+  window_days: 14
+  report_project: RPT
+  link_type: relates
+  max_listed_per_project: 5
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::ClosedIssueSummary(cfg)) = loaded.action.native else {
+            panic!("expected closed-issue-summary native config");
+        };
+        assert_eq!(cfg.parents, vec!["CLAUDE-100".to_string()]);
+        assert_eq!(cfg.window_days, 14);
+        assert_eq!(cfg.report_project.as_deref(), Some("RPT"));
+        assert_eq!(cfg.link_type, "relates");
+        assert_eq!(cfg.max_listed_per_project, 5);
+
+        let bad = "name: r\nkind: closed-issue-summary\nnative:\n  projects: [CLAUDE]\n  nope: 1\n";
+        assert!(validate_str(bad, "<candidate>").is_err());
+    }
+
+    /// The shipped `actions/closed-issue-summary.yml` loads, is recognized as a
+    /// native closed-issue-summary action with no script-bearing fields, and
+    /// round-trips through serialize -> parse unchanged.
+    #[test]
+    fn shipped_closed_issue_summary_action_is_native_and_round_trips() {
+        const SHIPPED: &str = include_str!("../actions/closed-issue-summary.yml");
+        let loaded = validate_str(SHIPPED, "actions/closed-issue-summary.yml")
+            .expect("shipped action valid");
+        let action = loaded.action;
+        assert_eq!(action.name, "closed-issue-summary");
+        assert_eq!(action.kind, ActionKind::ClosedIssueSummary);
+        assert!(action.input.is_none());
+        assert!(action.filter.is_none());
+        assert!(action.pre.is_empty());
+        assert!(action.prompt.is_none());
+        assert!(action.post.is_empty());
+        // A report run starts no agent session, so it configures no claude block.
+        assert!(action.claude.allowed_tools.is_none());
+        assert!(action.claude.permission_mode.is_none());
+        let Some(NativeConfig::ClosedIssueSummary(cfg)) = &action.native else {
+            panic!("expected closed-issue-summary native config");
+        };
+        assert!(!cfg.projects.is_empty(), "the reporter needs projects");
+        let reserialized = serde_yaml::to_string(&action).unwrap();
+        let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
+        assert_eq!(reloaded.action.native, action.native);
+        assert_eq!(reloaded.action.kind, action.kind);
+    }
+
+    /// CLAUDE-218 query partition: the reporting action and the worker action
+    /// must never gather the same issue. The worker pins the single `AI Agent`
+    /// value `Queued`; the reporter ships with no query at all, and its
+    /// `parents` list is nominated by id, so no issue can match both. This is
+    /// the mechanical guard `actions/youtrack.yml` points at.
+    #[test]
+    fn shipped_action_queries_are_disjoint() {
+        let worker = validate_str(
+            include_str!("../actions/youtrack.yml"),
+            "actions/youtrack.yml",
+        )
+        .unwrap()
+        .action;
+        let reporter = validate_str(
+            include_str!("../actions/closed-issue-summary.yml"),
+            "actions/closed-issue-summary.yml",
+        )
+        .unwrap()
+        .action;
+
+        let Some(NativeConfig::Youtrack(w)) = &worker.native else {
+            panic!("expected youtrack native config");
+        };
+        let Some(NativeConfig::ClosedIssueSummary(r)) = &reporter.native else {
+            panic!("expected closed-issue-summary native config");
+        };
+
+        assert!(
+            w.youtrack.query.contains("AI Agent: Queued"),
+            "the worker owns the Queued value: {}",
+            w.youtrack.query
+        );
+        assert!(
+            r.query.trim().is_empty() || !r.query.contains("AI Agent: Queued"),
+            "the reporting query must not select the worker's value: {}",
+            r.query
+        );
     }
 
     #[test]

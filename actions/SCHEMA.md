@@ -15,7 +15,7 @@ attempt caps, timeouts, and a cost-based usage check. The action YAML supplies e
 
 ```yaml
 name: <kebab-id>            # required
-kind: scripted              # optional: scripted (default) | youtrack | forgejo-ci-fix | ci-failure-analysis | ci-failure-reconcile
+kind: scripted              # optional: scripted (default) | youtrack | forgejo-ci-fix | ci-failure-analysis | ci-failure-reconcile | closed-issue-summary
 enabled: true               # optional, default true; false skips the action in the scheduler
 workdir_base: /path/to/dir  # optional, overrides $CLAUDE_RUN_WORKDIR_BASE for this action
 link_template: https://youtrack/issue/{key}  # optional; {key} -> job key, builds a per-job link (render_link)
@@ -117,6 +117,11 @@ The dispatch discriminator (CLAUDE-30). Selects how the runner executes the acti
 - `ci-failure-reconcile`: a built-in Rust handler that auto-closes each open "CI failure" / "Auto-fix" issue once the
   failing `(repo, branch, workflow, job)` it tracks is green again on its latest run (CLAUDE-191), and collapses
   duplicate issues that share a root-cause key (CLAUDE-198). Config only, supplying a typed
+  [`native`](#native-record-required-for-native-kinds) block.
+- `closed-issue-summary`: a built-in Rust handler that counts and lists every issue closed in a rolling window across a
+  configured project list, files that report as a new issue, and hangs it off a nominated parent as a subtask
+  (CLAUDE-218). The automation used as a reporting tool rather than as an issue worker: it clones no repository, starts
+  no agent session, and opens no pull request. Config only, supplying a typed
   [`native`](#native-record-required-for-native-kinds) block.
 
 `scripted` and native kinds share all the run accounting (locking, daily caps, per-job attempt caps, budget, job-outcome
@@ -596,6 +601,73 @@ sets both). The generic blocks (`schedule`, `output`, `limits`) stay at the top 
 Forgejo exposing the Actions read endpoints they call. `fj actions runs` landed on `pandoras-box/forgejo-cli` `main`
 after the `v0.13.0` tag (merge `b08d8bc`), so no released version ships it yet: build from that commit or newer. On a
 deployment lacking either, a repo scan is skipped with a warning rather than crashing.
+
+#### `kind: closed-issue-summary`
+
+A single flat config record (no sub-records). The automation used as a REPORTING tool rather than as an issue worker
+(CLAUDE-218): on each run it takes every nominated parent, queries each configured project for the issues resolved
+inside a rolling window, renders counts plus a per-project listing, creates that report as a new issue, and links it to
+the parent as a subtask. The dedup key is the parent issue id.
+
+**No code, no pull request.** The run clones no repository, starts no agent session, and opens no pull request, so there
+is no forge call and no git call on any path. That is why it is a separate action rather than a second job taught to
+`youtrack.yml`, following the audit split of CLAUDE-215: the worker action's query, custom field, states, assignee
+handling and labels are all for code work, and every one of them differs here.
+
+**Parents.** Two independent sources, unioned. `parents` nominates issues by id and needs no tracker configuration;
+those issues are never field-written. `query` (empty by default, so no query runs at all) selects parents dynamically,
+and each parent it selects gets `custom_field` advanced to `done_label` (or `failed_label`) once its report is filed,
+which is what drops it back out of the query. **A `query` MUST select a `custom_field` value the worker action does
+not**, or the two actions race for the same issue: `actions/youtrack.yml` pins `AI Agent: Queued`, so a reporting query
+needs its own distinct value. Note that the value has to exist in the YouTrack `AI Agent` bundle first, because YouTrack
+rejects a query naming an unknown enum value with HTTP 400 rather than returning an empty result; that is also why
+`youtrack.yml` documents the partition instead of negating the reporting value in its own query, which would break its
+poll until the value was created. `shipped_action_queries_are_disjoint` in `src/action.rs` is the mechanical guard.
+
+**Window and idempotency.** The window ends today and is `window_days` long inclusive, so `7` covers today plus the
+previous six days; it is applied server-side as the tracker's own `resolved date: <start> .. <end>` range. Counts are
+exact (the query is fully paginated); `max_listed_per_project` caps the LISTING only, and a capped section prints an
+explicit "and N more" line rather than truncating silently. The marker comment posted on the parent carries a hidden
+`Report-Window:` line, and a parent already carrying the current window's marker is skipped entirely, so a poll interval
+shorter than the window files one report per window rather than one per poll.
+
+```yaml
+kind: closed-issue-summary
+native:
+  enabled: true                       # master toggle (default true)
+  parents: [CLAUDE-100]               # issues to hang each report off; never field-written
+  query: ""                           # optional dynamic parent query; MUST NOT collide with the worker's AI Agent value
+  custom_field: "AI Agent"            # advanced on a query-selected parent once its report is filed
+  done_label: Done
+  failed_label: Failed
+  projects: [CLAUDE, LC]              # project short names the report counts closed issues across
+  window_days: 7                      # rolling window, ending today inclusive
+  report_project: RPT                 # omit to create the report in the parent's own project
+  link_type: "subtask of"             # applied as `<report> subtask of <parent>`
+  summary_template: "Closed-issue summary: {start} .. {end}"
+  max_listed_per_project: 100         # caps the listing only; counts stay exact
+```
+
+| Key                      | Default                                     | Meaning                                                                                 |
+|--------------------------|---------------------------------------------|-----------------------------------------------------------------------------------------|
+| `enabled`                | `true`                                      | Master toggle. While false the handler no-ops.                                          |
+| `parents`                | `[]`                                        | Issue ids each report hangs off, typically the milestone being reported against. Never field-written. |
+| `query`                  | `""`                                        | Optional tracker query selecting further parents. Empty runs no query. MUST select a `custom_field` value the worker action does not. |
+| `custom_field`           | `AI Agent`                                  | Field advanced on a query-selected parent once its report is filed.                      |
+| `done_label`             | `Done`                                      | Value written to `custom_field` after a query-selected parent's report is filed.          |
+| `failed_label`           | `Failed`                                    | Value written to `custom_field` when a query-selected parent's report could not be filed. |
+| `projects`               | `[]`                                        | Project short names the report counts closed issues across. Empty reports nothing.        |
+| `window_days`            | `7`                                         | Rolling window length in days, ending today inclusive.                                    |
+| `report_project`         | (the parent's project)                      | Project the report issue is created in.                                                   |
+| `link_type`              | `subtask of`                                | Link type attaching the report to its parent.                                             |
+| `summary_template`       | `Closed-issue summary: {start} .. {end}`    | Summary line of the report issue; `{start}` / `{end}` / `{days}` / `{total}` / `{parent}` are substituted. |
+| `max_listed_per_project` | `100`                                       | Cap on how many issues are LISTED per project. Counts stay exact; a capped section prints an "and N more" line. |
+
+`window_days` is the distinctive key that disambiguates this variant from the other native configs under the untagged
+`native:` block. It is a number, so it never prunes away on save, and the structured form always writes it.
+
+**Deployment prerequisite:** a host `yt` on `PATH` only. This kind reaches no forge and needs no Forgejo PAT, since it
+neither clones a repository nor opens a pull request.
 
 ### `workdir_base` (string, optional)
 
