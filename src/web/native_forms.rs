@@ -1,5 +1,6 @@
 //! Structured editors for the native action kinds other than `youtrack`
-//! (CLAUDE-211): `forgejo-ci-fix`, `ci-failure-analysis`, `ci-failure-reconcile`.
+//! (CLAUDE-211): `forgejo-ci-fix`, `ci-failure-analysis`, `ci-failure-reconcile`,
+//! `closed-issue-summary`.
 //!
 //! Same shape as the YouTrack editor in the parent module: a route pair
 //! (`/actions/new/<kind>` to create, `/actions/:name/form` to edit), one
@@ -26,8 +27,9 @@ use super::{
     WebError, WebState,
 };
 use crate::action::{
-    Action, CiFailureAnalysisConfig, CiFailureReconcileConfig, ClaudeBlock, ForgejoCiFixConfig,
-    Limits, LogTokenEntry, LogTokenRef, NativeConfig, OutputBlock,
+    Action, CiFailureAnalysisConfig, CiFailureReconcileConfig, ClaudeBlock,
+    ClosedIssueSummaryConfig, ForgejoCiFixConfig, Limits, LogTokenEntry, LogTokenRef, NativeConfig,
+    OutputBlock,
 };
 use crate::state;
 
@@ -744,6 +746,133 @@ pub fn ci_failure_reconcile_form_to_yaml(
     serde_yaml::to_string(&base).map_err(|e| e.to_string())
 }
 
+/// Backing form for `kind: closed-issue-summary` (CLAUDE-218).
+#[derive(Debug, Clone, Default)]
+pub struct ClosedIssueSummaryForm {
+    pub common: CommonForm,
+    pub native_enabled: bool,
+    pub parents: String,
+    pub query: String,
+    pub custom_field: String,
+    pub done_label: String,
+    pub failed_label: String,
+    pub projects: String,
+    pub window_days: String,
+    pub report_project: String,
+    pub link_type: String,
+    pub summary_template: String,
+    pub max_listed_per_project: String,
+}
+
+impl ClosedIssueSummaryForm {
+    fn defaults() -> Self {
+        let d = ClosedIssueSummaryConfig::default();
+        Self {
+            common: CommonForm {
+                enabled: true,
+                ..CommonForm::default()
+            },
+            native_enabled: d.enabled,
+            parents: String::new(),
+            query: d.query,
+            custom_field: d.custom_field,
+            done_label: d.done_label,
+            failed_label: d.failed_label,
+            projects: String::new(),
+            window_days: d.window_days.to_string(),
+            report_project: String::new(),
+            link_type: d.link_type,
+            summary_template: d.summary_template,
+            max_listed_per_project: d.max_listed_per_project.to_string(),
+        }
+    }
+
+    fn from_pairs(p: &FormPairs) -> Self {
+        Self {
+            common: CommonForm::from_pairs(p),
+            native_enabled: p.checked("native_enabled"),
+            parents: p.get("parents"),
+            query: p.get("query"),
+            custom_field: p.get("custom_field"),
+            done_label: p.get("done_label"),
+            failed_label: p.get("failed_label"),
+            projects: p.get("projects"),
+            window_days: p.get("window_days"),
+            report_project: p.get("report_project"),
+            link_type: p.get("link_type"),
+            summary_template: p.get("summary_template"),
+            max_listed_per_project: p.get("max_listed_per_project"),
+        }
+    }
+}
+
+/// Prefill from a loaded action, or `None` when it is not a
+/// `closed-issue-summary`.
+pub fn action_to_closed_issue_summary_form(a: &Action) -> Option<ClosedIssueSummaryForm> {
+    let NativeConfig::ClosedIssueSummary(c) = a.native.as_ref()? else {
+        return None;
+    };
+    Some(ClosedIssueSummaryForm {
+        common: CommonForm::from_action(a),
+        native_enabled: c.enabled,
+        parents: join_lines(&c.parents),
+        query: c.query.clone(),
+        custom_field: c.custom_field.clone(),
+        done_label: c.done_label.clone(),
+        failed_label: c.failed_label.clone(),
+        projects: join_lines(&c.projects),
+        window_days: c.window_days.to_string(),
+        report_project: c.report_project.clone().unwrap_or_default(),
+        link_type: c.link_type.clone(),
+        summary_template: c.summary_template.clone(),
+        max_listed_per_project: c.max_listed_per_project.to_string(),
+    })
+}
+
+pub fn closed_issue_summary_form_to_yaml(
+    mut base: serde_yaml::Value,
+    form: &ClosedIssueSummaryForm,
+) -> Result<String, String> {
+    use serde_yaml::Value;
+
+    let map = base
+        .as_mapping_mut()
+        .ok_or_else(|| "the action file is not a YAML mapping".to_string())?;
+    let d = ClosedIssueSummaryConfig::default();
+    let native = ClosedIssueSummaryConfig {
+        enabled: form.native_enabled,
+        parents: lines(&form.parents),
+        query: form.query.trim().to_string(),
+        custom_field: or_default(&form.custom_field, d.custom_field),
+        done_label: or_default(&form.done_label, d.done_label),
+        failed_label: or_default(&form.failed_label, d.failed_label),
+        projects: lines(&form.projects),
+        // Always written (a number never prunes away): `window_days` is what
+        // disambiguates this variant from the other native configs under the
+        // untagged `native:` key.
+        window_days: u32::try_from(parse_usize(
+            "Window days",
+            &form.window_days,
+            d.window_days as usize,
+        )?)
+        .map_err(|_| "Window days is too large".to_string())?,
+        report_project: opt(&form.report_project),
+        link_type: or_default(&form.link_type, d.link_type),
+        summary_template: or_default(&form.summary_template, d.summary_template),
+        max_listed_per_project: parse_usize(
+            "Max listed per project",
+            &form.max_listed_per_project,
+            d.max_listed_per_project,
+        )?,
+    };
+    map.insert(Value::from("kind"), Value::from("closed-issue-summary"));
+    map.insert(Value::from("native"), native_value(&native)?);
+    // `closed-issue-summary` runs no agent session, so the form has no claude
+    // fields and a hand-written block is left alone.
+    apply_common(map, &form.common, false)?;
+    serde_yaml::to_string(&base).map_err(|e| e.to_string())
+}
+
 /// Serialize a native config and drop its unset keys.
 fn native_value<T: serde::Serialize>(cfg: &T) -> Result<serde_yaml::Value, String> {
     let val = serde_yaml::to_value(cfg).map_err(|e| e.to_string())?;
@@ -773,6 +902,18 @@ struct CiFailureAnalysisTpl {
     raw_url: String,
     form: CiFailureAnalysisForm,
     secrets: Vec<String>,
+    error: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "closed_issue_summary_editor.html")]
+struct ClosedIssueSummaryTpl {
+    version: &'static str,
+    heading: String,
+    post_url: String,
+    raw_url: String,
+    form: ClosedIssueSummaryForm,
     error: Option<String>,
     name: Option<String>,
 }
@@ -1241,6 +1382,123 @@ pub(super) async fn ci_failure_reconcile_edit_save(
     }
 }
 
+// ---- closed-issue-summary handlers ----------------------------------------
+
+async fn render_closed_issue_summary(
+    s: &WebState,
+    status: StatusCode,
+    name: Option<String>,
+    form: ClosedIssueSummaryForm,
+    error: Option<String>,
+) -> Result<Response, WebError> {
+    let (heading, post_url, raw_url) = urls(name.as_ref(), "closed-issue-summary");
+    let tpl = ClosedIssueSummaryTpl {
+        version: s.api.version,
+        heading,
+        post_url,
+        raw_url,
+        form,
+        error,
+        name,
+    };
+    Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
+}
+
+pub(super) async fn closed_issue_summary_new_page(
+    State(s): State<WebState>,
+) -> Result<Response, WebError> {
+    render_closed_issue_summary(
+        &s,
+        StatusCode::OK,
+        None,
+        ClosedIssueSummaryForm::defaults(),
+        None,
+    )
+    .await
+}
+
+pub(super) async fn closed_issue_summary_create(
+    State(s): State<WebState>,
+    RawForm(body): RawForm,
+) -> Result<Response, WebError> {
+    let pairs = match FormPairs::parse(&body) {
+        Ok(p) => p,
+        Err(msg) => {
+            return render_closed_issue_summary(
+                &s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+                ClosedIssueSummaryForm::defaults(),
+                Some(msg),
+            )
+            .await
+        }
+    };
+    let form = ClosedIssueSummaryForm::from_pairs(&pairs);
+    let empty = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    let outcome = match closed_issue_summary_form_to_yaml(empty, &form) {
+        Ok(yaml) => write_new(&s, &yaml).await?,
+        Err(msg) => Saved::Rejected(msg),
+    };
+    match outcome {
+        Saved::Redirect(r) => Ok(r),
+        Saved::Rejected(msg) => {
+            render_closed_issue_summary(&s, StatusCode::UNPROCESSABLE_ENTITY, None, form, Some(msg))
+                .await
+        }
+    }
+}
+
+pub(super) async fn closed_issue_summary_edit_page(
+    s: &WebState,
+    name: String,
+    action: &Action,
+) -> Result<Response, WebError> {
+    let Some(form) = action_to_closed_issue_summary_form(action) else {
+        return Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response());
+    };
+    render_closed_issue_summary(s, StatusCode::OK, Some(name), form, None).await
+}
+
+pub(super) async fn closed_issue_summary_edit_save(
+    s: &WebState,
+    name: String,
+    path: &str,
+    body: &[u8],
+) -> Result<Response, WebError> {
+    let pairs = match FormPairs::parse(body) {
+        Ok(p) => p,
+        Err(msg) => {
+            return render_closed_issue_summary(
+                s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some(name),
+                ClosedIssueSummaryForm::defaults(),
+                Some(msg),
+            )
+            .await
+        }
+    };
+    let form = ClosedIssueSummaryForm::from_pairs(&pairs);
+    let outcome = match closed_issue_summary_form_to_yaml(base_value(path), &form) {
+        Ok(yaml) => write_existing(s, path, &yaml).await?,
+        Err(msg) => Saved::Rejected(msg),
+    };
+    match outcome {
+        Saved::Redirect(r) => Ok(r),
+        Saved::Rejected(msg) => {
+            render_closed_issue_summary(
+                s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some(name),
+                form,
+                Some(msg),
+            )
+            .await
+        }
+    }
+}
+
 // ---- edit dispatch --------------------------------------------------------
 
 /// Render the structured editor matching an action's native kind, or redirect to
@@ -1257,6 +1515,9 @@ pub(super) async fn edit_page_for_kind(
         }
         Some(NativeConfig::CiFailureReconcile(_)) => {
             ci_failure_reconcile_edit_page(s, name, action).await
+        }
+        Some(NativeConfig::ClosedIssueSummary(_)) => {
+            closed_issue_summary_edit_page(s, name, action).await
         }
         _ => Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response()),
     }
@@ -1278,6 +1539,9 @@ pub(super) async fn edit_save_for_kind(
         }
         Some(NativeConfig::CiFailureReconcile(_)) => {
             ci_failure_reconcile_edit_save(s, name, path, body).await
+        }
+        Some(NativeConfig::ClosedIssueSummary(_)) => {
+            closed_issue_summary_edit_save(s, name, path, body).await
         }
         _ => Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response()),
     }
@@ -1312,6 +1576,7 @@ mod tests {
     const FORGEJO_CI_FIX_YML: &str = include_str!("../../actions/forgejo-ci-fix.yml");
     const ANALYSIS_YML: &str = include_str!("../../actions/ci-failure-analysis.yml");
     const RECONCILE_YML: &str = include_str!("../../actions/ci-failure-reconcile.yml");
+    const SUMMARY_YML: &str = include_str!("../../actions/closed-issue-summary.yml");
 
     fn parsed(raw: &str) -> serde_yaml::Value {
         serde_yaml::from_str(raw).unwrap()
@@ -1359,6 +1624,16 @@ mod tests {
         let yaml = ci_failure_reconcile_form_to_yaml(parsed(RECONCILE_YML), &form).unwrap();
         let after = crate::action::validate_str(&yaml, "<test>").unwrap();
         assert_eq!(after.action.kind, ActionKind::CiFailureReconcile);
+        assert_same_action(&before.action, &after.action);
+    }
+
+    #[test]
+    fn closed_issue_summary_round_trips_shipped_action() {
+        let before = crate::action::validate_str(SUMMARY_YML, "<test>").unwrap();
+        let form = action_to_closed_issue_summary_form(&before.action).expect("summary form");
+        let yaml = closed_issue_summary_form_to_yaml(parsed(SUMMARY_YML), &form).unwrap();
+        let after = crate::action::validate_str(&yaml, "<test>").unwrap();
+        assert_eq!(after.action.kind, ActionKind::ClosedIssueSummary);
         assert_same_action(&before.action, &after.action);
     }
 
@@ -1483,6 +1758,41 @@ limits:
     }
 
     #[test]
+    fn every_closed_issue_summary_field_survives_a_round_trip() {
+        let raw = "\
+name: report
+kind: closed-issue-summary
+enabled: false
+native:
+  enabled: false
+  parents: [CLAUDE-100, DELTA-4]
+  query: \"-Resolved AI Agent: Reporting\"
+  custom_field: Reporter
+  done_label: Filed
+  failed_label: Broken
+  projects: [CLAUDE, DELTA]
+  window_days: 30
+  report_project: RPT
+  link_type: relates
+  summary_template: \"weekly {start}\"
+  max_listed_per_project: 7
+workdir_base: /tmp/wd
+output:
+  file: o.jsonl
+schedule:
+  kind: interval
+  spec: 6h
+limits:
+  max_runs_per_day: 3
+";
+        let before = crate::action::validate_str(raw, "<test>").unwrap();
+        let form = action_to_closed_issue_summary_form(&before.action).unwrap();
+        let yaml = closed_issue_summary_form_to_yaml(parsed(raw), &form).unwrap();
+        let after = crate::action::validate_str(&yaml, "<test>").unwrap();
+        assert_same_action(&before.action, &after.action);
+    }
+
+    #[test]
     fn prefill_rejects_a_mismatched_kind() {
         // Each prefill only handles its own kind; the dispatcher sends the rest
         // to the right editor (or the raw one).
@@ -1492,6 +1802,7 @@ limits:
         assert!(action_to_forgejo_ci_fix_form(&yt).is_none());
         assert!(action_to_ci_failure_analysis_form(&yt).is_none());
         assert!(action_to_ci_failure_reconcile_form(&yt).is_none());
+        assert!(action_to_closed_issue_summary_form(&yt).is_none());
     }
 
     #[test]
@@ -1517,6 +1828,15 @@ limits:
         // `ci-failure-analysis` under the untagged `native:` key, so an
         // otherwise-empty reconcile config must still resolve to this kind.
         assert_eq!(loaded.action.kind, ActionKind::CiFailureReconcile);
+
+        let mut f = ClosedIssueSummaryForm::defaults();
+        f.common.name = "report".to_string();
+        let yaml = closed_issue_summary_form_to_yaml(empty_base(), &f).unwrap();
+        let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+        // `window_days` is a number, so it never prunes away: it is what
+        // disambiguates this variant under the untagged `native:` key, and an
+        // otherwise-empty reporting config must still resolve to this kind.
+        assert_eq!(loaded.action.kind, ActionKind::ClosedIssueSummary);
     }
 
     #[test]

@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}{{ heading }} - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a>{% if let Some(n) = name %}<span class="sep">/</span><a href="/actions/{{ n }}">{{ n }}</a><span class="sep">/</span><span class="current">Edit (form)</span>{% else %}<span class="sep">/</span><a href="/actions/new">New action</a><span class="sep">/</span><span class="current">closed-issue-summary</span>{% endif %}{% endblock %}
+
+{% import "form_macros.html" as m %}
+
+{% block main %}
+
+{% call m::form_styles() %}
+
+<h2>{{ heading }}</h2>
+
+<div class="card" style="margin-bottom: 16px;">
+  <span class="dim">Structured editor for a native <code>kind: closed-issue-summary</code> action: it
+  counts and lists every issue closed in a rolling window across a set of projects, files that report
+  as a new issue, and hangs it off a nominated parent as a subtask. The run clones no repository,
+  starts no agent session and opens no pull request. Fields this form does not cover are preserved
+  untouched on save - use the <a href="{{ raw_url }}">raw YAML editor</a> for those.</span>
+</div>
+
+{% if let Some(e) = error %}
+<div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
+  <strong style="color: var(--bad);">Not saved - validation failed</strong>
+  <pre class="stream" style="max-height: 240px; margin: 8px 0 0;">{{ e }}</pre>
+</div>
+{% endif %}
+
+<form method="post" action="{{ post_url }}" class="yt-form">
+
+  {% call m::identity_block(form.common.name, "closed-issue-summary", form.common.enabled, form.common.workdir_base) %}
+
+  <div class="card">
+    <h3>Report</h3>
+    {% call m::checkbox("native_enabled", form.native_enabled, "Enabled (master toggle; off makes a run a no-op)") %}
+    <div class="grid2" style="margin-top: 8px;">
+      {% call m::numfield("Window days", "window_days", form.window_days, "7", "1") %}
+      {% call m::numfield("Max listed per project", "max_listed_per_project", form.max_listed_per_project, "100", "1") %}
+      {% call m::textfield("Report project", "report_project", form.report_project, "(the parent's own project)") %}
+      {% call m::textfield("Link type", "link_type", form.link_type, "subtask of") %}
+    </div>
+    <p class="hint dim">The window ends today and is <em>Window days</em> long inclusive, so 7 covers
+    today plus the previous six days. Counts are always exact; <em>Max listed per project</em> caps
+    the listing only, and a capped section says how many rows it did not print.</p>
+    {% call m::linesfield("Projects", "projects", form.projects, "CLAUDE", "One project short name per line. Empty reports nothing.") %}
+    {% call m::textfield("Summary template", "summary_template", form.summary_template, "Closed-issue summary: {start} .. {end}") %}
+  </div>
+
+  <div class="card">
+    <h3>Parents</h3>
+    {% call m::linesfield("Nominated parents", "parents", form.parents, "CLAUDE-100", "One issue id per line, typically the milestone being reported against. These are never field-written.") %}
+    <div class="grid2" style="margin-top: 8px;">
+      {% call m::textfield("Parent query", "query", form.query, "(none)") %}
+      {% call m::textfield("Custom field", "custom_field", form.custom_field, "AI Agent") %}
+      {% call m::textfield("Done label", "done_label", form.done_label, "Done") %}
+      {% call m::textfield("Failed label", "failed_label", form.failed_label, "Failed") %}
+    </div>
+    <p class="hint dim">Leave <em>Parent query</em> empty to run no query at all. When it is set it
+    MUST select a <code>Custom field</code> value the worker action does not, or the two race for the
+    same issue: <code>actions/youtrack.yml</code> owns <code>AI Agent: Queued</code>, so a reporting
+    query needs its own distinct value. Only query-selected parents get the field advanced to
+    <em>Done label</em> / <em>Failed label</em>.</p>
+  </div>
+
+  {% call m::schedule_block(form.common.schedule_kind, form.common.schedule_spec) %}
+
+  {% call m::output_block(form.common.output_file) %}
+
+  {% call m::limits_block(form.common.limit_max_attempts_per_key, form.common.limit_max_runs_per_day, form.common.limit_claude_timeout_seconds, form.common.limit_daily_budget_usd) %}
+
+  <div class="row-actions" style="margin-top: 12px;">
+    <button class="btn" type="submit">Save</button>
+    {% if let Some(n) = name %}
+      <a class="btn" href="/actions/{{ n }}">Cancel</a>
+    {% else %}
+      <a class="btn" href="/actions/new">Cancel</a>
+    {% endif %}
+    <a class="btn" href="{{ raw_url }}">Raw YAML</a>
+  </div>
+</form>
+
+{% endblock %}

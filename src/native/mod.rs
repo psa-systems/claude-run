@@ -17,6 +17,7 @@
 
 pub mod ci_failure_analysis;
 pub mod ci_failure_reconcile;
+pub mod closed_issue_summary;
 pub mod forgejo_ci_fix;
 pub mod youtrack;
 
@@ -74,6 +75,9 @@ fn handler_for(kind: ActionKind) -> Option<Box<dyn NativeHandler>> {
         }
         ActionKind::CiFailureReconcile => {
             Some(Box::new(ci_failure_reconcile::CiFailureReconcileHandler))
+        }
+        ActionKind::ClosedIssueSummary => {
+            Some(Box::new(closed_issue_summary::ClosedIssueSummaryHandler))
         }
     }
 }
@@ -139,5 +143,10 @@ mod tests {
     #[test]
     fn ci_failure_reconcile_has_a_native_handler() {
         assert!(handler_for(ActionKind::CiFailureReconcile).is_some());
+    }
+
+    #[test]
+    fn closed_issue_summary_has_a_native_handler() {
+        assert!(handler_for(ActionKind::ClosedIssueSummary).is_some());
     }
 }
