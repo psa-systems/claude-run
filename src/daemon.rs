@@ -284,13 +284,18 @@ impl Daemon {
 
         // CLAUDE-220: serve accepted `/claude` comment commands off the request
         // path for the daemon's lifetime. Each command authorizes against a live
-        // permission read, then clones / runs / pushes / replies; the shared key
-        // gate keeps at most one comment job per (repo, PR) in flight.
+        // permission read, then takes its route: a PR comment clones / runs /
+        // pushes, a plain-issue comment mints a Queued YouTrack issue
+        // (CLAUDE-221). The shared key gate keeps at most one job per thread.
         let comment_ctx = Arc::new(crate::web::comment_webhooks::CommentContext {
             pool: pool.clone(),
             paths: self.paths.clone(),
             claude: claude.clone(),
             config: settings.webhook_comment_handle(),
+            mint_cfg: settings.mint_handle(),
+            route_cache: Arc::new(crate::mint::VcsRouteCache::new(
+                crate::mint::DEFAULT_VCS_MAP_TTL,
+            )),
             defaults: crate::job::RunnerDefaults::default(),
             keygate: keygate.clone(),
             denials: Arc::new(crate::web::comment_webhooks::DenialReplyLimiter::new()),

@@ -1528,6 +1528,34 @@ impl Forge for CliBackend {
         Ok(())
     }
 
+    fn issue_comment(
+        &self,
+        host: &str,
+        repo: &str,
+        issue_number: u64,
+        body_file: &Path,
+    ) -> Result<()> {
+        // CLAUDE-221: `fj issue comment <repo>#<n> --body-file <path>`, the same
+        // `owner/repo#n` addressing (no local checkout) and body-through-a-file
+        // handling `pr_comment` uses.
+        let id = format!("{repo}#{issue_number}");
+        let body = body_file.to_string_lossy();
+        let args = [
+            "--host",
+            host,
+            "issue",
+            "comment",
+            &id,
+            "--body-file",
+            &body,
+        ];
+        let out = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        Self::checked(&self.fj, out, &args)?;
+        Ok(())
+    }
+
     fn pr_add_labels(
         &self,
         host: &str,
@@ -3512,6 +3540,40 @@ mod tests {
         assert!(
             calls.iter().any(|c| c
                 == "fj --host dev.a8n.run pr comment contoso/claude-run#52 --body-file /tmp/body.md"),
+            "{calls:?}"
+        );
+    }
+
+    /// CLAUDE-221: the plain-issue reply goes through `fj issue comment`, with
+    /// the same `owner/repo#n` addressing and body-through-a-file handling as
+    /// `pr_comment`. No raw REST anywhere on this path.
+    #[test]
+    fn issue_comment_addresses_the_issue_by_owner_repo_hash() {
+        let runner = std::sync::Arc::new(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "issue",
+                "comment",
+                "contoso/claude-run#52",
+                "--body-file",
+                "/tmp/body.md",
+            ],
+            "",
+        ));
+        let b = CliBackend::new(runner.clone());
+        b.issue_comment(
+            "dev.a8n.run",
+            "contoso/claude-run",
+            52,
+            Path::new("/tmp/body.md"),
+        )
+        .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c
+                == "fj --host dev.a8n.run issue comment contoso/claude-run#52 --body-file /tmp/body.md"),
             "{calls:?}"
         );
     }

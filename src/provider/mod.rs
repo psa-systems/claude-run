@@ -412,6 +412,19 @@ pub trait Forge: Send + Sync {
         body_file: &std::path::Path,
     ) -> Result<()>;
 
+    /// CLAUDE-221: post a comment on plain ISSUE `issue_number` in `repo` on
+    /// `host`, body read from `body_file` (`fj issue comment <repo>#<n>
+    /// --body-file <path>`). The issue-thread mirror of [`Forge::pr_comment`],
+    /// used to reply to a `/claude` command left on an issue that has no pull
+    /// request (and therefore no branch to push). No raw REST on this path.
+    fn issue_comment(
+        &self,
+        host: &str,
+        repo: &str,
+        issue_number: u64,
+        body_file: &std::path::Path,
+    ) -> Result<()>;
+
     /// CLAUDE-126: combined CI status plus mergeability of PR `pr_number` in
     /// `repo` on `host` (`fj pr status <repo>#<n> --json`). Backs the automerge
     /// poll, which needs both the CI verdict and whether the branch is up to
