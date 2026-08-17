@@ -238,7 +238,10 @@ impl ProcessRunner {
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        let output = match cmd.output() {
+        // CLAUDE-228: every `yt` / `fj` call in the runner lands here, most of
+        // them from an async job future. `yt list` has been observed taking
+        // minutes under load, so the worker's core goes back to the runtime.
+        let output = match crate::blocking::in_place(|| cmd.output()) {
             Ok(o) => o,
             // A missing binary surfaces as NotFound from the spawn; map it to
             // the typed CliNotFound so the factory can fall through.

@@ -20,7 +20,7 @@ use crate::action::{self, LoadedAction};
 use crate::api::{self, AppState};
 use crate::cancel::{CancellationToken, RegistryGuard, RunRegistry};
 use crate::claude::ClaudeInvoker;
-use crate::concurrency::{Executor, KeyGate, Limiter};
+use crate::concurrency::{Executor, GatherGate, KeyGate, Limiter};
 use crate::config::{ConcurrencyConfig, OnDiskConfig, Paths};
 use crate::error::Result;
 use crate::job::{self, RunnerDefaults};
@@ -337,6 +337,7 @@ impl Daemon {
             claude: claude.clone(),
             in_flight,
             keygate,
+            gather: GatherGate::new(),
             runs,
             // CLAUDE-162: daemon-wide caps + continuous-pickup state.
             limiter,
@@ -991,6 +992,9 @@ struct Dispatcher {
     keygate: KeyGate,
     /// CLAUDE-9: per-run cancellation tokens, registered by `run_action_inner`.
     runs: Arc<RunRegistry>,
+    /// CLAUDE-228: daemon-wide per-action gather marker. The tick reads it to
+    /// skip a pickup whose previous gather is still running.
+    gather: GatherGate,
     /// CLAUDE-162: daemon-wide concurrency limiter (global + per-action
     /// semaphores), acquired per job so caps hold across overlapping runs.
     limiter: Limiter,
@@ -1078,6 +1082,7 @@ impl Dispatcher {
             &self.keygate,
             &self.limiter,
             &self.pause,
+            &self.gather,
         )
         .await
     }
@@ -1100,6 +1105,8 @@ pub async fn run_action_inner(
     keygate: &KeyGate,
     limiter: &Limiter,
     pause: &crate::pause::PauseGate,
+    // CLAUDE-228: per-action gather marker, held across the gather step only.
+    gather: &GatherGate,
 ) -> Result<()> {
     // CLAUDE-30: native kinds route to a built-in Rust handler. Scripted
     // actions fall through to the generic nu-snippet pipeline below, unchanged.
@@ -1115,6 +1122,7 @@ pub async fn run_action_inner(
             keygate: keygate.clone(),
             limiter: limiter.clone(),
             pause: pause.clone(),
+            gather: gather.clone(),
         })
         .await;
     }
@@ -1133,7 +1141,13 @@ pub async fn run_action_inner(
         return Ok(());
     }
 
-    let jobs = job::gather_jobs(loaded, snippet.as_ref(), paths).await?;
+    // CLAUDE-228: mark the action as gathering so the scheduler does not stack
+    // another pickup on top of a slow `input.command`. Dropped right after the
+    // gather; overlapping runs past this point stay allowed (CLAUDE-162).
+    let jobs = {
+        let _gather_guard = gather.try_acquire(&loaded.action.name);
+        job::gather_jobs(loaded, snippet.as_ref(), paths).await?
+    };
     info!(action = %loaded.action.name, count = jobs.len(), "input jobs gathered");
 
     // CLAUDE-162 / CLAUDE-163: admission check. Compute each gathered job's issue
@@ -1173,6 +1187,9 @@ pub async fn run_action_inner(
     }
 
     let run_id = state::run_begin(pool, &loaded.action.name, triggered_by).await?;
+    // CLAUDE-228: from here the row MUST be closed on every exit path, including
+    // an early `?` out of the bookkeeping below.
+    let run_guard = state::RunGuard::new(pool, run_id);
 
     // CLAUDE-9: register a cancellation token for this run and ensure it is
     // unregistered on every exit path (including the `?` early returns below).
@@ -1319,7 +1336,7 @@ pub async fn run_action_inner(
     }
 
     let exit_code = run_pause.exit_code(cancel.is_cancelled());
-    state::run_finish(pool, run_id, exit_code, processed).await?;
+    run_guard.finish(exit_code, processed).await?;
     if let Some(e) = first_err {
         warn!(action = %loaded.action.name, error = %e, "one or more jobs errored during the run");
     }
@@ -1431,6 +1448,18 @@ async fn scheduler_loop(
     }
 }
 
+/// CLAUDE-228: what one action's pause read means for this tick's fire decision.
+/// An unreadable pause state skips the action: it cannot prove the action is NOT
+/// paused, and the next tick retries 5s later. Pure so the error branch is
+/// testable; the caller logs the cause before asking.
+fn pause_read_skips_pickup<T>(status: &Result<Option<T>>) -> bool {
+    match status {
+        Ok(None) => false,
+        Ok(Some(_)) => true,
+        Err(_) => true,
+    }
+}
+
 async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
     // Refresh on-disk action index so newly-added files become schedulable
     // without a daemon restart.
@@ -1460,10 +1489,14 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
         if !r.enabled || r.parse_error.is_some() {
             continue;
         }
-        if state::action_pause_status(&dispatch.pool, &r.name)
-            .await?
-            .is_some()
-        {
+        // CLAUDE-228: a failed pause read skips THIS action only. It used to be
+        // a `?`, so one transient pool timeout aborted the whole tick and no
+        // action fired at all.
+        let pause_status = state::action_pause_status(&dispatch.pool, &r.name).await;
+        if let Err(e) = &pause_status {
+            warn!(action = %r.name, error = %e, "pause status read failed; skipping this action's pickup for this tick");
+        }
+        if pause_read_skips_pickup(&pause_status) {
             continue;
         }
         // Manual actions never auto-fire; only `trigger` dispatches them.
@@ -1482,6 +1515,14 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
         // tick retries the moment a permit frees.
         let last_fire = dispatch.last_fire.lock().await.get(&r.name).copied();
         if !scheduler::regather_due(last_fire, now, interval) {
+            continue;
+        }
+        // CLAUDE-228: a gather still running from the previous fire means this
+        // pickup would re-run the same query against the same source. Skip it
+        // WITHOUT advancing `last_fire` (same contract as `can_admit` below), so
+        // the next tick fires the moment the gather finishes.
+        if dispatch.gather.is_gathering(&r.name) {
+            info!(action = %r.name, "pickup deferred: gather still in flight");
             continue;
         }
         let max_parallel = r.max_parallel.max(1) as usize;
@@ -1676,6 +1717,89 @@ mod tests {
         assert_eq!(read_pidfile(&paths), None);
     }
 
+    /// CLAUDE-228: an action whose previous gather is still running does not get
+    /// another pickup, and the deferral does NOT advance `last_fire`, so the next
+    /// tick fires the moment the gather finishes (same contract as a saturated
+    /// concurrency cap).
+    #[tokio::test]
+    async fn a_gather_in_flight_defers_that_actions_pickup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        std::fs::create_dir_all(paths.actions_dir()).unwrap();
+        std::fs::write(
+            paths.actions_dir().join("act.yml"),
+            "name: act\nkind: youtrack\nnative: {}\nschedule:\n  kind: interval\n  spec: 5m\n",
+        )
+        .unwrap();
+        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let dispatch = test_dispatcher(&paths, &pool);
+
+        // Marker held: the tick must not fire, and must not stamp last_fire.
+        let marker = dispatch.gather.try_acquire("act").expect("free at first");
+        scheduler_tick(&dispatch).await.unwrap();
+        assert!(
+            dispatch.last_fire.lock().await.get("act").is_none(),
+            "a deferred pickup must not advance last_fire"
+        );
+        assert!(
+            state::active_runs(&pool).await.unwrap().is_empty(),
+            "no run row is opened for a deferred pickup"
+        );
+
+        // Gather done: the very next tick fires, with no cadence penalty.
+        drop(marker);
+        scheduler_tick(&dispatch).await.unwrap();
+        assert!(
+            dispatch.last_fire.lock().await.get("act").is_some(),
+            "the next tick after the gather finishes fires"
+        );
+    }
+
+    /// CLAUDE-228: the three pause-read outcomes. The `Err` arm is the fix: it
+    /// used to be a `?` that aborted the whole tick, so one transient pool
+    /// timeout stopped EVERY action from firing, not just this one.
+    #[test]
+    fn a_failed_pause_read_skips_only_that_action() {
+        let readable_unpaused: Result<Option<(String, Option<String>)>> = Ok(None);
+        let readable_paused: Result<Option<(String, Option<String>)>> = Ok(Some((
+            "2026-08-17T18:00:00Z".to_string(),
+            Some("rebooting".to_string()),
+        )));
+        let unreadable: Result<Option<(String, Option<String>)>> = Err(crate::error::Error::Other(
+            anyhow::anyhow!("pool timed out"),
+        ));
+
+        assert!(
+            !pause_read_skips_pickup(&readable_unpaused),
+            "unpaused fires"
+        );
+        assert!(
+            pause_read_skips_pickup(&readable_paused),
+            "paused never fires"
+        );
+        assert!(
+            pause_read_skips_pickup(&unreadable),
+            "an unreadable pause state skips this action instead of firing it"
+        );
+    }
+
+    fn test_dispatcher(paths: &Paths, pool: &sqlx::SqlitePool) -> Arc<Dispatcher> {
+        Arc::new(Dispatcher {
+            paths: paths.clone(),
+            pool: pool.clone(),
+            snippet: Arc::new(SnippetRunner::new(None)),
+            claude: Arc::new(ClaudeInvoker::new(None)),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            keygate: KeyGate::new(),
+            gather: GatherGate::new(),
+            runs: Arc::new(RunRegistry::new()),
+            limiter: Limiter::new(1),
+            concurrency: Arc::new(RwLock::new(ConcurrencyConfig::default())),
+            pause: crate::pause::PauseGate::new(pool.clone()),
+            last_fire: Mutex::new(HashMap::new()),
+        })
+    }
+
     /// CLAUDE-223: a globally paused daemon does no scheduler work at all. The
     /// tick returns at the pause gate, BEFORE it recomputes the global
     /// concurrency cap, so an unchanged cap is the observable proof that
@@ -1704,6 +1828,7 @@ mod tests {
             claude: Arc::new(ClaudeInvoker::new(None)),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             keygate: KeyGate::new(),
+            gather: GatherGate::new(),
             runs: Arc::new(RunRegistry::new()),
             limiter: Limiter::new(1),
             concurrency: Arc::new(RwLock::new(ConcurrencyConfig::default())),
@@ -1760,6 +1885,7 @@ mod tests {
             &KeyGate::new(),
             &Limiter::new(1),
             &crate::pause::PauseGate::never(),
+            &GatherGate::new(),
         )
         .await
         .expect("native handler caps out cleanly");

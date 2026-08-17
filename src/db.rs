@@ -24,7 +24,16 @@ pub async fn open(db_path: &Path) -> Result<SqlitePool> {
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(std::time::Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
-        .max_connections(8)
+        // CLAUDE-228: 8 left no headroom once the daemon runs several overlapping
+        // runs plus the web UI's polling.
+        .max_connections(16)
+        // CLAUDE-228: sqlx's default, stated so it is a decision and not an
+        // inherited value. An acquire that waits this long is a real fault.
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        // CLAUDE-228: raised from the 2s default. With blocking work off the
+        // async runtime an acquire is sub-millisecond, so 5s flags a genuine
+        // regression instead of logging routine contention.
+        .acquire_slow_threshold(std::time::Duration::from_secs(5))
         .connect_with(opts)
         .await?;
     MIGRATOR.run(&pool).await?;

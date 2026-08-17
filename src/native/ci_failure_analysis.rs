@@ -105,6 +105,9 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
     let backend = provider::resolve(provider::DEFAULT_PRIORITY)?;
 
     // gather BEFORE run_begin so a gather failure is a no-op run (no empty row).
+    // CLAUDE-228: hold the gather marker so the scheduler does not stack another
+    // pickup while this one is still gathering.
+    let gather_guard = ctx.gather.try_acquire(&action.name);
     let candidates = match backend.list_queued(&cfg.query) {
         Ok(rows) => rows,
         Err(e) => {
@@ -137,7 +140,14 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
     }
     let max_parallel = action.concurrency.max_parallel.max(1) as usize;
 
+    // CLAUDE-228: the gather marker covers the whole pre-`run_begin` phase (the
+    // work a stacked pickup would redo); released here, so overlapping runs past
+    // this point stay allowed exactly as CLAUDE-162 intends.
+    drop(gather_guard);
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
+    // CLAUDE-228: from here the row MUST be closed on every exit path, including
+    // an early `?` out of the bookkeeping below.
+    let run_guard = state::RunGuard::new(pool, run_id);
     let cancel = match ctx.registry {
         Some(r) => r.register(run_id),
         None => CancellationToken::new(),
@@ -194,7 +204,7 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
     }
 
     let exit_code = run_pause.exit_code(cancel.is_cancelled());
-    state::run_finish(pool, run_id, exit_code, processed).await?;
+    run_guard.finish(exit_code, processed).await?;
     Ok(())
 }
 
@@ -266,7 +276,10 @@ async fn process_job(
     }
 
     // Fetch the complete redacted log (+ workflow YAML).
-    let fetched = fetch_analysis_inputs(fj, &coords, &token, &workdir_path);
+    // CLAUDE-228: shells out to `fj` and sleeps between retries (it is handed
+    // `std::thread::sleep`), so it must not run on the async worker thread.
+    let fetched =
+        crate::blocking::in_place(|| fetch_analysis_inputs(fj, &coords, &token, &workdir_path));
     let inputs = match fetched {
         FetchResult::Ready(inputs) => inputs,
         FetchResult::Unavailable(reason) => {
