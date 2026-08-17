@@ -94,6 +94,10 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
     let backend = provider::resolve(provider::DEFAULT_PRIORITY)?;
 
     // gather issues BEFORE run_begin so a gather failure is a no-op run.
+    // CLAUDE-228: hold the gather marker across the `yt list` AND the per-issue
+    // `yt issue inspect` loop below; that loop is the slow part a stacked pickup
+    // would redo verbatim.
+    let gather_guard = ctx.gather.try_acquire(&action.name);
     let candidates = match backend.list_queued(&cfg.query) {
         Ok(rows) => rows,
         Err(e) => {
@@ -150,7 +154,14 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
         return Ok(());
     }
 
+    // CLAUDE-228: the gather marker covers the whole pre-`run_begin` phase (the
+    // work a stacked pickup would redo); released here, so overlapping runs past
+    // this point stay allowed exactly as CLAUDE-162 intends.
+    drop(gather_guard);
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
+    // CLAUDE-228: from here the row MUST be closed on every exit path, including
+    // an early `?` out of the bookkeeping below.
+    let run_guard = state::RunGuard::new(pool, run_id);
     let cancel = match ctx.registry {
         Some(r) => r.register(run_id),
         None => CancellationToken::new(),
@@ -218,7 +229,10 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
                 continue;
             }
         };
-        let green = gather_now_green(&fj, &cfg, &token, &repo, &repo_targets);
+        // CLAUDE-228: shells out to `fj` per run and sleeps between retries, so
+        // it must not run on the async worker thread.
+        let green =
+            crate::blocking::in_place(|| gather_now_green(&fj, &cfg, &token, &repo, &repo_targets));
 
         for gt in &repo_targets {
             if green.iter().any(|g| issue_matches(&gt.coords, &repo, g)) {
@@ -240,7 +254,7 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
     }
 
     let exit_code = run_pause.exit_code(cancel.is_cancelled());
-    state::run_finish(pool, run_id, exit_code, closed).await?;
+    run_guard.finish(exit_code, closed).await?;
     Ok(())
 }
 

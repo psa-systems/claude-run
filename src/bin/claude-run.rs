@@ -565,8 +565,11 @@ async fn run_action(
     // the daemon, so a pause taken while it works stops it picking up new jobs
     // (the up-front check above only covers the moment the run started).
     let pause = claude_run::pause::PauseGate::new(pool.clone());
+    // CLAUDE-228: the standalone path has no scheduler to defer, so its gather
+    // marker is a fresh one nothing else reads.
+    let gather = claude_run::concurrency::GatherGate::new();
     daemon::run_action_inner(
-        &loaded, paths, &pool, snippet, claude, "cli", None, &keygate, &limiter, &pause,
+        &loaded, paths, &pool, snippet, claude, "cli", None, &keygate, &limiter, &pause, &gather,
     )
     .await?;
     Ok(exit::OK)

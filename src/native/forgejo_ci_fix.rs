@@ -124,7 +124,10 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
     let backend = provider::resolve(provider::DEFAULT_PRIORITY)?;
 
     // gather (before run_begin: a gather failure is a no-op run).
-    let jobs = gather(backend.as_ref(), &cfg, Utc::now());
+    // CLAUDE-228: hold the gather marker across the per-repo `fj` scan, which
+    // shells out per repo and must not run on the async worker thread.
+    let gather_guard = ctx.gather.try_acquire(&action.name);
+    let jobs = crate::blocking::in_place(|| gather(backend.as_ref(), &cfg, Utc::now()));
     info!(action = %action.name, count = jobs.len(), "forgejo-ci-fix jobs gathered");
 
     // CLAUDE-162: admission check. Drop PRs already in flight in another
@@ -153,7 +156,14 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
     // CLAUDE-162: this action's per-action cap, enforced daemon-wide.
     let max_parallel = action.concurrency.max_parallel.max(1) as usize;
 
+    // CLAUDE-228: the gather marker covers the whole pre-`run_begin` phase (the
+    // work a stacked pickup would redo); released here, so overlapping runs past
+    // this point stay allowed exactly as CLAUDE-162 intends.
+    drop(gather_guard);
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
+    // CLAUDE-228: from here the row MUST be closed on every exit path, including
+    // an early `?` out of the bookkeeping below.
+    let run_guard = state::RunGuard::new(pool, run_id);
 
     // CLAUDE-9: register a cancellation token, unregistered on every exit path.
     let cancel = match ctx.registry {
@@ -234,7 +244,7 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
     }
 
     let exit_code = run_pause.exit_code(cancel.is_cancelled());
-    state::run_finish(pool, run_id, exit_code, processed).await?;
+    run_guard.finish(exit_code, processed).await?;
     info!(action = %action.name, processed, exit_code, "run complete");
     Ok(())
 }
@@ -363,7 +373,8 @@ async fn process_job(
     std::fs::create_dir_all(&workdir_path)?;
 
     // ---- pre: clone the PR branch ----
-    let pre_result = run_pre(backend, job, &workdir_path);
+    // CLAUDE-228: a full `git clone`, synchronous; keep it off the async worker.
+    let pre_result = crate::blocking::in_place(|| run_pre(backend, job, &workdir_path));
 
     // ---- prompt + claude (skipped on pre failure / cancel / global pause) ----
     // CLAUDE-223: the gate is read once here (not in a match guard, which cannot
@@ -445,7 +456,9 @@ async fn process_job(
     }
 
     // ---- finalize (the native "post"): decision gate + guaranteed comment ----
-    let finalize_res = finalize(backend, cfg, job, &workdir_path, &claude_result);
+    // CLAUDE-228: git commit / push plus the forge comment, all synchronous.
+    let finalize_res =
+        crate::blocking::in_place(|| finalize(backend, cfg, job, &workdir_path, &claude_result));
     let post_failed = match &finalize_res {
         Ok(f) => {
             info!(action = %action.name, key = %key, pr = job.pr_number, outcome = %f.as_str(), "finalized");
