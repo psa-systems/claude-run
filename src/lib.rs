@@ -21,6 +21,7 @@ pub mod agent_home;
 pub mod api;
 pub mod auth;
 pub mod autofix;
+pub mod blocking;
 pub mod cancel;
 pub mod claude;
 pub mod client;

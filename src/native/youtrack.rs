@@ -172,6 +172,9 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     // credential store (the gather backend's is yt-only), so it materializes one
     // per probed repo; `None` when the action references no forge secret.
     let access = forge_access_check(&runner, &creds, &cred_base, gh);
+    // CLAUDE-228: hold the gather marker so the scheduler does not stack another
+    // pickup while this one is still gathering.
+    let gather_marker = ctx.gather.try_acquire(&action.name);
     let (jobs, input_events) = gather(
         &gather_backend,
         &src.query,
@@ -266,7 +269,14 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         return Ok(());
     }
 
+    // CLAUDE-228: the gather marker covers the whole pre-`run_begin` phase (the
+    // work a stacked pickup would redo); released here, so overlapping runs past
+    // this point stay allowed exactly as CLAUDE-162 intends.
+    drop(gather_marker);
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
+    // CLAUDE-228: from here the row MUST be closed on every exit path, including
+    // an early `?` out of the bookkeeping below.
+    let run_guard = state::RunGuard::new(pool, run_id);
     // CLAUDE-147: backfill this poll's input-phase events onto the new run row.
     if !input_events.is_empty() {
         if let Err(e) = state::run_events_attach(pool, run_id, &action.name, &poll_ts).await {
@@ -461,7 +471,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     }
 
     let exit_code = run_pause.exit_code(cancel.is_cancelled());
-    state::run_finish(pool, run_id, exit_code, processed).await?;
+    run_guard.finish(exit_code, processed).await?;
     if let Some(e) = first_err {
         warn!(action = %action.name, error = %e, "one or more jobs errored during the run");
     }
@@ -948,7 +958,9 @@ async fn process_job(
     std::fs::create_dir_all(&workdir_path)?;
 
     // ---- pre: mark Working / In Progress, then clone ----
-    let pre_result = run_pre(backend, src, job, &workdir_path);
+    // CLAUDE-228: `yt` field writes plus a full `git clone` of the target repo,
+    // all synchronous; keep them off the async worker thread.
+    let pre_result = crate::blocking::in_place(|| run_pre(backend, src, job, &workdir_path));
 
     // ---- prompt + claude (skipped on pre failure / cancel / global pause) ----
     // CLAUDE-223: the gate is read once here (not in a match guard, which cannot
@@ -1020,7 +1032,10 @@ async fn process_job(
     // Transient claude error: no finalize, no attempt counted, no daily count.
     if claude_result.transient {
         info!(action = %action.name, key = %key, error = %claude_result.error, "transient claude error, not counting attempt");
-        cleanup_or_preserve(&workdir_path, &action.name, key);
+        // CLAUDE-228: the preserve decision runs `git ls-remote` against the
+        // remote (network) and may then run `git clean -fdX`; keep it off the
+        // async worker thread.
+        crate::blocking::in_place(|| cleanup_or_preserve(&workdir_path, &action.name, key));
         return Ok(ProcessedJob::Transient { key: key.clone() });
     }
 
@@ -1029,17 +1044,22 @@ async fn process_job(
     }
 
     // ---- finalize (the native "post"): every external mutation lives here ----
-    let finalize_res = finalize(
-        backend,
-        forge,
-        src,
-        job,
-        &workdir_path,
-        &claude_result,
-        pr_strategy,
-        cancel,
-        pause,
-    );
+    // CLAUDE-228: synchronous throughout, and it contains the automerge poll
+    // loop that sleeps for up to `automerge.wait_seconds` (1800 in the shipped
+    // action), so the worker's core goes back to the runtime for its duration.
+    let finalize_res = crate::blocking::in_place(|| {
+        finalize(
+            backend,
+            forge,
+            src,
+            job,
+            &workdir_path,
+            &claude_result,
+            pr_strategy,
+            cancel,
+            pause,
+        )
+    });
     let post_failed = match &finalize_res {
         Ok(Finalized::CodeReview { pr_url }) => {
             info!(action = %action.name, key = %key, pr_url = %pr_url, "finalized: Code Review");
@@ -1087,14 +1107,15 @@ async fn process_job(
     // other outcome deletes only when no unpushed commits would be lost. A
     // panic anywhere above preserves trivially: deletion only ever happens
     // here, explicitly.
-    match &finalize_res {
+    // CLAUDE-228: same as above, the preserve branch shells out to git.
+    crate::blocking::in_place(|| match &finalize_res {
         // A merged PR (CLAUDE-126) is as safe to delete as a Code Review PR: the
         // work reached the server and, for Merged, was merged into the base.
         Ok(Finalized::CodeReview { .. }) | Ok(Finalized::Merged { .. }) => {
             cleanup_workdir(&workdir_path)
         }
         _ => cleanup_or_preserve(&workdir_path, &action.name, key),
-    }
+    });
 
     Ok(ProcessedJob::Done {
         key: key.clone(),

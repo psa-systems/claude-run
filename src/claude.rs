@@ -197,27 +197,38 @@ impl ClaudeInvoker {
         if let Some(dir) = &self.config_dir {
             command.env("CLAUDE_CONFIG_DIR", dir);
         }
-        let mut child = command.spawn()?;
+        // CLAUDE-228: the agent session runs for up to `claude_timeout_seconds`
+        // (3600 in the shipped actions) and the wait below is a poll loop, so
+        // this whole region hands the worker's core back to the runtime. Left
+        // inline it pinned one tokio worker per concurrent job for the entire
+        // session, which is what starved the sqlx pool.
+        let outcome = crate::blocking::in_place(|| -> std::io::Result<WaitOutcome> {
+            let mut child = command.spawn()?;
 
-        // Relay claude's piped stdout to the stream log, stamping each JSON
-        // object line with its arrival time. Runs on its own thread next to the
-        // blocking wait below and drains to EOF (the pipe closes when the child
-        // group exits, including a timeout/cancel kill, so all output up to the
-        // kill is captured).
-        let relay = child
-            .stdout
-            .take()
-            .map(|stdout| std::thread::spawn(move || relay_stamped_stdout(stdout, log_file)));
+            // Relay claude's piped stdout to the stream log, stamping each JSON
+            // object line with its arrival time. Runs on its own thread next to
+            // the blocking wait below and drains to EOF (the pipe closes when
+            // the child group exits, including a timeout/cancel kill, so all
+            // output up to the kill is captured).
+            let relay = child
+                .stdout
+                .take()
+                .map(|stdout| std::thread::spawn(move || relay_stamped_stdout(stdout, log_file)));
 
-        let pgid = child.id() as i32;
-        let outcome = wait_or_cancel(&mut child, pgid, stream_log, self.result_exit_grace, cancel)?;
+            let pgid = child.id() as i32;
+            let outcome =
+                wait_or_cancel(&mut child, pgid, stream_log, self.result_exit_grace, cancel)?;
+
+            // Drain the relay: the child group has exited, so the stdout pipe is
+            // at EOF and the thread has flushed every line it read up to the kill.
+            if let Some(relay) = relay {
+                if relay.join().is_err() {
+                    warn!(stream_log = %stream_log.display(), "stream-log relay thread panicked; the stream log may be truncated");
+                }
+            }
+            Ok(outcome)
+        })?;
         let status = outcome.status;
-
-        // Drain the relay: the child group has exited, so the stdout pipe is at
-        // EOF and the thread has flushed every line it read up to the kill.
-        if let Some(relay) = relay {
-            let _ = relay.join();
-        }
 
         let exit_code = status.code().unwrap_or(-1);
         let final_event = parse_final_result(stream_log).unwrap_or(Value::Null);
