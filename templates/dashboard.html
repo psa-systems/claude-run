@@ -263,10 +263,25 @@
             {% endfor %}
           </select>
         </th>
-        <th><a href="#" class="sort-link"
-               hx-get="/?{{ view.sort_query("jobs") }}" hx-include="#search-form"
-               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
-               >Jobs{{ view.arrow("jobs") }}</a></th>
+        <th>
+          <a href="#" class="sort-link"
+             hx-get="/?{{ view.sort_query("jobs") }}" hx-include="#search-form"
+             hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+             >Jobs{{ view.arrow("jobs") }}</a>
+          {# CLAUDE-230: sort worst-first by the derived failed-job count. #}
+          <a href="#" class="sort-link" style="color: var(--fg-dim);"
+             hx-get="/?{{ view.sort_query("failed") }}" hx-include="#search-form"
+             hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+             >failed{{ view.arrow("failed") }}</a>
+          {# CLAUDE-230: job-level outcome, independent of the run's Exit code. #}
+          <select name="outcome" hx-trigger="change"
+                  hx-get="/?{{ view.query_without("outcome") }}" hx-include="#search-form"
+                  hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+            <option value=""{% if view.outcome.is_empty() %} selected{% endif %}>all</option>
+            <option value="failed"{% if view.outcome == "failed" %} selected{% endif %}>failed</option>
+            <option value="timedout"{% if view.outcome == "timedout" %} selected{% endif %}>timed out</option>
+          </select>
+        </th>
         <th>
           <a href="#" class="sort-link"
              hx-get="/?{{ view.sort_query("exit") }}" hx-include="#search-form"

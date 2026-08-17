@@ -575,6 +575,39 @@ fn reject_synthetic(name: &str) -> Option<Response> {
     })
 }
 
+/// CLAUDE-230: the one definition of "the latest attempt of each job in this
+/// run", parameterised by an outcome predicate on the `o` alias. Every
+/// `failed_jobs` count and the Jobs-column outcome filter are built from it, so
+/// the rows the filter selects and the `(N failed)` marker a row renders can
+/// never drift apart. `pred` is always one of the fixed constants below, never
+/// user input.
+fn latest_job_attempts(pred: &str) -> String {
+    format!(
+        "FROM job_outcomes o WHERE o.run_id = runs.id AND {pred} AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)"
+    )
+}
+
+/// A hard-failed job. Excludes timeouts, which CLAUDE-52 badges separately and
+/// which the displayed failed count has always left out.
+const JOB_FAILED: &str = "o.ok = 0 AND o.timed_out = 0";
+/// A job whose `claude` hit the wall-clock limit and was SIGKILLed.
+const JOB_TIMED_OUT: &str = "o.timed_out = 1";
+
+/// Column list for every `RunRow` listing, including the derived `failed_jobs`
+/// count that `templates/dashboard.html` renders as `(N failed)`.
+fn run_row_columns() -> String {
+    format!(
+        "id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, stage, (SELECT COUNT(*) {}) AS failed_jobs",
+        latest_job_attempts(JOB_FAILED)
+    )
+}
+
+/// CLAUDE-230: `EXISTS` predicate for a run holding at least one job matching
+/// `pred` on its latest attempt, for the Jobs-column outcome filter.
+fn has_job_matching(pred: &str) -> String {
+    format!("EXISTS (SELECT 1 {})", latest_job_attempts(pred))
+}
+
 /// CLAUDE-35: when `show_empty` is false, finished runs that processed zero jobs
 /// are hidden. In-progress runs (`exit_code IS NULL`) are always kept so a
 /// just-started run never momentarily vanishes (it can legitimately sit at
@@ -597,7 +630,8 @@ async fn fetch_recent_runs(
     let (where_clause, binds) = view.where_clause(show_empty);
     let order_by = view.order_by();
     let sql = format!(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, stage, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs{where_clause} {order_by} LIMIT ? OFFSET ?"
+        "SELECT {} FROM runs{where_clause} {order_by} LIMIT ? OFFSET ?",
+        run_row_columns()
     );
     let mut q = sqlx::query_as::<_, RunRow>(&sql);
     for b in &binds {
@@ -978,14 +1012,15 @@ struct PageNav {
 
 /// CLAUDE-141: whitelisted sort + filter selection for the dashboard recent-runs
 /// table. Every field is validated in [`dashboard`] before it lands here:
-/// `sort`/`dir`/`exit` against fixed allow-lists, `action`/`triggered` against
+/// `sort`/`dir`/`exit`/`outcome` against fixed allow-lists, `action`/`triggered` against
 /// the actual distinct DB values. So nothing user-controlled reaches the SQL
 /// `ORDER BY`, the filter values are bound as parameters, and the strings echoed
 /// back into query strings and the page are all known-safe.
 #[derive(Default, Clone)]
 struct RunsView {
     /// Whitelisted sort column key (`run`/`action`/`started`/`ended`/
-    /// `duration`/`jobs`/`exit`), or empty for the default `started_at DESC`.
+    /// `duration`/`jobs`/`failed`/`exit`), or empty for the default
+    /// `started_at DESC`.
     sort: String,
     /// `asc` or `desc`; empty (the default) sorts descending.
     dir: String,
@@ -994,8 +1029,12 @@ struct RunsView {
     /// Exact `triggered_by` to filter to, or empty for all.
     triggered: String,
     /// Derived exit/outcome filter: `success`/`failed`/`cancelled`/`running`,
-    /// or empty for all.
+    /// or empty for all. This is the RUN's own exit code.
     exit: String,
+    /// CLAUDE-230: job-level outcome filter, independent of `exit`:
+    /// `failed`/`timedout`, or empty for all. Named `outcome` and not `jobs`
+    /// because the sort key `jobs` already means `jobs_processed`.
+    outcome: String,
 }
 
 impl RunsView {
@@ -1012,6 +1051,8 @@ impl RunsView {
             // SQLite has no duration column; derive it from the timestamps.
             "duration" => "(julianday(ended_at) - julianday(started_at))",
             "jobs" => "jobs_processed",
+            // CLAUDE-230: the derived count aliased by `run_row_columns`.
+            "failed" => "failed_jobs",
             "exit" => "exit_code",
             // "started" and any unknown/empty value fall back to the default.
             _ => "started_at",
@@ -1056,6 +1097,14 @@ impl RunsView {
             "running" => conds.push("exit_code IS NULL".to_string()),
             _ => {}
         }
+        // CLAUDE-230: job-level outcome, a different axis from the run's exit
+        // code (a run whose every job failed still finishes 0). Built from the
+        // same fragment as the displayed `(N failed)` count so the two agree.
+        match self.outcome.as_str() {
+            "failed" => conds.push(has_job_matching(JOB_FAILED)),
+            "timedout" => conds.push(has_job_matching(JOB_TIMED_OUT)),
+            _ => {}
+        }
         let where_clause = if conds.is_empty() {
             String::new()
         } else {
@@ -1096,8 +1145,8 @@ impl RunsView {
 
     fn query_with(&self, sort: &str, dir: &str) -> String {
         format!(
-            "sort={sort}&dir={dir}&action={}&triggered={}&exit={}",
-            self.action, self.triggered, self.exit,
+            "sort={sort}&dir={dir}&action={}&triggered={}&exit={}&outcome={}",
+            self.action, self.triggered, self.exit, self.outcome,
         )
     }
 
@@ -1111,6 +1160,7 @@ impl RunsView {
             ("action", self.action.as_str()),
             ("triggered", self.triggered.as_str()),
             ("exit", self.exit.as_str()),
+            ("outcome", self.outcome.as_str()),
         ]
         .iter()
         .filter(|(k, _)| *k != omit)
@@ -1141,6 +1191,10 @@ struct DashboardQuery {
     /// CLAUDE-141: derived Exit/outcome filter, empty for all.
     #[serde(default)]
     exit: String,
+    /// CLAUDE-230: job-level outcome filter (`failed`/`timedout`), empty for
+    /// all.
+    #[serde(default)]
+    outcome: String,
     /// CLAUDE-143: search text. Empty/absent leaves the normal runs view.
     #[serde(default)]
     q: String,
@@ -1172,7 +1226,7 @@ async fn dashboard(
     let actions = enriched_actions(pool, s.webhook_enabled, s.comment_webhook_enabled).await?;
 
     // CLAUDE-141: whitelist the sort/filter selections before they reach SQL or
-    // the page. `sort`/`dir`/`exit` are checked against fixed allow-lists; the
+    // the page. `sort`/`dir`/`exit`/`outcome` are checked against fixed allow-lists; the
     // Action/Triggered values are kept only when they match an actual distinct
     // value in `runs` (the same lists that populate the dropdowns), so a stale
     // or hand-edited param drops to "all" instead of echoing arbitrary input.
@@ -1182,7 +1236,7 @@ async fn dashboard(
         sort: whitelisted(
             &q.sort,
             &[
-                "run", "action", "started", "ended", "duration", "jobs", "exit",
+                "run", "action", "started", "ended", "duration", "jobs", "failed", "exit",
             ],
         ),
         dir: if q.dir == "asc" { "asc" } else { "desc" }.to_string(),
@@ -1192,6 +1246,7 @@ async fn dashboard(
             &q.exit,
             &["success", "failed", "cancelled", "paused", "running"],
         ),
+        outcome: whitelisted(&q.outcome, &["failed", "timedout"]),
     };
 
     // CLAUDE-142: page the Recent runs table. `total` is a COUNT over the same
@@ -1334,7 +1389,8 @@ async fn action_detail(
         " AND (jobs_processed > 0 OR exit_code IS NULL)"
     };
     let sql = format!(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, stage, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE action_name = ?{empty_filter} ORDER BY started_at DESC LIMIT 50"
+        "SELECT {} FROM runs WHERE action_name = ?{empty_filter} ORDER BY started_at DESC LIMIT 50",
+        run_row_columns()
     );
     let runs = sqlx::query_as::<_, RunRow>(&sql)
         .bind(&name)
@@ -1391,9 +1447,10 @@ async fn action_durations(
     }
     // Same recent window as the action-detail table (last 50 by start). The
     // query returns newest-first; the chart wants oldest-first, so reverse.
-    let runs = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, stage, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
-    )
+    let runs = sqlx::query_as::<_, RunRow>(&format!(
+        "SELECT {} FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
+        run_row_columns()
+    ))
     .bind(&name)
     .fetch_all(pool)
     .await?;
@@ -4042,12 +4099,14 @@ async fn run_detail(
     Query(q): Query<RunDetailQuery>,
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
-    let Some(run): Option<RunRow> = sqlx::query_as::<_, RunRow>(
-        "SELECT id, action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by, current_job_key, stage, (SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key)) AS failed_jobs FROM runs WHERE id = ?",
-    )
+    let Some(run): Option<RunRow> = sqlx::query_as::<_, RunRow>(&format!(
+        "SELECT {} FROM runs WHERE id = ?",
+        run_row_columns()
+    ))
     .bind(id)
     .fetch_optional(pool)
-    .await? else {
+    .await?
+    else {
         return Ok((StatusCode::NOT_FOUND, format!("no run #{id}")).into_response());
     };
     let outcomes = sqlx::query_as::<_, JobOutcomeRow>(
@@ -4784,6 +4843,16 @@ mod tests {
             v("bogus; DROP", "asc").order_by(),
             "ORDER BY started_at ASC, id DESC"
         );
+        // CLAUDE-230: the derived failed-job count is sortable worst-first and
+        // keeps the `id DESC` tiebreaker.
+        assert_eq!(
+            v("failed", "desc").order_by(),
+            "ORDER BY failed_jobs DESC, id DESC"
+        );
+        assert_eq!(
+            v("failed", "asc").order_by(),
+            "ORDER BY failed_jobs ASC, id DESC"
+        );
     }
 
     /// `where_clause` composes the CLAUDE-35 hide-empty rule with the Action /
@@ -4825,6 +4894,87 @@ mod tests {
         assert_eq!(running.where_clause(true).0, " WHERE exit_code IS NULL");
     }
 
+    /// CLAUDE-230: the job-level `outcome` filter is its own axis. It maps to an
+    /// `EXISTS` over the SHARED latest-attempt fragment (so it can never drift
+    /// from the displayed `(N failed)` count), composes with the other filters
+    /// via `AND` without adding binds, and ignores an unrecognised value.
+    #[test]
+    fn runs_view_where_clause_filters_job_outcome() {
+        use super::{
+            has_job_matching, latest_job_attempts, run_row_columns, RunsView, JOB_FAILED,
+            JOB_TIMED_OUT,
+        };
+        let with = |outcome: &str| RunsView {
+            outcome: outcome.to_string(),
+            ..RunsView::default()
+        };
+        assert_eq!(
+            with("failed").where_clause(true).0,
+            format!(" WHERE {}", has_job_matching(JOB_FAILED))
+        );
+        assert_eq!(
+            with("timedout").where_clause(true).0,
+            format!(" WHERE {}", has_job_matching(JOB_TIMED_OUT))
+        );
+        // Both the filter predicate and the displayed count are built from the
+        // one `latest_job_attempts` fragment, so they cannot drift apart. This
+        // is asserted against the fragment itself, never a copy of its text.
+        let shared = latest_job_attempts(JOB_FAILED);
+        assert!(with("failed").where_clause(true).0.contains(&shared));
+        assert!(run_row_columns().contains(&shared));
+        // An unrecognised (or empty) value adds no condition at all.
+        assert_eq!(with("bogus; DROP").where_clause(true).0, "");
+        assert_eq!(with("").where_clause(true).0, "");
+
+        // Composes with action / triggered / exit via AND, binds unchanged and
+        // in order (the outcome filter interpolates no user input).
+        let v = RunsView {
+            action: "YouTrack".to_string(),
+            triggered: "schedule".to_string(),
+            exit: "success".to_string(),
+            outcome: "failed".to_string(),
+            ..RunsView::default()
+        };
+        let (w, b) = v.where_clause(false);
+        assert_eq!(
+            w,
+            format!(
+                " WHERE (jobs_processed > 0 OR exit_code IS NULL) AND action_name = ? AND triggered_by = ? AND exit_code = 0 AND {}",
+                has_job_matching(JOB_FAILED)
+            )
+        );
+        assert_eq!(b, vec!["YouTrack".to_string(), "schedule".to_string()]);
+    }
+
+    /// CLAUDE-230: `outcome` rides in the poll/pagination query string and in
+    /// `query_without` for every other dropdown, so it survives the 2s refresh,
+    /// a page change, and a change to any sibling filter.
+    #[test]
+    fn runs_view_query_carries_outcome() {
+        use super::RunsView;
+        let v = RunsView {
+            sort: "failed".to_string(),
+            dir: "desc".to_string(),
+            action: "YouTrack".to_string(),
+            triggered: "schedule".to_string(),
+            exit: "success".to_string(),
+            outcome: "timedout".to_string(),
+        };
+        assert_eq!(
+            v.poll_query(),
+            "sort=failed&dir=desc&action=YouTrack&triggered=schedule&exit=success&outcome=timedout"
+        );
+        // The outcome select supplies its own value, so its URL omits it; every
+        // other dropdown's URL carries it.
+        assert_eq!(
+            v.query_without("outcome"),
+            "sort=failed&dir=desc&action=YouTrack&triggered=schedule&exit=success"
+        );
+        assert!(v.query_without("exit").contains("outcome=timedout"));
+        assert!(v.query_without("action").contains("outcome=timedout"));
+        assert!(v.query_without("triggered").contains("outcome=timedout"));
+    }
+
     /// `whitelist_member` keeps only values present in the data-derived list.
     #[test]
     fn whitelist_member_rejects_unknown_values() {
@@ -4860,6 +5010,7 @@ mod tests {
             dir: "desc".to_string(),
             action: "YouTrack".to_string(),
             exit: "running".to_string(),
+            outcome: "timedout".to_string(),
             ..RunsView::default()
         };
         let tpl = DashboardTpl {
@@ -4928,6 +5079,157 @@ mod tests {
             html.contains("value=\"running\" selected"),
             "active Exit filter option not selected: {html}"
         );
+        // CLAUDE-230: the job-outcome dropdown under the Jobs header, with its
+        // active option selected, and the failed-count sort link beside it.
+        assert!(
+            html.contains("name=\"outcome\""),
+            "job outcome filter dropdown missing: {html}"
+        );
+        assert!(
+            html.contains("value=\"timedout\" selected"),
+            "active outcome filter option not selected: {html}"
+        );
+        assert!(
+            html.contains("value=\"failed\""),
+            "failed outcome option missing: {html}"
+        );
+        assert!(
+            html.contains("sort=failed"),
+            "failed-count sort link missing: {html}"
+        );
+        // The outcome select's own URL omits `outcome`; every other control
+        // carries it, so the filter survives the poll and sibling changes.
+        assert!(
+            html.contains("exit=running&amp;outcome=timedout"),
+            "outcome not carried in the poll/sort URLs: {html}"
+        );
+    }
+
+    // ---- job-outcome filter, DB-backed (CLAUDE-230) -----------------------
+    mod outcome_filter {
+        use super::super::{count_recent_runs, fetch_recent_runs, RunsView};
+        use crate::db::MIGRATOR;
+        use crate::state;
+        use sqlx::sqlite::SqlitePoolOptions;
+        use sqlx::SqlitePool;
+
+        async fn pool() -> SqlitePool {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            MIGRATOR.run(&pool).await.unwrap();
+            pool
+        }
+
+        /// Seed one finished (exit 0) run and its job attempts, given as
+        /// `(job_key, attempt, ok, timed_out)`. Returns the run id.
+        async fn seed_run(pool: &SqlitePool, attempts: &[(&str, u32, bool, bool)]) -> i64 {
+            let id = state::run_begin(pool, "youtrack", "schedule")
+                .await
+                .unwrap();
+            for (job_key, attempt, ok, timed_out) in attempts {
+                state::job_outcome_insert(
+                    pool,
+                    &state::JobOutcome {
+                        run_id: id,
+                        action_name: "youtrack",
+                        job_key,
+                        attempt: *attempt,
+                        ok: *ok,
+                        claude_ran: true,
+                        claude_ok: *ok,
+                        claude_cost_usd: 0.0,
+                        attempt_counted: true,
+                        summary: None,
+                        stream_log_path: None,
+                        duration_ms: 1,
+                        timed_out: *timed_out,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            state::run_finish(pool, id, 0, 1).await.unwrap();
+            id
+        }
+
+        async fn matching(pool: &SqlitePool, outcome: &str) -> Vec<i64> {
+            let view = RunsView {
+                outcome: outcome.to_string(),
+                ..RunsView::default()
+            };
+            let rows = fetch_recent_runs(pool, 50, 0, true, &view).await.unwrap();
+            // The COUNT drives pagination and must agree with the listing.
+            let total = count_recent_runs(pool, true, &view).await.unwrap();
+            assert_eq!(total, rows.len() as i64, "count disagrees with the listing");
+            let mut ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+            ids.sort_unstable();
+            ids
+        }
+
+        /// The motivating case: every one of these runs finishes `exit_code = 0`
+        /// (the runners only ever write 0 / 1 / 130), so the Exit filter cannot
+        /// tell them apart. `outcome` selects on the JOB result instead, using
+        /// the latest attempt per job key: the retried run is a success and is
+        /// excluded, and a timeout is not a failure.
+        #[tokio::test]
+        async fn outcome_filter_selects_runs_by_latest_job_attempt() {
+            let pool = pool().await;
+            let failed = seed_run(&pool, &[("A-1", 1, false, false)]).await;
+            let retried =
+                seed_run(&pool, &[("A-2", 1, false, false), ("A-2", 2, true, false)]).await;
+            let timed_out = seed_run(&pool, &[("A-3", 1, false, true)]).await;
+            let clean = seed_run(&pool, &[("A-4", 1, true, false)]).await;
+
+            // No filter: every run, as before.
+            let mut all = vec![failed, retried, timed_out, clean];
+            all.sort_unstable();
+            assert_eq!(matching(&pool, "").await, all);
+            // An unrecognised value is ignored, not treated as a filter.
+            assert_eq!(matching(&pool, "bogus").await, all);
+
+            assert_eq!(matching(&pool, "failed").await, vec![failed]);
+            assert_eq!(matching(&pool, "timedout").await, vec![timed_out]);
+
+            // The displayed `(N failed)` count is derived from the same
+            // fragment, so it agrees row for row with what the filter selected.
+            let view = RunsView::default();
+            let rows = fetch_recent_runs(&pool, 50, 0, true, &view).await.unwrap();
+            for r in &rows {
+                let expected = i64::from(r.id == failed);
+                assert_eq!(
+                    r.failed_jobs, expected,
+                    "run #{} failed_jobs disagrees with the filter",
+                    r.id
+                );
+            }
+        }
+
+        /// `sort=failed` orders by the derived count, worst first.
+        #[tokio::test]
+        async fn failed_sort_orders_by_derived_count() {
+            let pool = pool().await;
+            let clean = seed_run(&pool, &[("B-1", 1, true, false)]).await;
+            let two = seed_run(&pool, &[("B-2", 1, false, false), ("B-3", 1, false, false)]).await;
+            let one = seed_run(&pool, &[("B-4", 1, false, false)]).await;
+
+            let view = RunsView {
+                sort: "failed".to_string(),
+                dir: "desc".to_string(),
+                ..RunsView::default()
+            };
+            let rows = fetch_recent_runs(&pool, 50, 0, true, &view).await.unwrap();
+            assert_eq!(
+                rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+                vec![two, one, clean]
+            );
+            assert_eq!(
+                rows.iter().map(|r| r.failed_jobs).collect::<Vec<_>>(),
+                vec![2, 1, 0]
+            );
+        }
     }
 
     // ---- action editor handlers (CLAUDE-34) -------------------------------
