@@ -3,6 +3,8 @@
 use chrono::{Local, NaiveDate, Utc};
 use sqlx::SqlitePool;
 
+use tracing::{error, warn};
+
 use crate::error::Result;
 
 pub fn today_local() -> NaiveDate {
@@ -655,6 +657,78 @@ pub async fn run_finish(
     Ok(())
 }
 
+/// CLAUDE-228: closes a `run_begin` row on EVERY exit path.
+///
+/// Each runner used to open the row, then apply `?` to a dozen bookkeeping
+/// awaits before reaching [`run_finish`]. One transient failure (in the incident
+/// it was `pool timed out while waiting for an open connection`) returned from
+/// the handler with the row still open, and nothing closed it while the daemon
+/// lived: `ci-failure-analysis` accumulated 19 rows over three days, every one
+/// of them rendered as a running job in the web UI.
+///
+/// The happy path calls [`RunGuard::finish`]. Anything else (an early `?`, an
+/// error return, a panic unwinding through the handler) hits `Drop`, which
+/// closes the row as [`crate::exit::UNEXPECTED`]. `cancel_orphaned_runs` is the
+/// backstop for a row this cannot reach, but it only runs at daemon start and
+/// stop, which is why a long-lived daemon needs this guard.
+pub struct RunGuard {
+    pool: SqlitePool,
+    run_id: i64,
+    finished: bool,
+}
+
+impl RunGuard {
+    pub fn new(pool: &SqlitePool, run_id: i64) -> Self {
+        Self {
+            pool: pool.clone(),
+            run_id,
+            finished: false,
+        }
+    }
+
+    /// The normal end of a run. Only a successful write disarms the guard, so a
+    /// failing `run_finish` still leaves `Drop` to retry the close.
+    pub async fn finish(mut self, exit_code: i32, jobs_processed: u32) -> Result<()> {
+        run_finish(&self.pool, self.run_id, exit_code, jobs_processed).await?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let pool = self.pool.clone();
+        let run_id = self.run_id;
+        // `Drop` cannot await, so the close is spawned. `jobs_processed` stays 0:
+        // the count lives in the handler frame that is unwinding, and inventing
+        // one would be worse than under-reporting a run that already failed.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                warn!(
+                    run_id,
+                    "run ended without finalizing its row; closing it as unexpected"
+                );
+                handle.spawn(async move {
+                    if let Err(e) =
+                        run_finish(&pool, run_id, crate::exit::UNEXPECTED, 0).await
+                    {
+                        error!(run_id, error = %e, "closing the unfinalized run row failed; it stays open until the next daemon start");
+                    }
+                });
+            }
+            Err(_) => {
+                error!(
+                    run_id,
+                    "run ended without finalizing its row and no runtime is available to close it; it stays open until the next daemon start"
+                );
+            }
+        }
+    }
+}
+
 /// CLAUDE-10: reconcile orphaned runs on daemon startup. A freshly started
 /// daemon cannot have any run still executing, so every row with no end state
 /// is a leftover from a dead process. Mark each cancelled with `ended_at` set
@@ -1271,6 +1345,84 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    /// CLAUDE-228: the happy path closes the row with the run's own exit code.
+    #[tokio::test]
+    async fn run_guard_finish_closes_the_row() {
+        let pool = mem_pool().await;
+        let run = run_begin(&pool, "act", "scheduler").await.unwrap();
+
+        RunGuard::new(&pool, run)
+            .finish(crate::exit::OK, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(exit_code_of(&pool, run).await, Some(crate::exit::OK as i64));
+        assert!(ended_at_of(&pool, run).await.is_some());
+        let processed: i64 = sqlx::query_scalar("SELECT jobs_processed FROM runs WHERE id = ?")
+            .bind(run)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(processed, 4);
+    }
+
+    /// CLAUDE-228: the regression. A handler that returns early (here, the
+    /// `pool timed out` shape: an error between `run_begin` and `run_finish`)
+    /// used to leave the row open forever, and the web UI rendered it as a
+    /// running job for days. The guard closes it as `UNEXPECTED` on drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_guard_closes_the_row_when_the_handler_errors() {
+        let pool = mem_pool().await;
+        let run = run_begin(&pool, "act", "scheduler").await.unwrap();
+
+        // A handler shaped like the real ones: open the row, then fail an await.
+        async fn handler(pool: &SqlitePool, run: i64) -> Result<()> {
+            let _guard = RunGuard::new(pool, run);
+            Err(crate::error::Error::Other(anyhow::anyhow!(
+                "pool timed out while waiting for an open connection"
+            )))
+        }
+        assert!(handler(&pool, run).await.is_err());
+
+        // `Drop` cannot await, so the close is spawned; wait for it to land.
+        let mut ended = None;
+        for _ in 0..100 {
+            ended = ended_at_of(&pool, run).await;
+            if ended.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            ended.is_some(),
+            "an errored handler must not leave its run row open"
+        );
+        assert_eq!(
+            exit_code_of(&pool, run).await,
+            Some(crate::exit::UNEXPECTED as i64),
+            "an unfinalized run is distinguishable from a clean finish and from a cancel"
+        );
+    }
+
+    /// A guard that finished must not be re-closed by its own drop, or a clean
+    /// run would be relabelled `UNEXPECTED` right after reporting success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_guard_does_not_reclose_a_finished_run() {
+        let pool = mem_pool().await;
+        let run = run_begin(&pool, "act", "scheduler").await.unwrap();
+        RunGuard::new(&pool, run)
+            .finish(crate::exit::PAUSED, 1)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            exit_code_of(&pool, run).await,
+            Some(crate::exit::PAUSED as i64),
+            "the finished exit code survives the guard's drop"
+        );
     }
 
     #[tokio::test]

@@ -57,6 +57,10 @@ pub struct NativeContext<'a> {
     /// at its per-job checkpoints, so a pause taken mid-run stops the next
     /// pickup and the run finishes with `exit::PAUSED`.
     pub pause: crate::pause::PauseGate,
+    /// CLAUDE-228: daemon-wide per-action gather marker. Each handler holds it
+    /// across its gather step (the `yt list` that opens the run) so the
+    /// scheduler does not stack another pickup on a gather still in flight.
+    pub gather: crate::concurrency::GatherGate,
 }
 
 /// Boxed future returned by a [`NativeHandler`]. Hand-rolled (rather than
