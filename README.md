@@ -286,7 +286,7 @@ Edits apply live (the dashboard, run and action detail pages, the secrets table,
 The daemon does not serialize runs per action. An issue queued while a run is in flight is picked up by a new,
 **overlapping** run within `regather_interval` (default 60s) rather than waiting for the in-flight run to drain, and it is
 never blocked behind an unrelated in-flight run of another action. A manual `trigger` during an in-flight run likewise
-starts an overlapping pickup run instead of being silently dropped. Concurrency is bounded by three limits:
+starts an overlapping pickup run instead of being silently dropped. Concurrency is bounded by four limits:
 
 - **Per-action `max_parallel`** (the action's `concurrency.max_parallel`, default 1), now enforced **daemon-wide**: the
   total number of concurrent jobs for an action stays `<= max_parallel` across all its overlapping runs, not just within
@@ -296,6 +296,11 @@ starts an overlapping pickup run instead of being silently dropped. Concurrency 
   `max_parallel`, so a single action still reaches its full per-action cap out of the box.
 - **Per-key serialization** (unchanged): same-repo / same-project jobs still serialize by the daemon-wide key gate, so
   distinct repos parallelize but two jobs against the same repo never run at once, even across overlapping runs.
+- **One gather at a time per action** (CLAUDE-228): a scheduled pickup is skipped while that action's previous gather is
+  still running. A gather is the `yt list` / `fj` scan that runs before `run_begin`, and when the source slows down it can
+  outlast the 60s cadence; each stacked fire then re-ran the same query against the same source for no new work. The skip
+  does not advance the cadence stamp, so the next tick fires as soon as the gather finishes, and overlapping runs PAST the
+  gather are unchanged. A manual `trigger` is never deferred by it.
 
 Each job acquires a global permit, then the per-action permit, then the key gate, in that fixed order, so the pipeline is
 deadlock-free. Two overlapping runs never both work the same job: each run drops issues already in flight in another open

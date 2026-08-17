@@ -146,7 +146,12 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
     let backend = provider::resolve(provider::DEFAULT_PRIORITY)?;
 
     // Resolve targets BEFORE run_begin so a gather failure is a no-op run.
-    let (targets, from_query) = match resolve_targets(backend.as_ref(), &cfg) {
+    // CLAUDE-228: hold the gather marker so the scheduler does not stack another
+    // pickup while this one is still resolving targets.
+    let gather_guard = ctx.gather.try_acquire(&action.name);
+    let (targets, from_query) = match crate::blocking::in_place(|| {
+        resolve_targets(backend.as_ref(), &cfg)
+    }) {
         Ok(t) => t,
         Err(e) => {
             warn!(action = %action.name, error = %e, "selecting report parents failed; skipping run");
@@ -160,7 +165,14 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
 
     let window = Window::ending(Local::now().date_naive(), cfg.window_days);
 
+    // CLAUDE-228: the gather marker covers the whole pre-`run_begin` phase (the
+    // work a stacked pickup would redo); released here, so overlapping runs past
+    // this point stay allowed exactly as CLAUDE-162 intends.
+    drop(gather_guard);
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
+    // CLAUDE-228: from here the row MUST be closed on every exit path, including
+    // an early `?` out of the bookkeeping below.
+    let run_guard = state::RunGuard::new(pool, run_id);
     let cancel = match ctx.registry {
         Some(r) => r.register(run_id),
         None => CancellationToken::new(),
@@ -207,7 +219,7 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
     }
 
     let exit_code = run_pause.exit_code(cancel.is_cancelled());
-    state::run_finish(pool, run_id, exit_code, filed).await?;
+    run_guard.finish(exit_code, filed).await?;
     Ok(())
 }
 
