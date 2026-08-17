@@ -109,13 +109,17 @@ impl SnippetRunner {
         };
         std::fs::write(&script_path, script)?;
 
-        let output = Command::new(interpreter)
-            .arg(&script_path)
-            .envs(env_bindings)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?;
+        // CLAUDE-228: a scripted action's nu snippet is arbitrary operator code
+        // with no time bound; keep it off the async worker thread.
+        let output = crate::blocking::in_place(|| {
+            Command::new(interpreter)
+                .arg(&script_path)
+                .envs(env_bindings)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+        })?;
 
         Ok(SnippetOutcome {
             ok: output.status.success(),
