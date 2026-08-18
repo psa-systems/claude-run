@@ -27,6 +27,10 @@ pub fn now_epoch_ms() -> i64 {
 pub struct DependencyGateState {
     /// Epoch ms before which the gate does not re-evaluate the issue.
     pub blocked_until_ms: i64,
+    /// CLAUDE-225: epoch ms at which this block STARTED (the row's insert), kept
+    /// across every re-arm so the age of a block is readable. The row is deleted
+    /// once the blockers clear, so it measures one continuous block.
+    pub blocked_since_ms: i64,
     /// Canonical signature of the unmet-blocker set at the last evaluation;
     /// drives comment idempotency (re-comment only when it changes).
     pub signature: String,
@@ -38,23 +42,28 @@ pub async fn dependency_gate_get(
     action: &str,
     key: &str,
 ) -> Result<Option<DependencyGateState>> {
-    let row: Option<(i64, String)> = sqlx::query_as(
-        "SELECT blocked_until, signature FROM dependency_gate \
+    let row: Option<(i64, i64, String)> = sqlx::query_as(
+        "SELECT blocked_until, blocked_since, signature FROM dependency_gate \
          WHERE action_name = ? AND job_key = ?",
     )
     .bind(action)
     .bind(key)
     .fetch_optional(pool)
     .await?;
-    Ok(
-        row.map(|(blocked_until_ms, signature)| DependencyGateState {
+    Ok(row.map(
+        |(blocked_until_ms, blocked_since_ms, signature)| DependencyGateState {
             blocked_until_ms,
+            blocked_since_ms,
             signature,
-        }),
-    )
+        },
+    ))
 }
 
 /// Record (or refresh) the dependency-gate backoff for `(action, key)`.
+///
+/// CLAUDE-225: `blocked_since` is stamped with now on insert and deliberately
+/// NOT touched by the conflict branch, so re-arming the backoff (or commenting a
+/// changed blocker set) never resets the age of an ongoing block.
 pub async fn dependency_gate_upsert(
     pool: &SqlitePool,
     action: &str,
@@ -65,8 +74,9 @@ pub async fn dependency_gate_upsert(
     let now = now_iso();
     sqlx::query(
         r#"
-        INSERT INTO dependency_gate (action_name, job_key, blocked_until, signature, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO dependency_gate
+            (action_name, job_key, blocked_until, blocked_since, signature, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(action_name, job_key) DO UPDATE SET
             blocked_until = excluded.blocked_until,
             signature = excluded.signature,
@@ -76,11 +86,71 @@ pub async fn dependency_gate_upsert(
     .bind(action)
     .bind(key)
     .bind(blocked_until_ms)
+    .bind(now_epoch_ms())
     .bind(signature)
     .bind(&now)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// CLAUDE-225: how long a dependency gate may hold an issue before the daemon
+/// says so out loud. The gate promises the issue "will be re-evaluated
+/// automatically", and that promise failing is silent: the issue simply stays
+/// Queued forever with nothing on the dashboard, in the run history, or in the
+/// journal. One hour is the assumed threshold (an order of magnitude above the
+/// 5m default `recheck_timeout`, so a normally-cycling gate never trips it);
+/// revise once the normal poll cadence is confirmed.
+pub const STALE_GATE_AFTER_MS: i64 = 60 * 60 * 1000;
+
+/// CLAUDE-225: one dependency gate that has held its issue longer than the
+/// staleness threshold, as the dashboard banner and `/api/status` report it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
+pub struct StaleGate {
+    pub action_name: String,
+    /// The held issue (its `idReadable`).
+    pub job_key: String,
+    /// Canonical unmet-blocker set at the last evaluation.
+    pub signature: String,
+    /// How long the issue has been continuously blocked.
+    pub blocked_for_ms: i64,
+    /// How long ago the backoff window expired, i.e. how overdue the promised
+    /// re-evaluation is. Negative while the window is still open.
+    pub recheck_overdue_ms: i64,
+    /// RFC 3339 timestamp of the last evaluation.
+    pub updated_at: String,
+}
+
+/// CLAUDE-225: gates blocked for at least `threshold_ms`, longest-held first.
+/// Reads the live gate table rather than an event trail, so it needs no
+/// acknowledgement and clears itself: the gate deletes the row the moment the
+/// blockers resolve.
+pub async fn dependency_gates_stale(
+    pool: &SqlitePool,
+    now_ms: i64,
+    threshold_ms: i64,
+    limit: i64,
+) -> Result<Vec<StaleGate>> {
+    let rows = sqlx::query_as::<_, StaleGate>(
+        r#"
+        SELECT action_name,
+               job_key,
+               signature,
+               ?1 - blocked_since AS blocked_for_ms,
+               ?1 - blocked_until AS recheck_overdue_ms,
+               updated_at
+        FROM dependency_gate
+        WHERE ?1 - blocked_since >= ?2
+        ORDER BY blocked_for_ms DESC
+        LIMIT ?3
+        "#,
+    )
+    .bind(now_ms)
+    .bind(threshold_ms)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 /// Drop the dependency-gate row for `(action, key)` (its dependencies cleared).
@@ -1923,6 +1993,143 @@ mod tests {
 
         // Outside the window it does not surface at all.
         assert!(access_failures_recent(&pool, "2026-09-01T00:00:00Z", 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// CLAUDE-225: re-arming the backoff (and re-commenting a changed blocker
+    /// set) must not reset `blocked_since`, or a gate re-evaluated every 5m would
+    /// read as 5m old forever and never surface. Clearing the row and blocking
+    /// again does start a new block.
+    #[tokio::test]
+    async fn dependency_gate_upsert_preserves_the_first_blocked_stamp() {
+        let pool = mem_pool().await;
+        dependency_gate_upsert(
+            &pool,
+            "act",
+            "AUD-31",
+            now_epoch_ms() + 300_000,
+            "AUD-32 (depends on)",
+        )
+        .await
+        .unwrap();
+        let first = dependency_gate_get(&pool, "act", "AUD-31")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Age the row, then re-arm with a CHANGED blocker set (a blocker cleared).
+        sqlx::query("UPDATE dependency_gate SET blocked_since = ? WHERE job_key = 'AUD-31'")
+            .bind(first.blocked_since_ms - 7_200_000)
+            .execute(&pool)
+            .await
+            .unwrap();
+        dependency_gate_upsert(
+            &pool,
+            "act",
+            "AUD-31",
+            now_epoch_ms() + 300_000,
+            "AUD-33 (depends on)",
+        )
+        .await
+        .unwrap();
+        let again = dependency_gate_get(&pool, "act", "AUD-31")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            again.blocked_since_ms,
+            first.blocked_since_ms - 7_200_000,
+            "the first-blocked stamp survives a re-arm"
+        );
+        assert_eq!(again.signature, "AUD-33 (depends on)");
+
+        // A cleared gate starts the clock over on the next block.
+        dependency_gate_clear(&pool, "act", "AUD-31").await.unwrap();
+        dependency_gate_upsert(
+            &pool,
+            "act",
+            "AUD-31",
+            now_epoch_ms() + 300_000,
+            "AUD-34 (depends on)",
+        )
+        .await
+        .unwrap();
+        let fresh = dependency_gate_get(&pool, "act", "AUD-31")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            fresh.blocked_since_ms > first.blocked_since_ms - 7_200_000,
+            "a new block after a clear is a new block"
+        );
+    }
+
+    /// CLAUDE-225: the dashboard/API read returns only gates held past the
+    /// threshold, longest-held first, and reports how overdue each gate's own
+    /// re-evaluation is. A gate whose blockers clear deletes its row, so the
+    /// signal disappears without anyone acknowledging it.
+    #[tokio::test]
+    async fn dependency_gates_stale_reports_only_long_blocks_and_overdue_rechecks() {
+        let pool = mem_pool().await;
+        let now = now_epoch_ms();
+        // Fresh block, still inside its backoff window: not stale.
+        dependency_gate_upsert(&pool, "act", "MK-16", now + 300_000, "MK-1 (depends on)")
+            .await
+            .unwrap();
+        // Blocked 2h with a re-check due 90m ago: stale AND overdue (the AUD-31
+        // shape, where the promised re-evaluation stopped happening).
+        dependency_gate_upsert(
+            &pool,
+            "act",
+            "AUD-31",
+            now - 5_400_000,
+            "AUD-32 (depends on)",
+        )
+        .await
+        .unwrap();
+        // Blocked 26h but re-evaluated 1m ago: stale, re-check on schedule.
+        dependency_gate_upsert(&pool, "other", "TR-8", now + 240_000, "TR-7 (depends on)")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE dependency_gate SET blocked_since = ? WHERE job_key = ?")
+            .bind(now - 7_200_000)
+            .bind("AUD-31")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE dependency_gate SET blocked_since = ? WHERE job_key = ?")
+            .bind(now - 93_600_000)
+            .bind("TR-8")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let stale = dependency_gates_stale(&pool, now, STALE_GATE_AFTER_MS, 20)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = stale.iter().map(|g| g.job_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["TR-8", "AUD-31"],
+            "only blocks past the threshold, longest-held first: {stale:?}"
+        );
+        assert_eq!(stale[0].action_name, "other");
+        assert_eq!(stale[1].blocked_for_ms, 7_200_000);
+        assert_eq!(
+            stale[1].recheck_overdue_ms, 5_400_000,
+            "AUD-31's re-check is 90m overdue"
+        );
+        assert!(
+            stale[0].recheck_overdue_ms < 0,
+            "TR-8 is long-blocked but its re-check is not due yet"
+        );
+
+        // The gate deletes the row when the blockers clear; the signal goes with it.
+        dependency_gate_clear(&pool, "other", "TR-8").await.unwrap();
+        dependency_gate_clear(&pool, "act", "AUD-31").await.unwrap();
+        assert!(dependency_gates_stale(&pool, now, STALE_GATE_AFTER_MS, 20)
             .await
             .unwrap()
             .is_empty());

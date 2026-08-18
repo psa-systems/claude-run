@@ -1222,6 +1222,12 @@ fn blocked_comment(blockers: &[Blocker]) -> String {
 /// pickup passes `false`, keeping CLAUDE-182's throttle. Every other side effect
 /// (signature/`blocked_until` persistence, row clear, changed-set comment) is
 /// unchanged; bypass only skips the window short-circuit.
+///
+/// CLAUDE-225: every blocked return logs how long the issue has been held, at
+/// `warn` once past [`state::STALE_GATE_AFTER_MS`]. A gate that stops resuming is
+/// otherwise silent at every layer: the issue stays Queued with no field change,
+/// a poll whose candidates are all blocked returns before `run_begin` so no run
+/// row is written, and the journal said nothing above `info`.
 async fn dependency_gate(
     pool: &SqlitePool,
     backend: &dyn Backend,
@@ -1248,6 +1254,7 @@ async fn dependency_gate(
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect();
+            log_held(action, key, &p.signature, p.blocked_since_ms, now_ms);
             return Ok(GateDecision::Blocked { blockers });
         }
     }
@@ -1284,9 +1291,34 @@ async fn dependency_gate(
     let blocked_until = now_ms + recheck.as_millis() as i64;
     state::dependency_gate_upsert(pool, action, key, blocked_until, &signature).await?;
 
+    // CLAUDE-225: an unchanged row keeps its original stamp, so this measures the
+    // whole block, not this evaluation.
+    let blocked_since = prev.map(|p| p.blocked_since_ms).unwrap_or(now_ms);
+    log_held(action, key, &signature, blocked_since, now_ms);
+
     Ok(GateDecision::Blocked {
         blockers: blockers.iter().map(Blocker::display).collect(),
     })
+}
+
+/// CLAUDE-225: log how long the gate has held this issue, escalating to `warn`
+/// past [`state::STALE_GATE_AFTER_MS`]. The gate's own comment promises automatic
+/// re-evaluation, so a block that outlives the threshold is either a dependency
+/// nobody is working or a re-evaluation that stopped happening; both are worth an
+/// operator's attention and neither announces itself anywhere else.
+fn log_held(action: &str, key: &str, signature: &str, blocked_since_ms: i64, now_ms: i64) {
+    let held_ms = (now_ms - blocked_since_ms).max(0);
+    if held_ms >= state::STALE_GATE_AFTER_MS {
+        warn!(
+            action = %action,
+            key = %key,
+            blockers = %signature,
+            held_secs = held_ms / 1000,
+            "dependency gate has held this issue past the staleness threshold; it stays Queued and is not being worked"
+        );
+    } else {
+        info!(action = %action, key = %key, blockers = %signature, held_secs = held_ms / 1000, "dependency gate holding issue");
+    }
 }
 
 /// Pre steps: mark the issue Working + In Progress, then clone the repo into
@@ -4484,6 +4516,70 @@ mod tests {
         assert!(matches!(d3, GateDecision::Blocked { .. }));
         assert_eq!(inspects(), 2, "expired backoff re-reads");
         assert_eq!(comments(), 1, "unchanged blocker set must not re-comment");
+    }
+
+    /// CLAUDE-225: a re-evaluation that finds the blocker still open re-arms the
+    /// window but keeps the original first-blocked stamp, so the age reported to
+    /// the operator is the age of the whole block and not of the last poll. This
+    /// is what makes a long-held gate surface at all: the gate re-evaluates every
+    /// `recheck_timeout`, so an age reset per evaluation would never cross the
+    /// threshold.
+    #[tokio::test]
+    async fn dependency_gate_keeps_the_block_age_across_re_evaluations() {
+        let pool = mem_pool().await;
+        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"AUD-32","summary":"x"}]}]}"#;
+        let body = blocked_comment(&[Blocker {
+            id: "AUD-32".into(),
+            verb: "depends on".into(),
+        }]);
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("yt", &["issue", "inspect", "AUD-31", "--json"], inspect)
+                .ok("yt", &["issue", "comment", "AUD-31", &body], ""),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let s = src();
+
+        // First block, then age it by three hours with an already-expired window.
+        let d = dependency_gate(&pool, &backend, &s, "act", "AUD-31", false)
+            .await
+            .unwrap();
+        assert!(matches!(d, GateDecision::Blocked { .. }));
+        let aged = state::now_epoch_ms() - 3 * 3_600_000;
+        sqlx::query(
+            "UPDATE dependency_gate SET blocked_since = ?, blocked_until = ? WHERE job_key = 'AUD-31'",
+        )
+        .bind(aged)
+        .bind(state::now_epoch_ms() - 1000)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Re-evaluate: still blocked, window re-armed, stamp untouched.
+        let d2 = dependency_gate(&pool, &backend, &s, "act", "AUD-31", false)
+            .await
+            .unwrap();
+        assert!(matches!(d2, GateDecision::Blocked { .. }));
+        let st = state::dependency_gate_get(&pool, "act", "AUD-31")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(st.blocked_since_ms, aged, "re-arm must not reset the age");
+        assert!(st.blocked_until_ms > state::now_epoch_ms());
+
+        // ...so the operator-facing read surfaces it.
+        let stale = state::dependency_gates_stale(
+            &pool,
+            state::now_epoch_ms(),
+            state::STALE_GATE_AFTER_MS,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stale.len(), 1, "{stale:?}");
+        assert_eq!(stale[0].job_key, "AUD-31");
+        assert_eq!(stale[0].signature, "AUD-32 (depends on)");
+        assert!(stale[0].blocked_for_ms >= 3 * 3_600_000);
     }
 
     /// CLAUDE-161: `enabled: false` makes the gate a no-op: it proceeds without

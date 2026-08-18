@@ -981,6 +981,9 @@ struct DashboardTpl {
     /// CLAUDE-216: poll-time access failures from the last 24h that no later
     /// successful preflight superseded. Empty renders no banner.
     access_failures: Vec<state::AccessFailure>,
+    /// CLAUDE-225: dependency gates that have held an issue longer than
+    /// [`state::STALE_GATE_AFTER_MS`]. Empty renders no banner.
+    stale_gates: Vec<StaleGateRow>,
     /// CLAUDE-141: whitelisted sort + filter selection, echoed into the header
     /// sort links, filter dropdowns, poll URL, and pagination links so the
     /// chosen view survives the morph poll.
@@ -991,6 +994,47 @@ struct DashboardTpl {
     /// CLAUDE-141: distinct `triggered_by` values present in `runs`, for the
     /// Triggered filter dropdown options.
     triggered_options: Vec<String>,
+}
+
+/// CLAUDE-225: one stale dependency gate, with its ages pre-rendered for the
+/// dashboard banner.
+struct StaleGateRow {
+    gate: state::StaleGate,
+}
+
+impl StaleGateRow {
+    fn action_name(&self) -> &str {
+        &self.gate.action_name
+    }
+
+    fn job_key(&self) -> &str {
+        &self.gate.job_key
+    }
+
+    fn signature(&self) -> &str {
+        &self.gate.signature
+    }
+
+    fn updated_at(&self) -> &str {
+        &self.gate.updated_at
+    }
+
+    /// How long the issue has been continuously blocked.
+    fn blocked_for(&self) -> String {
+        format_duration_ms(self.gate.blocked_for_ms)
+    }
+
+    /// True once the gate's own re-check deadline has passed by more than the
+    /// staleness threshold: the promised re-evaluation is not happening, which is
+    /// a different fault from a dependency that is simply still open.
+    fn recheck_overdue(&self) -> bool {
+        self.gate.recheck_overdue_ms >= state::STALE_GATE_AFTER_MS
+    }
+
+    /// How long the re-check has been overdue (rendered only when it is).
+    fn recheck_overdue_for(&self) -> String {
+        format_duration_ms(self.gate.recheck_overdue_ms)
+    }
 }
 
 /// CLAUDE-142: rendered pagination state for the dashboard Recent runs table.
@@ -1309,6 +1353,18 @@ async fn dashboard(
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let access_failures = state::access_failures_recent(pool, &since, 10).await?;
 
+    // CLAUDE-225: a dependency-blocked issue stays Queued with no field change,
+    // and a poll whose candidates are all blocked returns before `run_begin`, so
+    // nothing reaches the run history either. Read the live gate table so a block
+    // that outlives its promised re-evaluation is on screen instead of waiting
+    // for someone to notice a stale issue by hand.
+    let stale_gates: Vec<StaleGateRow> =
+        state::dependency_gates_stale(pool, state::now_epoch_ms(), state::STALE_GATE_AFTER_MS, 20)
+            .await?
+            .into_iter()
+            .map(|gate| StaleGateRow { gate })
+            .collect();
+
     let tpl = DashboardTpl {
         version: s.api.version,
         global_pause,
@@ -1323,6 +1379,7 @@ async fn dashboard(
         search,
         page: page_nav,
         access_failures,
+        stale_gates,
         view,
         action_options,
         triggered_options,
@@ -5035,6 +5092,7 @@ mod tests {
                 has_next: false,
             },
             access_failures: vec![],
+            stale_gates: vec![],
             view,
             action_options: vec!["YouTrack".to_string(), "forgejo".to_string()],
             triggered_options: vec!["schedule".to_string(), "webhook".to_string()],
@@ -5102,6 +5160,77 @@ mod tests {
         assert!(
             html.contains("exit=running&amp;outcome=timedout"),
             "outcome not carried in the poll/sort URLs: {html}"
+        );
+    }
+
+    /// CLAUDE-225: a gate held past the threshold renders the dashboard banner
+    /// with its issue, age, blockers, and whether its own re-check is overdue.
+    /// With no stale gate the banner is absent entirely.
+    #[test]
+    fn dashboard_banners_stale_dependency_gates() {
+        use super::{DashboardTpl, PageNav, RunsView, StaleGateRow};
+        use crate::state;
+        use askama::Template;
+
+        let tpl = |stale_gates: Vec<StaleGateRow>| DashboardTpl {
+            version: "test",
+            global_pause: None,
+            today_runs: 0,
+            today_actions: 0,
+            today_cost: 0.0,
+            actions: vec![],
+            recent_runs: vec![],
+            show_empty: false,
+            search_q: String::new(),
+            in_stream: false,
+            search: None,
+            page: PageNav {
+                page: 1,
+                total_pages: 1,
+                total: 0,
+                start: 0,
+                end: 0,
+                has_prev: false,
+                has_next: false,
+            },
+            access_failures: vec![],
+            stale_gates,
+            view: RunsView::default(),
+            action_options: vec![],
+            triggered_options: vec![],
+        };
+
+        let quiet = tpl(vec![]).render().expect("render dashboard");
+        assert!(
+            !quiet.contains("Dependency gates blocked"),
+            "no stale gate must render no banner: {quiet}"
+        );
+
+        let html = tpl(vec![StaleGateRow {
+            gate: state::StaleGate {
+                action_name: "youtrack".to_string(),
+                job_key: "AUD-31".to_string(),
+                signature: "AUD-32 (depends on)".to_string(),
+                blocked_for_ms: 21 * 3_600_000,
+                recheck_overdue_ms: 20 * 3_600_000,
+                updated_at: "2026-08-11T07:30:00Z".to_string(),
+            },
+        }])
+        .render()
+        .expect("render dashboard");
+        assert!(
+            html.contains("Dependency gates blocked over an hour"),
+            "banner heading missing: {html}"
+        );
+        assert!(html.contains("AUD-31"), "held issue missing: {html}");
+        assert!(
+            html.contains("AUD-32 (depends on)"),
+            "blocker set missing: {html}"
+        );
+        assert!(html.contains("21h 0m"), "block age missing: {html}");
+        assert!(
+            html.contains("overdue 20h 0m"),
+            "overdue re-check not flagged: {html}"
         );
     }
 
