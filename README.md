@@ -302,12 +302,15 @@ starts an overlapping pickup run instead of being silently dropped. Concurrency 
   does not advance the cadence stamp, so the next tick fires as soon as the gather finishes, and overlapping runs PAST the
   gather are unchanged. A manual `trigger` is never deferred by it.
 
-Each job acquires a global permit, then the per-action permit, then the key gate, in that fixed order, so the pipeline is
-deadlock-free. Two overlapping runs never both work the same job: each run drops issues already in flight in another open
-run (an admission check that also suppresses empty, redundant runs), the native `youtrack` handler re-reads the live `AI
-Agent` field per job, and the key gate serializes same-repo work. The daily cap and budget stay best-effort; because up
-to `max_parallel_global` jobs can pass the pre-launch check before any advances the ledger, the documented overshoot
-bound is `max_parallel_global - 1`.
+Each job first gates on its concurrency key with a non-blocking try, then acquires a global permit, then the per-action
+permit, in that fixed order (CLAUDE-163). A job whose key is already held by a running sibling takes no permit at all and
+defers, staying queued for the next pickup gather, so a permit is only ever held by a job that is actually running.
+Because the key is only ever taken by that non-blocking try, no job ever waits on a permit while another waits on that
+key, so the pipeline is deadlock-free. Two overlapping runs never both work the same job: each run drops issues already
+in flight in another open run (an admission check that also suppresses empty, redundant runs), the native `youtrack`
+handler re-reads the live `AI Agent` field per job, and the key gate serializes same-repo work. The daily cap and budget
+stay best-effort; because up to `max_parallel_global` jobs can pass the pre-launch check before any advances the ledger,
+the documented overshoot bound is `max_parallel_global - 1`.
 
 A run row is open **if and only if** a run is live (CLAUDE-228). Every runner closes its row on every exit path, including
 an early error return between `run_begin` and `run_finish`, and a row closed that way carries exit code `5` (unexpected).
