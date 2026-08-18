@@ -49,6 +49,42 @@
   </div>
 {% endif %}
 
+{# CLAUDE-225: dependency gates that have held an issue past the staleness
+   threshold. The gate leaves the issue Queued with no field change and a poll
+   whose candidates are all blocked writes no run row, so without this banner a
+   gate that stops resuming is invisible until someone notices the issue by
+   hand. Read straight off the gate table, so it clears itself the moment the
+   blockers resolve. #}
+{% if !stale_gates.is_empty() %}
+  <div class="card" style="border-color: var(--warn); margin-bottom: 16px;">
+    <strong style="color: var(--warn);">Dependency gates blocked over an hour</strong>
+    <div class="dim" style="margin-top: 6px;">These issues stay Queued and consume no attempt.
+    "recheck overdue" means the gate's own re-evaluation deadline passed without the issue being
+    re-evaluated, so the blockers may already be resolved.</div>
+    <table style="margin-top: 8px;">
+      <thead><tr><th>Action</th><th>Issue</th><th>Blocked for</th><th>Blockers</th><th>Last checked</th><th>Recheck</th></tr></thead>
+      <tbody>
+        {% for g in stale_gates %}
+        <tr>
+          <td class="mono"><a href="/actions/{{ g.action_name() }}">{{ g.action_name() }}</a></td>
+          <td class="mono">{{ g.job_key() }}</td>
+          <td class="mono">{{ g.blocked_for() }}</td>
+          <td>{{ g.signature() }}</td>
+          <td class="dim">{{ g.updated_at()|datetime }}</td>
+          <td>
+            {% if g.recheck_overdue() %}
+              <span class="badge bad">overdue {{ g.recheck_overdue_for() }}</span>
+            {% else %}
+              <span class="badge neutral">on schedule</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
 {% if let Some(g) = global_pause %}
   <h2>Globally paused</h2>
   <div class="card">

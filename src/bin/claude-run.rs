@@ -813,6 +813,12 @@ async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     // reads `quiet` whether or not the daemon is up. With no daemon there is no
     // in-flight map to consult, so the open `runs` rows are the whole signal.
     let active_runs = state::active_runs(&pool).await?;
+    // CLAUDE-225: the same stale-gate block `/status` carries. The gate table is
+    // the daemon's, but it is plain DB state, so a daemonless status reports a
+    // stuck gate rather than the misleading silence of omitting it.
+    let stale_gates =
+        state::dependency_gates_stale(&pool, state::now_epoch_ms(), state::STALE_GATE_AFTER_MS, 20)
+            .await?;
     let report = json!({
         "daemon": "not running",
         "socket_expected_at": sock.display().to_string(),
@@ -822,6 +828,7 @@ async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
             "active_runs": active_runs,
             "dispatched_actions": Vec::<String>::new(),
         },
+        "stale_gates": stale_gates,
         "actions": actions,
     });
     jsonfmt::print_json(&report)?;
