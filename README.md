@@ -309,6 +309,12 @@ Agent` field per job, and the key gate serializes same-repo work. The daily cap 
 to `max_parallel_global` jobs can pass the pre-launch check before any advances the ledger, the documented overshoot
 bound is `max_parallel_global - 1`.
 
+A run row is open **if and only if** a run is live (CLAUDE-228). Every runner closes its row on every exit path, including
+an early error return between `run_begin` and `run_finish`, and a row closed that way carries exit code `5` (unexpected).
+A row still open when the daemon starts belonged to a process that died without finalizing, so startup reaps it with the
+same code and logs the count at `warn` (an operator cancel stays `130`). Without that, one transient database error left
+a row the run list rendered as a running job indefinitely.
+
 `max_parallel_global` and `regather_interval` are a DB-backed runtime setting (the `concurrency` section) edited on the
 **Settings** page or via `GET` / `PUT /api/settings/concurrency`; fields are `max_parallel_global` (default `0` = auto)
 and `regather_interval_secs` (default `60`, must be `>= 1`). Both apply on the next scheduler tick.
