@@ -117,6 +117,10 @@ struct StatusResponse {
     /// CLAUDE-223: live-work snapshot, so an operator scripting a reboot polls
     /// `/status` instead of scraping the About page.
     activity: Activity,
+    /// CLAUDE-225: dependency gates holding an issue past the staleness
+    /// threshold, so an operator without the web UI sees the same signal the
+    /// dashboard banner shows.
+    stale_gates: Vec<state::StaleGate>,
     actions: Vec<ActionStatus>,
 }
 
@@ -210,6 +214,13 @@ async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusRespons
         version: s.version.to_string(),
         global_paused: global,
         activity: activity(&s.pool, &s.in_flight).await?,
+        stale_gates: state::dependency_gates_stale(
+            &s.pool,
+            state::now_epoch_ms(),
+            state::STALE_GATE_AFTER_MS,
+            20,
+        )
+        .await?,
         actions: out,
     }))
 }
@@ -856,6 +867,36 @@ mod tests {
         let Json(status) = get_status(State(s.clone())).await.unwrap();
         assert!(!status.activity.quiet);
         assert_eq!(status.activity.active_runs[0].id, run);
+    }
+
+    /// CLAUDE-225: `/status` carries the stale-gate block, so an operator with no
+    /// browser sees a gate that stopped resuming instead of an empty poll history.
+    #[tokio::test]
+    async fn status_reports_stale_dependency_gates() {
+        let s = app_state().await;
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert!(status.stale_gates.is_empty());
+
+        state::dependency_gate_upsert(
+            &s.pool,
+            "youtrack",
+            "AUD-31",
+            state::now_epoch_ms() - 5_400_000,
+            "AUD-32 (depends on)",
+        )
+        .await
+        .unwrap();
+        // A fresh block is not a signal; age this one past the threshold.
+        sqlx::query("UPDATE dependency_gate SET blocked_since = ? WHERE job_key = 'AUD-31'")
+            .bind(state::now_epoch_ms() - 7_200_000)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert_eq!(status.stale_gates.len(), 1, "{:?}", status.stale_gates);
+        assert_eq!(status.stale_gates[0].job_key, "AUD-31");
+        assert!(status.stale_gates[0].recheck_overdue_ms > 0);
     }
 
     /// CLAUDE-61 / CLAUDE-220: no synthetic action can be deleted (none has a
