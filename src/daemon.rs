@@ -91,12 +91,18 @@ impl Daemon {
             self.log_apply.take(),
         ));
 
-        // CLAUDE-10: a freshly started daemon cannot have any run still
-        // executing, so any run with no end state is orphaned from a dead
-        // process. Reconcile it to cancelled before scheduling begins.
-        let cancelled = state::cancel_orphaned_runs(&pool).await?;
-        if cancelled > 0 {
-            info!(count = cancelled, "cancelled orphaned runs on startup");
+        // CLAUDE-10 / CLAUDE-228: a freshly started daemon holds the
+        // single-instance lock, so any run with no end state is orphaned from a
+        // process that died without finalizing. Reap it before scheduling
+        // begins, as `UNEXPECTED` rather than cancelled (nothing cancelled it),
+        // and say so at `warn`: a non-zero count means the last daemon died
+        // dirty or a row leaked, which the web UI was rendering as a live run.
+        let reaped = state::reap_orphaned_runs(&pool).await?;
+        if reaped > 0 {
+            warn!(
+                count = reaped,
+                "reaped orphaned run rows on startup; closed as unexpected"
+            );
         }
 
         // CLAUDE-223: the global pause is DB-persisted, so it survives a restart
@@ -415,11 +421,11 @@ impl Daemon {
                 );
             }
             // Sweep any run row left without an end state (e.g. its task was
-            // still mid-`post` when the grace elapsed). Reuses the CLAUDE-10
-            // reconcile, here at shutdown rather than startup, so no orphaned
-            // "running" row survives this shutdown regardless of timing. The
-            // cancelled child is already SIGKILLed by the per-run escalation
-            // the token tripped above.
+            // still mid-`post` when the grace elapsed), so no orphaned "running"
+            // row survives this shutdown regardless of timing. `CANCELLED`, not
+            // the startup reap's `UNEXPECTED`: this shutdown is what stopped
+            // them, and the cancelled child is already SIGKILLed by the per-run
+            // escalation the token tripped above.
             match state::cancel_orphaned_runs(&pool).await {
                 Ok(n) if n > 0 => info!(count = n, "force-finalized runs after grace"),
                 Ok(_) => {}

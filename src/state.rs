@@ -668,9 +668,10 @@ pub async fn run_finish(
 ///
 /// The happy path calls [`RunGuard::finish`]. Anything else (an early `?`, an
 /// error return, a panic unwinding through the handler) hits `Drop`, which
-/// closes the row as [`crate::exit::UNEXPECTED`]. `cancel_orphaned_runs` is the
-/// backstop for a row this cannot reach, but it only runs at daemon start and
-/// stop, which is why a long-lived daemon needs this guard.
+/// closes the row as [`crate::exit::UNEXPECTED`]. [`reap_orphaned_runs`] (at
+/// serve start) and [`cancel_orphaned_runs`] (at shutdown) are the backstop for
+/// a row this cannot reach, but a long-lived daemon reaches neither, which is
+/// why the guard exists.
 pub struct RunGuard {
     pool: SqlitePool,
     run_id: i64,
@@ -729,26 +730,43 @@ impl Drop for RunGuard {
     }
 }
 
-/// CLAUDE-10: reconcile orphaned runs on daemon startup. A freshly started
-/// daemon cannot have any run still executing, so every row with no end state
-/// is a leftover from a dead process. Mark each cancelled with `ended_at` set
-/// to now and `exit_code = exit::CANCELLED`. Returns the number reconciled.
-/// `job_outcomes` is left untouched: a job either has an outcome or it does
-/// not, and no synthetic outcomes are invented. This is a pure DB reconcile,
-/// distinct from the live-cancel path (CLAUDE-9): the previous process is
-/// gone, so there is no child to terminate or `post` phase to run.
+/// CLAUDE-10: reconcile runs left open at daemon SHUTDOWN, after the cancel
+/// grace elapsed. Those runs were stopped by this process, so they close as
+/// `exit::CANCELLED`, the same sentinel the live-cancel path (CLAUDE-9) uses.
+/// The startup sweep is [`reap_orphaned_runs`], which closes with a different
+/// code because nothing cancelled those rows. Returns the number reconciled.
 pub async fn cancel_orphaned_runs(pool: &SqlitePool) -> Result<u64> {
+    close_open_runs(pool, crate::exit::CANCELLED).await
+}
+
+/// CLAUDE-228: the startup reap. A freshly started daemon holds the
+/// single-instance lock, so no row still open can belong to a live run: each is
+/// a leftover from a process that died without finalizing, or a row stranded
+/// between `run_begin` and `run_finish` (the failure [`RunGuard`] now prevents).
+/// Neither is a cancel, so they close as `exit::UNEXPECTED` and stay
+/// distinguishable from an operator's `claude-run stop`. Returns the number
+/// reaped; the caller logs a non-zero count at `warn`.
+pub async fn reap_orphaned_runs(pool: &SqlitePool) -> Result<u64> {
+    close_open_runs(pool, crate::exit::UNEXPECTED).await
+}
+
+/// Close every run row with no end state, stamping `exit_code`. `job_outcomes`
+/// is left untouched: a job either has an outcome or it does not, and no
+/// synthetic outcomes are invented. This is a pure DB reconcile: the run's
+/// process is already gone, so there is no child to terminate or `post` phase to
+/// run.
+async fn close_open_runs(pool: &SqlitePool, exit_code: i32) -> Result<u64> {
     let now = now_iso();
     // CLAUDE-80: a dead process reports no stage; clear it with the end state.
     let result = sqlx::query(
         "UPDATE runs SET ended_at = ?, exit_code = ?, stage = NULL WHERE ended_at IS NULL",
     )
     .bind(&now)
-    .bind(crate::exit::CANCELLED as i64)
+    .bind(exit_code as i64)
     .execute(pool)
     .await?;
-    // CLAUDE-28: at startup nothing is in flight, so any in-flight job markers
-    // are leftovers from the dead process. Clear them all.
+    // CLAUDE-28: nothing of the dead process is in flight, so any in-flight job
+    // markers it left are leftovers. Clear them all.
     sqlx::query("DELETE FROM run_inflight_jobs")
         .execute(pool)
         .await?;
@@ -1009,8 +1027,9 @@ pub struct ActiveRun {
 }
 
 /// CLAUDE-223: every run row with no `ended_at`, oldest first. Trustworthy as a
-/// liveness signal because `cancel_orphaned_runs` closes every leftover row at
-/// daemon startup, so an open row means a run really is executing. Returns the
+/// liveness signal because [`reap_orphaned_runs`] closes every leftover row at
+/// daemon startup and [`RunGuard`] closes one whose handler errors mid-run, so
+/// an open row means a run really is executing. Returns the
 /// rows (not a count) so the busy indicator can list and link each one.
 ///
 /// This is only HALF the quiet signal: it misses a run dispatched but not yet
@@ -1454,6 +1473,74 @@ mod tests {
             exit_code_of(&pool, finished).await,
             Some(crate::exit::OK as i64)
         );
+    }
+
+    /// CLAUDE-228: the startup reap. A row still open when the daemon starts was
+    /// stranded by a process that died without finalizing, not cancelled by an
+    /// operator, so it closes as `UNEXPECTED` and stays distinguishable from a
+    /// `claude-run stop`. This is what cleared the 19 `ci-failure-analysis` rows
+    /// the web UI had been rendering as running jobs for three days.
+    #[tokio::test]
+    async fn reap_orphaned_runs_closes_open_rows_as_unexpected() {
+        let pool = mem_pool().await;
+
+        let finished = run_begin(&pool, "act", "cli").await.unwrap();
+        run_finish(&pool, finished, crate::exit::OK, 2)
+            .await
+            .unwrap();
+        let orphan = run_begin(&pool, "act", "scheduler").await.unwrap();
+        assert!(ended_at_of(&pool, orphan).await.is_none(), "seeded open");
+
+        assert_eq!(reap_orphaned_runs(&pool).await.unwrap(), 1);
+
+        assert!(
+            ended_at_of(&pool, orphan).await.is_some(),
+            "the orphaned row is closed"
+        );
+        assert_eq!(
+            exit_code_of(&pool, orphan).await,
+            Some(crate::exit::UNEXPECTED as i64),
+            "a startup orphan is not an operator cancel"
+        );
+        // A completed run keeps its own outcome, and a second reap is a no-op.
+        assert_eq!(
+            exit_code_of(&pool, finished).await,
+            Some(crate::exit::OK as i64)
+        );
+        assert_eq!(reap_orphaned_runs(&pool).await.unwrap(), 0);
+    }
+
+    /// CLAUDE-228: every runner that opens a run row pairs it with a
+    /// [`RunGuard`], which is what closes the row on an error return (proved by
+    /// `run_guard_closes_the_row_when_the_handler_errors` above). Enumerated
+    /// mechanically over the runner sources so a NEW runner, or a `run_begin`
+    /// added to an existing one, fails here instead of silently reintroducing
+    /// the leak. Test modules are excluded: they open rows deliberately.
+    #[test]
+    fn every_runner_pairs_run_begin_with_a_run_guard() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let runners = [
+            "native/youtrack.rs",
+            "native/forgejo_ci_fix.rs",
+            "native/ci_failure_analysis.rs",
+            "native/ci_failure_reconcile.rs",
+            "native/closed_issue_summary.rs",
+            "daemon.rs",
+        ];
+        for file in runners {
+            let text = std::fs::read_to_string(src_dir.join(file)).unwrap();
+            let code = text.split("\n#[cfg(test)]").next().unwrap();
+            let begins = code.matches("run_begin(").count();
+            let guards = code.matches("RunGuard::new(").count();
+            assert!(
+                begins > 0,
+                "{file} no longer opens a run row; update this list"
+            );
+            assert_eq!(
+                begins, guards,
+                "{file}: {begins} run_begin call(s) but {guards} RunGuard(s); an unguarded row stays open forever when the handler errors"
+            );
+        }
     }
 
     #[tokio::test]
