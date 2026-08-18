@@ -175,11 +175,23 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     // CLAUDE-228: hold the gather marker so the scheduler does not stack another
     // pickup while this one is still gathering.
     let gather_marker = ctx.gather.try_acquire(&action.name);
-    let (jobs, input_events) = gather(
+    let Gathered {
+        jobs,
+        events: input_events,
+        candidate_keys,
+    } = gather(
         &gather_backend,
         &src.query,
         access.as_ref().map(|a| a as &dyn RepoAccess),
     )?;
+    // CLAUDE-225: drop dependency-gate rows for issues this query no longer
+    // matches. Only a successful query reaches here, so a `yt` failure never
+    // prunes. Non-fatal: a bookkeeping failure must not abort the poll, but it is
+    // logged, because a prune that stops running silently repopulates the
+    // stale-gate banner with issues nobody is waiting on.
+    if let Err(e) = state::dependency_gate_retain(pool, &action.name, &candidate_keys).await {
+        warn!(action = %action.name, error = %e, "dependency-gate prune failed (non-fatal); the stale-gate banner may list issues that are no longer queued");
+    }
     // CLAUDE-147: persist input-phase diagnostics before `run_begin` so they
     // survive even if no run row is ever created. Non-fatal: a bookkeeping
     // failure must not abort the poll.
@@ -638,12 +650,16 @@ fn forge_access_check(
 /// Returns the eligible jobs plus the CLAUDE-147 input-phase events (the
 /// per-project probe failures and no-VCS drops) that the caller persists to
 /// `run_events` so they surface in the web UI rather than only in the journal.
-fn gather(
-    backend: &dyn Backend,
-    query: &str,
-    access: Option<&dyn RepoAccess>,
-) -> Result<(Vec<YoutrackJob>, Vec<state::InputEvent>)> {
+fn gather(backend: &dyn Backend, query: &str, access: Option<&dyn RepoAccess>) -> Result<Gathered> {
     let issues = backend.list_queued(query)?;
+    // CLAUDE-225: every key the QUERY matched, before the VCS / access filters
+    // below drop any. This is "still a candidate for this action", which is what
+    // decides whether a dependency-gate row is still live.
+    let candidate_keys: Vec<String> = issues
+        .iter()
+        .filter_map(|i| i.get("idReadable").and_then(|v| v.as_str()))
+        .map(String::from)
+        .collect();
     let mut vcs_cache: std::collections::HashMap<String, Option<provider::VcsRepo>> =
         std::collections::HashMap::new();
     // CLAUDE-194: repo -> "the forge token can read it", so N issues in one
@@ -758,7 +774,25 @@ fn gather(
             clone_url: repo.clone_url,
         });
     }
-    Ok((jobs, events))
+    Ok(Gathered {
+        jobs,
+        events,
+        candidate_keys,
+    })
+}
+
+/// One poll's gather result.
+struct Gathered {
+    /// Workable jobs (query matches that survived the VCS / access filters).
+    jobs: Vec<YoutrackJob>,
+    /// CLAUDE-147 input-phase diagnostics the caller persists to `run_events`.
+    events: Vec<state::InputEvent>,
+    /// CLAUDE-225: every key the query matched, filters aside. A dependency-gate
+    /// row for a key absent from this list holds nothing: the issue left the
+    /// action's candidate set (resolved by hand, re-fielded, query changed), so
+    /// the row is dead state that would otherwise sit in the stale-gate banner
+    /// forever and teach the operator to ignore it.
+    candidate_keys: Vec<String>,
 }
 
 /// Project key prefix of an issue id (`MK-16` -> `MK`).
@@ -2571,7 +2605,7 @@ mod tests {
                 "[]",
             );
         let backend = CliBackend::new(Arc::new(runner));
-        let (jobs, events) = gather(&backend, &src().query, None).unwrap();
+        let Gathered { jobs, events, .. } = gather(&backend, &src().query, None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, "MK-16");
         assert_eq!(jobs[0].summary, "a");
@@ -2613,7 +2647,11 @@ mod tests {
                 "unrecognized subcommand",
             );
         let backend = CliBackend::new(Arc::new(runner));
-        let (jobs, events) = gather(&backend, &src().query, None).unwrap();
+        let Gathered {
+            jobs,
+            events,
+            candidate_keys,
+        } = gather(&backend, &src().query, None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, "MK-16");
         // CLAUDE-147: the probe failure is recorded as a warn event (not the
@@ -2622,6 +2660,13 @@ mod tests {
         assert_eq!(events[0].level, "warn");
         assert_eq!(events[0].context.as_deref(), Some("ZZ"));
         assert!(events[0].message.contains("VCS probe failed"));
+        // CLAUDE-225: the candidate set is what the QUERY matched, so a project
+        // skipped this poll keeps its dependency-gate row instead of having it
+        // pruned (and re-commented) every time a probe or a grant is flaky.
+        assert_eq!(
+            candidate_keys,
+            vec!["MK-16".to_string(), "ZZ-1".to_string()]
+        );
     }
 
     /// CLAUDE-194: a [`RepoAccess`] double that records every probe and either
@@ -2680,7 +2725,7 @@ mod tests {
         // per repo per poll, not once per issue.
         let backend = CliBackend::new(Arc::new(access_runner()));
         let access = StubAccess::allow();
-        let (jobs, events) = gather(&backend, &src().query, Some(&access)).unwrap();
+        let Gathered { jobs, events, .. } = gather(&backend, &src().query, Some(&access)).unwrap();
         assert_eq!(jobs.len(), 2);
         // CLAUDE-216: a pass emits only the recovery marker, once per repo. It is
         // dropped before recording unless it clears an open failure
@@ -2707,7 +2752,7 @@ mod tests {
         let runner = Arc::new(access_runner());
         let backend = CliBackend::new(runner.clone());
         let denied = StubAccess::deny("forge token cannot read it (404)");
-        let (jobs, events) = gather(&backend, &src().query, Some(&denied)).unwrap();
+        let Gathered { jobs, events, .. } = gather(&backend, &src().query, Some(&denied)).unwrap();
         assert!(jobs.is_empty(), "{jobs:?}");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, "warn");
@@ -2742,7 +2787,7 @@ mod tests {
         // The permission grant lands; the very next poll gathers the same issues
         // with no field change in between.
         let granted = StubAccess::allow();
-        let (jobs, events) = gather(&backend, &src().query, Some(&granted)).unwrap();
+        let Gathered { jobs, events, .. } = gather(&backend, &src().query, Some(&granted)).unwrap();
         assert_eq!(jobs.len(), 2);
         // CLAUDE-216: and the poll that recovers records the marker that clears
         // the dashboard's access banner for this repo.

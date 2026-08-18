@@ -94,6 +94,36 @@ pub async fn dependency_gate_upsert(
     Ok(())
 }
 
+/// CLAUDE-225: keep only the gate rows whose issue is still a candidate for
+/// `action`, dropping the rest. `keys` is the key set the action's query matched
+/// this poll (filters aside), so a row outside it holds nothing: the issue left
+/// the candidate set and its row is dead state that would otherwise sit in the
+/// stale-gate banner forever. An empty `keys` means the query matched nothing,
+/// which clears the action's rows; only a SUCCESSFUL query calls this, so a `yt`
+/// failure never prunes.
+pub async fn dependency_gate_retain(
+    pool: &SqlitePool,
+    action: &str,
+    keys: &[String],
+) -> Result<()> {
+    let placeholders = std::iter::repeat_n("?", keys.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = if keys.is_empty() {
+        "DELETE FROM dependency_gate WHERE action_name = ?".to_string()
+    } else {
+        format!(
+            "DELETE FROM dependency_gate WHERE action_name = ? AND job_key NOT IN ({placeholders})"
+        )
+    };
+    let mut q = sqlx::query(&sql).bind(action);
+    for k in keys {
+        q = q.bind(k);
+    }
+    q.execute(pool).await?;
+    Ok(())
+}
+
 /// CLAUDE-225: how long a dependency gate may hold an issue before the daemon
 /// says so out loud. The gate promises the issue "will be re-evaluated
 /// automatically", and that promise failing is silent: the issue simply stays
@@ -2064,6 +2094,68 @@ mod tests {
             fresh.blocked_since_ms > first.blocked_since_ms - 7_200_000,
             "a new block after a clear is a new block"
         );
+    }
+
+    /// CLAUDE-225: the poll-time prune keeps the gate rows of issues the query
+    /// still matches and drops the rest, so an issue that left the candidate set
+    /// while blocked (resolved by hand, re-fielded) cannot sit in the stale-gate
+    /// banner forever. Other actions' rows are untouched.
+    #[tokio::test]
+    async fn dependency_gate_retain_drops_rows_outside_the_candidate_set() {
+        let pool = mem_pool().await;
+        for (action, key) in [
+            ("act", "AUD-31"),
+            ("act", "TR-8"),
+            ("act", "GONE-1"),
+            ("other", "MK-16"),
+        ] {
+            dependency_gate_upsert(
+                &pool,
+                action,
+                key,
+                now_epoch_ms() + 300_000,
+                "X-1 (depends on)",
+            )
+            .await
+            .unwrap();
+        }
+
+        dependency_gate_retain(&pool, "act", &["AUD-31".to_string(), "TR-8".to_string()])
+            .await
+            .unwrap();
+        assert!(dependency_gate_get(&pool, "act", "AUD-31")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(dependency_gate_get(&pool, "act", "TR-8")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            dependency_gate_get(&pool, "act", "GONE-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "a key the query no longer matches is pruned"
+        );
+        assert!(
+            dependency_gate_get(&pool, "other", "MK-16")
+                .await
+                .unwrap()
+                .is_some(),
+            "another action's rows are not touched"
+        );
+
+        // A query that matched nothing clears the action's rows.
+        dependency_gate_retain(&pool, "act", &[]).await.unwrap();
+        assert!(dependency_gate_get(&pool, "act", "AUD-31")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(dependency_gate_get(&pool, "other", "MK-16")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// CLAUDE-225: the dashboard/API read returns only gates held past the
