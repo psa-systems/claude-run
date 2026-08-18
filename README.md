@@ -107,6 +107,15 @@ claude-run version update --version v0.2.0 # pin an exact tag (independent of tr
 The daemon's TCP web UI (loopback by default; see "Web UI / API auth") is more than the Dashboard. The pages an operator
 will want to know about:
 
+- **Dashboard** (`/`) leads with the conditions that make work stop without anything failing: the global-pause card, the
+  24h access-failure banner (CLAUDE-216, see "Access check"), and the stale-dependency-gate banner (CLAUDE-225). The
+  last one lists every queued issue the CLAUDE-161 dependency gate has held for over an hour, with its blocker set, how
+  long it has been held, and whether the gate's own re-evaluation deadline has passed (a "recheck overdue" gate is not
+  being re-evaluated at all, so its blockers may already be resolved). A held issue keeps its Queued field value and a
+  poll whose candidates are all blocked writes no run row, so without the banner the only symptom is an issue that never
+  moves. The same list is on `/api/status` as `stale_gates`, so `claude-run status` reports it too. It clears itself
+  when the blockers resolve. See `actions/SCHEMA.md`, "Pre-clone dependency gate".
+
 - **New action** (`/actions/new`, CLAUDE-211) is a kind picker: it lists every action kind with a one-line description
   and a link to its editor. Every native kind (`youtrack`, `forgejo-ci-fix`, `ci-failure-analysis`,
   `ci-failure-reconcile`, `closed-issue-summary`) has a structured form at `/actions/new/<kind>`, so no native action
