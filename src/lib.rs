@@ -79,6 +79,9 @@ pub mod exit {
     pub const LOCKED: i32 = 2;
     pub const CONFIG_ERROR: i32 = 3;
     pub const DAILY_CAP: i32 = 4;
+    /// CLAUDE-228: also the `runs.exit_code` of a run whose row was closed
+    /// without its handler finalizing it, by [`crate::state::RunGuard`] on drop
+    /// or by the startup reap in [`crate::state::reap_orphaned_runs`].
     pub const UNEXPECTED: i32 = 5;
     pub const OVER_BUDGET: i32 = 6;
     /// CLAUDE-40: a mutating command was refused because it conflicts with live
@@ -87,8 +90,9 @@ pub mod exit {
     pub const CONFLICT: i32 = 7;
     /// Sentinel exit_code for a run that was cancelled rather than finished,
     /// following the SIGINT convention (128 + SIGINT). Used both for live
-    /// cancel on demand (CLAUDE-9) and for orphaned-run reconcile on daemon
-    /// startup (CLAUDE-10). 130 does not collide with the codes above or
+    /// cancel on demand (CLAUDE-9) and for the shutdown sweep of runs the
+    /// daemon stopped (CLAUDE-10); a row found open at STARTUP is
+    /// [`UNEXPECTED`] instead (CLAUDE-228). 130 does not collide with the codes above or
     /// claude's own exits, so the web UI and CLI can map it to a distinct
     /// "cancelled" badge without a schema migration.
     pub const CANCELLED: i32 = 130;
