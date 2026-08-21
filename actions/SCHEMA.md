@@ -862,6 +862,10 @@ Per-action overrides for the runner-wide defaults. Any subset of:
 | `claude_timeout_seconds` | `$env.CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS` |
 | `daily_budget_usd`       | `$env.CLAUDE_RUN_DAILY_BUDGET_USD`       |
 
+CLAUDE-232: reaching `max_attempts_per_key` is **announced**, for the same reason a lasting dependency gate is (see "Pre-clone dependency gate"). The skip writes no `job_outcomes` row, no `run_events` row, and no field change, so the issue keeps its Queued value, re-enters the candidate set on the next poll, is skipped again, and never moves. It surfaces in three places: a `warn` line naming the count and the cap at each of the four cap-check sites (`src/job.rs`, `src/native/youtrack.rs`, `src/native/forgejo_ci_fix.rs`, `src/native/ci_failure_analysis.rs`), a Dashboard banner listing the action, key, count against the cap, and last counted attempt, and an `attempt_cap_hits` block on `/api/status` (so `claude-run status` reports it with or without the daemon). The read is the live `attempt_counters` table compared against each action's OWN effective cap, so lowering the cap parks a key immediately and raising it releases the key and grants one more attempt.
+
+Unlike a gate row, the counter row is not deleted when the trouble clears: it is the durable record of the attempts, and nothing (not even a successful run) resets it. So the runner cannot retry a capped key, and a key stays on the banner after the operator has dealt with the work by hand. The only reset today is deleting the action, which purges its whole control state; a per-key reset is tracked in CLAUDE-238.
+
 ### `concurrency` (record, optional)
 
 Controls keyed parallel execution of a run's jobs. By default a run processes its jobs strictly one at a time. With
