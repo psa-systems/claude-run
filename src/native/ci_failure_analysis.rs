@@ -2,9 +2,9 @@
 //!
 //! Enriches every open "CI failure" / "Auto-fix" issue with a deep, log-grounded
 //! root-cause comment: the exact failing workflow step, the root-cause diagnostic
-//! (or an explicit statement that the stored log is truncated / diagnostic-free),
-//! and concrete remediation. It is the automatic, idempotent equivalent of the
-//! manual CLAUDE-185 pass.
+//! (or, when the log carries none, whether the job stopped emitting output and
+//! was killed or the run ended with no diagnostic), and concrete remediation. It
+//! is the automatic, idempotent equivalent of the manual CLAUDE-185 pass.
 //!
 //! Pipeline (typed Rust, mirroring [`crate::native::forgejo_ci_fix`]):
 //!
@@ -359,6 +359,9 @@ struct AnalysisInputs {
     log_path: PathBuf,
     /// Path to the failing workflow YAML, or `None` if it could not be fetched.
     workflow_path: Option<PathBuf>,
+    /// CLAUDE-236: the run's forge-reported start / stop times, or `None` when
+    /// they could not be read (the prompt then says the timing is unavailable).
+    timing: Option<forge_log::RunTiming>,
 }
 
 /// Fetch result: inputs ready, or the log is unavailable (with a reason).
@@ -426,13 +429,45 @@ fn fetch_analysis_inputs(
         &[],
     )
     .and_then(|yaml| {
+        // A write failure is best-effort (the analysis proceeds over the log
+        // alone) but never silent: without the log line the prompt's "could not
+        // be fetched" would misreport a local I/O fault as a forge miss.
         let path = out_dir.join("failing-workflow.yml");
-        std::fs::write(&path, yaml).ok().map(|()| path)
+        match std::fs::write(&path, yaml) {
+            Ok(()) => Some(path),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "writing the failing workflow YAML failed; the analysis proceeds over the log alone");
+                None
+            }
+        }
     });
+
+    // 3. CLAUDE-236: the run's start / stop times, so the analysis can tell a job
+    // that stopped emitting output and was killed from a capture that lost data.
+    // Best effort: a failed or run-less read is logged and the prompt says the
+    // timing is unavailable, rather than the agent inventing a reason.
+    let timing = match fj.run_timing(
+        &log_target.host,
+        &coords.repo,
+        coords.index_in_repo,
+        Some(token),
+    ) {
+        Ok(t) => Some(t),
+        Err(reason) => {
+            warn!(
+                repo = %coords.repo,
+                run = coords.index_in_repo,
+                reason = %reason,
+                "reading the run timing failed; the analysis states the timing is unavailable"
+            );
+            None
+        }
+    };
 
     FetchResult::Ready(AnalysisInputs {
         log_path,
         workflow_path,
+        timing,
     })
 }
 
@@ -533,7 +568,10 @@ fn cap_comment(text: &str, max_bytes: usize) -> String {
 
 /// The agentic-analysis prompt. Directs claude to identify the failing step by
 /// mapping log position to workflow step order, state the root-cause diagnostic
-/// or that the log is truncated / diagnostic-free, and give remediation.
+/// or, when the log carries none, classify on the run's timing whether the job
+/// stopped emitting output and was killed or the run ended with no diagnostic,
+/// and give remediation. CLAUDE-236: the stored log is never truncated by this
+/// tool, so the prompt never offers truncation as an explanation.
 fn build_prompt(inputs: &AnalysisInputs, coords: &RunCoordinates) -> String {
     let log_name = inputs
         .log_path
@@ -548,18 +586,29 @@ fn build_prompt(inputs: &AnalysisInputs, coords: &RunCoordinates) -> String {
         None => "The failing workflow YAML could not be fetched; analyze the log alone and say so."
             .to_string(),
     };
+    // CLAUDE-236: the run's own start / stop times are the evidence that tells a
+    // job killed after going silent from a capture that lost data.
+    let timing_line = match &inputs.timing {
+        Some(t) => format!(
+            "The forge reports the run started at `{}` and stopped at `{}`; when the log stops mid-step, compare that stop time against the last timestamp in the log.",
+            t.started, t.stopped
+        ),
+        None => "The run's start / stop times could not be read from the forge; say so where they would matter rather than assuming why the log stops.".to_string(),
+    };
     [
         "You are analyzing a failed CI run to produce a deep, log-grounded root-cause report.".to_string(),
         format!(
             "The complete redacted run log is at `./{log_name}` (repo `{}`, workflow `{}`, commit `{}`, run #{}).",
             coords.repo, coords.workflow_id, coords.commit_sha, coords.index_in_repo
         ),
+        "That file is the whole log exactly as the forge stores it: this tool applies no size cap and never shortens it, so where the log stops is where the run stopped writing.".to_string(),
         format!("Run URL: {}", coords.html_url),
+        timing_line,
         workflow_line,
         String::new(),
         "Use Read/Grep/Bash to read both files. Then report, in Markdown:".to_string(),
-        "1. **Failing step**: the exact workflow step that failed, identified by mapping the log's end/truncation point against the workflow's step order.".to_string(),
-        "2. **Root cause**: the concrete diagnostic (the compiler/clippy/test error line). If the stored log is truncated or carries no diagnostic (it ends mid-step with no error captured), say so explicitly and give the leading hypothesis (e.g. an OOM if the workflow caps build parallelism).".to_string(),
+        "1. **Failing step**: the exact workflow step that failed, identified by mapping the point where the log stops against the workflow's step order.".to_string(),
+        "2. **Root cause**: the concrete diagnostic (the compiler/clippy/test error line). If the log stops mid-step with no diagnostic, classify which of these holds and justify it from the evidence: (a) the job stopped emitting output and was killed or timed out, shown by the gap between the last log timestamp and the run's stop time, or (b) the run ended and the failing step emitted no diagnostic at all. Then give the leading hypothesis (e.g. an OOM if the workflow caps build parallelism).".to_string(),
         "3. **Remediation**: concrete next steps to fix or to capture a diagnostic on the next run.".to_string(),
         String::new(),
         "Ground every claim in the actual log/workflow contents. Be concise. Do not modify any files, push, open a PR, or touch YouTrack: output only the analysis text, which is posted verbatim as a comment.".to_string(),
@@ -659,22 +708,32 @@ mod tests {
     }
 
     /// The ONE forge client the analysis holds (CLAUDE-205): a canned
-    /// `fj actions logs` outcome plus canned `fj repo file` contents keyed by
-    /// path, asserting the token every read is scoped with. The runs list is not
-    /// used by this action.
+    /// `fj actions logs` outcome, canned `fj repo file` contents keyed by path,
+    /// and a canned `fj actions runs --run-number` timing, asserting the token
+    /// every read is scoped with. The runs LIST is not used by this action.
     struct StubFj {
         outcome: Mutex<Option<RunLogsOutcome>>,
         files: std::collections::HashMap<String, String>,
+        timing: std::result::Result<forge_log::RunTiming, String>,
     }
     impl StubFj {
         fn new(outcome: RunLogsOutcome) -> Self {
             Self {
                 outcome: Mutex::new(Some(outcome)),
                 files: std::collections::HashMap::new(),
+                timing: Ok(forge_log::RunTiming {
+                    started: "2026-08-20T20:03:13+02:00".to_string(),
+                    stopped: "2026-08-20T20:27:31+02:00".to_string(),
+                }),
             }
         }
         fn with_file(mut self, path: &str, content: &str) -> Self {
             self.files.insert(path.to_string(), content.to_string());
+            self
+        }
+        /// The timing read fails (an unreachable forge, a run the page misses).
+        fn with_timing_error(mut self, reason: &str) -> Self {
+            self.timing = Err(reason.to_string());
             self
         }
     }
@@ -706,6 +765,19 @@ mod tests {
             _token: Option<&str>,
         ) -> crate::forge_log::RunsListOutcome {
             unreachable!("the analysis action never lists runs")
+        }
+        fn run_timing(
+            &self,
+            host: &str,
+            repo: &str,
+            run_number: i64,
+            token: Option<&str>,
+        ) -> std::result::Result<forge_log::RunTiming, String> {
+            assert_eq!(host, "dev.a8n.run");
+            assert_eq!(repo, "initech/chat");
+            assert_eq!(run_number, 4034);
+            assert_eq!(token, Some("test-pat"), "the log token scopes the read");
+            self.timing.clone()
         }
     }
     impl crate::forge_log::RepoFileClient for StubFj {
@@ -960,12 +1032,21 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
 
     // ---- prompt directs the required analysis -----------------------------
 
+    /// The timing every prompt fixture is built with (run #4017's real values).
+    fn test_timing() -> forge_log::RunTiming {
+        forge_log::RunTiming {
+            started: "2026-08-20T20:03:13+02:00".to_string(),
+            stopped: "2026-08-20T20:27:31+02:00".to_string(),
+        }
+    }
+
     #[test]
     fn prompt_directs_step_root_cause_and_remediation() {
         let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
         let inputs = AnalysisInputs {
             log_path: PathBuf::from("/wd/initech_chat-run4034-all-jobs.log"),
             workflow_path: Some(PathBuf::from("/wd/failing-workflow.yml")),
+            timing: Some(test_timing()),
         };
         let p = build_prompt(&inputs, &coords);
         // References both files by name.
@@ -975,10 +1056,96 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
         assert!(p.contains("Failing step"));
         assert!(p.contains("Root cause"));
         assert!(p.contains("Remediation"));
-        // Names the truncated / diagnostic-free case explicitly.
-        assert!(p.to_lowercase().contains("truncated"));
+        // CLAUDE-236: the log this tool stores is never truncated, so the prompt
+        // never offers truncation as an explanation; it asks for the two-way
+        // classification instead.
+        assert!(
+            !p.to_lowercase().contains("truncat"),
+            "the prompt must not call the stored log truncated: {p}"
+        );
+        assert!(p.contains("never shortens it"));
+        assert!(p.contains("stopped emitting output and was killed or timed out"));
+        assert!(p.contains("the failing step emitted no diagnostic at all"));
         // Read-only contract.
         assert!(p.contains("Do not modify any files"));
+    }
+
+    /// CLAUDE-236 AC: the run's `started` / `stopped` reach the prompt, with the
+    /// instruction to compare the stop time against where the log stops.
+    #[test]
+    fn prompt_carries_the_run_timing_when_it_is_available() {
+        let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        let inputs = AnalysisInputs {
+            log_path: PathBuf::from("/wd/run.log"),
+            workflow_path: None,
+            timing: Some(test_timing()),
+        };
+        let p = build_prompt(&inputs, &coords);
+        assert!(p.contains("started at `2026-08-20T20:03:13+02:00`"), "{p}");
+        assert!(p.contains("stopped at `2026-08-20T20:27:31+02:00`"), "{p}");
+        // The comparison is spelled out where the timing is given and again in
+        // the root-cause instruction.
+        assert!(p.contains("compare that stop time against the last timestamp in the log"));
+        assert!(p.contains("the gap between the last log timestamp and the run's stop time"));
+    }
+
+    /// CLAUDE-236 AC: an unreadable timing is stated as unavailable, so the agent
+    /// reports the limitation instead of inventing a reason for the log's end.
+    #[test]
+    fn prompt_states_the_timing_is_unavailable_when_it_could_not_be_read() {
+        let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        let inputs = AnalysisInputs {
+            log_path: PathBuf::from("/wd/run.log"),
+            workflow_path: None,
+            timing: None,
+        };
+        let p = build_prompt(&inputs, &coords);
+        assert!(
+            p.contains("could not be read from the forge"),
+            "the prompt states the timing is unavailable: {p}"
+        );
+        assert!(!p.contains("started at `"), "{p}");
+    }
+
+    /// CLAUDE-236: a timing read that fails does not fail the fetch; the inputs
+    /// are Ready with no timing (the reason is logged at `warn` by the fetch).
+    #[test]
+    fn a_failed_timing_read_still_yields_ready_inputs() {
+        let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        let fj = StubFj::new(RunLogsOutcome::Fetched(vec![JobLog {
+            name: "check".to_string(),
+            status: "failure".to_string(),
+            log: "boom".to_string(),
+        }]))
+        .with_timing_error("the page carries no run #4034");
+        let tmp = tempfile::tempdir().unwrap();
+        let FetchResult::Ready(inputs) =
+            fetch_analysis_inputs(&fj, &coords, "test-pat", tmp.path())
+        else {
+            panic!("a failed timing read must not make the log unavailable");
+        };
+        assert!(inputs.timing.is_none());
+        let p = build_prompt(&inputs, &coords);
+        assert!(p.contains("could not be read from the forge"));
+    }
+
+    /// CLAUDE-236: the timing the forge returns reaches the prompt end to end.
+    #[test]
+    fn a_successful_timing_read_reaches_the_prompt() {
+        let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        let fj = StubFj::new(RunLogsOutcome::Fetched(vec![JobLog {
+            name: "check".to_string(),
+            status: "failure".to_string(),
+            log: "boom".to_string(),
+        }]));
+        let tmp = tempfile::tempdir().unwrap();
+        let FetchResult::Ready(inputs) =
+            fetch_analysis_inputs(&fj, &coords, "test-pat", tmp.path())
+        else {
+            panic!("expected Ready");
+        };
+        assert_eq!(inputs.timing, Some(test_timing()));
+        assert!(build_prompt(&inputs, &coords).contains("stopped at `2026-08-20T20:27:31+02:00`"));
     }
 
     #[test]
@@ -987,6 +1154,7 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
         let inputs = AnalysisInputs {
             log_path: PathBuf::from("/wd/run.log"),
             workflow_path: None,
+            timing: Some(test_timing()),
         };
         let p = build_prompt(&inputs, &coords);
         assert!(p.contains("could not be fetched"));
