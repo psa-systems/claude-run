@@ -1858,6 +1858,42 @@ impl crate::forge_log::ActionRunsClient for FjForgeReads {
         }
         RunsListOutcome::Resolved(all)
     }
+
+    fn run_timing(
+        &self,
+        host: &str,
+        repo: &str,
+        run_number: i64,
+        token: Option<&str>,
+    ) -> std::result::Result<crate::forge_log::RunTiming, String> {
+        let creds = FjCreds::create(host, token)?;
+        // `--run-number` returns the ONE run, so this never pages.
+        let run = run_number.to_string();
+        let args = [
+            "--host",
+            host,
+            "actions",
+            "runs",
+            "--repo",
+            repo,
+            "--json",
+            "--run-number",
+            &run,
+        ];
+        match self.runner.run_in_env(None, &self.fj, &args, &creds.envs()) {
+            Ok(out) if out.ok => crate::forge_log::parse_run_timing(&out.stdout, run_number),
+            Ok(out) => Err(format!(
+                "fj actions runs exited {}: {}",
+                out.exit_code,
+                out.stderr
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("no stderr")
+            )),
+            Err(e) => Err(format!("running {} actions runs: {e}", self.fj)),
+        }
+    }
 }
 
 impl crate::forge_log::RepoFileClient for FjForgeReads {
@@ -4393,6 +4429,50 @@ mod tests {
         let envs = runner.envs.lock().unwrap();
         let (_, env) = envs.iter().find(|(b, _)| b == "fj").expect("fj child ran");
         assert!(env.is_empty(), "no env injected without a token: {env:?}");
+    }
+
+    // ---- CLAUDE-236: `fj actions runs --run-number` (one run's timing) ----
+
+    /// The argv for the single-run timing read, as the client builds it.
+    const TIMING_ARGS: &[&str] = &[
+        "--host",
+        "dev.a8n.run",
+        "actions",
+        "runs",
+        "--repo",
+        RUNS_REPO,
+        "--json",
+        "--run-number",
+        "4034",
+    ];
+
+    #[test]
+    fn run_timing_reads_one_run_and_never_pages() {
+        let body = r#"{"total_count":1,"runs":[{"id":21077,"index_in_repo":4034,"started":"2026-08-20T20:03:13+02:00","stopped":"2026-08-20T20:27:31+02:00","status":"failure"}]}"#;
+        let runner = Arc::new(StubRunner::new().ok("fj", TIMING_ARGS, body));
+        let t = FjForgeReads::new(runner.clone())
+            .run_timing("dev.a8n.run", RUNS_REPO, 4034, Some("test-pat"))
+            .expect("timing read");
+        assert_eq!(t.started, "2026-08-20T20:03:13+02:00");
+        assert_eq!(t.stopped, "2026-08-20T20:27:31+02:00");
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one call, no paging: {calls:?}");
+        // The token is never a process argument.
+        assert!(!calls.iter().any(|c| c.contains("test-pat")), "{calls:?}");
+    }
+
+    #[test]
+    fn run_timing_reports_a_failed_call_as_an_err_with_the_reason() {
+        let runner = Arc::new(StubRunner::new().fail(
+            "fj",
+            TIMING_ARGS,
+            1,
+            "Error: unexpected status code 404 Not Found\n",
+        ));
+        let e = FjForgeReads::new(runner)
+            .run_timing("dev.a8n.run", RUNS_REPO, 4034, Some("test-pat"))
+            .unwrap_err();
+        assert!(e.contains("404"), "the reason names the failure: {e}");
     }
 
     // ---- CLAUDE-205: `fj repo file` (FJ-67) -------------------------------

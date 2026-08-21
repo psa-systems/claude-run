@@ -139,6 +139,19 @@ pub trait ActionRunsClient: Send + Sync {
         max_pages: u32,
         token: Option<&str>,
     ) -> RunsListOutcome;
+
+    /// CLAUDE-236: read ONE run's forge-reported `started` / `stopped` through
+    /// `fj actions runs --json --run-number <n>` (one run, not a paged scan).
+    /// `Err` carries a human-readable reason (an unreadable page, a page
+    /// carrying no such run, a run reporting no times), so a best-effort caller
+    /// logs it and continues without the timing.
+    fn run_timing(
+        &self,
+        host: &str,
+        repo: &str,
+        run_number: i64,
+        token: Option<&str>,
+    ) -> std::result::Result<RunTiming, String>;
 }
 
 /// CLAUDE-205: seam over `fj repo file`, implemented by
@@ -402,28 +415,13 @@ pub struct RunEntry {
 pub fn parse_runs_list_entries(stdout: &str) -> std::result::Result<Vec<RunEntry>, String> {
     let value: serde_json::Value =
         serde_json::from_str(stdout.trim()).map_err(|e| e.to_string())?;
-    let arr = ["runs", "workflow_runs"]
-        .iter()
-        .find_map(|k| value.get(*k).and_then(|v| v.as_array()))
-        .or_else(|| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let str_field = |run: &serde_json::Value, keys: &[&str]| -> String {
-        keys.iter()
-            .find_map(|k| run.get(*k).and_then(serde_json::Value::as_str))
-            .filter(|s| !s.is_empty())
-            .unwrap_or("")
-            .to_string()
-    };
+    let arr = runs_array(&value);
     let mut out = Vec::new();
     for run in arr {
         let Some(global_id) = run.get("id").and_then(serde_json::Value::as_i64) else {
             continue;
         };
-        let index = ["index_in_repo", "index", "run_number", "number"]
-            .iter()
-            .find_map(|k| run.get(*k).and_then(serde_json::Value::as_i64))
-            .unwrap_or(0);
+        let index = run_index(&run);
         // The outcome is `conclusion` when present, else `status` (mirrors the
         // jobs-list parse), so a completed-success run reads `success`.
         let status = run
@@ -443,6 +441,71 @@ pub fn parse_runs_list_entries(stdout: &str) -> std::result::Result<Vec<RunEntry
         });
     }
     Ok(out)
+}
+
+/// The runs of a `fj actions runs --json` page, tolerant of Forgejo's field
+/// naming (and of a page that is a bare array).
+fn runs_array(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    ["runs", "workflow_runs"]
+        .iter()
+        .find_map(|k| value.get(*k).and_then(|v| v.as_array()))
+        .or_else(|| value.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The first non-empty string among `keys`, or `""`.
+fn str_field(run: &serde_json::Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|k| run.get(*k).and_then(serde_json::Value::as_str))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A run's per-repo index, under any of the names the page may use.
+fn run_index(run: &serde_json::Value) -> i64 {
+    ["index_in_repo", "index", "run_number", "number"]
+        .iter()
+        .find_map(|k| run.get(*k).and_then(serde_json::Value::as_i64))
+        .unwrap_or(0)
+}
+
+/// CLAUDE-236: one run's forge-reported start / stop times. Handed to the
+/// CI-failure analysis so it can tell a job that stopped emitting output and was
+/// killed (a long gap between the last log line and `stopped`) from a capture
+/// that lost data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunTiming {
+    /// When the run started, as the forge reports it (RFC 3339).
+    pub started: String,
+    /// When the run stopped, as the forge reports it (RFC 3339).
+    pub stopped: String,
+}
+
+/// CLAUDE-236: read `run_number`'s `started` / `stopped` out of a
+/// `fj actions runs --json` page. `Err` names the reason (unparseable page, no
+/// such run, a run still in flight that reports no stop time), so the caller
+/// logs it and analyzes without the timing rather than inventing one.
+pub fn parse_run_timing(stdout: &str, run_number: i64) -> std::result::Result<RunTiming, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).map_err(|e| e.to_string())?;
+    let Some(run) = runs_array(&value)
+        .into_iter()
+        .find(|r| run_index(r) == run_number)
+    else {
+        return Err(format!(
+            "the `fj actions runs --json` page carries no run #{run_number}"
+        ));
+    };
+    let started = str_field(&run, &["started", "started_at", "created"]);
+    let stopped = str_field(&run, &["stopped", "stopped_at", "completed_at"]);
+    if started.is_empty() || stopped.is_empty() {
+        return Err(format!(
+            "run #{run_number} reports no start / stop time (started `{started}`, stopped `{stopped}`); the run may still be in flight"
+        ));
+    }
+    Ok(RunTiming { started, stopped })
 }
 
 /// CLAUDE-205: keep a plain branch name, drop anything else. `fj`'s
@@ -600,8 +663,8 @@ fn branch_from_ref(value: &str) -> Option<&str> {
 /// `GITHUB_REF` is `refs/pull/N/head` and its `GITHUB_REF_NAME` the bare PR
 /// number, so the last fallback is skipped when `GITHUB_REF` names a pull or
 /// tag ref rather than returning a number or a tag name as a branch. `None`
-/// when the log carries no readable ref (truncated / diagnostic-free /
-/// logless).
+/// when the log carries no readable ref (a log that stops before the env dump,
+/// a diagnostic-free log, a logless failure).
 pub fn parse_branch_from_log(log: &str) -> Option<String> {
     let env = collect_ref_env(log);
     for candidate in [env.head_ref.as_deref(), env.git_ref.as_deref()] {
@@ -1152,6 +1215,36 @@ mod tests {
             e.html_url,
             "https://dev.a8n.run/fabrikam/forgejo-cli/actions/runs/469"
         );
+    }
+
+    // ---- CLAUDE-236: one run's start / stop times ------------------------
+
+    /// AC: the parse reads `started` / `stopped` off a real
+    /// `fj actions runs --json` page, selecting the run by its per-repo number.
+    #[test]
+    fn parse_run_timing_reads_started_and_stopped() {
+        let t = parse_run_timing(REAL_RUNS_PAGE, 469).unwrap();
+        assert_eq!(t.started, "2026-08-01T04:02:35+02:00");
+        assert_eq!(t.stopped, "2026-08-01T04:03:14+02:00");
+    }
+
+    /// A page that carries no such run is an `Err` naming the run, so the caller
+    /// logs it and analyzes without the timing.
+    #[test]
+    fn parse_run_timing_reports_a_missing_run() {
+        let e = parse_run_timing(REAL_RUNS_PAGE, 470).unwrap_err();
+        assert!(e.contains("no run #470"), "{e}");
+        let e = parse_run_timing("not json", 469).unwrap_err();
+        assert!(!e.is_empty(), "an unparseable page carries a reason");
+    }
+
+    /// A run still in flight reports no stop time: that is an `Err` rather than a
+    /// half-empty timing the prompt would render as evidence.
+    #[test]
+    fn parse_run_timing_rejects_a_run_with_no_stop_time() {
+        let body = r#"{"total_count":1,"runs":[{"id":1,"index_in_repo":42,"started":"2026-08-01T04:02:35+02:00","stopped":"","status":"running"}]}"#;
+        let e = parse_run_timing(body, 42).unwrap_err();
+        assert!(e.contains("no start / stop time"), "{e}");
     }
 
     #[test]
