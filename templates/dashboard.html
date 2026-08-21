@@ -23,29 +23,22 @@
         so the poll does not wipe text selection / scroll / focus. #}
      hx-swap="morph:outerHTML">
 
-{# CLAUDE-216: poll-time access failures. The preflight leaves the affected
+{# CLAUDE-216: poll-time diagnostics. The access preflight leaves the affected
    issues Queued with no field change, so this banner is the only place the
-   operator is told rather than having to go looking. #}
-{% if !access_failures.is_empty() %}
+   operator is told rather than having to go looking.
+   CLAUDE-235: a count and a link, not the messages. One repeating failure used
+   to fill the first screen with byte-identical rows; the rows are on /logs, and
+   the access subset is named separately because its remedy is the access
+   check. It clears itself when a later poll records the recovery marker. #}
+{% if events_24h > 0 %}
   <div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
-    <strong style="color: var(--bad);">Access failures in the last 24h</strong>
-    <div class="dim" style="margin-top: 6px;">Issues for these repos are skipped each poll and
-    left Queued. Run an <a href="/access">access check</a> to see which credential and scope
-    is short.</div>
-    <table style="margin-top: 8px;">
-      <thead><tr><th>Action</th><th>Context</th><th>Last seen</th><th>Count</th><th>Message</th></tr></thead>
-      <tbody>
-        {% for f in access_failures %}
-        <tr>
-          <td class="mono">{{ f.action_name }}</td>
-          <td class="mono">{% if let Some(c) = f.context %}{{ c }}{% else %}-{% endif %}</td>
-          <td class="dim">{{ f.last_ts|datetime }}</td>
-          <td class="dim">{{ f.count }}</td>
-          <td>{{ f.message }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <strong style="color: var(--bad);">{{ events_24h }} errors / warnings in the last 24h.</strong>
+    {% if access_failure_events > 0 %}
+      <span>{{ access_failure_events }} of them are still-open repo-access failures across
+      {{ access_failure_groups }} repo(s): those issues are skipped each poll and left Queued. Run an
+      <a href="/access">access check</a> to see which credential and scope is short.</span>
+    {% endif %}
+    <a href="/logs?since=24h">View logs</a>
   </div>
 {% endif %}
 
