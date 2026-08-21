@@ -78,6 +78,35 @@
   </div>
 {% endif %}
 
+{# CLAUDE-232: jobs parked at their action's per-key attempt cap, the sibling of
+   the stale-gate banner above. The skip writes no outcome row, no run event and
+   no field change, so the issue stays Queued, is skipped again on every poll,
+   and nothing but this banner says so. Read straight off `attempt_counters`. #}
+{% if !attempt_cap_hits.is_empty() %}
+  <div class="card" style="border-color: var(--warn); margin-bottom: 16px;">
+    <strong style="color: var(--warn);">Jobs parked at the attempt cap</strong>
+    <div class="dim" style="margin-top: 6px;">These jobs have used every attempt their action allows
+    (<code>limits.max_attempts_per_key</code>), so each poll skips them and they never move. The runner
+    cannot retry a capped key: the counter is only cleared by deleting the action, which purges its
+    control state. So finish the job by hand and take it out of the action's candidate set (resolve the
+    issue, or change its <code>AI Agent</code> value); raising the action's cap gets one more attempt.
+    A key stays listed until its counter is gone, including one you have already dealt with.</div>
+    <table style="margin-top: 8px;">
+      <thead><tr><th>Action</th><th>Job</th><th>Attempts</th><th>Last attempt</th></tr></thead>
+      <tbody>
+        {% for c in attempt_cap_hits %}
+        <tr>
+          <td class="mono"><a href="/actions/{{ c.action_name }}">{{ c.action_name }}</a></td>
+          <td class="mono">{{ c.job_key }}</td>
+          <td class="mono">{{ c.count }} / {{ c.cap }}</td>
+          <td class="dim">{{ c.last_at|datetime }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
 {% if let Some(g) = global_pause %}
   <h2>Globally paused</h2>
   <div class="card">

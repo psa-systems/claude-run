@@ -108,16 +108,27 @@ The daemon's TCP web UI (loopback by default; see "Web UI / API auth") is more t
 will want to know about:
 
 - **Dashboard** (`/`) leads with the conditions that make work stop without anything failing: the global-pause card, the
-  24h diagnostics banner (CLAUDE-216 / CLAUDE-235, see "Access check"), and the stale-dependency-gate banner
-  (CLAUDE-225). The diagnostics banner is one line: how many `warn`/`error` events the last 24h holds, how many of those
+  24h diagnostics banner (CLAUDE-216 / CLAUDE-235, see "Access check"), the stale-dependency-gate banner
+  (CLAUDE-225), and the attempt-cap banner (CLAUDE-232). The diagnostics banner is one line: how many `warn`/`error`
+  events the last 24h holds, how many of those
   are still-open repo-access failures (whose remedy is the access check, so they are named separately), and a link to
   the Logs screen for the messages themselves. The
-  last one lists every queued issue the CLAUDE-161 dependency gate has held for over an hour, with its blocker set, how
+  stale-gate banner lists every queued issue the CLAUDE-161 dependency gate has held for over an hour, with its blocker
+  set, how
   long it has been held, and whether the gate's own re-evaluation deadline has passed (a "recheck overdue" gate is not
   being re-evaluated at all, so its blockers may already be resolved). A held issue keeps its Queued field value and a
   poll whose candidates are all blocked writes no run row, so without the banner the only symptom is an issue that never
   moves. The same list is on `/api/status` as `stale_gates`, so `claude-run status` reports it too. It clears itself
   when the blockers resolve. See `actions/SCHEMA.md`, "Pre-clone dependency gate".
+
+  The attempt-cap banner is the same signal for the sibling condition: every job whose attempt counter has reached its
+  action's `limits.max_attempts_per_key`, with the action, the key, the count against the cap, and the last counted
+  attempt. That skip writes no outcome row, no run event, and no field change, so the issue keeps its Queued value, is
+  skipped again on the next poll, and never moves. The same list is on `/api/status` as `attempt_cap_hits`, with or
+  without the daemon, and the skip itself logs at `warn` with the count and the cap. Unlike a dependency gate, the row
+  does not clear itself: the counter is the durable record of the attempts, so a key stays listed until the counter is
+  gone (today only an action delete purges it, per CLAUDE-238), and the runner cannot retry a capped key until then.
+  Raising the action's cap grants one more attempt. See `actions/SCHEMA.md`, "`limits`".
 
 - **New action** (`/actions/new`, CLAUDE-211) is a kind picker: it lists every action kind with a one-line description
   and a link to its editor. Every native kind (`youtrack`, `forgejo-ci-fix`, `ci-failure-analysis`,

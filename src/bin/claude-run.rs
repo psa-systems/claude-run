@@ -807,19 +807,43 @@ async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
         return Ok(exit::OK);
     }
     let pool = db::open(&paths.state_db()).await?;
-    let global = state::global_pause_status(&pool).await?;
-    let actions = state::action_index_list(&pool).await?;
+    jsonfmt::print_json(&daemonless_status(&pool, &sock).await?)?;
+    Ok(exit::OK)
+}
+
+/// The report `status` prints with no daemon running. Split out of [`status`]
+/// (CLAUDE-232) so the blocks it must carry are testable without a live daemon
+/// or captured stdout.
+async fn daemonless_status(
+    pool: &sqlx::SqlitePool,
+    sock: &std::path::Path,
+) -> claude_run::error::Result<serde_json::Value> {
+    let global = state::global_pause_status(pool).await?;
+    let actions = state::action_index_list(pool).await?;
     // CLAUDE-223: the same activity block `/status` carries, so a reboot script
     // reads `quiet` whether or not the daemon is up. With no daemon there is no
     // in-flight map to consult, so the open `runs` rows are the whole signal.
-    let active_runs = state::active_runs(&pool).await?;
+    let active_runs = state::active_runs(pool).await?;
     // CLAUDE-225: the same stale-gate block `/status` carries. The gate table is
     // the daemon's, but it is plain DB state, so a daemonless status reports a
     // stuck gate rather than the misleading silence of omitting it.
     let stale_gates =
-        state::dependency_gates_stale(&pool, state::now_epoch_ms(), state::STALE_GATE_AFTER_MS, 20)
+        state::dependency_gates_stale(pool, state::now_epoch_ms(), state::STALE_GATE_AFTER_MS, 20)
             .await?;
-    let report = json!({
+    // CLAUDE-232: likewise for the keys parked at their action's attempt cap.
+    // Both counters and action YAML are plain on-disk state, so the daemonless
+    // path reports the same block rather than omitting it and reading as clear.
+    let defaults = claude_run::job::RunnerDefaults::default();
+    let caps =
+        claude_run::blocking::in_place(|| claude_run::job::attempt_caps(&actions, &defaults));
+    let attempt_cap_hits = state::attempt_cap_hits(
+        pool,
+        &caps,
+        defaults.max_attempts_per_key,
+        state::ATTEMPT_CAP_HITS_LIMIT,
+    )
+    .await?;
+    Ok(json!({
         "daemon": "not running",
         "socket_expected_at": sock.display().to_string(),
         "global_paused": global.map(|(a, r)| json!({"paused_at": a, "reason": r})),
@@ -829,10 +853,9 @@ async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
             "dispatched_actions": Vec::<String>::new(),
         },
         "stale_gates": stale_gates,
+        "attempt_cap_hits": attempt_cap_hits,
         "actions": actions,
-    });
-    jsonfmt::print_json(&report)?;
-    Ok(exit::OK)
+    }))
 }
 
 async fn action_cmd(
@@ -1110,5 +1133,33 @@ mod tests {
             let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             assert_eq!(resolve_color_choice(&owned), expected, "{args:?}");
         }
+    }
+
+    /// CLAUDE-232: `claude-run status` with no daemon carries the parked-at-cap
+    /// block, like the CLAUDE-225 stale-gate block beside it. The counters are
+    /// plain DB state, so omitting them here would read as "nothing is stuck"
+    /// exactly when the daemon is down and nobody can check the web UI.
+    #[tokio::test]
+    async fn daemonless_status_reports_keys_parked_at_the_attempt_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open(&dir.path().join("state.db")).await.unwrap();
+        let sock = dir.path().join("daemon.sock");
+
+        let report = daemonless_status(&pool, &sock).await.unwrap();
+        assert_eq!(report["attempt_cap_hits"].as_array().unwrap().len(), 0);
+
+        // No action index row, so the key is measured against the default cap.
+        for _ in 0..3 {
+            state::attempts_increment(&pool, "youtrack", "CLAUDE-9")
+                .await
+                .unwrap();
+        }
+        let report = daemonless_status(&pool, &sock).await.unwrap();
+        let hits = report["attempt_cap_hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{report:#}");
+        assert_eq!(hits[0]["job_key"], "CLAUDE-9");
+        assert_eq!(hits[0]["action_name"], "youtrack");
+        assert_eq!(hits[0]["count"], 3);
+        assert_eq!(hits[0]["cap"], 3);
     }
 }

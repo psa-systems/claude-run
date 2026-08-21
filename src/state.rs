@@ -193,6 +193,79 @@ pub async fn dependency_gate_clear(pool: &SqlitePool, action: &str, key: &str) -
     Ok(())
 }
 
+/// CLAUDE-232: how many rows the parked-at-cap read returns, matching the
+/// stale-gate banner's window.
+pub const ATTEMPT_CAP_HITS_LIMIT: usize = 20;
+
+/// CLAUDE-232: one job parked at its action's per-key attempt cap, as the
+/// dashboard banner and `/api/status` report it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CappedKey {
+    pub action_name: String,
+    /// The parked job (a YouTrack `idReadable`, a head SHA, whatever the
+    /// action's `dedup_key` resolves to).
+    pub job_key: String,
+    /// Attempts recorded against the key.
+    pub count: i64,
+    /// The action's effective `max_attempts_per_key` it has reached.
+    pub cap: i64,
+    /// RFC 3339 timestamp of the last counted attempt. It does NOT move once the
+    /// cap is hit: a skipped job counts no attempt.
+    pub last_at: String,
+}
+
+/// CLAUDE-232: keys whose attempt counter has reached their action's cap, most
+/// attempts first. Every one of them is skipped on every poll with no
+/// `job_outcomes` row and no `run_events` row, so this live read off
+/// `attempt_counters` is the only thing that can report them.
+///
+/// The cap is per action (`job::EffectiveLimits::max_attempts_per_key`), so
+/// `caps` carries the resolved cap per action name and `default_cap` covers the
+/// actions it does not list (the synthetic webhook actions, which mint jobs
+/// against `RunnerDefaults`). SQL narrows to rows at or over the SMALLEST cap in
+/// play and the per-action comparison happens here, so one query serves a mixed
+/// set of caps.
+///
+/// Unlike a dependency gate, nothing deletes the row when the operator resolves
+/// the parked issue: the counter is the durable record of the attempts. A key
+/// stays listed until its action's control state is cleared.
+pub async fn attempt_cap_hits(
+    pool: &SqlitePool,
+    caps: &std::collections::BTreeMap<String, u32>,
+    default_cap: u32,
+    limit: usize,
+) -> Result<Vec<CappedKey>> {
+    // A cap of 0 would match every row including count 0; the counters start at
+    // 1, so clamp the SQL floor to 1 and let the per-action compare below decide.
+    let min_cap = caps.values().copied().fold(default_cap, u32::min).max(1);
+    let rows: Vec<(String, String, i64, String)> = sqlx::query_as(
+        r#"
+        SELECT action_name, job_key, count, last_at
+        FROM attempt_counters
+        WHERE count >= ?1
+        ORDER BY count DESC, last_at DESC
+        "#,
+    )
+    .bind(min_cap as i64)
+    .fetch_all(pool)
+    .await?;
+    let mut out: Vec<CappedKey> = rows
+        .into_iter()
+        .filter_map(|(action_name, job_key, count, last_at)| {
+            let cap = caps.get(&action_name).copied().unwrap_or(default_cap) as i64;
+            (count >= cap).then_some(CappedKey {
+                action_name,
+                job_key,
+                count,
+                cap,
+                last_at,
+            })
+        })
+        .collect();
+    out.truncate(limit);
+    Ok(out)
+}
+
 pub async fn attempts_get(pool: &SqlitePool, action: &str, key: &str) -> Result<u32> {
     let row: Option<(i64,)> =
         sqlx::query_as("SELECT count FROM attempt_counters WHERE action_name = ? AND job_key = ?")
@@ -2366,5 +2439,68 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// CLAUDE-232: the parked-at-cap read compares each key against ITS action's
+    /// cap, not one global number, so an action that lowers `max_attempts_per_key`
+    /// parks earlier and an action that raises it releases the key again.
+    #[tokio::test]
+    async fn attempt_cap_hits_reports_each_key_against_its_own_action_cap() {
+        let pool = mem_pool().await;
+        let caps = |pairs: &[(&str, u32)]| -> std::collections::BTreeMap<String, u32> {
+            pairs.iter().map(|(a, c)| (a.to_string(), *c)).collect()
+        };
+        // `audit` caps at 2, `youtrack` takes the default 3, `webhook-forgejo`
+        // has no YAML at all and so is absent from the map.
+        for (action, key, n) in [
+            ("audit", "AUD-31", 2),
+            ("youtrack", "CLAUDE-9", 3),
+            ("youtrack", "CLAUDE-8", 2),
+            ("webhook-forgejo", "deadbeef", 4),
+        ] {
+            for _ in 0..n {
+                attempts_increment(&pool, action, key).await.unwrap();
+            }
+        }
+
+        let hits = attempt_cap_hits(&pool, &caps(&[("audit", 2)]), 3, ATTEMPT_CAP_HITS_LIMIT)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = hits.iter().map(|h| h.job_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["deadbeef", "CLAUDE-9", "AUD-31"],
+            "capped keys only, most attempts first: {hits:?}"
+        );
+        assert_eq!(hits[2].action_name, "audit");
+        assert_eq!((hits[2].count, hits[2].cap), (2, 2), "the action's own cap");
+        assert_eq!(
+            (hits[0].count, hits[0].cap),
+            (4, 3),
+            "an action absent from the map is measured against the default cap"
+        );
+        assert!(!hits[0].last_at.is_empty(), "the last attempt is dated");
+        assert!(
+            !keys.contains(&"CLAUDE-8"),
+            "one attempt left is not parked: {hits:?}"
+        );
+
+        // Raising the cap releases the key: the same counter is under the limit.
+        let hits = attempt_cap_hits(
+            &pool,
+            &caps(&[("audit", 5), ("youtrack", 5)]),
+            5,
+            ATTEMPT_CAP_HITS_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert!(hits.is_empty(), "nothing is at its cap any more: {hits:?}");
+
+        // The limit bounds the banner, not the comparison.
+        let hits = attempt_cap_hits(&pool, &caps(&[("audit", 2)]), 3, 1)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].job_key, "deadbeef");
     }
 }
