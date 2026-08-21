@@ -470,20 +470,14 @@ pub struct RunEventLogRecord {
     pub action_name: String,
 }
 
-/// CLAUDE-171: a group of byte-identical `run_events` rows collapsed into one
-/// summary row for the action-detail page.
-#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
-pub struct RunEventGroup {
-    pub level: String,
-    pub context: Option<String>,
-    pub message: String,
-    /// Occurrences of this exact `(level, context, message)` in the window.
+/// CLAUDE-235: one row of the Logs page's grouped 24h summary: a `context` or an
+/// `action_name` and how many `warn`/`error` events carry it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
+pub struct RunEventCount {
+    /// The grouped value. Empty for the rows whose `context` is NULL or empty,
+    /// which the page renders unlinked (no filter can express them).
+    pub value: String,
     pub count: i64,
-    pub first_ts: String,
-    pub last_ts: String,
-    /// Representative run: the newest attached run id in the group, or `None`
-    /// when every occurrence was a zero-job poll with no run row.
-    pub run_id: Option<i64>,
 }
 
 /// CLAUDE-147: persist this poll's input-phase events keyed by `action_name` +
@@ -592,46 +586,91 @@ pub async fn run_events_for_action(
     Ok(rows)
 }
 
-/// CLAUDE-171: the first `limit` DISTINCT input-phase diagnostics for an action
-/// since `started_at`, for the action-detail "Input errors / warnings" summary.
-///
-/// Rows with an identical `(level, context, message)` collapse into one group
-/// carrying its occurrence `count` and first/last-seen stamps, so a diagnostic
-/// that re-fires every poll (the CLAUDE-164 config-collision notice, recorded
-/// once per 5s poll) takes one row instead of burying every other diagnostic.
-/// Groups are ordered by first occurrence ascending: the earliest signal in this
-/// daemon lifetime is what the operator wants first, and it is stable as the
-/// flood keeps growing.
+/// CLAUDE-235: how many input-phase diagnostics an action has recorded since
+/// `started_at`, for the action-detail one-line summary. The rows themselves live
+/// on the Logs page; this is only the signal that there are some.
 ///
 /// `started_at` is the current serve's stamp ([`crate::settings::serve_started_at`]).
 /// `None` means "no lower bound": every `ts` is a non-empty ISO string, so the
 /// empty-string bind matches all rows. That is the degraded path for a DB no
 /// serve has stamped yet, not the daemon's normal path.
-pub async fn run_events_summary_for_action(
+pub async fn run_events_count_for_action(
     pool: &SqlitePool,
     action: &str,
     started_at: Option<&str>,
-    limit: i64,
-) -> Result<Vec<RunEventGroup>> {
-    let rows = sqlx::query_as::<_, RunEventGroup>(
-        r#"
-        SELECT level, context, message,
-               COUNT(*) AS count,
-               MIN(ts) AS first_ts,
-               MAX(ts) AS last_ts,
-               MAX(run_id) AS run_id
-        FROM run_events
-        WHERE action_name = ? AND ts >= ?
-        GROUP BY level, context, message
-        ORDER BY first_ts ASC
-        LIMIT ?
-        "#,
+) -> Result<i64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM run_events WHERE action_name = ? AND ts >= ?",
     )
     .bind(action)
     .bind(started_at.unwrap_or(""))
-    .bind(limit)
-    .fetch_all(pool)
+    .fetch_one(pool)
     .await?;
+    Ok(count)
+}
+
+/// CLAUDE-235: levels the Logs summary and the dashboard banner count. `info`
+/// rows (the CLAUDE-216 access-recovery markers among them) are diagnostics of
+/// record, not conditions to act on, so they stay out of the counts.
+const DIAGNOSTIC_LEVELS: &str = "('warn', 'error')";
+
+/// CLAUDE-235: total `warn`/`error` events recorded at or after `since`, for the
+/// dashboard banner's headline count.
+pub async fn run_events_count_since(pool: &SqlitePool, since: &str) -> Result<i64> {
+    let sql =
+        format!("SELECT COUNT(*) FROM run_events WHERE ts >= ? AND level IN {DIAGNOSTIC_LEVELS}");
+    let count = sqlx::query_scalar::<_, i64>(&sql)
+        .bind(since)
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
+/// CLAUDE-235: `warn`/`error` events at or after `since` grouped by `context`,
+/// busiest first, for the Logs page's summary card. A NULL or empty `context`
+/// groups under the empty string rather than being dropped, so the rows account
+/// for every counted event.
+pub async fn run_events_grouped_by_context(
+    pool: &SqlitePool,
+    since: &str,
+    limit: i64,
+) -> Result<Vec<RunEventCount>> {
+    run_events_grouped_by(pool, "IFNULL(context, '')", since, limit).await
+}
+
+/// CLAUDE-235: `warn`/`error` events at or after `since` grouped by
+/// `action_name`, busiest first, for the Logs page's summary card.
+pub async fn run_events_grouped_by_action(
+    pool: &SqlitePool,
+    since: &str,
+    limit: i64,
+) -> Result<Vec<RunEventCount>> {
+    run_events_grouped_by(pool, "action_name", since, limit).await
+}
+
+/// Shared body of the two grouped reads. `column` is a fixed SQL fragment chosen
+/// by the caller, never user input; `since` and `limit` are bound parameters.
+async fn run_events_grouped_by(
+    pool: &SqlitePool,
+    column: &str,
+    since: &str,
+    limit: i64,
+) -> Result<Vec<RunEventCount>> {
+    let sql = format!(
+        r#"
+        SELECT {column} AS value, COUNT(*) AS count
+        FROM run_events
+        WHERE ts >= ? AND level IN {DIAGNOSTIC_LEVELS}
+        GROUP BY value
+        ORDER BY count DESC, value ASC
+        LIMIT ?
+        "#
+    );
+    let rows = sqlx::query_as::<_, RunEventCount>(&sql)
+        .bind(since)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 
@@ -2026,6 +2065,108 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// CLAUDE-235: the Logs summary groups the window's `warn`/`error` events by
+    /// context and by action, busiest first, and leaves `info` out of both.
+    #[tokio::test]
+    async fn run_event_summaries_group_diagnostics_and_skip_info() {
+        let pool = mem_pool().await;
+        let ev = |level: &str, context: Option<&str>, message: &str| InputEvent {
+            level: level.into(),
+            context: context.map(str::to_string),
+            message: message.into(),
+        };
+        run_events_record(
+            &pool,
+            "youtrack",
+            "2026-08-01T00:00:00Z",
+            &[
+                ev("warn", Some("CLAUDE"), "probe failed"),
+                ev("error", Some("CLAUDE"), "clone failed"),
+                ev("warn", Some("GAMMA"), "probe failed"),
+                // Neither counted nor grouped: `info` is a marker, not a signal.
+                ev("info", Some("CLAUDE"), "preflight passed"),
+                // A NULL context still accounts for its event.
+                ev("warn", None, "no VCS integration"),
+            ],
+        )
+        .await
+        .unwrap();
+        run_events_record(
+            &pool,
+            "other",
+            "2026-08-01T00:00:05Z",
+            &[ev("error", Some("GAMMA"), "duplicate source")],
+        )
+        .await
+        .unwrap();
+        // Before the window: counted by neither read.
+        run_events_record(
+            &pool,
+            "youtrack",
+            "2000-01-01T00:00:00Z",
+            &[ev("error", Some("CLAUDE"), "ancient failure")],
+        )
+        .await
+        .unwrap();
+
+        let since = "2026-07-31T00:00:00Z";
+        assert_eq!(run_events_count_since(&pool, since).await.unwrap(), 5);
+
+        let by_context = run_events_grouped_by_context(&pool, since, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            by_context,
+            vec![
+                RunEventCount {
+                    value: "CLAUDE".into(),
+                    count: 2
+                },
+                RunEventCount {
+                    value: "GAMMA".into(),
+                    count: 2
+                },
+                RunEventCount {
+                    value: String::new(),
+                    count: 1
+                },
+            ]
+        );
+
+        let by_action = run_events_grouped_by_action(&pool, since, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            by_action,
+            vec![
+                RunEventCount {
+                    value: "youtrack".into(),
+                    count: 4
+                },
+                RunEventCount {
+                    value: "other".into(),
+                    count: 1
+                },
+            ]
+        );
+
+        // The action-detail count is per action and window-bounded by the serve
+        // stamp, and counts every level (the region is "input errors / warnings",
+        // but the page it links to lists them all).
+        assert_eq!(
+            run_events_count_for_action(&pool, "youtrack", Some("2026-07-31T00:00:00Z"))
+                .await
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            run_events_count_for_action(&pool, "youtrack", None)
+                .await
+                .unwrap(),
+            6
+        );
     }
 
     /// CLAUDE-225: re-arming the backoff (and re-commenting a changed blocker

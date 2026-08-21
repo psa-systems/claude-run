@@ -108,7 +108,10 @@ The daemon's TCP web UI (loopback by default; see "Web UI / API auth") is more t
 will want to know about:
 
 - **Dashboard** (`/`) leads with the conditions that make work stop without anything failing: the global-pause card, the
-  24h access-failure banner (CLAUDE-216, see "Access check"), and the stale-dependency-gate banner (CLAUDE-225). The
+  24h diagnostics banner (CLAUDE-216 / CLAUDE-235, see "Access check"), and the stale-dependency-gate banner
+  (CLAUDE-225). The diagnostics banner is one line: how many `warn`/`error` events the last 24h holds, how many of those
+  are still-open repo-access failures (whose remedy is the access check, so they are named separately), and a link to
+  the Logs screen for the messages themselves. The
   last one lists every queued issue the CLAUDE-161 dependency gate has held for over an hour, with its blocker set, how
   long it has been held, and whether the gate's own re-evaluation deadline has passed (a "recheck overdue" gate is not
   being re-evaluated at all, so its blockers may already be resolved). A held issue keeps its Queued field value and a
@@ -125,13 +128,16 @@ will want to know about:
   native action's form is at `/actions/<name>/form` (offered from the raw editor, which stays at
   `/actions/<name>/edit`). Every form saves through the same validation and write path as the raw editor, so a form can
   never write a file the raw editor would reject; keys no form covers are preserved untouched on save.
-- **Action detail** (`/actions/<name>`) carries an **Input errors / warnings** summary region (CLAUDE-147 / CLAUDE-171):
-  the first few (`ACTION_EVENT_SUMMARY_LIMIT = 5`) distinct input / poll-phase diagnostics (probe failures, no-VCS drops)
-  seen since the current serve started, each with its repeat count. It is a signal, not a log.
-- **Action error log** (`/actions/<name>/events`, CLAUDE-171) is the full list behind that summary: every matching
-  `run_events` row, undeduplicated and paginated (50 per page), filterable by a whitelisted Level / Action / Context /
-  message substring and an optional "since boot" bound. `<name>` seeds the Action filter, which can be widened to any
-  action or all.
+- **Action detail** (`/actions/<name>`) carries an **Input errors / warnings** line (CLAUDE-147 / CLAUDE-235): how many
+  input / poll-phase diagnostics (probe failures, no-VCS drops) this action has recorded since the current serve
+  started, linking to the Logs screen filtered to it. It is a signal, not a log.
+- **Logs** (`/logs`, CLAUDE-171 / CLAUDE-235) is the one diagnostics screen, in the top nav: every `run_events` row for
+  every action, undeduplicated and paginated (50 per page), filterable by a whitelisted Level / Action / Context /
+  message substring and a current-serve / last-24h / all-time window. Above the table, two summary cards count the last
+  24h of `warn` and `error` events grouped by `context` and by `action_name`, and each row links back to the same page
+  with that filter applied over the same window. `?action=<name>` narrows it to one action, which is where the
+  Dashboard banner, the action page's **View logs** buttons, and the permanent redirect from the former
+  `/actions/<name>/events` URL all land.
 - **Access** (`/access`, CLAUDE-216) runs the access check on demand: "Check all" probes every enabled `youtrack`
   action, and the form probes a named repo (`owner/name`, optional host) and/or a YouTrack project key. Results are one
   row per probe. `/secrets` grows a per-secret **Check** button that lands here with that credential's identity probe
@@ -184,10 +190,11 @@ query; the row's remediation says what it really is. A failed repo probe carries
 names the scope or the permission grant to add (see "Forge repo-access preflight" in `actions/SCHEMA.md`).
 
 **Dashboard banner.** A poll-time repo-access preflight failure is recorded as a `run_events` row (CLAUDE-147); the
-Dashboard now surfaces those from the last 24 hours in a banner linking to `/access`, so the operator is told rather
-than having to find the action's event list. A later poll whose preflight passes records a recovery marker for the same
-repo and the banner clears itself; the marker is written only on that fail -> pass transition, so a healthy poll adds
-nothing to the event log.
+Dashboard counts those from the last 24 hours in its diagnostics banner and links to `/access`, so the operator is told
+rather than having to go looking. A later poll whose preflight passes records a recovery marker for the same repo and
+that count drops to zero; the marker is written only on that fail -> pass transition, so a healthy poll adds nothing to
+the event log. CLAUDE-235 replaced the banner's table with the count: one repeating failure used to fill the operator's
+first screen with byte-identical rows, and the rows now live on the Logs screen.
 
 ## Filesystem layout
 

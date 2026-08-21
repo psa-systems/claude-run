@@ -120,11 +120,10 @@ pub fn router(
         .route("/actions", post(action_create))
         .route("/actions/:name", get(action_detail))
         .route("/actions/:name/durations", get(action_durations))
-        // CLAUDE-171: full input-event log for an action. The action-detail page
-        // only summarises the first 5 distinct events of the current serve; this
-        // page lists every matching row, undeduplicated and filterable. `:name`
-        // seeds the Action filter, which can be widened to any action or all.
-        .route("/actions/:name/events", get(action_events))
+        // CLAUDE-235: the log page is global and lives at `/logs`. This route is
+        // kept as a permanent redirect that carries the action into the Action
+        // filter, so existing links and bookmarks keep working.
+        .route("/actions/:name/events", get(action_events_redirect))
         .route(
             "/actions/:name/edit",
             get(action_edit_page).post(action_edit_save),
@@ -137,6 +136,9 @@ pub fn router(
         )
         .route("/actions/:name/export", get(action_export))
         .route("/actions/:name/delete", post(action_delete))
+        // CLAUDE-235: the one diagnostics screen. Every `run_events` row, for
+        // every action, undeduplicated and filterable; `?action=` narrows it.
+        .route("/logs", get(logs))
         .route("/secrets", get(secrets_page).post(secret_create))
         .route("/secrets/:name/rotate", post(secret_rotate))
         .route("/secrets/:name/delete", post(secret_delete))
@@ -978,9 +980,16 @@ struct DashboardTpl {
     /// bounds, and the "X-Y of N" indicator). Computed even while a search is
     /// active so the hidden `page` input keeps the morph poll on the right page.
     page: PageNav,
-    /// CLAUDE-216: poll-time access failures from the last 24h that no later
-    /// successful preflight superseded. Empty renders no banner.
-    access_failures: Vec<state::AccessFailure>,
+    /// CLAUDE-235: `warn`/`error` events in the last 24h. Zero renders no
+    /// banner; the rows themselves live on `/logs`.
+    events_24h: i64,
+    /// CLAUDE-216 / CLAUDE-235: the repo-access subset of `events_24h` that no
+    /// later successful preflight superseded, named separately in the banner
+    /// because its remedy is the access check. Zero once a recovery lands.
+    access_failure_events: i64,
+    /// Distinct `(action, context, message)` access failures behind
+    /// `access_failure_events`.
+    access_failure_groups: usize,
     /// CLAUDE-225: dependency gates that have held an issue longer than
     /// [`state::STALE_GATE_AFTER_MS`]. Empty renders no banner.
     stale_gates: Vec<StaleGateRow>,
@@ -1349,9 +1358,12 @@ async fn dashboard(
     // with no field change, so without this banner the only symptom is issues
     // that never move. 24h window; a later passing preflight for the same repo
     // clears it (`state::access_failures_recent`).
-    let since = (chrono::Utc::now() - chrono::Duration::hours(24))
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let access_failures = state::access_failures_recent(pool, &since, 10).await?;
+    // CLAUDE-235: a count, not a table. The messages are on `/logs`; the
+    // dashboard says how many there are and which of them the access check fixes.
+    let since = events_window_start();
+    let access_failures =
+        state::access_failures_recent(pool, &since, ACCESS_FAILURE_NO_LIMIT).await?;
+    let events_24h = state::run_events_count_since(pool, &since).await?;
 
     // CLAUDE-225: a dependency-blocked issue stays Queued with no field change,
     // and a poll whose candidates are all blocked returns before `run_begin`, so
@@ -1378,7 +1390,9 @@ async fn dashboard(
         in_stream: q.in_stream,
         search,
         page: page_nav,
-        access_failures,
+        events_24h,
+        access_failure_events: access_failures.iter().map(|f| f.count).sum(),
+        access_failure_groups: access_failures.len(),
         stale_gates,
         view,
         action_options,
@@ -1386,11 +1400,6 @@ async fn dashboard(
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
-
-/// CLAUDE-171: how many distinct input-event groups the action-detail summary
-/// shows. The region is a signal, not a log: the full list is one click away on
-/// `/actions/:name/events`.
-const ACTION_EVENT_SUMMARY_LIMIT: i64 = 5;
 
 #[derive(Template)]
 #[template(path = "action_detail.html")]
@@ -1400,12 +1409,11 @@ struct ActionDetailTpl {
     paused: Option<PauseInfo>,
     runs: Vec<RunRow>,
     /// CLAUDE-147: input/poll-phase diagnostics for this action (probe failures,
-    /// no-VCS drops). Rendered in an "Input errors / warnings" region; errors are
-    /// styled with `var(--bad)`.
-    /// CLAUDE-171: a summary, not a dump: the first
-    /// [`ACTION_EVENT_SUMMARY_LIMIT`] distinct `(level, context, message)` groups
-    /// since this serve started, oldest first, each with its repeat count.
-    events: Vec<state::RunEventGroup>,
+    /// no-VCS drops), which skip a project's issues before any job exists and so
+    /// never reach the per-run outcomes.
+    /// CLAUDE-235: a count, not a dump: how many were recorded since this serve
+    /// started. Zero renders no region; the rows are on `/logs?action=<name>`.
+    event_count: i64,
     /// CLAUDE-42: current state of the "Show empty runs" toggle. Threaded into
     /// the poll-region `hx-get` so the choice survives the 5s self-refresh.
     show_empty: bool,
@@ -1456,24 +1464,18 @@ async fn action_detail(
     // CLAUDE-147: input/poll-phase diagnostics (VCS probe failures, no-VCS
     // drops) recorded by `gather()`. Queried by action name independent of any
     // run row, so a zero-job poll's events are surfaced too.
-    // CLAUDE-171: summarised, not dumped. A diagnostic that re-fires every poll
-    // used to fill the whole region with byte-identical rows; the summary keeps
-    // the first 5 distinct groups of the current serve, each with its repeat
-    // count. The full undeduplicated list lives behind "View error log".
+    // CLAUDE-235: counted, not dumped. A diagnostic that re-fires every poll used
+    // to fill the whole region with byte-identical rows; the page now states how
+    // many there are and links to the one log screen for the rows themselves.
     let started_at = crate::settings::serve_started_at(pool).await?;
-    let events = state::run_events_summary_for_action(
-        pool,
-        &name,
-        started_at.as_deref(),
-        ACTION_EVENT_SUMMARY_LIMIT,
-    )
-    .await?;
+    let event_count =
+        state::run_events_count_for_action(pool, &name, started_at.as_deref()).await?;
     let tpl = ActionDetailTpl {
         version: s.api.version,
         action,
         paused,
         runs,
-        events,
+        event_count,
         show_empty: q.show_empty,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
@@ -1527,18 +1529,37 @@ async fn action_durations(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-// ---- input-event log page (CLAUDE-171) ------------------------------------
+// ---- logs page (CLAUDE-171, made global in CLAUDE-235) ---------------------
 //
-// The action-detail region summarises; this page is the full record. It lists
-// every `run_events` row with no dedup, filtered by whitelisted Level / Action /
-// Context selections, a parameterized message substring search, and a
-// since-this-serve vs all-time window, sorted by time and paginated. The
-// filter/whitelist/HTMX shape is the dashboard's (`RunsView`, CLAUDE-141/142):
-// every user-supplied value is validated server-side before it reaches SQL, and
-// every control morph-swaps the table region in place.
+// The one diagnostics screen. It lists every `run_events` row with no dedup,
+// filtered by whitelisted Level / Action / Context selections, a parameterized
+// message substring search, and a since-this-serve / last-24h / all-time window,
+// sorted by time and paginated. The dashboard and the action page only count;
+// this page is the record. The filter/whitelist/HTMX shape is the dashboard's
+// (`RunsView`, CLAUDE-141/142): every user-supplied value is validated
+// server-side before it reaches SQL, and every control morph-swaps the table
+// region in place.
 
-/// CLAUDE-171: rows per page on the error-log table.
+/// CLAUDE-171: rows per page on the log table.
 const EVENTS_PAGE_SIZE: i64 = 50;
+
+/// CLAUDE-235: rows per grouped summary card on the logs page. A card is a
+/// signal, not a second log; the table below carries the rest.
+const EVENTS_SUMMARY_LIMIT: i64 = 10;
+
+/// CLAUDE-235: the dashboard banner and the logs summary count every matching
+/// event rather than rendering a bounded table, so the access-failure read takes
+/// no upper bound (SQLite treats a negative `LIMIT` as unlimited). A silently
+/// truncated count would understate an outage.
+const ACCESS_FAILURE_NO_LIMIT: i64 = -1;
+
+/// CLAUDE-216 / CLAUDE-235: start of the 24h diagnostics window shared by the
+/// dashboard banner, the logs summary cards, and the logs page's `since=24h`
+/// selection, so the three never disagree about what "last 24h" means.
+fn events_window_start() -> String {
+    (chrono::Utc::now() - chrono::Duration::hours(24))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
 
 /// CLAUDE-171: distinct `level` values present in `run_events`, alphabetically.
 /// Drives the Level dropdown and whitelists the incoming `?level=`.
@@ -1577,7 +1598,7 @@ async fn distinct_event_contexts(pool: &SqlitePool) -> Result<Vec<String>, WebEr
 }
 
 /// CLAUDE-171: whitelisted filter + sort selection for the error-log table. The
-/// `RunsView` sibling: every field is validated in [`action_events`] before it
+/// `RunsView` sibling: every field is validated in [`logs`] before it
 /// lands here (`dir`/`since` against fixed allow-lists, `level`/`action`/
 /// `context` against the actual distinct DB values), so nothing user-controlled
 /// reaches the SQL text and every string echoed back into the page or a query
@@ -1593,7 +1614,9 @@ struct EventsView {
     action: String,
     /// Exact `context` to filter to, or empty for all.
     context: String,
-    /// `all` for all-time; empty (the default) bounds to the current serve.
+    /// `all` for all-time, `24h` for the last 24 hours (the window the summary
+    /// cards and the dashboard banner count); empty (the default) bounds to the
+    /// current serve.
     since: String,
     /// Free-text message substring (bound as a parameter, never interpolated).
     q: String,
@@ -1603,6 +1626,13 @@ impl EventsView {
     /// Whether the all-time window is selected (the since toggle's non-default).
     fn all_time(&self) -> bool {
         self.since == "all"
+    }
+
+    /// CLAUDE-235: whether the last-24h window is selected. It is what the
+    /// summary cards and the dashboard banner link to, so a count and the rows
+    /// behind it cover the same window.
+    fn last_24h(&self) -> bool {
+        self.since == "24h"
     }
 
     /// SQL `ORDER BY` for the When column. The only sortable column, so just the
@@ -1641,7 +1671,13 @@ impl EventsView {
             conds.push("instr(lower(message), ?) > 0".to_string());
             binds.push(self.q.to_ascii_lowercase());
         }
-        if !self.all_time() {
+        // CLAUDE-235: three windows, one bound. `all` leaves it off, `24h` uses
+        // the shared 24h start, and the default follows the current serve (an
+        // unstamped DB leaves it unbounded rather than hiding every row).
+        if self.last_24h() {
+            conds.push("ts >= ?".to_string());
+            binds.push(events_window_start());
+        } else if !self.all_time() {
             if let Some(start) = started_at {
                 conds.push("ts >= ?".to_string());
                 binds.push(start.to_string());
@@ -1749,12 +1785,9 @@ async fn fetch_run_events(
 }
 
 #[derive(Template)]
-#[template(path = "action_events.html")]
-struct ActionEventsTpl {
+#[template(path = "logs.html")]
+struct LogsTpl {
     version: &'static str,
-    /// The action the page was entered from. Seeds the Action filter default and
-    /// the breadcrumb; the filter itself may point elsewhere.
-    action_name: String,
     events: Vec<state::RunEventLogRecord>,
     page: PageNav,
     view: EventsView,
@@ -1764,14 +1797,21 @@ struct ActionEventsTpl {
     /// The current serve's start, for the since-toggle label. `None` renders the
     /// all-time-only degraded state (no serve has stamped this DB).
     started_at: Option<String>,
+    /// CLAUDE-235: last-24h `warn`/`error` counts grouped by `context`, busiest
+    /// first. Independent of the active filter: it is the way in to a filter,
+    /// not a summary of one.
+    by_context: Vec<state::RunEventCount>,
+    /// CLAUDE-235: the same 24h counts grouped by `action_name`.
+    by_action: Vec<state::RunEventCount>,
 }
 
-/// CLAUDE-171: query params for the error-log page. `action` is `Option` so an
-/// absent param (the link from the action page) can default to the route's
-/// action, while an explicit empty `?action=` (the dropdown's "all") widens to
-/// every action. Every other filter's empty value already means "all".
+/// CLAUDE-171: query params for the logs page. CLAUDE-235: `action` stays
+/// `Option` for symmetry with the other filters, but an absent param now means
+/// every action (the page is global); an explicit `?action=<name>` narrows it,
+/// which is what the redirect from `/actions/<name>/events` and the links from
+/// the action page and the summary cards send.
 #[derive(Deserialize, Default)]
-struct ActionEventsQuery {
+struct LogsQuery {
     #[serde(default)]
     dir: String,
     #[serde(default)]
@@ -1787,18 +1827,16 @@ struct ActionEventsQuery {
     page: Option<i64>,
 }
 
-async fn action_events(
-    State(s): State<WebState>,
-    AxumPath(name): AxumPath<String>,
-    Query(q): Query<ActionEventsQuery>,
-) -> Result<Response, WebError> {
+/// CLAUDE-235: the log page moved from `/actions/:name/events` to the global
+/// `/logs`. The old route stays as a permanent redirect that carries the action
+/// into the Action filter, so links, bookmarks and old READMEs still land on the
+/// same rows.
+async fn action_events_redirect(AxumPath(name): AxumPath<String>) -> Redirect {
+    Redirect::permanent(&format!("/logs?action={name}"))
+}
+
+async fn logs(State(s): State<WebState>, Query(q): Query<LogsQuery>) -> Result<Response, WebError> {
     let pool = &s.api.pool;
-    // 404 unknown actions cleanly, like the durations chart: only names the
-    // daemon has indexed (plus the synthetic webhook action) resolve.
-    let known_synthetic = synthetic_enabled(&s, &name);
-    if !known_synthetic && indexed_action_path(pool, &name).await?.is_none() {
-        return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
-    }
 
     // Whitelist every selection before it reaches SQL or the page. `dir`/`since`
     // check against fixed allow-lists; Level/Action/Context are kept only when
@@ -1807,22 +1845,38 @@ async fn action_events(
     // instead of echoing arbitrary input.
     let level_options = distinct_event_levels(pool).await?;
     let context_options = distinct_event_contexts(pool).await?;
-    // The route's action is always offered even when it has no events yet, so
-    // the default selection is always a real option in the dropdown.
     let mut action_options = distinct_event_actions(pool).await?;
-    if !action_options.contains(&name) {
-        action_options.push(name.clone());
-        action_options.sort();
+    // CLAUDE-235: an action the daemon has indexed (or the synthetic webhook
+    // action) is a legitimate filter even with no events yet, since the action
+    // page links here unconditionally. Anything else drops to "all" rather than
+    // being echoed back into the page.
+    if let Some(requested) = q.action.as_deref().filter(|a| !a.is_empty()) {
+        if !action_options.iter().any(|a| a == requested)
+            && (synthetic_enabled(&s, requested)
+                || indexed_action_path(pool, requested).await?.is_some())
+        {
+            action_options.push(requested.to_string());
+            action_options.sort();
+        }
     }
     let view = EventsView {
         dir: if q.dir == "asc" { "asc" } else { "desc" }.to_string(),
         level: whitelist_member(&q.level, &level_options),
-        // Absent => this action; present (including "") => the user's choice.
-        action: whitelist_member(q.action.as_deref().unwrap_or(&name), &action_options),
+        // Absent or unknown => every action.
+        action: whitelist_member(q.action.as_deref().unwrap_or(""), &action_options),
         context: whitelist_member(&q.context, &context_options),
-        since: whitelisted(&q.since, &["all"]),
+        since: whitelisted(&q.since, &["all", "24h"]),
         q: q.q.clone(),
     };
+
+    // CLAUDE-235: the summary cards, over a fixed 24h window at warn/error. They
+    // are the entry point the dashboard banner sends the operator to, so they do
+    // not narrow with the table's filter.
+    let window = events_window_start();
+    let by_context =
+        state::run_events_grouped_by_context(pool, &window, EVENTS_SUMMARY_LIMIT).await?;
+    let by_action =
+        state::run_events_grouped_by_action(pool, &window, EVENTS_SUMMARY_LIMIT).await?;
 
     let started_at = crate::settings::serve_started_at(pool).await?;
     let total = count_run_events(pool, &view, started_at.as_deref()).await?;
@@ -1840,9 +1894,8 @@ async fn action_events(
         has_prev: page > 1,
         has_next: page < total_pages,
     };
-    let tpl = ActionEventsTpl {
+    let tpl = LogsTpl {
         version: s.api.version,
-        action_name: name,
         events,
         page: page_nav,
         view,
@@ -1850,6 +1903,8 @@ async fn action_events(
         action_options,
         context_options,
         started_at,
+        by_context,
+        by_action,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
@@ -5091,7 +5146,9 @@ mod tests {
                 has_prev: false,
                 has_next: false,
             },
-            access_failures: vec![],
+            events_24h: 0,
+            access_failure_events: 0,
+            access_failure_groups: 0,
             stale_gates: vec![],
             view,
             action_options: vec!["YouTrack".to_string(), "forgejo".to_string()],
@@ -5193,7 +5250,9 @@ mod tests {
                 has_prev: false,
                 has_next: false,
             },
-            access_failures: vec![],
+            events_24h: 0,
+            access_failure_events: 0,
+            access_failure_groups: 0,
             stale_gates,
             view: RunsView::default(),
             action_options: vec![],
@@ -5372,10 +5431,10 @@ mod tests {
     mod editor {
         use super::super::{
             action_create, action_delete, action_detail, action_edit_page, action_edit_save,
-            action_events, action_export, action_to_youtrack_form, settings_page, settings_save,
-            youtrack_create, youtrack_edit_page, youtrack_edit_save, youtrack_form_to_yaml,
-            youtrack_new_page, ActionDetailQuery, ActionEventsQuery, ActionForm, EventsView,
-            SettingsForm, WebState, YoutrackEditForm, ACTION_EVENT_SUMMARY_LIMIT,
+            action_events_redirect, action_export, action_to_youtrack_form, dashboard, logs,
+            settings_page, settings_save, youtrack_create, youtrack_edit_page, youtrack_edit_save,
+            youtrack_form_to_yaml, youtrack_new_page, ActionDetailQuery, ActionForm,
+            DashboardQuery, EventsView, LogsQuery, SettingsForm, WebState, YoutrackEditForm,
         };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
@@ -5459,10 +5518,12 @@ mod tests {
 
         #[tokio::test]
         async fn action_detail_renders_input_events_region() {
-            // CLAUDE-147: a recorded probe-failure event is rendered on the
-            // action-detail page (message + var(--bad) styling), surfacing the
-            // poll/input-phase error that has no per-job outcome row. Covers the
-            // zero-job-poll case: the event has a NULL run_id and still shows.
+            // CLAUDE-147: a recorded probe-failure event is surfaced on the
+            // action-detail page, so the poll/input-phase error that has no
+            // per-job outcome row is not invisible. Covers the zero-job-poll
+            // case: the event has a NULL run_id and still counts.
+            // CLAUDE-235: the region is one counted line linking to the Logs
+            // screen; the message text itself is no longer rendered here.
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             let actions = s.paths.actions_dir();
@@ -5496,10 +5557,11 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
             let body = body_string(resp).await;
             assert!(body.contains("Input errors / warnings"));
-            assert!(body.contains("VCS probe failed"));
-            assert!(body.contains("VS"));
-            // The warn level renders with the bad badge / var(--bad) styling.
-            assert!(body.contains("var(--bad)"));
+            assert!(body.contains("1 poll/input-phase diagnostics"));
+            assert!(body.contains(r#"href="/logs?action=youtrack""#));
+            // The wall of message text is what CLAUDE-235 removed: the rows live
+            // on the Logs screen, which the line above links to.
+            assert!(!body.contains("VCS probe failed"));
         }
 
         /// Record `n` byte-identical input events for `action`, one per poll
@@ -5529,13 +5591,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn action_detail_collapses_repeated_events_into_one_counted_row() {
-            // CLAUDE-171: the motivating case. The CLAUDE-164 config-collision
-            // warn is recorded on every 5s poll; the region used to render one
-            // byte-identical row per poll, burying every other diagnostic. It
-            // must now collapse to a single row carrying the occurrence count
-            // and the first/last-seen stamps, and the distinct probe failure
-            // recorded alongside it must still be visible.
+        async fn action_detail_counts_repeated_events_instead_of_listing_them() {
+            // CLAUDE-171 / CLAUDE-235: the motivating case. The CLAUDE-164
+            // config-collision warn is recorded on every 5s poll; the region used
+            // to render one byte-identical row per poll, burying every other
+            // diagnostic. It is now a single counted line, and no message text
+            // reaches the page at all.
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             let actions = s.paths.actions_dir();
@@ -5571,24 +5632,6 @@ mod tests {
             )
             .await;
 
-            let groups = state::run_events_summary_for_action(
-                &s.api.pool,
-                "youtrack",
-                Some("2999-01-01T00:00:00Z"),
-                ACTION_EVENT_SUMMARY_LIMIT,
-            )
-            .await
-            .unwrap();
-            // Four identical rows + one distinct row collapse to two groups,
-            // ordered by first occurrence ascending.
-            assert_eq!(groups.len(), 2);
-            assert_eq!(groups[0].count, 4);
-            assert_eq!(groups[0].first_ts, "2999-01-01T00:00:00Z");
-            assert_eq!(groups[0].last_ts, "2999-01-01T00:00:15Z");
-            assert_eq!(groups[0].context.as_deref(), Some("config-collision"));
-            assert_eq!(groups[1].count, 1);
-            assert_eq!(groups[1].context.as_deref(), Some("VS"));
-
             let resp = action_detail(
                 State(s.clone()),
                 AxumPath("youtrack".to_string()),
@@ -5598,20 +5641,18 @@ mod tests {
             .unwrap()
             .into_response();
             let body = body_string(resp).await;
-            // One row for the flood, carrying its repeat count, and the distinct
-            // diagnostic is not buried.
-            assert_eq!(body.matches("duplicate source").count(), 1);
-            assert!(body.contains("&times;4"));
-            assert!(body.contains("VCS probe failed"));
-            assert!(body.contains("View error log"));
+            // One line stating five diagnostics, and not one message body.
+            assert!(body.contains("5 poll/input-phase diagnostics"));
+            assert!(!body.contains("duplicate source"));
+            assert!(!body.contains("VCS probe failed"));
+            assert!(body.contains(r#"href="/logs?action=youtrack""#));
         }
 
         #[tokio::test]
-        async fn action_detail_summary_is_bounded_to_five_since_serve_start() {
-            // CLAUDE-171: two halves of the same contract. Events from a
-            // previous daemon lifetime (ts < started_at) are out of the window,
-            // and the current lifetime's distinct groups are capped at the first
-            // 5 by first occurrence.
+        async fn action_detail_count_is_bounded_to_this_serve() {
+            // CLAUDE-171 / CLAUDE-235: events from a previous daemon lifetime
+            // (ts < started_at) are out of the window, so the count is what this
+            // serve has recorded and not the whole retained history.
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             let actions = s.paths.actions_dir();
@@ -5619,6 +5660,9 @@ mod tests {
             let file = actions.join("youtrack.yml");
             std::fs::write(&file, NATIVE_MINIMAL).unwrap();
             index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
+            crate::settings::record_serve_start(&s.api.pool)
+                .await
+                .unwrap();
 
             record_repeats(
                 &s.api.pool,
@@ -5629,8 +5673,6 @@ mod tests {
                 &["2000-01-01T00:00:00Z"],
             )
             .await;
-            // Seven distinct diagnostics in this lifetime; only the first five
-            // by first-seen may render.
             for i in 0..7 {
                 record_repeats(
                     &s.api.pool,
@@ -5643,34 +5685,24 @@ mod tests {
                 .await;
             }
 
-            let groups = state::run_events_summary_for_action(
-                &s.api.pool,
-                "youtrack",
-                Some("2999-01-01T00:00:00Z"),
-                ACTION_EVENT_SUMMARY_LIMIT,
+            let resp = action_detail(
+                State(s.clone()),
+                AxumPath("youtrack".to_string()),
+                Query(ActionDetailQuery::default()),
             )
             .await
-            .unwrap();
-            assert_eq!(groups.len() as i64, ACTION_EVENT_SUMMARY_LIMIT);
-            let messages: Vec<&str> = groups.iter().map(|g| g.message.as_str()).collect();
-            assert_eq!(
-                messages,
-                vec![
-                    "probe failure 0",
-                    "probe failure 1",
-                    "probe failure 2",
-                    "probe failure 3",
-                    "probe failure 4",
-                ]
-            );
-            assert!(groups.iter().all(|g| g.message != "from a previous serve"));
+            .unwrap()
+            .into_response();
+            let body = body_string(resp).await;
+            assert!(body.contains("7 poll/input-phase diagnostics"), "{body}");
         }
 
         #[tokio::test]
         async fn action_events_page_lists_every_event_undeduplicated() {
-            // CLAUDE-171: the log page is the summary's opposite: the same four
-            // identical rows the action page collapses to one must all appear
+            // CLAUDE-171: the log page is the counters' opposite: the same four
+            // identical rows the action page states as a count must all appear
             // here, with their owning action rendered in the Action column.
+            // CLAUDE-235: served by `/logs`, with no action in the path.
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             let actions = s.paths.actions_dir();
@@ -5697,14 +5729,10 @@ mod tests {
             )
             .await;
 
-            let resp = action_events(
-                State(s.clone()),
-                AxumPath("youtrack".to_string()),
-                Query(ActionEventsQuery::default()),
-            )
-            .await
-            .unwrap()
-            .into_response();
+            let resp = logs(State(s.clone()), Query(LogsQuery::default()))
+                .await
+                .unwrap()
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = body_string(resp).await;
             // No dedup: one row per recorded event, and the count says four.
@@ -5715,26 +5743,176 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn action_events_page_404s_unknown_action() {
+        async fn action_events_route_permanently_redirects_to_logs() {
+            // CLAUDE-235: the old per-action route keeps working, landing on the
+            // global page with the action already selected in the Action filter.
+            // Driven through the router, so the registration is proven too.
+            use tower::ServiceExt;
+            let resp = action_events_redirect(AxumPath("youtrack".to_string()))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                resp.headers().get("location").unwrap(),
+                "/logs?action=youtrack"
+            );
+
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
-            let resp = action_events(
+            let app = super::super::router(
+                s.api.clone(),
+                s.paths.clone(),
+                s.webhook_enabled,
+                s.comment_webhook_enabled,
+            );
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/actions/youtrack/events")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(
+                resp.headers().get("location").unwrap(),
+                "/logs?action=youtrack"
+            );
+        }
+
+        #[tokio::test]
+        async fn logs_route_serves_the_page() {
+            // CLAUDE-235: `/logs` is registered and needs no action in the path.
+            use tower::ServiceExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let app = super::super::router(
+                s.api.clone(),
+                s.paths.clone(),
+                s.webhook_enabled,
+                s.comment_webhook_enabled,
+            );
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/logs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            // The nav entry and the page's own heading / filters.
+            assert!(body.contains(r#"<a href="/logs">Logs</a>"#));
+            assert!(body.contains("<h2>Logs</h2>"));
+            assert!(body.contains(r#"name="level""#));
+            assert!(body.contains(r#"name="action""#));
+            assert!(body.contains(r#"name="context""#));
+            assert!(body.contains(r#"name="since""#));
+        }
+
+        #[tokio::test]
+        async fn logs_page_unknown_action_param_widens_to_all_actions() {
+            // CLAUDE-235: the page is global, so an action that is not a distinct
+            // value in `run_events` drops to "all" (the whitelist) instead of the
+            // 404 the per-action route used to return.
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            crate::settings::record_serve_start(&s.api.pool)
+                .await
+                .unwrap();
+            record_repeats(
+                &s.api.pool,
+                "youtrack",
+                "warn",
+                "VS",
+                "VCS probe failed",
+                &["2999-01-01T00:00:00Z"],
+            )
+            .await;
+
+            let resp = logs(
                 State(s.clone()),
-                AxumPath("nope".to_string()),
-                Query(ActionEventsQuery::default()),
+                Query(LogsQuery {
+                    action: Some("nope".to_string()),
+                    ..Default::default()
+                }),
             )
             .await
             .unwrap()
             .into_response();
-            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(body_string(resp).await.contains("VCS probe failed"));
+        }
+
+        #[tokio::test]
+        async fn logs_page_summarises_the_last_24h_by_context_and_action() {
+            // CLAUDE-235: the two summary cards count `warn`/`error` events in
+            // the last 24h and link each row back to the same page with that
+            // filter applied. `info` rows are markers, not signals, and stay out.
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            crate::settings::record_serve_start(&s.api.pool)
+                .await
+                .unwrap();
+            let now = state::now_iso();
+            state::run_events_record(
+                &s.api.pool,
+                "youtrack",
+                &now,
+                &[
+                    state::InputEvent {
+                        level: "warn".into(),
+                        context: Some("CLAUDE".into()),
+                        message: "probe failed".into(),
+                    },
+                    state::InputEvent {
+                        level: "error".into(),
+                        context: Some("CLAUDE".into()),
+                        message: "clone failed".into(),
+                    },
+                    state::InputEvent {
+                        level: "info".into(),
+                        context: Some("QUIET".into()),
+                        message: "preflight passed".into(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+            let resp = logs(State(s.clone()), Query(LogsQuery::default()))
+                .await
+                .unwrap()
+                .into_response();
+            let body = body_string(resp).await;
+            assert!(body.contains("Last 24h by context"));
+            assert!(body.contains("Last 24h by action"));
+            // Each row is a link that applies its own filter over the same 24h
+            // window. Askama escapes the `&` joiner.
+            assert!(
+                body.contains(r#"href="/logs?since=24h&amp;context=CLAUDE""#),
+                "{body}"
+            );
+            assert!(
+                body.contains(r#"href="/logs?since=24h&amp;action=youtrack""#),
+                "{body}"
+            );
+            // The `info` marker is counted by neither card (it is still listed in
+            // the table below and offered in the Context filter).
+            assert!(!body.contains(r#"href="/logs?since=24h&amp;context=QUIET""#));
         }
 
         #[tokio::test]
         async fn action_events_filters_are_whitelisted_and_applied() {
-            // CLAUDE-171: every filter narrows the list, the route's action is
-            // the default Action selection, and a value that is not an actual
-            // distinct DB value drops to "all" instead of reaching SQL or being
-            // echoed back into the page.
+            // CLAUDE-171: every filter narrows the list, and a value that is not
+            // an actual distinct DB value drops to "all" instead of reaching SQL
+            // or being echoed back into the page. CLAUDE-235: the default is now
+            // every action, and `since=24h` is a third window.
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             let actions = s.paths.actions_dir();
@@ -5786,27 +5964,54 @@ mod tests {
             )
             .await;
 
-            async fn render(s: &WebState, name: &str, q: ActionEventsQuery) -> String {
-                let resp = action_events(State(s.clone()), AxumPath(name.to_string()), Query(q))
+            async fn render(s: &WebState, q: LogsQuery) -> String {
+                let resp = logs(State(s.clone()), Query(q))
                     .await
                     .unwrap()
                     .into_response();
                 body_string(resp).await
             }
 
-            // Default: this action, current serve. The other action's event and
-            // the previous lifetime's event are both out.
-            let body = render(&s, "youtrack", ActionEventsQuery::default()).await;
+            // Default: every action, current serve. Only the previous lifetime's
+            // event is out.
+            let body = render(&s, LogsQuery::default()).await;
             assert!(body.contains("VCS probe failed"));
             assert!(body.contains("no enabled VCS integration"));
-            assert!(!body.contains("duplicate source detected"));
+            assert!(body.contains("duplicate source detected"));
             assert!(!body.contains("ancient probe failure"));
+
+            // Action filter: the link from the action page and the redirect.
+            let body = render(
+                &s,
+                LogsQuery {
+                    action: Some("youtrack".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(body.contains("VCS probe failed"));
+            assert!(!body.contains("duplicate source detected"));
+
+            // An indexed action with no events at all keeps its selection rather
+            // than silently widening to every action: the action page links here
+            // whether or not the action has recorded anything.
+            let quiet = actions.join("quiet.yml");
+            std::fs::write(&quiet, NATIVE_MINIMAL).unwrap();
+            index_action(&s.api.pool, "quiet", quiet.to_str().unwrap()).await;
+            let body = render(
+                &s,
+                LogsQuery {
+                    action: Some("quiet".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(body.contains("No input events match this filter"), "{body}");
 
             // Level filter.
             let body = render(
                 &s,
-                "youtrack",
-                ActionEventsQuery {
+                LogsQuery {
                     level: "info".to_string(),
                     ..Default::default()
                 },
@@ -5815,25 +6020,10 @@ mod tests {
             assert!(body.contains("no enabled VCS integration"));
             assert!(!body.contains("VCS probe failed"));
 
-            // Action filter widened to all: the other action's event appears.
-            let body = render(
-                &s,
-                "youtrack",
-                ActionEventsQuery {
-                    action: Some(String::new()),
-                    ..Default::default()
-                },
-            )
-            .await;
-            assert!(body.contains("duplicate source detected"));
-            assert!(body.contains("VCS probe failed"));
-
             // Context filter.
             let body = render(
                 &s,
-                "youtrack",
-                ActionEventsQuery {
-                    action: Some(String::new()),
+                LogsQuery {
                     context: "config-collision".to_string(),
                     ..Default::default()
                 },
@@ -5845,8 +6035,7 @@ mod tests {
             // Message substring search, case-insensitive.
             let body = render(
                 &s,
-                "youtrack",
-                ActionEventsQuery {
+                LogsQuery {
                     q: "PROBE".to_string(),
                     ..Default::default()
                 },
@@ -5855,25 +6044,35 @@ mod tests {
             assert!(body.contains("VCS probe failed"));
             assert!(!body.contains("no enabled VCS integration"));
 
-            // Since toggle: all-time reaches the previous lifetime's event.
+            // Since toggle: all-time reaches the previous lifetime's event, and
+            // the 24h window the summary cards link to does not.
             let body = render(
                 &s,
-                "youtrack",
-                ActionEventsQuery {
+                LogsQuery {
                     since: "all".to_string(),
                     ..Default::default()
                 },
             )
             .await;
             assert!(body.contains("ancient probe failure"));
+            let body = render(
+                &s,
+                LogsQuery {
+                    since: "24h".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(body.contains("Showing events from the last 24 hours"));
+            assert!(body.contains("VCS probe failed"));
+            assert!(!body.contains("ancient probe failure"));
 
             // A hand-edited value that is not a distinct DB value drops to "all"
             // rather than filtering or being echoed into the page.
             let injected = "' OR 1=1 --";
             let body = render(
                 &s,
-                "youtrack",
-                ActionEventsQuery {
+                LogsQuery {
                     level: injected.to_string(),
                     context: injected.to_string(),
                     action: Some(injected.to_string()),
@@ -5888,6 +6087,89 @@ mod tests {
             // (current serve) window on `since`.
             assert!(body.contains("duplicate source detected"));
             assert!(!body.contains("ancient probe failure"));
+        }
+
+        #[tokio::test]
+        async fn dashboard_banner_counts_events_and_names_the_access_subset() {
+            // CLAUDE-235: the dashboard states how many diagnostics there are and
+            // links to the Logs screen; it renders none of the message text that
+            // used to fill the first screen. CLAUDE-216: the repo-access subset
+            // is named separately (its remedy is the access check) and clears
+            // itself once a later poll records the recovery marker.
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let failure = format!(
+                "{} for `contoso/claude-run` on dev.a8n.run; issues skipped this poll",
+                state::ACCESS_FAILURE_PREFIX
+            );
+            // Stamps inside the 24h window and strictly ordered: the recovery
+            // marker only supersedes a failure recorded before it.
+            state::run_events_record(
+                &s.api.pool,
+                "youtrack",
+                "2999-01-01T00:00:00Z",
+                &[
+                    state::InputEvent {
+                        level: "warn".into(),
+                        context: Some("CLAUDE".into()),
+                        message: failure.clone(),
+                    },
+                    state::InputEvent {
+                        level: "warn".into(),
+                        context: Some("CLAUDE".into()),
+                        message: "duplicate source detected".into(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+            let body = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                body.contains("2 errors / warnings in the last 24h"),
+                "{body}"
+            );
+            assert!(body.contains("1 of them are still-open repo-access failures"));
+            assert!(body.contains(r#"href="/logs?since=24h""#));
+            // The messages themselves stay on the Logs screen.
+            assert!(!body.contains("duplicate source detected"));
+            assert!(!body.contains(state::ACCESS_FAILURE_PREFIX));
+
+            // A later passing preflight clears the access subset; the headline
+            // count keeps the other diagnostic.
+            state::run_events_record(
+                &s.api.pool,
+                "youtrack",
+                "2999-01-01T00:00:10Z",
+                &[state::InputEvent {
+                    level: "info".into(),
+                    context: Some("CLAUDE".into()),
+                    message: format!(
+                        "{} for `contoso/claude-run` on dev.a8n.run",
+                        state::ACCESS_RECOVERY_PREFIX
+                    ),
+                }],
+            )
+            .await
+            .unwrap();
+            let body = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                body.contains("2 errors / warnings in the last 24h"),
+                "{body}"
+            );
+            assert!(!body.contains("still-open repo-access failures"));
         }
 
         #[test]
