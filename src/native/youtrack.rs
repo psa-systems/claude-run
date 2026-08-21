@@ -921,8 +921,14 @@ async fn process_job(
 
     // YouTrack jobs always carry a stable key (idReadable), so the attempt cap
     // always applies.
+    // CLAUDE-232: `warn`, not `info`: the issue keeps its Queued field value, so
+    // it re-enters the candidate set and is skipped again on every poll.
     if attempts >= limits.max_attempts_per_key {
-        info!(action = %action.name, key = %key, attempts, "skipping job, attempt cap reached");
+        warn!(
+            action = %action.name, key = %key, attempts,
+            cap = limits.max_attempts_per_key,
+            "skipping job, attempt cap reached"
+        );
         return Ok(ProcessedJob::CapHit { key: key.clone() });
     }
 

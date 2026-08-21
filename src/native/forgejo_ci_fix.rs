@@ -361,8 +361,14 @@ async fn process_job(
     let attempts = state::attempts_get(ctx.pool, &action.name, key).await?;
     // CI-fix jobs always carry a stable key (the head SHA), so the per-commit
     // attempt cap always applies.
+    // CLAUDE-232: `warn`, not `info`: nothing else records the skip, and the
+    // failing commit stays a candidate until someone looks.
     if attempts >= limits.max_attempts_per_key {
-        info!(action = %action.name, key = %key, attempts, "skipping job, attempt cap reached");
+        warn!(
+            action = %action.name, key = %key, attempts,
+            cap = limits.max_attempts_per_key,
+            "skipping job, attempt cap reached"
+        );
         return Ok(ProcessedJob::CapHit { key: key.clone() });
     }
 

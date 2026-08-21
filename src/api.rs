@@ -121,6 +121,10 @@ struct StatusResponse {
     /// threshold, so an operator without the web UI sees the same signal the
     /// dashboard banner shows.
     stale_gates: Vec<state::StaleGate>,
+    /// CLAUDE-232: keys parked at their action's per-key attempt cap. They are
+    /// skipped on every poll with no outcome and no event row, so this is the
+    /// only machine-readable report of a queue that has stopped moving.
+    attempt_cap_hits: Vec<state::CappedKey>,
     actions: Vec<ActionStatus>,
 }
 
@@ -191,6 +195,17 @@ async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusRespons
             reason: r,
         });
     let actions = state::action_index_list(&s.pool).await?;
+    // CLAUDE-232: resolve each action's cap before the rows are consumed below.
+    // Reading the YAML touches disk, hence `in_place`.
+    let defaults = crate::job::RunnerDefaults::default();
+    let caps = crate::blocking::in_place(|| crate::job::attempt_caps(&actions, &defaults));
+    let attempt_cap_hits = state::attempt_cap_hits(
+        &s.pool,
+        &caps,
+        defaults.max_attempts_per_key,
+        state::ATTEMPT_CAP_HITS_LIMIT,
+    )
+    .await?;
     let mut out = Vec::with_capacity(actions.len());
     for a in actions {
         let paused = state::action_pause_status(&s.pool, &a.name)
@@ -221,6 +236,7 @@ async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusRespons
             20,
         )
         .await?,
+        attempt_cap_hits,
         actions: out,
     }))
 }
@@ -897,6 +913,43 @@ mod tests {
         assert_eq!(status.stale_gates.len(), 1, "{:?}", status.stale_gates);
         assert_eq!(status.stale_gates[0].job_key, "AUD-31");
         assert!(status.stale_gates[0].recheck_overdue_ms > 0);
+    }
+
+    /// CLAUDE-232: `/status` carries the parked-at-cap block. The skip writes no
+    /// outcome and no event row, so without this an operator scripting against
+    /// the API cannot tell a stalled queue from an idle one.
+    #[tokio::test]
+    async fn status_reports_keys_parked_at_the_attempt_cap() {
+        let s = app_state().await;
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert!(status.attempt_cap_hits.is_empty());
+
+        // The action has no index row here, so the default cap (3) applies.
+        for _ in 0..3 {
+            state::attempts_increment(&s.pool, "youtrack", "CLAUDE-9")
+                .await
+                .unwrap();
+        }
+        state::attempts_increment(&s.pool, "youtrack", "CLAUDE-8")
+            .await
+            .unwrap();
+
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert_eq!(
+            status.attempt_cap_hits.len(),
+            1,
+            "{:?}",
+            status.attempt_cap_hits
+        );
+        assert_eq!(status.attempt_cap_hits[0].job_key, "CLAUDE-9");
+        assert_eq!(status.attempt_cap_hits[0].action_name, "youtrack");
+        assert_eq!(
+            (
+                status.attempt_cap_hits[0].count,
+                status.attempt_cap_hits[0].cap
+            ),
+            (3, 3)
+        );
     }
 
     /// CLAUDE-61 / CLAUDE-220: no synthetic action can be deleted (none has a
