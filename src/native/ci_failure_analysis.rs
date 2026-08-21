@@ -224,8 +224,14 @@ async fn process_job(
     let started = Instant::now();
 
     let attempts = state::attempts_get(ctx.pool, &action.name, key).await?;
+    // CLAUDE-232: `warn`, not `info`: the analysis never runs again for this key
+    // and no outcome or event row records the skip.
     if attempts >= limits.max_attempts_per_key {
-        info!(action = %action.name, key, "attempt cap reached; skipping analysis");
+        warn!(
+            action = %action.name, key, attempts,
+            cap = limits.max_attempts_per_key,
+            "attempt cap reached; skipping analysis"
+        );
         return Ok(ProcessedJob::CapHit {
             key: key.to_string(),
         });

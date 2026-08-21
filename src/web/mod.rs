@@ -993,6 +993,9 @@ struct DashboardTpl {
     /// CLAUDE-225: dependency gates that have held an issue longer than
     /// [`state::STALE_GATE_AFTER_MS`]. Empty renders no banner.
     stale_gates: Vec<StaleGateRow>,
+    /// CLAUDE-232: keys parked at their action's per-key attempt cap. Empty
+    /// renders no banner.
+    attempt_cap_hits: Vec<state::CappedKey>,
     /// CLAUDE-141: whitelisted sort + filter selection, echoed into the header
     /// sort links, filter dropdowns, poll URL, and pagination links so the
     /// chosen view survives the morph poll.
@@ -1377,6 +1380,22 @@ async fn dashboard(
             .map(|gate| StaleGateRow { gate })
             .collect();
 
+    // CLAUDE-232: the sibling silent no-dispatch condition. A key at its
+    // action's `max_attempts_per_key` is skipped on every poll with no outcome
+    // row, no run event, and no field change, so the counter table is the only
+    // live record that the queue has stopped moving. The cap is per action, so
+    // resolve it from each indexed action's YAML (disk, hence `in_place`).
+    let index_rows = state::action_index_list(pool).await?;
+    let defaults = crate::job::RunnerDefaults::default();
+    let caps = crate::blocking::in_place(|| crate::job::attempt_caps(&index_rows, &defaults));
+    let attempt_cap_hits = state::attempt_cap_hits(
+        pool,
+        &caps,
+        defaults.max_attempts_per_key,
+        state::ATTEMPT_CAP_HITS_LIMIT,
+    )
+    .await?;
+
     let tpl = DashboardTpl {
         version: s.api.version,
         global_pause,
@@ -1394,6 +1413,7 @@ async fn dashboard(
         access_failure_events: access_failures.iter().map(|f| f.count).sum(),
         access_failure_groups: access_failures.len(),
         stale_gates,
+        attempt_cap_hits,
         view,
         action_options,
         triggered_options,
@@ -5150,6 +5170,7 @@ mod tests {
             access_failure_events: 0,
             access_failure_groups: 0,
             stale_gates: vec![],
+            attempt_cap_hits: vec![],
             view,
             action_options: vec!["YouTrack".to_string(), "forgejo".to_string()],
             triggered_options: vec!["schedule".to_string(), "webhook".to_string()],
@@ -5254,6 +5275,7 @@ mod tests {
             access_failure_events: 0,
             access_failure_groups: 0,
             stale_gates,
+            attempt_cap_hits: vec![],
             view: RunsView::default(),
             action_options: vec![],
             triggered_options: vec![],
@@ -5290,6 +5312,84 @@ mod tests {
         assert!(
             html.contains("overdue 20h 0m"),
             "overdue re-check not flagged: {html}"
+        );
+    }
+
+    /// CLAUDE-232: a key at its action's attempt cap renders the dashboard
+    /// banner with its action, key, count against the cap, and last attempt,
+    /// and the banner is absent entirely when nothing is parked.
+    #[test]
+    fn dashboard_banners_keys_parked_at_the_attempt_cap() {
+        use super::{DashboardTpl, PageNav, RunsView};
+        use crate::state;
+        use askama::Template;
+
+        let tpl = |attempt_cap_hits: Vec<state::CappedKey>| DashboardTpl {
+            version: "test",
+            global_pause: None,
+            today_runs: 0,
+            today_actions: 0,
+            today_cost: 0.0,
+            actions: vec![],
+            recent_runs: vec![],
+            show_empty: false,
+            search_q: String::new(),
+            in_stream: false,
+            search: None,
+            page: PageNav {
+                page: 1,
+                total_pages: 1,
+                total: 0,
+                start: 0,
+                end: 0,
+                has_prev: false,
+                has_next: false,
+            },
+            events_24h: 0,
+            access_failure_events: 0,
+            access_failure_groups: 0,
+            stale_gates: vec![],
+            attempt_cap_hits,
+            view: RunsView::default(),
+            action_options: vec![],
+            triggered_options: vec![],
+        };
+
+        let quiet = tpl(vec![]).render().expect("render dashboard");
+        assert!(
+            !quiet.contains("parked at the attempt cap"),
+            "nothing parked must render no banner: {quiet}"
+        );
+
+        let html = tpl(vec![state::CappedKey {
+            action_name: "youtrack".to_string(),
+            job_key: "CLAUDE-9".to_string(),
+            count: 3,
+            cap: 3,
+            last_at: "2026-08-11T07:30:00Z".to_string(),
+        }])
+        .render()
+        .expect("render dashboard");
+        assert!(
+            html.contains("Jobs parked at the attempt cap"),
+            "banner heading missing: {html}"
+        );
+        assert!(html.contains("CLAUDE-9"), "parked key missing: {html}");
+        assert!(
+            html.contains("/actions/youtrack"),
+            "link to the owning action missing: {html}"
+        );
+        assert!(
+            html.contains("3 / 3"),
+            "attempt count against the cap missing: {html}"
+        );
+        assert!(
+            html.contains("max_attempts_per_key"),
+            "banner must name the limit that parked the job: {html}"
+        );
+        assert!(
+            html.contains("AI Agent"),
+            "banner must say what releases the job: {html}"
         );
     }
 

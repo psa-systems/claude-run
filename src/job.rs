@@ -77,6 +77,40 @@ pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> Eff
     }
 }
 
+/// CLAUDE-232: the effective `max_attempts_per_key` per indexed action, for the
+/// operator surfaces that report which keys are parked at their cap. The index
+/// does not cache this limit, so each action's YAML is re-read; an action whose
+/// YAML already failed to parse is left out and reads as the default, since its
+/// parse error is surfaced on its own (the index row's `parse_error`).
+///
+/// Actions with no YAML at all (the synthetic webhook listeners) are absent by
+/// construction; they mint against `defaults`, which is what the caller passes
+/// as the fallback.
+pub fn attempt_caps(
+    rows: &[state::ActionIndexRow],
+    defaults: &RunnerDefaults,
+) -> std::collections::BTreeMap<String, u32> {
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows.iter().filter(|r| r.parse_error.is_none()) {
+        match crate::action::load_from_path(Path::new(&row.file_path)) {
+            Ok(loaded) => {
+                out.insert(
+                    row.name.clone(),
+                    effective_limits(defaults, &loaded).max_attempts_per_key,
+                );
+            }
+            // Read/parse failed for a row the index says parses: the file moved
+            // or changed under us. The default cap is the honest fallback, and
+            // the next scan re-indexes the row with its own `parse_error`.
+            Err(e) => warn!(
+                action = %row.name, path = %row.file_path, error = %e,
+                "cannot read action YAML for its attempt cap; assuming the default"
+            ),
+        }
+    }
+    out
+}
+
 pub struct JobContext<'a> {
     pub action: &'a LoadedAction,
     pub limits: EffectiveLimits,
@@ -197,8 +231,14 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     let key = job_key(ctx.action, job, idx);
     let attempts = state::attempts_get(ctx.pool, &action.name, &key).await?;
 
+    // CLAUDE-232: `warn`, not `info`: the job is parked for good (no outcome row,
+    // no run event, the source still lists it), so every poll skips it again.
     if attempts >= ctx.limits.max_attempts_per_key && action.dedup_key.is_some() {
-        info!(action = %action.name, key = %key, attempts, "skipping job, attempt cap reached");
+        warn!(
+            action = %action.name, key = %key, attempts,
+            cap = ctx.limits.max_attempts_per_key,
+            "skipping job, attempt cap reached"
+        );
         return Ok(ProcessedJob::CapHit { key });
     }
 
@@ -573,6 +613,60 @@ mod tests {
         let action = mk_action(None);
         let r = job_key(&action, &json!({"foo": "bar"}), 7);
         assert_eq!(r, "job-7");
+    }
+
+    /// CLAUDE-232: the cap the operator surfaces compare against is each
+    /// action's own `limits.max_attempts_per_key`, falling back to the runner
+    /// default. An action the index already flags as unparseable is skipped
+    /// (its parse error is its own signal) rather than reported with a guess.
+    #[test]
+    fn attempt_caps_resolve_per_action_over_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.path().join(format!("{name}.yml"));
+            std::fs::write(&p, body).unwrap();
+            p.display().to_string()
+        };
+        let capped = write(
+            "audit",
+            "name: audit\ninput:\n  command: 'x'\nprompt: 'y'\nlimits:\n  max_attempts_per_key: 2\n",
+        );
+        let plain = write(
+            "youtrack",
+            "name: youtrack\ninput:\n  command: 'x'\nprompt: 'y'\n",
+        );
+        let row = |name: &str, file_path: &str, parse_error: Option<&str>| state::ActionIndexRow {
+            name: name.to_string(),
+            file_path: file_path.to_string(),
+            yaml_sha256: String::new(),
+            enabled: true,
+            schedule_kind: None,
+            schedule_spec: None,
+            last_seen_at: String::new(),
+            parse_error: parse_error.map(str::to_string),
+            link_template: None,
+            max_parallel: 1,
+        };
+
+        let caps = attempt_caps(
+            &[
+                row("audit", &capped, None),
+                row("youtrack", &plain, None),
+                row("broken", "/nonexistent/broken.yml", Some("bad yaml")),
+            ],
+            &RunnerDefaults::default(),
+        );
+        assert_eq!(caps.get("audit").copied(), Some(2), "the YAML override");
+        assert_eq!(
+            caps.get("youtrack").copied(),
+            Some(3),
+            "no override, so the runner default"
+        );
+        assert_eq!(
+            caps.get("broken"),
+            None,
+            "an unparseable action is left to the caller's default: {caps:?}"
+        );
     }
 
     fn mk_action(dedup_key: Option<String>) -> LoadedAction {
