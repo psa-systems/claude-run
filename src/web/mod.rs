@@ -2508,6 +2508,9 @@ struct YoutrackEditForm {
     claude_cwd: String,
     claude_allowed_tools: String,
     claude_permission_mode: String,
+    /// CLAUDE-239: per-action `--model`; blank inherits the global
+    /// `config.claude.model`.
+    claude_model: String,
     limit_max_attempts_per_key: String,
     limit_max_runs_per_day: String,
     limit_claude_timeout_seconds: String,
@@ -2619,6 +2622,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         claude_cwd: s(&a.claude.cwd),
         claude_allowed_tools: s(&a.claude.allowed_tools),
         claude_permission_mode: s(&a.claude.permission_mode),
+        claude_model: s(&a.claude.model),
         limit_max_attempts_per_key: n(a.limits.max_attempts_per_key),
         limit_max_runs_per_day: n(a.limits.max_runs_per_day),
         limit_claude_timeout_seconds: n(a.limits.claude_timeout_seconds),
@@ -2855,6 +2859,7 @@ fn youtrack_form_to_yaml(
         cwd: opt(&form.claude_cwd),
         allowed_tools: opt(&form.claude_allowed_tools),
         permission_mode: opt(&form.claude_permission_mode),
+        model: opt(&form.claude_model),
     };
     set_or_remove(
         map,
@@ -3602,6 +3607,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "cadence (seconds) the scheduler starts overlapping pickup runs; >= 1.",
             },
         ],
+        Claude => vec![FieldDoc {
+            name: "model",
+            badge: "next invocation",
+            note: "default --model for every action that pins no claude.model; null = the claude CLI's own default. Passed through unvalidated (sonnet, opus, claude-sonnet-4-5-20250929, ...).",
+        }],
         DbRetention => vec![
             FieldDoc {
                 name: "enabled",
@@ -6538,6 +6548,7 @@ mod tests {
             f.schedule_kind = "interval".to_string();
             f.schedule_spec = "5m".to_string();
             f.claude_permission_mode = "acceptEdits".to_string();
+            f.claude_model = "opus".to_string();
             f.limit_max_runs_per_day = "24".to_string();
             f.limit_daily_budget_usd = "1.50".to_string();
             f.enabled = Some("on".to_string());
@@ -7535,6 +7546,7 @@ mod tests {
                 "claude_cwd",
                 "claude_allowed_tools",
                 "claude_permission_mode",
+                "claude_model",
             ];
             let log_token_inputs = ["log_token_global", "log_token_repos", "log_token_ref"];
             let cases: [(Response, &str, &str, Vec<&str>); 4] = [

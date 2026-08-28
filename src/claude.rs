@@ -30,6 +30,7 @@ use tracing::warn;
 
 use crate::action::ClaudeBlock;
 use crate::cancel::CancellationToken;
+use crate::config::ClaudeConfigHandle;
 use crate::error::Result;
 
 /// Grace window the claude process group gets after SIGTERM, before the
@@ -87,6 +88,11 @@ pub struct ClaudeInvoker {
     /// `HOME` is left inherited so git/ssh keep working. `None` (the default and
     /// every test) inherits the ambient environment unchanged.
     config_dir: Option<PathBuf>,
+    /// CLAUDE-239: live handle to the global `config.claude` defaults, shared
+    /// with `LiveSettings` so a Settings save applies to the next invocation.
+    /// `None` (the default) means no global default: the action's own
+    /// `claude.model` decides, and with neither set no `--model` flag is passed.
+    default_claude: Option<ClaudeConfigHandle>,
 }
 
 impl ClaudeInvoker {
@@ -95,6 +101,7 @@ impl ClaudeInvoker {
             binary: binary.unwrap_or("claude").to_string(),
             result_exit_grace: RESULT_EXIT_GRACE,
             config_dir: None,
+            default_claude: None,
         }
     }
 
@@ -103,6 +110,25 @@ impl ClaudeInvoker {
     pub fn with_config_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.config_dir = dir;
         self
+    }
+
+    /// CLAUDE-239: take the live global `config.claude` defaults from
+    /// [`crate::settings::LiveSettings::claude_handle`]. A builder for the same
+    /// reason `with_config_dir` is one: existing callers/tests stay unchanged.
+    pub fn with_default_claude(mut self, handle: ClaudeConfigHandle) -> Self {
+        self.default_claude = Some(handle);
+        self
+    }
+
+    /// CLAUDE-239: the model this invocation runs with: the action's own
+    /// `claude.model`, else the live global default, else `None` (no `--model`
+    /// flag, so the `claude` CLI's own default applies). The value is passed
+    /// through untouched; the CLI validates it.
+    fn resolve_model(&self, claude_cfg: &ClaudeBlock) -> Option<String> {
+        claude_cfg.model.clone().or_else(|| {
+            let handle = self.default_claude.as_ref()?;
+            crate::settings::read_claude(handle).model.clone()
+        })
     }
 
     pub fn stream_log_path(logs_dir: &Path, action: &str, key: &str, attempt: u32) -> PathBuf {
@@ -185,7 +211,14 @@ impl ClaudeInvoker {
             .arg("--verbose")
             .arg("--output-format=stream-json")
             .arg(format!("--permission-mode={}", permission_mode))
-            .arg(format!("--allowed-tools={}", allowed_tools))
+            .arg(format!("--allowed-tools={}", allowed_tools));
+        // CLAUDE-239: the resolved model, if any. Added before the trailing
+        // prompt positional; omitted entirely when nothing resolves, which is
+        // the pre-CLAUDE-239 command line.
+        if let Some(model) = self.resolve_model(claude_cfg) {
+            command.arg(format!("--model={}", model));
+        }
+        command
             .arg(prompt)
             .current_dir(&cwd)
             .stdin(Stdio::null())
@@ -857,6 +890,7 @@ exit "$code"
             binary: stub.to_str().unwrap().to_string(),
             result_exit_grace: Duration::from_secs(30),
             config_dir: None,
+            default_claude: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -896,6 +930,7 @@ exit "$code"
             // Short grace so the test doesn't wait the production 30s.
             result_exit_grace: Duration::from_millis(300),
             config_dir: None,
+            default_claude: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -952,6 +987,7 @@ exit "$code"
             binary: stub.to_str().unwrap().to_string(),
             result_exit_grace: Duration::from_secs(30),
             config_dir: None,
+            default_claude: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -1013,6 +1049,125 @@ exit "$code"
         assert!(
             elapsed < Duration::from_secs(5),
             "cancel should terminate fast, took {elapsed:?}"
+        );
+    }
+
+    // ---- CLAUDE-239: model selection ---------------------------------------
+
+    /// Run a stub that records the exact argv it was spawned with, and return
+    /// those arguments one per line. Asserts on the real spawn path rather than
+    /// on a rebuilt `Command`.
+    fn spawn_and_capture_args(invoker: &ClaudeInvoker, cfg: &ClaudeBlock, dir: &Path) -> String {
+        let marker = dir.join("child-argv.txt");
+        let res = invoker
+            .invoke(
+                "hi",
+                cfg,
+                Duration::from_secs(10),
+                dir,
+                &dir.join("stream.jsonl"),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(res.ok, "stub run succeeds");
+        std::fs::read_to_string(&marker).unwrap()
+    }
+
+    /// Stub that writes its argv (one per line) to `child-argv.txt` next to it,
+    /// then emits a terminal success result event.
+    fn argv_recording_stub(dir: &Path) -> PathBuf {
+        let stub = dir.join("claude-stub.sh");
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n\
+                 printf '%s\\n' '{RESULT_LINE}'\n\
+                 exit 0\n",
+                dir.join("child-argv.txt").display()
+            ),
+        );
+        stub
+    }
+
+    fn claude_defaults(model: Option<&str>) -> crate::config::ClaudeConfigHandle {
+        std::sync::Arc::new(std::sync::RwLock::new(crate::config::ClaudeConfig {
+            model: model.map(|m| m.to_string()),
+        }))
+    }
+
+    /// Neither the action nor the global default names a model: no `--model`
+    /// flag is passed at all, which is the pre-CLAUDE-239 command line.
+    #[test]
+    fn invoke_omits_model_flag_when_nothing_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = argv_recording_stub(dir.path());
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()))
+            .with_default_claude(claude_defaults(None));
+        let argv = spawn_and_capture_args(&invoker, &ClaudeBlock::default(), dir.path());
+        assert!(
+            !argv.contains("--model"),
+            "no model anywhere must pass no --model flag, got:\n{argv}"
+        );
+    }
+
+    /// Global default set, action silent: the global model is passed through.
+    #[test]
+    fn invoke_uses_the_global_default_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = argv_recording_stub(dir.path());
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()))
+            .with_default_claude(claude_defaults(Some("sonnet")));
+        let argv = spawn_and_capture_args(&invoker, &ClaudeBlock::default(), dir.path());
+        assert!(
+            argv.lines().any(|l| l == "--model=sonnet"),
+            "the global default must reach the CLI, got:\n{argv}"
+        );
+    }
+
+    /// The action's own model wins over the global default, and an arbitrary
+    /// model id is passed through untouched (the CLI validates it, not us).
+    #[test]
+    fn invoke_action_model_overrides_the_global_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = argv_recording_stub(dir.path());
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()))
+            .with_default_claude(claude_defaults(Some("sonnet")));
+        let cfg = ClaudeBlock {
+            model: Some("claude-opus-4-5-20251101".to_string()),
+            ..Default::default()
+        };
+        let argv = spawn_and_capture_args(&invoker, &cfg, dir.path());
+        assert!(
+            argv.lines()
+                .any(|l| l == "--model=claude-opus-4-5-20251101"),
+            "the action model must win and pass through untouched, got:\n{argv}"
+        );
+        assert!(
+            !argv.contains("--model=sonnet"),
+            "the global default must not also be passed, got:\n{argv}"
+        );
+        // The prompt stays the trailing positional, after every flag.
+        assert_eq!(argv.lines().last(), Some("hi"), "argv:\n{argv}");
+    }
+
+    /// A live save through the shared handle is picked up by the next
+    /// invocation: the invoker reads the handle per call, never a startup copy.
+    #[test]
+    fn invoke_reads_the_global_default_per_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = argv_recording_stub(dir.path());
+        let handle = claude_defaults(None);
+        let invoker =
+            ClaudeInvoker::new(Some(stub.to_str().unwrap())).with_default_claude(handle.clone());
+        let argv = spawn_and_capture_args(&invoker, &ClaudeBlock::default(), dir.path());
+        assert!(!argv.contains("--model"), "argv:\n{argv}");
+
+        handle.write().unwrap().model = Some("opus".to_string());
+        let argv = spawn_and_capture_args(&invoker, &ClaudeBlock::default(), dir.path());
+        assert!(
+            argv.lines().any(|l| l == "--model=opus"),
+            "a settings save must apply to the next invocation, got:\n{argv}"
         );
     }
 
@@ -1105,6 +1260,7 @@ exit "$code"
             binary: stub.to_str().unwrap().to_string(),
             result_exit_grace: Duration::from_secs(30),
             config_dir: None,
+            default_claude: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -1270,6 +1426,7 @@ exit "$code"
             binary: stub.to_str().unwrap().to_string(),
             result_exit_grace: Duration::from_secs(30),
             config_dir: None,
+            default_claude: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
