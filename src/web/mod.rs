@@ -6576,6 +6576,9 @@ mod tests {
             assert_eq!(a.limits.max_runs_per_day, Some(24));
             assert_eq!(a.limits.daily_budget_usd, Some(1.5));
             assert_eq!(a.claude.permission_mode.as_deref(), Some("acceptEdits"));
+            // CLAUDE-239: the editor carries the per-action model, so saving an
+            // action through the form does not drop a pinned `model:`.
+            assert_eq!(a.claude.model.as_deref(), Some("opus"));
             let sched = a.schedule.unwrap();
             assert_eq!(sched.kind, crate::action::ScheduleKind::Interval);
             assert_eq!(sched.spec.as_deref(), Some("5m"));
@@ -7299,6 +7302,73 @@ mod tests {
                 .await
                 .sources
                 .contains_key("ng"));
+        }
+
+        /// CLAUDE-239: the `Claude invocation` section renders on `/settings`, and
+        /// a POST to `/settings/claude` sets and clears the global default model
+        /// through the same live handle `ClaudeInvoker` reads per invocation.
+        #[tokio::test]
+        async fn settings_page_renders_and_saves_the_claude_section() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let page = settings_page(State(s.clone())).await.unwrap();
+            assert_eq!(page.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = String::from_utf8_lossy(&body);
+            assert!(
+                html.contains("Claude invocation"),
+                "the section card is rendered"
+            );
+            assert!(html.contains("/settings/claude"), "with its form");
+            assert!(html.contains("model"), "and its field reference");
+
+            let handle = s.api.settings.claude_handle();
+            assert_eq!(crate::settings::read_claude(&handle).model, None);
+
+            // Setting the default is live on the handle the invoker reads.
+            let saved = settings_save(
+                State(s.clone()),
+                AxumPath("claude".to_string()),
+                Form(SettingsForm {
+                    json: r#"{"model":"opus"}"#.to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                crate::settings::read_claude(&handle).model.as_deref(),
+                Some("opus")
+            );
+
+            // Clearing it returns to "no --model flag".
+            let cleared = settings_save(
+                State(s.clone()),
+                AxumPath("claude".to_string()),
+                Form(SettingsForm {
+                    json: r#"{"model":null}"#.to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cleared.status(), StatusCode::SEE_OTHER);
+            assert_eq!(crate::settings::read_claude(&handle).model, None);
+
+            // An invalid payload is rejected inline and persists nothing.
+            let bad = settings_save(
+                State(s.clone()),
+                AxumPath("claude".to_string()),
+                Form(SettingsForm {
+                    json: r#"{"bogus":"x"}"#.to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(crate::settings::read_claude(&handle).model, None);
         }
 
         /// CLAUDE-220: the comment listener gets its own synthetic entry, injected
