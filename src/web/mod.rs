@@ -2508,6 +2508,9 @@ struct YoutrackEditForm {
     claude_cwd: String,
     claude_allowed_tools: String,
     claude_permission_mode: String,
+    /// CLAUDE-239: per-action `--model`; blank inherits the global
+    /// `config.claude.model`.
+    claude_model: String,
     limit_max_attempts_per_key: String,
     limit_max_runs_per_day: String,
     limit_claude_timeout_seconds: String,
@@ -2619,6 +2622,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         claude_cwd: s(&a.claude.cwd),
         claude_allowed_tools: s(&a.claude.allowed_tools),
         claude_permission_mode: s(&a.claude.permission_mode),
+        claude_model: s(&a.claude.model),
         limit_max_attempts_per_key: n(a.limits.max_attempts_per_key),
         limit_max_runs_per_day: n(a.limits.max_runs_per_day),
         limit_claude_timeout_seconds: n(a.limits.claude_timeout_seconds),
@@ -2855,6 +2859,7 @@ fn youtrack_form_to_yaml(
         cwd: opt(&form.claude_cwd),
         allowed_tools: opt(&form.claude_allowed_tools),
         permission_mode: opt(&form.claude_permission_mode),
+        model: opt(&form.claude_model),
     };
     set_or_remove(
         map,
@@ -3602,6 +3607,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "cadence (seconds) the scheduler starts overlapping pickup runs; >= 1.",
             },
         ],
+        Claude => vec![FieldDoc {
+            name: "model",
+            badge: "next invocation",
+            note: "default --model for every action that pins no claude.model; null = the claude CLI's own default. Passed through unvalidated (sonnet, opus, claude-sonnet-4-5-20250929, ...).",
+        }],
         DbRetention => vec![
             FieldDoc {
                 name: "enabled",
@@ -6538,6 +6548,7 @@ mod tests {
             f.schedule_kind = "interval".to_string();
             f.schedule_spec = "5m".to_string();
             f.claude_permission_mode = "acceptEdits".to_string();
+            f.claude_model = "opus".to_string();
             f.limit_max_runs_per_day = "24".to_string();
             f.limit_daily_budget_usd = "1.50".to_string();
             f.enabled = Some("on".to_string());
@@ -6565,6 +6576,9 @@ mod tests {
             assert_eq!(a.limits.max_runs_per_day, Some(24));
             assert_eq!(a.limits.daily_budget_usd, Some(1.5));
             assert_eq!(a.claude.permission_mode.as_deref(), Some("acceptEdits"));
+            // CLAUDE-239: the editor carries the per-action model, so saving an
+            // action through the form does not drop a pinned `model:`.
+            assert_eq!(a.claude.model.as_deref(), Some("opus"));
             let sched = a.schedule.unwrap();
             assert_eq!(sched.kind, crate::action::ScheduleKind::Interval);
             assert_eq!(sched.spec.as_deref(), Some("5m"));
@@ -7290,6 +7304,73 @@ mod tests {
                 .contains_key("ng"));
         }
 
+        /// CLAUDE-239: the `Claude invocation` section renders on `/settings`, and
+        /// a POST to `/settings/claude` sets and clears the global default model
+        /// through the same live handle `ClaudeInvoker` reads per invocation.
+        #[tokio::test]
+        async fn settings_page_renders_and_saves_the_claude_section() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let page = settings_page(State(s.clone())).await.unwrap();
+            assert_eq!(page.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = String::from_utf8_lossy(&body);
+            assert!(
+                html.contains("Claude invocation"),
+                "the section card is rendered"
+            );
+            assert!(html.contains("/settings/claude"), "with its form");
+            assert!(html.contains("model"), "and its field reference");
+
+            let handle = s.api.settings.claude_handle();
+            assert_eq!(crate::settings::read_claude(&handle).model, None);
+
+            // Setting the default is live on the handle the invoker reads.
+            let saved = settings_save(
+                State(s.clone()),
+                AxumPath("claude".to_string()),
+                Form(SettingsForm {
+                    json: r#"{"model":"opus"}"#.to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                crate::settings::read_claude(&handle).model.as_deref(),
+                Some("opus")
+            );
+
+            // Clearing it returns to "no --model flag".
+            let cleared = settings_save(
+                State(s.clone()),
+                AxumPath("claude".to_string()),
+                Form(SettingsForm {
+                    json: r#"{"model":null}"#.to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cleared.status(), StatusCode::SEE_OTHER);
+            assert_eq!(crate::settings::read_claude(&handle).model, None);
+
+            // An invalid payload is rejected inline and persists nothing.
+            let bad = settings_save(
+                State(s.clone()),
+                AxumPath("claude".to_string()),
+                Form(SettingsForm {
+                    json: r#"{"bogus":"x"}"#.to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(crate::settings::read_claude(&handle).model, None);
+        }
+
         /// CLAUDE-220: the comment listener gets its own synthetic entry, injected
         /// on the same rule (at least one configured source) and independent of
         /// the CI-failure listener's.
@@ -7535,6 +7616,7 @@ mod tests {
                 "claude_cwd",
                 "claude_allowed_tools",
                 "claude_permission_mode",
+                "claude_model",
             ];
             let log_token_inputs = ["log_token_global", "log_token_repos", "log_token_ref"];
             let cases: [(Response, &str, &str, Vec<&str>); 4] = [

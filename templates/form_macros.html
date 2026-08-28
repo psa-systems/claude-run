@@ -118,13 +118,14 @@
 </div>
 {% endmacro %}
 
-{% macro claude_block(cwd, allowed_tools, permission_mode) %}
+{% macro claude_block(cwd, allowed_tools, permission_mode, model) %}
 <div class="card">
   <h3>Claude</h3>
   <div class="grid2">
     {% call textfield("CWD", "claude_cwd", cwd, "working directory override") %}
     {% call textfield("Allowed tools", "claude_allowed_tools", allowed_tools, "e.g. Read,Grep,Bash") %}
     {% call textfield("Permission mode", "claude_permission_mode", permission_mode, "e.g. acceptEdits") %}
+    {% call textfield("Model", "claude_model", model, "blank = the config.claude default") %}
   </div>
 </div>
 {% endmacro %}

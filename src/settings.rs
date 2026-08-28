@@ -32,8 +32,9 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
-    CommentWebhookConfig, ConcurrencyConfig, DbRetentionConfig, MintConfig, OnDiskConfig, Paths,
-    PreferencesConfig, UpdateConfig, WebhookConfig, WorkdirGcConfig,
+    ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig, ConcurrencyConfig, DbRetentionConfig,
+    MintConfig, OnDiskConfig, Paths, PreferencesConfig, UpdateConfig, WebhookConfig,
+    WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -57,11 +58,14 @@ pub enum Section {
     /// CLAUDE-220: `/claude` pull-request comment listener. DB-only from day one
     /// (never a `config.toml` section, so `migrate_config_file` never touches it).
     WebhookComment,
+    /// CLAUDE-239: global defaults for the `claude` CLI invocation (the default
+    /// model an action inherits when it pins none).
+    Claude,
 }
 
 impl Section {
     /// Every section, in display order (used by the Settings page).
-    pub const ALL: [Section; 9] = [
+    pub const ALL: [Section; 10] = [
         Section::Mint,
         Section::Update,
         Section::Webhook,
@@ -71,6 +75,7 @@ impl Section {
         Section::Preferences,
         Section::Concurrency,
         Section::DbRetention,
+        Section::Claude,
     ];
 
     /// `settings` table primary key for this section's JSON document.
@@ -85,6 +90,7 @@ impl Section {
             Section::Concurrency => "config.concurrency",
             Section::DbRetention => "config.db_retention",
             Section::WebhookComment => "config.webhook_comment",
+            Section::Claude => "config.claude",
         }
     }
 
@@ -100,6 +106,7 @@ impl Section {
             Section::Concurrency => "concurrency",
             Section::DbRetention => "db_retention",
             Section::WebhookComment => "webhook_comment",
+            Section::Claude => "claude",
         }
     }
 
@@ -120,6 +127,7 @@ impl Section {
             Section::Concurrency => "Concurrency",
             Section::DbRetention => "DB retention",
             Section::WebhookComment => "Comment webhook",
+            Section::Claude => "Claude invocation",
         }
     }
 
@@ -134,6 +142,7 @@ impl Section {
             Section::Concurrency => "next tick",
             Section::DbRetention => "next sweep",
             Section::WebhookComment => "live",
+            Section::Claude => "next invocation",
         }
     }
 }
@@ -327,6 +336,10 @@ pub struct EffectiveRuntime {
     /// CLAUDE-220: `/claude` comment-command listener. DB-only from day one, so
     /// there is no file fallback: the DB value or the built-in default.
     pub webhook_comment: CommentWebhookConfig,
+    /// CLAUDE-239: global `claude` invocation defaults. DB-only from day one, so
+    /// there is no file fallback: the DB value or the built-in default (no
+    /// model, i.e. the CLI's own default).
+    pub claude: ClaudeConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
@@ -360,6 +373,9 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
     let webhook_comment = get_json::<CommentWebhookConfig>(pool, Section::WebhookComment.key())
         .await?
         .unwrap_or_default();
+    let claude = get_json::<ClaudeConfig>(pool, Section::Claude.key())
+        .await?
+        .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
         update,
@@ -370,6 +386,7 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
         concurrency,
         db_retention,
         webhook_comment,
+        claude,
     })
 }
 
@@ -418,6 +435,15 @@ pub async fn effective_webhook(pool: &SqlitePool, paths: &Paths) -> Result<Webho
         Some(webhook) => Ok(webhook),
         None => Ok(OnDiskConfig::load(paths)?.0.webhook),
     }
+}
+
+/// CLAUDE-239: resolve the effective [`ClaudeConfig`] for a caller that holds no
+/// [`LiveSettings`] (the daemonless `claude-run run`). DB-only from birth, so
+/// there is no file fallback: the stored document or the built-in default.
+pub async fn effective_claude(pool: &SqlitePool) -> Result<ClaudeConfig> {
+    Ok(get_json::<ClaudeConfig>(pool, Section::Claude.key())
+        .await?
+        .unwrap_or_default())
 }
 
 // ---- one-time import + breaking migration --------------------------------
@@ -576,6 +602,10 @@ pub struct LiveSettings {
     /// rebuilt in lock-step on save exactly like the `webhook` section.
     webhook_comment: Arc<RwLock<CommentWebhookConfig>>,
     webhook_comment_rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
+    /// CLAUDE-239: global `claude` invocation defaults. A `std::sync::RwLock`
+    /// (not the tokio one every other section uses) because the reader is
+    /// `ClaudeInvoker::invoke`, which is synchronous and cannot await.
+    claude: ClaudeConfigHandle,
 }
 
 impl LiveSettings {
@@ -602,6 +632,7 @@ impl LiveSettings {
             db_retention: Arc::new(RwLock::new(eff.db_retention)),
             webhook_comment: Arc::new(RwLock::new(eff.webhook_comment)),
             webhook_comment_rate: Arc::new(RwLock::new(webhook_comment_rate)),
+            claude: Arc::new(std::sync::RwLock::new(eff.claude)),
         };
         if let (Some(apply), Some(filter)) = (s.log_apply.as_ref(), eff.log_filter.as_ref()) {
             match apply(filter) {
@@ -665,6 +696,13 @@ impl LiveSettings {
         self.db_retention.clone()
     }
 
+    /// CLAUDE-239: shared handle to the live `claude` invocation defaults, read
+    /// by [`crate::claude::ClaudeInvoker`] on each invocation so a Settings save
+    /// applies to the next one without a daemon restart.
+    pub fn claude_handle(&self) -> ClaudeConfigHandle {
+        self.claude.clone()
+    }
+
     /// CLAUDE-129: a snapshot of the live update config (train + token_ref), read
     /// by the About page handlers to drive the on-demand check / apply.
     pub async fn update_config(&self) -> UpdateConfig {
@@ -686,6 +724,7 @@ impl LiveSettings {
             Section::Concurrency => to_pretty(&*self.concurrency.read().await),
             Section::DbRetention => to_pretty(&*self.db_retention.read().await),
             Section::WebhookComment => to_pretty(&*self.webhook_comment.read().await),
+            Section::Claude => to_pretty(&*read_claude(&self.claude)),
         }
     }
 
@@ -772,9 +811,35 @@ impl LiveSettings {
                 *self.webhook_comment_rate.write().await = comment_rate_map(&v);
                 *self.webhook_comment.write().await = v;
             }
+            Section::Claude => {
+                let v: ClaudeConfig = parse(json)?;
+                // No model-name validation: the `claude` CLI is the source of
+                // truth for which models exist (CLAUDE-239).
+                set_json(&self.pool, section.key(), &v).await?;
+                *write_claude(&self.claude) = v;
+            }
         }
         Ok(())
     }
+}
+
+/// CLAUDE-239: read the shared [`ClaudeConfig`] handle, recovering the value a
+/// panicking writer poisoned rather than propagating the panic: a stale-but-real
+/// default is better than killing the run that is reading it. The poisoning is
+/// logged so the panic that caused it is never silent.
+pub fn read_claude(handle: &ClaudeConfigHandle) -> std::sync::RwLockReadGuard<'_, ClaudeConfig> {
+    handle.read().unwrap_or_else(|poisoned| {
+        tracing::error!("claude settings lock poisoned; reading the last stored value");
+        poisoned.into_inner()
+    })
+}
+
+/// Write half of [`read_claude`], with the same poison recovery.
+fn write_claude(handle: &ClaudeConfigHandle) -> std::sync::RwLockWriteGuard<'_, ClaudeConfig> {
+    handle.write().unwrap_or_else(|poisoned| {
+        tracing::error!("claude settings lock poisoned; overwriting the last stored value");
+        poisoned.into_inner()
+    })
 }
 
 /// CLAUDE-220: per-source limiter map for the comment listener, built through the
@@ -838,6 +903,7 @@ mod tests {
             concurrency: ConcurrencyConfig::default(),
             db_retention: DbRetentionConfig::default(),
             webhook_comment: CommentWebhookConfig::default(),
+            claude: ClaudeConfig::default(),
         }
     }
 
@@ -1140,6 +1206,87 @@ mod tests {
         )
         .await
         .expect("a disabled config bypasses the window floor");
+    }
+
+    // ---- CLAUDE-239: global claude invocation defaults ---------------------
+
+    #[tokio::test]
+    async fn claude_section_round_trips_on_the_shared_handle() {
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+
+        // Default is no model, i.e. the claude CLI's own default.
+        let handle = live.claude_handle();
+        assert_eq!(read_claude(&handle).model, None);
+        assert_eq!(Section::Claude.key(), "config.claude");
+        assert_eq!(Section::Claude.as_path(), "claude");
+        assert_eq!(Section::from_path("claude"), Some(Section::Claude));
+
+        // A saved model persists and is live on the handle the invoker reads.
+        live.save_section(Section::Claude, r#"{"model":"opus"}"#)
+            .await
+            .unwrap();
+        let stored: ClaudeConfig = get_json(&pool, Section::Claude.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.model.as_deref(), Some("opus"));
+        assert_eq!(read_claude(&handle).model.as_deref(), Some("opus"));
+
+        // Any model string is accepted: the CLI, not the runner, validates it.
+        live.save_section(Section::Claude, r#"{"model":"claude-sonnet-4-5-20250929"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_claude(&handle).model.as_deref(),
+            Some("claude-sonnet-4-5-20250929")
+        );
+
+        // Clearing it falls back to the CLI default again.
+        live.save_section(Section::Claude, r#"{"model":null}"#)
+            .await
+            .unwrap();
+        assert_eq!(read_claude(&handle).model, None);
+
+        // An unknown field is rejected (deny_unknown_fields) and persists nothing.
+        let err = live
+            .save_section(Section::Claude, r#"{"bogus":"x"}"#)
+            .await
+            .expect_err("unknown field must reject");
+        assert!(matches!(err, SaveError::Invalid(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn effective_claude_reads_the_db_else_the_default() {
+        let pool = pool().await;
+        assert_eq!(effective_claude(&pool).await.unwrap().model, None);
+        set_json(
+            &pool,
+            Section::Claude.key(),
+            &ClaudeConfig {
+                model: Some("sonnet".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            effective_claude(&pool).await.unwrap().model.as_deref(),
+            Some("sonnet")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_is_never_imported_from_config_toml() {
+        // DB-only from day one: the migration has no arm for it.
+        let pool = pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::write(paths.config_file(), "[web]\nbind = \"127.0.0.1\"\n").unwrap();
+        migrate_config_file(&pool, &paths).await.unwrap();
+        assert!(get_raw(&pool, Section::Claude.key())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // ---- CLAUDE-154: preferences formatting + validation -------------------

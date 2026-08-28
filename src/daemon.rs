@@ -151,9 +151,13 @@ impl Daemon {
         info!(dir = %agent_config_dir.display(), "seeded claude agent config dir");
         // `Arc` so the same invoker backs both the dispatcher and the
         // webhook triage classifier (CLAUDE-47).
+        // CLAUDE-239: the invoker also takes the live `config.claude` handle, so
+        // an action with no `claude.model` inherits the global default and a
+        // Settings save applies to the next invocation with no restart.
         let claude = Arc::new(
             ClaudeInvoker::new(self.on_disk.daemon.claude_binary.as_deref())
-                .with_config_dir(Some(agent_config_dir)),
+                .with_config_dir(Some(agent_config_dir))
+                .with_default_claude(settings.claude_handle()),
         );
 
         // CLAUDE-9: one registry shared between the dispatcher (which registers
@@ -479,6 +483,9 @@ fn build_mint_context(
         cwd: None,
         allowed_tools: Some(String::new()),
         permission_mode: Some("default".to_string()),
+        // CLAUDE-239: triage pins no model, so it follows the global
+        // `config.claude.model` (or the CLI default when that is unset).
+        model: None,
     };
     let stream_log = cwd.join("triage-stream.jsonl");
     let classifier: Arc<dyn FailureClassifier> = Arc::new(ClaudeClassifier::new(
