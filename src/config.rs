@@ -600,6 +600,29 @@ impl Default for PreferencesConfig {
     }
 }
 
+/// CLAUDE-239: global defaults for the `claude` CLI invocation. A DB-backed
+/// runtime section (settings key `config.claude`, editable on the web Settings
+/// page and via `GET`/`PUT /api/settings/claude`) per the CLAUDE-101
+/// bootstrap-vs-runtime split, so it is NOT a `config.toml` key (a brand-new
+/// section, so there is no file fallback: the DB value or the default).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaudeConfig {
+    /// Instance-wide default model, passed through to `--model` untouched. An
+    /// action's own `claude.model` wins over it; when neither is set no
+    /// `--model` flag is passed and the `claude` CLI's own default applies. The
+    /// runner never validates the value: the CLI is the source of truth for
+    /// which models exist.
+    pub model: Option<String>,
+}
+
+/// CLAUDE-239: live handle to the global [`ClaudeConfig`], shared between
+/// [`crate::settings::LiveSettings`] (which swaps it on save) and
+/// [`crate::claude::ClaudeInvoker`] (which reads it per invocation). A
+/// `std::sync::RwLock` rather than a tokio one because the read happens inside
+/// the synchronous `invoke`, which has no `await`.
+pub type ClaudeConfigHandle = std::sync::Arc<std::sync::RwLock<ClaudeConfig>>;
+
 /// CLAUDE-162: daemon-wide concurrency + continuous-pickup settings. A DB-backed
 /// runtime section (settings key `config.concurrency`, editable on the web
 /// Settings page and via `GET`/`PUT /api/settings/concurrency`) per the

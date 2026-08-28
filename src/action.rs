@@ -2171,6 +2171,25 @@ native:
         assert!(validate_str(bad, "<candidate>").is_err());
     }
 
+    /// CLAUDE-239: an action may pin a model in its `claude:` block, and the
+    /// value round-trips unvalidated (any string the `claude` CLI accepts).
+    #[test]
+    fn claude_block_accepts_a_model() {
+        let raw =
+            "name: demo\ninput:\n  command: echo '[]'\nprompt: |\n  'hi'\nclaude:\n  model: opus\n";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        assert_eq!(loaded.action.claude.model.as_deref(), Some("opus"));
+
+        // Absent stays absent, so the runner passes no `--model` flag.
+        let raw = "name: demo\ninput:\n  command: echo '[]'\nprompt: |\n  'hi'\n";
+        assert!(validate_str(raw, "<candidate>")
+            .unwrap()
+            .action
+            .claude
+            .model
+            .is_none());
+    }
+
     /// The shipped `actions/closed-issue-summary.yml` loads, is recognized as a
     /// native closed-issue-summary action with no script-bearing fields, and
     /// round-trips through serialize -> parse unchanged.
@@ -2273,6 +2292,10 @@ pub struct ClaudeBlock {
     pub cwd: Option<String>,
     pub allowed_tools: Option<String>,
     pub permission_mode: Option<String>,
+    /// CLAUDE-239: model this action pins, passed through to `--model`
+    /// untouched (no validation here; the `claude` CLI owns that). Unset falls
+    /// back to the global `config.claude.model`, then to the CLI's own default.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

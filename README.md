@@ -241,10 +241,10 @@ are rendered as that name only. Each
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
 secret refs, adding a source), `next event` for mint / update, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
-`GET` / `PUT /api/settings/{mint,update,webhook,webhook_comment,log_filter,workdir_gc,preferences,concurrency,db_retention}`.
+`GET` / `PUT /api/settings/{mint,update,webhook,webhook_comment,log_filter,workdir_gc,preferences,concurrency,db_retention,claude}`.
 The `webhook_comment` (CLAUDE-220), `workdir_gc` (CLAUDE-106), `preferences` (CLAUDE-154), `concurrency` (CLAUDE-162),
-and `db_retention` (CLAUDE-175) sections are DB-only from birth (never `config.toml` keys), so they are not part of the
-one-time import below; each simply defaults until edited. `webhook_comment` is additionally rejected by the file parser:
+`db_retention` (CLAUDE-175), and `claude` (CLAUDE-239) sections are DB-only from birth (never `config.toml` keys), so
+they are not part of the one-time import below; each simply defaults until edited. `webhook_comment` is additionally rejected by the file parser:
 a `config.toml` declaring `[webhook_comment]` fails to start with serde's unknown-field error naming the section, so
 there is no way to end up with two sources of truth for it.
 
