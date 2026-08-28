@@ -547,9 +547,16 @@ async fn run_action(
         on_disk.daemon.claude_config_dir.as_deref(),
     );
     claude_run::agent_home::ensure(&agent_config_dir)?;
+    // CLAUDE-239: no daemon here, so there is no `LiveSettings` to share a
+    // handle with; read the stored global `config.claude` once and hand the
+    // invoker a handle over that snapshot.
+    let claude_defaults = Arc::new(std::sync::RwLock::new(
+        settings::effective_claude(&pool).await?,
+    ));
     let claude = Arc::new(
         claude_mod::ClaudeInvoker::new(on_disk.daemon.claude_binary.as_deref())
-            .with_config_dir(Some(agent_config_dir)),
+            .with_config_dir(Some(agent_config_dir))
+            .with_default_claude(claude_defaults),
     );
     // CLAUDE-28: a standalone `run` is a single process with no daemon, so it
     // gets its own ephemeral key gate; the per-action lock already prevents it

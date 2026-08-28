@@ -150,6 +150,9 @@ pub struct CommonForm {
     pub claude_cwd: String,
     pub claude_allowed_tools: String,
     pub claude_permission_mode: String,
+    /// CLAUDE-239: per-action `--model`; blank inherits the global
+    /// `config.claude.model`.
+    pub claude_model: String,
     pub limit_max_attempts_per_key: String,
     pub limit_max_runs_per_day: String,
     pub limit_claude_timeout_seconds: String,
@@ -169,6 +172,7 @@ impl CommonForm {
             claude_cwd: p.get("claude_cwd"),
             claude_allowed_tools: p.get("claude_allowed_tools"),
             claude_permission_mode: p.get("claude_permission_mode"),
+            claude_model: p.get("claude_model"),
             limit_max_attempts_per_key: p.get("limit_max_attempts_per_key"),
             limit_max_runs_per_day: p.get("limit_max_runs_per_day"),
             limit_claude_timeout_seconds: p.get("limit_claude_timeout_seconds"),
@@ -205,6 +209,7 @@ impl CommonForm {
             claude_cwd: s(&a.claude.cwd),
             claude_allowed_tools: s(&a.claude.allowed_tools),
             claude_permission_mode: s(&a.claude.permission_mode),
+            claude_model: s(&a.claude.model),
             limit_max_attempts_per_key: n(a.limits.max_attempts_per_key),
             limit_max_runs_per_day: n(a.limits.max_runs_per_day),
             limit_claude_timeout_seconds: n(a.limits.claude_timeout_seconds),
@@ -260,6 +265,7 @@ fn apply_common(
             cwd: opt(&c.claude_cwd),
             allowed_tools: opt(&c.claude_allowed_tools),
             permission_mode: opt(&c.claude_permission_mode),
+            model: opt(&c.claude_model),
         };
         set_or_remove(
             map,
