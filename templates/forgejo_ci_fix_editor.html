@@ -95,7 +95,7 @@
 
   {% call m::output_block(form.common.output_file) %}
 
-  {% call m::limits_block(form.common.limit_max_attempts_per_key, form.common.limit_max_runs_per_day, form.common.limit_claude_timeout_seconds, form.common.limit_daily_budget_usd) %}
+  {% call m::limits_block(form.common.limit_max_attempts_per_key, form.common.limit_max_runs_per_day, form.common.limit_claude_timeout_seconds, form.common.limit_daily_budget_usd, form.common.limit_max_issues_per_run) %}
 
   <div class="row-actions" style="margin-top: 12px;">
     <button class="btn" type="submit">Save</button>

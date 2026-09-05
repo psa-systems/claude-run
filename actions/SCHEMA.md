@@ -41,11 +41,12 @@ post: # optional, ordered list of nu snippets
     ...
 output:
   file: <name>.log          # optional, appended JSONL of per-job outcomes
-limits: # optional per-action overrides of env defaults
+limits: # optional per-action overrides of the built-in defaults
   max_attempts_per_key: 3
   max_runs_per_day: 20
   claude_timeout_seconds: 600
   daily_budget_usd: 5.00
+  max_issues_per_run: 25
 concurrency: # optional; default is strictly sequential
   max_parallel: 1           # distinct-key jobs in flight at once, daemon-wide (default 1)
   key: [ project, repo, workflow ]   # job fields composing the concurrency key
@@ -865,16 +866,25 @@ If omitted, per-job outcomes are only visible in the daily JSONL log.
 
 Per-action overrides for the runner-wide defaults. Any subset of:
 
-| Key                      | Env default                              |
-|--------------------------|------------------------------------------|
-| `max_attempts_per_key`   | `$env.CLAUDE_RUN_MAX_ATTEMPTS_PER_KEY`   |
-| `max_runs_per_day`       | `$env.CLAUDE_RUN_MAX_RUNS_PER_DAY`       |
-| `claude_timeout_seconds` | `$env.CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS` |
-| `daily_budget_usd`       | `$env.CLAUDE_RUN_DAILY_BUDGET_USD`       |
+| Key                      | Default |
+|--------------------------|---------|
+| `max_attempts_per_key`   | `3`     |
+| `max_runs_per_day`       | `20`    |
+| `claude_timeout_seconds` | `600`   |
+| `daily_budget_usd`       | `5.00`  |
+| `max_issues_per_run`     | `25`    |
+
+The defaults are the built-in `RunnerDefaults::default()` (`src/job.rs`); the Rust runner reads no `CLAUDE_RUN_MAX_*` environment variable for them, so an action's YAML is the only override.
 
 CLAUDE-232: reaching `max_attempts_per_key` is **announced**, for the same reason a lasting dependency gate is (see "Pre-clone dependency gate"). The skip writes no `job_outcomes` row, no `run_events` row, and no field change, so the issue keeps its Queued value, re-enters the candidate set on the next poll, is skipped again, and never moves. It surfaces in three places: a `warn` line naming the count and the cap at each of the four cap-check sites (`src/job.rs`, `src/native/youtrack.rs`, `src/native/forgejo_ci_fix.rs`, `src/native/ci_failure_analysis.rs`), a Dashboard banner listing the action, key, count against the cap, and last counted attempt, and an `attempt_cap_hits` block on `/api/status` (so `claude-run status` reports it with or without the daemon). The read is the live `attempt_counters` table compared against each action's OWN effective cap, so lowering the cap parks a key immediately and raising it releases the key and grants one more attempt.
 
 Unlike a gate row, the counter row is not deleted when the trouble clears: it is the durable record of the attempts, and nothing (not even a successful run) resets it. So the runner cannot retry a capped key, and a key stays on the banner after the operator has dealt with the work by hand. The only reset today is deleting the action, which purges its whole control state; a per-key reset is tracked in CLAUDE-238.
+
+CLAUDE-234: `max_issues_per_run` bounds a different axis from the other caps. `max_runs_per_day` bounds how often an action FIRES; this bounds how many issues ONE firing may create in the tracker, so a misfiring filing run opens a handful of issues rather than a hundred. It is enforced at the provider boundary (`src/provider/audit.rs`, `AuditedTracker` wrapping the `yt` backend for the duration of a run), never in a prompt: a prompt is guidance, and the ceiling exists for the case where the guidance is ignored. Reaching it refuses the create BEFORE `yt issue create` runs, logs at `warn`, and records a `run_events` row on the run, so a truncated filing run does not read as a clean one. `0` means "create nothing" rather than "unlimited". The same wrapper writes one `youtrack issue write` line per create AND per update, carrying the originating `run_id` and the issue key, so an unexpected issue resolves to a run in one journal query.
+
+The ceiling covers the writes the RUNNER itself makes through the provider (the mint, the closed-issue-summary filing, every field / state / comment write the native actions perform). It does not reach the `yt` calls an agent session makes inside its own workdir: those are a separate process with its own credentials, bounded by the agent prompt rather than by this cap (tracked separately).
+
+Deletes are denied on this surface by omission: `IssueTracker` exposes no delete, the CLI backend invokes no `yt issue delete`, and `no_delete_on_the_tracker_surface` (`src/provider/audit.rs`) fails if either reappears.
 
 ### `concurrency` (record, optional)
 

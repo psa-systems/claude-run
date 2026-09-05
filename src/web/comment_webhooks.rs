@@ -73,7 +73,7 @@ use crate::claude::{ClaudeInvoker, ClaudeResult};
 use crate::concurrency::KeyGate;
 use crate::config::{CommentWebhookConfig, CommentWebhookSource, MintConfig, Paths};
 use crate::job::RunnerDefaults;
-use crate::provider::{Backend, CliBackend, Forge, ProcessRunner};
+use crate::provider::{Backend, CliBackend, Forge, IssueTracker, ProcessRunner};
 use crate::secrets::{self, SecretsKey};
 use crate::state;
 
@@ -964,9 +964,14 @@ async fn run_instruction(
         let route_cache = ctx.route_cache.clone();
         let cmd = cmd.clone();
         let workdir = workdir.clone();
+        // CLAUDE-234: one ledger for this delivery's run, so the mint's writes
+        // are journalled with `run_id` and bounded by the run's ceiling.
+        let audit = crate::provider::IssueWriteAudit::new(run_id, ctx.defaults.max_issues_per_run);
         tokio::task::block_in_place(move || {
+            let tracker = crate::provider::AuditedTracker::new(backend.as_ref(), audit);
             serve_mint(
                 backend.as_ref(),
+                &tracker,
                 &mint_cfg,
                 &route_cache,
                 &cmd,
@@ -1152,6 +1157,7 @@ fn serve_run(
 /// path (minted, create failed, queue failed).
 fn serve_mint(
     backend: &dyn Backend,
+    tracker: &dyn IssueTracker,
     mint_cfg: &MintConfig,
     route_cache: &crate::mint::VcsRouteCache,
     cmd: &VerifiedCommentCommand,
@@ -1162,7 +1168,10 @@ fn serve_mint(
     let summary = mint_summary(cmd);
     let description = mint_description(cmd, instruction);
 
-    let key = match backend.create_issue(&project, &summary, &description, None) {
+    // CLAUDE-234: the tracker writes go through this delivery's ledger (the
+    // backend is per-delivery but the ledger carries the run id and the
+    // ceiling); the forge replies keep using `backend` directly.
+    let key = match tracker.create_issue(&project, &summary, &description, None) {
         Ok(k) => k,
         Err(e) => {
             warn!(repo = %cmd.repo, issue = cmd.number, %project, error = %e, "minting the YouTrack issue failed");
@@ -1181,10 +1190,10 @@ fn serve_mint(
     // State first, then the authoritative `AI Agent` write, the same order the
     // triage mint uses. A failed state write leaves a usable issue, so it is
     // logged and the queueing still runs; a failed queue write is reported.
-    if let Err(e) = backend.set_state(&key, &mint_cfg.target_state) {
+    if let Err(e) = tracker.set_state(&key, &mint_cfg.target_state) {
         warn!(key = %key, error = %e, "setting the minted issue's state failed (continuing to the AI Agent write)");
     }
-    if let Err(e) = backend.set_field(&key, &mint_cfg.ai_agent_field, &mint_cfg.queued_value) {
+    if let Err(e) = tracker.set_field(&key, &mint_cfg.ai_agent_field, &mint_cfg.queued_value) {
         warn!(key = %key, error = %e, "queueing the minted issue failed");
         post_reply(
             backend,
@@ -2291,8 +2300,11 @@ mod tests {
         );
         let backend = CliBackend::new(runner.clone());
         let cache = crate::mint::VcsRouteCache::new(Duration::from_secs(900));
+        let audit = crate::provider::IssueWriteAudit::new(Some(1), 25);
+        let tracker = crate::provider::AuditedTracker::new(&backend, audit);
         let outcome = serve_mint(
             &backend,
+            &tracker,
             &MintConfig::default(),
             &cache,
             &cmd,
@@ -2360,8 +2372,11 @@ mod tests {
         let backend = CliBackend::new(runner.clone());
         let cache = crate::mint::VcsRouteCache::new(Duration::from_secs(900));
         // `yt issue create` has no canned response, so the mint fails.
+        let audit = crate::provider::IssueWriteAudit::new(Some(1), 25);
+        let tracker = crate::provider::AuditedTracker::new(&backend, audit);
         let outcome = serve_mint(
             &backend,
+            &tracker,
             &MintConfig::default(),
             &cache,
             &cmd,

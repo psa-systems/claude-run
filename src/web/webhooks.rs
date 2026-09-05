@@ -896,6 +896,11 @@ async fn triage_and_mint(
 
     let backend = ctx.backend.clone();
     let classifier = ctx.classifier.clone();
+    // CLAUDE-234: this delivery's own issue-write ledger. The backend is
+    // daemon-lifetime and shared by every delivery, so the ledger is built per
+    // run here rather than held on the backend: that is what keeps the ceiling
+    // and the `run_id` on each write line belonging to THIS run.
+    let audit = crate::provider::IssueWriteAudit::new(run_id, ctx.defaults.max_issues_per_run);
     // CLAUDE-101: snapshot the live mint config for this event; the next event
     // re-reads, so a Settings save in between is honored without a restart.
     let mint_cfg = ctx.mint_cfg.read().await.clone();
@@ -907,9 +912,10 @@ async fn triage_and_mint(
         };
         report_stage(STAGE_TRIAGING);
         let has_open_pr = resolve_has_open_pr(backend.as_ref(), &event);
+        let tracker = crate::provider::AuditedTracker::new(backend.as_ref(), audit);
         decide_mint(
             classifier.as_ref(),
-            backend.as_ref(),
+            &tracker,
             &mint_cfg,
             route_cache.as_ref(),
             &caps,

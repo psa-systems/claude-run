@@ -86,6 +86,19 @@ pub enum Error {
     #[error("no usable provider backend (tried: {0})")]
     NoBackend(String),
 
+    /// CLAUDE-234: the run already created `cap` issues, so the provider refused
+    /// to create another. `run` is the run id, or `none` outside a run.
+    #[error(
+        "run {run} reached its per-run issue-creation cap of {cap}; refusing to create another \
+         issue in `{project}`. Raise `limits.max_issues_per_run` if this run legitimately needs \
+         more."
+    )]
+    IssueCapReached {
+        run: String,
+        cap: u32,
+        project: String,
+    },
+
     #[error("secret: {0}")]
     Secret(String),
 

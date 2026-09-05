@@ -48,7 +48,7 @@ use crate::error::{Error, Result};
 use crate::forge_log::{
     self, ForgeReads, JobLog, LogFetchConfig, LogOutcome, LogTarget, RunEntry, RunsListOutcome,
 };
-use crate::provider::{self, Backend, IssueInspect};
+use crate::provider::{self, AuditedTracker, IssueInspect, IssueTracker, IssueWriteAudit};
 use crate::secrets::{self, SecretsKey};
 use crate::state;
 
@@ -175,6 +175,12 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
         warn!(run_id, error = %e, "recording planned keys failed (continuing)");
     }
 
+    // CLAUDE-234: every tracker write from here on carries this run's id into
+    // the journal, and any issue it creates spends the run's ceiling.
+    let limits = crate::job::effective_limits(&crate::job::RunnerDefaults::default(), ctx.action);
+    let audit = IssueWriteAudit::new(Some(run_id), limits.max_issues_per_run);
+    let tracker = AuditedTracker::new(backend.as_ref(), audit);
+
     // CLAUDE-223: run-scoped global-pause gate, checked alongside cancel at the
     // per-repo pickup so a mid-run pause stops the next repo scan.
     let run_pause = ctx.pause.for_action_run(&action.name);
@@ -186,7 +192,7 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
     if cfg.close_duplicates {
         let dups = plan_duplicates(&targets);
         for dup in &dups {
-            match close_duplicate(backend.as_ref(), &cfg, dup) {
+            match close_duplicate(&tracker, &cfg, dup) {
                 Ok(()) => {
                     info!(action = %action.name, key = %dup.key, canonical = %dup.canonical, "auto-closed duplicate CI-failure issue");
                     closed += 1;
@@ -240,7 +246,7 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
                     .iter()
                     .find(|g| issue_matches(&gt.coords, &repo, g))
                     .expect("just matched");
-                match close_issue(backend.as_ref(), &cfg, &gt.key, g) {
+                match close_issue(&tracker, &cfg, &gt.key, g) {
                     Ok(()) => {
                         info!(action = %action.name, key = %gt.key, repo = %repo, branch = %g.branch, job = %g.job_name, "auto-closed CI-failure issue (job now green)");
                         closed += 1;
@@ -469,7 +475,7 @@ fn issue_order(key: &str) -> (String, i64) {
 /// State is set FIRST, exactly as [`close_issue`] does, so a failed comment can
 /// never leave the issue open and re-processed.
 fn close_duplicate(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     cfg: &CiFailureReconcileConfig,
     dup: &DuplicateClose,
 ) -> Result<()> {
@@ -701,7 +707,7 @@ fn issue_matches(coords: &IssueCoords, repo: &str, green: &GreenJob) -> bool {
 /// `#Unresolved` scan, so a later run never re-closes it even if the comment
 /// failed to post. The comment carries the hidden auto-closed marker.
 fn close_issue(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     cfg: &CiFailureReconcileConfig,
     key: &str,
     green: &GreenJob,

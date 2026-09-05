@@ -41,7 +41,7 @@ use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::claude::{raw_event_details, ClaudeInvoker, ClaudeResult};
 use crate::error::{Error, Result};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
-use crate::provider::{self, Backend};
+use crate::provider::{self, AuditedTracker, Backend, IssueTracker, IssueWriteAudit};
 use crate::state;
 use crate::workdir;
 
@@ -175,6 +175,11 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
         run_id,
     };
 
+    // CLAUDE-234: every tracker write from here on carries this run's id into
+    // the journal, and any issue it creates spends the run's ceiling.
+    let audit = IssueWriteAudit::new(Some(run_id), limits.max_issues_per_run);
+    let tracker = AuditedTracker::new(backend.as_ref(), audit);
+
     // CLAUDE-1: record planned job keys so the web UI shows what is queued.
     let planned_keys: Vec<String> = jobs.iter().map(|j| j.key.clone()).collect();
     if let Err(e) = state::run_set_job_keys(pool, run_id, &planned_keys).await {
@@ -228,6 +233,7 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
         let outcome = process_job(
             &ctx,
             backend.as_ref(),
+            &tracker,
             &cfg,
             &limits,
             &cancel,
@@ -314,9 +320,11 @@ fn within_window(updated_at: &str, cutoff: DateTime<Utc>) -> bool {
 /// reached the workdir, transient claude errors skip finalize + attempt
 /// counting, the skip marker (or a cancel) suppresses attempt counting, and the
 /// daily ledger advances only when claude actually ran.
+#[allow(clippy::too_many_arguments)]
 async fn process_job(
     ctx: &NativeContext<'_>,
     backend: &dyn Backend,
+    tracker: &dyn IssueTracker,
     cfg: &ForgejoCiFixConfig,
     limits: &EffectiveLimits,
     cancel: &CancellationToken,
@@ -350,7 +358,7 @@ async fn process_job(
         let review_key = format!("review:{}#{}", job.repo, job.pr_number);
         if state::attempts_get(ctx.pool, &action.name, &review_key).await? == 0 {
             info!(action = %action.name, key = %key, pr = job.pr_number, pr_attempts, "per-PR fix ceiling reached; flagging Needs Review");
-            flag_needs_review(ctx, backend, cfg, job).await;
+            flag_needs_review(ctx, backend, tracker, cfg, job).await;
             state::attempts_increment(ctx.pool, &action.name, &review_key).await?;
         } else {
             info!(action = %action.name, key = %key, pr = job.pr_number, "per-PR ceiling already flagged Needs Review; not re-flagging");
@@ -964,6 +972,7 @@ fn pr_ceiling_reached(pr_attempts: u32, max_pr_attempts: u64) -> bool {
 async fn flag_needs_review(
     ctx: &NativeContext<'_>,
     backend: &dyn Backend,
+    tracker: &dyn IssueTracker,
     cfg: &ForgejoCiFixConfig,
     job: &ForgejoCiFixJob,
 ) {
@@ -1009,11 +1018,11 @@ async fn flag_needs_review(
     match backend.pr_referenced_issues(&job.host, &job.repo, job.pr_number) {
         Ok(keys) => {
             for issue in keys {
-                if let Err(e) = backend.set_state(&issue, &cfg.needs_review_state) {
+                if let Err(e) = tracker.set_state(&issue, &cfg.needs_review_state) {
                     warn!(issue = %issue, error = %e, "needs-review: set_state failed (continuing)");
                 }
                 if let Some(assignee) = &cfg.review_assignee {
-                    if let Err(e) = backend.set_assignee(&issue, assignee) {
+                    if let Err(e) = tracker.set_assignee(&issue, assignee) {
                         warn!(issue = %issue, error = %e, "needs-review: set_assignee failed (continuing)");
                     }
                 }

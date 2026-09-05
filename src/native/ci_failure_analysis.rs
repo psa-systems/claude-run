@@ -45,7 +45,7 @@ use crate::claude::ClaudeInvoker;
 use crate::error::{Error, Result};
 use crate::forge_log::{self, ForgeReads, LogFetchConfig, LogOutcome, LogTarget};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
-use crate::provider::{self, Backend, IssueInspect};
+use crate::provider::{self, AuditedTracker, IssueInspect, IssueTracker, IssueWriteAudit};
 use crate::secrets::{self, SecretsKey};
 use crate::state;
 use crate::workdir;
@@ -169,6 +169,11 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
         warn!(run_id, error = %e, "recording planned keys failed (continuing)");
     }
 
+    // CLAUDE-234: every tracker write from here on carries this run's id into
+    // the journal, and any issue it creates spends the run's ceiling.
+    let audit = IssueWriteAudit::new(Some(run_id), limits.max_issues_per_run);
+    let tracker = AuditedTracker::new(backend.as_ref(), audit);
+
     // CLAUDE-205: ONE forge client: `fj actions logs` for the run log and
     // `fj repo file` for the workflow YAML.
     let fj = crate::provider::FjForgeReads::new(std::sync::Arc::new(
@@ -202,7 +207,7 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
         if let Err(e) = state::run_inflight_add(pool, run_id, key, key).await {
             warn!(run_id, error = %e, "run_inflight_add failed (continuing)");
         }
-        let outcome = process_job(&ctx, backend.as_ref(), &cfg, &limits, &fj, &tokens, key).await;
+        let outcome = process_job(&ctx, &tracker, &cfg, &limits, &fj, &tokens, key).await;
         if let Err(e) = state::run_inflight_remove(pool, run_id, key).await {
             warn!(run_id, error = %e, "run_inflight_remove failed (continuing)");
         }
@@ -221,7 +226,7 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn process_job(
     ctx: &NativeContext<'_>,
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     cfg: &CiFailureAnalysisConfig,
     limits: &EffectiveLimits,
     fj: &dyn ForgeReads,
