@@ -60,7 +60,10 @@ use crate::concurrency::Executor;
 use crate::config::Paths;
 use crate::error::{Error, Result};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
-use crate::provider::{self, Backend, CliBackend, CommandRunner, Forge, PullRequest};
+use crate::provider::{
+    self, AuditedTracker, CliBackend, CommandRunner, Forge, IssueTracker, IssueWriteAudit,
+    PullRequest,
+};
 use crate::secrets::{self, JobCredentials};
 use crate::state;
 use crate::workdir;
@@ -334,6 +337,11 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         }
     }
 
+    // CLAUDE-234: ONE issue-write ledger for the whole run, shared by every
+    // per-job backend below, so the ceiling is per run rather than per job and
+    // every write this run makes carries `run_id` into the journal.
+    let audit = IssueWriteAudit::new(Some(run_id), limits.max_issues_per_run);
+
     // CLAUDE-28: keyed, bounded-parallel execution. Distinct repos (the
     // concurrency key) run in parallel; jobs against the same repo serialize so
     // they never collide on the clone dir / branch / PR. `max_parallel: 1`
@@ -360,6 +368,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         let gh = gh_owned.clone();
         let job_cancel = cancel.clone();
         let job_pause = run_pause.clone();
+        let job_audit = audit.clone();
         let fut: crate::concurrency::JobFuture = Box::pin(async move {
             let action = &loaded.action;
             // CLAUDE-28: best-effort cap/budget check before launch; bounded
@@ -413,12 +422,16 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 Some(f) => f,
                 None => &job_backend,
             };
+            // CLAUDE-234: the job writes through the RUN's ledger, so each
+            // comment / field write is journalled with `run_id` and the issue
+            // key, and any issue this job creates spends the run's ceiling.
+            let tracker = AuditedTracker::new(&job_backend, job_audit);
             let outcome = process_job(
                 loaded.as_ref(),
                 &paths,
                 &pool,
                 claude.as_ref(),
-                &job_backend,
+                &tracker,
                 forge,
                 &src,
                 &limits,
@@ -479,6 +492,25 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                     first_err = Some(e);
                 }
             }
+        }
+    }
+
+    // CLAUDE-234: a run stopped by its issue-creation ceiling surfaces on the
+    // action page, not only in the daemon journal. The ledger is the run's, so
+    // the drain is here rather than per job. Non-fatal bookkeeping.
+    let notices = audit.take_notices();
+    if !notices.is_empty() {
+        let events: Vec<state::InputEvent> = notices
+            .into_iter()
+            .map(|message| state::InputEvent {
+                level: "warn".to_string(),
+                context: None,
+                message,
+            })
+            .collect();
+        if let Err(e) = state::run_events_record_for_run(pool, run_id, &action.name, &events).await
+        {
+            warn!(run_id, error = %e, "run_events_record_for_run failed (non-fatal)");
         }
     }
 
@@ -650,7 +682,11 @@ fn forge_access_check(
 /// Returns the eligible jobs plus the CLAUDE-147 input-phase events (the
 /// per-project probe failures and no-VCS drops) that the caller persists to
 /// `run_events` so they surface in the web UI rather than only in the journal.
-fn gather(backend: &dyn Backend, query: &str, access: Option<&dyn RepoAccess>) -> Result<Gathered> {
+fn gather(
+    backend: &dyn IssueTracker,
+    query: &str,
+    access: Option<&dyn RepoAccess>,
+) -> Result<Gathered> {
     let issues = backend.list_queued(query)?;
     // CLAUDE-225: every key the QUERY matched, before the VCS / access filters
     // below drop any. This is "still a candidate for this action", which is what
@@ -826,7 +862,7 @@ enum Eligibility {
 /// guard right before the first mutation (`src/concurrency.rs` module docs).
 async fn evaluate_eligibility(
     pool: &SqlitePool,
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     src: &YoutrackSource,
     action: &str,
     job: &YoutrackJob,
@@ -875,7 +911,7 @@ async fn evaluate_eligibility(
 /// issues never compete for a project's concurrency key.
 async fn filter_eligible(
     pool: &SqlitePool,
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     src: &YoutrackSource,
     action: &str,
     jobs: Vec<YoutrackJob>,
@@ -904,7 +940,7 @@ async fn process_job(
     paths: &Paths,
     pool: &SqlitePool,
     claude: &ClaudeInvoker,
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     forge: &dyn Forge,
     src: &YoutrackSource,
     limits: &EffectiveLimits,
@@ -1270,7 +1306,7 @@ fn blocked_comment(blockers: &[Blocker]) -> String {
 /// row is written, and the journal said nothing above `info`.
 async fn dependency_gate(
     pool: &SqlitePool,
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     src: &YoutrackSource,
     action: &str,
     key: &str,
@@ -1365,7 +1401,7 @@ fn log_held(action: &str, key: &str, signature: &str, blocked_since_ms: i64, now
 /// `workdir`. Returns the failure reason on any step error so the caller can
 /// synthesize a failed claude result and still finalize.
 fn run_pre(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     src: &YoutrackSource,
     job: &YoutrackJob,
     workdir: &Path,
@@ -1637,7 +1673,7 @@ impl Finalized {
 /// enabled and the runner merges the PR itself (then State / AI Agent go Done).
 #[allow(clippy::too_many_arguments)]
 fn finalize(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     forge: &dyn Forge,
     src: &YoutrackSource,
     job: &YoutrackJob,
@@ -1777,7 +1813,7 @@ fn finalize(
 /// stays unmergeable after one update is left for a human.
 #[allow(clippy::too_many_arguments)]
 fn automerge(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     forge: &dyn Forge,
     src: &YoutrackSource,
     job: &YoutrackJob,
@@ -1935,7 +1971,7 @@ fn automerge_not_mergeable_comment(pr_url: &str) -> String {
 /// field from advancing off Working; a set_field failure propagates and marks
 /// the job's finalize as failed.
 fn comment_then_field(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     src: &YoutrackSource,
     key: &str,
     body: &str,

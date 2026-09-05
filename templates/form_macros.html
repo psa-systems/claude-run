@@ -139,7 +139,7 @@
 </div>
 {% endmacro %}
 
-{% macro limits_block(max_attempts_per_key, max_runs_per_day, claude_timeout_seconds, daily_budget_usd) %}
+{% macro limits_block(max_attempts_per_key, max_runs_per_day, claude_timeout_seconds, daily_budget_usd, max_issues_per_run) %}
 <div class="card">
   <h3>Limits</h3>
   <div class="grid2">
@@ -147,6 +147,7 @@
     {% call numfield("Max runs per day", "limit_max_runs_per_day", max_runs_per_day, "unset = no cap", "1") %}
     {% call numfield("Claude timeout (seconds)", "limit_claude_timeout_seconds", claude_timeout_seconds, "unset = no timeout", "1") %}
     {% call numfield("Daily budget (USD)", "limit_daily_budget_usd", daily_budget_usd, "unset = no budget", "0.01") %}
+    {% call numfield("Max issues per run", "limit_max_issues_per_run", max_issues_per_run, "unset = 25; 0 = create none", "1") %}
   </div>
 </div>
 {% endmacro %}

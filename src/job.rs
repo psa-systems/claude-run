@@ -41,6 +41,8 @@ pub struct RunnerDefaults {
     pub max_runs_per_day: u32,
     pub claude_timeout_seconds: u32,
     pub daily_budget_usd: f64,
+    /// CLAUDE-234: issues one run may create when the action sets no override.
+    pub max_issues_per_run: u32,
 }
 
 impl Default for RunnerDefaults {
@@ -50,6 +52,7 @@ impl Default for RunnerDefaults {
             max_runs_per_day: 20,
             claude_timeout_seconds: 600,
             daily_budget_usd: 5.00,
+            max_issues_per_run: crate::provider::DEFAULT_MAX_ISSUES_PER_RUN,
         }
     }
 }
@@ -60,6 +63,9 @@ pub struct EffectiveLimits {
     pub max_runs_per_day: u32,
     pub claude_timeout: Duration,
     pub daily_budget_usd: f64,
+    /// CLAUDE-234: this run's issue-creation ceiling, enforced at the provider
+    /// boundary by [`crate::provider::AuditedTracker`].
+    pub max_issues_per_run: u32,
 }
 
 pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> EffectiveLimits {
@@ -74,6 +80,7 @@ pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> Eff
                 .unwrap_or(defaults.claude_timeout_seconds) as u64,
         ),
         daily_budget_usd: l.daily_budget_usd.unwrap_or(defaults.daily_budget_usd),
+        max_issues_per_run: l.max_issues_per_run.unwrap_or(defaults.max_issues_per_run),
     }
 }
 
@@ -613,6 +620,28 @@ mod tests {
         let action = mk_action(None);
         let r = job_key(&action, &json!({"foo": "bar"}), 7);
         assert_eq!(r, "job-7");
+    }
+
+    /// CLAUDE-234: the per-run issue-creation ceiling resolves like every other
+    /// limit: the action's own value wins, and an unset one falls back to the
+    /// default of 25. `0` is a real value (create nothing), not "unset".
+    #[test]
+    fn max_issues_per_run_defaults_to_25_and_the_action_overrides_it() {
+        let defaults = RunnerDefaults::default();
+        assert_eq!(defaults.max_issues_per_run, 25);
+
+        let mut action = mk_action(None);
+        assert_eq!(
+            effective_limits(&defaults, &action).max_issues_per_run,
+            25,
+            "an action with no `limits.max_issues_per_run` takes the default"
+        );
+
+        action.action.limits.max_issues_per_run = Some(3);
+        assert_eq!(effective_limits(&defaults, &action).max_issues_per_run, 3);
+
+        action.action.limits.max_issues_per_run = Some(0);
+        assert_eq!(effective_limits(&defaults, &action).max_issues_per_run, 0);
     }
 
     /// CLAUDE-232: the cap the operator surfaces compare against is each

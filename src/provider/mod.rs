@@ -25,6 +25,7 @@
 //! [`crate::snippet`]). The async native handler (CLAUDE-32) wraps a backend
 //! call in `tokio::task::spawn_blocking`.
 
+pub mod audit;
 pub mod cli;
 pub mod github;
 
@@ -34,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+pub use audit::{AuditedTracker, IssueWriteAudit, DEFAULT_MAX_ISSUES_PER_RUN};
 pub use cli::{CliBackend, CmdOutput, CommandRunner, FjForgeReads, ProcessRunner};
 pub use github::{is_github_host, GithubForge, HttpMcpTransport, McpTransport};
 
@@ -216,6 +218,11 @@ pub trait IssueTracker: Send + Sync {
     /// and a Markdown `description`, optionally pre-assigning `assignee` (a login).
     /// Returns the new issue's `idReadable` (e.g. `CLAUDE-47`). Backs the
     /// triage-driven issue mint (CLAUDE-46).
+    ///
+    /// CLAUDE-234: a run reaches this through [`AuditedTracker`], which spends
+    /// one slot of the run's issue-creation ceiling per call and refuses once
+    /// the ceiling is reached. Implementations do NOT count; the ledger is
+    /// per-run, and a backend can outlive many runs.
     fn create_issue(
         &self,
         project: &str,
