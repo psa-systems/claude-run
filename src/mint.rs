@@ -67,8 +67,9 @@ pub struct MintRequest<'a> {
     /// CLAUDE-190: a deterministic, pure-string signature of the first
     /// diagnostic line in the redacted log (paths / numbers stripped), so the
     /// same root cause across commits yields the same key. `None` when no
-    /// diagnostic line is derivable (truncated / diagnostic-free / logless
-    /// failure); the key then falls back to `(repo, branch, workflow, job)`.
+    /// diagnostic line is derivable: the log stops before one was emitted,
+    /// carries none, or the failure produced no log at all. The key then falls
+    /// back to `(repo, branch, workflow, job)`.
     pub failure_signature: Option<&'a str>,
     /// Run URL, surfaced in the issue body.
     pub html_url: &'a str,
@@ -401,8 +402,9 @@ fn secondary_marker(req: &MintRequest) -> String {
 /// `(repo, branch, workflow_id, job_name, failure_signature)` so N commits that
 /// each fail the same job on the same branch with the same signature collapse
 /// onto ONE open issue, while a different signature (a different root cause)
-/// stays a separate issue. When no signature is derivable (a truncated /
-/// diagnostic-free / logless failure) the key falls back to
+/// stays a separate issue. When no signature is derivable (the log stops before
+/// a diagnostic was emitted, carries none, or the failure produced no log at
+/// all) the key falls back to
 /// `(repo, branch, workflow_id, job_name)`: this still collapses the
 /// "branch is broken" storm onto one issue, intentionally grouping two
 /// indistinguishable logless failures (the CLAUDE-189 analysis can later split a
@@ -1707,7 +1709,7 @@ mod tests {
 
     #[test]
     fn signature_none_when_no_diagnostic_line() {
-        // A diagnostic-free / truncated log yields no signature (fallback key).
+        // A log carrying no diagnostic line yields no signature (fallback key).
         assert!(failure_signature("Compiling...\nBuilding...\nDone.\n").is_none());
         assert!(failure_signature("").is_none());
     }
