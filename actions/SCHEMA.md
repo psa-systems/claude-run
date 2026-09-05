@@ -773,11 +773,19 @@ $CLAUDE_RUN_LOG_DIR/<name>/streams/<key>-attempt-<n>.jsonl
 `tail -f` that file from another terminal to watch Claude work in real time. The final `result` event on the last line
 is parsed for cost (`total_cost_usd`) and outcome (`result`, `is_error`) once claude exits.
 
+A relay thread inside the runner is that file's only writer, so if writing to it fails (a full log partition is the
+usual cause) every later event is lost, including the terminal `result`. CLAUDE-233: that is reported as what it is - a
+runner-side I/O failure naming the underlying error and the log path - rather than as claude failing to produce a
+result, and it is classified `transient`, so it costs the job no attempt and the job is retried on the next poll. When
+the `result` event was already captured before the write failed, the run is still finalized from it and the truncation
+is logged at `warn`.
+
 ### `post` (list of nu snippets, optional)
 
 Ordered steps that run after every code path that reached the workdir: Claude success, Claude non-transient failure,
 prompt-snippet failure, empty-prompt, and pre-step failure all run post. The single exception is transient Claude errors
-(rate limit, auth) - those skip post and return early so the job can be retried cleanly on the next firing.
+(rate limit, auth, and the stream-log write failure above) - those skip post and return early so the job can be retried
+cleanly on the next firing.
 
 When a run is canceled while this job is in flight, its claude child is terminated and post still runs, with a
 synthesized cancelled `$claude_result` (`ok: false`, `error: "run cancelled by operator"`, `cost: 0`), so end-of-job
