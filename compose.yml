@@ -1,25 +1,27 @@
-# claude-run daemon, containerized (CLAUDE-37).
+# claude-run daemon, containerized (CLAUDE-37, CLAUDE-247).
 #
 # The whole daemon runs in this container, so every `claude` child it spawns
 # inherits the container's clean $HOME and loads only the slim bot CLAUDE.md
 # baked into the image (deploy/bot-CLAUDE.md), never the operator's interactive
 # ~/.claude/CLAUDE.md.
 #
-# Host tool auth reaches the container through read-only bind mounts. The
-# operator's ~/.claude is NOT mounted wholesale: only ~/.claude/.credentials.json
-# is bound, so the baked slim CLAUDE.md is never shadowed. (To use an API key
-# instead, drop that bind and set ANTHROPIC_API_KEY in the environment block.)
+# CLAUDE-247: the container is self-contained. It bind-mounts NOTHING from the
+# host and reads no host credential. The operator logs Claude, YouTrack, Forgejo
+# and git in INSIDE the container once (see README "Containerized deployment"),
+# and each login persists on its own named volume. That keeps the runner's
+# identity separate from the operator's and lets the stack deploy on a host
+# where neither $HOME nor the invocation directory is available.
 #
 # Names are app-prefixed per house convention. For a development stack, prefix
 # each name with `dev-` (service dev-claude-bot, network dev-claude-bot-private,
-# volumes dev-claude-bot-{config,data,state}).
+# volumes dev-claude-bot-*).
 
 name: claude-bot
 
 services:
   claude-bot:
     container_name: claude-bot
-    # CLAUDE-88: published by .forgejo/workflows/build-binary.yml on every main
+    # CLAUDE-88: published by .forgejo/workflows/build-image.yml on every main
     # push (`latest`) and release tag (`vX.Y.Z`). Pin a version tag in
     # production. For local development, comment `image:` and uncomment
     # the build block to build from the working tree instead.
@@ -31,6 +33,10 @@ services:
     restart: unless-stopped
     networks:
       claude-bot-private:
+    # CLAUDE-247: no `user:` here. The image starts as root so its entrypoint can
+    # chown the volumes, then drops to claudebot with su-exec (pattern 3 in
+    # governance/CONTAINER_UID_GID.md). A `user:` override would leave the
+    # entrypoint without the privileges the chown needs.
     environment:
       CLAUDE_RUN_CONFIG_DIR: /home/claudebot/.config/claude-run
       CLAUDE_RUN_DATA_DIR: /home/claudebot/.local/share/claude-run
@@ -53,32 +59,31 @@ services:
       - type: volume
         source: claude-bot-state
         target: /home/claudebot/.local/state/claude-run
-      # Actions YAML, supplied read-only into the config dir.
-      - type: bind
-        source: ./actions
-        target: /home/claudebot/.config/claude-run/actions
-        read_only: true
-      # Claude auth: ONLY the credentials file, never the whole ~/.claude (which
-      # would shadow the baked slim CLAUDE.md).
-      - type: bind
-        source: ${HOME}/.claude/.credentials.json
-        target: /home/claudebot/.claude/.credentials.json
-        read_only: true
-      # yt (youtrack-cli) config.
-      - type: bind
-        source: ${HOME}/.config/youtrack-cli
+      # Tool credentials, one volume per store, each written by an in-container
+      # login. Separate volumes rather than subpaths of one: a `volume.subpath`
+      # is resolved before the entrypoint runs, is never auto-created, and is
+      # not seeded from the image, so a missing subdirectory fails the container
+      # create outright.
+      #
+      # claude: `claude auth login` writes .credentials.json here. The image
+      # bakes the slim bot CLAUDE.md at this path and Docker seeds it into the
+      # empty volume on first start.
+      - type: volume
+        source: claude-bot-claude
+        target: /home/claudebot/.claude
+      # yt: the youtrack-cli instance store (config.yml, config-<name>.yml).
+      - type: volume
+        source: claude-bot-youtrack-cli
         target: /home/claudebot/.config/youtrack-cli
-        read_only: true
-      # fj (forgejo-cli) keys. Token needs write:repository + write:issue (CLAUDE-196).
-      - type: bind
-        source: ${HOME}/.local/share/forgejo-cli/keys.json
-        target: /home/claudebot/.local/share/forgejo-cli/keys.json
-        read_only: true
-      # git identity.
-      - type: bind
-        source: ${HOME}/.gitconfig
-        target: /home/claudebot/.gitconfig
-        read_only: true
+      # fj: forgejo-cli keys.json. The runner resolves this path itself through
+      # the XDG data dir (src/provider/cli.rs), so it must stay where fj puts it.
+      - type: volume
+        source: claude-bot-forgejo-cli
+        target: /home/claudebot/.local/share/forgejo-cli
+      # git identity, at the path GIT_CONFIG_GLOBAL names in the image.
+      - type: volume
+        source: claude-bot-git
+        target: /home/claudebot/.config/git
     # The daemon's unix socket lives here; ephemeral per container so a stale
     # socket never survives a restart.
     tmpfs:
@@ -95,11 +100,22 @@ volumes:
     name: claude-bot-data
   claude-bot-state:
     name: claude-bot-state
+  claude-bot-claude:
+    name: claude-bot-claude
+  claude-bot-youtrack-cli:
+    name: claude-bot-youtrack-cli
+  claude-bot-forgejo-cli:
+    name: claude-bot-forgejo-cli
+  claude-bot-git:
+    name: claude-bot-git
 
 # CLAUDE-88: the age identity that decrypts the secrets store (web auth token,
 # webhook HMACs, registry token refs). Create it once before `compose up`:
 #   mkdir secrets; chmod 700 secrets
 #   age-keygen | save secrets/age-key.txt
+# A deployment that cannot use a path relative to this file supplies the same
+# secret from an environment value instead; see README "Containerized
+# deployment".
 secrets:
   claude-run-age-key:
     file: ./secrets/age-key.txt

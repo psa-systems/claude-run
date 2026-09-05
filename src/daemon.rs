@@ -140,9 +140,10 @@ impl Daemon {
 
         let snippet = SnippetRunner::new(self.on_disk.daemon.nu_binary.as_deref());
         // CLAUDE-165: seed the agent's dedicated CLAUDE_CONFIG_DIR (slim bot
-        // CLAUDE.md + linked host login) before spawning any agent, so the child
-        // never loads the operator's global `~/.claude/CLAUDE.md`. A missing host
-        // credential file aborts serve start with a clear error.
+        // CLAUDE.md + the host login when there is one) before spawning any
+        // agent, so the child never loads the operator's global
+        // `~/.claude/CLAUDE.md`. CLAUDE-247: a missing host login is a warn, not
+        // an abort, so the container comes up for the operator to log into.
         let agent_config_dir = crate::agent_home::resolve_config_dir(
             &self.paths,
             self.on_disk.daemon.claude_config_dir.as_deref(),
