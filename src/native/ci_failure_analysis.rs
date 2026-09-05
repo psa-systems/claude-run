@@ -17,9 +17,11 @@
 //!   needs; `fj` resolves it to the run internally.
 //! - fetch: reuse [`crate::forge_log::fetch_run_log`] to pull the complete
 //!   redacted run log through `fj actions logs`, plus the failing workflow YAML,
-//!   into the workdir. A log miss (`AuthDenied` / `TransientMiss` / `Failed`)
+//!   into the workdir. A log miss never crashes. A log that can still arrive
 //!   posts a short "unavailable" note (once) and leaves the issue un-marked so a
-//!   later run retries; it never crashes or marks analyzed.
+//!   later run retries; a log that is gone for good (CLAUDE-240) is marked
+//!   analyzed with a comment routing the issue to a human, so it stops being
+//!   re-fetched. An auth denial is fixable and always stays retryable.
 //! - analyze: one agentic `claude` session (tools `Read,Grep,Bash`) over the
 //!   redacted full-log file plus the workflow YAML.
 //! - finalize: post the analysis as a comment (carrying the hidden analyzed
@@ -55,6 +57,12 @@ const ANALYZED_MARKER: &str = "crcianalyzed";
 /// Hidden token embedded in the "log unavailable" note, so the note is posted at
 /// most once while the issue stays un-marked and retryable.
 const UNAVAILABLE_MARKER: &str = "crcianalysisunavailable";
+
+/// CLAUDE-240: how long after a run stops a log that still cannot be fetched is
+/// treated as gone for good rather than not yet flushed. A log flushes within
+/// seconds of a run finishing, so this is orders of magnitude past the window it
+/// must not cut into, and past any transient outage of the forge's log storage.
+const PERMANENT_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 pub struct CiFailureAnalysisHandler;
 
@@ -288,16 +296,38 @@ async fn process_job(
         crate::blocking::in_place(|| fetch_analysis_inputs(fj, &coords, &token, &workdir_path));
     let inputs = match fetched {
         FetchResult::Ready(inputs) => inputs,
-        FetchResult::Unavailable(reason) => {
-            // Post the note once; leave the issue un-marked so a later run (once
-            // logs flush / a token is fixed) retries. No attempt is consumed.
-            if should_post_unavailable(&inspect, UNAVAILABLE_MARKER) {
-                let body = build_unavailable_comment(&reason, UNAVAILABLE_MARKER);
-                if let Err(e) = backend.comment(key, &body) {
-                    warn!(key, error = %e, "posting the log-unavailable note failed (continuing)");
+        FetchResult::Unavailable(miss) => {
+            // CLAUDE-240: a log that can still arrive is retried as before; one
+            // that is gone for good is marked so it leaves the queue.
+            // CLAUDE-228: the age fallback shells out to `fj`.
+            let decided = crate::blocking::in_place(|| {
+                decide_miss(fj, &coords, &token, &inspect, &miss, key)
+            });
+            match decided {
+                MissAction::Retry { note } => {
+                    if let Some(body) = note {
+                        if let Err(e) = backend.comment(key, &body) {
+                            warn!(key, error = %e, "posting the log-unavailable note failed (continuing)");
+                        }
+                    }
+                    info!(action = %action.name, key, reason = %miss.reason, "log unavailable; left un-marked for retry");
+                }
+                MissAction::GiveUp { comment } => {
+                    // The marker rides in the comment, so a failed post leaves
+                    // the issue un-marked and it is retried: loud, and never a
+                    // silently dropped decision.
+                    match backend.comment(key, &comment) {
+                        Ok(()) => warn!(
+                            action = %action.name, key, reason = %miss.reason,
+                            "run log permanently unavailable; marked analyzed and routed to a human"
+                        ),
+                        Err(e) => warn!(
+                            key, error = %e,
+                            "posting the permanent-miss comment failed; the issue stays un-marked and is retried"
+                        ),
+                    }
                 }
             }
-            info!(action = %action.name, key, reason = %reason, "log unavailable; left un-marked for retry");
             return Ok(ProcessedJob::Filtered {
                 key: key.to_string(),
             });
@@ -373,7 +403,139 @@ struct AnalysisInputs {
 /// Fetch result: inputs ready, or the log is unavailable (with a reason).
 enum FetchResult {
     Ready(AnalysisInputs),
-    Unavailable(String),
+    Unavailable(Miss),
+}
+
+/// CLAUDE-240: a log that could not be read, and what the fetch itself knows
+/// about whether asking again could ever help.
+struct Miss {
+    /// Operator-facing cause, as the note and the log line carry it.
+    reason: String,
+    verdict: MissVerdict,
+}
+
+/// CLAUDE-240: what the fetch knows about the permanence of a miss. Advisory in
+/// one direction only: it may only ever mark a log gone, never resurrect one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissVerdict {
+    /// `fj` reported the log gone for good (the FJ-79 signal). Decided here,
+    /// with no age check.
+    Gone,
+    /// Retryable whatever the run's age: a credential problem is fixable, so a
+    /// rejected token must never terminate an issue.
+    Retryable,
+    /// Nothing known about permanence; the run's age decides.
+    Unknown,
+}
+
+impl Miss {
+    /// A miss `fj` reported as permanent (FJ-79).
+    fn gone(reason: String) -> Self {
+        Self {
+            reason,
+            verdict: MissVerdict::Gone,
+        }
+    }
+    /// A miss that stays retryable however old the run is.
+    fn retryable(reason: String) -> Self {
+        Self {
+            reason,
+            verdict: MissVerdict::Retryable,
+        }
+    }
+    /// A miss whose permanence the run's age decides.
+    fn unknown(reason: String) -> Self {
+        Self {
+            reason,
+            verdict: MissVerdict::Unknown,
+        }
+    }
+}
+
+/// CLAUDE-240: what to do with an issue whose run log could not be fetched.
+enum MissAction {
+    /// Leave the issue un-marked so a later run retries. `note` is the one-time
+    /// "log unavailable" comment to post, or `None` when it is already there.
+    Retry { note: Option<String> },
+    /// The log is gone for good: post `comment`, which carries
+    /// [`ANALYZED_MARKER`], so the existing analyzed guard never picks this
+    /// issue up again and a human triages it instead.
+    GiveUp { comment: String },
+}
+
+/// CLAUDE-240: decide whether a log miss is permanent, and what to post.
+///
+/// `fj`'s own verdict wins where it has one (FJ-79); an auth denial is fixable
+/// and stays retryable whatever the run's age; anything else falls back to the
+/// run's age. A permanence check that cannot be made leaves the miss retryable,
+/// so nothing here can terminate an issue that would otherwise have succeeded.
+fn decide_miss(
+    fj: &dyn ForgeReads,
+    coords: &RunCoordinates,
+    token: &str,
+    inspect: &IssueInspect,
+    miss: &Miss,
+    key: &str,
+) -> MissAction {
+    let permanent = match miss.verdict {
+        MissVerdict::Gone => true,
+        MissVerdict::Retryable => false,
+        MissVerdict::Unknown => run_stopped_long_ago(fj, coords, token, key),
+    };
+    if permanent {
+        return MissAction::GiveUp {
+            comment: build_permanent_comment(&miss.reason, coords, ANALYZED_MARKER),
+        };
+    }
+    MissAction::Retry {
+        note: should_post_unavailable(inspect, UNAVAILABLE_MARKER)
+            .then(|| build_unavailable_comment(&miss.reason, UNAVAILABLE_MARKER)),
+    }
+}
+
+/// CLAUDE-240: true when the run stopped more than [`PERMANENT_AFTER`] ago, so a
+/// log that still cannot be read is gone rather than un-flushed.
+///
+/// TODO(FJ-79): drop this age fallback once the deployed `fj` reports a missing
+/// log directly; its `log_state` then decides every case on its own.
+///
+/// A stop time that cannot be read or parsed, and a run that reports stopping in
+/// the future, are logged at `warn` and reported as NOT permanent: a failed
+/// permanence check must never terminate an issue by accident.
+fn run_stopped_long_ago(
+    fj: &dyn ForgeReads,
+    coords: &RunCoordinates,
+    token: &str,
+    key: &str,
+) -> bool {
+    let Some(host) = forge_log::host_from_html_url(&coords.html_url) else {
+        warn!(key, url = %coords.html_url, "could not derive the forge host from the run URL; treating the log miss as retryable");
+        return false;
+    };
+    let stopped = match fj.run_timing(&host, &coords.repo, coords.index_in_repo, Some(token)) {
+        Ok(t) => t.stopped,
+        Err(reason) => {
+            warn!(key, repo = %coords.repo, run = coords.index_in_repo, %reason, "could not read the run's stop time; treating the log miss as retryable");
+            return false;
+        }
+    };
+    let stopped_at = match chrono::DateTime::parse_from_rfc3339(&stopped) {
+        Ok(t) => t.with_timezone(&chrono::Utc),
+        Err(e) => {
+            warn!(key, stopped = %stopped, error = %e, "the run's stop time is unparseable; treating the log miss as retryable");
+            return false;
+        }
+    };
+    match chrono::Utc::now()
+        .signed_duration_since(stopped_at)
+        .to_std()
+    {
+        Ok(age) => age >= PERMANENT_AFTER,
+        Err(_) => {
+            warn!(key, stopped = %stopped, "the run reports stopping in the future; treating the log miss as retryable");
+            false
+        }
+    }
 }
 
 /// Fetch the complete redacted run log through `fj actions logs` and, best-effort,
@@ -396,9 +558,9 @@ fn fetch_analysis_inputs(
         coords.index_in_repo,
         Some(token.to_string()),
     ) else {
-        return FetchResult::Unavailable(
+        return FetchResult::Unavailable(Miss::retryable(
             "could not derive the forge host from the run URL".to_string(),
-        );
+        ));
     };
     let log_path = match forge_log::fetch_run_log(
         fj,
@@ -408,19 +570,38 @@ fn fetch_analysis_inputs(
         &[],
         std::thread::sleep,
     ) {
-        Ok(LogOutcome::Fetched(log)) => log.artifact,
+        Ok(LogOutcome::Fetched(log)) => {
+            // CLAUDE-240: post-FJ-79 `fj` ANSWERS for a run whose log blobs are
+            // gone, handing back every job with an empty log. There is nothing
+            // to analyze and re-asking can never help, so that is a permanent
+            // miss, not an input.
+            match forge_log::logs_permanently_missing(&log.jobs) {
+                Some(reason) => return FetchResult::Unavailable(Miss::gone(reason)),
+                None => log.artifact,
+            }
+        }
         Ok(LogOutcome::AuthDenied { reason }) => {
-            return FetchResult::Unavailable(format!("run-logs auth denied ({reason})"))
+            // A rejected or under-scoped token is fixable, so this stays
+            // retryable however old the run is.
+            return FetchResult::Unavailable(Miss::retryable(format!(
+                "run-logs auth denied ({reason})"
+            )));
         }
         Ok(LogOutcome::TransientMiss { reason }) => {
-            return FetchResult::Unavailable(format!(
+            return FetchResult::Unavailable(Miss::unknown(format!(
                 "run logs not available yet or pruned: {reason}"
-            ))
+            )))
         }
         Ok(LogOutcome::Failed { reason }) => {
-            return FetchResult::Unavailable(format!("fetching the run logs failed: {reason}"))
+            return FetchResult::Unavailable(Miss::unknown(format!(
+                "fetching the run logs failed: {reason}"
+            )))
         }
-        Err(e) => return FetchResult::Unavailable(format!("fetching the run logs errored: {e}")),
+        Err(e) => {
+            return FetchResult::Unavailable(Miss::unknown(format!(
+                "fetching the run logs errored: {e}"
+            )))
+        }
     };
 
     // 2. Best-effort workflow YAML at the failing commit, through `fj repo file`
@@ -651,6 +832,28 @@ fn build_unavailable_comment(reason: &str, marker: &str) -> String {
     .join("\n")
 }
 
+/// CLAUDE-240: the give-up comment for a log that is gone for good. It carries
+/// [`ANALYZED_MARKER`], so the existing idempotency guard skips the issue from
+/// here on with no new state, and it says plainly that no analysis exists and a
+/// human has to take it from here.
+fn build_permanent_comment(reason: &str, coords: &RunCoordinates, marker: &str) -> String {
+    [
+        "## CI-failure analysis: log permanently unavailable".to_string(),
+        String::new(),
+        format!(
+            "The log for run #{} of `{}` cannot be fetched and never will be: {reason}.",
+            coords.index_in_repo, coords.repo
+        ),
+        format!("Run: {}", coords.html_url),
+        String::new(),
+        "No analysis could be produced, so this issue needs human triage. It is marked analyzed to stop the retries; nothing will pick it up for analysis again.".to_string(),
+        String::new(),
+        "<!-- claude-run ci-failure-analysis; do not edit -->".to_string(),
+        format!("Ci-Analysis: {marker}"),
+    ]
+    .join("\n")
+}
+
 /// Bridge a [`ProcessedJob`] to the JSONL output record + persisted job outcome,
 /// byte-identical to the scripted / forgejo-ci-fix path.
 async fn record_outcome(
@@ -742,6 +945,15 @@ mod tests {
             self.timing = Err(reason.to_string());
             self
         }
+        /// CLAUDE-240: the forge reports the run stopping at `stopped`, which is
+        /// what the age fallback measures against.
+        fn with_stopped(mut self, stopped: &str) -> Self {
+            self.timing = Ok(forge_log::RunTiming {
+                started: "2026-08-20T20:03:13+02:00".to_string(),
+                stopped: stopped.to_string(),
+            });
+            self
+        }
     }
     impl ActionLogClient for StubFj {
         fn run_logs(
@@ -825,6 +1037,7 @@ mod tests {
             name: "check".to_string(),
             status: "failure".to_string(),
             log: log.to_string(),
+            ..Default::default()
         }]));
         // Every workflow-YAML candidate misses, so no yaml is written.
         let tmp = tempfile::tempdir().unwrap();
@@ -863,6 +1076,7 @@ mod tests {
             name: "check".to_string(),
             status: "failure".to_string(),
             log: "boom".to_string(),
+            ..Default::default()
         }]))
         .with_file(".forgejo/workflows/check.yml", yaml);
         let tmp = tempfile::tempdir().unwrap();
@@ -895,8 +1109,10 @@ mod tests {
         let fj = StubFj::new(RunLogsOutcome::NotFound("no action run #4034".to_string()));
         let tmp = tempfile::tempdir().unwrap();
         match fetch_analysis_inputs(&fj, &coords, "test-pat", tmp.path()) {
-            FetchResult::Unavailable(reason) => {
-                assert!(reason.contains("no action run"), "{reason}")
+            FetchResult::Unavailable(miss) => {
+                assert!(miss.reason.contains("no action run"), "{}", miss.reason);
+                // Nothing known about permanence: the run's age decides.
+                assert_eq!(miss.verdict, MissVerdict::Unknown);
             }
             FetchResult::Ready(_) => panic!("a missing run must not be Ready"),
         }
@@ -915,7 +1131,12 @@ mod tests {
         let fj = StubFj::new(RunLogsOutcome::AuthDenied("HTTP 403: ...".to_string()));
         let tmp = tempfile::tempdir().unwrap();
         match fetch_analysis_inputs(&fj, &coords, "test-pat", tmp.path()) {
-            FetchResult::Unavailable(reason) => assert!(reason.contains("auth denied"), "{reason}"),
+            FetchResult::Unavailable(miss) => {
+                assert!(miss.reason.contains("auth denied"), "{}", miss.reason);
+                // CLAUDE-240: a credential problem is fixable, so it is never a
+                // candidate for the permanence check.
+                assert_eq!(miss.verdict, MissVerdict::Retryable);
+            }
             FetchResult::Ready(_) => panic!("an auth denial must not be Ready"),
         }
     }
@@ -987,6 +1208,202 @@ mod tests {
         assert!(!should_post_unavailable(&noted, UNAVAILABLE_MARKER));
         // The unavailable note must NOT count as analyzed (retry stays possible).
         assert!(!is_analyzed(&noted, ANALYZED_MARKER));
+    }
+
+    // ---- CLAUDE-240: giving up on a log that is gone for good --------------
+
+    /// An RFC 3339 stamp `hours` before now, for the age fallback.
+    fn hours_ago(hours: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339()
+    }
+
+    /// A job whose log `fj` reports as permanently gone (the FJ-79 signal).
+    fn missing_job() -> JobLog {
+        JobLog {
+            name: "build".to_string(),
+            status: "failure".to_string(),
+            log: String::new(),
+            log_state: forge_log::LOG_STATE_MISSING.to_string(),
+            log_reason: Some("open logs for task 43177: no such file or directory".to_string()),
+        }
+    }
+
+    /// AC: a log `fj` reports as missing is permanent immediately, with no age
+    /// check. The stub's timing read ERRORS, so a decision that reached the age
+    /// fallback could not have come out permanent.
+    #[test]
+    fn a_log_fj_reports_as_missing_is_permanent_with_no_age_check() {
+        let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        let fj = StubFj::new(RunLogsOutcome::Fetched(vec![missing_job()]))
+            .with_timing_error("the age fallback must not be consulted");
+        let tmp = tempfile::tempdir().unwrap();
+        let FetchResult::Unavailable(miss) =
+            fetch_analysis_inputs(&fj, &coords, "test-pat", tmp.path())
+        else {
+            panic!("a run whose every job log is gone has nothing to analyze");
+        };
+        assert_eq!(miss.verdict, MissVerdict::Gone);
+        assert!(miss.reason.contains("task 43177"), "{}", miss.reason);
+
+        let fresh = inspect(CLAUDE_185_BODY, &[]);
+        let MissAction::GiveUp { comment } =
+            decide_miss(&fj, &coords, "test-pat", &fresh, &miss, "PMS-970")
+        else {
+            panic!("a log fj reports gone must not be retried");
+        };
+        // AC: the comment names the run, the server's reason, and the triage.
+        assert!(comment.contains("run #4034"), "{comment}");
+        assert!(comment.contains("initech/chat"), "{comment}");
+        assert!(comment.contains("task 43177"), "{comment}");
+        assert!(comment.contains("needs human triage"), "{comment}");
+    }
+
+    /// AC: after the give-up comment, the existing `is_analyzed` guard skips the
+    /// issue. Two passes over the same issue: the second sees the comment the
+    /// first produced, and `process_job`'s FIRST act is that guard, so it never
+    /// reaches a fetch again.
+    #[test]
+    fn the_give_up_comment_makes_the_next_pass_take_the_analyzed_path() {
+        let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        let fj = StubFj::new(RunLogsOutcome::Fetched(vec![missing_job()]));
+        let miss = Miss::gone("the log blob is gone".to_string());
+
+        // Pass 1: nothing analyzed yet, so the decision is taken and posted.
+        let first = inspect(CLAUDE_185_BODY, &[]);
+        assert!(!is_analyzed(&first, ANALYZED_MARKER));
+        let MissAction::GiveUp { comment } =
+            decide_miss(&fj, &coords, "test-pat", &first, &miss, "PMS-970")
+        else {
+            panic!("expected GiveUp");
+        };
+
+        // Pass 2: the issue now carries that comment.
+        let second = inspect(CLAUDE_185_BODY, &[&comment]);
+        assert!(
+            is_analyzed(&second, ANALYZED_MARKER),
+            "the analyzed guard skips the issue from here on: {comment}"
+        );
+        // And it is not mistaken for the retryable note, which would re-arm it.
+        assert!(!should_post_unavailable(&second, ANALYZED_MARKER));
+    }
+
+    /// AC: an auth denial is never permanent, however old the run is. The run
+    /// here stopped a year ago, which the age fallback would call permanent.
+    #[test]
+    fn an_auth_denial_stays_retryable_however_old_the_run_is() {
+        let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        let fj = StubFj::new(RunLogsOutcome::AuthDenied("HTTP 403".to_string()))
+            .with_stopped(&hours_ago(24 * 365));
+        let miss = Miss::retryable("run-logs auth denied (HTTP 403)".to_string());
+        let MissAction::Retry { note } = decide_miss(
+            &fj,
+            &coords,
+            "test-pat",
+            &inspect(CLAUDE_185_BODY, &[]),
+            &miss,
+            "PMS-970",
+        ) else {
+            panic!("a fixable credential problem must never terminate an issue");
+        };
+        let note = note.expect("the one-time note is posted");
+        assert!(note.contains(UNAVAILABLE_MARKER));
+        assert!(!note.contains(ANALYZED_MARKER), "the issue stays un-marked");
+    }
+
+    /// AC: a fetch failure on a run that stopped within `PERMANENT_AFTER` keeps
+    /// today's behaviour: the one-time note is posted, the issue stays un-marked,
+    /// and no attempt is consumed (the miss path returns `Filtered`, the outcome
+    /// kind that records no job outcome and therefore no attempt).
+    #[test]
+    fn a_recent_run_still_posts_the_note_once_and_stays_unmarked() {
+        let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        let fj = StubFj::new(RunLogsOutcome::NotFound("no action run #4034".to_string()))
+            .with_stopped(&hours_ago(2));
+        let miss = Miss::unknown("run logs not available yet or pruned".to_string());
+
+        let fresh = inspect(CLAUDE_185_BODY, &[]);
+        let MissAction::Retry { note } =
+            decide_miss(&fj, &coords, "test-pat", &fresh, &miss, "PMS-970")
+        else {
+            panic!("a run that stopped 2h ago may still be flushing its log");
+        };
+        let note = note.expect("the first miss posts the note");
+        assert!(note.contains("left un-marked"), "{note}");
+        let noted = inspect(CLAUDE_185_BODY, &[&note]);
+        assert!(!is_analyzed(&noted, ANALYZED_MARKER), "still un-marked");
+
+        // The second miss on the same issue re-posts nothing.
+        let MissAction::Retry { note } =
+            decide_miss(&fj, &coords, "test-pat", &noted, &miss, "PMS-970")
+        else {
+            panic!("still retryable");
+        };
+        assert!(note.is_none(), "the note is posted at most once");
+        assert!(
+            job::done_record(&ProcessedJob::Filtered {
+                key: "PMS-970".to_string()
+            })
+            .is_none(),
+            "a filtered job records no outcome, so no attempt is consumed"
+        );
+    }
+
+    /// AC: with no `fj` signal, a run that stopped more than `PERMANENT_AFTER`
+    /// ago whose log still fails to fetch is permanent.
+    #[test]
+    fn an_old_run_whose_log_still_fails_is_permanent() {
+        let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        let miss = Miss::unknown(
+            "fetching the run logs failed: fj actions logs exited 1: unexpected status code 500"
+                .to_string(),
+        );
+        let fresh = inspect(CLAUDE_185_BODY, &[]);
+
+        // One hour short of the threshold: still retried.
+        let recent =
+            StubFj::new(RunLogsOutcome::NotFound("500".to_string())).with_stopped(&hours_ago(23));
+        assert!(matches!(
+            decide_miss(&recent, &coords, "test-pat", &fresh, &miss, "PMS-970"),
+            MissAction::Retry { .. }
+        ));
+
+        // One hour past it: given up on, with the server's reason in the comment.
+        let old =
+            StubFj::new(RunLogsOutcome::NotFound("500".to_string())).with_stopped(&hours_ago(25));
+        let MissAction::GiveUp { comment } =
+            decide_miss(&old, &coords, "test-pat", &fresh, &miss, "PMS-970")
+        else {
+            panic!("a log unreadable a day after the run stopped is not coming back");
+        };
+        assert!(comment.contains("unexpected status code 500"), "{comment}");
+        assert!(comment.contains(ANALYZED_MARKER), "{comment}");
+    }
+
+    /// AC: a permanence decision that cannot be made is treated as NOT permanent,
+    /// so a failed lookup can never terminate an issue by accident. Each case is
+    /// logged at `warn` by `run_stopped_long_ago`.
+    #[test]
+    fn an_undecidable_permanence_check_leaves_the_issue_retryable() {
+        let coords = parse_failure_block(CLAUDE_185_BODY).unwrap();
+        let miss = Miss::unknown("fetching the run logs failed".to_string());
+        let fresh = inspect(CLAUDE_185_BODY, &[]);
+        for fj in [
+            // The runs lookup itself failed.
+            StubFj::new(RunLogsOutcome::NotFound("500".to_string()))
+                .with_timing_error("fj actions runs exited 1"),
+            // The forge reported a stop time nothing can parse.
+            StubFj::new(RunLogsOutcome::NotFound("500".to_string())).with_stopped("not a date"),
+            // The forge reported the run stopping in the future (clock skew).
+            StubFj::new(RunLogsOutcome::NotFound("500".to_string())).with_stopped(&hours_ago(-2)),
+        ] {
+            assert!(
+                matches!(
+                    decide_miss(&fj, &coords, "test-pat", &fresh, &miss, "PMS-970"),
+                    MissAction::Retry { .. }
+                ),
+                "an undecidable check must leave the issue retryable"
+            );
+        }
     }
 
     // ---- `## Failure` coordinate parsing (CLAUDE-185 shape) ---------------
@@ -1122,6 +1539,7 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
             name: "check".to_string(),
             status: "failure".to_string(),
             log: "boom".to_string(),
+            ..Default::default()
         }]))
         .with_timing_error("the page carries no run #4034");
         let tmp = tempfile::tempdir().unwrap();
@@ -1143,6 +1561,7 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
             name: "check".to_string(),
             status: "failure".to_string(),
             log: "boom".to_string(),
+            ..Default::default()
         }]));
         let tmp = tempfile::tempdir().unwrap();
         let FetchResult::Ready(inputs) =
