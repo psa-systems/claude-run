@@ -2311,6 +2311,12 @@ pub struct Limits {
     pub max_runs_per_day: Option<u32>,
     pub claude_timeout_seconds: Option<u32>,
     pub daily_budget_usd: Option<f64>,
+    /// CLAUDE-234: issues ONE run may create in the tracker. `max_runs_per_day`
+    /// bounds how often an action fires; this bounds what a single firing can
+    /// author, so a misfiring run opens a handful of issues rather than a
+    /// hundred. Unset falls back to
+    /// [`crate::provider::DEFAULT_MAX_ISSUES_PER_RUN`]; `0` creates nothing.
+    pub max_issues_per_run: Option<u32>,
 }
 
 /// CLAUDE-28: per-action keyed parallel execution.
