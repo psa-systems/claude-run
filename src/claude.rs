@@ -19,14 +19,14 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use chrono::SecondsFormat;
 
 use serde::Serialize;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::action::ClaudeBlock;
 use crate::cancel::CancellationToken;
@@ -235,36 +235,67 @@ impl ClaudeInvoker {
         // this whole region hands the worker's core back to the runtime. Left
         // inline it pinned one tokio worker per concurrent job for the entire
         // session, which is what starved the sqlx pool.
-        let outcome = crate::blocking::in_place(|| -> std::io::Result<WaitOutcome> {
-            let mut child = command.spawn()?;
+        let (outcome, relay_error) =
+            crate::blocking::in_place(|| -> std::io::Result<(WaitOutcome, Option<String>)> {
+                let mut child = command.spawn()?;
 
-            // Relay claude's piped stdout to the stream log, stamping each JSON
-            // object line with its arrival time. Runs on its own thread next to
-            // the blocking wait below and drains to EOF (the pipe closes when
-            // the child group exits, including a timeout/cancel kill, so all
-            // output up to the kill is captured).
-            let relay = child
-                .stdout
-                .take()
-                .map(|stdout| std::thread::spawn(move || relay_stamped_stdout(stdout, log_file)));
+                // Relay claude's piped stdout to the stream log, stamping each JSON
+                // object line with its arrival time. Runs on its own thread next to
+                // the blocking wait below and drains to EOF (the pipe closes when
+                // the child group exits, including a timeout/cancel kill, so all
+                // output up to the kill is captured).
+                let relay = child.stdout.take().map(|stdout| {
+                    std::thread::spawn(move || relay_stamped_stdout(stdout, log_file))
+                });
 
-            let pgid = child.id() as i32;
-            let outcome =
-                wait_or_cancel(&mut child, pgid, stream_log, self.result_exit_grace, cancel)?;
+                let pgid = child.id() as i32;
+                let outcome =
+                    wait_or_cancel(&mut child, pgid, stream_log, self.result_exit_grace, cancel)?;
 
-            // Drain the relay: the child group has exited, so the stdout pipe is
-            // at EOF and the thread has flushed every line it read up to the kill.
-            if let Some(relay) = relay {
-                if relay.join().is_err() {
-                    warn!(stream_log = %stream_log.display(), "stream-log relay thread panicked; the stream log may be truncated");
-                }
-            }
-            Ok(outcome)
-        })?;
+                // Drain the relay: the child group has exited, so the stdout pipe is
+                // at EOF and the thread has flushed every line it read up to the kill.
+                // CLAUDE-233: both ways the relay can stop early (an I/O error and a
+                // panic) surface as a reason string the caller reports; neither is
+                // dropped, because either one truncates the stream log.
+                let relay_error = match relay.map(|relay| relay.join()) {
+                    None | Some(Ok(Ok(()))) => None,
+                    Some(Ok(Err(err))) => Some(err.to_string()),
+                    Some(Err(_)) => Some("the relay thread panicked".to_string()),
+                };
+                Ok((outcome, relay_error))
+            })?;
         let status = outcome.status;
 
         let exit_code = status.code().unwrap_or(-1);
         let final_event = parse_final_result(stream_log).unwrap_or(Value::Null);
+        let have_result = final_event.get("type").and_then(|v| v.as_str()) == Some("result");
+
+        // CLAUDE-233: the relay is the stream log's only writer, so a relay that
+        // stopped early means the log is missing every event after that point.
+        // With the terminal `result` already captured the run is still decidable
+        // and we finalize from it below, noting the gap. Without it the outcome
+        // is simply unknown, and the honest report names the runner's own write
+        // failure rather than blaming the agent for a silence it did not produce.
+        // Transient because a full disk or a failing device is not the job's
+        // fault: a retry on a healthy host is exactly the right response, and
+        // burning an attempt against `max_attempts_per_key` for it is not.
+        if let Some(reason) = &relay_error {
+            if have_result {
+                warn!(
+                    stream_log = %stream_log.display(),
+                    reason = %reason,
+                    "stream-log relay stopped early; the log is truncated but the terminal result was captured, so the run is finalized from it"
+                );
+            } else {
+                error!(
+                    stream_log = %stream_log.display(),
+                    reason = %reason,
+                    exit_code,
+                    "stream-log relay failed before claude's terminal result; the run outcome is unrecoverable"
+                );
+                return Ok(relay_failure_result(reason, stream_log, exit_code));
+            }
+        }
 
         // CLAUDE-53: when we force-terminated a hung-but-done group after its
         // terminal `result` event, the wrapper exits non-zero (SIGTERM 143 /
@@ -289,7 +320,7 @@ impl ClaudeInvoker {
             });
         }
 
-        if final_event.get("type").and_then(|v| v.as_str()) != Some("result") {
+        if !have_result {
             let summary = friendly_failure_summary(&final_event, stream_log);
             return Ok(ClaudeResult {
                 ok: false,
@@ -465,22 +496,31 @@ fn classify_transient(exit_code: i32, final_event: &Value) -> bool {
 /// that do not parse as a JSON object pass through byte-identically (defensive:
 /// never lose output). Flush per line so the SSE tail and the terminal-result
 /// poller see events promptly.
-fn relay_stamped_stdout(stdout: ChildStdout, mut sink: std::fs::File) {
+///
+/// CLAUDE-233: an I/O error is returned, never swallowed. This relay is the
+/// stream log's only writer, so stopping early silently discards every event
+/// claude emits afterwards, including the terminal `result`, and the run then
+/// reads as "claude produced no result" when in fact the runner stopped
+/// recording. 33 stream logs on host-a ended that way, in four bursts that
+/// line up with the log partition filling: `write_all` returned `ENOSPC` on a
+/// short write, the old `break` dropped it, and the jobs were failed for the
+/// agent's supposed silence.
+///
+/// Generic over both ends so the failure paths are unit-testable without a real
+/// child process or a real full disk.
+fn relay_stamped_stdout<R: std::io::Read, W: Write>(stdout: R, mut sink: W) -> std::io::Result<()> {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(_) => break,
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break; // EOF
         }
         let stamped = stamp_line(&line);
-        if sink.write_all(&stamped).is_err() {
-            break;
-        }
-        let _ = sink.flush();
+        sink.write_all(&stamped)?;
+        sink.flush()?;
     }
+    Ok(())
 }
 
 /// Augment a single stream line with an arrival-time `ts` key. `raw` is the line
@@ -566,6 +606,40 @@ fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -> String {
         }
     }
     read_tail(stream_log, 2000).unwrap_or_default()
+}
+
+/// CLAUDE-233: the outcome reported when the runner's own stream-log relay died
+/// before claude's terminal `result` event. The summary has to say three things,
+/// because the operator reading it on the issue would otherwise draw the wrong
+/// conclusion: the fault is the runner's, the agent's real outcome is unknown
+/// rather than bad, and no attempt was spent. The disk hint is named because
+/// `ENOSPC` on the log partition is what produced every occurrence so far.
+///
+/// `transient` is the load-bearing field: it is what keeps a runner-side I/O
+/// fault from spending one of the job's `max_attempts_per_key`.
+fn relay_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> ClaudeResult {
+    ClaudeResult {
+        ok: false,
+        summary: format!(
+            "The runner could not write this run's stream log ({}): {}. \
+             Recording stopped there, so every later event, including claude's terminal result, was lost. \
+             The agent session itself may well have succeeded; its outcome is unknown, not failed. \
+             Check free space on the log partition (a full disk is the usual cause). \
+             This attempt was not counted, so the job is picked up again on the next poll.",
+            stream_log.display(),
+            reason
+        ),
+        cost: 0.0,
+        raw: Value::Null,
+        error: format!(
+            "the runner could not write the stream log {}: {}",
+            stream_log.display(),
+            reason
+        ),
+        transient: true,
+        // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
+        timed_out: exit_code == 124,
+    }
 }
 
 /// Scan the stream log backwards for the last `assistant` message event and
@@ -1401,6 +1475,135 @@ exit "$code"
             parse_final_result(&log).is_none(),
             "no result event anywhere yields None"
         );
+    }
+
+    /// CLAUDE-233: a sink that accepts `remaining` bytes and then fails,
+    /// modelling the log partition filling mid-run. The real kernel behaviour it
+    /// stands in for is a short buffered write that lands on a page boundary and
+    /// then returns `ENOSPC`, which is what every truncated stream log on
+    /// host-a shows: the file ends mid-line at an exact multiple of 4096.
+    struct FullDisk {
+        remaining: usize,
+    }
+
+    impl Write for FullDisk {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "No space left on device",
+                ));
+            }
+            let n = buf.len().min(self.remaining);
+            self.remaining -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const RELAY_EVENTS: &str = "{\"type\":\"system\",\"subtype\":\"init\"}\n\
+                                {\"type\":\"assistant\",\"message\":{\"content\":[]}}\n\
+                                {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}\n";
+
+    /// CLAUDE-233: the relay reports a write failure instead of stopping
+    /// silently. The old `if sink.write_all(..).is_err() { break }` discarded the
+    /// error, so a full disk truncated the stream log with no log line anywhere
+    /// and the run was failed for "no result event" that the runner had simply
+    /// stopped recording.
+    #[test]
+    fn relay_reports_a_write_failure_instead_of_truncating_silently() {
+        let err = relay_stamped_stdout(RELAY_EVENTS.as_bytes(), FullDisk { remaining: 40 })
+            .expect_err("a sink that runs out of space must surface the error");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::StorageFull,
+            "the underlying cause reaches the caller unchanged, not a generic string"
+        );
+    }
+
+    /// CLAUDE-233: the same for a read failure on the child's stdout. Both of the
+    /// relay's `break`-on-error arms discarded the cause.
+    #[test]
+    fn relay_reports_a_read_failure_instead_of_truncating_silently() {
+        struct FailingRead;
+        impl std::io::Read for FailingRead {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pipe went away",
+                ))
+            }
+        }
+        let err = relay_stamped_stdout(FailingRead, Vec::new())
+            .expect_err("a failing read must surface the error");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// CLAUDE-233: the success path is unchanged: drain to EOF, write every
+    /// stamped line, report `Ok`.
+    #[test]
+    fn relay_reports_ok_when_it_drains_to_eof() {
+        let mut sink = Vec::new();
+        relay_stamped_stdout(RELAY_EVENTS.as_bytes(), &mut sink)
+            .expect("clean EOF is not an error");
+        assert_eq!(
+            String::from_utf8(sink).unwrap().lines().count(),
+            3,
+            "every event reaches the sink"
+        );
+    }
+
+    /// CLAUDE-233: a relay failure is reported as the runner's own I/O fault and
+    /// is transient, so it does NOT spend one of the job's
+    /// `max_attempts_per_key`. The three 2026-08-11 ALPHA runs each burned an
+    /// attempt and were moved to `Failed` for this condition; `transient` is what
+    /// prevents that, so it is asserted explicitly rather than inferred.
+    #[test]
+    fn relay_failure_is_transient_and_names_the_runner_as_the_cause() {
+        let result = relay_failure_result(
+            "No space left on device (os error 28)",
+            Path::new("/logs/YouTrack/streams/ALPHA-511-attempt-1.jsonl"),
+            0,
+        );
+        assert!(!result.ok, "the run did not succeed");
+        assert!(
+            result.transient,
+            "a runner-side write failure must not count an attempt against the job"
+        );
+        assert!(!result.timed_out, "exit 0 is not a timeout");
+        assert!(
+            result.error.contains("No space left on device"),
+            "the underlying cause is named, got: {}",
+            result.error
+        );
+        assert!(
+            result.error.contains("ALPHA-511-attempt-1.jsonl"),
+            "the affected stream log is named, got: {}",
+            result.error
+        );
+        assert!(
+            !result.error.contains("did not end with a result event"),
+            "the failure is no longer attributed to claude, got: {}",
+            result.error
+        );
+        assert!(
+            result.summary.contains("could not write")
+                && result.summary.contains("outcome is unknown"),
+            "the operator-facing summary names the runner and does not call the session failed, got: {}",
+            result.summary
+        );
+    }
+
+    /// CLAUDE-233: a relay failure that happens to coincide with the `timeout(1)`
+    /// wrapper's SIGKILL still reports as a timeout, so the "Timed Out" outcome
+    /// (CLAUDE-52) is not silently reclassified.
+    #[test]
+    fn relay_failure_preserves_the_timeout_flag() {
+        let result = relay_failure_result("write failed", Path::new("/logs/s.jsonl"), 124);
+        assert!(result.timed_out, "exit 124 is still surfaced as a timeout");
     }
 
     /// CLAUDE-63 (smoke): a run through a stub claude that emits several JSON
