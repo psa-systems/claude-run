@@ -86,6 +86,43 @@ pub struct JobLog {
     /// that 404 to an empty log); an empty log is NOT a fetch miss.
     #[serde(default)]
     pub log: String,
+    /// FJ-79: what `fj` says about this log: `available`, `missing` (gone for
+    /// good, so re-asking can never help) or `unavailable` (it could not be read
+    /// this time). Empty from an `fj` predating FJ-79, which is why it defaults:
+    /// its absence means "nothing known", never "gone".
+    #[serde(default)]
+    pub log_state: String,
+    /// FJ-79: the forge's own reason [`JobLog::log`] is empty, when it is.
+    #[serde(default)]
+    pub log_reason: Option<String>,
+}
+
+/// FJ-79's [`JobLog::log_state`] value that means the log is gone for good.
+pub const LOG_STATE_MISSING: &str = "missing";
+
+/// CLAUDE-240: `Some(reason)` when `fj` reports EVERY job's log as permanently
+/// missing (the FJ-79 signal), so the run has no log to analyze and never will.
+/// `None` when any job carries a log, when the run has no jobs, or when the `fj`
+/// that answered predates FJ-79 and says nothing about the state: this may only
+/// ever turn a readable log into a missing one, never the reverse.
+pub fn logs_permanently_missing(jobs: &[JobLog]) -> Option<String> {
+    if jobs.is_empty() || !jobs.iter().all(|j| j.log_state == LOG_STATE_MISSING) {
+        return None;
+    }
+    let per_job: Vec<String> = jobs
+        .iter()
+        .map(|j| {
+            format!(
+                "`{}`: {}",
+                j.name,
+                j.log_reason.as_deref().unwrap_or("no reason given")
+            )
+        })
+        .collect();
+    Some(format!(
+        "`fj` reports every job's log as permanently missing ({})",
+        per_job.join("; ")
+    ))
 }
 
 /// The `fj actions logs --json` document: the run number plus its jobs.
@@ -406,6 +443,12 @@ pub struct RunEntry {
     pub status: String,
     /// The run web URL, used to derive the forge origin and link the close comment.
     pub html_url: String,
+    /// CLAUDE-240: when the run stopped, as the runs list reports it: `stopped`,
+    /// else `updated`, else `created`. Empty when the page carries none of the
+    /// three, so a caller must read an empty value as "unknown", never as "long
+    /// ago". The CI-failure age fallback reads the same value for ONE run
+    /// through [`ActionRunsClient::run_timing`], which does not page.
+    pub stopped: String,
 }
 
 /// CLAUDE-191: parse one `fj actions runs --json` page into [`RunEntry`]s,
@@ -438,6 +481,7 @@ pub fn parse_runs_list_entries(stdout: &str) -> std::result::Result<Vec<RunEntry
             branch: branch_name(&str_field(&run, &["head_branch", "head_ref", "branch"])),
             status,
             html_url: str_field(&run, &["html_url", "url"]),
+            stopped: str_field(&run, &["stopped", "updated", "created"]),
         });
     }
     Ok(out)
@@ -922,6 +966,18 @@ mod tests {
             name: name.to_string(),
             status: status.to_string(),
             log: log.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A job whose log `fj` reports as permanently gone (FJ-79).
+    fn missing_job(name: &str, reason: &str) -> JobLog {
+        JobLog {
+            name: name.to_string(),
+            status: "failure".to_string(),
+            log: String::new(),
+            log_state: LOG_STATE_MISSING.to_string(),
+            log_reason: Some(reason.to_string()),
         }
     }
 
@@ -1089,6 +1145,64 @@ mod tests {
         assert!(parse_run_logs("not json").is_err());
     }
 
+    /// CLAUDE-240 AC: an `fj` predating FJ-79 emits no `log_state`, and its
+    /// output parses exactly as before, with nothing known about the state.
+    #[test]
+    fn parse_run_logs_still_reads_a_pre_fj79_document() {
+        let stdout =
+            r#"{"run_number":889,"jobs":[{"name":"check","status":"failure","log":"boom\n"}]}"#;
+        let jobs = parse_run_logs(stdout).unwrap();
+        assert_eq!(jobs[0].log, "boom\n");
+        assert_eq!(jobs[0].log_state, "", "no state claimed");
+        assert_eq!(jobs[0].log_reason, None);
+        assert!(
+            logs_permanently_missing(&jobs).is_none(),
+            "an absent state is never read as a missing log"
+        );
+    }
+
+    /// CLAUDE-240 AC: the per-job state FJ-79 added is parsed, so a log that is
+    /// gone for good is distinguishable from a job that printed nothing. The
+    /// document is the shape `fj actions logs --format json` emits: `log_state`
+    /// is one of `available` / `missing` / `unavailable`, with `log_reason` null
+    /// for an available log.
+    #[test]
+    fn parse_run_logs_reads_the_fj79_log_state() {
+        let stdout = r#"{"run_number":4760,"jobs":[{"name":"build","status":"failure","log":"","log_state":"missing","log_reason":"open logs for task 43177: no such file or directory"},{"name":"deploy","status":"success","log":"ok\n","log_state":"available","log_reason":null}]}"#;
+        let jobs = parse_run_logs(stdout).unwrap();
+        assert_eq!(jobs[0].log_state, LOG_STATE_MISSING);
+        assert!(jobs[0]
+            .log_reason
+            .as_deref()
+            .unwrap()
+            .contains("task 43177"));
+        assert_eq!(jobs[1].log_state, "available");
+        assert_eq!(jobs[1].log_reason, None);
+        // One readable job means the run still has something to analyze.
+        assert!(logs_permanently_missing(&jobs).is_none());
+    }
+
+    /// CLAUDE-240 AC: a run whose EVERY job log is gone is reported as
+    /// permanently missing, carrying the forge's own reason.
+    #[test]
+    fn every_job_missing_is_permanently_missing_with_the_reason() {
+        let jobs = vec![missing_job(
+            "build",
+            "open logs for task 43177: no such file",
+        )];
+        let reason = logs_permanently_missing(&jobs).expect("permanently missing");
+        assert!(reason.contains("build"), "{reason}");
+        assert!(reason.contains("task 43177"), "{reason}");
+        // A run with no jobs claims nothing: there is no evidence either way.
+        assert!(logs_permanently_missing(&[]).is_none());
+        // Neither does a state `fj` reports as merely unreadable this time.
+        let transient = vec![JobLog {
+            log_state: "unavailable".to_string(),
+            ..missing_job("build", "500 Internal Server Error")
+        }];
+        assert!(logs_permanently_missing(&transient).is_none());
+    }
+
     // ---- URL / host derivation -------------------------------------------
 
     #[test]
@@ -1214,6 +1328,34 @@ mod tests {
         assert_eq!(
             e.html_url,
             "https://dev.a8n.run/fabrikam/forgejo-cli/actions/runs/469"
+        );
+    }
+
+    /// CLAUDE-240 AC: a run entry carries the run's stop time, read from
+    /// `stopped` with `updated` then `created` as fallbacks; all three absent is
+    /// tolerated as an empty (unknown) value rather than a parse failure.
+    #[test]
+    fn parse_entries_reads_the_run_stop_time_with_fallbacks() {
+        let e = &parse_runs_list_entries(REAL_RUNS_PAGE).unwrap()[0];
+        assert_eq!(e.stopped, "2026-08-01T04:03:14+02:00");
+
+        let updated = r#"[{"id":1,"index_in_repo":3,"updated":"2026-09-02T02:42:31+02:00","created":"2026-09-02T02:40:00+02:00"}]"#;
+        assert_eq!(
+            parse_runs_list_entries(updated).unwrap()[0].stopped,
+            "2026-09-02T02:42:31+02:00",
+            "`updated` is the first fallback"
+        );
+        let created = r#"[{"id":1,"index_in_repo":3,"created":"2026-09-02T02:40:00+02:00"}]"#;
+        assert_eq!(
+            parse_runs_list_entries(created).unwrap()[0].stopped,
+            "2026-09-02T02:40:00+02:00",
+            "`created` is the last fallback"
+        );
+        let none = r#"[{"id":1,"index_in_repo":3}]"#;
+        assert_eq!(
+            parse_runs_list_entries(none).unwrap()[0].stopped,
+            "",
+            "a page carrying no time at all still parses, with no time claimed"
         );
     }
 

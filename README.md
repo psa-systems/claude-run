@@ -671,9 +671,18 @@ justified from the gap between the last log timestamp and the run's stop time: t
 killed or timed out, or the run ended and the failing step emitted no diagnostic at all.
 
 Selection is by summary prefix + analyzed-marker ONLY; it **never** selects by `AI Agent: Queued` (that field belongs to
-the code-fix runner, so analysis, a read-only enrichment, must not collide with it). A log miss (auth denied or a pruned
-run) posts a short "unavailable" note once and leaves the issue un-marked so a later run retries; it never crashes or
-marks analyzed on a miss. Log reads go through `fj actions logs` and the workflow-YAML read through `fj repo file`
+the code-fix runner, so analysis, a read-only enrichment, must not collide with it). A log miss never crashes, and the
+handler distinguishes a log that can still arrive from one that is gone (CLAUDE-240). A log that may yet arrive posts a
+short "unavailable" note once and leaves the issue un-marked, so a later run retries and no attempt is consumed. A log
+that is gone for good is instead commented with the analyzed marker, naming the run and the forge's own reason and
+saying plainly that no analysis exists and the issue needs human triage; the existing analyzed guard then skips it, so
+it stops being re-fetched. The log counts as gone when `fj` reports every job's log as missing (the per-job `log_state`
+FJ-79 added, authoritative and checked with no delay) or, while the deployed `fj` predates that signal, when the run
+stopped more than 24 hours ago (`PERMANENT_AFTER`) and the log still cannot be read: a log flushes within seconds of a
+run finishing, so a day-old unreadable log is not coming back. An auth denial is a fixable credential problem and stays
+retryable whatever the run's age, and a permanence check that cannot be made (the runs lookup fails, the forge reports
+an unparseable stop time) is logged at `warn` and leaves the issue retryable, so nothing here can terminate an issue
+that would otherwise have succeeded. Log reads go through `fj actions logs` and the workflow-YAML read through `fj repo file`
 (CLAUDE-205); both are in Rust inside `forge_log`, never a raw REST call and never one from a nu snippet, and redaction
 is preserved end to end via `forge_log::redact`, so no token lands in a posted comment. Configure it in `actions/ci-failure-analysis.yml` (`log_token_ref` picks the Forgejo PAT per repo, see
 below; `query` / `summary_prefixes` / `max_analysis_bytes` tune selection and the comment cap). See `actions/SCHEMA.md`
