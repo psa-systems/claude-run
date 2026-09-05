@@ -464,8 +464,14 @@ comment marker) so it is never analyzed twice. The dedup / attempt key is the is
 
 **Selection is by summary prefix + analyzed-marker ONLY; it NEVER selects by `AI Agent: Queued`.** That field belongs to
 the code-fix runner in `actions/youtrack.yml`; analysis is read-only enrichment and must not collide with it, so `query`
-must not filter on `AI Agent`. A log miss (`AuthDenied` / `TransientMiss` / `Failed`) posts a short "unavailable" note
-once and leaves the issue un-marked so a later run retries; it never crashes or marks analyzed on a miss. Redaction is
+must not filter on `AI Agent`. A log miss never crashes, and which of two things it does depends on whether the log can
+still arrive (CLAUDE-240). A log that may yet arrive posts a short "unavailable" note once and leaves the issue
+un-marked, so a later run retries and no attempt is consumed. A log that is gone for good is commented with the analyzed
+marker instead, naming the run and the forge's reason and saying the issue needs human triage, so it stops being
+re-fetched. It counts as gone when `fj` reports every job's log as missing (the FJ-79 `log_state`), or, with no such
+signal, when the run stopped more than 24 hours ago and the log still cannot be read; an `AuthDenied` is a fixable
+credential problem and stays retryable whatever the run's age. A permanence check that cannot be made (the runs lookup
+fails, the stop time is unparseable) is logged at `warn` and leaves the issue retryable. Redaction is
 preserved end to end via `forge_log::redact`. Log reads shell out to `fj actions logs` and the workflow-YAML read to
 `fj repo file` (CLAUDE-205). Both go through `forge_log` (Rust), never a raw REST call and never one from a nu snippet
 (tooling-gap rule).

@@ -751,6 +751,7 @@ mod tests {
             branch: branch.to_string(),
             status: status.to_string(),
             html_url: format!("https://dev.a8n.run/owner/repo/actions/runs/{index}"),
+            stopped: "2026-08-20T20:27:31+02:00".to_string(),
         }
     }
 
@@ -759,6 +760,7 @@ mod tests {
             name: name.to_string(),
             status: status.to_string(),
             log: String::new(),
+            ..Default::default()
         }
     }
 

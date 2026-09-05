@@ -2102,6 +2102,7 @@ mod tests {
                 name: "check".to_string(),
                 status: "failure".to_string(),
                 log: "assertion failed: expected 1 got 2".to_string(),
+                ..Default::default()
             }])
         }
     }
@@ -2252,6 +2253,7 @@ mod tests {
             name: "check".to_string(),
             status: "failure".to_string(),
             log: "assertion failed: expected 1 got 2\n".to_string(),
+            ..Default::default()
         }])
     }
 
@@ -2382,6 +2384,7 @@ mod tests {
                     name: format!("job-{i}"),
                     status: (*s).to_string(),
                     log: "cargo build\n".to_string(),
+                    ..Default::default()
                 })
                 .collect(),
         )
