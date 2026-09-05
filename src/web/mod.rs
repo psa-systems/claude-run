@@ -2515,6 +2515,8 @@ struct YoutrackEditForm {
     limit_max_runs_per_day: String,
     limit_claude_timeout_seconds: String,
     limit_daily_budget_usd: String,
+    /// CLAUDE-234: issues one run may create in the tracker.
+    limit_max_issues_per_run: String,
     /// Per-run parallelism cap (number-as-text, like the `limit_*` fields).
     concurrency_max_parallel: String,
     /// Comma-separated job-field names composing the concurrency key.
@@ -2631,6 +2633,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
             .daily_budget_usd
             .map(|v| v.to_string())
             .unwrap_or_default(),
+        limit_max_issues_per_run: n(a.limits.max_issues_per_run),
         concurrency_max_parallel: a.concurrency.max_parallel.to_string(),
         concurrency_key: a.concurrency.key.join(", "),
         enabled: a.enabled.then(|| "on".to_string()),
@@ -2847,6 +2850,7 @@ fn youtrack_form_to_yaml(
                     .map_err(|_| format!("Daily budget (USD) must be a number (got `{t}`)"))?,
             ),
         },
+        max_issues_per_run: pu32("Max issues per run", &form.limit_max_issues_per_run)?,
     };
     set_or_remove(
         map,

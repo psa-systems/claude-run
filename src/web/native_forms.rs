@@ -157,6 +157,8 @@ pub struct CommonForm {
     pub limit_max_runs_per_day: String,
     pub limit_claude_timeout_seconds: String,
     pub limit_daily_budget_usd: String,
+    /// CLAUDE-234: issues one run may create in the tracker.
+    pub limit_max_issues_per_run: String,
 }
 
 impl CommonForm {
@@ -177,6 +179,7 @@ impl CommonForm {
             limit_max_runs_per_day: p.get("limit_max_runs_per_day"),
             limit_claude_timeout_seconds: p.get("limit_claude_timeout_seconds"),
             limit_daily_budget_usd: p.get("limit_daily_budget_usd"),
+            limit_max_issues_per_run: p.get("limit_max_issues_per_run"),
         }
     }
 
@@ -218,6 +221,7 @@ impl CommonForm {
                 .daily_budget_usd
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
+            limit_max_issues_per_run: n(a.limits.max_issues_per_run),
         }
     }
 }
@@ -288,6 +292,7 @@ fn apply_common(
                     .map_err(|_| format!("Daily budget (USD) must be a number (got `{t}`)"))?,
             ),
         },
+        max_issues_per_run: parse_opt_u32("Max issues per run", &c.limit_max_issues_per_run)?,
     };
     set_or_remove(
         map,

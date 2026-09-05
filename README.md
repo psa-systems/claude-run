@@ -130,6 +130,13 @@ will want to know about:
   gone (today only an action delete purges it, per CLAUDE-238), and the runner cannot retry a capped key until then.
   Raising the action's cap grants one more attempt. See `actions/SCHEMA.md`, "`limits`".
 
+  A third cap bounds what a single run may WRITE rather than how often it fires: `limits.max_issues_per_run`
+  (CLAUDE-234, default 25) is the ceiling on issues one run may create in YouTrack. It is enforced at the provider
+  boundary rather than in the agent prompt, so it holds whatever the prompt says; a run that reaches it stops creating,
+  logs at `warn`, and records a run event, so a truncated filing run does not read as a clean one. Every issue create
+  and every issue update the runner performs is journalled as one `youtrack issue write` line carrying the originating
+  run id and the issue key. See `actions/SCHEMA.md`, "`limits`".
+
 - **New action** (`/actions/new`, CLAUDE-211) is a kind picker: it lists every action kind with a one-line description
   and a link to its editor. Every native kind (`youtrack`, `forgejo-ci-fix`, `ci-failure-analysis`,
   `ci-failure-reconcile`, `closed-issue-summary`) has a structured form at `/actions/new/<kind>`, so no native action
