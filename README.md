@@ -571,8 +571,9 @@ branch with the same failure collapse onto ONE open issue (later runs append a r
 a duplicate), while a genuinely different failure signature on the same job stays a separate issue. The
 `failure_signature` is a deterministic, pure-string signature of the first diagnostic line in the redacted log
 (lowercased, path prefixes dropped, digit runs masked, whitespace collapsed): no LLM, computed on every event. When no
-diagnostic line is derivable (a truncated / diagnostic-free / logless failure) the key falls back to
-`hash(repo, branch, workflow_id, job_name)`, which still collapses a "branch is broken" storm onto one issue (two
+diagnostic line is derivable (the log stops before a diagnostic was emitted, carries none, or the failure produced no
+log at all) the key falls back to `hash(repo, branch, workflow_id, job_name)`, which still collapses a "branch is
+broken" storm onto one issue (two
 indistinguishable logless failures on the same job are intentionally grouped; the CLAUDE-189 analysis can later split a
 mis-grouped issue). The branch is read from the run's log environment dump (`GITHUB_HEAD_REF` on a PR run, else the `refs/heads/` short name, in either the `setupEnv => map[...]` or the `KEY=value` form; the deployed
 Forgejo returns `head_branch: null` from run detail) and the job name from the jobs `fj actions logs` returns with the
@@ -650,19 +651,24 @@ on a later commit lands on the same open issue.
 ### Deep CI-failure analysis (CLAUDE-189)
 
 A minted "CI failure" issue's `## Triage` prose is a one-shot classification: it does not read the complete run log, does
-not cross-reference the failing workflow YAML to name the exact step that failed, and does not distinguish a
-truncated / diagnostic-free log from a real compiler/clippy/test error. The `ci-failure-analysis` native action
+not cross-reference the failing workflow YAML to name the exact step that failed, and does not distinguish a log that
+carries no diagnostic from a real compiler/clippy/test error. The `ci-failure-analysis` native action
 (`kind: ci-failure-analysis`, `src/native/ci_failure_analysis.rs`) closes that gap: on a schedule it enriches every open,
 unresolved "CI failure" / "Auto-fix" issue with a deep, log-grounded root-cause comment, produced automatically and
 idempotently, including for issues already open when the feature ships (the CLAUDE-185 backfill case).
 
 For each issue it: parses the run coordinates from the `## Failure` block; fetches the complete redacted run log
 through `fj actions logs <run_number>` (the per-repo run number the block already carries, which is what `fj` takes)
-plus the failing workflow YAML into a workdir; runs one agentic
-`claude` session (tools `Read,Grep,Bash`) over both; and posts the analysis as a YouTrack comment carrying a hidden marker
+plus the failing workflow YAML into a workdir; reads the run's forge-reported `started` / `stopped` times through
+`fj actions runs --json --run-number <n>` (CLAUDE-236, best effort: a failed read is logged and the prompt says the
+timing is unavailable rather than letting the agent invent a reason); runs one agentic `claude` session (tools
+`Read,Grep,Bash`) over both files; and posts the analysis as a YouTrack comment carrying a hidden marker
 so the issue is never analyzed twice. The analysis names the exact failing workflow step (by mapping log position to
-workflow step order), the root-cause diagnostic or an explicit statement that the stored log is truncated / diagnostic
--free, and concrete remediation.
+workflow step order), the root-cause diagnostic, and concrete remediation. The stored log is never truncated by this
+tool: it is the whole log exactly as the forge stores it, with no size cap, so where the log stops is where the run
+stopped writing. Where the log carries no diagnostic, the analysis therefore classifies which of two things happened,
+justified from the gap between the last log timestamp and the run's stop time: the job stopped emitting output and was
+killed or timed out, or the run ended and the failing step emitted no diagnostic at all.
 
 Selection is by summary prefix + analyzed-marker ONLY; it **never** selects by `AI Agent: Queued` (that field belongs to
 the code-fix runner, so analysis, a read-only enrichment, must not collide with it). A log miss (auth denied or a pruned
