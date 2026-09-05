@@ -234,7 +234,8 @@ Configuration splits in two. `config.toml` is the **bootstrap** file: only what 
 the DB and bind the listener, namely `[web]` (bind / port / `auth_token_ref` / login) and `[daemon]` binary overrides (
 `nu_binary`, `claude_binary`) plus `[daemon].claude_config_dir` (CLAUDE-165: where the spawned agent reads its
 user-level `CLAUDE.md` / credentials from; defaults to `<CLAUDE_RUN_CONFIG_DIR>/claude-agent-home`, seeded at serve
-start with the slim bot `CLAUDE.md` and a symlink to the host `~/.claude/.credentials.json`). Everything runtime-tunable, namely issue minting (`[mint]`), the update train (
+start with the slim bot `CLAUDE.md`, and with a symlink to the host `~/.claude/.credentials.json` when the host has
+one). Everything runtime-tunable, namely issue minting (`[mint]`), the update train (
 `[update]`), the webhook sources (`[webhook]`), and the log filter (`[daemon].log_filter`), now lives in the database
 and is edited in the app on the **Settings** page (`/settings`, in the nav next to Dashboard), behind the same auth gate
 as the rest of the web UI. A `config.toml` containing only `[web]` and `[daemon]` binary overrides is a complete, valid
@@ -889,14 +890,18 @@ container bakes in) and, on Linux, a symlink `<dir>/.credentials.json` to the ho
 then spawns every `claude` child with `CLAUDE_CONFIG_DIR=<dir>`. That relocates where Claude Code reads the user-level
 `CLAUDE.md` and credentials, so the child loads the bot memory instead of the operator's global `~/.claude/CLAUDE.md`
 while staying authenticated with the shared host login; `HOME` is left inherited so git/ssh keep working, and (unlike
-`--bare`) MCP servers, hooks, and skills stay enabled. If the host credential file is absent at serve start the daemon
-fails loudly naming the path (run `claude` once to log in first). On macOS credentials live in the Keychain rather than
-`.credentials.json`, so the symlink step is Linux-only.
+`--bare`) MCP servers, hooks, and skills stay enabled. If the host credential file is absent at serve start the daemon logs a
+`warn` naming the path and continues (CLAUDE-247, so a container the operator has not logged into yet still comes up);
+run `claude` once to log in, or set `ANTHROPIC_API_KEY`. A regular `.credentials.json` already in the agent config dir
+is left alone rather than replaced by the link, because in a container that file is the login itself. On macOS
+credentials live in the Keychain rather than `.credentials.json`, so the symlink step is Linux-only.
 
 **Image.** `oci-build/Dockerfile` has a `runtime` target built on the CI image (`dev.a8n.run/pandoras-box/rust-builder-musl`).
 It carries `claude-run` plus the pinned runtime toolchain: `nu`, the `claude` CLI, coreutils `timeout`, `git`, `yt` (
-youtrack-cli), and `fj` (forgejo-cli). Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VERSION`, `YT_VERSION`,
-`FJ_VERSION`); override any one with `--build-arg`. The two CI-failure actions read the forge only through `fj`, so they
+youtrack-cli), and `fj` (forgejo-cli). `yt` and `fj` are the org's own prebuilt static binaries, pulled from the Forgejo
+generic packages `fabrikam/youtrack-cli` and `pandoras-box/forgejo-cli` and verified against the `.sha256` published
+beside each (CLAUDE-247). Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VERSION`, `YT_VERSION`, `FJ_VERSION`, plus
+`PKG_BASE` for the registry); override any one with `--build-arg`. The two CI-failure actions read the forge only through `fj`, so they
 need an `fj` carrying `fj actions logs`, `fj actions runs` (FJ-66), and `fj repo file` (FJ-67); the latter two landed on
 `pandoras-box/forgejo-cli` `main` after the `v0.13.0` tag (merge `b08d8bc`) and are in no released version yet, so
 `FJ_VERSION` must point at a build from that commit or newer for those actions to work. The container runs as the
@@ -926,28 +931,50 @@ branch as HEAD; the runner finalizes), the bounded tracker writes from
 Nushell 0.112.2 note, and the simplest-solution preference. It has no Git workflow and no lifecycle section, so the
 agent is never told to push, open PRs, or transition issue state.
 
-**compose.yml.** Consumes the published image (`image: dev.a8n.run/psa-systems/claude-run:latest`; the local `build:`block
-stays as a commented development alternative). App-prefixed names (service `claude-bot`, network`claude-bot-private`,
-volumes `claude-bot-{config,data,state}`; prefix each with `dev-` for a development stack).
+**compose.yml.** Consumes the published image (`image: dev.a8n.run/psa-systems/claude-run:latest`; the local `build:` block stays as a commented development alternative). App-prefixed names (service `claude-bot`, network `claude-bot-private`, volumes `claude-bot-{config,data,state,claude,youtrack-cli,forgejo-cli,git}`; prefix each with `dev-` for a development stack).
 
-**Mounts.** What each one is for:
+**Self-contained by design (CLAUDE-247).** The container bind-mounts nothing from the host and reads no host credential. The operator logs Claude, YouTrack, Forgejo and git in INSIDE the container once; each login lands on its own named volume and survives restarts and image upgrades. Two reasons: the runner's identity stays separate from the operator's, and the stack deploys on a host where neither `$HOME` nor the invocation directory is available to the compose file (the only path relative to this repo is the age-key secret, and the alternative for that is below).
 
-| Mount                                            | Container path                                       | Purpose                                                                                             |
-|--------------------------------------------------|------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| volume `claude-bot-config`                       | `/home/claudebot/.config/claude-run`                 | `config.toml` and the actions dir (`CLAUDE_RUN_CONFIG_DIR`)                                         |
-| volume `claude-bot-data`                         | `/home/claudebot/.local/share/claude-run`            | `state.db` (runs, outcomes, encrypted secrets store) and per-job workdirs (`CLAUDE_RUN_DATA_DIR`)   |
-| volume `claude-bot-state`                        | `/home/claudebot/.local/state/claude-run`            | logs, per-attempt stream JSONL, webhook log artifacts (`CLAUDE_RUN_STATE_DIR`)                      |
-| bind `./actions` (ro)                            | `/home/claudebot/.config/claude-run/actions`         | action YAML under version control                                                                   |
-| bind `~/.claude/.credentials.json` (ro)          | `/home/claudebot/.claude/.credentials.json`          | Claude CLI auth (alternative: `ANTHROPIC_API_KEY` env)                                              |
-| bind `~/.config/youtrack-cli` (ro)               | `/home/claudebot/.config/youtrack-cli`               | `yt` auth/config                                                                                    |
-| bind `~/.local/share/forgejo-cli/keys.json` (ro) | `/home/claudebot/.local/share/forgejo-cli/keys.json` | `fj` auth; the token needs `write:repository` + `write:issue` (see Install)                          |
-| bind `~/.gitconfig` (ro)                         | `/home/claudebot/.gitconfig`                         | git identity for clones/commits                                                                     |
-| secret `claude-run-age-key`                      | `/run/secrets/claude-run-age-key`                    | age identity decrypting the secrets store                                                           |
-| tmpfs                                            | `/home/claudebot/.runtime/claude-run`                | daemon unix socket (`CLAUDE_RUN_RUNTIME_DIR`); ephemeral so a stale socket never survives a restart |
+**Volumes.** What each one is for:
 
-Only the single Claude credentials file is mounted, never the whole `~/.claude`. Mounting `~/.claude` wholesale would
-re-shadow the baked slim CLAUDE.md (the exact regression this removes). To use an API key instead of mounted
-credentials, drop that bind and set `ANTHROPIC_API_KEY` in the service `environment`.
+| Volume                        | Container path                            | Purpose                                                                                             |
+|-------------------------------|-------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| `claude-bot-config`           | `/home/claudebot/.config/claude-run`      | `config.toml`, the actions dir, and the agent's `claude-agent-home` (`CLAUDE_RUN_CONFIG_DIR`)       |
+| `claude-bot-data`             | `/home/claudebot/.local/share/claude-run` | `state.db` (runs, outcomes, encrypted secrets store) and per-job workdirs (`CLAUDE_RUN_DATA_DIR`)   |
+| `claude-bot-state`            | `/home/claudebot/.local/state/claude-run` | logs, per-attempt stream JSONL, webhook log artifacts (`CLAUDE_RUN_STATE_DIR`)                      |
+| `claude-bot-claude`           | `/home/claudebot/.claude`                 | the in-container Claude login, plus the baked slim bot CLAUDE.md Docker seeds into the empty volume |
+| `claude-bot-youtrack-cli`     | `/home/claudebot/.config/youtrack-cli`    | `yt` instance store, written by `yt auth login`                                                     |
+| `claude-bot-forgejo-cli`      | `/home/claudebot/.local/share/forgejo-cli`| `fj` `keys.json`; the token needs `write:repository` + `write:issue` (see Install)                  |
+| `claude-bot-git`              | `/home/claudebot/.config/git`             | git identity, at the path `GIT_CONFIG_GLOBAL` names in the image                                    |
+| secret `claude-run-age-key`   | `/run/secrets/claude-run-age-key`         | age identity decrypting the secrets store                                                           |
+| tmpfs                         | `/home/claudebot/.runtime/claude-run`     | daemon unix socket (`CLAUDE_RUN_RUNTIME_DIR`); ephemeral so a stale socket never survives a restart |
+
+One volume per credential store rather than subpaths of a single volume: a compose `volume.subpath` is resolved before the entrypoint runs, is never auto-created, and is not seeded from the image, so a missing subdirectory fails the container create outright.
+
+**Running user.** The image has no `USER` directive. It starts as root so `oci-build/entrypoint.sh` can chown the mounted volumes to `claudebot`, then drops to that user with `su-exec` (pattern 3 in `governance/CONTAINER_UID_GID.md`); the daemon itself runs non-root. Do NOT set `user:` in compose: the entrypoint would lose the privileges the chown needs and a volume owned by another uid could never be repaired from inside. Two consequences for the operator:
+
+- `docker compose exec` lands as root unless you pass `--user claudebot`. Always pass it for the login commands below, or the credentials are written root-owned and only become usable after the next restart's chown.
+- The chown skips `$CLAUDE_RUN_DATA_DIR/workdirs`, which is a tree of job git clones the runtime user created itself; walking it on every boot would be slow for no gain.
+
+**Actions.** The `./actions` bind is gone with the other host mounts. The image bakes this repo's action YAML at `/usr/share/claude-run/actions`, and the entrypoint copies it into the config volume the first time that volume holds no `*.yml`, so a fresh container starts with the shipped action set. It never overwrites after that: an action edited in the web UI survives an image upgrade, and a changed shipped action reaches an existing deployment through the same editor (`/actions`), not by recreating the container.
+
+**First-run logins.** Start the stack, then log the three CLIs in. The daemon comes up before any login exists (a missing Claude credential is a `warn`, not a startup failure), so the container is there to exec into:
+
+```nu
+docker compose up --detach
+
+docker compose exec --user claudebot claude-bot claude auth login
+docker compose exec --user claudebot claude-bot yt auth login --base-url https://yt.example.com
+docker compose exec --user claudebot claude-bot fj auth add-key
+docker compose exec --user claudebot claude-bot git config --global user.name "claude-bot"
+docker compose exec --user claudebot claude-bot git config --global user.email "claude-bot@example.com"
+
+docker compose restart
+```
+
+`claude auth login` needs the interactive TTY that `docker compose exec` provides; `claude setup-token` is the long-lived-token alternative. Verify with `claude auth status`, `yt auth list`, and `fj auth list` through the same `exec --user claudebot` form.
+
+To use an API key instead of an interactive Claude login, set `ANTHROPIC_API_KEY` in the service `environment:` and skip `claude auth login`. Nothing else changes: since CLAUDE-247 the daemon no longer requires a credentials file to start.
 
 **Secrets.** The store itself (web auth token, webhook HMACs, registry token refs) lives encrypted inside `state.db` on
 the data volume; the only material the container needs injected is the age identity that decrypts it. It travels as a
@@ -963,6 +990,14 @@ chmod 700 secrets
 # migrating from a host install: copy the EXISTING key instead of generating,
 # or the secrets already in state.db cannot be decrypted
 age-keygen | save secrets/age-key.txt
+```
+
+A deployment that cannot use a path relative to the compose file (one whose config is piped through `docker compose --file -`, where relative paths resolve against the caller's working directory) declares the same secret from an environment value instead, and supplies that value from its own secret store:
+
+```yaml
+secrets:
+  claude-run-age-key:
+    environment: CLAUDE_RUN_AGE_KEY
 ```
 
 **Networking.** To expose the web UI / webhook listener, set `[web].bind` to a non-loopback address in the container's
