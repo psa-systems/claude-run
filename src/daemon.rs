@@ -176,8 +176,13 @@ impl Daemon {
         crate::service_auth::export_yt_config_env(&self.paths);
         let auth_cfg = settings.auth_config().await;
         let anthropic_key: crate::service_auth::ApiKeyHandle = {
-            let (status, key) =
-                crate::service_auth::materialize(&pool, &self.paths, &auth_cfg).await?;
+            let (status, key) = crate::service_auth::materialize(
+                &pool,
+                &self.paths,
+                &auth_cfg,
+                &crate::service_auth::default_fj_data_home(),
+            )
+            .await?;
             info!(
                 anthropic_key = status.anthropic_key,
                 youtrack = status.youtrack_base_url.as_deref().unwrap_or("<unset>"),
@@ -233,6 +238,7 @@ impl Daemon {
             anthropic_key: Some(anthropic_key.clone()),
             readiness: Some(readiness.clone()),
             claude_login: Some(claude_login.clone()),
+            fj_data_home: crate::service_auth::default_fj_data_home(),
             claude_binary: self
                 .on_disk
                 .daemon

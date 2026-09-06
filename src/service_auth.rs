@@ -75,6 +75,15 @@ pub struct AuthStatus {
     pub forgejo_host: Option<String>,
 }
 
+/// The XDG data dir `fj` reads its `keys.json` from. Callers pass this in; it is
+/// deliberately NOT a `dirs::data_dir()` call inside [`materialize`], because a
+/// test that reached for the real one overwrote the developer's own
+/// `~/.local/share/forgejo-cli/keys.json` and destroyed two live tokens. Nothing
+/// in this module resolves a home directory on its own.
+pub fn default_fj_data_home() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// Materialize whatever `config.auth` names into the credential files the CLIs
 /// read, and return the Anthropic key for the `claude` invoker.
 ///
@@ -86,6 +95,7 @@ pub async fn materialize(
     pool: &SqlitePool,
     paths: &Paths,
     cfg: &AuthConfig,
+    fj_data_home: &Path,
 ) -> Result<(AuthStatus, Option<String>)> {
     let mut status = AuthStatus::default();
     let mut api_key = None;
@@ -126,8 +136,7 @@ pub async fn materialize(
     if let (Some(name), Some(host)) = (&cfg.forgejo_token_ref, &cfg.forgejo_host) {
         match resolve_secret(pool, &key, name).await {
             Ok(token) if !token.is_empty() => {
-                let data_home = fj_data_home();
-                crate::secrets::write_fj_keys(&data_home, host, &token)?;
+                crate::secrets::write_fj_keys(fj_data_home, host, &token)?;
                 status.forgejo_host = Some(host.clone());
             }
             Ok(_) => tracing::warn!(secret = name, "stored Forgejo token is empty; ignoring"),
@@ -136,11 +145,6 @@ pub async fn materialize(
     }
 
     Ok((status, api_key))
-}
-
-/// The XDG data dir `fj` reads its `keys.json` from.
-fn fj_data_home() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Write the single-file `yt` config: `url:` + `token:`, 0600, parent created.
@@ -197,6 +201,35 @@ mod tests {
         );
     }
 
+    /// Every path this module writes is derived from an argument, never from
+    /// `dirs::data_dir()` or `$HOME`. A test that reached for the real Forgejo
+    /// data dir once overwrote the developer's own `keys.json` and destroyed two
+    /// live tokens; this asserts the only home-resolving helper is the explicit
+    /// one callers opt into.
+    #[test]
+    fn no_write_path_resolves_a_home_directory_on_its_own() {
+        let src = include_str!("service_auth.rs");
+        let mut in_resolver = false;
+        for (n, line) in src.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if code.contains("fn default_fj_data_home") {
+                in_resolver = true;
+            } else if in_resolver && line == "}" {
+                in_resolver = false;
+            }
+            if code.contains("dirs::data_dir") || code.contains("dirs::home_dir") {
+                assert!(
+                    in_resolver,
+                    "line {}: home resolution outside default_fj_data_home: {line}",
+                    n + 1
+                );
+            }
+        }
+        // The one permitted resolver lives in its own function, so a caller that
+        // wants the real location has to say so.
+        assert!(src.contains("pub fn default_fj_data_home"));
+    }
+
     #[tokio::test]
     async fn nothing_configured_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -208,9 +241,14 @@ mod tests {
             .unwrap();
         crate::db::MIGRATOR.run(&pool).await.unwrap();
 
-        let (status, key) = materialize(&pool, &paths, &AuthConfig::default())
-            .await
-            .unwrap();
+        let (status, key) = materialize(
+            &pool,
+            &paths,
+            &AuthConfig::default(),
+            &tmp.path().join("fj-data"),
+        )
+        .await
+        .unwrap();
         assert_eq!(status, AuthStatus::default());
         assert!(key.is_none());
         assert!(
