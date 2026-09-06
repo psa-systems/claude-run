@@ -93,6 +93,10 @@ pub struct ClaudeInvoker {
     /// `None` (the default) means no global default: the action's own
     /// `claude.model` decides, and with neither set no `--model` flag is passed.
     default_claude: Option<ClaudeConfigHandle>,
+    /// Live Anthropic API key from Settings -> Auth, exported to the child as
+    /// `ANTHROPIC_API_KEY`. `None` (the default and every test) leaves the
+    /// child's auth to whatever its config dir holds.
+    api_key: Option<crate::service_auth::ApiKeyHandle>,
 }
 
 impl ClaudeInvoker {
@@ -102,6 +106,7 @@ impl ClaudeInvoker {
             result_exit_grace: RESULT_EXIT_GRACE,
             config_dir: None,
             default_claude: None,
+            api_key: None,
         }
     }
 
@@ -117,6 +122,15 @@ impl ClaudeInvoker {
     /// reason `with_config_dir` is one: existing callers/tests stay unchanged.
     pub fn with_default_claude(mut self, handle: ClaudeConfigHandle) -> Self {
         self.default_claude = Some(handle);
+        self
+    }
+
+    /// Live Anthropic API key from the Settings Auth card. When set, every child
+    /// gets `ANTHROPIC_API_KEY`, which is how a container authenticates the
+    /// agent without an interactive `claude auth login`. An OAuth login in the
+    /// agent config dir keeps working and takes over when no key is stored.
+    pub fn with_api_key(mut self, handle: Option<crate::service_auth::ApiKeyHandle>) -> Self {
+        self.api_key = handle;
         self
     }
 
@@ -229,6 +243,22 @@ impl ClaudeInvoker {
         // (slim bot CLAUDE.md + linked host credentials). HOME is left inherited.
         if let Some(dir) = &self.config_dir {
             command.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        // The Settings Auth card's Anthropic key, when one is stored. Read live
+        // so a save applies to the next invocation. A poisoned lock is logged
+        // rather than swallowed: the child would otherwise fail to authenticate
+        // with no clue why.
+        if let Some(handle) = &self.api_key {
+            match handle.read() {
+                Ok(slot) => {
+                    if let Some(key) = slot.as_ref() {
+                        command.env("ANTHROPIC_API_KEY", key);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Anthropic key handle is poisoned; the child runs without ANTHROPIC_API_KEY")
+                }
+            }
         }
         // CLAUDE-228: the agent session runs for up to `claude_timeout_seconds`
         // (3600 in the shipped actions) and the wait below is a poll loop, so
@@ -965,6 +995,7 @@ exit "$code"
             result_exit_grace: Duration::from_secs(30),
             config_dir: None,
             default_claude: None,
+            api_key: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -1005,6 +1036,7 @@ exit "$code"
             result_exit_grace: Duration::from_millis(300),
             config_dir: None,
             default_claude: None,
+            api_key: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -1062,6 +1094,7 @@ exit "$code"
             result_exit_grace: Duration::from_secs(30),
             config_dir: None,
             default_claude: None,
+            api_key: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -1335,6 +1368,7 @@ exit "$code"
             result_exit_grace: Duration::from_secs(30),
             config_dir: None,
             default_claude: None,
+            api_key: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -1630,6 +1664,7 @@ exit "$code"
             result_exit_grace: Duration::from_secs(30),
             config_dir: None,
             default_claude: None,
+            api_key: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");

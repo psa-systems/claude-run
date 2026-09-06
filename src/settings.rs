@@ -32,9 +32,9 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
-    ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig, ConcurrencyConfig, DbRetentionConfig,
-    MintConfig, OnDiskConfig, Paths, PreferencesConfig, UpdateConfig, WebhookConfig,
-    WorkdirGcConfig,
+    AuthConfig, ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig, ConcurrencyConfig,
+    DbRetentionConfig, MintConfig, OnDiskConfig, Paths, PreferencesConfig, UpdateConfig,
+    WebhookConfig, WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -61,11 +61,16 @@ pub enum Section {
     /// CLAUDE-239: global defaults for the `claude` CLI invocation (the default
     /// model an action inherits when it pins none).
     Claude,
+    /// The daemon's own service logins (Claude API key, YouTrack, Forgejo).
+    /// Edited through the Settings page's Auth card rather than the generic JSON
+    /// editor, because the values are secrets typed into password fields; the
+    /// document stored here holds only URLs and secret NAMES.
+    Auth,
 }
 
 impl Section {
     /// Every section, in display order (used by the Settings page).
-    pub const ALL: [Section; 10] = [
+    pub const ALL: [Section; 11] = [
         Section::Mint,
         Section::Update,
         Section::Webhook,
@@ -76,6 +81,7 @@ impl Section {
         Section::Concurrency,
         Section::DbRetention,
         Section::Claude,
+        Section::Auth,
     ];
 
     /// `settings` table primary key for this section's JSON document.
@@ -91,6 +97,7 @@ impl Section {
             Section::DbRetention => "config.db_retention",
             Section::WebhookComment => "config.webhook_comment",
             Section::Claude => "config.claude",
+            Section::Auth => "config.auth",
         }
     }
 
@@ -107,6 +114,7 @@ impl Section {
             Section::DbRetention => "db_retention",
             Section::WebhookComment => "webhook_comment",
             Section::Claude => "claude",
+            Section::Auth => "auth",
         }
     }
 
@@ -128,6 +136,7 @@ impl Section {
             Section::DbRetention => "DB retention",
             Section::WebhookComment => "Comment webhook",
             Section::Claude => "Claude invocation",
+            Section::Auth => "Service auth",
         }
     }
 
@@ -143,6 +152,7 @@ impl Section {
             Section::DbRetention => "next sweep",
             Section::WebhookComment => "live",
             Section::Claude => "next invocation",
+            Section::Auth => "live",
         }
     }
 }
@@ -340,6 +350,10 @@ pub struct EffectiveRuntime {
     /// there is no file fallback: the DB value or the built-in default (no
     /// model, i.e. the CLI's own default).
     pub claude: ClaudeConfig,
+    /// The daemon's own service logins. DB-only from day one (never a
+    /// `config.toml` section), so the DB value or the built-in default (nothing
+    /// configured, i.e. host auth as before).
+    pub auth: AuthConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
@@ -376,6 +390,9 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
     let claude = get_json::<ClaudeConfig>(pool, Section::Claude.key())
         .await?
         .unwrap_or_default();
+    let auth = get_json::<AuthConfig>(pool, Section::Auth.key())
+        .await?
+        .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
         update,
@@ -387,6 +404,7 @@ pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<Effecti
         db_retention,
         webhook_comment,
         claude,
+        auth,
     })
 }
 
@@ -606,6 +624,10 @@ pub struct LiveSettings {
     /// (not the tokio one every other section uses) because the reader is
     /// `ClaudeInvoker::invoke`, which is synchronous and cannot await.
     claude: ClaudeConfigHandle,
+    /// The daemon's own service logins. Read by [`crate::service_auth`] when it
+    /// re-materializes the `yt` / `fj` credential files and by the Settings
+    /// page's Auth card.
+    auth: Arc<RwLock<AuthConfig>>,
 }
 
 impl LiveSettings {
@@ -633,6 +655,7 @@ impl LiveSettings {
             webhook_comment: Arc::new(RwLock::new(eff.webhook_comment)),
             webhook_comment_rate: Arc::new(RwLock::new(webhook_comment_rate)),
             claude: Arc::new(std::sync::RwLock::new(eff.claude)),
+            auth: Arc::new(RwLock::new(eff.auth)),
         };
         if let (Some(apply), Some(filter)) = (s.log_apply.as_ref(), eff.log_filter.as_ref()) {
             match apply(filter) {
@@ -699,6 +722,16 @@ impl LiveSettings {
     /// CLAUDE-239: shared handle to the live `claude` invocation defaults, read
     /// by [`crate::claude::ClaudeInvoker`] on each invocation so a Settings save
     /// applies to the next one without a daemon restart.
+    /// Live handle to the daemon's own service logins.
+    pub fn auth_handle(&self) -> Arc<RwLock<AuthConfig>> {
+        Arc::clone(&self.auth)
+    }
+
+    /// Snapshot of the daemon's own service logins (names and URLs only).
+    pub async fn auth_config(&self) -> AuthConfig {
+        self.auth.read().await.clone()
+    }
+
     pub fn claude_handle(&self) -> ClaudeConfigHandle {
         self.claude.clone()
     }
@@ -725,6 +758,7 @@ impl LiveSettings {
             Section::DbRetention => to_pretty(&*self.db_retention.read().await),
             Section::WebhookComment => to_pretty(&*self.webhook_comment.read().await),
             Section::Claude => to_pretty(&*read_claude(&self.claude)),
+            Section::Auth => to_pretty(&*self.auth.read().await),
         }
     }
 
@@ -818,6 +852,11 @@ impl LiveSettings {
                 set_json(&self.pool, section.key(), &v).await?;
                 *write_claude(&self.claude) = v;
             }
+            Section::Auth => {
+                let v: AuthConfig = parse(json)?;
+                set_json(&self.pool, section.key(), &v).await?;
+                *self.auth.write().await = v;
+            }
         }
         Ok(())
     }
@@ -904,6 +943,7 @@ mod tests {
             db_retention: DbRetentionConfig::default(),
             webhook_comment: CommentWebhookConfig::default(),
             claude: ClaudeConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 
