@@ -56,6 +56,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::db::DbPool;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -64,7 +65,6 @@ use axum::routing::post;
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
@@ -341,7 +341,7 @@ pub fn verified_comment_command(
 /// [`crate::settings::LiveSettings`] swaps on save.
 #[derive(Clone)]
 pub struct CommentWebhookState {
-    pool: SqlitePool,
+    pool: DbPool,
     config: Arc<RwLock<CommentWebhookConfig>>,
     /// Loop-safety bot logins, reused from the mint config rather than
     /// re-declared, so the bot's own reply can never re-trigger a run.
@@ -357,7 +357,7 @@ impl CommentWebhookState {
     /// the CI-failure listener, so a Settings save routes live and the replay
     /// store is one instance across both endpoints.
     pub fn from_shared(
-        pool: SqlitePool,
+        pool: DbPool,
         config: Arc<RwLock<CommentWebhookConfig>>,
         mint_cfg: Arc<RwLock<MintConfig>>,
         rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
@@ -376,7 +376,7 @@ impl CommentWebhookState {
 
     /// Standalone instance owning fresh handles built from `config` (tests).
     pub fn new(
-        pool: SqlitePool,
+        pool: DbPool,
         config: CommentWebhookConfig,
         commands: mpsc::Sender<VerifiedCommentCommand>,
     ) -> Self {
@@ -548,10 +548,7 @@ async fn forgejo_comment_webhook(
 
 /// Resolve a source's HMAC secret to plaintext. Errors when the source has no
 /// `secret_ref` or the secret cannot be decrypted (both fail closed as 401).
-async fn resolve_secret(
-    pool: &SqlitePool,
-    src: &CommentWebhookSource,
-) -> crate::error::Result<String> {
+async fn resolve_secret(pool: &DbPool, src: &CommentWebhookSource) -> crate::error::Result<String> {
     let name = src.secret_ref.as_deref().ok_or_else(|| {
         crate::error::Error::Secret(
             "comment webhook source secret_ref is not configured".to_string(),
@@ -631,7 +628,7 @@ impl DenialReplyLimiter {
 /// Everything [`consume_commands`] needs to serve an accepted command. Built
 /// once at daemon start.
 pub struct CommentContext {
-    pub pool: SqlitePool,
+    pub pool: DbPool,
     pub paths: Paths,
     pub claude: Arc<ClaudeInvoker>,
     /// Live comment config, re-read per command so a Settings save applies
@@ -1703,7 +1700,7 @@ fn first_line(s: &str) -> String {
 /// Close a comment run: one `job_outcomes` row carrying the decision summary and
 /// the stream-log link, then finalize the run.
 async fn finish_comment_run(
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: Option<i64>,
     key: &str,
     outcome: &RunOutcome,
@@ -1751,25 +1748,17 @@ pub fn creds_root(paths: &Paths) -> PathBuf {
 mod tests {
     use super::*;
     use crate::config::WebhookConfig;
-    use crate::db::MIGRATOR;
     use crate::provider::cli::testutil::StubRunner;
     use age::secrecy::ExposeSecret;
     use axum::http::HeaderValue;
     use hmac::{Hmac, Mac};
-    use sqlx::sqlite::SqlitePoolOptions;
 
     const SOURCE: &str = "contoso";
     const SECRET: &str = "hmac-value-for-comments";
     const REPO: &str = "contoso/claude-run";
 
-    async fn memory_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn memory_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     fn sign(secret: &[u8], body: &[u8]) -> String {
@@ -2668,7 +2657,7 @@ mod tests {
     // exercised at the status-code level, mirroring the CI-failure handler's
     // tests. These set the process-global key-file env, so they take the shared
     // lock.
-    async fn setup_pool(tmp: &FsPath) -> SqlitePool {
+    async fn setup_pool(tmp: &FsPath) -> DbPool {
         let key_path = tmp.join("key.txt");
         let identity = age::x25519::Identity::generate();
         std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();

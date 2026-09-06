@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 use tracing::{error, info};
 
 use crate::state;
@@ -34,7 +34,7 @@ const DEFAULT_TTL: Duration = Duration::from_millis(1500);
 #[derive(Clone)]
 pub struct PauseGate {
     /// `None` on the inert gate used by tests and by callers with no DB.
-    pool: Option<SqlitePool>,
+    pool: Option<DbPool>,
     /// Last known state, shared so a blocking path can read it without `await`.
     paused: Arc<AtomicBool>,
     /// When `paused` was last read from the DB; `None` means never.
@@ -43,7 +43,7 @@ pub struct PauseGate {
 }
 
 impl PauseGate {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: DbPool) -> Self {
         Self {
             pool: Some(pool),
             paused: Arc::new(AtomicBool::new(false)),
@@ -196,17 +196,9 @@ impl RunPause {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::MIGRATOR;
-    use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     /// The inert gate is never paused and never trips a run.

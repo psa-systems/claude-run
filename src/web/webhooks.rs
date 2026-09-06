@@ -43,6 +43,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::db::DbPool;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -52,7 +53,6 @@ use axum::Router;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use sqlx::SqlitePool;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
@@ -90,7 +90,7 @@ pub const WEBHOOK_MINT_ACTION: &str = "webhook-forgejo";
 /// the replay store, so a same-id retry would 409, and the scheduled `youtrack`
 /// / `forgejo-ci-fix` poll is the backstop that re-finds the work after Resume.
 pub(crate) async fn paused_accept_and_drop(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
     source: &str,
     delivery: &str,
@@ -241,14 +241,14 @@ pub struct VerifiedFailureEvent {
 /// full 60s retry budget); both finish in ~0s with no fetch, triage, or mint.
 pub const RUN_STATUS_FAILURE: &str = "failure";
 
-/// State injected into the webhook handler. Cheap to clone (`SqlitePool` and
+/// State injected into the webhook handler. Cheap to clone (`DbPool` and
 /// `Sender` are `Arc`-shaped; the config and the rate-limiter map are
 /// `Arc`-wrapped). CLAUDE-87: one [`RateLimiter`] per source (built once at
 /// startup, keyed by source name) and a single shared [`SeenDeliveries`] replay
 /// store across all sources.
 #[derive(Clone)]
 pub struct WebhookState {
-    pool: SqlitePool,
+    pool: DbPool,
     /// CLAUDE-101: live webhook config, shared with [`crate::settings::LiveSettings`]
     /// so a Settings save (new/edited source, allow-list, rate limit, secret refs)
     /// is routable on the next request without a restart.
@@ -293,7 +293,7 @@ impl WebhookState {
     /// Standalone constructor (tests, single-source callers): owns fresh shared
     /// handles built from `config`.
     pub fn new(
-        pool: SqlitePool,
+        pool: DbPool,
         config: WebhookConfig,
         events: mpsc::Sender<VerifiedFailureEvent>,
     ) -> Self {
@@ -312,7 +312,7 @@ impl WebhookState {
     /// so a save swaps the routed config + limiters live. The replay store is
     /// built once here from `replay_window_secs` (restart-only by design).
     pub fn from_shared(
-        pool: SqlitePool,
+        pool: DbPool,
         config: Arc<RwLock<WebhookConfig>>,
         rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
         replay_window_secs: u64,
@@ -353,7 +353,7 @@ pub fn router(state: WebhookState) -> Router {
 /// backend) it passes `None` and the consumer falls back to log-only behaviour.
 pub struct MintContext {
     /// State DB, for the reused DEV-335 caps ledger.
-    pub pool: SqlitePool,
+    pub pool: DbPool,
     /// The LLM pass for the residue the deterministic rules cannot label.
     pub classifier: Arc<dyn FailureClassifier>,
     /// Provider backend: the `IssueTracker` the mint writes through and the
@@ -380,7 +380,7 @@ pub struct MintContext {
 /// signal (the rules pass routes an unavailable log to transient).
 pub async fn consume_events(
     mut rx: mpsc::Receiver<VerifiedFailureEvent>,
-    pool: SqlitePool,
+    pool: DbPool,
     logs: Arc<dyn crate::forge_log::ActionLogClient>,
     out_dir: PathBuf,
     mint: Option<MintContext>,
@@ -664,7 +664,7 @@ pub const STAGE_MINTING: &str = "minting issue";
 
 /// CLAUDE-96: decrypt the named log token from the secrets store (same age-key
 /// mechanism as the HMAC refs).
-async fn resolve_log_token(pool: &SqlitePool, name: &str) -> crate::error::Result<String> {
+async fn resolve_log_token(pool: &DbPool, name: &str) -> crate::error::Result<String> {
     let key = SecretsKey::load()?;
     // CLAUDE-146: trim the decrypted token. A stored trailing space or CR
     // survives as a valid header character and yields a spurious HTTP 401.
@@ -676,7 +676,7 @@ async fn resolve_log_token(pool: &SqlitePool, name: &str) -> crate::error::Resul
 /// source has no token configured or it cannot be resolved. Authorizes the
 /// `fj actions logs` read; a public repo's run reads without one.
 async fn source_log_token(
-    pool: &SqlitePool,
+    pool: &DbPool,
     webhook_cfg: &WebhookConfig,
     source: &str,
 ) -> Option<String> {
@@ -705,7 +705,7 @@ async fn source_log_token(
 /// CLAUDE-220: `action` is a parameter so the comment listener records its runs
 /// through this same accounting rather than a forked copy.
 pub(crate) async fn begin_webhook_run(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
     job_key: &str,
     html_url: &str,
@@ -747,7 +747,7 @@ pub(crate) async fn begin_webhook_run(
 /// DEV-335 caps ledger is advanced separately inside [`triage_and_mint`] and
 /// must not be double counted here. A no-op when `run_id` is `None`.
 async fn finish_webhook_run(
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: Option<i64>,
     job_key: &str,
     summary: &str,
@@ -2113,14 +2113,8 @@ mod tests {
         }
     }
 
-    async fn memory_pool() -> SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::db::MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn memory_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     /// CLAUDE-85: a client that fails the test on any call, proving the
@@ -2164,19 +2158,23 @@ mod tests {
             )
             .await;
 
-            let (jobs, exit): (i64, Option<i64>) =
-                sqlx::query_as("SELECT jobs_processed, exit_code FROM runs")
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let (jobs, exit): (i64, Option<i64>) = sqlx::query_as(&crate::db::q(
+                &pool,
+                "SELECT jobs_processed, exit_code FROM runs",
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             assert_eq!(jobs, 1, "{status}");
             assert_eq!(exit, Some(crate::exit::OK as i64), "{status}");
 
-            let (ok, summary): (bool, Option<String>) =
-                sqlx::query_as("SELECT ok, summary FROM job_outcomes")
+            // `ok` is an integer 0/1 column on both backends (see `crate::db::flag`).
+            let (ok, summary): (i64, Option<String>) =
+                sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
                     .fetch_one(&pool)
                     .await
                     .unwrap();
+            let ok = ok != 0;
             assert!(ok, "{status}");
             let summary = summary.expect("summary recorded");
             assert!(summary.contains(status), "{status}: {summary}");
@@ -2266,7 +2264,7 @@ mod tests {
     /// Shared scaffolding for the log-token consume tests: age key file, stored
     /// `log-token` secret, and a webhook config whose `test-source` (the
     /// `event()` fixture's source) carries the `log_token_ref`.
-    async fn log_token_setup(tmp: &std::path::Path) -> (SqlitePool, Arc<RwLock<WebhookConfig>>) {
+    async fn log_token_setup(tmp: &std::path::Path) -> (DbPool, Arc<RwLock<WebhookConfig>>) {
         use age::secrecy::ExposeSecret;
         let key_path = tmp.join("key.txt");
         let identity = age::x25519::Identity::generate();
@@ -2331,10 +2329,11 @@ mod tests {
                 "private={private}"
             );
 
-            let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            let summary: Option<String> =
+                sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             let summary = summary.expect("summary recorded");
             assert!(
                 summary.contains("log fetched and redacted"),
@@ -2372,10 +2371,11 @@ mod tests {
         .await;
 
         assert_eq!(logs.calls.lock().unwrap().len(), 1, "exactly one call");
-        let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let summary: Option<String> =
+            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log unavailable"), "{summary}");
     }
@@ -2425,11 +2425,13 @@ mod tests {
             )
             .await;
 
-            let (ok, summary): (bool, Option<String>) =
-                sqlx::query_as("SELECT ok, summary FROM job_outcomes")
+            // `ok` is an integer 0/1 column on both backends (see `crate::db::flag`).
+            let (ok, summary): (i64, Option<String>) =
+                sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
                     .fetch_one(&pool)
                     .await
                     .unwrap();
+            let ok = ok != 0;
             assert!(ok, "{statuses:?}");
             let summary = summary.expect("summary recorded");
             assert!(summary.contains("no job failed"), "{statuses:?}: {summary}");
@@ -2475,10 +2477,11 @@ mod tests {
             )
             .await;
 
-            let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            let summary: Option<String> =
+                sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             let summary = summary.expect("summary recorded");
             assert!(summary.contains("log-only"), "{label}: {summary}");
             assert!(!summary.contains("no job failed"), "{label}: {summary}");
@@ -2514,9 +2517,10 @@ mod tests {
             i64,
             Option<i64>,
             Option<String>,
-        ) = sqlx::query_as(
+        ) = sqlx::query_as(&crate::db::q(
+            &pool,
             "SELECT action_name, triggered_by, jobs_processed, exit_code, stage FROM runs",
-        )
+        ))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -2525,15 +2529,18 @@ mod tests {
         assert_eq!(jobs, 1);
         assert_eq!(exit, Some(crate::exit::OK as i64));
         assert_eq!(stage, None, "stage cleared on finish");
-        let inflight: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_inflight_jobs")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let inflight: i64 = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT COUNT(*) FROM run_inflight_jobs",
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(inflight, 0, "in-flight marker cleared on finish");
 
         // CLAUDE-93: the event's html_url is recorded as the job's outbound
         // link so the run-detail tables can link the key to the Forgejo run.
-        let run_id: i64 = sqlx::query_scalar("SELECT id FROM runs")
+        let run_id: i64 = sqlx::query_scalar(&crate::db::q(&pool, "SELECT id FROM runs"))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -2546,11 +2553,13 @@ mod tests {
 
         // The outcome carries a summary; with no backend it is the log-only note,
         // and it references the redacted artifact that the ready fetch wrote.
-        let (job_key, summary): (String, Option<String>) =
-            sqlx::query_as("SELECT job_key, summary FROM job_outcomes")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (job_key, summary): (String, Option<String>) = sqlx::query_as(&crate::db::q(
+            &pool,
+            "SELECT job_key, summary FROM job_outcomes",
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(job_key, "fabrikam/forgejo-cli#7");
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log-only"), "{summary}");
@@ -2662,7 +2671,7 @@ mod tests {
         /// sources' HMAC secrets, returning the backing pool. The caller holds
         /// [`crate::secrets::key_file_env_lock`] so the env stays stable across
         /// the `resolve_secret` call inside the handler.
-        async fn setup_pool(tmp: &std::path::Path) -> SqlitePool {
+        async fn setup_pool(tmp: &std::path::Path) -> DbPool {
             let key_path = tmp.join("key.txt");
             let identity = age::x25519::Identity::generate();
             std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();
