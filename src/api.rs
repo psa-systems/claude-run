@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 
+use crate::db::DbPool;
 use axum::{
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
@@ -35,7 +36,6 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 
 use crate::cancel::RunRegistry;
@@ -51,11 +51,11 @@ use crate::state;
 pub type InFlight = Arc<tokio::sync::Mutex<std::collections::HashMap<String, usize>>>;
 
 /// Shared state injected into every handler. `Clone` is trivial because the
-/// fields are already cheap-clone (`SqlitePool` is `Arc`-shaped, `Sender`
+/// fields are already cheap-clone (`DbPool` is `Arc`-shaped, `Sender`
 /// is `Clone`, version is `&'static`).
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: SqlitePool,
+    pub pool: DbPool,
     /// One-shot trigger channel: dropping a name into here asks the scheduler
     /// to queue an out-of-cycle run for that action.
     pub trigger_tx: mpsc::Sender<String>,
@@ -175,7 +175,7 @@ pub struct Activity {
 /// than degrading to an empty list: reporting "idle, safe to restart" because
 /// the query failed is exactly the mistake this indicator exists to prevent.
 pub async fn activity(
-    pool: &SqlitePool,
+    pool: &DbPool,
     in_flight: &InFlight,
 ) -> Result<Activity, crate::error::Error> {
     let active_runs = state::active_runs(pool).await?;
@@ -422,10 +422,7 @@ async fn delete_action(
 /// Returns `false` when `name` is not in the index (unknown action). Shared by
 /// the API, web, and CLI-direct delete paths; the in-flight guard is each
 /// caller's responsibility (the API additionally consults its in-flight set).
-pub async fn delete_indexed_action(
-    pool: &SqlitePool,
-    name: &str,
-) -> Result<bool, crate::error::Error> {
+pub async fn delete_indexed_action(pool: &DbPool, name: &str) -> Result<bool, crate::error::Error> {
     let rows = state::action_index_list(pool).await?;
     let Some(row) = rows.into_iter().find(|r| r.name == name) else {
         return Ok(false);
@@ -694,8 +691,6 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::MIGRATOR;
-    use sqlx::sqlite::SqlitePoolOptions;
 
     async fn app_state() -> Arc<AppState> {
         app_state_with_triggers().await.0
@@ -705,12 +700,7 @@ mod tests {
     /// must hold the receiver: dropping it closes the channel and every send
     /// fails with a 503 that has nothing to do with what is under test.
     async fn app_state_with_triggers() -> (Arc<AppState>, mpsc::Receiver<String>) {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::db::test_pool().await;
         let (trigger_tx, rx) = mpsc::channel(8);
         let state = Arc::new(AppState {
             pool: pool.clone(),
@@ -951,11 +941,14 @@ mod tests {
         .await
         .unwrap();
         // A fresh block is not a signal; age this one past the threshold.
-        sqlx::query("UPDATE dependency_gate SET blocked_since = ? WHERE job_key = 'AUD-31'")
-            .bind(state::now_epoch_ms() - 7_200_000)
-            .execute(&s.pool)
-            .await
-            .unwrap();
+        sqlx::query(&crate::db::q(
+            &s.pool,
+            "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = 'AUD-31'",
+        ))
+        .bind(state::now_epoch_ms() - 7_200_000)
+        .execute(&s.pool)
+        .await
+        .unwrap();
 
         let Json(status) = get_status(State(s.clone())).await.unwrap();
         assert_eq!(status.stale_gates.len(), 1, "{:?}", status.stale_gates);

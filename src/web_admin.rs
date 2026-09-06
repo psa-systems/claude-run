@@ -14,9 +14,9 @@
 //! There is exactly one row (`id = 1`, enforced by the schema). This is the
 //! instance's admin, not a user table.
 
+use crate::db::DbPool;
 use argon2::password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
-use sqlx::SqlitePool;
 
 use crate::error::{Error, Result};
 
@@ -62,11 +62,13 @@ impl AdminCredential {
 }
 
 /// Load the admin credential, or `None` when the instance has not been set up.
-pub async fn load(pool: &SqlitePool) -> Result<Option<AdminCredential>> {
-    let row: Option<(String, String, String)> =
-        sqlx::query_as("SELECT username, password_hash, session_key FROM web_admin WHERE id = 1")
-            .fetch_optional(pool)
-            .await?;
+pub async fn load(pool: &DbPool) -> Result<Option<AdminCredential>> {
+    let row: Option<(String, String, String)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT username, password_hash, session_key FROM web_admin WHERE id = 1",
+    ))
+    .fetch_optional(pool)
+    .await?;
     Ok(
         row.map(|(username, password_hash, session_key)| AdminCredential {
             username,
@@ -78,16 +80,19 @@ pub async fn load(pool: &SqlitePool) -> Result<Option<AdminCredential>> {
 
 /// Whether an admin already exists. Cheaper than [`load`] for the "is this
 /// instance configured" question the setup page asks.
-pub async fn exists(pool: &SqlitePool) -> Result<bool> {
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_admin WHERE id = 1")
-        .fetch_one(pool)
-        .await?;
+pub async fn exists(pool: &DbPool) -> Result<bool> {
+    let n: i64 = sqlx::query_scalar(&crate::db::q(
+        pool,
+        "SELECT COUNT(*) FROM web_admin WHERE id = 1",
+    ))
+    .fetch_one(pool)
+    .await?;
     Ok(n > 0)
 }
 
 /// Create the admin. Fails when one already exists (the `id = 1` primary key is
 /// what makes two concurrent setup submissions safe: the second insert loses).
-pub async fn create(pool: &SqlitePool, username: &str, password: &str) -> Result<AdminCredential> {
+pub async fn create(pool: &DbPool, username: &str, password: &str) -> Result<AdminCredential> {
     let username = username.trim();
     validate(username, password)?;
     let cred = AdminCredential {
@@ -96,10 +101,11 @@ pub async fn create(pool: &SqlitePool, username: &str, password: &str) -> Result
         session_key: new_session_key()?,
     };
     let now = chrono::Utc::now().to_rfc3339();
-    let inserted = sqlx::query(
-        "INSERT OR IGNORE INTO web_admin (id, username, password_hash, session_key, created_at, updated_at) \
-         VALUES (1, ?, ?, ?, ?, ?)",
-    )
+    let inserted = sqlx::query(&crate::db::q(
+        pool,
+        "INSERT INTO web_admin (id, username, password_hash, session_key, created_at, updated_at) \
+         VALUES (1, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+    ))
     .bind(&cred.username)
     .bind(&cred.password_hash)
     .bind(&cred.session_key)
@@ -118,7 +124,7 @@ pub async fn create(pool: &SqlitePool, username: &str, password: &str) -> Result
 
 /// Replace the password (and rotate the session key with it, signing out every
 /// browser). Errors when no admin exists yet: that is a setup, not a change.
-pub async fn set_password(pool: &SqlitePool, password: &str) -> Result<AdminCredential> {
+pub async fn set_password(pool: &DbPool, password: &str) -> Result<AdminCredential> {
     let Some(current) = load(pool).await? else {
         return Err(Error::Secret(
             "no administrator to update; run first-run setup instead".to_string(),
@@ -130,9 +136,10 @@ pub async fn set_password(pool: &SqlitePool, password: &str) -> Result<AdminCred
         password_hash: hash_password(password)?,
         session_key: new_session_key()?,
     };
-    sqlx::query(
+    sqlx::query(&crate::db::q(
+        pool,
         "UPDATE web_admin SET password_hash = ?, session_key = ?, updated_at = ? WHERE id = 1",
-    )
+    ))
     .bind(&cred.password_hash)
     .bind(&cred.session_key)
     .bind(chrono::Utc::now().to_rfc3339())
@@ -172,16 +179,9 @@ fn new_session_key() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn mem_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::db::MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn mem_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     #[tokio::test]
@@ -217,10 +217,13 @@ mod tests {
         create(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let stored: String = sqlx::query_scalar("SELECT password_hash FROM web_admin WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let stored: String = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT password_hash FROM web_admin WHERE id = 1",
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(stored.starts_with("$argon2id$"), "got {stored}");
         assert!(!stored.contains("correct horse battery"));
     }

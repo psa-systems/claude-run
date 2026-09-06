@@ -30,9 +30,9 @@ use crate::cancel::RunRegistry;
 use crate::claude::ClaudeInvoker;
 use crate::concurrency::{KeyGate, Limiter};
 use crate::config::Paths;
+use crate::db::DbPool;
 use crate::error::{Error, Result};
 use crate::snippet::SnippetRunner;
-use sqlx::SqlitePool;
 
 /// Everything a native handler needs, mirroring the arguments
 /// [`crate::daemon::run_action_inner`] receives. Passed by value so a handler
@@ -40,7 +40,7 @@ use sqlx::SqlitePool;
 pub struct NativeContext<'a> {
     pub action: &'a LoadedAction,
     pub paths: &'a Paths,
-    pub pool: &'a SqlitePool,
+    pub pool: &'a DbPool,
     /// `Arc` (not `&`) so the native handler can clone it into the per-job
     /// tasks spawned by the CLAUDE-28 keyed executor.
     pub snippet: Arc<SnippetRunner>,
@@ -109,7 +109,7 @@ pub async fn dispatch(ctx: NativeContext<'_>) -> Result<()> {
 /// unreadable webhook section yields an empty mapping (every repo skipped with a
 /// warning) rather than a wrong token.
 pub(crate) async fn effective_log_tokens(
-    pool: &SqlitePool,
+    pool: &DbPool,
     paths: &Paths,
     configured: Option<&LogTokenRef>,
 ) -> LogTokenRef {

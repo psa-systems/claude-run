@@ -435,15 +435,7 @@ mod tests {
     /// `exit::PAUSED` rather than `exit::OK` or `exit::CANCELLED`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_global_pause_stops_the_next_job_pickup() {
-        use crate::db::MIGRATOR;
-        use sqlx::sqlite::SqlitePoolOptions;
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::db::test_pool().await;
         crate::state::global_pause_set(&pool, Some("reboot"))
             .await
             .unwrap();

@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use std::collections::HashMap;
 
+use crate::db::DbPool;
 use chrono::{DateTime, Utc};
-use sqlx::SqlitePool;
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn};
@@ -73,7 +73,8 @@ impl Daemon {
         let pidfile = self.paths.runtime_dir.join("daemon.pid");
         let _pid_lock = pidfile_lock(&pidfile)?;
 
-        let pool = crate::db::open(&self.paths.state_db()).await?;
+        let target = crate::config::resolve_database(&self.paths, &self.on_disk.database)?;
+        let pool = crate::db::open(&target).await?;
 
         // CLAUDE-153: migration 0013 renamed the webhook action's persisted DB
         // rows; the on-disk stream-log directory lives outside SQLite, so rename
@@ -553,7 +554,7 @@ impl Daemon {
 /// when no `yt`/`fj` backend is usable or the triage workdir cannot be created,
 /// so a daemon on a host without the forge CLIs still ingests and logs failures.
 fn build_mint_context(
-    pool: &SqlitePool,
+    pool: &DbPool,
     mint_cfg: Arc<tokio::sync::RwLock<crate::config::MintConfig>>,
     claude: &Arc<ClaudeInvoker>,
     webhook_log_dir: &Path,
@@ -953,7 +954,7 @@ fn detect_collisions(scanned: &[ScannedAction]) -> Vec<Collision> {
     collisions
 }
 
-pub async fn scan_actions(pool: &SqlitePool, actions_dir: &Path) -> Result<()> {
+pub async fn scan_actions(pool: &DbPool, actions_dir: &Path) -> Result<()> {
     if !actions_dir.is_dir() {
         info!(dir = %actions_dir.display(), "actions dir does not exist; nothing to index");
         return Ok(());
@@ -1094,7 +1095,7 @@ fn schedule_kind_str(k: &crate::action::ScheduleKind) -> &'static str {
 
 struct Dispatcher {
     paths: Paths,
-    pool: SqlitePool,
+    pool: DbPool,
     snippet: Arc<SnippetRunner>,
     claude: Arc<ClaudeInvoker>,
     in_flight: api::InFlight,
@@ -1224,7 +1225,7 @@ impl Dispatcher {
 pub async fn run_action_inner(
     loaded: &LoadedAction,
     paths: &Paths,
-    pool: &SqlitePool,
+    pool: &DbPool,
     snippet: Arc<SnippetRunner>,
     claude: Arc<ClaudeInvoker>,
     triggered_by: &str,
@@ -1542,7 +1543,7 @@ async fn gc_loop(paths: Paths, cfg: Arc<tokio::sync::RwLock<crate::config::Workd
 /// config off the shared handle so a Settings save applies on the next tick. The
 /// interval's first tick fires immediately, so a prune runs on serve start.
 async fn retention_loop(
-    pool: sqlx::SqlitePool,
+    pool: crate::db::DbPool,
     cfg: Arc<tokio::sync::RwLock<crate::config::DbRetentionConfig>>,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(GC_TICK_SECS));
@@ -1863,7 +1864,7 @@ mod tests {
             "name: act\nkind: youtrack\nnative: {}\nschedule:\n  kind: interval\n  spec: 5m\n",
         )
         .unwrap();
-        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
         let dispatch = test_dispatcher(&paths, &pool);
 
         // Marker held: the tick must not fire, and must not stamp last_fire.
@@ -1934,14 +1935,14 @@ mod tests {
             "name: act\ninput:\n  command: \"echo '[]'\"\nprompt: \"x\"\n",
         )
         .unwrap();
-        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
         scan_actions(&pool, &paths.actions_dir()).await.unwrap();
 
         let mut dispatch = test_dispatcher(&paths, &pool);
         Arc::get_mut(&mut dispatch).unwrap().readiness = gate.clone();
         dispatch.execute("act", "test").await.unwrap();
 
-        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+        let runs: i64 = sqlx::query_scalar(&crate::db::q(&pool, "SELECT COUNT(*) FROM runs"))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -1952,7 +1953,7 @@ mod tests {
         assert!(gate.check().ready);
     }
 
-    fn test_dispatcher(paths: &Paths, pool: &sqlx::SqlitePool) -> Arc<Dispatcher> {
+    fn test_dispatcher(paths: &Paths, pool: &crate::db::DbPool) -> Arc<Dispatcher> {
         Arc::new(Dispatcher {
             paths: paths.clone(),
             pool: pool.clone(),
@@ -1986,7 +1987,7 @@ mod tests {
             "name: act\nkind: youtrack\nnative: {}\nschedule:\n  kind: manual\nconcurrency:\n  max_parallel: 7\n",
         )
         .unwrap();
-        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
         state::global_pause_set(&pool, Some("rebooting"))
             .await
             .unwrap();
@@ -2038,7 +2039,7 @@ mod tests {
     async fn run_action_inner_dispatches_native_to_youtrack_handler() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_runtime(tmp.path());
-        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
         let snippet = SnippetRunner::new(None);
         let claude = ClaudeInvoker::new(None);
 
@@ -2068,7 +2069,7 @@ mod tests {
     async fn scan_actions_prunes_vanished_files() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_runtime(tmp.path());
-        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
         let actions_dir = tmp.path().join("actions");
         std::fs::create_dir_all(&actions_dir).unwrap();
         let file = actions_dir.join("doomed.yml");
@@ -2105,11 +2106,14 @@ mod tests {
         );
 
         // History survives the prune.
-        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE action_name = ?")
-            .bind("doomed")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let runs: i64 = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT COUNT(*) FROM runs WHERE action_name = ?",
+        ))
+        .bind("doomed")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(runs, 1, "run history is retained across a prune");
     }
 
@@ -2121,7 +2125,7 @@ mod tests {
     async fn scan_actions_refuses_every_reserved_synthetic_name() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_runtime(tmp.path());
-        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
         let actions_dir = tmp.path().join("actions");
         std::fs::create_dir_all(&actions_dir).unwrap();
         assert!(
@@ -2226,7 +2230,7 @@ mod tests {
     async fn scan_actions_warns_on_duplicate_source_and_keeps_both() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_runtime(tmp.path());
-        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
         let actions_dir = tmp.path().join("actions");
         std::fs::create_dir_all(&actions_dir).unwrap();
         let body = |name: &str| {
@@ -2264,7 +2268,7 @@ mod tests {
     async fn scan_actions_silent_for_single_and_disabled_twin() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_runtime(tmp.path());
-        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
         let actions_dir = tmp.path().join("actions");
         std::fs::create_dir_all(&actions_dir).unwrap();
         // Enabled action plus a DISABLED case-colliding twin sharing its query.
