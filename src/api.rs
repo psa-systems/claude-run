@@ -72,6 +72,26 @@ pub struct AppState {
     /// CLAUDE-216: resolved on-disk locations, so the access check can write its
     /// throwaway credential files under the runtime dir the daemon already owns.
     pub paths: crate::config::Paths,
+    /// Live Anthropic API key from the Settings Auth card, shared with the
+    /// `claude` invoker so a save applies to the next invocation. `None` in
+    /// contexts that spawn no agent (tests, the CLI-direct paths).
+    pub anthropic_key: Option<crate::service_auth::ApiKeyHandle>,
+    /// Whether an agent can be spawned at all. `None` where nothing dispatches
+    /// (tests, CLI-direct paths).
+    pub readiness: Option<crate::readiness::ReadinessGate>,
+    /// Where `fj` reads `keys.json`. Held here rather than resolved at the call
+    /// site so a test can point it at a temp dir; the daemon passes
+    /// `service_auth::default_fj_data_home()`.
+    pub fj_data_home: std::path::PathBuf,
+    /// Broker for an interactive `claude auth login` driven from the Settings
+    /// Auth card. `None` outside the daemon.
+    pub claude_login: Option<Arc<crate::claude_login::LoginBroker>>,
+    /// The `claude` binary the login broker spawns (mirrors the daemon's own
+    /// `[daemon].claude_binary` override).
+    pub claude_binary: String,
+    /// Where an interactive sign-in writes its credential: the agent's
+    /// `CLAUDE_CONFIG_DIR`, so the agent picks the login up directly.
+    pub agent_config_dir: Option<std::path::PathBuf>,
 }
 
 /// JSON API router. Phase 2 mounted it at root over the unix socket;
@@ -117,6 +137,12 @@ struct StatusResponse {
     /// CLAUDE-223: live-work snapshot, so an operator scripting a reboot polls
     /// `/status` instead of scraping the About page.
     activity: Activity,
+    /// Whether the daemon can run anything at all. `false` means setup is
+    /// unfinished (no Claude credential) and the scheduler is idle by design,
+    /// which otherwise looks identical to a daemon that has no work.
+    ready: bool,
+    /// Why not, when `ready` is false.
+    not_ready_reason: Option<&'static str>,
     /// CLAUDE-225: dependency gates holding an issue past the staleness
     /// threshold, so an operator without the web UI sees the same signal the
     /// dashboard banner shows.
@@ -229,6 +255,12 @@ async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusRespons
         version: s.version.to_string(),
         global_paused: global,
         activity: activity(&s.pool, &s.in_flight).await?,
+        ready: s
+            .readiness
+            .as_ref()
+            .map(|g| g.check().ready)
+            .unwrap_or(true),
+        not_ready_reason: s.readiness.as_ref().and_then(|g| g.check().reason()),
         stale_gates: state::dependency_gates_stale(
             &s.pool,
             state::now_epoch_ms(),
@@ -291,6 +323,16 @@ async fn trigger_action(
                 "globally paused since {paused_at}{because}; resume before triggering `{name}`"
             ),
         });
+    }
+    // Same reasoning for an unconfigured instance: `Dispatcher::execute` drops
+    // the run, so acking it as queued would be a lie.
+    if let Some(gate) = &s.readiness {
+        if let Some(reason) = gate.check().reason() {
+            return Err(AppError {
+                status: StatusCode::CONFLICT,
+                message: format!("{reason}; cannot trigger `{name}` yet"),
+            });
+        }
     }
     s.trigger_tx
         .send(name.clone())
@@ -676,6 +718,12 @@ mod tests {
             version: "test",
             runs: Arc::new(RunRegistry::new()),
             in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            anthropic_key: None,
+            readiness: None,
+            claude_login: None,
+            fj_data_home: std::path::PathBuf::from("/nonexistent/test-fj-data"),
+            claude_binary: "claude".to_string(),
+            agent_config_dir: None,
             settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
             paths: crate::config::Paths::resolve().unwrap(),
         });

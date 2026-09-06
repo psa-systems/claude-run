@@ -50,6 +50,12 @@ const WEB_BIND_RETRY_LOG_EVERY: u64 = 12;
 pub struct Daemon {
     pub paths: Paths,
     pub on_disk: OnDiskConfig,
+    /// Whether to bind the unix-socket control API at
+    /// `$CLAUDE_RUN_RUNTIME_DIR/daemon.sock`. It exists for the CLI on a host
+    /// install; `serve --no-socket` turns it off for deployments (the container)
+    /// where the web UI is the whole interface and an unauthenticated second
+    /// copy of the control plane is a liability rather than a convenience.
+    pub unix_socket: bool,
     /// CLAUDE-101: live tracing log-filter reload hook, wired from the CLI's
     /// reload handle. `None` when `CLAUDE_RUN_LOG` is set (env wins) or no handle
     /// is available, in which case a saved filter persists but is not applied.
@@ -58,6 +64,7 @@ pub struct Daemon {
 
 impl Daemon {
     pub async fn run(mut self) -> Result<()> {
+        let unix_socket = self.unix_socket;
         std::fs::create_dir_all(&self.paths.runtime_dir)?;
         std::fs::create_dir_all(&self.paths.data_dir)?;
 
@@ -130,13 +137,24 @@ impl Daemon {
 
         // Bind the unix socket before any other work. CLI clients can connect
         // the moment the daemon writes the pidfile; failing the bind here
-        // means the daemon never claims it is up.
+        // means the daemon never claims it is up. A stale socket is removed
+        // either way, so `--no-socket` cannot leave a dead path a CLI would
+        // still try to connect to.
         let sock_path = self.paths.runtime_dir.join("daemon.sock");
         if sock_path.exists() {
             std::fs::remove_file(&sock_path)?;
         }
-        let listener = UnixListener::bind(&sock_path)?;
-        info!(socket = %sock_path.display(), "daemon listening");
+        let listener = if unix_socket {
+            let listener = UnixListener::bind(&sock_path)?;
+            info!(socket = %sock_path.display(), "daemon listening");
+            Some(listener)
+        } else {
+            info!(
+                "unix-socket API disabled (serve --no-socket); the TCP web UI and its /api routes \
+                 are the only control plane this run"
+            );
+            None
+        };
 
         let snippet = SnippetRunner::new(self.on_disk.daemon.nu_binary.as_deref());
         // CLAUDE-165: seed the agent's dedicated CLAUDE_CONFIG_DIR (slim bot
@@ -150,6 +168,42 @@ impl Daemon {
         );
         crate::agent_home::ensure(&agent_config_dir)?;
         info!(dir = %agent_config_dir.display(), "seeded claude agent config dir");
+        // Materialize the daemon's own service logins (Settings -> Auth) before
+        // anything polls: the `yt` single-file config, the `fj` keys.json, and
+        // the Anthropic API key handed to the invoker below. `YOUTRACK_CLI_CONFIG`
+        // is exported first and unconditionally, so a credential saved later in
+        // the web UI needs no restart to reach the next `yt` child.
+        crate::service_auth::export_yt_config_env(&self.paths);
+        let auth_cfg = settings.auth_config().await;
+        let anthropic_key: crate::service_auth::ApiKeyHandle = {
+            let (status, key) = crate::service_auth::materialize(
+                &pool,
+                &self.paths,
+                &auth_cfg,
+                &crate::service_auth::default_fj_data_home(),
+            )
+            .await?;
+            info!(
+                anthropic_key = status.anthropic_key,
+                youtrack = status.youtrack_base_url.as_deref().unwrap_or("<unset>"),
+                forgejo = status.forgejo_host.as_deref().unwrap_or("<unset>"),
+                "service auth materialized"
+            );
+            Arc::new(std::sync::RwLock::new(key))
+        };
+
+        // Broker for the web-UI-driven `claude auth login` (Settings -> Auth).
+        let claude_login = Arc::new(crate::claude_login::LoginBroker::new());
+
+        // The scheduler asks this before every pickup and every dispatch.
+        let readiness = crate::readiness::ReadinessGate::new(
+            agent_config_dir.clone(),
+            Some(anthropic_key.clone()),
+        );
+        if !readiness.check().ready {
+            warn!("{}", crate::readiness::NOT_READY_REASON);
+        }
+
         // `Arc` so the same invoker backs both the dispatcher and the
         // webhook triage classifier (CLAUDE-47).
         // CLAUDE-239: the invoker also takes the live `config.claude` handle, so
@@ -157,8 +211,9 @@ impl Daemon {
         // Settings save applies to the next invocation with no restart.
         let claude = Arc::new(
             ClaudeInvoker::new(self.on_disk.daemon.claude_binary.as_deref())
-                .with_config_dir(Some(agent_config_dir))
-                .with_default_claude(settings.claude_handle()),
+                .with_config_dir(Some(agent_config_dir.clone()))
+                .with_default_claude(settings.claude_handle())
+                .with_api_key(Some(anthropic_key.clone())),
         );
 
         // CLAUDE-9: one registry shared between the dispatcher (which registers
@@ -180,14 +235,26 @@ impl Daemon {
             version: VERSION,
             runs: runs.clone(),
             in_flight: in_flight.clone(),
+            anthropic_key: Some(anthropic_key.clone()),
+            readiness: Some(readiness.clone()),
+            claude_login: Some(claude_login.clone()),
+            fj_data_home: crate::service_auth::default_fj_data_home(),
+            claude_binary: self
+                .on_disk
+                .daemon
+                .claude_binary
+                .clone()
+                .unwrap_or_else(|| "claude".to_string()),
+            agent_config_dir: Some(agent_config_dir.clone()),
             settings: settings.clone(),
             paths: self.paths.clone(),
         });
 
         // Unix-socket router: bare paths (`/status`, `/actions`, ...). CLI
         // continues to call these paths; no /api prefix to avoid breaking
-        // existing client code.
-        let unix_app = api::router((*api_state).clone());
+        // existing client code. Built only when the socket is enabled; the TCP
+        // flavor below is the same router, so nothing is lost without it.
+        let unix_app = unix_socket.then(|| api::router((*api_state).clone()));
 
         // TCP router: web UI at root, JSON API under `/api/`. Same handlers
         // as the unix-socket flavor, just nested + sibling-mounted.
@@ -243,26 +310,31 @@ impl Daemon {
             .merge(comment_router)
             .nest("/api", api_for_tcp);
 
-        // CLAUDE-48 (Phase 5): gate the TCP surface (web UI + /api/*) behind a
-        // bearer token whenever the bind is non-loopback. The /webhooks/ prefix
-        // keeps its own HMAC and is exempt. When auth is required but the token
-        // cannot be resolved, fail closed: drop the TCP listener entirely rather
-        // than expose an unauthenticated surface. The unix-socket API is
+        // CLAUDE-48 (Phase 5): gate the TCP surface (web UI + /api/*) whenever
+        // the bind is non-loopback. The /webhooks/ prefix keeps its own HMAC and
+        // is exempt. An instance with no credential at all serves only its
+        // first-run setup page (see `auth::resolve_gate`), so the surface is
+        // never unauthenticated but the operator can still reach it to create
+        // an administrator; a missing `auth_token_ref` secret no longer takes
+        // the whole web UI down. The unix-socket API, when enabled, is
         // unaffected (loopback-only by construction).
         let tcp_app = match crate::auth::resolve_gate(&self.on_disk.web, &pool).await {
             Ok(None) => Some(tcp_app),
             Ok(Some(gate)) => {
-                info!("token auth enabled for the TCP web UI and /api/*");
+                info!("auth enabled for the TCP web UI and /api/*");
                 Some(crate::auth::protect(tcp_app, gate))
             }
             Err(e) => {
-                warn!(error = %e, "token auth required but unavailable; TCP web UI disabled this run");
+                warn!(error = %e, "could not read the web credentials; TCP web UI disabled this run");
                 None
             }
         };
 
         // Tasks: unix-socket server, TCP server, scheduler tick, trigger consumer.
-        let server_unix = tokio::spawn(serve_unix(listener, unix_app));
+        let server_unix = match (listener, unix_app) {
+            (Some(listener), Some(app)) => Some(tokio::spawn(serve_unix(listener, app))),
+            _ => None,
+        };
 
         // CLAUDE-57: bind + serve the web UI in its own task. The bind retries
         // on the boot-race `AddrNotAvailable` (configured IP not assigned yet)
@@ -354,6 +426,7 @@ impl Daemon {
             limiter,
             concurrency,
             pause: crate::pause::PauseGate::new(pool.clone()),
+            readiness: readiness.clone(),
             last_fire: Mutex::new(HashMap::new()),
         });
 
@@ -382,8 +455,18 @@ impl Daemon {
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigquit = signal(SignalKind::quit())?;
+        // With `--no-socket` there is no server task to watch, so the arm waits
+        // forever and shutdown comes from a signal exactly as it does when the
+        // socket server stays healthy.
+        let unix_exit = async move {
+            match server_unix {
+                Some(handle) => handle.await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(unix_exit);
         tokio::select! {
-            res = server_unix => {
+            res = &mut unix_exit => {
                 warn!(?res, "unix-socket server exited");
             }
             _ = sigint.recv() => {
@@ -444,7 +527,9 @@ impl Daemon {
         webhook_consumer.abort();
         comment_consumer.abort();
         // pidfile lock released on drop
-        let _ = std::fs::remove_file(&sock_path);
+        if unix_socket {
+            let _ = std::fs::remove_file(&sock_path);
+        }
         Ok(())
     }
 }
@@ -1019,6 +1104,12 @@ struct Dispatcher {
     /// tick (which has to read the flag anyway) and handed to every run so the
     /// per-job gates share one TTL-cached read instead of querying per job.
     pause: crate::pause::PauseGate,
+    /// Whether an agent can be spawned at all (a Claude credential exists). A
+    /// pause is an operator decision; this is an instance that was never
+    /// finished, and it stops the scheduler for the same reason: dispatching a
+    /// run that can only fail at the `claude` call burns an attempt and buries
+    /// real failures in noise.
+    readiness: crate::readiness::ReadinessGate,
     /// CLAUDE-162: in-memory per-action timestamp of the last pickup fire. Drives
     /// the `regather_interval` cadence decoupled from run rows, so an action whose
     /// re-gather finds no fresh work (and thus creates no run row) is still not
@@ -1053,6 +1144,16 @@ impl Dispatcher {
     }
 
     async fn execute(&self, action_name: &str, trigger_source: &'static str) -> Result<()> {
+        // Readiness first: an unconfigured instance cannot spawn an agent, and a
+        // run dispatched anyway would fail at the `claude` call and consume an
+        // attempt against `max_attempts_per_key`.
+        if !self.readiness.ready() {
+            info!(
+                action = %action_name,
+                "{}", crate::readiness::NOT_READY_REASON
+            );
+            return Ok(());
+        }
         // Pause checks
         if state::global_pause_status(&self.pool).await?.is_some() {
             info!(action = %action_name, "globally paused, skipping");
@@ -1487,6 +1588,11 @@ async fn scheduler_tick(dispatch: &Arc<Dispatcher>) -> Result<()> {
     if dispatch.pause.refresh().await {
         return Ok(());
     }
+    // No Claude credential means no run can succeed, so poll nothing: the source
+    // queries (and their auth errors) are pure noise until setup finishes.
+    if !dispatch.readiness.ready() {
+        return Ok(());
+    }
     let now = Utc::now();
     let rows = state::action_index_list(&dispatch.pool).await?;
 
@@ -1797,6 +1903,43 @@ mod tests {
         );
     }
 
+    /// An instance with no Claude credential dispatches nothing. The runner
+    /// exists to spawn `claude`, so a run would fail at that call, burn an
+    /// attempt against `max_attempts_per_key`, and bury the real cause under a
+    /// per-tick source-query error from every action.
+    #[tokio::test]
+    async fn an_unready_daemon_dispatches_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_home = tmp.path().join("agent-home");
+        std::fs::create_dir_all(&agent_home).unwrap();
+        let gate = crate::readiness::ReadinessGate::new(agent_home.clone(), None);
+        assert!(!gate.check().ready, "no credential file yet");
+
+        let paths = paths_with_runtime(tmp.path());
+        std::fs::create_dir_all(paths.actions_dir()).unwrap();
+        std::fs::write(
+            paths.actions_dir().join("act.yml"),
+            "name: act\ninput:\n  command: \"echo '[]'\"\nprompt: \"x\"\n",
+        )
+        .unwrap();
+        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+        scan_actions(&pool, &paths.actions_dir()).await.unwrap();
+
+        let mut dispatch = test_dispatcher(&paths, &pool);
+        Arc::get_mut(&mut dispatch).unwrap().readiness = gate.clone();
+        dispatch.execute("act", "test").await.unwrap();
+
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0, "no run row may be opened while unready");
+
+        // The credential appearing is all it takes; nothing else is consulted.
+        std::fs::write(agent_home.join(".credentials.json"), "{}").unwrap();
+        assert!(gate.check().ready);
+    }
+
     fn test_dispatcher(paths: &Paths, pool: &sqlx::SqlitePool) -> Arc<Dispatcher> {
         Arc::new(Dispatcher {
             paths: paths.clone(),
@@ -1810,6 +1953,7 @@ mod tests {
             limiter: Limiter::new(1),
             concurrency: Arc::new(RwLock::new(ConcurrencyConfig::default())),
             pause: crate::pause::PauseGate::new(pool.clone()),
+            readiness: crate::readiness::ReadinessGate::always(),
             last_fire: Mutex::new(HashMap::new()),
         })
     }
@@ -1847,6 +1991,7 @@ mod tests {
             limiter: Limiter::new(1),
             concurrency: Arc::new(RwLock::new(ConcurrencyConfig::default())),
             pause: crate::pause::PauseGate::new(pool.clone()),
+            readiness: crate::readiness::ReadinessGate::always(),
             last_fire: Mutex::new(HashMap::new()),
         });
 

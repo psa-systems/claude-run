@@ -660,6 +660,40 @@ impl Default for ConcurrencyConfig {
     }
 }
 
+/// Names the service-auth secrets are stored under. Fixed rather than
+/// operator-chosen: the Settings page owns these three credentials end to end,
+/// and a stable name keeps a rotation an overwrite instead of an orphan.
+pub const ANTHROPIC_KEY_SECRET: &str = "auth-anthropic-api-key";
+/// See [`ANTHROPIC_KEY_SECRET`].
+pub const YOUTRACK_TOKEN_SECRET: &str = "auth-youtrack-token";
+/// See [`ANTHROPIC_KEY_SECRET`].
+pub const FORGEJO_TOKEN_SECRET: &str = "auth-forgejo-token";
+
+/// The `config.auth` settings section: the daemon's own logins to Claude,
+/// YouTrack and Forgejo, entered on the Settings page.
+///
+/// Only non-secret fields and secret NAMES live here. The tokens themselves go
+/// into the encrypted secrets store under the constants above, and
+/// [`crate::service_auth`] materializes them into the credential files the `yt`
+/// and `fj` CLIs read. An action's own `token_ref` still wins for its runs; this
+/// is the default the daemon's own provider calls use, which before had nothing
+/// but whatever the host operator had logged in.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Set when an Anthropic API key is stored; carries the secret name so the
+    /// document says where the value lives.
+    pub anthropic_key_ref: Option<String>,
+    /// YouTrack base URL, e.g. `https://yt.example.com`.
+    pub youtrack_base_url: Option<String>,
+    /// Secret name holding the YouTrack token.
+    pub youtrack_token_ref: Option<String>,
+    /// Forgejo host, e.g. `dev.example.com` (no scheme).
+    pub forgejo_host: Option<String>,
+    /// Secret name holding the Forgejo token.
+    pub forgejo_token_ref: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {

@@ -153,6 +153,12 @@ pub fn router(
         // one section (re-rendering inline serde errors on rejection). Behind the
         // CLAUDE-48 auth gate like every other TCP route.
         .route("/settings", get(settings_page))
+        .route("/settings/auth/claude", post(auth_save_claude))
+        .route("/settings/auth/claude/login", post(auth_login_start))
+        .route("/settings/auth/claude/code", post(auth_login_code))
+        .route("/settings/auth/claude/cancel", post(auth_login_cancel))
+        .route("/settings/auth/youtrack", post(auth_save_youtrack))
+        .route("/settings/auth/forgejo", post(auth_save_forgejo))
         .route("/settings/:section", post(settings_save))
         // CLAUDE-117: historical reporting page (spend / runs / time-of-day /
         // day-of-week). Global by default; `action` + `range` query params narrow
@@ -959,6 +965,9 @@ async fn search_jobs(pool: &SqlitePool, q: &str, in_stream: bool) -> Result<Sear
 struct DashboardTpl {
     version: &'static str,
     global_pause: Option<PauseInfo>,
+    /// Set when setup is unfinished (no Claude credential): the scheduler is
+    /// idle by design, which otherwise looks exactly like having no work.
+    not_ready_reason: Option<&'static str>,
     today_runs: u32,
     today_actions: usize,
     today_cost: f64,
@@ -1397,6 +1406,7 @@ async fn dashboard(
     .await?;
 
     let tpl = DashboardTpl {
+        not_ready_reason: s.api.readiness.as_ref().and_then(|g| g.check().reason()),
         version: s.api.version,
         global_pause,
         today_runs: today_runs as u32,
@@ -3455,6 +3465,25 @@ struct SettingsTpl {
     version: &'static str,
     sections: Vec<SettingsSectionView>,
     saved: Option<String>,
+    auth: AuthCardView,
+}
+
+/// What the Auth card shows. Derived from the `config.auth` document alone, so
+/// rendering the page never decrypts a secret; "configured" means a credential
+/// is named and its non-secret half is present.
+struct AuthCardView {
+    anthropic_key: bool,
+    youtrack_base_url: Option<String>,
+    forgejo_host: Option<String>,
+    error: Option<String>,
+    /// Whether a Claude credential exists at all (an OAuth login in the agent
+    /// config dir, a stored API key, or the env). This is what gates the
+    /// scheduler, so the card says so plainly.
+    claude_ready: bool,
+    /// An interactive sign-in waiting for its code.
+    login_url: Option<String>,
+    /// The CLI's own message after a refused code, shown above the field.
+    login_error: Option<String>,
 }
 
 struct SettingsSectionView {
@@ -3481,6 +3510,9 @@ struct SettingsForm {
 fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
     use crate::settings::Section::*;
     match section {
+        // Rendered by the Auth card at the top of the page, not the generic JSON
+        // editor: the values are typed into password fields and never echoed.
+        Auth => vec![],
         Mint => vec![
             FieldDoc {
                 name: "repo_project_map",
@@ -3639,8 +3671,34 @@ async fn render_settings(
     saved: Option<String>,
     rejected: Option<(crate::settings::Section, String, String)>,
 ) -> Result<Response, WebError> {
+    render_settings_with(s, status, saved, rejected, None).await
+}
+
+async fn render_settings_with(
+    s: &WebState,
+    status: StatusCode,
+    saved: Option<String>,
+    rejected: Option<(crate::settings::Section, String, String)>,
+    auth_error: Option<String>,
+) -> Result<Response, WebError> {
+    render_settings_full(s, status, saved, rejected, auth_error, None).await
+}
+
+async fn render_settings_full(
+    s: &WebState,
+    status: StatusCode,
+    saved: Option<String>,
+    rejected: Option<(crate::settings::Section, String, String)>,
+    auth_error: Option<String>,
+    login_error: Option<String>,
+) -> Result<Response, WebError> {
     let mut sections = Vec::with_capacity(crate::settings::Section::ALL.len());
     for section in crate::settings::Section::ALL {
+        // The Auth section has its own card with real password inputs; a JSON
+        // textarea would invite pasting a token into a stored document.
+        if section == crate::settings::Section::Auth {
+            continue;
+        }
         let (json, error) = match &rejected {
             Some((sec, submitted, msg)) if *sec == section => {
                 (submitted.clone(), Some(msg.clone()))
@@ -3656,16 +3714,54 @@ async fn render_settings(
             fields: section_fields(section),
         });
     }
+    let auth_cfg = s.api.settings.auth_config().await;
     let tpl = SettingsTpl {
         version: s.api.version,
         sections,
         saved,
+        auth: AuthCardView {
+            claude_ready: s
+                .api
+                .readiness
+                .as_ref()
+                .map(|g| g.check().ready)
+                .unwrap_or(true),
+            login_url: s
+                .api
+                .claude_login
+                .as_ref()
+                .and_then(|b| b.view())
+                .map(|v| v.url),
+            login_error,
+            anthropic_key: auth_cfg.anthropic_key_ref.is_some(),
+            youtrack_base_url: auth_cfg
+                .youtrack_token_ref
+                .is_some()
+                .then_some(auth_cfg.youtrack_base_url)
+                .flatten(),
+            forgejo_host: auth_cfg
+                .forgejo_token_ref
+                .is_some()
+                .then_some(auth_cfg.forgejo_host)
+                .flatten(),
+            error: auth_error,
+        },
     };
     Ok((status, Html(tpl.render()?)).into_response())
 }
 
-async fn settings_page(State(s): State<WebState>) -> Result<Response, WebError> {
-    render_settings(&s, StatusCode::OK, None, None).await
+/// `?saved=<what>` renders the confirmation banner after an Auth-card save
+/// redirects back here.
+#[derive(Deserialize)]
+struct SettingsQuery {
+    saved: Option<String>,
+}
+
+async fn settings_page(
+    State(s): State<WebState>,
+    Query(q): Query<SettingsQuery>,
+) -> Result<Response, WebError> {
+    render_settings(&s, StatusCode::OK, q.saved, None).await
 }
 
 async fn settings_save(
@@ -3691,6 +3787,302 @@ async fn settings_save(
         }
         Err(crate::settings::SaveError::Db(e)) => Err(e.into()),
     }
+}
+
+// ---- Settings: service auth ------------------------------------------------
+//
+// The daemon's own logins to Claude, YouTrack and Forgejo, typed into the
+// Settings page instead of a CLI. Each handler stores the secret encrypted under
+// a fixed name, records the non-secret half in the `config.auth` document, and
+// re-materializes the credential files the CLIs read (see
+// `crate::service_auth`). A value is never rendered back, only the fact that it
+// is set.
+
+#[derive(Deserialize)]
+struct AuthClaudeForm {
+    api_key: String,
+}
+
+#[derive(Deserialize)]
+struct AuthYoutrackForm {
+    base_url: String,
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct AuthForgejoForm {
+    host: String,
+    token: String,
+}
+
+/// Store `value` under `name`, creating or rotating as needed. The caller has
+/// already checked the value is non-empty.
+async fn put_secret(s: &WebState, name: &str, value: &str) -> std::result::Result<(), String> {
+    let key = crate::secrets::SecretsKey::load().map_err(|e| e.to_string())?;
+    let ciphertext = key.encrypt(value).map_err(|e| e.to_string())?;
+    let exists = state::secret_exists(&s.api.pool, name)
+        .await
+        .map_err(|e| e.to_string())?;
+    if exists {
+        state::secret_rotate(&s.api.pool, name, &ciphertext)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        state::secret_create(&s.api.pool, name, &ciphertext)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Persist `cfg` as the `config.auth` document and re-materialize the credential
+/// files from it, so the next `yt` / `fj` / `claude` child sees the new login
+/// with no restart.
+async fn save_auth_config(
+    s: &WebState,
+    cfg: &crate::config::AuthConfig,
+) -> std::result::Result<(), String> {
+    let json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
+    s.api
+        .settings
+        .save_section(crate::settings::Section::Auth, &json)
+        .await
+        .map_err(|e| match e {
+            crate::settings::SaveError::Invalid(m) => m,
+            crate::settings::SaveError::Db(e) => e.to_string(),
+        })?;
+    let (_, api_key) =
+        crate::service_auth::materialize(&s.api.pool, &s.api.paths, cfg, &s.api.fj_data_home)
+            .await
+            .map_err(|e| e.to_string())?;
+    if let Some(handle) = &s.api.anthropic_key {
+        match handle.write() {
+            Ok(mut slot) => *slot = api_key,
+            // A poisoned lock means a panic already happened elsewhere; say so
+            // rather than let the key silently fail to apply.
+            Err(e) => return Err(format!("applying the Anthropic key: {e}")),
+        }
+    }
+    Ok(())
+}
+
+async fn auth_save_claude(
+    State(s): State<WebState>,
+    Form(form): Form<AuthClaudeForm>,
+) -> Result<Response, WebError> {
+    let key = form.api_key.trim().to_string();
+    if key.is_empty() {
+        return render_settings_with(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            None,
+            Some("an Anthropic API key is required".to_string()),
+        )
+        .await;
+    }
+    let name = crate::config::ANTHROPIC_KEY_SECRET;
+    if let Err(e) = put_secret(&s, name, &key).await {
+        return render_settings_with(&s, StatusCode::UNPROCESSABLE_ENTITY, None, None, Some(e))
+            .await;
+    }
+    let mut cfg = s.api.settings.auth_config().await;
+    cfg.anthropic_key_ref = Some(name.to_string());
+    if let Err(e) = save_auth_config(&s, &cfg).await {
+        return render_settings_with(&s, StatusCode::UNPROCESSABLE_ENTITY, None, None, Some(e))
+            .await;
+    }
+    Ok(Redirect::to("/settings?saved=Claude+auth").into_response())
+}
+
+async fn auth_save_youtrack(
+    State(s): State<WebState>,
+    Form(form): Form<AuthYoutrackForm>,
+) -> Result<Response, WebError> {
+    let base_url = form.base_url.trim().trim_end_matches('/').to_string();
+    let token = form.token.trim().to_string();
+    if base_url.is_empty() || token.is_empty() {
+        return render_settings_with(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            None,
+            Some("a YouTrack base URL and token are both required".to_string()),
+        )
+        .await;
+    }
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return render_settings_with(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            None,
+            Some(format!(
+                "the YouTrack base URL must include a scheme, e.g. https://{base_url}"
+            )),
+        )
+        .await;
+    }
+    let name = crate::config::YOUTRACK_TOKEN_SECRET;
+    if let Err(e) = put_secret(&s, name, &token).await {
+        return render_settings_with(&s, StatusCode::UNPROCESSABLE_ENTITY, None, None, Some(e))
+            .await;
+    }
+    let mut cfg = s.api.settings.auth_config().await;
+    cfg.youtrack_base_url = Some(base_url);
+    cfg.youtrack_token_ref = Some(name.to_string());
+    if let Err(e) = save_auth_config(&s, &cfg).await {
+        return render_settings_with(&s, StatusCode::UNPROCESSABLE_ENTITY, None, None, Some(e))
+            .await;
+    }
+    Ok(Redirect::to("/settings?saved=YouTrack+auth").into_response())
+}
+
+async fn auth_save_forgejo(
+    State(s): State<WebState>,
+    Form(form): Form<AuthForgejoForm>,
+) -> Result<Response, WebError> {
+    // `fj` keys are keyed by bare host, so strip a pasted scheme rather than
+    // storing a key nothing will ever match.
+    let host = form
+        .host
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    let token = form.token.trim().to_string();
+    if host.is_empty() || token.is_empty() {
+        return render_settings_with(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            None,
+            Some("a Forgejo host and token are both required".to_string()),
+        )
+        .await;
+    }
+    let name = crate::config::FORGEJO_TOKEN_SECRET;
+    if let Err(e) = put_secret(&s, name, &token).await {
+        return render_settings_with(&s, StatusCode::UNPROCESSABLE_ENTITY, None, None, Some(e))
+            .await;
+    }
+    let mut cfg = s.api.settings.auth_config().await;
+    cfg.forgejo_host = Some(host);
+    cfg.forgejo_token_ref = Some(name.to_string());
+    if let Err(e) = save_auth_config(&s, &cfg).await {
+        return render_settings_with(&s, StatusCode::UNPROCESSABLE_ENTITY, None, None, Some(e))
+            .await;
+    }
+    Ok(Redirect::to("/settings?saved=Forgejo+auth").into_response())
+}
+
+#[derive(Deserialize)]
+struct AuthCodeForm {
+    code: String,
+}
+
+/// POST `/settings/auth/claude/login`: start `claude auth login` and show the
+/// authorize URL. The child stays alive holding its PKCE verifier until the code
+/// arrives (see `crate::claude_login`).
+async fn auth_login_start(State(s): State<WebState>) -> Result<Response, WebError> {
+    let Some(broker) = s.api.claude_login.clone() else {
+        return render_settings_with(
+            &s,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+            None,
+            Some("interactive sign-in is not available in this process".to_string()),
+        )
+        .await;
+    };
+    let binary = s.api.claude_binary.clone();
+    let dir = s.api.agent_config_dir.clone().unwrap_or_default();
+    // Spawning and reading the URL blocks; keep it off the async worker
+    // (CLAUDE-228).
+    let started = crate::blocking::in_place(move || broker.start(&binary, &dir));
+    match started {
+        Ok(_) => Ok(Redirect::to("/settings#section-auth").into_response()),
+        Err(e) => {
+            render_settings_with(
+                &s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+                None,
+                Some(e.to_string()),
+            )
+            .await
+        }
+    }
+}
+
+/// POST `/settings/auth/claude/code`: hand the pasted code to the waiting child.
+async fn auth_login_code(
+    State(s): State<WebState>,
+    Form(form): Form<AuthCodeForm>,
+) -> Result<Response, WebError> {
+    let Some(broker) = s.api.claude_login.clone() else {
+        return render_settings_with(
+            &s,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+            None,
+            Some("interactive sign-in is not available in this process".to_string()),
+        )
+        .await;
+    };
+    let code = form.code.trim().to_string();
+    if code.is_empty() {
+        return render_settings_full(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            None,
+            None,
+            Some("paste the code from the authorization page".to_string()),
+        )
+        .await;
+    }
+    let outcome = crate::blocking::in_place(move || broker.submit_code(&code));
+    match outcome {
+        Ok(crate::claude_login::CodeOutcome::LoggedIn) => {
+            tracing::info!("claude sign-in completed from the web UI");
+            Ok(Redirect::to("/settings?saved=Claude+sign-in").into_response())
+        }
+        // The CLI refused the code and is still waiting: show its wording and
+        // leave the session open for another paste.
+        Ok(crate::claude_login::CodeOutcome::Retry(msg)) => {
+            render_settings_full(
+                &s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+                None,
+                None,
+                Some(msg),
+            )
+            .await
+        }
+        Err(e) => {
+            render_settings_full(
+                &s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+                None,
+                None,
+                Some(e.to_string()),
+            )
+            .await
+        }
+    }
+}
+
+/// POST `/settings/auth/claude/cancel`: abandon an in-flight sign-in, killing
+/// the child rather than leaving it holding a pipe and a verifier.
+async fn auth_login_cancel(State(s): State<WebState>) -> Result<Response, WebError> {
+    if let Some(broker) = &s.api.claude_login {
+        broker.cancel();
+    }
+    Ok(Redirect::to("/settings#section-auth").into_response())
 }
 
 // ---- About page (CLAUDE-129) ----------------------------------------------
@@ -5160,6 +5552,7 @@ mod tests {
             ..RunsView::default()
         };
         let tpl = DashboardTpl {
+            not_ready_reason: None,
             version: "test",
             global_pause: None,
             today_runs: 0,
@@ -5265,6 +5658,7 @@ mod tests {
         use askama::Template;
 
         let tpl = |stale_gates: Vec<StaleGateRow>| DashboardTpl {
+            not_ready_reason: None,
             version: "test",
             global_pause: None,
             today_runs: 0,
@@ -5339,6 +5733,7 @@ mod tests {
         use askama::Template;
 
         let tpl = |attempt_cap_hits: Vec<state::CappedKey>| DashboardTpl {
+            not_ready_reason: None,
             version: "test",
             global_pause: None,
             today_runs: 0,
@@ -5584,8 +5979,21 @@ mod tests {
                 version: "test",
                 runs: Arc::new(RunRegistry::new()),
                 in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                anthropic_key: None,
+                readiness: None,
+                claude_login: None,
+                fj_data_home: tmp.join("fj-data"),
+                claude_binary: "claude".to_string(),
+                agent_config_dir: None,
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
-                paths: Paths::resolve().unwrap(),
+                // Tmp, not `Paths::resolve()`: handlers that write credential
+                // files must never land in the developer's real config dir.
+                paths: Paths {
+                    config_dir: tmp.join("config"),
+                    data_dir: tmp.join("data"),
+                    state_dir: tmp.join("state"),
+                    runtime_dir: tmp.join("runtime"),
+                },
             });
             let paths = Paths {
                 config_dir: tmp.join("config"),
@@ -7249,7 +7657,12 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
 
-            let page = settings_page(State(s.clone())).await.unwrap();
+            let page = settings_page(
+                State(s.clone()),
+                Query(crate::web::SettingsQuery { saved: None }),
+            )
+            .await
+            .unwrap();
             assert_eq!(page.status(), StatusCode::OK);
             let body = axum::body::to_bytes(page.into_body(), usize::MAX)
                 .await
@@ -7316,7 +7729,12 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
 
-            let page = settings_page(State(s.clone())).await.unwrap();
+            let page = settings_page(
+                State(s.clone()),
+                Query(crate::web::SettingsQuery { saved: None }),
+            )
+            .await
+            .unwrap();
             assert_eq!(page.status(), StatusCode::OK);
             let body = axum::body::to_bytes(page.into_body(), usize::MAX)
                 .await
@@ -8097,6 +8515,178 @@ mod tests {
     // it), so create -> list -> rotate -> delete runs against a stable key
     // without an env race. It proves the listing is write-only: the page shows
     // a secret's name but never its value, and the stored bytes are ciphertext.
+    /// Settings -> Auth: the daemon's own service logins, typed into the web UI
+    /// instead of a CLI (the container has no CLI operator).
+    mod service_auth_ui {
+        use super::super::{
+            auth_save_forgejo, auth_save_youtrack, settings_page, AuthForgejoForm,
+            AuthYoutrackForm, SettingsQuery,
+        };
+        use super::secrets_ui::{body_string, web_state};
+        use age::secrecy::ExposeSecret;
+        use axum::extract::{Form, Query, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        /// Point the process-global key env at a throwaway key for one test.
+        fn use_temp_key(tmp: &std::path::Path) {
+            let key_path = tmp.join("key.txt");
+            let identity = age::x25519::Identity::generate();
+            std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();
+            std::env::set_var(crate::secrets::KEY_FILE_ENV, &key_path);
+        }
+
+        /// Saving a YouTrack login stores the token encrypted, records only the
+        /// URL and the secret name in `config.auth`, and writes the single-file
+        /// `yt` config the daemon exports `YOUTRACK_CLI_CONFIG` for.
+        #[tokio::test]
+        async fn youtrack_login_is_stored_and_materialized() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            use_temp_key(tmp.path());
+            let s = web_state(tmp.path()).await;
+
+            let resp = auth_save_youtrack(
+                State(s.clone()),
+                Form(AuthYoutrackForm {
+                    base_url: "https://yt.example.com/".into(),
+                    token: "perm:the-token".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+            // Stored under the fixed name, and the document holds no token.
+            let cfg = s.api.settings.auth_config().await;
+            assert_eq!(
+                cfg.youtrack_base_url.as_deref(),
+                Some("https://yt.example.com"),
+                "the trailing slash is trimmed"
+            );
+            assert_eq!(
+                cfg.youtrack_token_ref.as_deref(),
+                Some(crate::config::YOUTRACK_TOKEN_SECRET)
+            );
+            let json = serde_json::to_string(&cfg).unwrap();
+            assert!(!json.contains("perm:the-token"), "no token in the document");
+
+            // Materialized where `yt` reads it, owner-only.
+            let yt_path = crate::service_auth::yt_config_path(&s.api.paths);
+            let body = std::fs::read_to_string(&yt_path).unwrap();
+            assert_eq!(body, "url: https://yt.example.com\ntoken: perm:the-token\n");
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&yt_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+
+            // The page reports it as configured, and never echoes the token.
+            let page = body_string(
+                settings_page(State(s.clone()), Query(SettingsQuery { saved: None }))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(page.contains("https://yt.example.com"));
+            assert!(!page.contains("perm:the-token"), "the token is write-only");
+
+            std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+        }
+
+        /// A pasted scheme is stripped: `fj` keys are keyed by bare host, so
+        /// storing `https://host` would write a key nothing ever matches.
+        #[tokio::test]
+        async fn forgejo_host_is_normalized_and_keys_written() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            use_temp_key(tmp.path());
+            let s = web_state(tmp.path()).await;
+
+            let resp = auth_save_forgejo(
+                State(s.clone()),
+                Form(AuthForgejoForm {
+                    host: "https://dev.example.com/".into(),
+                    token: "fj-token".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+            let cfg = s.api.settings.auth_config().await;
+            assert_eq!(cfg.forgejo_host.as_deref(), Some("dev.example.com"));
+            assert_eq!(
+                cfg.forgejo_token_ref.as_deref(),
+                Some(crate::config::FORGEJO_TOKEN_SECRET)
+            );
+
+            std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+        }
+
+        /// Half a credential is refused with the reason shown, and nothing is
+        /// written: a stored URL with no token would look configured and fail on
+        /// every poll.
+        #[tokio::test]
+        async fn a_missing_token_is_refused_and_stores_nothing() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            use_temp_key(tmp.path());
+            let s = web_state(tmp.path()).await;
+
+            let resp = auth_save_youtrack(
+                State(s.clone()),
+                Form(AuthYoutrackForm {
+                    base_url: "https://yt.example.com".into(),
+                    token: "   ".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let html = body_string(resp).await;
+            assert!(html.contains("both required"), "{html}");
+            assert!(s
+                .api
+                .settings
+                .auth_config()
+                .await
+                .youtrack_token_ref
+                .is_none());
+            assert!(!crate::service_auth::yt_config_path(&s.api.paths).exists());
+
+            std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+        }
+
+        /// A base URL with no scheme is refused: `yt` would fail on every call
+        /// with a less obvious error.
+        #[tokio::test]
+        async fn a_schemeless_base_url_is_refused() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            use_temp_key(tmp.path());
+            let s = web_state(tmp.path()).await;
+
+            let resp = auth_save_youtrack(
+                State(s.clone()),
+                Form(AuthYoutrackForm {
+                    base_url: "yt.example.com".into(),
+                    token: "perm:x".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let html = body_string(resp).await;
+            assert!(html.contains("must include a scheme"), "{html}");
+
+            std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+        }
+    }
+
     mod secrets_ui {
         use super::super::{
             secret_create, secret_delete, secret_rotate, secrets_page, SecretCreateForm,
@@ -8128,8 +8718,21 @@ mod tests {
                 version: "test",
                 runs: Arc::new(RunRegistry::new()),
                 in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                anthropic_key: None,
+                readiness: None,
+                claude_login: None,
+                fj_data_home: tmp.join("fj-data"),
+                claude_binary: "claude".to_string(),
+                agent_config_dir: None,
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
-                paths: Paths::resolve().unwrap(),
+                // Tmp, not `Paths::resolve()`: handlers that write credential
+                // files must never land in the developer's real config dir.
+                paths: Paths {
+                    config_dir: tmp.join("config"),
+                    data_dir: tmp.join("data"),
+                    state_dir: tmp.join("state"),
+                    runtime_dir: tmp.join("runtime"),
+                },
             });
             let paths = Paths {
                 config_dir: tmp.join("config"),
@@ -8380,6 +8983,12 @@ mod tests {
                 version: "9.9.9 (testsha, 2026-06-25)",
                 runs: Arc::new(RunRegistry::new()),
                 in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                anthropic_key: None,
+                readiness: None,
+                claude_login: None,
+                fj_data_home: std::path::PathBuf::from("/nonexistent/test-fj-data"),
+                claude_binary: "claude".to_string(),
+                agent_config_dir: None,
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
                 paths: Paths::resolve().unwrap(),
             });

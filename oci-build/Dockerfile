@@ -145,6 +145,12 @@ COPY --from=builder /build/target/release/claude-run /usr/local/bin/claude-run
 # same editor.
 COPY actions/*.yml /usr/share/claude-run/actions/
 
+# Bootstrap config seeded the same way, and for the same reason the actions are:
+# the container binds 0.0.0.0 because a loopback bind is reachable from nothing
+# outside the container, and the operator owns the file once it lands on the
+# volume.
+COPY deploy/container-config.toml /usr/share/claude-run/config.toml
+
 # Non-root container user with a dedicated, clean $HOME. The agent's user memory
 # is the slim bot CLAUDE.md, never the operator's interactive one.
 RUN addgroup -S claudebot \
@@ -183,10 +189,14 @@ WORKDIR /home/claudebot
 COPY oci-build/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
-# Foreground daemon (no --detach): claude-run owns the socket under
-# CLAUDE_RUN_RUNTIME_DIR exactly as on the host.
+# Foreground daemon (no --detach), and no unix-socket API. That socket is the
+# CLI's control plane on a host install; this image has no CLI operator (the web
+# UI and its /api routes are the whole interface), so binding it would only leave
+# an unauthenticated second copy of the control plane inside the container,
+# reachable by the agent the daemon spawns. Override the command to `serve` if a
+# deployment really does want it.
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["serve"]
+CMD ["serve", "--no-socket"]
 
 # Export stage: pull just the binary out, no runtime base.
 FROM scratch AS binary

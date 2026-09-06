@@ -24,6 +24,7 @@ pub mod autofix;
 pub mod blocking;
 pub mod cancel;
 pub mod claude;
+pub mod claude_login;
 pub mod client;
 pub mod concurrency;
 pub mod config;
@@ -41,16 +42,19 @@ pub mod native;
 pub mod paint;
 pub mod pause;
 pub mod provider;
+pub mod readiness;
 pub mod report;
 pub mod retention;
 pub mod scheduler;
 pub mod secrets;
+pub mod service_auth;
 pub mod settings;
 pub mod snippet;
 pub mod state;
 pub mod triage;
 pub mod update;
 pub mod web;
+pub mod web_admin;
 pub mod workdir;
 
 /// Build-stamped version string: semver + short git hash + build date, baked

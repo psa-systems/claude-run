@@ -14,10 +14,11 @@
 //! exactly as before.
 
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use age::secrecy::ExposeSecret;
 use sqlx::SqlitePool;
 
 use crate::action::{ForgejoTarget, GithubTarget, YoutrackSource};
@@ -67,9 +68,21 @@ impl SecretsKey {
         Ok(Self { identity })
     }
 
-    /// Load the key from the path named by `CLAUDE_RUN_SECRETS_KEY_FILE`.
+    /// Load the key from [`key_file_path`], creating it when that path is the
+    /// default and no file exists yet. An operator-named path
+    /// (`CLAUDE_RUN_SECRETS_KEY_FILE`) is never auto-created: see
+    /// [`key_file_path`].
     pub fn load() -> Result<Self> {
-        Self::load_from_file(&key_file_path()?)
+        let path = key_file_path()?;
+        if !path.exists() && !key_file_is_explicit() {
+            generate_key_file(&path)?;
+            tracing::info!(
+                path = %path.display(),
+                "generated a new secrets key; BACK IT UP. Every stored secret is encrypted under \
+                 it and is unrecoverable without it"
+            );
+        }
+        Self::load_from_file(&path)
     }
 
     /// Encrypt `plaintext` to this key's recipient, returning the age ciphertext.
@@ -107,10 +120,70 @@ impl SecretsKey {
 }
 
 /// Resolve the key file path from the environment, fail-closed when unset.
+/// Where the key lives when [`KEY_FILE_ENV`] names no path: alongside the
+/// database it protects, under the data dir.
+pub const DEFAULT_KEY_FILE: &str = "secrets.key";
+
+/// The path of the age key file.
+///
+/// `CLAUDE_RUN_SECRETS_KEY_FILE` wins when set. When it is not, the key lives at
+/// `<CLAUDE_RUN_DATA_DIR>/secrets.key` and [`SecretsKey::load`] creates it on
+/// first use. That default is what lets a container store a secret with nothing
+/// mounted and no CLI: the operator types a token into the web UI and the store
+/// works. An explicitly configured path is never auto-created, because naming a
+/// path says the operator has a specific key in mind and silently generating a
+/// different one would leave every existing secret undecryptable.
 pub fn key_file_path() -> Result<PathBuf> {
-    std::env::var(KEY_FILE_ENV)
-        .map(|v| PathBuf::from(crate::config::expand_path(&v)))
-        .map_err(|_| Error::Secret(format!("{KEY_FILE_ENV} is not set")))
+    if let Ok(v) = std::env::var(KEY_FILE_ENV) {
+        return Ok(PathBuf::from(crate::config::expand_path(&v)));
+    }
+    let paths = crate::config::Paths::resolve()?;
+    Ok(paths.data_dir.join(DEFAULT_KEY_FILE))
+}
+
+/// Whether the key path came from [`KEY_FILE_ENV`] (operator-chosen) rather than
+/// the default. Only the default is auto-created.
+fn key_file_is_explicit() -> bool {
+    std::env::var_os(KEY_FILE_ENV).is_some()
+}
+
+/// Create a new age identity at `path` with `0600` permissions, creating the
+/// parent directory. Fails rather than overwrites when the file already exists,
+/// so a race between two callers cannot destroy a key mid-flight.
+fn generate_key_file(path: &Path) -> Result<()> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            Error::Secret(format!(
+                "creating the secrets key directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let identity = age::x25519::Identity::generate();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| {
+            Error::Secret(format!(
+                "creating the secrets key file {}: {e}",
+                path.display()
+            ))
+        })?;
+    writeln!(
+        f,
+        "# created by claude-run. Back this up: every stored secret is encrypted\n         # under this key and is unrecoverable without it."
+    )
+    .and_then(|()| writeln!(f, "{}", identity.to_string().expose_secret()))
+    .map_err(|e| {
+        Error::Secret(format!(
+            "writing the secrets key file {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(())
 }
 
 /// Decrypt the secret named `name`, bumping its `last_used_at`. Errors when the
@@ -326,7 +399,7 @@ impl Drop for TempFjKeys {
 }
 
 /// Write `bytes` to `path`, creating/truncating it mode `0600`.
-fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -409,6 +482,70 @@ mod tests {
         let path = dir.join("key.txt");
         std::fs::write(&path, identity.to_string().expose_secret()).unwrap();
         path
+    }
+
+    /// The auto-generated key is a usable identity, owner-only, and carries the
+    /// back-it-up notice a human will meet in the file.
+    #[test]
+    fn generated_key_file_is_usable_and_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested").join("secrets.key");
+        generate_key_file(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the key must not be group- or world-readable");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("Back this up"), "{body}");
+
+        // It round-trips as a real key, comments and all.
+        let key = SecretsKey::load_from_file(&path).unwrap();
+        let ct = key.encrypt("hello").unwrap();
+        assert_eq!(key.decrypt(&ct).unwrap(), "hello");
+    }
+
+    /// Generating never clobbers: a second call fails rather than replacing a key
+    /// that existing ciphertext depends on.
+    #[test]
+    fn generating_refuses_to_overwrite_an_existing_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secrets.key");
+        generate_key_file(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = generate_key_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("creating the secrets key file"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the original key must survive a second generate attempt"
+        );
+    }
+
+    /// An operator-named key path is never auto-created: naming it says a
+    /// specific key is meant, and inventing a different one would leave every
+    /// stored secret undecryptable.
+    #[tokio::test]
+    async fn an_explicit_missing_key_path_errors_instead_of_generating() {
+        let _guard = key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nowhere").join("key.txt");
+        std::env::set_var(KEY_FILE_ENV, &missing);
+        let err = match SecretsKey::load() {
+            Ok(_) => panic!("an explicit missing key path must not load"),
+            Err(e) => e,
+        };
+        std::env::remove_var(KEY_FILE_ENV);
+        assert!(
+            err.to_string().contains("reading key file"),
+            "expected a read failure naming the path, got: {err}"
+        );
+        assert!(
+            !missing.exists(),
+            "nothing may be created at an explicit path"
+        );
     }
 
     #[test]
