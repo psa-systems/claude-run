@@ -1074,8 +1074,11 @@ async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Re
                 paint::error(&format!("refusing to store an empty secret `{name}`"));
                 return Ok(exit::CONFIG_ERROR);
             }
-            // Encrypt under the age key (CLAUDE_RUN_SECRETS_KEY_FILE). A missing
-            // key file surfaces the same clear error the daemon emits.
+            // Encrypt under the age key. `ensure_key` generates one on a fresh
+            // install so `secret set` works with nothing provisioned, and refuses
+            // to mint a replacement when secrets are already stored under a key
+            // that has gone missing.
+            secrets::ensure_key(&pool).await?;
             let key = secrets::SecretsKey::load()?;
             let ciphertext = key.encrypt(value)?;
             if state::secret_exists(&pool, &name).await? {
