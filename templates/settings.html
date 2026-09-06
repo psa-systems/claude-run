@@ -24,6 +24,108 @@
 </div>
 {% endif %}
 
+<div class="card" style="margin-bottom: 16px;" id="section-auth">
+  <h3>Service auth <span class="badge neutral">apply: live</span></h3>
+  <span class="dim">The daemon's own logins to Claude, YouTrack and Forgejo, used by
+  the scheduler's own polling and by every action that does not carry its own
+  <code>token_ref</code>. Values are written to the encrypted secrets store and to the
+  credential files the <code>yt</code> and <code>fj</code> CLIs read; they are never shown
+  again here. Saving applies to the next invocation, with no restart.</span>
+
+  {% if let Some(e) = auth.error %}
+  <div class="card" style="border-color: var(--bad); margin: 12px 0;">
+    <strong style="color: var(--bad);">Not saved:</strong> {{ e }}
+  </div>
+  {% endif %}
+
+  <h4 style="margin: 16px 0 4px;">Claude
+    {% if auth.claude_ready %}<span class="badge ok">authenticated</span>
+    {% else %}<span class="badge bad">required</span>{% endif %}
+  </h4>
+  {% if !auth.claude_ready %}
+  <div class="card" style="border-color: var(--bad); margin: 8px 0;">
+    <strong style="color: var(--bad);">Actions are not running.</strong>
+    <span class="dim">The runner spawns <code>claude</code> for every job, so with no Claude
+    credential the scheduler stays idle and polls nothing. Sign in or store an API key below.</span>
+  </div>
+  {% endif %}
+
+  {% if let Some(url) = auth.login_url %}
+  <div class="card" style="margin: 8px 0;">
+    <strong>Sign-in in progress.</strong>
+    <ol style="margin: 8px 0 0 18px; padding: 0;">
+      <li><a href="{{ url }}" target="_blank" rel="noopener noreferrer">Open the Anthropic authorization page</a>
+        and approve the request.</li>
+      <li>Copy the code it shows and paste it here.</li>
+    </ol>
+    {% if let Some(e) = auth.login_error %}
+    <div class="card" style="border-color: var(--bad); margin: 8px 0;">
+      <strong style="color: var(--bad);">{{ e }}</strong>
+    </div>
+    {% endif %}
+    <form method="post" action="/settings/auth/claude/code" style="margin-top: 8px;">
+      <label for="auth-code">Code</label>
+      <input id="auth-code" name="code" type="text" autocomplete="off" autofocus required>
+      <button type="submit" style="margin-top: 8px;">Complete sign-in</button>
+    </form>
+    <form method="post" action="/settings/auth/claude/cancel" style="margin-top: 8px;">
+      <button type="submit" class="secondary">Cancel sign-in</button>
+    </form>
+  </div>
+  {% else %}
+  <span class="dim">Sign in with your Anthropic account (a subscription login, brokered through
+  this page: you get an authorization link, approve it, and paste the code back). Or store an API
+  key instead, which is the right credential for API-billed deployments.</span>
+  {% if let Some(e) = auth.login_error %}
+  <div class="card" style="border-color: var(--bad); margin: 8px 0;">
+    <strong style="color: var(--bad);">{{ e }}</strong>
+  </div>
+  {% endif %}
+  <form method="post" action="/settings/auth/claude/login" style="margin-top: 8px;">
+    <button type="submit">Sign in with Anthropic</button>
+  </form>
+  <form method="post" action="/settings/auth/claude" style="margin-top: 12px;">
+    <label for="auth-api-key">API key
+      {% if auth.anthropic_key %}<span class="badge ok">stored</span>{% endif %}
+    </label>
+    <input id="auth-api-key" name="api_key" type="password" autocomplete="off"
+           placeholder="sk-ant-..." required>
+    <button type="submit" style="margin-top: 8px;">Save API key</button>
+  </form>
+  {% endif %}
+
+  <h4 style="margin: 20px 0 4px;">YouTrack
+    {% if let Some(url) = auth.youtrack_base_url %}<span class="badge ok">{{ url }}</span>
+    {% else %}<span class="badge neutral">not set</span>{% endif %}
+  </h4>
+  <span class="dim">Base URL and a permanent token. Equivalent to
+  <code>yt auth login --base-url &lt;url&gt;</code>.</span>
+  <form method="post" action="/settings/auth/youtrack" style="margin-top: 8px;">
+    <label for="auth-yt-url">Base URL</label>
+    <input id="auth-yt-url" name="base_url" type="url" placeholder="https://yt.example.com"
+           {% if let Some(url) = auth.youtrack_base_url %}value="{{ url }}"{% endif %} required>
+    <label for="auth-yt-token" style="margin-top: 8px;">Token</label>
+    <input id="auth-yt-token" name="token" type="password" autocomplete="off"
+           placeholder="perm:..." required>
+    <button type="submit" style="margin-top: 8px;">Save YouTrack login</button>
+  </form>
+
+  <h4 style="margin: 20px 0 4px;">Forgejo
+    {% if let Some(host) = auth.forgejo_host %}<span class="badge ok">{{ host }}</span>
+    {% else %}<span class="badge neutral">not set</span>{% endif %}
+  </h4>
+  <span class="dim">Host and an application token with <code>write:repository</code> and
+  <code>write:issue</code>. Equivalent to <code>fj auth add-key</code>.</span>
+  <form method="post" action="/settings/auth/forgejo" style="margin-top: 8px;">
+    <label for="auth-fj-host">Host</label>
+    <input id="auth-fj-host" name="host" type="text" placeholder="dev.example.com"
+           {% if let Some(host) = auth.forgejo_host %}value="{{ host }}"{% endif %} required>
+    <label for="auth-fj-token" style="margin-top: 8px;">Token</label>
+    <input id="auth-fj-token" name="token" type="password" autocomplete="off" required>
+    <button type="submit" style="margin-top: 8px;">Save Forgejo login</button>
+  </form>
+</div>
+
 {% for sec in sections %}
 <div class="card" style="margin-bottom: 16px;" id="section-{{ sec.path }}">
   <h3>{{ sec.title }} <span class="badge neutral">apply: {{ sec.apply_badge }}</span></h3>

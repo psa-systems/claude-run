@@ -84,8 +84,9 @@ services:
       - type: volume
         source: claude-bot-git
         target: /home/claudebot/.config/git
-    # The daemon's unix socket lives here; ephemeral per container so a stale
-    # socket never survives a restart.
+    # Runtime dir (pidfile, and the unix socket when it is enabled at all; the
+    # image runs `serve --no-socket`). Ephemeral per container so nothing stale
+    # survives a restart.
     tmpfs:
       - /home/claudebot/.runtime/claude-run
 

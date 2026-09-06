@@ -30,6 +30,17 @@
    to fill the first screen with byte-identical rows; the rows are on /logs, and
    the access subset is named separately because its remedy is the access
    check. It clears itself when a later poll records the recovery marker. #}
+{# Setup is unfinished: the runner spawns `claude` for every job, so with no
+   Claude credential the scheduler polls nothing and dispatches nothing. Without
+   this banner an idle dashboard is indistinguishable from having no work. #}
+{% if let Some(reason) = not_ready_reason %}
+  <div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
+    <strong style="color: var(--bad);">Setup incomplete: actions are not running.</strong>
+    <span>{{ reason }}</span>
+    <a href="/settings#section-auth">Finish setup</a>
+  </div>
+{% endif %}
+
 {% if events_24h > 0 %}
   <div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
     <strong style="color: var(--bad);">{{ events_24h }} errors / warnings in the last 24h.</strong>
