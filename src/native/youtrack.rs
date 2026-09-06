@@ -1036,7 +1036,7 @@ async fn process_job(
     // ---- pre: mark Working / In Progress, then clone ----
     // CLAUDE-228: `yt` field writes plus a full `git clone` of the target repo,
     // all synchronous; keep them off the async worker thread.
-    let pre_result = crate::blocking::in_place(|| run_pre(backend, src, job, &workdir_path));
+    let pre_result = crate::blocking::in_place(|| run_pre(backend, forge, src, job, &workdir_path));
 
     // ---- prompt + claude (skipped on pre failure / cancel / global pause) ----
     // CLAUDE-223: the gate is read once here (not in a match guard, which cannot
@@ -1402,6 +1402,7 @@ fn log_held(action: &str, key: &str, signature: &str, blocked_since_ms: i64, now
 /// synthesize a failed claude result and still finalize.
 fn run_pre(
     backend: &dyn IssueTracker,
+    forge: &dyn Forge,
     src: &YoutrackSource,
     job: &YoutrackJob,
     workdir: &Path,
@@ -1420,7 +1421,7 @@ fn run_pre(
             .set_assignee(&job.key, login)
             .map_err(|e| format!("set Assignee={login}: {e}"))?;
     }
-    clone_repo(&job.clone_url, workdir).map_err(|e| format!("git clone: {e}"))?;
+    clone_repo(&clone_url_for(forge, job), workdir).map_err(|e| format!("git clone: {e}"))?;
     install_hooks(workdir);
     Ok(())
 }
@@ -1471,24 +1472,47 @@ fn install_hooks(workdir: &Path) {
     }
 }
 
-/// Shallow-clone `clone_url` into `workdir` (already created, empty). Host git
-/// identity handles auth.
-fn clone_repo(clone_url: &str, workdir: &Path) -> Result<()> {
-    let status = Command::new("git")
-        .arg("clone")
-        .arg("--depth")
-        .arg("50")
-        .arg(clone_url)
-        .arg(workdir)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::Other(anyhow::anyhow!(
-            "git clone exited {}",
-            status.code().unwrap_or(-1)
-        )))
+/// The URL to clone this job's repo from.
+///
+/// CLAUDE-252: prefer the token-bearing URL the forge builds from its own key
+/// store, the same one `forgejo_ci_fix` and the comment webhook already use.
+/// `job.clone_url` comes from the YouTrack VCS integration and carries no
+/// credential, so on a host with no git credential of its own (the container,
+/// deliberately) every clone failed with `could not read Username`.
+///
+/// Falls back to the plain URL when the forge cannot resolve one, because a host
+/// install authenticating through a credential helper or `~/.netrc` must keep
+/// working exactly as before. The failure is logged once, naming the host.
+fn clone_url_for(forge: &dyn Forge, job: &YoutrackJob) -> String {
+    // `Forge::clone_url` looks the host up in the key store and formats the URL
+    // itself, so it wants a bare host; `repo_host` carries the scheme.
+    let host = job
+        .repo_host
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    match forge.clone_url(host, &job.repo_path) {
+        Ok(url) => url,
+        Err(e) => {
+            warn!(
+                host = %host,
+                repo = %job.repo_path,
+                error = %e,
+                "no forge credential for this host; cloning with the unauthenticated URL and \
+                 whatever git credentials the environment provides"
+            );
+            job.clone_url.clone()
+        }
     }
+}
+
+/// Shallow-clone `clone_url` into `workdir` (already created, empty).
+///
+/// The URL may carry a token, so the shared helper captures and redacts git's
+/// output rather than letting it inherit the daemon's stderr; the reason string
+/// this produces reaches the action page and can reach a YouTrack comment.
+fn clone_repo(clone_url: &str, workdir: &Path) -> Result<()> {
+    provider::shallow_clone(clone_url, None, workdir, 50)
 }
 
 /// The built-in YouTrack agent prompt as a placeholder template (CLAUDE-125).
@@ -2376,6 +2400,51 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
+    /// CLAUDE-252: the pre step clones the URL the FORGE resolves from its key
+    /// store, not the unauthenticated one the YouTrack VCS integration reports.
+    /// A container has no git credential of its own, so the plain URL failed
+    /// every job with `could not read Username`.
+    #[test]
+    fn the_clone_url_comes_from_the_forge_key_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys.json");
+        std::fs::write(
+            &keys,
+            r#"{"hosts":{"dev.a8n.run":{"name":"bot","token":"tok-123","type":"Application"}}}"#,
+        )
+        .unwrap();
+        let backend = CliBackend::new(Arc::new(StubRunner::new())).with_keys_path(&keys);
+
+        let url = clone_url_for(&backend, &job());
+        assert_eq!(
+            url, "https://oauth2:tok-123@dev.a8n.run/contoso/claude-run.git",
+            "the scheme must be stripped from repo_host before the key lookup"
+        );
+    }
+
+    /// A host the key store does not know falls back to the plain URL, so a host
+    /// install authenticating through a credential helper keeps working.
+    #[test]
+    fn an_unknown_host_falls_back_to_the_unauthenticated_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
+        let backend = CliBackend::new(Arc::new(StubRunner::new())).with_keys_path(&keys);
+
+        let j = job();
+        assert_eq!(clone_url_for(&backend, &j), j.clone_url);
+    }
+
+    /// The token must never reach the agent: `{{clone_url}}` renders the job's
+    /// own unauthenticated URL, which the authenticated one does not replace.
+    #[test]
+    fn the_prompt_never_renders_an_authenticated_url() {
+        let j = job();
+        let rendered = render_prompt_template("Repo: {{clone_url}}", &j, Path::new("/w"), "");
+        assert!(rendered.contains("https://dev.a8n.run/contoso/claude-run.git"));
+        assert!(!rendered.contains("oauth2:"), "{rendered}");
+    }
+
     fn job() -> YoutrackJob {
         YoutrackJob {
             key: "MK-16".into(),
@@ -3006,13 +3075,17 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        // An empty key store: `clone_url` must resolve nothing here rather than
+        // read the developer's real forgejo-cli credentials.
+        let keys = dir.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
+        let backend = CliBackend::new(runner.clone()).with_keys_path(&keys);
         let mut s = src();
         s.assignee = Some("octocat".into());
         let mut j = job();
         // Bogus local path: `git clone` fails immediately with no network.
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let _ = run_pre(&backend, &s, &j, &wd);
+        let _ = run_pre(&backend, &backend, &s, &j, &wd);
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls
@@ -3037,12 +3110,16 @@ mod tests {
                 )
                 .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], ""),
         );
-        let backend = CliBackend::new(runner.clone());
+        // An empty key store: `clone_url` must resolve nothing here rather than
+        // read the developer's real forgejo-cli credentials.
+        let keys = dir.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
+        let backend = CliBackend::new(runner.clone()).with_keys_path(&keys);
         let s = src(); // assignee defaults to None
         assert!(s.assignee.is_none());
         let mut j = job();
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let _ = run_pre(&backend, &s, &j, &wd);
+        let _ = run_pre(&backend, &backend, &s, &j, &wd);
         let calls = runner.calls.lock().unwrap();
         assert!(!calls.iter().any(|c| c.contains("--assignee")), "{calls:?}");
     }
@@ -3068,12 +3145,16 @@ mod tests {
                     "no such user",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        // An empty key store: `clone_url` must resolve nothing here rather than
+        // read the developer's real forgejo-cli credentials.
+        let keys = dir.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
+        let backend = CliBackend::new(runner.clone()).with_keys_path(&keys);
         let mut s = src();
         s.assignee = Some("octocat".into());
         let mut j = job();
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let err = run_pre(&backend, &s, &j, &wd).unwrap_err();
+        let err = run_pre(&backend, &backend, &s, &j, &wd).unwrap_err();
         assert!(err.starts_with("set Assignee=octocat:"), "{err}");
         // The clone is never attempted: the workdir stays absent.
         assert!(!wd.exists(), "clone must not run after an assignee failure");

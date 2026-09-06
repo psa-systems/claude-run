@@ -554,26 +554,11 @@ fn run_pre(
 }
 
 /// Shallow-clone `branch` of `clone_url` (token-authenticated) into `workdir`
-/// (already created, empty). Errors carry only the exit code, never the URL, so
-/// the token does not leak into logs.
+/// (already created, empty). CLAUDE-252: the shared helper reports git's own
+/// reason for a failure with the URL's credential redacted, instead of the bare
+/// exit code this used to carry.
 fn clone_branch(clone_url: &str, branch: &str, workdir: &Path) -> Result<()> {
-    let status = Command::new("git")
-        .arg("clone")
-        .arg("--branch")
-        .arg(branch)
-        .arg("--depth")
-        .arg("50")
-        .arg(clone_url)
-        .arg(workdir)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::Other(anyhow::anyhow!(
-            "git clone exited {}",
-            status.code().unwrap_or(-1)
-        )))
-    }
+    provider::shallow_clone(clone_url, Some(branch), workdir, 50)
 }
 
 /// Build the agent's instruction text. Local-only work: investigate and fix the
@@ -795,39 +780,34 @@ fn push_fix(
 /// Run `git -C <workdir> <args...>`, erroring on a non-zero exit. The args carry
 /// no secrets (config / add / commit), so the failed-command echo is safe.
 fn git_in(workdir: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new("git")
+    let out = Command::new("git")
         .arg("-C")
         .arg(workdir)
         .args(args)
-        .status()?;
-    if status.success() {
+        .output()?;
+    if out.status.success() {
         Ok(())
     } else {
-        Err(Error::Other(anyhow::anyhow!(
-            "git {} exited {}",
-            args.join(" "),
-            status.code().unwrap_or(-1)
-        )))
+        Err(provider::git_error(&args.join(" "), &out, None))
     }
 }
 
 /// Push `branch` to `url` from `workdir`. Kept separate from [`git_in`] so the
 /// token-bearing URL never appears in an error message.
 fn git_push(workdir: &Path, url: &str, branch: &str) -> Result<()> {
-    let status = Command::new("git")
+    let out = Command::new("git")
         .arg("-C")
         .arg(workdir)
         .arg("push")
         .arg(url)
         .arg(branch)
-        .status()?;
-    if status.success() {
+        .output()?;
+    if out.status.success() {
         Ok(())
     } else {
-        Err(Error::Other(anyhow::anyhow!(
-            "git push exited {}",
-            status.code().unwrap_or(-1)
-        )))
+        // CLAUDE-252: a rejected push (non-fast-forward, protected branch, a
+        // token without write scope) said only `exited 1` before this.
+        Err(provider::git_error("push", &out, Some(url)))
     }
 }
 
