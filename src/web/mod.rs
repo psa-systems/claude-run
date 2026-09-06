@@ -3851,9 +3851,10 @@ async fn save_auth_config(
             crate::settings::SaveError::Invalid(m) => m,
             crate::settings::SaveError::Db(e) => e.to_string(),
         })?;
-    let (_, api_key) = crate::service_auth::materialize(&s.api.pool, &s.api.paths, cfg)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (_, api_key) =
+        crate::service_auth::materialize(&s.api.pool, &s.api.paths, cfg, &s.api.fj_data_home)
+            .await
+            .map_err(|e| e.to_string())?;
     if let Some(handle) = &s.api.anthropic_key {
         match handle.write() {
             Ok(mut slot) => *slot = api_key,
@@ -5981,6 +5982,7 @@ mod tests {
                 anthropic_key: None,
                 readiness: None,
                 claude_login: None,
+                fj_data_home: tmp.join("fj-data"),
                 claude_binary: "claude".to_string(),
                 agent_config_dir: None,
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
@@ -8719,6 +8721,7 @@ mod tests {
                 anthropic_key: None,
                 readiness: None,
                 claude_login: None,
+                fj_data_home: tmp.join("fj-data"),
                 claude_binary: "claude".to_string(),
                 agent_config_dir: None,
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
@@ -8983,6 +8986,7 @@ mod tests {
                 anthropic_key: None,
                 readiness: None,
                 claude_login: None,
+                fj_data_home: std::path::PathBuf::from("/nonexistent/test-fj-data"),
                 claude_binary: "claude".to_string(),
                 agent_config_dir: None,
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),

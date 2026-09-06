@@ -79,6 +79,10 @@ pub struct AppState {
     /// Whether an agent can be spawned at all. `None` where nothing dispatches
     /// (tests, CLI-direct paths).
     pub readiness: Option<crate::readiness::ReadinessGate>,
+    /// Where `fj` reads `keys.json`. Held here rather than resolved at the call
+    /// site so a test can point it at a temp dir; the daemon passes
+    /// `service_auth::default_fj_data_home()`.
+    pub fj_data_home: std::path::PathBuf,
     /// Broker for an interactive `claude auth login` driven from the Settings
     /// Auth card. `None` outside the daemon.
     pub claude_login: Option<Arc<crate::claude_login::LoginBroker>>,
@@ -717,6 +721,7 @@ mod tests {
             anthropic_key: None,
             readiness: None,
             claude_login: None,
+            fj_data_home: std::path::PathBuf::from("/nonexistent/test-fj-data"),
             claude_binary: "claude".to_string(),
             agent_config_dir: None,
             settings: Arc::new(crate::settings::LiveSettings::detached(pool)),

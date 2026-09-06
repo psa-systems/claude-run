@@ -325,6 +325,17 @@ fn extract_url(line: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that write an executable stub and then exec it.
+    /// `cargo test` runs them in parallel, and a fork taken while another
+    /// thread still holds the stub open for writing makes the exec fail with
+    /// `ETXTBSY` (`Text file busy`), which showed up only under the containered
+    /// `just check`. Nothing about the broker is racy; this is the classic
+    /// write-then-fork/exec hazard in the harness.
+    fn stub_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn the_authorize_url_is_recognized_in_the_cli_wording() {
         let line = "If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz";
@@ -358,6 +369,7 @@ mod tests {
     /// handshake without contacting Anthropic.
     #[test]
     fn a_login_round_trips_through_the_broker() {
+        let _serial = stub_lock();
         let tmp = tempfile::tempdir().unwrap();
         let stub = tmp.path().join("claude-stub");
         std::fs::write(
@@ -412,6 +424,7 @@ mod tests {
     /// A child that never prints a URL is killed and reported, not left running.
     #[test]
     fn a_child_that_prints_no_url_is_reaped() {
+        let _serial = stub_lock();
         let tmp = tempfile::tempdir().unwrap();
         let stub = tmp.path().join("silent");
         std::fs::write(&stub, "#!/bin/sh\nexit 3\n").unwrap();
