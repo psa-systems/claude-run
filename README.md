@@ -22,7 +22,8 @@ long-running daemon.
   on each colliding action instead of discovering the contention during an incident.
 - **HTTP API over a unix socket**: the daemon exposes `/status`, `/actions`, `/actions/<n>/trigger`, `/pause`,
   `/resume`, `/runs/<id>/cancel`, ... The CLI client speaks that API when the daemon is reachable, else operates on the
-  DB directly.
+  DB directly. It is the CLI's control plane, so `serve --no-socket` turns it off for a deployment that has no CLI
+  operator; the same handlers are always mounted under `/api` on the TCP listener, which is what the web UI drives.
 
 ## Install
 
@@ -62,6 +63,7 @@ scopes".
 
 ```nu
 # Long-running daemon: scheduler + unix-socket API. --detach forks into the background.
+# --no-socket skips the unix-socket API (the container image runs that way).
 claude-run serve --detach
 
 # Manual out-of-cycle run via the daemon (counts as triggered_by=trigger in the runs table).
@@ -223,7 +225,7 @@ XDG-compliant; each path overridable by the matching env var.
 | `$XDG_CONFIG_HOME/claude-run/` | `CLAUDE_RUN_CONFIG_DIR`  | `config.toml`, `actions/*.yml`                                                                  |
 | `$XDG_DATA_HOME/claude-run/`   | `CLAUDE_RUN_DATA_DIR`    | `state.db`, `workdirs/`                                                                         |
 | `$XDG_STATE_HOME/claude-run/`  | `CLAUDE_RUN_STATE_DIR`   | `logs/<action>/YYYY-MM-DD.jsonl`, `logs/<action>/streams/<key>-attempt-<n>.jsonl`, `daemon.log` |
-| `$XDG_RUNTIME_DIR/claude-run/` | `CLAUDE_RUN_RUNTIME_DIR` | `daemon.pid`, `daemon.sock`, `locks/<action>.lock`                                              |
+| `$XDG_RUNTIME_DIR/claude-run/` | `CLAUDE_RUN_RUNTIME_DIR` | `daemon.pid`, `daemon.sock` (absent under `serve --no-socket`), `locks/<action>.lock`           |
 
 `workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-job workdirs live; defaults to
 `$DATA_DIR/workdirs/`. Supports `~`, `$VAR`, `${VAR}` expansion.
@@ -510,29 +512,96 @@ the daemon requires a bearer token on every request to the web UI and `/api/*`:
 [web]
 bind = "0.0.0.0"
 port = 7321
-# Name of a stored secret (see "Secrets store" below) holding the bearer token / web password.
+# Optional: name of a stored secret (see "Secrets store" below) holding a bearer token for API
+# clients. The browser login does not need it: that credential is created at /setup on first run.
 auth_token_ref = "web-ui-token"
-# Optional: enable the browser login form with this username (lets a password manager sign in).
+# Optional, and only used while no administrator exists: the username for the pre-setup login form.
 auth_username = "admin"
 # Optional: require the token even on a loopback bind (off by default; useful for local testing).
 require_auth_on_loopback = false
 ```
 
-Callers send `Authorization: Bearer <token>`. The token value lives encrypted in the secrets store (resolved once at
-daemon startup); only its name appears in `config.toml`. If `web.bind` is non-loopback but `auth_token_ref` is unset or
-its secret cannot be decrypted, the daemon fails closed and does not bring up the TCP listener at all, rather than serve
-an unauthenticated surface. Run the daemon behind a TLS-terminating reverse proxy when exposed; the token is bearer
-credentials and must not cross the network in plaintext. The `/webhooks/` route keeps its own HMAC verification and is
-exempt from the token gate.
+Two credentials answer that gate, for two kinds of caller.
+
+**The browser: a first-run administrator.** An exposed instance with no credential yet serves exactly one page: `/setup`,
+which asks for a username and a password (minimum 12 characters) and creates the administrator. Everything else
+redirects there, and non-browser callers get `503` naming the state. The credential is an argon2id hash in the
+`web_admin` table, so it needs neither the secrets store, nor a key file, nor the CLI, and the setup page closes itself
+the moment an administrator exists: a second POST to `/setup` is refused and redirected to `/login`. The new credential
+applies to the next request, with no restart. This is what makes a container reachable out of the box; before it, a
+non-loopback bind with no resolvable token took the whole web UI down, which no browser could recover from.
+
+Setup is trust-on-first-use: whoever reaches the exposed port first can claim the instance. Bring it up behind the
+reverse proxy (and whatever the proxy already enforces) and complete setup promptly. `no administrator yet` is logged at
+`warn` on every start while the instance is unclaimed.
+
+**API clients: the bearer token.** Callers send `Authorization: Bearer <token>`. The value lives encrypted in the
+secrets store (resolved once at daemon startup); only its name appears in `config.toml`. `auth_token_ref` is optional
+now: when it is unset, or its secret cannot be decrypted, the reason is logged at `warn` and bearer auth is simply
+unavailable for the run, while the browser login and setup are unaffected. Where no administrator exists, the older
+pairing still signs in: `auth_username` plus the token plaintext as the password, so existing host deployments are
+unchanged.
+
+Run the daemon behind a TLS-terminating reverse proxy when exposed; the token is bearer credentials and must not cross
+the network in plaintext. The `/webhooks/` route keeps its own HMAC verification and is exempt from the gate, before and
+after setup.
+
+### Service auth (Settings -> Auth)
+
+The daemon needs its own logins to do its own work: the scheduler polls YouTrack for queued issues and reads Forgejo
+for CI failures long before any action-level `token_ref` is involved. Historically those calls used whatever the host
+operator had logged in with (`~/.config/youtrack-cli`, `~/.local/share/forgejo-cli/keys.json`), which a container does
+not have, so every poll failed with `no instance configured. Run 'yt auth login --base-url <url>'`.
+
+The **Auth** card at the top of `/settings` takes those credentials in the browser:
+
+| Credential | Fields | Equivalent CLI | Where it lands |
+|---|---|---|---|
+| Claude | interactive sign-in, or an API key | `claude auth login` / `ANTHROPIC_API_KEY` | the agent's own config dir / that env var on each child |
+| YouTrack | base URL, token | `yt auth login --base-url <url>` | single-file `yt` config at `<CLAUDE_RUN_CONFIG_DIR>/auth/youtrack.yml`, named by `YOUTRACK_CLI_CONFIG` |
+| Forgejo | host, token | `fj auth add-key` | `keys.json` in the daemon's XDG data dir, the same file `fj` writes |
+
+Each value is encrypted into the secrets store under a fixed name (`auth-anthropic-api-key`, `auth-youtrack-token`,
+`auth-forgejo-token`); the `config.auth` settings document holds only the URL, the host, and those names, and the page
+never renders a stored value back. Saving applies to the next invocation with no restart: `YOUTRACK_CLI_CONFIG` is
+exported once at serve start and points at a fixed path whose contents the save rewrites.
+
+**Signing in to Claude from the page.** `claude auth login` is an OAuth flow, but its redirect is a paste-the-code
+callback rather than a `localhost` listener, and with pipes on stdin/stdout it prints the authorize URL and then reads
+the code from stdin. The Auth card brokers exactly that: **Sign in with Anthropic** spawns the CLI under the agent's
+config dir, shows you the authorization link, and takes the code back through a form. A refused code shows the CLI's own
+message and keeps the session open for another paste; **Cancel sign-in** kills the child. The child stays alive between
+the two requests because it holds the PKCE verifier the code is redeemed against, so exactly one sign-in runs at a time
+and an abandoned one expires after 15 minutes. The API key remains the right credential for API-billed deployments and
+needs no browser at all.
+
+**No Claude credential means nothing runs.** The runner's whole job is spawning `claude`, so an instance without a
+Claude credential is not finished being set up: the scheduler polls no source, dispatches no action, and the trigger
+endpoint answers `409` naming the reason. That is deliberate. Before it, a fresh container queried YouTrack every tick
+and logged an auth error per action per tick, which buries real failures and would have burned attempts against
+`max_attempts_per_key` on runs that could only fail. The dashboard carries a banner while it lasts, `/api/status`
+reports `ready` plus `not_ready_reason`, and the transition is logged once in each direction rather than every tick. A
+credential counts when any of these hold, so a host install with an existing login is unaffected: a
+`.credentials.json` in the agent config dir (on a host, the symlink to `~/.claude/.credentials.json`), a stored API
+key, or `ANTHROPIC_API_KEY` in the daemon's environment.
+
+Precedence is unchanged where an action carries its own credentials: an action's `youtrack.token_ref` /
+`forgejo.token_ref` is materialized per job and sets the same env in the child, so it still wins. These are the
+defaults for everything else, including the daemon's own polling. An operator who prefers the CLIs can still run
+`claude auth login`, `yt auth login` and `fj auth add-key` inside the container; leaving the Auth card empty writes
+nothing and does not disturb those files.
 
 ### Secrets store
 
 Auth (and every action `token_ref`) reads from an encrypted secrets store. Two things are required before
 `auth_token_ref` resolves:
 
-1. **A key file.** The store is encrypted with an [`age`](https://github.com/FiloSottile/age) X25519 identity. Generate
-   one and point `CLAUDE_RUN_SECRETS_KEY_FILE` at it (the daemon reads only this env var; it is never put in
-   `config.toml`):
+1. **A key file.** The store is encrypted with an [`age`](https://github.com/FiloSottile/age) X25519 identity. When
+   `CLAUDE_RUN_SECRETS_KEY_FILE` is unset the daemon uses `<CLAUDE_RUN_DATA_DIR>/secrets.key` and creates it (mode
+   `0600`) the first time a secret is stored, so a container can hold a credential with nothing mounted and no CLI.
+   **Back that file up**: every stored secret is encrypted under it and is unrecoverable without it. Setting the env var
+   instead names a key you manage, and that path is never auto-created (naming a path says a specific key is meant, and
+   generating a different one would silently orphan every existing secret):
 
    ```sh
    age-keygen -o /etc/claude-run/secrets.key
@@ -939,7 +1008,7 @@ agent is never told to push, open PRs, or transition issue state.
 
 | Volume                        | Container path                            | Purpose                                                                                             |
 |-------------------------------|-------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| `claude-bot-config`           | `/home/claudebot/.config/claude-run`      | `config.toml`, the actions dir, and the agent's `claude-agent-home` (`CLAUDE_RUN_CONFIG_DIR`)       |
+| `claude-bot-config`           | `/home/claudebot/.config/claude-run`      | `config.toml` (seeded, binds 0.0.0.0), the actions dir, and the agent's `claude-agent-home`         |
 | `claude-bot-data`             | `/home/claudebot/.local/share/claude-run` | `state.db` (runs, outcomes, encrypted secrets store) and per-job workdirs (`CLAUDE_RUN_DATA_DIR`)   |
 | `claude-bot-state`            | `/home/claudebot/.local/state/claude-run` | logs, per-attempt stream JSONL, webhook log artifacts (`CLAUDE_RUN_STATE_DIR`)                      |
 | `claude-bot-claude`           | `/home/claudebot/.claude`                 | the in-container Claude login, plus the baked slim bot CLAUDE.md Docker seeds into the empty volume |
@@ -947,7 +1016,7 @@ agent is never told to push, open PRs, or transition issue state.
 | `claude-bot-forgejo-cli`      | `/home/claudebot/.local/share/forgejo-cli`| `fj` `keys.json`; the token needs `write:repository` + `write:issue` (see Install)                  |
 | `claude-bot-git`              | `/home/claudebot/.config/git`             | git identity, at the path `GIT_CONFIG_GLOBAL` names in the image                                    |
 | secret `claude-run-age-key`   | `/run/secrets/claude-run-age-key`         | age identity decrypting the secrets store                                                           |
-| tmpfs                         | `/home/claudebot/.runtime/claude-run`     | daemon unix socket (`CLAUDE_RUN_RUNTIME_DIR`); ephemeral so a stale socket never survives a restart |
+| tmpfs                         | `/home/claudebot/.runtime/claude-run`     | pidfile and action locks (`CLAUDE_RUN_RUNTIME_DIR`); ephemeral so nothing stale survives a restart |
 
 One volume per credential store rather than subpaths of a single volume: a compose `volume.subpath` is resolved before the entrypoint runs, is never auto-created, and is not seeded from the image, so a missing subdirectory fails the container create outright.
 
@@ -958,11 +1027,16 @@ One volume per credential store rather than subpaths of a single volume: a compo
 
 **Actions.** The `./actions` bind is gone with the other host mounts. The image bakes this repo's action YAML at `/usr/share/claude-run/actions`, and the entrypoint copies it into the config volume the first time that volume holds no `*.yml`, so a fresh container starts with the shipped action set. It never overwrites after that: an action edited in the web UI survives an image upgrade, and a changed shipped action reaches an existing deployment through the same editor (`/actions`), not by recreating the container.
 
-**First-run logins.** Start the stack, then log the three CLIs in. The daemon comes up before any login exists (a missing Claude credential is a `warn`, not a startup failure), so the container is there to exec into:
+**No unix-socket API.** The image runs `serve --no-socket`, so the daemon binds only the TCP listener. That socket is the CLI's control plane on a host install, and this container has no CLI operator: the web UI and its `/api` routes are the whole interface, and they carry the same handlers (`/api/actions/<n>/trigger`, `/api/pause`, `/api/resume`, `/settings/<section>`). Binding it here would only leave a second copy of that control plane with no token gate on it, reachable by the `claude` agent the daemon spawns as the same user. `claude-run trigger` and `claude-run cancel` inside the container therefore fail, naming the reason rather than claiming no daemon is running; every other subcommand (`secret set`, `action list`, `status`) works as before because it goes to the database directly. Override `command: ["serve"]` in compose if a deployment really does want the socket.
+
+**Web bind and first-run setup.** The image seeds a bootstrap `config.toml` (from `deploy/container-config.toml`) that binds `0.0.0.0:7321`, because a loopback bind inside a container is reachable from nothing outside it, published port or reverse proxy included. A non-loopback bind requires auth, and that credential is created in the browser: open the URL and the daemon serves `/setup`, which takes a username and a password and creates the administrator. No token, no key file, no CLI. The seeded `config.toml` is copied only when the config volume has none, so operator edits survive restarts and image upgrades. See "Web UI / API auth" for what setup is and is not (it is trust-on-first-use; bring the instance up behind the proxy).
+
+**First-run logins.** Everything is in the browser: after creating the administrator, open **Settings -> Auth**, press **Sign in with Anthropic** (or store an API key), and enter the YouTrack base URL plus token and the Forgejo host plus token. No restart, and no CLI. Until the Claude credential exists the scheduler runs nothing and says so on the dashboard. The `exec` route below remains for operators who would rather the CLIs own their own config. The daemon comes up before any login exists (a missing Claude credential is a `warn`, not a startup failure), so the container is there to exec into:
 
 ```nu
 docker compose up --detach
 
+# Create the web administrator at https://<your-host>/setup, then the tool logins:
 docker compose exec --user claudebot claude-bot claude auth login
 docker compose exec --user claudebot claude-bot yt auth login --base-url https://yt.example.com
 docker compose exec --user claudebot claude-bot fj auth add-key
@@ -1000,10 +1074,9 @@ secrets:
     environment: CLAUDE_RUN_AGE_KEY
 ```
 
-**Networking.** To expose the web UI / webhook listener, set `[web].bind` to a non-loopback address in the container's
-`config.toml` (e.g. `0.0.0.0`) and publish the port (`ports:` mapping or a reverse-proxy network). A non-loopback bind
-requires token auth: `web.auth_token_ref` must name a secret stored via `claude-run secret set` (see "Web UI / API
-auth").
+**Networking.** The seeded `config.toml` already binds `0.0.0.0:7321`; publish the port (`ports:` mapping or a
+reverse-proxy network) to reach it. A non-loopback bind requires auth, which the first-run `/setup` page creates. A
+bearer token for API clients stays optional and separate (`web.auth_token_ref`, see "Web UI / API auth").
 
 ```nu
 docker compose up --detach      # start the daemon from the published image

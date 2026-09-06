@@ -901,11 +901,22 @@ impl CliBackend {
     /// CLAUDE-148: the value of the injected `YOUTRACK_CLI_CONFIG`, if any. The
     /// PATH only is returned, never the file contents (which hold the token).
     /// `None` means host-auth fallback (no injected config).
-    fn yt_config_path(&self) -> Option<&str> {
-        self.yt_env
+    fn yt_config_path(&self) -> Option<String> {
+        if let Some((_, v)) = self
+            .yt_env
             .iter()
-            .find(|(k, _)| k == "YOUTRACK_CLI_CONFIG")
-            .map(|(_, v)| v.as_str())
+            .find(|(k, _)| k == crate::service_auth::YT_CONFIG_ENV)
+        {
+            return Some(v.clone());
+        }
+        // No per-job credential: the child still inherits the daemon's own
+        // `YOUTRACK_CLI_CONFIG` (Settings -> Auth). Reading it here keeps the
+        // failure diagnostics honest; before, a run using the daemon credential
+        // logged `youtrack_cli_config_present: false` and `<host-auth or
+        // unknown>`, which pointed at the wrong cause.
+        std::env::var(crate::service_auth::YT_CONFIG_ENV)
+            .ok()
+            .filter(|v| !v.is_empty())
     }
 
     /// CLAUDE-148: the YouTrack base URL the injected config targets, read from
@@ -917,7 +928,7 @@ impl CliBackend {
     /// in a diagnostic without ever exposing the secret.
     fn yt_base_url(&self) -> Option<String> {
         let path = self.yt_config_path()?;
-        let contents = std::fs::read_to_string(path).ok()?;
+        let contents = std::fs::read_to_string(&path).ok()?;
         contents
             .lines()
             .find_map(|l| l.trim().strip_prefix("url:"))
@@ -947,13 +958,22 @@ impl CliBackend {
             .runner
             .run_in_env(None, &self.yt, args, &self.yt_envs())?;
         if !out.ok {
+            // Name the likeliest cause when the configured credential file is
+            // simply absent: that is an unconfigured instance, not a broken
+            // token, and the fix is one page away.
+            let hint = match self.yt_config_path() {
+                Some(p) if !std::path::Path::new(&p).exists() => {
+                    " (no YouTrack credential yet: Settings -> Auth)"
+                }
+                _ => "",
+            };
             warn!(
                 binary = %self.yt,
                 args = %args.join(" "),
                 exit_code = out.exit_code,
                 youtrack_cli_config_present = config_present,
                 base_url = %self.yt_base_url().as_deref().unwrap_or("<host-auth or unknown>"),
-                "yt invocation failed"
+                "yt invocation failed{hint}"
             );
         }
         Self::checked(&self.yt, out, args)
@@ -2336,7 +2356,10 @@ mod tests {
             cfg.to_string_lossy().into_owned(),
         )]);
         assert_eq!(b.yt_base_url().as_deref(), Some("https://yt.example.com"));
-        assert_eq!(b.yt_config_path(), Some(cfg.to_string_lossy().as_ref()));
+        assert_eq!(
+            b.yt_config_path().as_deref(),
+            Some(cfg.to_string_lossy().as_ref())
+        );
         // Host-auth fallback (no injected config) yields no base URL.
         let host_auth = CliBackend::new(Arc::new(StubRunner::new()));
         assert_eq!(host_auth.yt_base_url(), None);

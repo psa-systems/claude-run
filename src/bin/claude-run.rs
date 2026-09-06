@@ -74,11 +74,19 @@ enum Cmd {
         /// Action name (resolved against the actions dir) or path to a YAML file.
         action: String,
     },
-    /// Start the daemon. Owns the scheduler and the unix-socket API.
+    /// Start the daemon. Owns the scheduler and, unless `--no-socket`, the
+    /// unix-socket API.
     Serve {
         /// Detach (fork twice, write pidfile, redirect stdio to daemon.log).
         #[arg(long)]
         detach: bool,
+        /// Do not bind the unix-socket control API. The CLI subcommands that
+        /// need a daemon (`trigger`, `cancel`) then fail, and the TCP web UI
+        /// and its `/api` routes are the only control plane. Intended for the
+        /// container image, where no CLI operator exists and the socket would
+        /// only be an unauthenticated second copy of that control plane.
+        #[arg(long)]
+        no_socket: bool,
     },
     /// Stop a running daemon (SIGTERM, graceful). Idempotent: a no-op exit 0
     /// when no daemon is running. Never force-kills; if the daemon does not
@@ -86,6 +94,9 @@ enum Cmd {
     Stop,
     /// Restart the daemon: stop the running one, then `serve` again.
     Restart {
+        /// Restart without the unix-socket API (mirrors `serve --no-socket`).
+        #[arg(long)]
+        no_socket: bool,
         /// Detach the restarted daemon (mirrors `serve --detach`).
         #[arg(long)]
         detach: bool,
@@ -236,7 +247,7 @@ fn main() -> ExitCode {
     // the runtime is constructed produces a child with corrupt scheduler
     // state. Resolve paths and do the fork in this sync context, then build
     // the runtime in the child.
-    let maybe_detach = matches!(&cli.cmd, Cmd::Serve { detach: true });
+    let maybe_detach = matches!(&cli.cmd, Cmd::Serve { detach: true, .. });
     if maybe_detach {
         if let Err(e) = detach_now() {
             paint::error(&format!("detach failed: {e}"));
@@ -407,9 +418,21 @@ async fn real_main(
 
     match cli.cmd {
         Cmd::Run { action } => run_action(&action, &actions_dir, &paths, &on_disk).await,
-        Cmd::Serve { detach } => serve(detach, paths, on_disk, config_source, log_reload).await,
+        Cmd::Serve { detach, no_socket } => {
+            serve(
+                detach,
+                !no_socket,
+                paths,
+                on_disk,
+                config_source,
+                log_reload,
+            )
+            .await
+        }
         Cmd::Stop => stop(&paths).await,
-        Cmd::Restart { detach } => restart(detach, cli.actions_dir.as_deref(), &paths).await,
+        Cmd::Restart { detach, no_socket } => {
+            restart(detach, no_socket, cli.actions_dir.as_deref(), &paths).await
+        }
         Cmd::Trigger { action } => trigger(&action, &paths).await,
         Cmd::Cancel { run_id } => cancel_run(run_id, &paths).await,
         Cmd::Pause { action, reason } => pause(action, reason, &paths).await,
@@ -584,6 +607,7 @@ async fn run_action(
 
 async fn serve(
     _detach: bool, // already actioned in main() before the tokio runtime started
+    unix_socket: bool,
     paths: cfg::Paths,
     on_disk: cfg::OnDiskConfig,
     config_source: cfg::ConfigSource,
@@ -614,6 +638,7 @@ async fn serve(
         paths,
         on_disk,
         log_apply,
+        unix_socket,
     };
     d.run().await?;
     Ok(exit::OK)
@@ -693,6 +718,7 @@ async fn stop(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
 
 async fn restart(
     detach: bool,
+    no_socket: bool,
     actions_dir_arg: Option<&str>,
     paths: &cfg::Paths,
 ) -> claude_run::error::Result<i32> {
@@ -720,18 +746,45 @@ async fn restart(
     if detach {
         cmd.arg("--detach");
     }
+    if no_socket {
+        cmd.arg("--no-socket");
+    }
     let err = cmd.exec();
     Err(anyhow::anyhow!("failed to exec `serve` on restart: {err}").into())
+}
+
+/// The error for "the daemon socket is not answering", told apart from "no
+/// daemon is running". With `serve --no-socket` the daemon is healthy and the
+/// socket is absent by design, and reporting that as "not running" sends the
+/// operator to restart a daemon that is working fine.
+fn daemon_unreachable(
+    paths: &cfg::Paths,
+    sock: &std::path::Path,
+    consequence: &str,
+) -> claude_run::error::Error {
+    match daemon::read_pidfile(paths) {
+        Some(pid) if daemon::process_alive(pid) => anyhow::anyhow!(
+            "daemon (pid {pid}) is running with its unix-socket API disabled (`serve --no-socket`), \
+             so {consequence}. Use the web UI or its `/api` routes over TCP, or restart the daemon \
+             without --no-socket."
+        )
+        .into(),
+        _ => anyhow::anyhow!(
+            "daemon not reachable at {}; start it with `claude-run serve --detach`",
+            sock.display()
+        )
+        .into(),
+    }
 }
 
 async fn trigger(action: &str, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     if !DaemonClient::is_reachable(&sock) {
-        return Err(anyhow::anyhow!(
-            "daemon not reachable at {}; start it with `claude-run serve --detach`",
-            sock.display()
-        )
-        .into());
+        return Err(daemon_unreachable(
+            paths,
+            &sock,
+            "a trigger cannot reach its scheduler",
+        ));
     }
     let c = DaemonClient::new(&sock);
     let v: serde_json::Value = c
@@ -744,12 +797,11 @@ async fn trigger(action: &str, paths: &cfg::Paths) -> claude_run::error::Result<
 async fn cancel_run(run_id: i64, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     if !DaemonClient::is_reachable(&sock) {
-        return Err(anyhow::anyhow!(
-            "daemon not reachable at {}; an in-flight run only exists inside the daemon, \
-             so cancellation requires it to be running",
-            sock.display()
-        )
-        .into());
+        return Err(daemon_unreachable(
+            paths,
+            &sock,
+            "an in-flight run exists only inside it and cannot be cancelled from here",
+        ));
     }
     let c = DaemonClient::new(&sock);
     let v: serde_json::Value = c.post(&format!("/runs/{}/cancel", run_id), None).await?;
@@ -1115,6 +1167,55 @@ mod tests {
             _ => panic!("expected access check"),
         }
         assert!(Cli::try_parse_from(["claude-run", "access", "check"]).is_ok());
+    }
+
+    /// The container image runs `serve --no-socket`, so the flag must parse on
+    /// both `serve` and `restart`, default to off, and not disturb the
+    /// detach pre-scan that decides whether to fork before the tokio runtime.
+    #[test]
+    fn no_socket_flag_parses_on_serve_and_restart() {
+        let cli = Cli::try_parse_from(["claude-run", "serve"]).unwrap();
+        assert!(
+            matches!(
+                cli.cmd,
+                Cmd::Serve {
+                    detach: false,
+                    no_socket: false
+                }
+            ),
+            "the socket stays on by default, so a host install is unchanged"
+        );
+
+        let cli = Cli::try_parse_from(["claude-run", "serve", "--no-socket"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Serve {
+                detach: false,
+                no_socket: true
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["claude-run", "serve", "--detach", "--no-socket"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Serve {
+                detach: true,
+                no_socket: true
+            }
+        ));
+        assert!(
+            matches!(&cli.cmd, Cmd::Serve { detach: true, .. }),
+            "the detach pre-scan must still fire when --no-socket follows it"
+        );
+
+        let cli = Cli::try_parse_from(["claude-run", "restart", "--no-socket"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Restart {
+                detach: false,
+                no_socket: true
+            }
+        ));
     }
 
     #[test]
