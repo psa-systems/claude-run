@@ -752,26 +752,50 @@ struct SearchView {
     /// Stream search hit the file cap; older streams were not searched. Surfaced
     /// in the UI so results are never silently truncated.
     capped: bool,
-    /// Number of stream files actually opened and grepped (missing files are
-    /// skipped and not counted).
+    /// Number of stream files actually opened and grepped end to end (missing
+    /// and unreadable files are not counted).
     files_searched: usize,
+    /// CLAUDE-246: stream logs that opened but failed mid-read, so the search
+    /// could not answer for those runs. Rendered separately: an unreadable log
+    /// is not a clean "no match".
+    unreadable: Vec<UnreadableStream>,
     /// The file cap (`SEARCH_STREAM_MAX_FILES`), surfaced for the capped note.
     max_files: usize,
 }
 
+/// CLAUDE-246: one stream log the search opened and then failed to read.
+#[derive(Serialize)]
+struct UnreadableStream {
+    run_id: i64,
+    job_key: String,
+    attempt: i64,
+    path: String,
+    /// The underlying I/O error, shown so the operator can act on the cause.
+    error: String,
+}
+
 /// CLAUDE-143: outcome of grepping a single stream log file.
+#[derive(Debug)]
 enum StreamGrep {
-    /// File absent or unreadable (path recorded but rotated/deleted) - skipped,
-    /// not counted toward `files_searched`.
+    /// File absent or could not be opened (path recorded but rotated/deleted) -
+    /// skipped, not counted toward `files_searched`.
     Missing,
-    /// File was opened and scanned; `Some(snippet)` on the first matching line.
+    /// CLAUDE-246: the file opened but a read failed partway through (truncated,
+    /// corrupt, or an I/O error). Distinct from `Searched(None)`: only part of
+    /// the file was scanned, so "no match" would be an answer the search never
+    /// established.
+    Unreadable(String),
+    /// File was opened and scanned to EOF (or the byte cap); `Some(snippet)` on
+    /// the first matching line.
     Searched(Option<String>),
 }
 
 /// CLAUDE-143: read a stream `.jsonl` log line-by-line (as `job_stream_sse`
 /// does) looking for the first line containing `needle` (already ASCII
 /// lowercased). Reads at most `max_bytes` before giving up so a huge log cannot
-/// stall the search. A missing/unreadable file returns [`StreamGrep::Missing`].
+/// stall the search. A file that cannot be opened returns
+/// [`StreamGrep::Missing`]; one that fails mid-read returns
+/// [`StreamGrep::Unreadable`] (CLAUDE-246).
 async fn stream_match_snippet(path: &std::path::Path, needle: &str, max_bytes: u64) -> StreamGrep {
     let Ok(file) = tokio::fs::File::open(path).await else {
         return StreamGrep::Missing;
@@ -789,7 +813,15 @@ async fn stream_match_snippet(path: &std::path::Path, needle: &str, max_bytes: u
                     return StreamGrep::Searched(None);
                 }
             }
-            Ok(None) | Err(_) => return StreamGrep::Searched(None),
+            Ok(None) => return StreamGrep::Searched(None),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "stream log search: read failed; this run is reported unreadable, not unmatched"
+                );
+                return StreamGrep::Unreadable(e.to_string());
+            }
         }
     }
 }
@@ -844,8 +876,10 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// per-attempt stream `.jsonl` log - contains `q` (case-insensitive ASCII
 /// substring). Stream search is bounded to the most recent failed-job attempts
 /// (`SEARCH_STREAM_MAX_FILES`, reading at most `SEARCH_STREAM_MAX_BYTES` each);
-/// missing/rotated files are skipped without error, and `capped` reports when
-/// the file cap was reached so the UI never silently truncates.
+/// missing/rotated files are skipped without error, a file that fails mid-read
+/// is reported in `unreadable` rather than counted as a non-match (CLAUDE-246),
+/// and `capped` reports when the file cap was reached so the UI never silently
+/// truncates.
 async fn search_jobs(
     pool: &SqlitePool,
     paths: &Paths,
@@ -898,6 +932,7 @@ async fn search_jobs(
     }
 
     let mut files_searched = 0usize;
+    let mut unreadable: Vec<UnreadableStream> = Vec::new();
     let mut capped = false;
 
     if in_stream {
@@ -941,6 +976,18 @@ async fn search_jobs(
             };
             match stream_match_snippet(&resolved, &needle, SEARCH_STREAM_MAX_BYTES).await {
                 StreamGrep::Missing => continue,
+                StreamGrep::Unreadable(error) => {
+                    // The resolved path, not the recorded one: on a moved
+                    // deployment those differ and only the resolved file was
+                    // actually opened.
+                    unreadable.push(UnreadableStream {
+                        run_id: r.run_id,
+                        job_key: r.job_key.clone(),
+                        attempt: r.attempt,
+                        path: resolved.display().to_string(),
+                        error,
+                    });
+                }
                 StreamGrep::Searched(found) => {
                     files_searched += 1;
                     let Some(snippet) = found else { continue };
@@ -974,6 +1021,7 @@ async fn search_jobs(
         hits,
         capped,
         files_searched,
+        unreadable,
         max_files: SEARCH_STREAM_MAX_FILES,
     })
 }
@@ -9136,7 +9184,7 @@ mod tests {
     /// summary; with stream search on it must surface, and a missing/rotated
     /// stream file must not error.
     mod search {
-        use super::super::{match_snippet, search_jobs};
+        use super::super::{match_snippet, search_jobs, stream_match_snippet, StreamGrep};
         use crate::db::MIGRATOR;
         use sqlx::sqlite::SqlitePoolOptions;
         use sqlx::SqlitePool;
@@ -9337,6 +9385,75 @@ mod tests {
             assert!(hit.matched_summary && hit.matched_stream);
             // The missing file was not opened, so it is not counted.
             assert_eq!(view.files_searched, 1);
+            // Both files were readable; nothing to report as skipped.
+            assert!(view.unreadable.is_empty());
+        }
+
+        /// CLAUDE-246: a log that opens and then fails to read (invalid UTF-8 is
+        /// the cheapest real read error) is `Unreadable`, never the `Searched`
+        /// no-match value a whole-file scan would produce.
+        #[tokio::test]
+        async fn read_failure_is_not_a_clean_no_match() {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = tmp.path().join("CLAUDE-5-attempt-1.jsonl");
+            // Valid line first, then a line the UTF-8 decode in `lines()` rejects.
+            let mut bytes = b"{\"result\":\"fine\"}\n".to_vec();
+            bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+            std::fs::write(&log, &bytes).unwrap();
+
+            let grep = stream_match_snippet(&log, "token", 1 << 20).await;
+            match grep {
+                StreamGrep::Unreadable(e) => assert!(!e.is_empty()),
+                other => panic!("expected Unreadable, got {other:?}"),
+            }
+        }
+
+        /// The same failure at the search surface: the run is reported in
+        /// `unreadable` (with its path and cause) rather than counted as a
+        /// searched file that did not match, and it is distinct from the missing
+        /// file, which is skipped silently.
+        #[tokio::test]
+        async fn unreadable_stream_is_reported_not_counted_as_no_match() {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = crate::config::Paths {
+                config_dir: tmp.path().join("config"),
+                data_dir: tmp.path().join("data"),
+                state_dir: tmp.path().join("state"),
+                runtime_dir: tmp.path().join("run"),
+            };
+            let bad = tmp.path().join("CLAUDE-5-attempt-1.jsonl");
+            std::fs::write(&bad, [0xff, 0xfe, b'\n']).unwrap();
+            let good = tmp.path().join("CLAUDE-6-attempt-1.jsonl");
+            std::fs::write(&good, "{\"result\":\"nothing of note\"}\n").unwrap();
+            let gone = tmp.path().join("CLAUDE-7-attempt-1.jsonl");
+
+            let pool = pool().await;
+            seed_run(&pool, 1).await;
+            for (key, path) in [("CLAUDE-5", &bad), ("CLAUDE-6", &good), ("CLAUDE-7", &gone)] {
+                seed_job(
+                    &pool,
+                    1,
+                    key,
+                    1,
+                    false,
+                    "2026-06-26T00:01:00+00:00",
+                    Some("Run failed"),
+                    Some(path.to_str().unwrap()),
+                )
+                .await;
+            }
+
+            let view = search_jobs(&pool, &paths, "token", true).await.unwrap();
+            assert!(view.hits.is_empty());
+            // Only the readable log was scanned end to end.
+            assert_eq!(view.files_searched, 1);
+            // The unreadable one is named; the missing one stays silent.
+            assert_eq!(view.unreadable.len(), 1);
+            let u = &view.unreadable[0];
+            assert_eq!(u.job_key, "CLAUDE-5");
+            assert_eq!(u.attempt, 1);
+            assert_eq!(u.path, bad.to_str().unwrap());
+            assert!(!u.error.is_empty());
         }
 
         /// The snippet centers a single-line window on the match and flattens

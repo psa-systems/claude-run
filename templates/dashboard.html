@@ -251,8 +251,32 @@
   {% if sr.in_stream %}
     <p class="meta">Searched summaries and the stream logs of {{ sr.files_searched }} failed-job attempt(s){% if sr.capped %}; capped at {{ sr.max_files }} files, older streams were not searched{% endif %}.</p>
   {% endif %}
+  {# CLAUDE-246: logs that opened and then failed to read. The search never
+     established whether these runs match, so they are named here instead of
+     being folded into the no-match set. #}
+  {% if !sr.unreadable.is_empty() %}
+    <div class="card" style="border-color: var(--warn); margin-bottom: 16px;">
+      <strong style="color: var(--warn);">{{ sr.unreadable.len() }} stream log(s) could not be read</strong>
+      <div class="dim" style="margin-top: 6px;">These attempts were skipped mid-read, so this search says nothing
+      about them either way: they may contain "{{ sr.q }}". A log truncated by a full disk reads like this.</div>
+      <table style="margin-top: 8px;">
+        <thead><tr><th>Run</th><th>Job</th><th>Attempt</th><th>Log</th><th>Error</th></tr></thead>
+        <tbody>
+          {% for u in sr.unreadable %}
+          <tr>
+            <td class="mono"><a href="/runs/{{ u.run_id }}">#{{ u.run_id }}</a></td>
+            <td class="mono"><a href="/runs/{{ u.run_id }}/jobs/{{ u.job_key }}/attempt/{{ u.attempt }}">{{ u.job_key }}</a></td>
+            <td class="mono">{{ u.attempt }}</td>
+            <td class="mono dim">{{ u.path }}</td>
+            <td class="mono">{{ u.error }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
   {% if sr.hits.is_empty() %}
-    <div class="card"><span class="dim">No jobs match "{{ sr.q }}".</span></div>
+    <div class="card"><span class="dim">No jobs match "{{ sr.q }}"{% if !sr.unreadable.is_empty() %} among the logs that could be read{% endif %}.</span></div>
   {% else %}
     <table>
       <thead><tr><th>Run</th><th>Action</th><th>Job</th><th>Attempt</th><th>When</th><th>Status</th><th>Match</th><th>Snippet</th></tr></thead>
