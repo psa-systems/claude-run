@@ -846,7 +846,12 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// (`SEARCH_STREAM_MAX_FILES`, reading at most `SEARCH_STREAM_MAX_BYTES` each);
 /// missing/rotated files are skipped without error, and `capped` reports when
 /// the file cap was reached so the UI never silently truncates.
-async fn search_jobs(pool: &SqlitePool, q: &str, in_stream: bool) -> Result<SearchView, WebError> {
+async fn search_jobs(
+    pool: &SqlitePool,
+    paths: &Paths,
+    q: &str,
+    in_stream: bool,
+) -> Result<SearchView, WebError> {
     let needle = q.to_ascii_lowercase();
 
     // Summary search (always on). `instr(lower(...), needle)` is a plain
@@ -917,9 +922,24 @@ async fn search_jobs(pool: &SqlitePool, q: &str, in_stream: bool) -> Result<Sear
             let Some(path) = r.stream_log_path.as_deref() else {
                 continue;
             };
-            match stream_match_snippet(std::path::Path::new(path), &needle, SEARCH_STREAM_MAX_BYTES)
-                .await
-            {
+            // CLAUDE-253: the stored path is absolute and was recorded under
+            // whatever layout the daemon ran with when the row was written. A
+            // deployment that moved its state dir (the container's flat /state)
+            // would otherwise search nothing for every pre-move row, silently
+            // reporting no matches. Recompute from the CURRENT logs dir when the
+            // recorded path is gone; the stream page already resolves this way.
+            let recorded = std::path::PathBuf::from(path);
+            let resolved = if recorded.exists() {
+                recorded
+            } else {
+                ClaudeInvoker::stream_log_path(
+                    &paths.logs_dir(),
+                    &r.action_name,
+                    &r.job_key,
+                    r.attempt as u32,
+                )
+            };
+            match stream_match_snippet(&resolved, &needle, SEARCH_STREAM_MAX_BYTES).await {
                 StreamGrep::Missing => continue,
                 StreamGrep::Searched(found) => {
                     files_searched += 1;
@@ -1346,7 +1366,7 @@ async fn dashboard(
     let search = if search_q.is_empty() {
         None
     } else {
-        Some(search_jobs(pool, &search_q, q.in_stream).await?)
+        Some(search_jobs(pool, &s.paths, &search_q, q.in_stream).await?)
     };
 
     // Today totals: sum across all actions
@@ -5995,7 +6015,7 @@ mod tests {
                     runtime_dir: tmp.join("runtime"),
                 },
             });
-            let paths = Paths {
+            let paths = crate::config::Paths {
                 config_dir: tmp.join("config"),
                 data_dir: tmp.join("data"),
                 state_dir: tmp.join("state"),
@@ -8734,7 +8754,7 @@ mod tests {
                     runtime_dir: tmp.join("runtime"),
                 },
             });
-            let paths = Paths {
+            let paths = crate::config::Paths {
                 config_dir: tmp.join("config"),
                 data_dir: tmp.join("data"),
                 state_dir: tmp.join("state"),
@@ -9176,6 +9196,13 @@ mod tests {
         #[tokio::test]
         async fn summary_match_is_case_insensitive_substring() {
             let pool = pool().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = crate::config::Paths {
+                config_dir: tmp.path().join("config"),
+                data_dir: tmp.path().join("data"),
+                state_dir: tmp.path().join("state"),
+                runtime_dir: tmp.path().join("run"),
+            };
             seed_run(&pool, 1).await;
             seed_job(
                 &pool,
@@ -9200,7 +9227,7 @@ mod tests {
             )
             .await;
 
-            let view = search_jobs(&pool, "widget", false).await.unwrap();
+            let view = search_jobs(&pool, &paths, "widget", false).await.unwrap();
             assert_eq!(view.hits.len(), 1);
             assert_eq!(view.hits[0].job_key, "CLAUDE-1");
             assert!(view.hits[0].matched_summary);
@@ -9214,6 +9241,12 @@ mod tests {
         #[tokio::test]
         async fn stream_search_finds_disk_space_failure() {
             let tmp = tempfile::tempdir().unwrap();
+            let paths = crate::config::Paths {
+                config_dir: tmp.path().join("config"),
+                data_dir: tmp.path().join("data"),
+                state_dir: tmp.path().join("state"),
+                runtime_dir: tmp.path().join("run"),
+            };
             let log = tmp.path().join("CLAUDE-9-attempt-1.jsonl");
             std::fs::write(
                 &log,
@@ -9237,13 +9270,13 @@ mod tests {
             .await;
 
             // Summary-only: the cause is invisible.
-            let summary_only = search_jobs(&pool, "No space left on device", false)
+            let summary_only = search_jobs(&pool, &paths, "No space left on device", false)
                 .await
                 .unwrap();
             assert!(summary_only.hits.is_empty());
 
             // With stream search: found, with a snippet and the stream badge.
-            let view = search_jobs(&pool, "No space left on device", true)
+            let view = search_jobs(&pool, &paths, "No space left on device", true)
                 .await
                 .unwrap();
             assert_eq!(view.hits.len(), 1);
@@ -9260,6 +9293,12 @@ mod tests {
         #[tokio::test]
         async fn missing_stream_file_is_skipped_and_badges_merge() {
             let tmp = tempfile::tempdir().unwrap();
+            let paths = crate::config::Paths {
+                config_dir: tmp.path().join("config"),
+                data_dir: tmp.path().join("data"),
+                state_dir: tmp.path().join("state"),
+                runtime_dir: tmp.path().join("run"),
+            };
             let log = tmp.path().join("CLAUDE-3-attempt-1.jsonl");
             std::fs::write(&log, "{\"result\":\"boom token here\"}\n").unwrap();
             let gone = tmp.path().join("CLAUDE-4-attempt-1.jsonl");
@@ -9291,7 +9330,7 @@ mod tests {
             )
             .await;
 
-            let view = search_jobs(&pool, "token", true).await.unwrap();
+            let view = search_jobs(&pool, &paths, "token", true).await.unwrap();
             assert_eq!(view.hits.len(), 1);
             let hit = &view.hits[0];
             assert_eq!(hit.job_key, "CLAUDE-3");
