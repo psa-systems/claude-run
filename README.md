@@ -596,12 +596,26 @@ nothing and does not disturb those files.
 Auth (and every action `token_ref`) reads from an encrypted secrets store. Two things are required before
 `auth_token_ref` resolves:
 
-1. **A key file.** The store is encrypted with an [`age`](https://github.com/FiloSottile/age) X25519 identity. When
-   `CLAUDE_RUN_SECRETS_KEY_FILE` is unset the daemon uses `<CLAUDE_RUN_DATA_DIR>/secrets.key` and creates it (mode
-   `0600`) the first time a secret is stored, so a container can hold a credential with nothing mounted and no CLI.
-   **Back that file up**: every stored secret is encrypted under it and is unrecoverable without it. Setting the env var
-   instead names a key you manage, and that path is never auto-created (naming a path says a specific key is meant, and
-   generating a different one would silently orphan every existing secret):
+1. **A key file, which the runner provides.** The store is encrypted with an
+   [`age`](https://github.com/FiloSottile/age) X25519 identity at `<CLAUDE_RUN_CONFIG_DIR>/secrets.key`, generated at
+   serve start (mode `0600`) when the instance has none. You do not run `age-keygen` to get started.
+
+   The key lives with the config, not the data, on purpose: the ciphertext it decrypts is in `state.db` under the data
+   dir, and a key stored beside its ciphertext buys nothing. Keeping them apart is what lets the database be copied,
+   snapshotted or backed up without carrying the tokens along. **Back the key up separately**, because every stored
+   secret is unrecoverable without it. A key already at the old `<CLAUDE_RUN_DATA_DIR>/secrets.key` is moved to the new
+   path on the next start rather than replaced, so an existing deployment keeps reading what it stored.
+
+   Generation only happens while the store is empty. A missing key file with secrets already in the database means the
+   key was lost, and the daemon says so, naming the file and the secrets at risk, rather than minting a replacement that
+   would turn all of them into permanently undecryptable bytes.
+
+   `CLAUDE_RUN_SECRETS_KEY_FILE` overrides the path when you want to supply the key yourself, from a secret store or a
+   mounted file. That file does not have to be `age-keygen` output: the key is read from wherever it appears on a line,
+   so a SOPS-decrypted `data: AGE-SECRET-KEY-...` or an env-style `CLAUDE_RUN_AGE_KEY=AGE-SECRET-KEY-...` works as-is. A
+   key file readable beyond its owner is logged at `warn` (every process that can read it can decrypt every stored
+   token) but still loads, since an operator's own delivery may hand it over `0644` deliberately. To generate one
+   yourself:
 
    ```sh
    age-keygen -o /etc/claude-run/secrets.key

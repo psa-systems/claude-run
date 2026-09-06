@@ -173,6 +173,18 @@ impl Daemon {
         // the Anthropic API key handed to the invoker below. `YOUTRACK_CLI_CONFIG`
         // is exported first and unconditionally, so a credential saved later in
         // the web UI needs no restart to reach the next `yt` child.
+        // The runner owns its age key: generate one when the store is empty, move
+        // an older one out of the data dir, and refuse to invent a replacement
+        // when ciphertext already exists (see `secrets::ensure_key`).
+        match crate::secrets::ensure_key(&pool).await {
+            Ok(path) => info!(path = %path.display(), "secrets key ready"),
+            // Not fatal: the daemon still serves, and every credential path
+            // reports the same error with its own context. Failing to boot would
+            // take the web UI down, which is where the fix is applied.
+            Err(e) => {
+                warn!(error = %e, "secrets key unavailable; stored credentials cannot be read")
+            }
+        }
         crate::service_auth::export_yt_config_env(&self.paths);
         let auth_cfg = settings.auth_config().await;
         let anthropic_key: crate::service_auth::ApiKeyHandle = {
