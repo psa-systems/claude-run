@@ -3681,6 +3681,18 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "longer age past which even unpushed-commit workdirs are deleted.",
             },
         ],
+        StreamLogGc => vec![
+            FieldDoc {
+                name: "enabled",
+                badge: "next sweep",
+                note: "master toggle; false parks the stream-log sweeper without losing the window.",
+            },
+            FieldDoc {
+                name: "retention_days",
+                badge: "next sweep",
+                note: "age past which logs/<action>/streams/<key>-attempt-<n>.jsonl is deleted; a job still in flight keeps its log at any age.",
+            },
+        ],
         Preferences => vec![
             FieldDoc {
                 name: "locale",
@@ -4942,12 +4954,17 @@ async fn job_stream_sse(
     headers: HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, WebError> {
-    let action_name: Option<String> =
-        sqlx::query_scalar("SELECT action_name FROM runs WHERE id = ?")
+    let run: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT action_name, ended_at FROM runs WHERE id = ?")
             .bind(id)
             .fetch_optional(&s.api.pool)
             .await?;
-    let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
+    let (action_name, ended_at) =
+        run.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
+    // CLAUDE-245: a finished run's log will never appear, so an absent file is a
+    // permanent answer (swept by the retention sweep, or never written), not the
+    // "the agent has not started writing" one the wait below reports.
+    let run_ended = ended_at.is_some();
     let path = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
 
     // CLAUDE-154: snapshot the display preferences for this connection so each
@@ -4976,15 +4993,21 @@ async fn job_stream_sse(
     // record lands in `job_outcomes` (run has moved on past this attempt).
     let pool = s.api.pool.clone();
     let stream = async_stream::stream! {
-        // Wait briefly for the file to exist (claude may be spinning up).
+        // Wait briefly for the file to exist (claude may be spinning up). A run
+        // that has already ended is never going to write it, so skip the wait.
         let mut waited = 0u32;
-        while !path.exists() && waited < 20 {
+        while !run_ended && !path.exists() && waited < 20 {
             tokio::time::sleep(Duration::from_millis(250)).await;
             waited += 1;
         }
         if !path.exists() {
+            // CLAUDE-245: the two absences are different facts and the operator
+            // must be able to tell them apart. "Not written yet" is a live run
+            // spinning up; a finished run's missing log is gone for good, most
+            // often deleted by the stream-log retention sweep.
+            let subtype = if run_ended { "stream-log-gone" } else { "no-stream-yet" };
             yield Ok(Event::default().event("msg").data(
-                serde_json::json!({"type": "system", "subtype": "no-stream-yet"}).to_string()
+                serde_json::json!({"type": "system", "subtype": subtype}).to_string()
             ));
             yield Ok(Event::default().event("done").data(""));
             return;

@@ -251,9 +251,9 @@ are rendered as that name only. Each
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
 secret refs, adding a source), `next event` for mint / update, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
-`GET` / `PUT /api/settings/{mint,update,webhook,webhook_comment,log_filter,workdir_gc,preferences,concurrency,db_retention,claude}`.
-The `webhook_comment` (CLAUDE-220), `workdir_gc` (CLAUDE-106), `preferences` (CLAUDE-154), `concurrency` (CLAUDE-162),
-`db_retention` (CLAUDE-175), and `claude` (CLAUDE-239) sections are DB-only from birth (never `config.toml` keys), so
+`GET` / `PUT /api/settings/{mint,update,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,claude}`.
+The `webhook_comment` (CLAUDE-220), `workdir_gc` (CLAUDE-106), `stream_log_gc` (CLAUDE-245), `preferences` (CLAUDE-154),
+`concurrency` (CLAUDE-162), `db_retention` (CLAUDE-175), and `claude` (CLAUDE-239) sections are DB-only from birth (never `config.toml` keys), so
 they are not part of the one-time import below; each simply defaults until edited. `webhook_comment` is additionally rejected by the file parser:
 a `config.toml` declaring `[webhook_comment]` fails to start with serde's unknown-field error naming the section, so
 there is no way to end up with two sources of truth for it.
@@ -299,6 +299,18 @@ losing the configured windows.
 Known limitation: the handful of startup lines emitted before the stored filter is applied (e.g. the config-source line)
 are governed by the initial filter, not the saved one; use `CLAUDE_RUN_LOG` when those specific lines are needed at
 `debug`.
+
+## Stream log retention (CLAUDE-245)
+
+Every claude invocation writes a per-attempt stream log to `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`, and until this sweep nothing ever deleted one: the workdir GC walks `workdirs/*/*` and the DB retention prune touches only database rows, so `logs/` only ever grew. That is not a cosmetic leak. A full log partition is what made the stream-log relay's write fail in the incident diagnosed in CLAUDE-233, which truncated 33 logs mid-line and failed the runs that produced them.
+
+An age-based sweeper (`crate::gc::sweep_stream_logs`) bounds it. It runs on `serve` start and then hourly, walking `logs/<action>/streams/` and deleting every `.jsonl` whose last-modified time is older than the retention window. Every pass logs its `deleted` / `kept` / `bytes_reclaimed` tally at `info`, so the sweep is auditable even when it deletes nothing.
+
+A log whose job is still in flight is never deleted, at any age. Age alone would not prove a run has finished: a job with a long `claude_timeout_seconds` can outlive any window while its log is still being appended to. The sweep runs inside the daemon that owns the runs, so it reads the authoritative set of `(action, job key)` pairs from `run_inflight_jobs` joined to the runs that have not ended, and keeps everything that set names. If that read fails the whole pass is skipped rather than run with an empty set, because the wrong guess would delete a live run's only transcript.
+
+The window is a DB-backed runtime setting edited on the **Settings** page (the `Stream log GC` section, or `GET` / `PUT /api/settings/stream_log_gc`). Fields: `enabled` (master toggle, default `true`) and `retention_days` (default `30`). Edits apply on the next sweep. Set `enabled: false` to park the sweeper without losing the configured window, but nothing then bounds the directory.
+
+The default is deliberately longer than the workdir GC's 14 days and shorter than DB retention's 180: a failure reported weeks late still has its transcript, while at the ~800 MB/month this directory was observed growing at, 30 days holds it near 1 GB. The two windows are independent, so a `job_outcomes` row (180 days) outlives its stream log (30 days): run history, cost, and the reports are unaffected, but the transcript behind an older run is gone. The stream-log search skips a swept log silently, as an absent file rather than a read failure; CLAUDE-246's `unreadable` list is for logs that exist and fail mid-read.
 
 ## DB retention (CLAUDE-175)
 
