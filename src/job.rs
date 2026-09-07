@@ -22,8 +22,8 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::db::DbPool;
 use serde_json::Value;
-use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use crate::action::LoadedAction;
@@ -124,7 +124,7 @@ pub struct JobContext<'a> {
     pub paths: &'a Paths,
     pub snippet: &'a SnippetRunner,
     pub claude: &'a ClaudeInvoker,
-    pub pool: &'a SqlitePool,
+    pub pool: &'a DbPool,
     pub run_id: i64,
     /// CLAUDE-9: tripped when an operator cancels this run. The claude
     /// invocation watches it to terminate the child; this pipeline watches it
