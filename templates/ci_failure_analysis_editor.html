@@ -44,7 +44,7 @@
 
   {% call m::log_token_block(form.log_token.mode, form.log_token.global, form.log_token.rows, secrets) %}
 
-  {% call m::claude_block(form.common.claude_cwd, form.common.claude_allowed_tools, form.common.claude_permission_mode, form.common.claude_model) %}
+  {% call m::claude_block(form.common.claude_cwd, form.common.claude_allowed_tools, form.common.claude_permission_mode, form.common.claude_model, form.common.claude_effort) %}
 
   {% call m::schedule_block(form.common.schedule_kind, form.common.schedule_spec) %}
 

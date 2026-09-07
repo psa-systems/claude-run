@@ -33,6 +33,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::db::DbPool;
 use askama::Template;
 use axum::{
     extract::{Form, Request, State},
@@ -45,7 +46,6 @@ use axum::{
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
-use sqlx::SqlitePool;
 
 use tracing::warn;
 
@@ -78,7 +78,7 @@ pub struct TokenGate {
     /// The DB administrator, or `None` on an instance that has not run setup.
     admin: AdminHandle,
     /// Pool the setup handler writes the new administrator through.
-    pool: Option<SqlitePool>,
+    pool: Option<DbPool>,
 }
 
 impl TokenGate {
@@ -102,7 +102,7 @@ impl TokenGate {
     }
 
     /// Attach the live administrator handle and the pool `/setup` writes through.
-    pub fn with_admin(mut self, admin: AdminHandle, pool: SqlitePool) -> Self {
+    pub fn with_admin(mut self, admin: AdminHandle, pool: DbPool) -> Self {
         self.admin = admin;
         self.pool = Some(pool);
         self
@@ -110,7 +110,7 @@ impl TokenGate {
 
     /// A gate with no credential at all: the instance is unconfigured and every
     /// request is steered to `/setup`.
-    pub fn unconfigured(admin: AdminHandle, pool: SqlitePool) -> Self {
+    pub fn unconfigured(admin: AdminHandle, pool: DbPool) -> Self {
         Self {
             token: None,
             username: None,
@@ -249,7 +249,7 @@ pub fn is_loopback_bind(bind: &str) -> bool {
 /// in. Refusing to bind at all was the older behaviour and it locked operators
 /// out of containers, where the CLI that would fix the secret is not the
 /// interface they have.
-pub async fn resolve_gate(web: &WebConfig, pool: &SqlitePool) -> Result<Option<TokenGate>> {
+pub async fn resolve_gate(web: &WebConfig, pool: &DbPool) -> Result<Option<TokenGate>> {
     if !auth_required(web) {
         return Ok(None);
     }
@@ -287,7 +287,7 @@ pub async fn resolve_gate(web: &WebConfig, pool: &SqlitePool) -> Result<Option<T
 
 /// Resolve the bearer token from `auth_token_ref`, or `None` with the reason
 /// logged. Never fatal: see [`resolve_gate`].
-async fn resolve_token(web: &WebConfig, pool: &SqlitePool) -> Option<String> {
+async fn resolve_token(web: &WebConfig, pool: &DbPool) -> Option<String> {
     let name = web.auth_token_ref.as_deref()?;
     let key = match crate::secrets::SecretsKey::load() {
         Ok(k) => k,
@@ -656,20 +656,13 @@ mod tests {
         router.oneshot(req).await.unwrap().status()
     }
 
-    async fn setup_pool() -> SqlitePool {
-        use sqlx::sqlite::SqlitePoolOptions;
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::db::MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn setup_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     /// A router gated by an instance with no credential at all: the state a
     /// fresh container comes up in.
-    async fn unconfigured_router(pool: &SqlitePool) -> Router {
+    async fn unconfigured_router(pool: &DbPool) -> Router {
         let app = Router::new()
             .route("/api/status", get(|| async { "ok" }))
             .route("/", get(|| async { "dashboard" }))

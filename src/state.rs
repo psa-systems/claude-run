@@ -1,7 +1,7 @@
 //! State operations against the SQLite DB.
 
+use crate::db::DbPool;
 use chrono::{Local, NaiveDate, Utc};
-use sqlx::SqlitePool;
 
 use tracing::{error, warn};
 
@@ -38,14 +38,15 @@ pub struct DependencyGateState {
 
 /// Read the dependency-gate backoff row for `(action, key)`, if any.
 pub async fn dependency_gate_get(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
     key: &str,
 ) -> Result<Option<DependencyGateState>> {
-    let row: Option<(i64, i64, String)> = sqlx::query_as(
+    let row: Option<(i64, i64, String)> = sqlx::query_as(&crate::db::q(
+        pool,
         "SELECT blocked_until, blocked_since, signature FROM dependency_gate \
          WHERE action_name = ? AND job_key = ?",
-    )
+    ))
     .bind(action)
     .bind(key)
     .fetch_optional(pool)
@@ -65,14 +66,15 @@ pub async fn dependency_gate_get(
 /// NOT touched by the conflict branch, so re-arming the backoff (or commenting a
 /// changed blocker set) never resets the age of an ongoing block.
 pub async fn dependency_gate_upsert(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
     key: &str,
     blocked_until_ms: i64,
     signature: &str,
 ) -> Result<()> {
     let now = now_iso();
-    sqlx::query(
+    sqlx::query(&crate::db::q(
+        pool,
         r#"
         INSERT INTO dependency_gate
             (action_name, job_key, blocked_until, blocked_since, signature, updated_at)
@@ -82,7 +84,7 @@ pub async fn dependency_gate_upsert(
             signature = excluded.signature,
             updated_at = excluded.updated_at
         "#,
-    )
+    ))
     .bind(action)
     .bind(key)
     .bind(blocked_until_ms)
@@ -101,11 +103,7 @@ pub async fn dependency_gate_upsert(
 /// stale-gate banner forever. An empty `keys` means the query matched nothing,
 /// which clears the action's rows; only a SUCCESSFUL query calls this, so a `yt`
 /// failure never prunes.
-pub async fn dependency_gate_retain(
-    pool: &SqlitePool,
-    action: &str,
-    keys: &[String],
-) -> Result<()> {
+pub async fn dependency_gate_retain(pool: &DbPool, action: &str, keys: &[String]) -> Result<()> {
     let placeholders = std::iter::repeat_n("?", keys.len())
         .collect::<Vec<_>>()
         .join(",");
@@ -116,6 +114,7 @@ pub async fn dependency_gate_retain(
             "DELETE FROM dependency_gate WHERE action_name = ? AND job_key NOT IN ({placeholders})"
         )
     };
+    let sql = crate::db::q(pool, &sql).into_owned();
     let mut q = sqlx::query(&sql).bind(action);
     for k in keys {
         q = q.bind(k);
@@ -156,12 +155,13 @@ pub struct StaleGate {
 /// acknowledgement and clears itself: the gate deletes the row the moment the
 /// blockers resolve.
 pub async fn dependency_gates_stale(
-    pool: &SqlitePool,
+    pool: &DbPool,
     now_ms: i64,
     threshold_ms: i64,
     limit: i64,
 ) -> Result<Vec<StaleGate>> {
-    let rows = sqlx::query_as::<_, StaleGate>(
+    let rows = sqlx::query_as::<_, StaleGate>(&crate::db::q(
+        pool,
         r#"
         SELECT action_name,
                job_key,
@@ -174,7 +174,7 @@ pub async fn dependency_gates_stale(
         ORDER BY blocked_for_ms DESC
         LIMIT ?3
         "#,
-    )
+    ))
     .bind(now_ms)
     .bind(threshold_ms)
     .bind(limit)
@@ -184,12 +184,15 @@ pub async fn dependency_gates_stale(
 }
 
 /// Drop the dependency-gate row for `(action, key)` (its dependencies cleared).
-pub async fn dependency_gate_clear(pool: &SqlitePool, action: &str, key: &str) -> Result<()> {
-    sqlx::query("DELETE FROM dependency_gate WHERE action_name = ? AND job_key = ?")
-        .bind(action)
-        .bind(key)
-        .execute(pool)
-        .await?;
+pub async fn dependency_gate_clear(pool: &DbPool, action: &str, key: &str) -> Result<()> {
+    sqlx::query(&crate::db::q(
+        pool,
+        "DELETE FROM dependency_gate WHERE action_name = ? AND job_key = ?",
+    ))
+    .bind(action)
+    .bind(key)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -230,7 +233,7 @@ pub struct CappedKey {
 /// the parked issue: the counter is the durable record of the attempts. A key
 /// stays listed until its action's control state is cleared.
 pub async fn attempt_cap_hits(
-    pool: &SqlitePool,
+    pool: &DbPool,
     caps: &std::collections::BTreeMap<String, u32>,
     default_cap: u32,
     limit: usize,
@@ -238,14 +241,15 @@ pub async fn attempt_cap_hits(
     // A cap of 0 would match every row including count 0; the counters start at
     // 1, so clamp the SQL floor to 1 and let the per-action compare below decide.
     let min_cap = caps.values().copied().fold(default_cap, u32::min).max(1);
-    let rows: Vec<(String, String, i64, String)> = sqlx::query_as(
+    let rows: Vec<(String, String, i64, String)> = sqlx::query_as(&crate::db::q(
+        pool,
         r#"
         SELECT action_name, job_key, count, last_at
         FROM attempt_counters
         WHERE count >= ?1
         ORDER BY count DESC, last_at DESC
         "#,
-    )
+    ))
     .bind(min_cap as i64)
     .fetch_all(pool)
     .await?;
@@ -266,27 +270,30 @@ pub async fn attempt_cap_hits(
     Ok(out)
 }
 
-pub async fn attempts_get(pool: &SqlitePool, action: &str, key: &str) -> Result<u32> {
-    let row: Option<(i64,)> =
-        sqlx::query_as("SELECT count FROM attempt_counters WHERE action_name = ? AND job_key = ?")
-            .bind(action)
-            .bind(key)
-            .fetch_optional(pool)
-            .await?;
+pub async fn attempts_get(pool: &DbPool, action: &str, key: &str) -> Result<u32> {
+    let row: Option<(i64,)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT count FROM attempt_counters WHERE action_name = ? AND job_key = ?",
+    ))
+    .bind(action)
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|(c,)| c as u32).unwrap_or(0))
 }
 
-pub async fn attempts_increment(pool: &SqlitePool, action: &str, key: &str) -> Result<u32> {
+pub async fn attempts_increment(pool: &DbPool, action: &str, key: &str) -> Result<u32> {
     let now = now_iso();
-    sqlx::query(
+    sqlx::query(&crate::db::q(
+        pool,
         r#"
         INSERT INTO attempt_counters (action_name, job_key, count, last_at)
         VALUES (?, ?, 1, ?)
         ON CONFLICT(action_name, job_key) DO UPDATE SET
-            count = count + 1,
+            count = attempt_counters.count + 1,
             last_at = excluded.last_at
         "#,
-    )
+    ))
     .bind(action)
     .bind(key)
     .bind(&now)
@@ -295,27 +302,30 @@ pub async fn attempts_increment(pool: &SqlitePool, action: &str, key: &str) -> R
     attempts_get(pool, action, key).await
 }
 
-pub async fn daily_count_get(pool: &SqlitePool, action: &str) -> Result<u32> {
+pub async fn daily_count_get(pool: &DbPool, action: &str) -> Result<u32> {
     let today = today_local().to_string();
-    let row: Option<(i64,)> =
-        sqlx::query_as("SELECT run_count FROM daily_ledger WHERE action_name = ? AND date = ?")
-            .bind(action)
-            .bind(&today)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(i64,)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT run_count FROM daily_ledger WHERE action_name = ? AND date = ?",
+    ))
+    .bind(action)
+    .bind(&today)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|(c,)| c as u32).unwrap_or(0))
 }
 
-pub async fn daily_count_increment(pool: &SqlitePool, action: &str) -> Result<()> {
+pub async fn daily_count_increment(pool: &DbPool, action: &str) -> Result<()> {
     let today = today_local().to_string();
-    sqlx::query(
+    sqlx::query(&crate::db::q(
+        pool,
         r#"
         INSERT INTO daily_ledger (action_name, date, run_count, cost_usd)
         VALUES (?, ?, 1, 0.0)
         ON CONFLICT(action_name, date) DO UPDATE SET
-            run_count = run_count + 1
+            run_count = daily_ledger.run_count + 1
         "#,
-    )
+    ))
     .bind(action)
     .bind(&today)
     .execute(pool)
@@ -323,27 +333,30 @@ pub async fn daily_count_increment(pool: &SqlitePool, action: &str) -> Result<()
     Ok(())
 }
 
-pub async fn daily_cost_get(pool: &SqlitePool, action: &str) -> Result<f64> {
+pub async fn daily_cost_get(pool: &DbPool, action: &str) -> Result<f64> {
     let today = today_local().to_string();
-    let row: Option<(f64,)> =
-        sqlx::query_as("SELECT cost_usd FROM daily_ledger WHERE action_name = ? AND date = ?")
-            .bind(action)
-            .bind(&today)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(f64,)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT cost_usd FROM daily_ledger WHERE action_name = ? AND date = ?",
+    ))
+    .bind(action)
+    .bind(&today)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|(c,)| c).unwrap_or(0.0))
 }
 
-pub async fn daily_cost_add(pool: &SqlitePool, action: &str, amount: f64) -> Result<()> {
+pub async fn daily_cost_add(pool: &DbPool, action: &str, amount: f64) -> Result<()> {
     let today = today_local().to_string();
-    sqlx::query(
+    sqlx::query(&crate::db::q(
+        pool,
         r#"
         INSERT INTO daily_ledger (action_name, date, run_count, cost_usd)
         VALUES (?, ?, 0, ?)
         ON CONFLICT(action_name, date) DO UPDATE SET
-            cost_usd = cost_usd + excluded.cost_usd
+            cost_usd = daily_ledger.cost_usd + excluded.cost_usd
         "#,
-    )
+    ))
     .bind(action)
     .bind(&today)
     .bind(amount)
@@ -352,15 +365,16 @@ pub async fn daily_cost_add(pool: &SqlitePool, action: &str, amount: f64) -> Res
     Ok(())
 }
 
-pub async fn run_begin(pool: &SqlitePool, action: &str, triggered_by: &str) -> Result<i64> {
+pub async fn run_begin(pool: &DbPool, action: &str, triggered_by: &str) -> Result<i64> {
     let now = now_iso();
-    let id = sqlx::query_scalar::<_, i64>(
+    let id = sqlx::query_scalar::<_, i64>(&crate::db::q(
+        pool,
         r#"
         INSERT INTO runs (action_name, started_at, triggered_by)
         VALUES (?, ?, ?)
         RETURNING id
         "#,
-    )
+    ))
     .bind(action)
     .bind(&now)
     .bind(triggered_by)
@@ -373,13 +387,16 @@ pub async fn run_begin(pool: &SqlitePool, action: &str, triggered_by: &str) -> R
 /// has produced them, so the web UI can show what's queued / in-flight
 /// before any outcome record exists. Stored as a JSON array of strings on
 /// the `runs.job_keys` column.
-pub async fn run_set_job_keys(pool: &SqlitePool, run_id: i64, keys: &[String]) -> Result<()> {
+pub async fn run_set_job_keys(pool: &DbPool, run_id: i64, keys: &[String]) -> Result<()> {
     let payload = serde_json::to_string(keys)?;
-    sqlx::query("UPDATE runs SET job_keys = ? WHERE id = ?")
-        .bind(payload)
-        .bind(run_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(&crate::db::q(
+        pool,
+        "UPDATE runs SET job_keys = ? WHERE id = ?",
+    ))
+    .bind(payload)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -388,29 +405,35 @@ pub async fn run_set_job_keys(pool: &SqlitePool, run_id: i64, keys: &[String]) -
 /// event's `html_url` so the run-detail tables can link the job key straight
 /// to the Forgejo Actions run.
 pub async fn run_set_job_links(
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: i64,
     links: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     let payload = serde_json::to_string(links)?;
-    sqlx::query("UPDATE runs SET job_links = ? WHERE id = ?")
-        .bind(payload)
-        .bind(run_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(&crate::db::q(
+        pool,
+        "UPDATE runs SET job_links = ? WHERE id = ?",
+    ))
+    .bind(payload)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 /// CLAUDE-93: the per-job link map for a run. Empty for legacy rows (NULL
 /// column) and for runs that link via the action's `link_template` instead.
 pub async fn run_job_links(
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: i64,
 ) -> Result<std::collections::BTreeMap<String, String>> {
-    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT job_links FROM runs WHERE id = ?")
-        .bind(run_id)
-        .fetch_optional(pool)
-        .await?;
+    let row: Option<(Option<String>,)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT job_links FROM runs WHERE id = ?",
+    ))
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
     let json = row.and_then(|(j,)| j);
     if let Some(j) = json {
         Ok(serde_json::from_str(&j).unwrap_or_default())
@@ -423,12 +446,15 @@ pub async fn run_job_links(
 /// UI can show exactly the one in-flight job as "running" instead of inferring
 /// it from gaps in `job_outcomes`. Pass `Some(key)` before processing a job;
 /// `run_finish` clears it back to NULL when the run ends.
-pub async fn run_set_current_job(pool: &SqlitePool, run_id: i64, key: Option<&str>) -> Result<()> {
-    sqlx::query("UPDATE runs SET current_job_key = ? WHERE id = ?")
-        .bind(key)
-        .bind(run_id)
-        .execute(pool)
-        .await?;
+pub async fn run_set_current_job(pool: &DbPool, run_id: i64, key: Option<&str>) -> Result<()> {
+    sqlx::query(&crate::db::q(
+        pool,
+        "UPDATE runs SET current_job_key = ? WHERE id = ?",
+    ))
+    .bind(key)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -436,32 +462,37 @@ pub async fn run_set_current_job(pool: &SqlitePool, run_id: i64, key: Option<&st
 /// the run-detail page can show what an in-flight run is doing (the webhook
 /// fast-path advances it through download / triage / classify / mint).
 /// `run_finish` clears it together with `current_job_key`.
-pub async fn run_stage_set(pool: &SqlitePool, run_id: i64, stage: Option<&str>) -> Result<()> {
-    sqlx::query("UPDATE runs SET stage = ? WHERE id = ?")
-        .bind(stage)
-        .bind(run_id)
-        .execute(pool)
-        .await?;
+pub async fn run_stage_set(pool: &DbPool, run_id: i64, stage: Option<&str>) -> Result<()> {
+    sqlx::query(&crate::db::q(
+        pool,
+        "UPDATE runs SET stage = ? WHERE id = ?",
+    ))
+    .bind(stage)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 /// CLAUDE-28: mark a job key as in flight for a run. Replaces the single
 /// `run_set_current_job` marker so a run with several jobs running in parallel
-/// badges all of them. Idempotent (`INSERT OR IGNORE`).
+/// badges all of them. Idempotent (`ON CONFLICT DO NOTHING`).
 ///
 /// CLAUDE-163: also records the job's `concurrency_key` so the admission dedup
 /// can drop gathered jobs whose concurrency key (project / repo) is already in
 /// flight, not just those whose issue id is. For a path with one job per key
 /// (webhook, forgejo-ci-fix) the concurrency key equals `key`.
 pub async fn run_inflight_add(
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: i64,
     key: &str,
     concurrency_key: &str,
 ) -> Result<()> {
-    sqlx::query(
-        "INSERT OR IGNORE INTO run_inflight_jobs (run_id, job_key, concurrency_key) VALUES (?, ?, ?)",
-    )
+    sqlx::query(&crate::db::q(
+        pool,
+        "INSERT INTO run_inflight_jobs (run_id, job_key, concurrency_key) VALUES (?, ?, ?) \
+         ON CONFLICT DO NOTHING",
+    ))
     .bind(run_id)
     .bind(key)
     .bind(concurrency_key)
@@ -471,30 +502,38 @@ pub async fn run_inflight_add(
 }
 
 /// CLAUDE-28: clear one job's in-flight marker when it finishes.
-pub async fn run_inflight_remove(pool: &SqlitePool, run_id: i64, key: &str) -> Result<()> {
-    sqlx::query("DELETE FROM run_inflight_jobs WHERE run_id = ? AND job_key = ?")
-        .bind(run_id)
-        .bind(key)
-        .execute(pool)
-        .await?;
+pub async fn run_inflight_remove(pool: &DbPool, run_id: i64, key: &str) -> Result<()> {
+    sqlx::query(&crate::db::q(
+        pool,
+        "DELETE FROM run_inflight_jobs WHERE run_id = ? AND job_key = ?",
+    ))
+    .bind(run_id)
+    .bind(key)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 /// CLAUDE-28: the set of job keys currently in flight for a run.
-pub async fn run_inflight_keys(pool: &SqlitePool, run_id: i64) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT job_key FROM run_inflight_jobs WHERE run_id = ?")
-            .bind(run_id)
-            .fetch_all(pool)
-            .await?;
+pub async fn run_inflight_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT job_key FROM run_inflight_jobs WHERE run_id = ?",
+    ))
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
     Ok(rows.into_iter().map(|(k,)| k).collect())
 }
 
-pub async fn run_job_keys(pool: &SqlitePool, run_id: i64) -> Result<Vec<String>> {
-    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT job_keys FROM runs WHERE id = ?")
-        .bind(run_id)
-        .fetch_optional(pool)
-        .await?;
+pub async fn run_job_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT job_keys FROM runs WHERE id = ?",
+    ))
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
     let json = row.and_then(|(j,)| j);
     if let Some(j) = json {
         Ok(serde_json::from_str(&j).unwrap_or_default())
@@ -559,18 +598,19 @@ pub struct RunEventCount {
 /// id once it is created. Called before `run_begin` so the events survive even
 /// if the run row is never created.
 pub async fn run_events_record(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
     poll_ts: &str,
     events: &[InputEvent],
 ) -> Result<()> {
     for e in events {
-        sqlx::query(
+        sqlx::query(&crate::db::q(
+            pool,
             r#"
             INSERT INTO run_events (run_id, action_name, ts, level, context, message)
             VALUES (NULL, ?, ?, ?, ?, ?)
             "#,
-        )
+        ))
         .bind(action)
         .bind(poll_ts)
         .bind(&e.level)
@@ -587,19 +627,20 @@ pub async fn run_events_record(
 /// [`run_events_record`] these need no [`run_events_attach`] backfill, so a
 /// concurrent poll's NULL-`run_id` rows can never be attached by mistake.
 pub async fn run_events_record_for_run(
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: i64,
     action: &str,
     events: &[InputEvent],
 ) -> Result<()> {
     let ts = now_iso();
     for e in events {
-        sqlx::query(
+        sqlx::query(&crate::db::q(
+            pool,
             r#"
             INSERT INTO run_events (run_id, action_name, ts, level, context, message)
             VALUES (?, ?, ?, ?, ?, ?)
             "#,
-        )
+        ))
         .bind(run_id)
         .bind(action)
         .bind(&ts)
@@ -618,14 +659,15 @@ pub async fn run_events_record_for_run(
 /// time; a zero-job poll that never reaches here keeps its events with a NULL
 /// `run_id`, and they still surface on the action page under that timestamp.
 pub async fn run_events_attach(
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: i64,
     action: &str,
     poll_ts: &str,
 ) -> Result<()> {
-    sqlx::query(
+    sqlx::query(&crate::db::q(
+        pool,
         "UPDATE run_events SET run_id = ? WHERE action_name = ? AND ts = ? AND run_id IS NULL",
-    )
+    ))
     .bind(run_id)
     .bind(action)
     .bind(poll_ts)
@@ -639,11 +681,12 @@ pub async fn run_events_attach(
 /// `action_name` independent of any run row, so a zero-job poll's events (NULL
 /// `run_id`) are returned too. Bounds display with `limit`.
 pub async fn run_events_for_action(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
     limit: i64,
 ) -> Result<Vec<RunEventRecord>> {
-    let rows = sqlx::query_as::<_, RunEventRecord>(
+    let rows = sqlx::query_as::<_, RunEventRecord>(&crate::db::q(
+        pool,
         r#"
         SELECT run_id, ts, level, context, message
         FROM run_events
@@ -651,7 +694,7 @@ pub async fn run_events_for_action(
         ORDER BY ts DESC, id DESC
         LIMIT ?
         "#,
-    )
+    ))
     .bind(action)
     .bind(limit)
     .fetch_all(pool)
@@ -668,13 +711,14 @@ pub async fn run_events_for_action(
 /// empty-string bind matches all rows. That is the degraded path for a DB no
 /// serve has stamped yet, not the daemon's normal path.
 pub async fn run_events_count_for_action(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
     started_at: Option<&str>,
 ) -> Result<i64> {
-    let count = sqlx::query_scalar::<_, i64>(
+    let count = sqlx::query_scalar::<_, i64>(&crate::db::q(
+        pool,
         "SELECT COUNT(*) FROM run_events WHERE action_name = ? AND ts >= ?",
-    )
+    ))
     .bind(action)
     .bind(started_at.unwrap_or(""))
     .fetch_one(pool)
@@ -689,10 +733,10 @@ const DIAGNOSTIC_LEVELS: &str = "('warn', 'error')";
 
 /// CLAUDE-235: total `warn`/`error` events recorded at or after `since`, for the
 /// dashboard banner's headline count.
-pub async fn run_events_count_since(pool: &SqlitePool, since: &str) -> Result<i64> {
+pub async fn run_events_count_since(pool: &DbPool, since: &str) -> Result<i64> {
     let sql =
         format!("SELECT COUNT(*) FROM run_events WHERE ts >= ? AND level IN {DIAGNOSTIC_LEVELS}");
-    let count = sqlx::query_scalar::<_, i64>(&sql)
+    let count = sqlx::query_scalar::<_, i64>(&crate::db::q(pool, &sql))
         .bind(since)
         .fetch_one(pool)
         .await?;
@@ -704,17 +748,17 @@ pub async fn run_events_count_since(pool: &SqlitePool, since: &str) -> Result<i6
 /// groups under the empty string rather than being dropped, so the rows account
 /// for every counted event.
 pub async fn run_events_grouped_by_context(
-    pool: &SqlitePool,
+    pool: &DbPool,
     since: &str,
     limit: i64,
 ) -> Result<Vec<RunEventCount>> {
-    run_events_grouped_by(pool, "IFNULL(context, '')", since, limit).await
+    run_events_grouped_by(pool, "COALESCE(context, '')", since, limit).await
 }
 
 /// CLAUDE-235: `warn`/`error` events at or after `since` grouped by
 /// `action_name`, busiest first, for the Logs page's summary card.
 pub async fn run_events_grouped_by_action(
-    pool: &SqlitePool,
+    pool: &DbPool,
     since: &str,
     limit: i64,
 ) -> Result<Vec<RunEventCount>> {
@@ -724,7 +768,7 @@ pub async fn run_events_grouped_by_action(
 /// Shared body of the two grouped reads. `column` is a fixed SQL fragment chosen
 /// by the caller, never user input; `since` and `limit` are bound parameters.
 async fn run_events_grouped_by(
-    pool: &SqlitePool,
+    pool: &DbPool,
     column: &str,
     since: &str,
     limit: i64,
@@ -739,7 +783,7 @@ async fn run_events_grouped_by(
         LIMIT ?
         "#
     );
-    let rows = sqlx::query_as::<_, RunEventCount>(&sql)
+    let rows = sqlx::query_as::<_, RunEventCount>(&crate::db::q(pool, &sql))
         .bind(since)
         .bind(limit)
         .fetch_all(pool)
@@ -771,12 +815,16 @@ pub struct AccessFailure {
 /// later successful preflight has superseded, newest first. A repo whose grant
 /// lands mid-window records a recovery marker, which drops its failures here, so
 /// the banner clears itself without an operator acknowledging anything.
+/// `limit` is `None` for "every match": the dashboard banner counts an outage
+/// rather than rendering a bounded table, and a silently truncated count would
+/// understate it. The clause is dropped rather than given a negative bound,
+/// which only SQLite reads as unlimited.
 pub async fn access_failures_recent(
-    pool: &SqlitePool,
+    pool: &DbPool,
     since: &str,
-    limit: i64,
+    limit: Option<i64>,
 ) -> Result<Vec<AccessFailure>> {
-    let rows = sqlx::query_as::<_, AccessFailure>(
+    let sql = format!(
         r#"
         SELECT action_name, context, message,
                MAX(ts) AS last_ts,
@@ -787,21 +835,28 @@ pub async fn access_failures_recent(
           AND NOT EXISTS (
             SELECT 1 FROM run_events r
             WHERE r.action_name = e.action_name
-              AND IFNULL(r.context, '') = IFNULL(e.context, '')
+              AND COALESCE(r.context, '') = COALESCE(e.context, '')
               AND r.message LIKE ?3 || '%'
               AND r.ts > e.ts
           )
         GROUP BY action_name, context, message
         ORDER BY last_ts DESC
-        LIMIT ?4
+        {}
         "#,
-    )
-    .bind(since)
-    .bind(ACCESS_FAILURE_PREFIX)
-    .bind(ACCESS_RECOVERY_PREFIX)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+        match limit {
+            Some(_) => "LIMIT ?4",
+            None => "",
+        }
+    );
+    let sql = crate::db::q(pool, &sql).into_owned();
+    let mut query = sqlx::query_as::<_, AccessFailure>(&sql)
+        .bind(since)
+        .bind(ACCESS_FAILURE_PREFIX)
+        .bind(ACCESS_RECOVERY_PREFIX);
+    if let Some(limit) = limit {
+        query = query.bind(limit);
+    }
+    let rows = query.fetch_all(pool).await?;
     Ok(rows)
 }
 
@@ -810,21 +865,22 @@ pub async fn access_failures_recent(
 /// recording. Keeps the success marker off the event log in the normal case,
 /// where every poll passes and nothing changed.
 pub async fn access_failure_is_open(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
     context: Option<&str>,
 ) -> Result<bool> {
-    let newest: Option<String> = sqlx::query_scalar(
+    let newest: Option<String> = sqlx::query_scalar(&crate::db::q(
+        pool,
         r#"
         SELECT message
         FROM run_events
         WHERE action_name = ?1
-          AND IFNULL(context, '') = IFNULL(?2, '')
+          AND COALESCE(context, '') = COALESCE(?2, '')
           AND (message LIKE ?3 || '%' OR message LIKE ?4 || '%')
         ORDER BY ts DESC, id DESC
         LIMIT 1
         "#,
-    )
+    ))
     .bind(action)
     .bind(context)
     .bind(ACCESS_FAILURE_PREFIX)
@@ -837,7 +893,7 @@ pub async fn access_failure_is_open(
 }
 
 pub async fn run_finish(
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: i64,
     exit_code: i32,
     jobs_processed: u32,
@@ -847,13 +903,14 @@ pub async fn run_finish(
     // run has no job in flight, so every break/finish path that reaches here
     // also drops the stale "running" marker. CLAUDE-80: the live stage is
     // cleared the same way so it never outlives its run.
-    sqlx::query(
+    sqlx::query(&crate::db::q(
+        pool,
         r#"
         UPDATE runs
         SET ended_at = ?, exit_code = ?, jobs_processed = ?, current_job_key = NULL, stage = NULL
         WHERE id = ?
         "#,
-    )
+    ))
     .bind(&now)
     .bind(exit_code as i64)
     .bind(jobs_processed as i64)
@@ -862,10 +919,13 @@ pub async fn run_finish(
     .await?;
     // CLAUDE-28: a finished run has nothing in flight; drop any stale in-flight
     // job markers alongside clearing the legacy single-job marker above.
-    sqlx::query("DELETE FROM run_inflight_jobs WHERE run_id = ?")
-        .bind(run_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(&crate::db::q(
+        pool,
+        "DELETE FROM run_inflight_jobs WHERE run_id = ?",
+    ))
+    .bind(run_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -885,13 +945,13 @@ pub async fn run_finish(
 /// a row this cannot reach, but a long-lived daemon reaches neither, which is
 /// why the guard exists.
 pub struct RunGuard {
-    pool: SqlitePool,
+    pool: DbPool,
     run_id: i64,
     finished: bool,
 }
 
 impl RunGuard {
-    pub fn new(pool: &SqlitePool, run_id: i64) -> Self {
+    pub fn new(pool: &DbPool, run_id: i64) -> Self {
         Self {
             pool: pool.clone(),
             run_id,
@@ -947,7 +1007,7 @@ impl Drop for RunGuard {
 /// `exit::CANCELLED`, the same sentinel the live-cancel path (CLAUDE-9) uses.
 /// The startup sweep is [`reap_orphaned_runs`], which closes with a different
 /// code because nothing cancelled those rows. Returns the number reconciled.
-pub async fn cancel_orphaned_runs(pool: &SqlitePool) -> Result<u64> {
+pub async fn cancel_orphaned_runs(pool: &DbPool) -> Result<u64> {
     close_open_runs(pool, crate::exit::CANCELLED).await
 }
 
@@ -958,7 +1018,7 @@ pub async fn cancel_orphaned_runs(pool: &SqlitePool) -> Result<u64> {
 /// Neither is a cancel, so they close as `exit::UNEXPECTED` and stay
 /// distinguishable from an operator's `claude-run stop`. Returns the number
 /// reaped; the caller logs a non-zero count at `warn`.
-pub async fn reap_orphaned_runs(pool: &SqlitePool) -> Result<u64> {
+pub async fn reap_orphaned_runs(pool: &DbPool) -> Result<u64> {
     close_open_runs(pool, crate::exit::UNEXPECTED).await
 }
 
@@ -967,19 +1027,20 @@ pub async fn reap_orphaned_runs(pool: &SqlitePool) -> Result<u64> {
 /// synthetic outcomes are invented. This is a pure DB reconcile: the run's
 /// process is already gone, so there is no child to terminate or `post` phase to
 /// run.
-async fn close_open_runs(pool: &SqlitePool, exit_code: i32) -> Result<u64> {
+async fn close_open_runs(pool: &DbPool, exit_code: i32) -> Result<u64> {
     let now = now_iso();
     // CLAUDE-80: a dead process reports no stage; clear it with the end state.
-    let result = sqlx::query(
+    let result = sqlx::query(&crate::db::q(
+        pool,
         "UPDATE runs SET ended_at = ?, exit_code = ?, stage = NULL WHERE ended_at IS NULL",
-    )
+    ))
     .bind(&now)
     .bind(exit_code as i64)
     .execute(pool)
     .await?;
     // CLAUDE-28: nothing of the dead process is in flight, so any in-flight job
     // markers it left are leftovers. Clear them all.
-    sqlx::query("DELETE FROM run_inflight_jobs")
+    sqlx::query(&crate::db::q(pool, "DELETE FROM run_inflight_jobs"))
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
@@ -1006,9 +1067,10 @@ pub struct JobOutcome<'a> {
     pub timed_out: bool,
 }
 
-pub async fn job_outcome_insert(pool: &SqlitePool, r: &JobOutcome<'_>) -> Result<()> {
+pub async fn job_outcome_insert(pool: &DbPool, r: &JobOutcome<'_>) -> Result<()> {
     let now = now_iso();
-    sqlx::query(
+    sqlx::query(&crate::db::q(
+        pool,
         r#"
         INSERT INTO job_outcomes (
             run_id, action_name, job_key, attempt, ts, ok,
@@ -1016,7 +1078,7 @@ pub async fn job_outcome_insert(pool: &SqlitePool, r: &JobOutcome<'_>) -> Result
             summary, stream_log_path, duration_ms, timed_out
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
-    )
+    ))
     .bind(r.run_id)
     .bind(r.action_name)
     .bind(r.job_key)
@@ -1038,22 +1100,25 @@ pub async fn job_outcome_insert(pool: &SqlitePool, r: &JobOutcome<'_>) -> Result
 
 // ---- Phase 2: pause + action index --------------------------------------
 
-pub async fn global_pause_status(pool: &SqlitePool) -> Result<Option<(String, Option<String>)>> {
-    let row: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT paused_at, reason FROM global_pause WHERE id = 1")
-            .fetch_optional(pool)
-            .await?;
+pub async fn global_pause_status(pool: &DbPool) -> Result<Option<(String, Option<String>)>> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT paused_at, reason FROM global_pause WHERE id = 1",
+    ))
+    .fetch_optional(pool)
+    .await?;
     Ok(row)
 }
 
-pub async fn global_pause_set(pool: &SqlitePool, reason: Option<&str>) -> Result<()> {
+pub async fn global_pause_set(pool: &DbPool, reason: Option<&str>) -> Result<()> {
     let now = now_iso();
-    sqlx::query(
+    sqlx::query(&crate::db::q(
+        pool,
         r#"
         INSERT INTO global_pause (id, paused_at, reason) VALUES (1, ?, ?)
         ON CONFLICT(id) DO UPDATE SET paused_at = excluded.paused_at, reason = excluded.reason
         "#,
-    )
+    ))
     .bind(&now)
     .bind(reason)
     .execute(pool)
@@ -1061,33 +1126,35 @@ pub async fn global_pause_set(pool: &SqlitePool, reason: Option<&str>) -> Result
     Ok(())
 }
 
-pub async fn global_pause_clear(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("DELETE FROM global_pause WHERE id = 1")
+pub async fn global_pause_clear(pool: &DbPool) -> Result<()> {
+    sqlx::query(&crate::db::q(pool, "DELETE FROM global_pause WHERE id = 1"))
         .execute(pool)
         .await?;
     Ok(())
 }
 
 pub async fn action_pause_status(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
 ) -> Result<Option<(String, Option<String>)>> {
-    let row: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT paused_at, reason FROM paused_actions WHERE action_name = ?")
-            .bind(action)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(String, Option<String>)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT paused_at, reason FROM paused_actions WHERE action_name = ?",
+    ))
+    .bind(action)
+    .fetch_optional(pool)
+    .await?;
     Ok(row)
 }
 
-pub async fn action_pause_set(pool: &SqlitePool, action: &str, reason: Option<&str>) -> Result<()> {
+pub async fn action_pause_set(pool: &DbPool, action: &str, reason: Option<&str>) -> Result<()> {
     let now = now_iso();
-    sqlx::query(
+    sqlx::query(&crate::db::q(pool,
         r#"
         INSERT INTO paused_actions (action_name, paused_at, reason) VALUES (?, ?, ?)
         ON CONFLICT(action_name) DO UPDATE SET paused_at = excluded.paused_at, reason = excluded.reason
         "#,
-    )
+    ))
     .bind(action)
     .bind(&now)
     .bind(reason)
@@ -1096,15 +1163,18 @@ pub async fn action_pause_set(pool: &SqlitePool, action: &str, reason: Option<&s
     Ok(())
 }
 
-pub async fn action_pause_clear(pool: &SqlitePool, action: &str) -> Result<()> {
-    sqlx::query("DELETE FROM paused_actions WHERE action_name = ?")
-        .bind(action)
-        .execute(pool)
-        .await?;
+pub async fn action_pause_clear(pool: &DbPool, action: &str) -> Result<()> {
+    sqlx::query(&crate::db::q(
+        pool,
+        "DELETE FROM paused_actions WHERE action_name = ?",
+    ))
+    .bind(action)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ActionIndexRow {
     pub name: String,
     pub file_path: String,
@@ -1118,13 +1188,34 @@ pub struct ActionIndexRow {
     pub link_template: Option<String>,
     /// CLAUDE-162: the action's configured `concurrency.max_parallel`, cached in
     /// the index so the scheduler can resolve the `max_parallel_global` auto
-    /// default without re-parsing every action's YAML each tick. Defaults to 1.
-    #[sqlx(default)]
+    /// default without re-parsing every action's YAML each tick. Defaults to 1
+    /// in the schema; the one query that reads this row always selects it.
     pub max_parallel: i64,
 }
 
-pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Result<()> {
-    sqlx::query(
+// CLAUDE-250: by hand rather than derived, because `enabled` is an integer 0/1
+// column on both backends. See `crate::db::flag`.
+impl sqlx::FromRow<'_, sqlx::any::AnyRow> for ActionIndexRow {
+    fn from_row(row: &sqlx::any::AnyRow) -> sqlx::Result<Self> {
+        use sqlx::Row;
+        Ok(Self {
+            name: row.try_get("name")?,
+            file_path: row.try_get("file_path")?,
+            yaml_sha256: row.try_get("yaml_sha256")?,
+            enabled: crate::db::flag(row, "enabled")?,
+            schedule_kind: row.try_get("schedule_kind")?,
+            schedule_spec: row.try_get("schedule_spec")?,
+            last_seen_at: row.try_get("last_seen_at")?,
+            parse_error: row.try_get("parse_error")?,
+            link_template: row.try_get("link_template")?,
+            max_parallel: row.try_get("max_parallel")?,
+        })
+    }
+}
+
+pub async fn action_index_upsert(pool: &DbPool, row: &ActionIndexRow) -> Result<()> {
+    sqlx::query(&crate::db::q(
+        pool,
         r#"
         INSERT INTO actions (
             name, file_path, yaml_sha256, enabled,
@@ -1141,7 +1232,7 @@ pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Res
             link_template = excluded.link_template,
             max_parallel = excluded.max_parallel
         "#,
-    )
+    ))
     .bind(&row.name)
     .bind(&row.file_path)
     .bind(&row.yaml_sha256)
@@ -1157,19 +1248,20 @@ pub async fn action_index_upsert(pool: &SqlitePool, row: &ActionIndexRow) -> Res
     Ok(())
 }
 
-pub async fn action_index_list(pool: &SqlitePool) -> Result<Vec<ActionIndexRow>> {
-    let rows = sqlx::query_as::<_, ActionIndexRow>(
+pub async fn action_index_list(pool: &DbPool) -> Result<Vec<ActionIndexRow>> {
+    let rows = sqlx::query_as::<_, ActionIndexRow>(&crate::db::q(pool,
         "SELECT name, file_path, yaml_sha256, enabled, schedule_kind, schedule_spec, last_seen_at, parse_error, link_template, max_parallel FROM actions ORDER BY name",
-    )
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows)
 }
 
-pub async fn action_last_run_started(pool: &SqlitePool, action: &str) -> Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as(
+pub async fn action_last_run_started(pool: &DbPool, action: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(&crate::db::q(
+        pool,
         "SELECT started_at FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 1",
-    )
+    ))
     .bind(action)
     .fetch_optional(pool)
     .await?;
@@ -1179,8 +1271,8 @@ pub async fn action_last_run_started(pool: &SqlitePool, action: &str) -> Result<
 /// CLAUDE-40: delete the `actions` index row for `name`. Returns `false` when
 /// no row matched, mirroring [`secret_delete`]. Only touches the derived index;
 /// the caller is responsible for the on-disk YAML and the runtime purge.
-pub async fn action_index_delete(pool: &SqlitePool, name: &str) -> Result<bool> {
-    let res = sqlx::query("DELETE FROM actions WHERE name = ?")
+pub async fn action_index_delete(pool: &DbPool, name: &str) -> Result<bool> {
+    let res = sqlx::query(&crate::db::q(pool, "DELETE FROM actions WHERE name = ?"))
         .bind(name)
         .execute(pool)
         .await?;
@@ -1192,15 +1284,21 @@ pub async fn action_index_delete(pool: &SqlitePool, name: &str) -> Result<bool> 
 /// cleared separately via [`action_pause_clear`]. Run history (`runs`,
 /// `job_outcomes`) and on-disk stream logs are intentionally left intact so a
 /// re-created same-name action re-associates its audit trail.
-pub async fn action_runtime_purge(pool: &SqlitePool, name: &str) -> Result<()> {
-    sqlx::query("DELETE FROM attempt_counters WHERE action_name = ?")
-        .bind(name)
-        .execute(pool)
-        .await?;
-    sqlx::query("DELETE FROM daily_ledger WHERE action_name = ?")
-        .bind(name)
-        .execute(pool)
-        .await?;
+pub async fn action_runtime_purge(pool: &DbPool, name: &str) -> Result<()> {
+    sqlx::query(&crate::db::q(
+        pool,
+        "DELETE FROM attempt_counters WHERE action_name = ?",
+    ))
+    .bind(name)
+    .execute(pool)
+    .await?;
+    sqlx::query(&crate::db::q(
+        pool,
+        "DELETE FROM daily_ledger WHERE action_name = ?",
+    ))
+    .bind(name)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1209,7 +1307,7 @@ pub async fn action_runtime_purge(pool: &SqlitePool, name: &str) -> Result<()> {
 /// `attempt_counters` / `daily_ledger` rows. Returns the index row's prior
 /// existence (`true` = a row was deleted), so callers can distinguish a real
 /// delete from an unknown action. History (`runs`, `job_outcomes`) is kept.
-pub async fn action_purge_state(pool: &SqlitePool, name: &str) -> Result<bool> {
+pub async fn action_purge_state(pool: &DbPool, name: &str) -> Result<bool> {
     let existed = action_index_delete(pool, name).await?;
     action_pause_clear(pool, name).await?;
     action_runtime_purge(pool, name).await?;
@@ -1220,12 +1318,14 @@ pub async fn action_purge_state(pool: &SqlitePool, name: &str) -> Result<bool> {
 /// `runs` row with no `ended_at`). The delete flow refuses with a conflict when
 /// this holds. The daemon additionally consults its in-memory in-flight set for
 /// a job dispatched but not yet recorded as a run.
-pub async fn action_has_active_run(pool: &SqlitePool, action: &str) -> Result<bool> {
-    let row: Option<(i64,)> =
-        sqlx::query_as("SELECT id FROM runs WHERE action_name = ? AND ended_at IS NULL LIMIT 1")
-            .bind(action)
-            .fetch_optional(pool)
-            .await?;
+pub async fn action_has_active_run(pool: &DbPool, action: &str) -> Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT id FROM runs WHERE action_name = ? AND ended_at IS NULL LIMIT 1",
+    ))
+    .bind(action)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.is_some())
 }
 
@@ -1247,10 +1347,11 @@ pub struct ActiveRun {
 /// This is only HALF the quiet signal: it misses a run dispatched but not yet
 /// past `run_begin`. The daemon's in-flight map covers that, and the two are
 /// combined in `crate::api::activity`.
-pub async fn active_runs(pool: &SqlitePool) -> Result<Vec<ActiveRun>> {
-    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+pub async fn active_runs(pool: &DbPool) -> Result<Vec<ActiveRun>> {
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(&crate::db::q(
+        pool,
         "SELECT id, action_name, started_at FROM runs WHERE ended_at IS NULL ORDER BY started_at",
-    )
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -1268,15 +1369,16 @@ pub async fn active_runs(pool: &SqlitePool) -> Result<Vec<ActiveRun>> {
 /// working an issue dedups its gathered jobs against this set, so an overlapping
 /// pickup run never re-claims work another open run already holds. Joins
 /// `run_inflight_jobs` (per-job markers, migration 0007) to the open `runs` rows.
-pub async fn action_inflight_keys(pool: &SqlitePool, action: &str) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
+pub async fn action_inflight_keys(pool: &DbPool, action: &str) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(&crate::db::q(
+        pool,
         r#"
         SELECT rij.job_key
         FROM run_inflight_jobs rij
         JOIN runs r ON r.id = rij.run_id
         WHERE r.action_name = ? AND r.ended_at IS NULL
         "#,
-    )
+    ))
     .bind(action)
     .fetch_all(pool)
     .await?;
@@ -1289,11 +1391,9 @@ pub async fn action_inflight_keys(pool: &SqlitePool, action: &str) -> Result<Vec
 /// gathers a second same-key job while that key is already in flight and could
 /// only park on the KeyGate. NULL `concurrency_key` values (rows written before
 /// migration 0016) are ignored. Joins `run_inflight_jobs` to the open `runs`.
-pub async fn action_inflight_concurrency_keys(
-    pool: &SqlitePool,
-    action: &str,
-) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
+pub async fn action_inflight_concurrency_keys(pool: &DbPool, action: &str) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(&crate::db::q(
+        pool,
         r#"
         SELECT DISTINCT rij.concurrency_key
         FROM run_inflight_jobs rij
@@ -1301,7 +1401,7 @@ pub async fn action_inflight_concurrency_keys(
         WHERE r.action_name = ? AND r.ended_at IS NULL
           AND rij.concurrency_key IS NOT NULL
         "#,
-    )
+    ))
     .bind(action)
     .fetch_all(pool)
     .await?;
@@ -1320,51 +1420,59 @@ pub struct SecretMeta {
 }
 
 /// List stored secrets (names + timestamps only), alphabetical by name.
-pub async fn secret_list(pool: &SqlitePool) -> Result<Vec<SecretMeta>> {
-    let rows = sqlx::query_as::<_, SecretMeta>(
+pub async fn secret_list(pool: &DbPool) -> Result<Vec<SecretMeta>> {
+    let rows = sqlx::query_as::<_, SecretMeta>(&crate::db::q(
+        pool,
         "SELECT name, created_at, last_used_at FROM secrets ORDER BY name",
-    )
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows)
 }
 
 /// True when a secret with `name` already exists.
-pub async fn secret_exists(pool: &SqlitePool, name: &str) -> Result<bool> {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM secrets WHERE name = ?")
-        .bind(name)
-        .fetch_optional(pool)
-        .await?;
+pub async fn secret_exists(pool: &DbPool, name: &str) -> Result<bool> {
+    let row: Option<(i64,)> =
+        sqlx::query_as(&crate::db::q(pool, "SELECT id FROM secrets WHERE name = ?"))
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.is_some())
 }
 
 /// Create a new secret. Errors via the UNIQUE constraint when `name` is taken;
 /// callers should check [`secret_exists`] first for a friendly message.
-pub async fn secret_create(pool: &SqlitePool, name: &str, ciphertext: &[u8]) -> Result<()> {
+pub async fn secret_create(pool: &DbPool, name: &str, ciphertext: &[u8]) -> Result<()> {
     let now = now_iso();
-    sqlx::query("INSERT INTO secrets (name, ciphertext, created_at) VALUES (?, ?, ?)")
-        .bind(name)
-        .bind(ciphertext)
-        .bind(&now)
-        .execute(pool)
-        .await?;
+    sqlx::query(&crate::db::q(
+        pool,
+        "INSERT INTO secrets (name, ciphertext, created_at) VALUES (?, ?, ?)",
+    ))
+    .bind(name)
+    .bind(ciphertext)
+    .bind(&now)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 /// Rotate an existing secret's value in place (keeps `created_at`). Returns
 /// `false` when no secret with `name` exists.
-pub async fn secret_rotate(pool: &SqlitePool, name: &str, ciphertext: &[u8]) -> Result<bool> {
-    let res = sqlx::query("UPDATE secrets SET ciphertext = ? WHERE name = ?")
-        .bind(ciphertext)
-        .bind(name)
-        .execute(pool)
-        .await?;
+pub async fn secret_rotate(pool: &DbPool, name: &str, ciphertext: &[u8]) -> Result<bool> {
+    let res = sqlx::query(&crate::db::q(
+        pool,
+        "UPDATE secrets SET ciphertext = ? WHERE name = ?",
+    ))
+    .bind(ciphertext)
+    .bind(name)
+    .execute(pool)
+    .await?;
     Ok(res.rows_affected() > 0)
 }
 
 /// Delete a secret. Returns `false` when no secret with `name` exists.
-pub async fn secret_delete(pool: &SqlitePool, name: &str) -> Result<bool> {
-    let res = sqlx::query("DELETE FROM secrets WHERE name = ?")
+pub async fn secret_delete(pool: &DbPool, name: &str) -> Result<bool> {
+    let res = sqlx::query(&crate::db::q(pool, "DELETE FROM secrets WHERE name = ?"))
         .bind(name)
         .execute(pool)
         .await?;
@@ -1372,47 +1480,48 @@ pub async fn secret_delete(pool: &SqlitePool, name: &str) -> Result<bool> {
 }
 
 /// Fetch a secret's raw ciphertext for decryption at run time.
-pub async fn secret_get_ciphertext(pool: &SqlitePool, name: &str) -> Result<Option<Vec<u8>>> {
-    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT ciphertext FROM secrets WHERE name = ?")
-        .bind(name)
-        .fetch_optional(pool)
-        .await?;
+pub async fn secret_get_ciphertext(pool: &DbPool, name: &str) -> Result<Option<Vec<u8>>> {
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT ciphertext FROM secrets WHERE name = ?",
+    ))
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|(c,)| c))
 }
 
 /// Bump a secret's `last_used_at` to now (best-effort run-time audit).
-pub async fn secret_touch(pool: &SqlitePool, name: &str) -> Result<()> {
+pub async fn secret_touch(pool: &DbPool, name: &str) -> Result<()> {
     let now = now_iso();
-    sqlx::query("UPDATE secrets SET last_used_at = ? WHERE name = ?")
-        .bind(&now)
-        .bind(name)
-        .execute(pool)
-        .await?;
+    sqlx::query(&crate::db::q(
+        pool,
+        "UPDATE secrets SET last_used_at = ? WHERE name = ?",
+    ))
+    .bind(&now)
+    .bind(name)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::MIGRATOR;
-    use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn mem_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn mem_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
-    async fn stage_of(pool: &SqlitePool, run_id: i64) -> Option<String> {
-        sqlx::query_scalar::<_, Option<String>>("SELECT stage FROM runs WHERE id = ?")
-            .bind(run_id)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+    async fn stage_of(pool: &DbPool, run_id: i64) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(&crate::db::q(
+            pool,
+            "SELECT stage FROM runs WHERE id = ?",
+        ))
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1562,20 +1671,26 @@ mod tests {
         assert_eq!(stage_of(&pool, run).await, None, "finish clears the stage");
     }
 
-    async fn exit_code_of(pool: &SqlitePool, run_id: i64) -> Option<i64> {
-        sqlx::query_scalar::<_, Option<i64>>("SELECT exit_code FROM runs WHERE id = ?")
-            .bind(run_id)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+    async fn exit_code_of(pool: &DbPool, run_id: i64) -> Option<i64> {
+        sqlx::query_scalar::<_, Option<i64>>(&crate::db::q(
+            pool,
+            "SELECT exit_code FROM runs WHERE id = ?",
+        ))
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
-    async fn ended_at_of(pool: &SqlitePool, run_id: i64) -> Option<String> {
-        sqlx::query_scalar::<_, Option<String>>("SELECT ended_at FROM runs WHERE id = ?")
-            .bind(run_id)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+    async fn ended_at_of(pool: &DbPool, run_id: i64) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(&crate::db::q(
+            pool,
+            "SELECT ended_at FROM runs WHERE id = ?",
+        ))
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     /// CLAUDE-228: the happy path closes the row with the run's own exit code.
@@ -1591,11 +1706,14 @@ mod tests {
 
         assert_eq!(exit_code_of(&pool, run).await, Some(crate::exit::OK as i64));
         assert!(ended_at_of(&pool, run).await.is_some());
-        let processed: i64 = sqlx::query_scalar("SELECT jobs_processed FROM runs WHERE id = ?")
-            .bind(run)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let processed: i64 = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT jobs_processed FROM runs WHERE id = ?",
+        ))
+        .bind(run)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(processed, 4);
     }
 
@@ -1609,7 +1727,7 @@ mod tests {
         let run = run_begin(&pool, "act", "scheduler").await.unwrap();
 
         // A handler shaped like the real ones: open the row, then fail an await.
-        async fn handler(pool: &SqlitePool, run: i64) -> Result<()> {
+        async fn handler(pool: &DbPool, run: i64) -> Result<()> {
             let _guard = RunGuard::new(pool, run);
             Err(crate::error::Error::Other(anyhow::anyhow!(
                 "pool timed out while waiting for an open connection"
@@ -1852,18 +1970,20 @@ mod tests {
         .unwrap();
 
         // The timed_out column persisted exactly for the timeout job.
-        let flag: i64 =
-            sqlx::query_scalar("SELECT timed_out FROM job_outcomes WHERE job_key = 'TIMEOUT-1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let flag: i64 = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT timed_out FROM job_outcomes WHERE job_key = 'TIMEOUT-1'",
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(flag, 1);
 
         // The web failed-job count (ok = 0 AND timed_out = 0) sees only the
         // hard failure, not the timeout.
-        let failed: i64 = sqlx::query_scalar(
+        let failed: i64 = sqlx::query_scalar(&crate::db::q(&pool,
             "SELECT COUNT(*) FROM job_outcomes o WHERE o.run_id = ? AND o.ok = 0 AND o.timed_out = 0",
-        )
+        ))
         .bind(run_id)
         .fetch_one(&pool)
         .await
@@ -1888,12 +2008,15 @@ mod tests {
         }
     }
 
-    async fn runs_count(pool: &SqlitePool, action: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM runs WHERE action_name = ?")
-            .bind(action)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+    async fn runs_count(pool: &DbPool, action: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(&crate::db::q(
+            pool,
+            "SELECT COUNT(*) FROM runs WHERE action_name = ?",
+        ))
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -2099,7 +2222,7 @@ mod tests {
             .await
             .unwrap();
 
-        let open = access_failures_recent(&pool, "2026-07-31T00:00:00Z", 10)
+        let open = access_failures_recent(&pool, "2026-07-31T00:00:00Z", Some(10))
             .await
             .unwrap();
         assert_eq!(open.len(), 1, "{open:?}");
@@ -2125,19 +2248,23 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(access_failures_recent(&pool, "2026-07-31T00:00:00Z", 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            access_failures_recent(&pool, "2026-07-31T00:00:00Z", Some(10))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(!access_failure_is_open(&pool, "youtrack", Some("CLAUDE"))
             .await
             .unwrap());
 
         // Outside the window it does not surface at all.
-        assert!(access_failures_recent(&pool, "2026-09-01T00:00:00Z", 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            access_failures_recent(&pool, "2026-09-01T00:00:00Z", Some(10))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// CLAUDE-235: the Logs summary groups the window's `warn`/`error` events by
@@ -2264,11 +2391,14 @@ mod tests {
             .unwrap();
 
         // Age the row, then re-arm with a CHANGED blocker set (a blocker cleared).
-        sqlx::query("UPDATE dependency_gate SET blocked_since = ? WHERE job_key = 'AUD-31'")
-            .bind(first.blocked_since_ms - 7_200_000)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(&crate::db::q(
+            &pool,
+            "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = 'AUD-31'",
+        ))
+        .bind(first.blocked_since_ms - 7_200_000)
+        .execute(&pool)
+        .await
+        .unwrap();
         dependency_gate_upsert(
             &pool,
             "act",
@@ -2399,18 +2529,24 @@ mod tests {
         dependency_gate_upsert(&pool, "other", "TR-8", now + 240_000, "TR-7 (depends on)")
             .await
             .unwrap();
-        sqlx::query("UPDATE dependency_gate SET blocked_since = ? WHERE job_key = ?")
-            .bind(now - 7_200_000)
-            .bind("AUD-31")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE dependency_gate SET blocked_since = ? WHERE job_key = ?")
-            .bind(now - 93_600_000)
-            .bind("TR-8")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(&crate::db::q(
+            &pool,
+            "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = ?",
+        ))
+        .bind(now - 7_200_000)
+        .bind("AUD-31")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&crate::db::q(
+            &pool,
+            "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = ?",
+        ))
+        .bind(now - 93_600_000)
+        .bind("TR-8")
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let stale = dependency_gates_stale(&pool, now, STALE_GATE_AFTER_MS, 20)
             .await

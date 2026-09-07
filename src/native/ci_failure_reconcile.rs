@@ -316,7 +316,7 @@ struct GreenJob {
 }
 
 /// Resolve the decrypted, trimmed Forgejo PAT from the secrets store.
-async fn resolve_token(pool: &sqlx::SqlitePool, name: &str) -> Result<String> {
+async fn resolve_token(pool: &crate::db::DbPool, name: &str) -> Result<String> {
     let key = SecretsKey::load()?;
     let token = secrets::resolve_secret(pool, &key, name).await?;
     Ok(token.trim().to_string())
