@@ -324,17 +324,7 @@ fn extract_url(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes the tests that write an executable stub and then exec it.
-    /// `cargo test` runs them in parallel, and a fork taken while another
-    /// thread still holds the stub open for writing makes the exec fail with
-    /// `ETXTBSY` (`Text file busy`), which showed up only under the containered
-    /// `just check`. Nothing about the broker is racy; this is the classic
-    /// write-then-fork/exec hazard in the harness.
-    fn stub_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use crate::testutil::write_stub;
 
     #[test]
     fn the_authorize_url_is_recognized_in_the_cli_wording() {
@@ -369,10 +359,12 @@ mod tests {
     /// handshake without contacting Anthropic.
     #[test]
     fn a_login_round_trips_through_the_broker() {
-        let _serial = stub_lock();
         let tmp = tempfile::tempdir().unwrap();
         let stub = tmp.path().join("claude-stub");
-        std::fs::write(
+        // CLAUDE-255: written by an external `sh`, so this process never holds a
+        // writable descriptor a sibling test thread's fork could carry into the
+        // exec below (`ETXTBSY`). See `crate::testutil::write_stub`.
+        write_stub(
             &stub,
             "#!/bin/sh\n\
              echo \"Opening browser to sign in...\"\n\
@@ -382,10 +374,7 @@ mod tests {
              if [ \"$code\" = \"good-code\" ]; then exit 0; fi\n\
              echo 'Invalid code. Please make sure the full code was copied.' >&2\n\
              sleep 30\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let broker = LoginBroker::new();
         let dir = tmp.path().to_path_buf();
@@ -424,12 +413,9 @@ mod tests {
     /// A child that never prints a URL is killed and reported, not left running.
     #[test]
     fn a_child_that_prints_no_url_is_reaped() {
-        let _serial = stub_lock();
         let tmp = tempfile::tempdir().unwrap();
         let stub = tmp.path().join("silent");
-        std::fs::write(&stub, "#!/bin/sh\nexit 3\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_stub(&stub, "#!/bin/sh\nexit 3\n");
 
         let broker = LoginBroker::new();
         let err = broker
