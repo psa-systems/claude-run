@@ -560,6 +560,38 @@ impl Default for WorkdirGcConfig {
     }
 }
 
+/// CLAUDE-245: age-based retention for the per-attempt stream logs under
+/// `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/`. A DB-backed runtime setting
+/// (settings key `config.stream_log_gc`, editable on the web Settings page) per
+/// the CLAUDE-101 bootstrap-vs-runtime split, so it is NOT a `config.toml` key.
+/// The sweeper ([`crate::gc::sweep_stream_logs`]) runs on `serve` start and on a
+/// periodic tick. Nothing deleted these before: the directory had only ever
+/// grown, and filling the log partition is what truncated the stream logs
+/// diagnosed in CLAUDE-233.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct StreamLogGcConfig {
+    /// Master enable toggle. When `false`, no sweep deletes anything, so an
+    /// operator can park the feature without losing the configured window.
+    pub enabled: bool,
+    /// Age, in days, past which a stream log is deleted, measured from its
+    /// last-modified time. Default 30 days: long enough that a failure reported
+    /// weeks after the fact still has its transcript (the CLAUDE-233 incident
+    /// windows were days apart), and at the ~800 MB/month observed on host-a
+    /// it bounds the directory near 1 GB instead of the 2.8 GB it reached. A log
+    /// whose run is still in flight is kept regardless of age.
+    pub retention_days: u64,
+}
+
+impl Default for StreamLogGcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: 30,
+        }
+    }
+}
+
 /// CLAUDE-175: DB-backed retention for the unbounded history tables (settings
 /// key `config.db_retention`, editable on the web Settings page), Phase 6 of the
 /// roadmap. NOT a `config.toml` key. The daemon sweep ([`crate::retention`]) runs

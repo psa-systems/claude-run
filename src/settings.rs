@@ -33,8 +33,8 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
     AuthConfig, ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig, ConcurrencyConfig,
-    DbRetentionConfig, MintConfig, OnDiskConfig, Paths, PreferencesConfig, UpdateConfig,
-    WebhookConfig, WorkdirGcConfig,
+    DbRetentionConfig, MintConfig, OnDiskConfig, Paths, PreferencesConfig, StreamLogGcConfig,
+    UpdateConfig, WebhookConfig, WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -49,6 +49,8 @@ pub enum Section {
     LogFilter,
     /// CLAUDE-106: preserved / aside workdir GC retention windows.
     WorkdirGc,
+    /// CLAUDE-245: per-attempt stream-log retention window.
+    StreamLogGc,
     /// CLAUDE-154: global display preferences (locale, timezone, date format).
     Preferences,
     /// CLAUDE-162: daemon-wide concurrency caps + continuous-pickup cadence.
@@ -70,13 +72,14 @@ pub enum Section {
 
 impl Section {
     /// Every section, in display order (used by the Settings page).
-    pub const ALL: [Section; 11] = [
+    pub const ALL: [Section; 12] = [
         Section::Mint,
         Section::Update,
         Section::Webhook,
         Section::WebhookComment,
         Section::LogFilter,
         Section::WorkdirGc,
+        Section::StreamLogGc,
         Section::Preferences,
         Section::Concurrency,
         Section::DbRetention,
@@ -92,6 +95,7 @@ impl Section {
             Section::Webhook => "config.webhook",
             Section::LogFilter => "config.log_filter",
             Section::WorkdirGc => "config.workdir_gc",
+            Section::StreamLogGc => "config.stream_log_gc",
             Section::Preferences => "config.preferences",
             Section::Concurrency => "config.concurrency",
             Section::DbRetention => "config.db_retention",
@@ -109,6 +113,7 @@ impl Section {
             Section::Webhook => "webhook",
             Section::LogFilter => "log_filter",
             Section::WorkdirGc => "workdir_gc",
+            Section::StreamLogGc => "stream_log_gc",
             Section::Preferences => "preferences",
             Section::Concurrency => "concurrency",
             Section::DbRetention => "db_retention",
@@ -131,6 +136,7 @@ impl Section {
             Section::Webhook => "Webhook sources",
             Section::LogFilter => "Log filter",
             Section::WorkdirGc => "Workdir GC",
+            Section::StreamLogGc => "Stream log GC",
             Section::Preferences => "Display preferences",
             Section::Concurrency => "Concurrency",
             Section::DbRetention => "DB retention",
@@ -146,7 +152,7 @@ impl Section {
             Section::Mint | Section::Update => "next event",
             Section::Webhook => "live (replay window: restart)",
             Section::LogFilter => "live",
-            Section::WorkdirGc => "next sweep",
+            Section::WorkdirGc | Section::StreamLogGc => "next sweep",
             Section::Preferences => "live",
             Section::Concurrency => "next tick",
             Section::DbRetention => "next sweep",
@@ -338,6 +344,10 @@ pub struct EffectiveRuntime {
     /// in `config.toml`), so there is no file fallback: the DB value or the
     /// built-in default.
     pub workdir_gc: WorkdirGcConfig,
+    /// CLAUDE-245: stream-log retention window. Brand-new section (never in
+    /// `config.toml`), so there is no file fallback: the DB value or the
+    /// built-in default (30 days).
+    pub stream_log_gc: StreamLogGcConfig,
     /// CLAUDE-154: global display preferences. Brand-new section (never in
     /// `config.toml`), so the DB value or the built-in default (UTC / ISO).
     pub preferences: PreferencesConfig,
@@ -379,6 +389,9 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
     let workdir_gc = get_json::<WorkdirGcConfig>(pool, Section::WorkdirGc.key())
         .await?
         .unwrap_or_default();
+    let stream_log_gc = get_json::<StreamLogGcConfig>(pool, Section::StreamLogGc.key())
+        .await?
+        .unwrap_or_default();
     let preferences = get_json::<PreferencesConfig>(pool, Section::Preferences.key())
         .await?
         .unwrap_or_default();
@@ -403,6 +416,7 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
         webhook,
         log_filter,
         workdir_gc,
+        stream_log_gc,
         preferences,
         concurrency,
         db_retention,
@@ -617,6 +631,7 @@ pub struct LiveSettings {
     log_filter: Arc<RwLock<Option<String>>>,
     log_apply: Option<LogFilterApply>,
     workdir_gc: Arc<RwLock<WorkdirGcConfig>>,
+    stream_log_gc: Arc<RwLock<StreamLogGcConfig>>,
     preferences: Arc<RwLock<PreferencesConfig>>,
     concurrency: Arc<RwLock<ConcurrencyConfig>>,
     db_retention: Arc<RwLock<DbRetentionConfig>>,
@@ -653,6 +668,7 @@ impl LiveSettings {
             log_filter: Arc::new(RwLock::new(eff.log_filter.clone())),
             log_apply,
             workdir_gc: Arc::new(RwLock::new(eff.workdir_gc)),
+            stream_log_gc: Arc::new(RwLock::new(eff.stream_log_gc)),
             preferences: Arc::new(RwLock::new(eff.preferences)),
             concurrency: Arc::new(RwLock::new(eff.concurrency)),
             db_retention: Arc::new(RwLock::new(eff.db_retention)),
@@ -710,6 +726,12 @@ impl LiveSettings {
         self.workdir_gc.clone()
     }
 
+    /// CLAUDE-245: shared handle to the live stream-log GC config, read by the
+    /// sweeper on each tick so a Settings save applies on the next sweep.
+    pub fn stream_log_gc_handle(&self) -> Arc<RwLock<StreamLogGcConfig>> {
+        self.stream_log_gc.clone()
+    }
+
     /// CLAUDE-162: shared handle to the live concurrency config, read by the
     /// scheduler each tick (global cap + regather cadence) so a Settings save
     /// applies on the next tick.
@@ -757,6 +779,7 @@ impl LiveSettings {
                 filter: self.log_filter.read().await.clone(),
             }),
             Section::WorkdirGc => to_pretty(&*self.workdir_gc.read().await),
+            Section::StreamLogGc => to_pretty(&*self.stream_log_gc.read().await),
             Section::Preferences => to_pretty(&*self.preferences.read().await),
             Section::Concurrency => to_pretty(&*self.concurrency.read().await),
             Section::DbRetention => to_pretty(&*self.db_retention.read().await),
@@ -813,6 +836,11 @@ impl LiveSettings {
                 let v: WorkdirGcConfig = parse(json)?;
                 set_json(&self.pool, section.key(), &v).await?;
                 *self.workdir_gc.write().await = v;
+            }
+            Section::StreamLogGc => {
+                let v: StreamLogGcConfig = parse(json)?;
+                set_json(&self.pool, section.key(), &v).await?;
+                *self.stream_log_gc.write().await = v;
             }
             Section::Preferences => {
                 let v: PreferencesConfig = parse(json)?;
@@ -934,6 +962,7 @@ mod tests {
             webhook: WebhookConfig::default(),
             log_filter: None,
             workdir_gc: WorkdirGcConfig::default(),
+            stream_log_gc: StreamLogGcConfig::default(),
             preferences: PreferencesConfig::default(),
             concurrency: ConcurrencyConfig::default(),
             db_retention: DbRetentionConfig::default(),
@@ -1242,6 +1271,55 @@ mod tests {
         )
         .await
         .expect("a disabled config bypasses the window floor");
+    }
+
+    // ---- CLAUDE-245: stream-log GC section ---------------------------------
+
+    #[tokio::test]
+    async fn stream_log_gc_section_round_trips() {
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+
+        // Routing surface: the section is addressable as `stream_log_gc` on
+        // `/settings` and `GET` / `PUT /api/settings/<section>`.
+        assert_eq!(Section::StreamLogGc.key(), "config.stream_log_gc");
+        assert_eq!(Section::StreamLogGc.as_path(), "stream_log_gc");
+        assert_eq!(
+            Section::from_path("stream_log_gc"),
+            Some(Section::StreamLogGc)
+        );
+        assert!(Section::ALL.contains(&Section::StreamLogGc));
+
+        // The default is served before anything is stored.
+        let default: StreamLogGcConfig =
+            serde_json::from_str(&live.section_json(Section::StreamLogGc).await).unwrap();
+        assert_eq!(default, StreamLogGcConfig::default());
+
+        // A save persists and applies live on the handle the sweeper reads.
+        live.save_section(
+            Section::StreamLogGc,
+            r#"{"enabled":true,"retention_days":7}"#,
+        )
+        .await
+        .unwrap();
+        let stored: StreamLogGcConfig = get_json(&pool, Section::StreamLogGc.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.retention_days, 7);
+        assert_eq!(live.stream_log_gc_handle().read().await.retention_days, 7);
+
+        // An unknown field is rejected and nothing is persisted over it.
+        let err = live
+            .save_section(Section::StreamLogGc, r#"{"retention_dayz":7}"#)
+            .await
+            .expect_err("deny_unknown_fields must reject a typo");
+        assert!(matches!(err, SaveError::Invalid(_)), "{err}");
+        let unchanged: StreamLogGcConfig = get_json(&pool, Section::StreamLogGc.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.retention_days, 7);
     }
 
     // ---- CLAUDE-239: global claude invocation defaults ---------------------

@@ -1282,26 +1282,11 @@ fn head_branch(
         })
 }
 
-/// Shallow-clone `branch` into `workdir`. Errors carry only the exit code, never
-/// the token-bearing URL.
+/// Shallow-clone `branch` into `workdir`. CLAUDE-252: the shared helper reports
+/// git's own reason for a failure with the token-bearing URL's credential
+/// redacted, instead of the bare exit code this used to carry.
 fn clone_branch(clone_url: &str, branch: &str, workdir: &FsPath) -> crate::error::Result<()> {
-    let status = std::process::Command::new("git")
-        .arg("clone")
-        .arg("--branch")
-        .arg(branch)
-        .arg("--depth")
-        .arg("50")
-        .arg(clone_url)
-        .arg(workdir)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(crate::error::Error::Other(anyhow::anyhow!(
-            "git clone exited {}",
-            status.code().unwrap_or(-1)
-        )))
-    }
+    crate::provider::shallow_clone(clone_url, Some(branch), workdir, 50)
 }
 
 /// The agent's instruction text. The human's own words are NOT inlined here:
@@ -1433,38 +1418,32 @@ fn push_fix(
 }
 
 fn git_in(workdir: &FsPath, args: &[&str]) -> crate::error::Result<()> {
-    let status = std::process::Command::new("git")
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
         .args(args)
-        .status()?;
-    if status.success() {
+        .output()?;
+    if out.status.success() {
         Ok(())
     } else {
-        Err(crate::error::Error::Other(anyhow::anyhow!(
-            "git {} exited {}",
-            args.join(" "),
-            status.code().unwrap_or(-1)
-        )))
+        Err(crate::provider::git_error(&args.join(" "), &out, None))
     }
 }
 
 /// Kept separate from [`git_in`] so the token-bearing URL never reaches an error.
 fn git_push(workdir: &FsPath, url: &str, branch: &str) -> crate::error::Result<()> {
-    let status = std::process::Command::new("git")
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
         .arg("push")
         .arg(url)
         .arg(branch)
-        .status()?;
-    if status.success() {
+        .output()?;
+    if out.status.success() {
         Ok(())
     } else {
-        Err(crate::error::Error::Other(anyhow::anyhow!(
-            "git push exited {}",
-            status.code().unwrap_or(-1)
-        )))
+        // CLAUDE-252: report git's own reason, with the URL credential masked.
+        Err(crate::provider::git_error("push", &out, Some(url)))
     }
 }
 
