@@ -151,33 +151,54 @@ COPY actions/*.yml /usr/share/claude-run/actions/
 # volume.
 COPY deploy/container-config.toml /usr/share/claude-run/config.toml
 
-# Non-root container user with a dedicated, clean $HOME. The agent's user memory
-# is the slim bot CLAUDE.md, never the operator's interactive one.
+# Non-root container user. $HOME is deliberately NOT where anything persists
+# (CLAUDE-253): it is scratch, and every store the operator cares about lives
+# under the three volumes below.
 RUN addgroup -S claudebot \
     && adduser -S -G claudebot -h /home/claudebot claudebot
 COPY deploy/bot-CLAUDE.md /home/claudebot/.claude/CLAUDE.md
 
-# Runtime XDG dirs the compose named volumes / tmpfs back. Keep them under the
-# container user's $HOME so the clean-home guarantee holds end to end.
-ENV CLAUDE_RUN_CONFIG_DIR=/home/claudebot/.config/claude-run \
-    CLAUDE_RUN_DATA_DIR=/home/claudebot/.local/share/claude-run \
-    CLAUDE_RUN_STATE_DIR=/home/claudebot/.local/state/claude-run \
-    CLAUDE_RUN_RUNTIME_DIR=/home/claudebot/.runtime/claude-run
-RUN mkdir -p "${CLAUDE_RUN_CONFIG_DIR}/actions" "${CLAUDE_RUN_DATA_DIR}" \
-    "${CLAUDE_RUN_STATE_DIR}" "${CLAUDE_RUN_RUNTIME_DIR}" \
-    /home/claudebot/.config/youtrack-cli /home/claudebot/.config/git \
-    /home/claudebot/.local/share/forgejo-cli \
+# CLAUDE-253: three flat mounts instead of seven XDG paths under a home
+# directory. An operator mounting a volume should not have to know that config
+# lives in `.config/claude-run` while credentials split across
+# `.config/youtrack-cli` and `.local/share/forgejo-cli`.
+#
+#   /config  config.toml, actions, secrets.key, the agent config dir, the yt
+#            store, the git identity
+#   /data    state.db, workdirs, the fj key store
+#   /state   logs and per-attempt stream JSONL
+#   /run/claude-run  pidfile (tmpfs; the socket is off, see CMD below)
+#
+# The tool stores follow their own tools rather than being relabelled: `yt`
+# reads XDG_CONFIG_HOME, `fj` reads XDG_DATA_HOME (it has no config-dir variable
+# of its own, and claude-run resolves its key store the same way through
+# `dirs::data_dir()`), `claude` reads CLAUDE_CONFIG_DIR and git reads
+# GIT_CONFIG_GLOBAL. Nothing here changes how paths resolve for a HOST install,
+# where none of these variables is set and XDG defaults still apply.
+#
+# CLAUDE_CONFIG_DIR names the SAME directory the daemon seeds and points its
+# agent children at (`<config dir>/claude-agent-home`, CLAUDE-165), so an
+# operator running `claude auth login` through `docker compose exec` writes the
+# credential exactly where the agent reads it. Two Claude config dirs is the
+# failure this avoids: a login that reports success and leaves the runner still
+# unauthenticated.
+ENV CLAUDE_RUN_CONFIG_DIR=/config \
+    CLAUDE_RUN_DATA_DIR=/data \
+    CLAUDE_RUN_STATE_DIR=/state \
+    CLAUDE_RUN_RUNTIME_DIR=/run/claude-run \
+    XDG_CONFIG_HOME=/config \
+    XDG_DATA_HOME=/data \
+    CLAUDE_CONFIG_DIR=/config/claude-agent-home \
+    GIT_CONFIG_GLOBAL=/config/git/config
+RUN mkdir -p /config/actions /config/claude-agent-home /config/git /config/youtrack-cli \
+    /data/forgejo-cli /state /run/claude-run \
+    && chown -R claudebot:claudebot /config /data /state /run/claude-run \
     && chown -R claudebot:claudebot /home/claudebot
-
-# CLAUDE-247: the operator logs the three CLIs in INSIDE the container, so git
-# needs a global config file on a volume rather than a bind of the host's
-# ~/.gitconfig. GIT_CONFIG_GLOBAL names it explicitly instead of relying on the
-# XDG fallback.
-ENV GIT_CONFIG_GLOBAL=/home/claudebot/.config/git/config
 
 # HOME is set explicitly because the runtime stage has no USER directive (see the
 # entrypoint note below): without it a root `docker compose exec` would write to
-# /root and the operator's in-container login would land nowhere useful.
+# /root. Nothing persists here; it is the scratch home the agent's own tooling
+# uses.
 ENV HOME=/home/claudebot
 WORKDIR /home/claudebot
 

@@ -36,14 +36,13 @@ fi
 
 # Credential and config stores, plus the runner's own state. $CLAUDE_RUN_DATA_DIR
 # is handled separately below.
+# CLAUDE-253: three flat roots, so the tool stores (yt under $XDG_CONFIG_HOME,
+# fj under $XDG_DATA_HOME, git, the agent config dir) are subdirectories that
+# come along with them rather than mount points of their own.
 for dir in \
     "${CLAUDE_RUN_CONFIG_DIR}" \
     "${CLAUDE_RUN_STATE_DIR}" \
-    "${CLAUDE_RUN_RUNTIME_DIR}" \
-    "${HOME}/.claude" \
-    "${HOME}/.config/youtrack-cli" \
-    "${HOME}/.config/git" \
-    "${HOME}/.local/share/forgejo-cli"; do
+    "${CLAUDE_RUN_RUNTIME_DIR}"; do
     if [ -d "${dir}" ]; then
         chown -R claudebot:claudebot "${dir}"
     fi
@@ -61,6 +60,8 @@ if [ -d "${CLAUDE_RUN_DATA_DIR}" ]; then
     fi
 fi
 
-# su-exec sets HOME from the target user's passwd entry, so the dropped process
-# resolves $HOME/.claude, $HOME/.config and $HOME/.local/share correctly.
+# su-exec sets HOME from the target user's passwd entry. Nothing persistent hangs
+# off $HOME any more (CLAUDE-253): the stores are named by CLAUDE_RUN_*_DIR,
+# XDG_CONFIG_HOME, XDG_DATA_HOME, CLAUDE_CONFIG_DIR and GIT_CONFIG_GLOBAL, all
+# set in the image and all inherited by the dropped process.
 exec su-exec claudebot /usr/local/bin/claude-run "$@"
