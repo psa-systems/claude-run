@@ -771,7 +771,7 @@ The runner always passes `--print --verbose --output-format stream-json`. It wra
 $claude_timeout_seconds`. Stdout+stderr are redirected to a per-job NDJSON stream log:
 
 ```
-$CLAUDE_RUN_LOG_DIR/<name>/streams/<key>-attempt-<n>.jsonl
+$CLAUDE_RUN_STATE_DIR/logs/<name>/streams/<key>-attempt-<n>.jsonl
 ```
 
 `tail -f` that file from another terminal to watch Claude work in real time. The final `result` event on the last line
@@ -880,7 +880,7 @@ plain convention between an action's prompt and its post step; the runner itself
 
 ### `output.file` (string, optional)
 
-If set, the runner appends one JSON line per job to `$CLAUDE_RUN_LOG_DIR/<name>/<output.file>` summarizing the outcome
+If set, the runner appends one JSON line per job to `$CLAUDE_RUN_STATE_DIR/logs/<name>/<output.file>` summarizing the outcome
 (job key, attempt number, claude cost, push/comment results from post steps, etc.).
 
 If omitted, per-job outcomes are only visible in the daily JSONL log.
@@ -1049,16 +1049,25 @@ Intervals shorter than 5s are not meaningful, and cron seconds-precision is hono
 
 ## Runner environment variables
 
-| Variable                            | Default                      | Purpose                                                                                              |
-|-------------------------------------|------------------------------|------------------------------------------------------------------------------------------------------|
-| `CLAUDE_RUN_STATE_DIR`              | `~/.local/share/claude-run`  | State, locks, PAUSED flags, cost ledger.                                                             |
-| `CLAUDE_RUN_LOG_DIR`                | `$CLAUDE_RUN_STATE_DIR/logs` | Daily JSONL logs and per-action output files.                                                        |
-| `CLAUDE_RUN_ACTIONS_DIR`            | `./actions`                  | Resolves bare action names to YAML files.                                                            |
-| `CLAUDE_RUN_WORKDIR_BASE`           | `/tmp/claude-run`            | Per-job workdir root. Final path = `<base>/<name>/<key>`. Overridable per action via `workdir_base`. |
-| `CLAUDE_RUN_MAX_RUNS_PER_DAY`       | `20`                         | Hard cap on Claude invocations per action per day.                                                   |
-| `CLAUDE_RUN_MAX_ATTEMPTS_PER_KEY`   | `3`                          | Per-job attempt cap when `dedup_key` is set.                                                         |
-| `CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS` | `600`                        | `timeout` wrapper around the `claude` CLI call.                                                      |
-| `CLAUDE_RUN_DAILY_BUDGET_USD`       | `5.00`                       | Skip run when today's cost ledger meets/exceeds this.                                                |
+These are the variables an ACTION author meets. Each one below is read by the Rust binary; verify with
+`grep -rn CLAUDE_RUN_ src/`. The daemon-level variables (`CLAUDE_RUN_DATABASE_URL`, `CLAUDE_RUN_DATABASE_URL_FILE`,
+`CLAUDE_RUN_SECRETS_KEY_FILE`, `CLAUDE_RUN_LOG`) are the operator's and are documented in the README, not repeated here.
+
+| Variable                  | Default                          | Purpose                                                                                          |
+|---------------------------|----------------------------------|--------------------------------------------------------------------------------------------------|
+| `CLAUDE_RUN_CONFIG_DIR`   | `$XDG_CONFIG_HOME/claude-run`    | `config.toml` and `actions/*.yml`.                                                               |
+| `CLAUDE_RUN_DATA_DIR`     | `$XDG_DATA_HOME/claude-run`      | `state.db` (SQLite backend only) and `workdirs/`.                                                |
+| `CLAUDE_RUN_STATE_DIR`    | `$XDG_STATE_HOME/claude-run`     | `logs/`: the daily JSONL log, per-action `output.file`, and the per-attempt stream logs.         |
+| `CLAUDE_RUN_RUNTIME_DIR`  | `$XDG_RUNTIME_DIR/claude-run`    | `daemon.pid`, `daemon.sock`, and `locks/<name>.lock`.                                            |
+| `CLAUDE_RUN_ACTIONS_DIR`  | `$CLAUDE_RUN_CONFIG_DIR/actions` | Resolves bare action names to YAML files (same as `--actions-dir`).                              |
+| `CLAUDE_RUN_WORKDIR_BASE` | `$CLAUDE_RUN_DATA_DIR/workdirs`  | Per-job workdir root. Final path = `<base>/<name>/<key>`. The action's `workdir_base` field wins. |
+
+There is no environment variable for any `limits` key. CLAUDE-244: the table above used to carry
+`CLAUDE_RUN_MAX_RUNS_PER_DAY`, `CLAUDE_RUN_MAX_ATTEMPTS_PER_KEY`, `CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS`,
+`CLAUDE_RUN_DAILY_BUDGET_USD`, and `CLAUDE_RUN_LOG_DIR`, all inherited from the removed `scripts/claude-run.nu` runner
+and read by nothing in the Rust binary, so an operator setting one changed no behaviour and got no warning. The limit
+defaults come from `RunnerDefaults::default()` (`src/job.rs`) and an action's YAML `limits` block is the only override;
+logs live under the state dir as shown above.
 
 ## State + lock layout
 
@@ -1167,7 +1176,7 @@ error). Plain `rm -r` is used, not `rm -rf`, so permission or read-only issues s
 silently force-deleted.
 
 To inspect what happened in a failed run, look at the per-attempt stream log
-(`$CLAUDE_RUN_LOG_DIR/<name>/streams/<key>-attempt-<n>.jsonl`); it survives across runs since it lives outside
+(`$CLAUDE_RUN_STATE_DIR/logs/<name>/streams/<key>-attempt-<n>.jsonl`); it survives across runs since it lives outside
 `$workdir`, up to the `config.stream_log_gc` retention window (default 30 days) past which the daemon sweep deletes it.
 
 For `filter` and `pre`/`post`, exit code 0 = continue, non-zero = step failure (skip job, count attempt). The snippet's
