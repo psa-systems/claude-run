@@ -17,7 +17,7 @@ use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
 use claude_run::{
     access, action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db,
-    exit, jsonfmt, lock, migrate, paint, secrets, settings, snippet, state, update,
+    exit, import, jsonfmt, lock, migrate, paint, secrets, settings, snippet, state, update,
 };
 
 /// `--color` choices. Maps to both `anstream` (our own output) and clap's
@@ -133,6 +133,22 @@ enum Cmd {
     Migrate {
         #[arg(long)]
         from: Option<String>,
+    },
+    /// Copy an existing SQLite state store into the configured database
+    /// (CLAUDE-251). The target is whatever `[database] url` /
+    /// `CLAUDE_RUN_DATABASE_URL` resolves to, so the import and the daemon
+    /// cannot disagree about where the rows went; the source is opened
+    /// read-only and is never modified.
+    Import {
+        /// SQLite file to read. Defaults to `<CLAUDE_RUN_DATA_DIR>/state.db`,
+        /// the store this install uses with no database URL set.
+        #[arg(long)]
+        from: Option<String>,
+        /// Copy into a target that already holds rows. Off by default: the
+        /// expected move is into a fresh database, and a second import into a
+        /// populated one duplicates history.
+        #[arg(long)]
+        allow_nonempty: bool,
     },
     /// Show the running version, check the registry for a newer build, or
     /// self-update in place. With no subcommand, behaves like `show`.
@@ -459,6 +475,27 @@ async fn real_main(
                 attempts = report.attempts,
                 daily_rows = report.daily_rows,
                 "legacy state imported"
+            );
+            Ok(exit::OK)
+        }
+        Cmd::Import {
+            from,
+            allow_nonempty,
+        } => {
+            let source = from
+                .map(|f| PathBuf::from(cfg::expand_path(&f)))
+                .unwrap_or_else(|| paths.state_db());
+            import::refuse_same_target(&source, &db_target)?;
+            let target = db::open(&db_target).await?;
+            let report =
+                import::import_sqlite(&source, &target, import::ImportOptions { allow_nonempty })
+                    .await?;
+            print!("{}", report.render());
+            tracing::info!(
+                source = %source.display(),
+                tables = report.tables.len(),
+                rows = report.total_copied(),
+                "sqlite state store imported"
             );
             Ok(exit::OK)
         }
@@ -1192,6 +1229,43 @@ mod tests {
             _ => panic!("expected access check"),
         }
         assert!(Cli::try_parse_from(["claude-run", "access", "check"]).is_ok());
+    }
+
+    /// CLAUDE-251: `import` takes its source from `--from` (defaulting to the
+    /// install's own `state.db`) and copies into a populated target only when
+    /// told to.
+    #[test]
+    fn import_parses_its_source_and_defaults_to_refusing_a_populated_target() {
+        let cli = Cli::try_parse_from(["claude-run", "import"]).unwrap();
+        assert!(
+            matches!(
+                cli.cmd,
+                Cmd::Import {
+                    from: None,
+                    allow_nonempty: false
+                }
+            ),
+            "no source means <CLAUDE_RUN_DATA_DIR>/state.db, and an empty target"
+        );
+
+        let cli = Cli::try_parse_from([
+            "claude-run",
+            "import",
+            "--from",
+            "/srv/old/state.db",
+            "--allow-nonempty",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Import {
+                from,
+                allow_nonempty,
+            } => {
+                assert_eq!(from.as_deref(), Some("/srv/old/state.db"));
+                assert!(allow_nonempty);
+            }
+            _ => panic!("expected import"),
+        }
     }
 
     /// The container image runs `serve --no-socket`, so the flag must parse on
