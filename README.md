@@ -1000,7 +1000,8 @@ beside each (CLAUDE-247). Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VE
 need an `fj` carrying `fj actions logs`, `fj actions runs` (FJ-66), and `fj repo file` (FJ-67); the latter two landed on
 `pandoras-box/forgejo-cli` `main` after the `v0.13.0` tag (merge `b08d8bc`) and are in no released version yet, so
 `FJ_VERSION` must point at a build from that commit or newer for those actions to work. The container runs as the
-non-root user `claudebot` with `$HOME=/home/claudebot`.
+non-root user `claudebot` with `$HOME=/home/claudebot`, which holds nothing persistent: everything the operator cares
+about lives on the three flat volumes below.
 
 **Published image (CLAUDE-88).** CI publishes the runtime image to the Forgejo OCI registry on every push to main (
 `:latest`) and every release tag (`:vX.Y.Z`), the same tag set as the binary's Generic Package. The image publish runs
@@ -1019,8 +1020,9 @@ docker compose pull
 docker compose up --detach
 ```
 
-**Slim bot CLAUDE.md.** `deploy/bot-CLAUDE.md` is versioned in this repo and `COPY`d to
-`/home/claudebot/.claude/CLAUDE.md`. It contains only the local-only agent contract (no push, no PR; leave the feature
+**Slim bot CLAUDE.md.** `deploy/bot-CLAUDE.md` is versioned in this repo, `COPY`d to
+`/home/claudebot/.claude/CLAUDE.md` in the image, and written into the agent's own config dir
+(`/config/claude-agent-home/CLAUDE.md`) on every serve start, which is the copy the agent actually reads. It contains only the local-only agent contract (no push, no PR; leave the feature
 branch as HEAD; the runner finalizes), the bounded tracker writes from
 [What the agent may write to the tracker](#what-the-agent-may-write-to-the-tracker-claude-214), the em-dash ban, the
 Nushell 0.112.2 note, and the simplest-solution preference. It has no Git workflow and no lifecycle section, so the
@@ -1030,21 +1032,20 @@ agent is never told to push, open PRs, or transition issue state.
 
 **Self-contained by design (CLAUDE-247).** The container bind-mounts nothing from the host and reads no host credential. The operator logs Claude, YouTrack, Forgejo and git in INSIDE the container once; each login lands on its own named volume and survives restarts and image upgrades. Two reasons: the runner's identity stays separate from the operator's, and the stack deploys on a host where neither `$HOME` nor the invocation directory is available to the compose file (the only path relative to this repo is the age-key secret, and the alternative for that is below).
 
-**Volumes.** What each one is for:
+**Volumes.** Three, flat, named for what they hold:
 
-| Volume                        | Container path                            | Purpose                                                                                             |
-|-------------------------------|-------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| `claude-bot-config`           | `/home/claudebot/.config/claude-run`      | `config.toml` (seeded, binds 0.0.0.0), the actions dir, and the agent's `claude-agent-home`         |
-| `claude-bot-data`             | `/home/claudebot/.local/share/claude-run` | `state.db` (runs, outcomes, encrypted secrets store) and per-job workdirs (`CLAUDE_RUN_DATA_DIR`)   |
-| `claude-bot-state`            | `/home/claudebot/.local/state/claude-run` | logs, per-attempt stream JSONL, webhook log artifacts (`CLAUDE_RUN_STATE_DIR`)                      |
-| `claude-bot-claude`           | `/home/claudebot/.claude`                 | the in-container Claude login, plus the baked slim bot CLAUDE.md Docker seeds into the empty volume |
-| `claude-bot-youtrack-cli`     | `/home/claudebot/.config/youtrack-cli`    | `yt` instance store, written by `yt auth login`                                                     |
-| `claude-bot-forgejo-cli`      | `/home/claudebot/.local/share/forgejo-cli`| `fj` `keys.json`; the token needs `write:repository` + `write:issue` (see Install)                  |
-| `claude-bot-git`              | `/home/claudebot/.config/git`             | git identity, at the path `GIT_CONFIG_GLOBAL` names in the image                                    |
-| secret `claude-run-age-key`   | `/run/secrets/claude-run-age-key`         | age identity decrypting the secrets store                                                           |
-| tmpfs                         | `/home/claudebot/.runtime/claude-run`     | pidfile and action locks (`CLAUDE_RUN_RUNTIME_DIR`); ephemeral so nothing stale survives a restart |
+| Volume              | Container path   | Purpose                                                                                                    |
+|---------------------|------------------|------------------------------------------------------------------------------------------------------------|
+| `claude-bot-config` | `/config`        | `config.toml`, `actions/`, `secrets.key`, `claude-agent-home/` (the agent's Claude login), `youtrack-cli/` (`yt`), `git/` (commit identity) |
+| `claude-bot-data`   | `/data`          | `state.db` (runs, outcomes, the encrypted secrets store), per-job `workdirs/`, `forgejo-cli/` (`fj` keys)  |
+| `claude-bot-state`  | `/state`         | logs and per-attempt stream JSONL                                                                          |
+| tmpfs               | `/run/claude-run`| pidfile; ephemeral so nothing stale survives a restart                                                     |
 
-One volume per credential store rather than subpaths of a single volume: a compose `volume.subpath` is resolved before the entrypoint runs, is never auto-created, and is not seeded from the image, so a missing subdirectory fails the container create outright.
+Each tool's store is a subdirectory rather than a mount of its own, because the image points every tool at these roots: `CLAUDE_RUN_{CONFIG,DATA,STATE,RUNTIME}_DIR` for the runner, `XDG_CONFIG_HOME=/config` for `yt`, `XDG_DATA_HOME=/data` for `fj` (which has no config-dir variable of its own, and which claude-run resolves the same way through `dirs::data_dir()`), `CLAUDE_CONFIG_DIR=/config/claude-agent-home` for `claude`, and `GIT_CONFIG_GLOBAL=/config/git/config` for git. `$HOME` holds nothing persistent; it is scratch.
+
+`CLAUDE_CONFIG_DIR` deliberately names the same directory the daemon seeds and points its agent children at, so a `claude auth login` run through `docker compose exec` writes the credential where the agent reads it rather than into a second Claude config dir that looks fine and authenticates nothing.
+
+A host install is unaffected by all of this: none of these variables is set there, and every path still resolves through XDG exactly as before.
 
 **Running user.** The image has no `USER` directive. It starts as root so `oci-build/entrypoint.sh` can chown the mounted volumes to `claudebot`, then drops to that user with `su-exec` (pattern 3 in `governance/CONTAINER_UID_GID.md`); the daemon itself runs non-root. Do NOT set `user:` in compose: the entrypoint would lose the privileges the chown needs and a volume owned by another uid could never be repaired from inside. Two consequences for the operator:
 
