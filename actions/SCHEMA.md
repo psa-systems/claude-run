@@ -780,6 +780,17 @@ result, and it is classified `transient`, so it costs the job no attempt and the
 the `result` event was already captured before the write failed, the run is still finalized from it and the truncation
 is logged at `warn`.
 
+**Retention (CLAUDE-245).** Stream logs are bounded, not permanent. A daemon sweep runs at `serve` start and hourly
+thereafter, deleting every `logs/<name>/streams/<key>-attempt-<n>.jsonl` whose last-modified time is older than the
+configured window; every pass logs its `deleted` / `kept` / `bytes_reclaimed` tally at `info`. A log whose job is still
+in flight is kept no matter how old it is: the sweep reads the in-flight job set from the same database the daemon
+records its runs in, so age is never the only evidence a run has finished. The window is the `Stream log GC` settings
+section (DB key `config.stream_log_gc`, fields `enabled` (default `true`) and `retention_days` (default `30`)), edited
+on `/settings` or via `GET` / `PUT /api/settings/stream_log_gc`. Like every DB-backed section it is DB-only from birth
+(never a `config.toml` key) and applies on the next sweep. Set `enabled: false` to park the sweep without losing the
+window, but note that nothing then bounds the directory: an unbounded `logs/` filling its partition is exactly what
+truncated the stream logs described above.
+
 ### `post` (list of nu snippets, optional)
 
 Ordered steps that run after every code path that reached the workdir: Claude success, Claude non-transient failure,
@@ -1104,7 +1115,7 @@ It is a separate action from `webhook-forgejo`, not a second event type on it, b
 
 An action can be deleted from all three surfaces: the CLI (`claude-run action delete <name>`), the web UI (the Delete button on an action's detail page), and the JSON API (`POST /actions/<name>/delete`).
 
-Delete is a config-and-control purge, not a history wipe. It removes the on-disk YAML file, the `actions` index row, the `paused_actions` row, and the `attempt_counters` / `daily_ledger` rows for that action. It KEEPS the action's run history: the `runs` and `job_outcomes` rows and the on-disk stream logs under `logs/<name>/` survive. Re-creating an action with the same name re-associates that retained history, which is the intended audit behavior.
+Delete is a config-and-control purge, not a history wipe. It removes the on-disk YAML file, the `actions` index row, the `paused_actions` row, and the `attempt_counters` / `daily_ledger` rows for that action. It KEEPS the action's run history: the `runs` and `job_outcomes` rows and the on-disk stream logs under `logs/<name>/` survive, each for as long as its own retention window allows (`config.db_retention` for the rows, `config.stream_log_gc` for the stream logs). Re-creating an action with the same name re-associates that retained history, which is the intended audit behavior.
 
 Delete is refused while a run for the action is in flight, so removing a config can never orphan a running job. The CLI returns exit code 7 (conflict) and the API / web UI return HTTP 409; cancel the run (`claude-run cancel <run-id>`) or wait for it to finish, then retry. An unknown action returns exit code 3 from the CLI and HTTP 404 from the API / web UI.
 
@@ -1153,7 +1164,7 @@ silently force-deleted.
 
 To inspect what happened in a failed run, look at the per-attempt stream log
 (`$CLAUDE_RUN_LOG_DIR/<name>/streams/<key>-attempt-<n>.jsonl`); it survives across runs since it lives outside
-`$workdir`.
+`$workdir`, up to the `config.stream_log_gc` retention window (default 30 days) past which the daemon sweep deletes it.
 
 For `filter` and `pre`/`post`, exit code 0 = continue, non-zero = step failure (skip job, count attempt). The snippet's
 stdout is captured into the daily log; stderr passes through.

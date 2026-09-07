@@ -460,6 +460,16 @@ impl Daemon {
         let retention_task =
             tokio::spawn(retention_loop(pool.clone(), settings.db_retention_handle()));
 
+        // CLAUDE-245: sweep per-attempt stream logs older than the configured
+        // window. Nothing ever deleted them, and the full log partition that
+        // caused the truncations diagnosed in CLAUDE-233 is what this bounds.
+        // Same cadence and live-config shape as the two sweeps above.
+        let stream_log_gc_task = tokio::spawn(stream_log_gc_loop(
+            self.paths.clone(),
+            pool.clone(),
+            settings.stream_log_gc_handle(),
+        ));
+
         // Graceful shutdown on SIGINT (Ctrl-C), SIGTERM (service managers,
         // `claude-run stop`), or SIGQUIT. All fall through to the same cleanup
         // below.
@@ -498,6 +508,7 @@ impl Daemon {
         trigger_task.abort();
         gc_task.abort();
         retention_task.abort();
+        stream_log_gc_task.abort();
 
         // CLAUDE-11: cancel in-flight runs through the CLAUDE-9 path (child
         // terminated, `post` run with a synthesized cancelled result,
@@ -1562,6 +1573,73 @@ async fn retention_loop(
     }
 }
 
+/// CLAUDE-245: the `(action_name, job_key)` pairs whose job is running right
+/// now, from `run_inflight_jobs` joined to the runs that have not ended. This is
+/// the evidence the stream-log sweep needs that a log is finished with: the
+/// sweep runs inside the daemon that owns those runs, and every runner marks a
+/// job in flight for exactly the span it is being worked
+/// (`state::run_inflight_add` / `run_inflight_remove`, cleared wholesale by
+/// `run_finish`, with `reap_orphaned_runs` closing anything a crash stranded).
+async fn inflight_stream_log_jobs(
+    pool: &sqlx::SqlitePool,
+) -> Result<std::collections::HashSet<(String, String)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT r.action_name, j.job_key
+         FROM run_inflight_jobs j
+         JOIN runs r ON r.id = j.run_id
+         WHERE r.ended_at IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// CLAUDE-245: periodic stream-log GC, on the [`GC_TICK_SECS`] cadence the other
+/// two sweeps use. The interval's first tick fires immediately, so a sweep runs
+/// on serve start; the window is read off the shared handle per tick so a
+/// Settings save applies on the next pass. The walk and the unlinks are blocking
+/// filesystem work, so they run on a blocking thread.
+///
+/// A failed in-flight read SKIPS the pass rather than sweeping with an empty
+/// set: without that table the sweep cannot tell a finished job's log from a
+/// running one's, and the wrong guess deletes a live run's only transcript.
+async fn stream_log_gc_loop(
+    paths: Paths,
+    pool: sqlx::SqlitePool,
+    cfg: Arc<tokio::sync::RwLock<crate::config::StreamLogGcConfig>>,
+) {
+    let base = paths.logs_dir();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(GC_TICK_SECS));
+    loop {
+        ticker.tick().await;
+        let snapshot = cfg.read().await.clone();
+        if !snapshot.enabled {
+            continue;
+        }
+        let in_flight = match inflight_stream_log_jobs(&pool).await {
+            Ok(set) => set,
+            Err(e) => {
+                warn!(error = %e, "stream-log GC: cannot read in-flight jobs; skipping this sweep rather than risk deleting a live run's log");
+                continue;
+            }
+        };
+        let base = base.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::gc::sweep_stream_logs(&base, &snapshot, std::time::SystemTime::now(), &in_flight)
+        })
+        .await;
+        match result {
+            Ok(stats) => info!(
+                deleted = stats.deleted,
+                kept = stats.kept,
+                bytes_reclaimed = stats.bytes_reclaimed,
+                "stream-log GC sweep complete"
+            ),
+            Err(e) => warn!(error = %e, "stream-log GC sweep task failed"),
+        }
+    }
+}
+
 async fn scheduler_loop(
     dispatch: Arc<Dispatcher>,
     _trigger_tx: mpsc::Sender<String>,
@@ -1729,6 +1807,53 @@ mod tests {
     #[test]
     fn current_process_is_alive() {
         assert!(process_alive(std::process::id() as i32));
+    }
+
+    /// CLAUDE-245: the set the stream-log sweep is protected by. A job marked
+    /// in flight on a run that has not ended is named; the same job once its
+    /// run finishes is not, and a stale marker on an already-ended run does not
+    /// pin its log forever. The end-to-end assertion is the last one: an aged
+    /// log for the live job survives a sweep that deletes its neighbour.
+    #[tokio::test]
+    async fn inflight_jobs_protect_only_the_running_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let pool = crate::db::open(&paths.state_db()).await.unwrap();
+
+        let live = state::run_begin(&pool, "youtrack", "cli").await.unwrap();
+        state::run_inflight_add(&pool, live, "CLAUDE-1", "CLAUDE")
+            .await
+            .unwrap();
+        let done = state::run_begin(&pool, "youtrack", "cli").await.unwrap();
+        state::run_inflight_add(&pool, done, "CLAUDE-2", "CLAUDE")
+            .await
+            .unwrap();
+        state::run_finish(&pool, done, 0, 1).await.unwrap();
+
+        let set = inflight_stream_log_jobs(&pool).await.unwrap();
+        assert!(set.contains(&("youtrack".to_string(), "CLAUDE-1".to_string())));
+        assert!(
+            !set.contains(&("youtrack".to_string(), "CLAUDE-2".to_string())),
+            "a finished run's job is not in flight"
+        );
+
+        let logs = paths.logs_dir();
+        let streams = logs.join("youtrack").join("streams");
+        std::fs::create_dir_all(&streams).unwrap();
+        let running = streams.join("CLAUDE-1-attempt-1.jsonl");
+        let finished = streams.join("CLAUDE-2-attempt-1.jsonl");
+        std::fs::write(&running, b"{}\n").unwrap();
+        std::fs::write(&finished, b"{}\n").unwrap();
+
+        let stats = crate::gc::sweep_stream_logs(
+            &logs,
+            &crate::config::StreamLogGcConfig::default(),
+            std::time::SystemTime::now() + std::time::Duration::from_secs(365 * 86_400),
+            &set,
+        );
+        assert!(running.exists(), "the in-flight job's log must survive");
+        assert!(!finished.exists(), "the finished job's aged log is swept");
+        assert_eq!((stats.kept, stats.deleted), (1, 1));
     }
 
     #[test]
