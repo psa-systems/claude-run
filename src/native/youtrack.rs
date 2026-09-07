@@ -48,7 +48,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 use tracing::{info, warn};
 
 use super::{HandlerFuture, NativeContext, NativeHandler};
@@ -861,7 +861,7 @@ enum Eligibility {
 /// wins the key: that post-gate re-read is the authoritative cross-run TOCTOU
 /// guard right before the first mutation (`src/concurrency.rs` module docs).
 async fn evaluate_eligibility(
-    pool: &SqlitePool,
+    pool: &DbPool,
     backend: &dyn IssueTracker,
     src: &YoutrackSource,
     action: &str,
@@ -910,7 +910,7 @@ async fn evaluate_eligibility(
 /// blocked). Runs per candidate, before the executor is built, so ineligible
 /// issues never compete for a project's concurrency key.
 async fn filter_eligible(
-    pool: &SqlitePool,
+    pool: &DbPool,
     backend: &dyn IssueTracker,
     src: &YoutrackSource,
     action: &str,
@@ -938,7 +938,7 @@ async fn filter_eligible(
 async fn process_job(
     loaded: &crate::action::LoadedAction,
     paths: &Paths,
-    pool: &SqlitePool,
+    pool: &DbPool,
     claude: &ClaudeInvoker,
     backend: &dyn IssueTracker,
     forge: &dyn Forge,
@@ -1305,7 +1305,7 @@ fn blocked_comment(blockers: &[Blocker]) -> String {
 /// a poll whose candidates are all blocked returns before `run_begin` so no run
 /// row is written, and the journal said nothing above `info`.
 async fn dependency_gate(
-    pool: &SqlitePool,
+    pool: &DbPool,
     backend: &dyn IssueTracker,
     src: &YoutrackSource,
     action: &str,
@@ -2117,7 +2117,7 @@ fn failure_comment(r: &ClaudeResult) -> String {
 async fn record_outcome(
     loaded: &crate::action::LoadedAction,
     paths: &Paths,
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: i64,
     outcome: &ProcessedJob,
 ) -> Result<()> {
@@ -2393,11 +2393,9 @@ fn preserve_aside(workdir: &Path) {
 mod tests {
     use super::*;
     use crate::action::PrStrategy;
-    use crate::db::MIGRATOR;
     use crate::provider::cli::testutil::StubRunner;
     use crate::provider::{CliBackend, IssueLink, LinkDirection};
     use serde_json::Value;
-    use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
     /// CLAUDE-252: the pre step clones the URL the FORGE resolves from its key
@@ -4558,14 +4556,8 @@ mod tests {
 
     // ---- CLAUDE-161 pre-clone dependency gate ----
 
-    async fn mem_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn mem_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     fn link(
@@ -4714,9 +4706,9 @@ mod tests {
             .unwrap();
         assert!(matches!(d, GateDecision::Blocked { .. }));
         let aged = state::now_epoch_ms() - 3 * 3_600_000;
-        sqlx::query(
+        sqlx::query(&crate::db::q(&pool,
             "UPDATE dependency_gate SET blocked_since = ?, blocked_until = ? WHERE job_key = 'AUD-31'",
-        )
+        ))
         .bind(aged)
         .bind(state::now_epoch_ms() - 1000)
         .execute(&pool)

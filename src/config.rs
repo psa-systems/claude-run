@@ -9,6 +9,12 @@
 //! | State (logs) | `$XDG_STATE_HOME/claude-run/` | `CLAUDE_RUN_STATE_DIR` |
 //! | Runtime (pid, socket) | `$XDG_RUNTIME_DIR/claude-run/` | `CLAUDE_RUN_RUNTIME_DIR` |
 //!
+//! CLAUDE-250: `state.db` is the DEFAULT state store, not the only one. A
+//! `[database] url` (or `CLAUDE_RUN_DATABASE_URL`, or the file named by
+//! `CLAUDE_RUN_DATABASE_URL_FILE`) points the daemon at PostgreSQL instead, in
+//! which case nothing but `workdirs/` lives under the data dir. See
+//! [`resolve_database`].
+//!
 //! `~`, `$VAR`, and `${VAR}` are expanded in all values (the env override and
 //! the `workdir_base` field on actions both go through `expand_path`).
 
@@ -98,6 +104,27 @@ pub struct OnDiskConfig {
     /// CLAUDE-55: `version` self-update settings (release/latest train default
     /// and the name of the secret holding the registry token).
     pub update: UpdateConfig,
+    /// CLAUDE-250: which database backend holds the runtime state. Bootstrap,
+    /// not a DB-backed setting: it has to be known before the DB is open.
+    pub database: DatabaseConfig,
+}
+
+/// CLAUDE-250: backend selection for the runtime state store.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DatabaseConfig {
+    /// Connection URL for the state store. Unset (the default) means SQLite at
+    /// [`Paths::state_db`], which is what every install had before this key
+    /// existed. `postgres://` or `postgresql://` selects PostgreSQL;
+    /// `sqlite://` selects SQLite explicitly. Any other scheme is a startup
+    /// error naming the scheme, never a silent fallback.
+    ///
+    /// Precedence, highest first: the contents of the file named by
+    /// `CLAUDE_RUN_DATABASE_URL_FILE`, then `CLAUDE_RUN_DATABASE_URL`, then
+    /// this key. The file form exists because the URL carries the password and
+    /// an environment value is readable through `docker inspect` and `/proc`,
+    /// the same reasoning that puts the age key on a compose secret.
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -830,6 +857,68 @@ impl OnDiskConfig {
     }
 }
 
+/// CLAUDE-250: the resolved state-store backend, produced once at startup and
+/// handed to `db::open`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatabaseTarget {
+    /// The SQLite file at [`Paths::state_db`], or at the path a `sqlite://`
+    /// URL named.
+    Sqlite(PathBuf),
+    /// A PostgreSQL server, carrying the URL verbatim (password included, so
+    /// this value is never logged).
+    Postgres(String),
+}
+
+/// The URL configured for the state store, or `None` for the default SQLite
+/// file. Highest precedence first: `CLAUDE_RUN_DATABASE_URL_FILE`, then
+/// `CLAUDE_RUN_DATABASE_URL`, then `[database] url` in `config.toml`.
+pub fn database_url(cfg: &DatabaseConfig) -> Result<Option<String>> {
+    if let Ok(path) = std::env::var("CLAUDE_RUN_DATABASE_URL_FILE") {
+        let path = expand_path(&path);
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("reading CLAUDE_RUN_DATABASE_URL_FILE ({path}): {e}"))?;
+        return Ok(Some(raw.trim().to_string()));
+    }
+    if let Ok(url) = std::env::var("CLAUDE_RUN_DATABASE_URL") {
+        return Ok(Some(url.trim().to_string()));
+    }
+    Ok(cfg.url.as_ref().map(|u| u.trim().to_string()))
+}
+
+/// Resolve [`database_url`] into the backend `db::open` should open. An
+/// unrecognised scheme is an error naming it, so a typo stops the daemon
+/// instead of quietly opening a second, empty SQLite store.
+pub fn resolve_database(paths: &Paths, cfg: &DatabaseConfig) -> Result<DatabaseTarget> {
+    let Some(url) = database_url(cfg)? else {
+        return Ok(DatabaseTarget::Sqlite(paths.state_db()));
+    };
+    if url.is_empty() {
+        return Ok(DatabaseTarget::Sqlite(paths.state_db()));
+    }
+    let scheme = url.split(':').next().unwrap_or_default();
+    match scheme {
+        "sqlite" => {
+            let rest = url
+                .strip_prefix("sqlite://")
+                .or_else(|| url.strip_prefix("sqlite:"))
+                .unwrap_or_default();
+            let file = rest.split('?').next().unwrap_or_default();
+            if file.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "database URL `{url}` names no SQLite file; leave the setting unset to use the default"
+                )
+                .into());
+            }
+            Ok(DatabaseTarget::Sqlite(PathBuf::from(file)))
+        }
+        "postgres" | "postgresql" => Ok(DatabaseTarget::Postgres(url)),
+        other => Err(anyhow::anyhow!(
+            "unsupported database URL scheme `{other}`: expected sqlite, postgres or postgresql"
+        )
+        .into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1067,6 +1156,79 @@ mod tests {
         assert!(!source_name_is_clean("a b"));
         assert!(!source_name_is_clean("a/b"));
         assert!(!source_name_is_clean(""));
+    }
+
+    // CLAUDE-250: one test rather than four, because the three inputs are
+    // process-wide environment variables and `cargo test` runs in parallel.
+    #[test]
+    fn database_url_precedence_is_file_then_env_then_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        std::env::remove_var("CLAUDE_RUN_DATABASE_URL");
+        std::env::remove_var("CLAUDE_RUN_DATABASE_URL_FILE");
+
+        // Nothing set anywhere: the SQLite file every install had before.
+        let empty = DatabaseConfig::default();
+        assert_eq!(database_url(&empty).unwrap(), None);
+        assert_eq!(
+            resolve_database(&paths, &empty).unwrap(),
+            DatabaseTarget::Sqlite(paths.state_db())
+        );
+
+        // The config key alone.
+        let from_file = DatabaseConfig {
+            url: Some("postgres://cfg/db".to_string()),
+        };
+        assert_eq!(
+            database_url(&from_file).unwrap().as_deref(),
+            Some("postgres://cfg/db")
+        );
+
+        // The env var beats the config key.
+        std::env::set_var("CLAUDE_RUN_DATABASE_URL", "postgres://env/db");
+        assert_eq!(
+            database_url(&from_file).unwrap().as_deref(),
+            Some("postgres://env/db")
+        );
+
+        // The file beats both, and its trailing newline is trimmed.
+        let secret = tmp.path().join("db-url");
+        std::fs::write(&secret, "postgres://secret/db\n").unwrap();
+        std::env::set_var("CLAUDE_RUN_DATABASE_URL_FILE", &secret);
+        assert_eq!(
+            database_url(&from_file).unwrap().as_deref(),
+            Some("postgres://secret/db")
+        );
+        assert_eq!(
+            resolve_database(&paths, &from_file).unwrap(),
+            DatabaseTarget::Postgres("postgres://secret/db".to_string())
+        );
+
+        // An unreadable file named by the variable is an error, never a silent
+        // fall-through to the next input.
+        std::env::set_var("CLAUDE_RUN_DATABASE_URL_FILE", tmp.path().join("absent"));
+        let err = database_url(&from_file).unwrap_err().to_string();
+        assert!(err.contains("CLAUDE_RUN_DATABASE_URL_FILE"), "{err}");
+        std::env::remove_var("CLAUDE_RUN_DATABASE_URL_FILE");
+
+        // An explicit sqlite URL selects the file it names.
+        std::env::set_var("CLAUDE_RUN_DATABASE_URL", "sqlite:///tmp/other.db");
+        assert_eq!(
+            resolve_database(&paths, &empty).unwrap(),
+            DatabaseTarget::Sqlite(PathBuf::from("/tmp/other.db"))
+        );
+
+        // Any other scheme stops startup and names the scheme.
+        std::env::set_var("CLAUDE_RUN_DATABASE_URL", "mysql://host/db");
+        let err = resolve_database(&paths, &empty).unwrap_err().to_string();
+        assert!(err.contains("mysql"), "{err}");
+
+        std::env::remove_var("CLAUDE_RUN_DATABASE_URL");
     }
 
     // CLAUDE-57: `load` reports whether `config.toml` was present so `serve` can

@@ -2,7 +2,7 @@
 //! `config.toml`.
 //!
 //! Every runtime-tunable section lives as one JSON document in the existing
-//! `settings` key/value table (`migrations/0001_init.sql`), keyed
+//! `settings` key/value table (`migrations/sqlite/0001_init.sql`), keyed
 //! `config.<section>`; [`Section::ALL`] is the list. The serde structs in
 //! [`crate::config`] are the schema, so saving a section is exactly the
 //! file-parser's validation (`deny_unknown_fields`), and the web Settings page
@@ -27,8 +27,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::db::DbPool;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
@@ -265,20 +265,24 @@ pub fn format_datetime(rfc3339: &str, prefs: &PreferencesConfig) -> String {
 // ---- raw + typed store ----------------------------------------------------
 
 /// Read a raw settings value by key. `None` when the key is absent.
-pub async fn get_raw(pool: &SqlitePool, key: &str) -> Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
-        .bind(key)
-        .fetch_optional(pool)
-        .await?;
+pub async fn get_raw(pool: &DbPool, key: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT value FROM settings WHERE key = ?",
+    ))
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|r| r.0))
 }
 
 /// Upsert a raw settings value.
-pub async fn set_raw(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
-    sqlx::query(
+pub async fn set_raw(pool: &DbPool, key: &str, value: &str) -> Result<()> {
+    sqlx::query(&crate::db::q(
+        pool,
         "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-    )
+    ))
     .bind(key)
     .bind(value)
     .bind(now_iso())
@@ -297,7 +301,7 @@ const SERVE_STARTED_AT_KEY: &str = "daemon.started_at";
 /// [`crate::state::now_iso`] RFC3339-UTC-seconds format every `run_events.ts` is
 /// written in, so the web layer can bound events to this lifetime with a
 /// lexicographic `ts >= started_at`. Returns the stamp it wrote.
-pub async fn record_serve_start(pool: &SqlitePool) -> Result<String> {
+pub async fn record_serve_start(pool: &DbPool) -> Result<String> {
     let now = now_iso();
     set_raw(pool, SERVE_STARTED_AT_KEY, &now).await?;
     Ok(now)
@@ -306,12 +310,12 @@ pub async fn record_serve_start(pool: &SqlitePool) -> Result<String> {
 /// CLAUDE-171: the current serve's start stamp, or `None` when no serve has
 /// recorded one yet (a CLI invocation against a never-served DB). Callers that
 /// filter by it treat `None` as "no lower bound" rather than "no rows".
-pub async fn serve_started_at(pool: &SqlitePool) -> Result<Option<String>> {
+pub async fn serve_started_at(pool: &DbPool) -> Result<Option<String>> {
     get_raw(pool, SERVE_STARTED_AT_KEY).await
 }
 
 /// Read and deserialize a JSON settings document. `None` when the key is absent.
-pub async fn get_json<T: DeserializeOwned>(pool: &SqlitePool, key: &str) -> Result<Option<T>> {
+pub async fn get_json<T: DeserializeOwned>(pool: &DbPool, key: &str) -> Result<Option<T>> {
     match get_raw(pool, key).await? {
         Some(raw) => Ok(Some(serde_json::from_str(&raw)?)),
         None => Ok(None),
@@ -319,7 +323,7 @@ pub async fn get_json<T: DeserializeOwned>(pool: &SqlitePool, key: &str) -> Resu
 }
 
 /// Serialize and upsert a JSON settings document.
-pub async fn set_json<T: Serialize>(pool: &SqlitePool, key: &str, value: &T) -> Result<()> {
+pub async fn set_json<T: Serialize>(pool: &DbPool, key: &str, value: &T) -> Result<()> {
     let raw = serde_json::to_string(value)?;
     set_raw(pool, key, &raw).await
 }
@@ -368,7 +372,7 @@ pub struct EffectiveRuntime {
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
 /// `config.toml`) for any section the DB does not hold.
-pub async fn effective(pool: &SqlitePool, file: &OnDiskConfig) -> Result<EffectiveRuntime> {
+pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRuntime> {
     let mint = get_json::<MintConfig>(pool, Section::Mint.key())
         .await?
         .unwrap_or_else(|| file.mint.clone());
@@ -452,7 +456,7 @@ pub fn validate_db_retention(cfg: &DbRetentionConfig) -> std::result::Result<(),
 
 /// Resolve the effective [`UpdateConfig`] for a CLI `version` invocation: the DB
 /// value when present, else the file value (`[update]`), else the default.
-pub async fn effective_update(pool: &SqlitePool, file: &OnDiskConfig) -> Result<UpdateConfig> {
+pub async fn effective_update(pool: &DbPool, file: &OnDiskConfig) -> Result<UpdateConfig> {
     Ok(get_json::<UpdateConfig>(pool, Section::Update.key())
         .await?
         .unwrap_or_else(|| file.update.clone()))
@@ -462,7 +466,7 @@ pub async fn effective_update(pool: &SqlitePool, file: &OnDiskConfig) -> Result<
 /// no parsed `config.toml` (the native CI-failure handlers, which reach the
 /// webhook sources only for their per-repo log-token fallback). Same order as
 /// [`effective`]: the DB document, else the on-disk file, else the default.
-pub async fn effective_webhook(pool: &SqlitePool, paths: &Paths) -> Result<WebhookConfig> {
+pub async fn effective_webhook(pool: &DbPool, paths: &Paths) -> Result<WebhookConfig> {
     match get_json::<WebhookConfig>(pool, Section::Webhook.key()).await? {
         Some(webhook) => Ok(webhook),
         None => Ok(OnDiskConfig::load(paths)?.0.webhook),
@@ -472,7 +476,7 @@ pub async fn effective_webhook(pool: &SqlitePool, paths: &Paths) -> Result<Webho
 /// CLAUDE-239: resolve the effective [`ClaudeConfig`] for a caller that holds no
 /// [`LiveSettings`] (the daemonless `claude-run run`). DB-only from birth, so
 /// there is no file fallback: the stored document or the built-in default.
-pub async fn effective_claude(pool: &SqlitePool) -> Result<ClaudeConfig> {
+pub async fn effective_claude(pool: &DbPool) -> Result<ClaudeConfig> {
     Ok(get_json::<ClaudeConfig>(pool, Section::Claude.key())
         .await?
         .unwrap_or_default())
@@ -485,7 +489,7 @@ pub async fn effective_claude(pool: &SqlitePool) -> Result<ClaudeConfig> {
 /// yet hold it) or refuse to start (when the DB already holds it). A missing file
 /// or a file with no moved sections is a clean no-op. Bootstrap keys (`[web]`,
 /// `[daemon]` binary overrides) are ignored here.
-pub async fn migrate_config_file(pool: &SqlitePool, paths: &Paths) -> Result<()> {
+pub async fn migrate_config_file(pool: &DbPool, paths: &Paths) -> Result<()> {
     let f = paths.config_file();
     if !f.exists() {
         return Ok(());
@@ -522,7 +526,7 @@ pub async fn migrate_config_file(pool: &SqlitePool, paths: &Paths) -> Result<()>
 /// Import one TOML-subtree section into the DB, or error if the DB already holds
 /// it (both-sources-present case).
 async fn import_or_error<T>(
-    pool: &SqlitePool,
+    pool: &DbPool,
     section: Section,
     label: &str,
     value: toml::Value,
@@ -550,7 +554,7 @@ where
 /// Import an already-built section document (used for `[daemon].log_filter`,
 /// which is a sub-key rather than a TOML table), or error if the DB holds it.
 async fn import_doc_or_error<T>(
-    pool: &SqlitePool,
+    pool: &DbPool,
     section: Section,
     label: &str,
     doc: T,
@@ -619,7 +623,7 @@ impl From<crate::error::Error> for SaveError {
 /// webhook listener, the webhook consumer, and the mint context so a save applies
 /// live without a restart.
 pub struct LiveSettings {
-    pool: SqlitePool,
+    pool: DbPool,
     mint: Arc<RwLock<MintConfig>>,
     update: Arc<RwLock<UpdateConfig>>,
     webhook: Arc<RwLock<WebhookConfig>>,
@@ -649,7 +653,7 @@ impl LiveSettings {
     /// Build from the effective runtime config. Applies the effective log filter
     /// immediately (so a DB value wins over the file value the bootstrap path
     /// already applied), unless `log_apply` is `None` (env wins / no handle).
-    pub fn new(pool: SqlitePool, eff: EffectiveRuntime, log_apply: Option<LogFilterApply>) -> Self {
+    pub fn new(pool: DbPool, eff: EffectiveRuntime, log_apply: Option<LogFilterApply>) -> Self {
         let webhook_rate = build_rate_map(&eff.webhook);
         let webhook_comment_rate = comment_rate_map(&eff.webhook_comment);
         // CLAUDE-154: seed the process-global snapshot the Askama `datetime`
@@ -686,7 +690,7 @@ impl LiveSettings {
 
     /// Standalone instance backed by `pool` with built-in defaults and no live
     /// log-filter hook. For tests and any context without a daemon.
-    pub fn detached(pool: SqlitePool) -> Self {
+    pub fn detached(pool: DbPool) -> Self {
         Self::new(pool, EffectiveRuntime::default(), None)
     }
 
@@ -946,17 +950,9 @@ fn to_pretty<T: Serialize>(v: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::MIGRATOR;
-    use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     fn eff_default() -> EffectiveRuntime {

@@ -13,6 +13,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::db::DbPool;
 use askama::Template;
 use axum::body::Body;
 use axum::extract::{Form, Path as AxumPath, Query, RawForm, State};
@@ -23,7 +24,6 @@ use axum::routing::{get, post};
 use axum::Router;
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::action::{
@@ -266,7 +266,7 @@ impl RunRow {
     }
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize)]
 struct JobOutcomeRow {
     job_key: String,
     attempt: i64,
@@ -287,6 +287,28 @@ struct JobOutcomeRow {
     /// stream log, so this carries the triage bucket + mint result + redacted
     /// log artifact reference; rendered on the run-detail outcomes table.
     summary: Option<String>,
+}
+
+// CLAUDE-250: by hand rather than derived, because `ok` / `claude_ran` /
+// `claude_ok` / `attempt_counted` / `timed_out` are integer 0/1 columns on both
+// backends. See `crate::db::flag`.
+impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobOutcomeRow {
+    fn from_row(row: &sqlx::any::AnyRow) -> sqlx::Result<Self> {
+        use sqlx::Row;
+        Ok(Self {
+            job_key: row.try_get("job_key")?,
+            attempt: row.try_get("attempt")?,
+            ts: row.try_get("ts")?,
+            ok: crate::db::flag(row, "ok")?,
+            claude_ran: crate::db::flag(row, "claude_ran")?,
+            claude_ok: crate::db::flag(row, "claude_ok")?,
+            claude_cost_usd: row.try_get("claude_cost_usd")?,
+            attempt_counted: crate::db::flag(row, "attempt_counted")?,
+            duration_ms: row.try_get("duration_ms")?,
+            timed_out: crate::db::flag(row, "timed_out")?,
+            summary: row.try_get("summary")?,
+        })
+    }
 }
 
 impl JobOutcomeRow {
@@ -465,7 +487,7 @@ fn build_duration_chart(series: &[(String, i64)]) -> DurationChart {
 }
 
 async fn enriched_actions(
-    pool: &SqlitePool,
+    pool: &DbPool,
     webhook_enabled: bool,
     comment_webhook_enabled: bool,
 ) -> Result<Vec<ActionView>, WebError> {
@@ -518,7 +540,7 @@ async fn enriched_actions(
 /// `paused_actions` row like every other action, so the dashboard shows a
 /// Paused badge and the Pause/Resume controls act on it; a paused delivery is
 /// accepted-and-dropped by the inbound endpoint.
-async fn synthetic_action_view(pool: &SqlitePool, name: &str) -> Result<ActionView, WebError> {
+async fn synthetic_action_view(pool: &DbPool, name: &str) -> Result<ActionView, WebError> {
     let name = name.to_string();
     let last = state::action_last_run_started(pool, &name).await?;
     let paused = state::action_pause_status(pool, &name)
@@ -629,7 +651,7 @@ fn has_job_matching(pred: &str) -> String {
 /// `ORDER BY` is built from a fixed column allow-list (no raw input reaches the
 /// clause) and its filter values are passed as bound parameters.
 async fn fetch_recent_runs(
-    pool: &SqlitePool,
+    pool: &DbPool,
     limit: i64,
     offset: i64,
     show_empty: bool,
@@ -641,6 +663,7 @@ async fn fetch_recent_runs(
         "SELECT {} FROM runs{where_clause} {order_by} LIMIT ? OFFSET ?",
         run_row_columns()
     );
+    let sql = crate::db::q(pool, &sql).into_owned();
     let mut q = sqlx::query_as::<_, RunRow>(&sql);
     for b in &binds {
         q = q.bind(b);
@@ -654,12 +677,13 @@ async fn fetch_recent_runs(
 /// indicator and the last-page boundary. Uses the same `WHERE` (and the same
 /// bound filter values) as the listing so the count matches the paged rows.
 async fn count_recent_runs(
-    pool: &SqlitePool,
+    pool: &DbPool,
     show_empty: bool,
     view: &RunsView,
 ) -> Result<i64, WebError> {
     let (where_clause, binds) = view.where_clause(show_empty);
     let sql = format!("SELECT COUNT(*) FROM runs{where_clause}");
+    let sql = crate::db::q(pool, &sql).into_owned();
     let mut q = sqlx::query_scalar::<_, i64>(&sql);
     for b in &binds {
         q = q.bind(b);
@@ -672,10 +696,11 @@ async fn count_recent_runs(
 /// alphabetically. Drives the dashboard Action filter dropdown so it only offers
 /// actions that actually have runs (not every indexed action), and serves as the
 /// allow-list that whitelists the incoming `?action=` value.
-async fn distinct_run_actions(pool: &SqlitePool) -> Result<Vec<String>, WebError> {
-    let rows = sqlx::query_scalar::<_, String>(
+async fn distinct_run_actions(pool: &DbPool) -> Result<Vec<String>, WebError> {
+    let rows = sqlx::query_scalar::<_, String>(&crate::db::q(
+        pool,
         "SELECT DISTINCT action_name FROM runs ORDER BY action_name",
-    )
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -684,10 +709,11 @@ async fn distinct_run_actions(pool: &SqlitePool) -> Result<Vec<String>, WebError
 /// CLAUDE-141: distinct `triggered_by` values present in the `runs` table,
 /// alphabetically. Drives the dashboard Triggered filter dropdown and whitelists
 /// the incoming `?triggered=` value.
-async fn distinct_triggered_by(pool: &SqlitePool) -> Result<Vec<String>, WebError> {
-    let rows = sqlx::query_scalar::<_, String>(
+async fn distinct_triggered_by(pool: &DbPool) -> Result<Vec<String>, WebError> {
+    let rows = sqlx::query_scalar::<_, String>(&crate::db::q(
+        pool,
         "SELECT DISTINCT triggered_by FROM runs ORDER BY triggered_by",
-    )
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -712,7 +738,7 @@ const SEARCH_STREAM_MAX_FILES: usize = 200;
 /// pathologically large log cannot stall the whole search.
 const SEARCH_STREAM_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
-#[derive(sqlx::FromRow)]
+#[derive(Debug)]
 struct JobSearchRow {
     run_id: i64,
     action_name: String,
@@ -723,6 +749,25 @@ struct JobSearchRow {
     timed_out: bool,
     summary: Option<String>,
     stream_log_path: Option<String>,
+}
+
+// CLAUDE-250: by hand rather than derived; `ok` and `timed_out` are integer 0/1
+// columns on both backends. See `crate::db::flag`.
+impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobSearchRow {
+    fn from_row(row: &sqlx::any::AnyRow) -> sqlx::Result<Self> {
+        use sqlx::Row;
+        Ok(Self {
+            run_id: row.try_get("run_id")?,
+            action_name: row.try_get("action_name")?,
+            job_key: row.try_get("job_key")?,
+            attempt: row.try_get("attempt")?,
+            ts: row.try_get("ts")?,
+            ok: crate::db::flag(row, "ok")?,
+            timed_out: crate::db::flag(row, "timed_out")?,
+            summary: row.try_get("summary")?,
+            stream_log_path: row.try_get("stream_log_path")?,
+        })
+    }
 }
 
 /// CLAUDE-143: one matching job attempt in the search results. Keyed in the
@@ -881,22 +926,22 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// and `capped` reports when the file cap was reached so the UI never silently
 /// truncates.
 async fn search_jobs(
-    pool: &SqlitePool,
+    pool: &DbPool,
     paths: &Paths,
     q: &str,
     in_stream: bool,
 ) -> Result<SearchView, WebError> {
     let needle = q.to_ascii_lowercase();
 
-    // Summary search (always on). `instr(lower(...), needle)` is a plain
+    // Summary search (always on). `strpos(lower(...), needle)` is a plain
     // substring test, so query text containing LIKE metacharacters (% _) needs
-    // no escaping. SQLite `lower()` is ASCII-only, matching the ASCII needle.
-    let summary_rows = sqlx::query_as::<_, JobSearchRow>(
+    // no escaping. `lower()` is ASCII-only on SQLite, matching the ASCII needle.
+    let summary_rows = sqlx::query_as::<_, JobSearchRow>(&crate::db::q(pool,
         "SELECT run_id, action_name, job_key, attempt, ts, ok, timed_out, summary, stream_log_path \
          FROM job_outcomes \
-         WHERE summary IS NOT NULL AND instr(lower(summary), ?) > 0 \
+         WHERE summary IS NOT NULL AND strpos(lower(summary), ?) > 0 \
          ORDER BY id DESC LIMIT ?",
-    )
+    ))
     .bind(&needle)
     .bind(SEARCH_SUMMARY_LIMIT)
     .fetch_all(pool)
@@ -938,12 +983,12 @@ async fn search_jobs(
     if in_stream {
         // Scope: the most recent failed-job attempts that recorded a stream log
         // path. Fetch one past the cap to detect truncation.
-        let mut candidates = sqlx::query_as::<_, JobSearchRow>(
+        let mut candidates = sqlx::query_as::<_, JobSearchRow>(&crate::db::q(pool,
             "SELECT run_id, action_name, job_key, attempt, ts, ok, timed_out, summary, stream_log_path \
              FROM job_outcomes \
              WHERE ok = 0 AND stream_log_path IS NOT NULL \
              ORDER BY id DESC LIMIT ?",
-        )
+        ))
         .bind(SEARCH_STREAM_MAX_FILES as i64 + 1)
         .fetch_all(pool)
         .await?;
@@ -1181,8 +1226,8 @@ impl RunsView {
             "run" => "id",
             "action" => "action_name",
             "ended" => "ended_at",
-            // SQLite has no duration column; derive it from the timestamps.
-            "duration" => "(julianday(ended_at) - julianday(started_at))",
+            // No duration column; derive it from the timestamps.
+            "duration" => "elapsed_seconds(started_at, ended_at)",
             "jobs" => "jobs_processed",
             // CLAUDE-230: the derived count aliased by `run_row_columns`.
             "failed" => "failed_jobs",
@@ -1419,18 +1464,22 @@ async fn dashboard(
 
     // Today totals: sum across all actions
     let today = state::today_local().to_string();
-    let totals: Option<(i64, f64)> = sqlx::query_as(
-        "SELECT IFNULL(SUM(run_count), 0), IFNULL(SUM(cost_usd), 0.0) FROM daily_ledger WHERE date = ?",
-    )
+    let totals: Option<(i64, f64)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT CAST(COALESCE(SUM(run_count), 0) AS BIGINT), COALESCE(SUM(cost_usd), 0.0) \
+         FROM daily_ledger WHERE date = ?",
+    ))
     .bind(&today)
     .fetch_optional(pool)
     .await?;
-    let today_actions: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM daily_ledger WHERE date = ? AND run_count > 0")
-            .bind(&today)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+    let today_actions: i64 = sqlx::query_scalar(&crate::db::q(
+        pool,
+        "SELECT COUNT(*) FROM daily_ledger WHERE date = ? AND run_count > 0",
+    ))
+    .bind(&today)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
 
     let (today_runs, today_cost) = totals.unwrap_or((0, 0.0));
 
@@ -1441,8 +1490,7 @@ async fn dashboard(
     // CLAUDE-235: a count, not a table. The messages are on `/logs`; the
     // dashboard says how many there are and which of them the access check fixes.
     let since = events_window_start();
-    let access_failures =
-        state::access_failures_recent(pool, &since, ACCESS_FAILURE_NO_LIMIT).await?;
+    let access_failures = state::access_failures_recent(pool, &since, None).await?;
     let events_24h = state::run_events_count_since(pool, &since).await?;
 
     // CLAUDE-225: a dependency-blocked issue stays Queued with no field change,
@@ -1555,7 +1603,7 @@ async fn action_detail(
         "SELECT {} FROM runs WHERE action_name = ?{empty_filter} ORDER BY started_at DESC LIMIT 50",
         run_row_columns()
     );
-    let runs = sqlx::query_as::<_, RunRow>(&sql)
+    let runs = sqlx::query_as::<_, RunRow>(&crate::db::q(pool, &sql))
         .bind(&name)
         .fetch_all(pool)
         .await?;
@@ -1604,9 +1652,12 @@ async fn action_durations(
     }
     // Same recent window as the action-detail table (last 50 by start). The
     // query returns newest-first; the chart wants oldest-first, so reverse.
-    let runs = sqlx::query_as::<_, RunRow>(&format!(
-        "SELECT {} FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
-        run_row_columns()
+    let runs = sqlx::query_as::<_, RunRow>(&crate::db::q(
+        pool,
+        &format!(
+            "SELECT {} FROM runs WHERE action_name = ? ORDER BY started_at DESC LIMIT 50",
+            run_row_columns()
+        ),
     ))
     .bind(&name)
     .fetch_all(pool)
@@ -1645,12 +1696,6 @@ const EVENTS_PAGE_SIZE: i64 = 50;
 /// signal, not a second log; the table below carries the rest.
 const EVENTS_SUMMARY_LIMIT: i64 = 10;
 
-/// CLAUDE-235: the dashboard banner and the logs summary count every matching
-/// event rather than rendering a bounded table, so the access-failure read takes
-/// no upper bound (SQLite treats a negative `LIMIT` as unlimited). A silently
-/// truncated count would understate an outage.
-const ACCESS_FAILURE_NO_LIMIT: i64 = -1;
-
 /// CLAUDE-216 / CLAUDE-235: start of the 24h diagnostics window shared by the
 /// dashboard banner, the logs summary cards, and the logs page's `since=24h`
 /// selection, so the three never disagree about what "last 24h" means.
@@ -1661,11 +1706,13 @@ fn events_window_start() -> String {
 
 /// CLAUDE-171: distinct `level` values present in `run_events`, alphabetically.
 /// Drives the Level dropdown and whitelists the incoming `?level=`.
-async fn distinct_event_levels(pool: &SqlitePool) -> Result<Vec<String>, WebError> {
-    let rows =
-        sqlx::query_scalar::<_, String>("SELECT DISTINCT level FROM run_events ORDER BY level")
-            .fetch_all(pool)
-            .await?;
+async fn distinct_event_levels(pool: &DbPool) -> Result<Vec<String>, WebError> {
+    let rows = sqlx::query_scalar::<_, String>(&crate::db::q(
+        pool,
+        "SELECT DISTINCT level FROM run_events ORDER BY level",
+    ))
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
 }
 
@@ -1673,10 +1720,11 @@ async fn distinct_event_levels(pool: &SqlitePool) -> Result<Vec<String>, WebErro
 /// alphabetically. Drives the Action dropdown and whitelists `?action=`. Note
 /// this is the events table's own action column, not `runs`': an action can have
 /// diagnostics without ever having produced a run row.
-async fn distinct_event_actions(pool: &SqlitePool) -> Result<Vec<String>, WebError> {
-    let rows = sqlx::query_scalar::<_, String>(
+async fn distinct_event_actions(pool: &DbPool) -> Result<Vec<String>, WebError> {
+    let rows = sqlx::query_scalar::<_, String>(&crate::db::q(
+        pool,
         "SELECT DISTINCT action_name FROM run_events ORDER BY action_name",
-    )
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -1686,10 +1734,10 @@ async fn distinct_event_actions(pool: &SqlitePool) -> Result<Vec<String>, WebErr
 /// alphabetically. Drives the Context dropdown and whitelists `?context=`.
 /// `context` is free-form (a project key, or `config-collision`) and nullable;
 /// NULL/empty is not a selectable value, so it is excluded from the list.
-async fn distinct_event_contexts(pool: &SqlitePool) -> Result<Vec<String>, WebError> {
-    let rows = sqlx::query_scalar::<_, String>(
+async fn distinct_event_contexts(pool: &DbPool) -> Result<Vec<String>, WebError> {
+    let rows = sqlx::query_scalar::<_, String>(&crate::db::q(pool,
         "SELECT DISTINCT context FROM run_events WHERE context IS NOT NULL AND context <> '' ORDER BY context",
-    )
+    ))
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -1701,7 +1749,7 @@ async fn distinct_event_contexts(pool: &SqlitePool) -> Result<Vec<String>, WebEr
 /// `context` against the actual distinct DB values), so nothing user-controlled
 /// reaches the SQL text and every string echoed back into the page or a query
 /// string is known-safe. `q` is the one free-form field: it never reaches the
-/// clause text either, only a bound `instr()` parameter.
+/// clause text either, only a bound `strpos()` parameter.
 #[derive(Default, Clone)]
 struct EventsView {
     /// `asc` or `desc`; empty (the default) sorts descending (newest first).
@@ -1762,11 +1810,11 @@ impl EventsView {
             binds.push(self.context.clone());
         }
         if !self.q.is_empty() {
-            // Same plain substring test as the CLAUDE-143 run search: `instr`
-            // over a lowercased needle, so LIKE metacharacters (% _) in the
-            // query text need no escaping. SQLite `lower()` is ASCII-only,
-            // matching the ASCII needle.
-            conds.push("instr(lower(message), ?) > 0".to_string());
+            // Same plain substring test as the CLAUDE-143 run search:
+            // `strpos` over a lowercased needle, so LIKE metacharacters (% _)
+            // in the query text need no escaping. `lower()` is ASCII-only on
+            // SQLite, matching the ASCII needle.
+            conds.push("strpos(lower(message), ?) > 0".to_string());
             binds.push(self.q.to_ascii_lowercase());
         }
         // CLAUDE-235: three windows, one bound. `all` leaves it off, `24h` uses
@@ -1848,12 +1896,13 @@ impl EventsView {
 /// bounds and the "X-Y of N" indicator. Counts over the same `WHERE` as
 /// [`fetch_run_events`], so the two never disagree.
 async fn count_run_events(
-    pool: &SqlitePool,
+    pool: &DbPool,
     view: &EventsView,
     started_at: Option<&str>,
 ) -> Result<i64, WebError> {
     let (where_clause, binds) = view.where_clause(started_at);
     let sql = format!("SELECT COUNT(*) FROM run_events{where_clause}");
+    let sql = crate::db::q(pool, &sql).into_owned();
     let mut q = sqlx::query_scalar::<_, i64>(&sql);
     for b in &binds {
         q = q.bind(b);
@@ -1864,7 +1913,7 @@ async fn count_run_events(
 /// CLAUDE-171: one page of `run_events` rows under the active filter. Every row
 /// is returned as recorded: no dedup here, unlike the action-detail summary.
 async fn fetch_run_events(
-    pool: &SqlitePool,
+    pool: &DbPool,
     view: &EventsView,
     started_at: Option<&str>,
     limit: i64,
@@ -1875,6 +1924,7 @@ async fn fetch_run_events(
     let sql = format!(
         "SELECT run_id, ts, level, context, message, action_name FROM run_events{where_clause} {order_by} LIMIT ? OFFSET ?"
     );
+    let sql = crate::db::q(pool, &sql).into_owned();
     let mut q = sqlx::query_as::<_, state::RunEventLogRecord>(&sql);
     for b in &binds {
         q = q.bind(b);
@@ -2221,7 +2271,7 @@ enabled: false\n";
 /// Resolve an indexed action's on-disk path by exact name. Only names the
 /// daemon has scanned (always under `actions_dir`) resolve, so a hostile
 /// `:name` such as `../../etc/passwd` can never reach the filesystem here.
-async fn indexed_action_path(pool: &SqlitePool, name: &str) -> Result<Option<String>, WebError> {
+async fn indexed_action_path(pool: &DbPool, name: &str) -> Result<Option<String>, WebError> {
     let rows = state::action_index_list(pool).await?;
     Ok(rows
         .into_iter()
@@ -4366,7 +4416,7 @@ struct AboutTpl {
 /// Mirrors the CLI's `configured_update_token` (CLAUDE-158): nothing is decrypted
 /// here; the secret is resolved only on registry escalation.
 fn configured_update_token(
-    pool: &SqlitePool,
+    pool: &DbPool,
     cfg: &crate::config::UpdateConfig,
 ) -> Option<crate::update::ConfiguredToken> {
     cfg.token_ref
@@ -4717,9 +4767,9 @@ async fn run_detail(
     Query(q): Query<RunDetailQuery>,
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
-    let Some(run): Option<RunRow> = sqlx::query_as::<_, RunRow>(&format!(
-        "SELECT {} FROM runs WHERE id = ?",
-        run_row_columns()
+    let Some(run): Option<RunRow> = sqlx::query_as::<_, RunRow>(&crate::db::q(
+        pool,
+        &format!("SELECT {} FROM runs WHERE id = ?", run_row_columns()),
     ))
     .bind(id)
     .fetch_optional(pool)
@@ -4727,21 +4777,23 @@ async fn run_detail(
     else {
         return Ok((StatusCode::NOT_FOUND, format!("no run #{id}")).into_response());
     };
-    let outcomes = sqlx::query_as::<_, JobOutcomeRow>(
+    let outcomes = sqlx::query_as::<_, JobOutcomeRow>(&crate::db::q(pool,
         "SELECT job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, attempt_counted, duration_ms, timed_out, summary FROM job_outcomes WHERE run_id = ? ORDER BY id ASC",
-    )
+    ))
     .bind(id)
     .fetch_all(pool)
     .await?;
 
     // Look up the action's link_template once and reuse for both planned
     // jobs and the outcomes table.
-    let link_template: Option<String> =
-        sqlx::query_scalar("SELECT link_template FROM actions WHERE name = ?")
-            .bind(&run.action_name)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
+    let link_template: Option<String> = sqlx::query_scalar(&crate::db::q(
+        pool,
+        "SELECT link_template FROM actions WHERE name = ?",
+    ))
+    .bind(&run.action_name)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
 
     let planned_keys = state::run_job_keys(pool, run.id).await.unwrap_or_default();
     // CLAUDE-93: per-job links recorded on the run (the webhook
@@ -4910,11 +4962,13 @@ async fn job_stream_page(
     AxumPath((id, key, attempt)): AxumPath<(i64, String, u32)>,
 ) -> Result<Html<String>, WebError> {
     // Resolve the run's action so we can compute the stream-log path.
-    let action_name: Option<String> =
-        sqlx::query_scalar("SELECT action_name FROM runs WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&s.api.pool)
-            .await?;
+    let action_name: Option<String> = sqlx::query_scalar(&crate::db::q(
+        &s.api.pool,
+        "SELECT action_name FROM runs WHERE id = ?",
+    ))
+    .bind(id)
+    .fetch_optional(&s.api.pool)
+    .await?;
     let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
     let stream = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
     let tpl = JobStreamTpl {
@@ -4954,11 +5008,13 @@ async fn job_stream_sse(
     headers: HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, WebError> {
-    let run: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT action_name, ended_at FROM runs WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&s.api.pool)
-            .await?;
+    let run: Option<(String, Option<String>)> = sqlx::query_as(&crate::db::q(
+        &s.api.pool,
+        "SELECT action_name, ended_at FROM runs WHERE id = ?",
+    ))
+    .bind(id)
+    .fetch_optional(&s.api.pool)
+    .await?;
     let (action_name, ended_at) =
         run.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
     // CLAUDE-245: a finished run's log will never appear, so an absent file is a
@@ -5047,9 +5103,9 @@ async fn job_stream_sse(
                 Ok(None) => {
                     // EOF: either the run is still writing more, or it's done.
                     // Check the DB to decide whether to keep waiting.
-                    let done: Option<i64> = sqlx::query_scalar(
+                    let done: Option<i64> = sqlx::query_scalar(&crate::db::q(&pool,
                         "SELECT id FROM job_outcomes WHERE run_id = ? AND job_key = ? AND attempt = ?",
-                    )
+                    ))
                     .bind(id)
                     .bind(&key)
                     .bind(attempt as i64)
@@ -5464,7 +5520,7 @@ mod tests {
         );
         assert_eq!(
             v("duration", "asc").order_by(),
-            "ORDER BY (julianday(ended_at) - julianday(started_at)) ASC, id DESC"
+            "ORDER BY elapsed_seconds(started_at, ended_at) ASC, id DESC"
         );
         // Empty / unknown sort falls back to the pre-CLAUDE-141 default.
         assert_eq!(v("", "").order_by(), "ORDER BY started_at DESC, id DESC");
@@ -5896,24 +5952,16 @@ mod tests {
     // ---- job-outcome filter, DB-backed (CLAUDE-230) -----------------------
     mod outcome_filter {
         use super::super::{count_recent_runs, fetch_recent_runs, RunsView};
-        use crate::db::MIGRATOR;
+        use crate::db::DbPool;
         use crate::state;
-        use sqlx::sqlite::SqlitePoolOptions;
-        use sqlx::SqlitePool;
 
-        async fn pool() -> SqlitePool {
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            MIGRATOR.run(&pool).await.unwrap();
-            pool
+        async fn pool() -> DbPool {
+            crate::db::test_pool().await
         }
 
         /// Seed one finished (exit 0) run and its job attempts, given as
         /// `(job_key, attempt, ok, timed_out)`. Returns the run id.
-        async fn seed_run(pool: &SqlitePool, attempts: &[(&str, u32, bool, bool)]) -> i64 {
+        async fn seed_run(pool: &DbPool, attempts: &[(&str, u32, bool, bool)]) -> i64 {
             let id = state::run_begin(pool, "youtrack", "schedule")
                 .await
                 .unwrap();
@@ -5943,7 +5991,7 @@ mod tests {
             id
         }
 
-        async fn matching(pool: &SqlitePool, outcome: &str) -> Vec<i64> {
+        async fn matching(pool: &DbPool, outcome: &str) -> Vec<i64> {
             let view = RunsView {
                 outcome: outcome.to_string(),
                 ..RunsView::default()
@@ -6039,14 +6087,12 @@ mod tests {
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
         use crate::config::Paths;
-        use crate::db::MIGRATOR;
+        use crate::db::DbPool;
         use crate::state;
         use axum::extract::Query;
         use axum::extract::{Form, Path as AxumPath, State};
         use axum::http::StatusCode;
         use axum::response::{IntoResponse, Response};
-        use sqlx::sqlite::SqlitePoolOptions;
-        use sqlx::SqlitePool;
         use std::sync::Arc;
 
         /// A valid native youtrack action. `native: {}` resolves every field to
@@ -6057,12 +6103,7 @@ mod tests {
         /// `Paths`. The trigger receiver is dropped; none of the editor handlers
         /// send on it.
         async fn web_state(tmp: &std::path::Path) -> WebState {
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            MIGRATOR.run(&pool).await.unwrap();
+            let pool = crate::db::test_pool().await;
             let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
             let api = Arc::new(AppState {
                 pool: pool.clone(),
@@ -6102,7 +6143,7 @@ mod tests {
 
         /// Register an action in the index so `indexed_action_path` resolves it
         /// to `file_path` (the only names the edit/export handlers will touch).
-        async fn index_action(pool: &SqlitePool, name: &str, file_path: &str) {
+        async fn index_action(pool: &DbPool, name: &str, file_path: &str) {
             state::action_index_upsert(
                 pool,
                 &state::ActionIndexRow {
@@ -6180,7 +6221,7 @@ mod tests {
         /// Record `n` byte-identical input events for `action`, one per poll
         /// second apart, mimicking a diagnostic that re-fires every poll.
         async fn record_repeats(
-            pool: &SqlitePool,
+            pool: &DbPool,
             action: &str,
             level: &str,
             context: &str,
@@ -6800,7 +6841,7 @@ mod tests {
             let (clause, binds) = view.where_clause(Some("2999-01-01T00:00:00Z"));
             assert_eq!(
                 clause,
-                " WHERE level = ? AND action_name = ? AND context = ? AND instr(lower(message), ?) > 0 AND ts >= ?"
+                " WHERE level = ? AND action_name = ? AND context = ? AND strpos(lower(message), ?) > 0 AND ts >= ?"
             );
             assert_eq!(
                 binds,
@@ -7028,11 +7069,14 @@ mod tests {
                 0
             );
             // History is kept.
-            let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE action_name = ?")
-                .bind("act")
-                .fetch_one(&s.api.pool)
-                .await
-                .unwrap();
+            let runs: i64 = sqlx::query_scalar(&crate::db::q(
+                &s.api.pool,
+                "SELECT COUNT(*) FROM runs WHERE action_name = ?",
+            ))
+            .bind("act")
+            .fetch_one(&s.api.pool)
+            .await
+            .unwrap();
             assert_eq!(runs, 1, "run history survives the delete");
         }
 
@@ -8786,22 +8830,15 @@ mod tests {
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
         use crate::config::Paths;
-        use crate::db::MIGRATOR;
         use crate::state;
         use age::secrecy::ExposeSecret;
         use axum::extract::{Form, Path as AxumPath, State};
         use axum::http::StatusCode;
         use axum::response::IntoResponse;
-        use sqlx::sqlite::SqlitePoolOptions;
         use std::sync::Arc;
 
         pub(super) async fn web_state(tmp: &std::path::Path) -> WebState {
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            MIGRATOR.run(&pool).await.unwrap();
+            let pool = crate::db::test_pool().await;
             let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
             let api = Arc::new(AppState {
                 pool: pool.clone(),
@@ -9053,20 +9090,13 @@ mod tests {
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
         use crate::config::Paths;
-        use crate::db::MIGRATOR;
         use axum::extract::State;
         use axum::http::StatusCode;
         use axum::response::Response;
-        use sqlx::sqlite::SqlitePoolOptions;
         use std::sync::Arc;
 
         async fn web_state() -> WebState {
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            MIGRATOR.run(&pool).await.unwrap();
+            let pool = crate::db::test_pool().await;
             let (trigger_tx, _rx) = tokio::sync::mpsc::channel(8);
             let api = Arc::new(AppState {
                 pool: pool.clone(),
@@ -9208,25 +9238,18 @@ mod tests {
     /// stream file must not error.
     mod search {
         use super::super::{match_snippet, search_jobs, stream_match_snippet, StreamGrep};
-        use crate::db::MIGRATOR;
-        use sqlx::sqlite::SqlitePoolOptions;
-        use sqlx::SqlitePool;
+        use crate::db::DbPool;
 
-        async fn pool() -> SqlitePool {
-            let pool = SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect("sqlite::memory:")
-                .await
-                .unwrap();
-            MIGRATOR.run(&pool).await.unwrap();
-            pool
+        async fn pool() -> DbPool {
+            crate::db::test_pool().await
         }
 
-        async fn seed_run(pool: &SqlitePool, id: i64) {
-            sqlx::query(
+        async fn seed_run(pool: &DbPool, id: i64) {
+            sqlx::query(&crate::db::q(
+                pool,
                 "INSERT INTO runs (id, action_name, started_at, triggered_by) \
                  VALUES (?, 'act', '2026-06-26T00:00:00+00:00', 'schedule')",
-            )
+            ))
             .bind(id)
             .execute(pool)
             .await
@@ -9235,7 +9258,7 @@ mod tests {
 
         #[allow(clippy::too_many_arguments)]
         async fn seed_job(
-            pool: &SqlitePool,
+            pool: &DbPool,
             run_id: i64,
             job_key: &str,
             attempt: i64,
@@ -9244,17 +9267,17 @@ mod tests {
             summary: Option<&str>,
             stream_log_path: Option<&str>,
         ) {
-            sqlx::query(
+            sqlx::query(&crate::db::q(pool,
                 "INSERT INTO job_outcomes \
                  (run_id, action_name, job_key, attempt, ts, ok, claude_ran, claude_ok, summary, stream_log_path) \
                  VALUES (?, 'act', ?, ?, ?, ?, 1, ?, ?, ?)",
-            )
+            ))
             .bind(run_id)
             .bind(job_key)
             .bind(attempt)
             .bind(ts)
-            .bind(ok)
-            .bind(ok)
+            .bind(ok as i64)
+            .bind(ok as i64)
             .bind(summary)
             .bind(stream_log_path)
             .execute(pool)

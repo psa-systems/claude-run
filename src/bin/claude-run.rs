@@ -409,6 +409,9 @@ async fn real_main(
     let paths = cfg::Paths::resolve()?;
     let (on_disk, config_source) = cfg::OnDiskConfig::load(&paths)?;
     apply_config_log_filter(&log_reload, on_disk.daemon.log_filter.as_deref());
+    // CLAUDE-250: which state store to open, resolved once so every subcommand
+    // and the daemon agree on the backend.
+    let db_target = cfg::resolve_database(&paths, &on_disk.database)?;
 
     let actions_dir = cli
         .actions_dir
@@ -417,7 +420,9 @@ async fn real_main(
         .unwrap_or_else(|| paths.actions_dir());
 
     match cli.cmd {
-        Cmd::Run { action } => run_action(&action, &actions_dir, &paths, &on_disk).await,
+        Cmd::Run { action } => {
+            run_action(&action, &actions_dir, &paths, &on_disk, &db_target).await
+        }
         Cmd::Serve { detach, no_socket } => {
             serve(
                 detach,
@@ -435,14 +440,14 @@ async fn real_main(
         }
         Cmd::Trigger { action } => trigger(&action, &paths).await,
         Cmd::Cancel { run_id } => cancel_run(run_id, &paths).await,
-        Cmd::Pause { action, reason } => pause(action, reason, &paths).await,
-        Cmd::Resume { action } => resume(action, &paths).await,
-        Cmd::Status => status(&paths).await,
-        Cmd::Action(c) => action_cmd(c, &paths, &actions_dir).await,
-        Cmd::Access(c) => access_cmd(c, &paths).await,
-        Cmd::Secret(c) => secret_cmd(c, &paths).await,
+        Cmd::Pause { action, reason } => pause(action, reason, &paths, &db_target).await,
+        Cmd::Resume { action } => resume(action, &paths, &db_target).await,
+        Cmd::Status => status(&paths, &db_target).await,
+        Cmd::Action(c) => action_cmd(c, &paths, &actions_dir, &db_target).await,
+        Cmd::Access(c) => access_cmd(c, &paths, &db_target).await,
+        Cmd::Secret(c) => secret_cmd(c, &db_target).await,
         Cmd::Migrate { from } => {
-            let pool = db::open(&paths.state_db()).await?;
+            let pool = db::open(&db_target).await?;
             let legacy = from.map(PathBuf::from).unwrap_or_else(|| {
                 dirs::home_dir()
                     .unwrap()
@@ -457,14 +462,14 @@ async fn real_main(
             );
             Ok(exit::OK)
         }
-        Cmd::Version { cmd } => version_cmd(cmd, &paths, &on_disk).await,
+        Cmd::Version { cmd } => version_cmd(cmd, &on_disk, &db_target).await,
     }
 }
 
 async fn version_cmd(
     cmd: Option<VersionCmd>,
-    paths: &cfg::Paths,
     on_disk: &cfg::OnDiskConfig,
+    db_target: &cfg::DatabaseTarget,
 ) -> claude_run::error::Result<i32> {
     match cmd.unwrap_or(VersionCmd::Show) {
         VersionCmd::Show => {
@@ -477,7 +482,7 @@ async fn version_cmd(
         } => {
             // CLAUDE-101: the update config is DB-backed; read the effective value
             // (DB wins, file is the fallback before any serve migrated it).
-            let pool = db::open(&paths.state_db()).await?;
+            let pool = db::open(db_target).await?;
             let update_cfg = settings::effective_update(&pool, on_disk).await?;
             let train = resolve_train(train, &update_cfg.train)?;
             let configured = configured_update_token(&pool, &update_cfg);
@@ -489,7 +494,7 @@ async fn version_cmd(
             use_fj_token,
             yes,
         } => {
-            let pool = db::open(&paths.state_db()).await?;
+            let pool = db::open(db_target).await?;
             let update_cfg = settings::effective_update(&pool, on_disk).await?;
             let train = resolve_train(train, &update_cfg.train)?;
             let configured = configured_update_token(&pool, &update_cfg);
@@ -516,7 +521,7 @@ fn resolve_train(
 /// the configured-token branch is taken, so a configured `token_ref` no longer
 /// forces `CLAUDE_RUN_SECRETS_KEY_FILE` to be present up front.
 fn configured_update_token(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::DbPool,
     update_cfg: &cfg::UpdateConfig,
 ) -> Option<update::ConfiguredToken> {
     update_cfg
@@ -530,11 +535,12 @@ async fn run_action(
     actions_dir: &std::path::Path,
     paths: &cfg::Paths,
     on_disk: &cfg::OnDiskConfig,
+    db_target: &cfg::DatabaseTarget,
 ) -> claude_run::error::Result<i32> {
     let loaded = action::load(arg, actions_dir)?;
     tracing::info!(action = %loaded.action.name, path = %loaded.path.display(), "starting run");
 
-    let pool = db::open(&paths.state_db()).await?;
+    let pool = db::open(db_target).await?;
 
     // Pause checks (Phase 2 contract)
     if state::global_pause_status(&pool).await?.is_some() {
@@ -813,6 +819,7 @@ async fn pause(
     action: Option<String>,
     reason: Option<String>,
     paths: &cfg::Paths,
+    db_target: &cfg::DatabaseTarget,
 ) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     let body = reason.as_ref().map(|r| json!({"reason": r}));
@@ -826,7 +833,7 @@ async fn pause(
         let v: serde_json::Value = c.post(&path, body.as_ref()).await?;
         jsonfmt::print_json(&v)?;
     } else {
-        let pool = db::open(&paths.state_db()).await?;
+        let pool = db::open(db_target).await?;
         match action {
             Some(name) => state::action_pause_set(&pool, &name, reason.as_deref()).await?,
             None => state::global_pause_set(&pool, reason.as_deref()).await?,
@@ -836,7 +843,11 @@ async fn pause(
     Ok(exit::OK)
 }
 
-async fn resume(action: Option<String>, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+async fn resume(
+    action: Option<String>,
+    paths: &cfg::Paths,
+    db_target: &cfg::DatabaseTarget,
+) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     if DaemonClient::is_reachable(&sock) {
         let c = DaemonClient::new(&sock);
@@ -847,7 +858,7 @@ async fn resume(action: Option<String>, paths: &cfg::Paths) -> claude_run::error
         let v: serde_json::Value = c.post(&path, None).await?;
         jsonfmt::print_json(&v)?;
     } else {
-        let pool = db::open(&paths.state_db()).await?;
+        let pool = db::open(db_target).await?;
         match action {
             Some(name) => state::action_pause_clear(&pool, &name).await?,
             None => state::global_pause_clear(&pool).await?,
@@ -857,7 +868,10 @@ async fn resume(action: Option<String>, paths: &cfg::Paths) -> claude_run::error
     Ok(exit::OK)
 }
 
-async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+async fn status(
+    paths: &cfg::Paths,
+    db_target: &cfg::DatabaseTarget,
+) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     if DaemonClient::is_reachable(&sock) {
         let c = DaemonClient::new(&sock);
@@ -865,7 +879,7 @@ async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
         jsonfmt::print_json(&v)?;
         return Ok(exit::OK);
     }
-    let pool = db::open(&paths.state_db()).await?;
+    let pool = db::open(db_target).await?;
     jsonfmt::print_json(&daemonless_status(&pool, &sock).await?)?;
     Ok(exit::OK)
 }
@@ -874,7 +888,7 @@ async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
 /// (CLAUDE-232) so the blocks it must carry are testable without a live daemon
 /// or captured stdout.
 async fn daemonless_status(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::DbPool,
     sock: &std::path::Path,
 ) -> claude_run::error::Result<serde_json::Value> {
     let global = state::global_pause_status(pool).await?;
@@ -921,8 +935,9 @@ async fn action_cmd(
     cmd: ActionCmd,
     paths: &cfg::Paths,
     actions_dir: &std::path::Path,
+    db_target: &cfg::DatabaseTarget,
 ) -> claude_run::error::Result<i32> {
-    let pool = db::open(&paths.state_db()).await?;
+    let pool = db::open(db_target).await?;
     let sock = daemon::daemon_socket_path(paths);
     let reachable = DaemonClient::is_reachable(&sock);
     if !reachable {
@@ -995,7 +1010,11 @@ async fn action_cmd(
 /// PATH and env) and runs the same service directly against the DB when it is
 /// not. Prints the typed report as JSON either way, and exits `CONFIG_ERROR`
 /// when any probe failed so it is usable as a deployment smoke test.
-async fn access_cmd(cmd: AccessCmd, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+async fn access_cmd(
+    cmd: AccessCmd,
+    paths: &cfg::Paths,
+    db_target: &cfg::DatabaseTarget,
+) -> claude_run::error::Result<i32> {
     let AccessCmd::Check {
         repo,
         host,
@@ -1016,7 +1035,7 @@ async fn access_cmd(cmd: AccessCmd, paths: &cfg::Paths) -> claude_run::error::Re
         c.post("/access/check", Some(&serde_json::to_value(&req)?))
             .await?
     } else {
-        let pool = db::open(&paths.state_db()).await?;
+        let pool = db::open(db_target).await?;
         match access::check(&pool, &api::access_cred_base(paths), &req).await {
             Ok(r) => r,
             Err(e) => access::AccessReport::from_error(&e),
@@ -1032,8 +1051,11 @@ async fn access_cmd(cmd: AccessCmd, paths: &cfg::Paths) -> claude_run::error::Re
     }
 }
 
-async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
-    let pool = db::open(&paths.state_db()).await?;
+async fn secret_cmd(
+    cmd: SecretCmd,
+    db_target: &cfg::DatabaseTarget,
+) -> claude_run::error::Result<i32> {
+    let pool = db::open(db_target).await?;
     match cmd {
         SecretCmd::Set { name } => {
             // The value never appears in argv (shell history, `ps`). Interactive
@@ -1253,7 +1275,7 @@ mod tests {
     #[tokio::test]
     async fn daemonless_status_reports_keys_parked_at_the_attempt_cap() {
         let dir = tempfile::tempdir().unwrap();
-        let pool = db::open(&dir.path().join("state.db")).await.unwrap();
+        let pool = db::open_sqlite(&dir.path().join("state.db")).await.unwrap();
         let sock = dir.path().join("daemon.sock");
 
         let report = daemonless_status(&pool, &sock).await.unwrap();

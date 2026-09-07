@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use sqlx::SqlitePool;
+use crate::db::DbPool;
 
 use crate::config::{AuthConfig, Paths};
 use crate::error::Result;
@@ -92,7 +92,7 @@ pub fn default_fj_data_home() -> PathBuf {
 /// not stop the Forgejo login from being written, and neither is worth refusing
 /// to start over.
 pub async fn materialize(
-    pool: &SqlitePool,
+    pool: &DbPool,
     paths: &Paths,
     cfg: &AuthConfig,
     fj_data_home: &Path,
@@ -234,12 +234,7 @@ mod tests {
     async fn nothing_configured_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::db::MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::db::test_pool().await;
 
         let (status, key) = materialize(
             &pool,

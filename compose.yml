@@ -49,6 +49,23 @@ services:
       # first start. Set CLAUDE_RUN_SECRETS_KEY_FILE only to supply your own,
       # e.g. from a secret store; the value is a PATH, never key material.
       CLAUDE_RUN_LOG: info
+      # CLAUDE-250: uncomment together with the `claude-run-database-url` secret
+      # below to put the runner state on the `postgres` profile's server instead
+      # of the SQLite file on claude-bot-data. Unset means SQLite, which is what
+      # this file does by default. The URL travels as a file, not as an
+      # environment value, because it carries the password.
+      # CLAUDE_RUN_DATABASE_URL_FILE: /run/secrets/claude-run-database-url
+    # CLAUDE-250: uncomment with the variable above; the daemon reads the URL
+    # from the file this mounts.
+    # secrets:
+    #   - claude-run-database-url
+    # CLAUDE-250: `required: false` so this stays a no-op without
+    # `--profile postgres`: the plain stack is SQLite-only and must not wait on
+    # a service that was never started.
+    depends_on:
+      claude-bot-postgres:
+        condition: service_healthy
+        required: false
     volumes:
       # CLAUDE-253: three mounts, not seven. Each tool's store is a
       # subdirectory of one of these rather than a mount point of its own,
@@ -76,6 +93,38 @@ services:
     tmpfs:
       - /run/claude-run
 
+  # CLAUDE-250: the optional PostgreSQL state store. Behind a profile, so a plain
+  # `docker compose up` starts exactly the service set it started before this
+  # existed; `docker compose --profile postgres up` adds the database. Nothing
+  # is carried over from an existing state.db (that is CLAUDE-251), so the first
+  # start on this backend is a fresh instance.
+  claude-bot-postgres:
+    container_name: claude-bot-postgres
+    image: docker.io/postgres:18.4-alpine3.23
+    profiles:
+      - postgres
+    restart: unless-stopped
+    networks:
+      claude-bot-private:
+    environment:
+      POSTGRES_DB: claude_run
+      POSTGRES_USER: claude_run
+      # A file mount rather than POSTGRES_PASSWORD, which `docker inspect` and
+      # /proc/<pid>/environ would expose.
+      POSTGRES_PASSWORD_FILE: /run/secrets/claude-run-postgres-password
+    secrets:
+      - claude-run-postgres-password
+    volumes:
+      - type: volume
+        source: claude-bot-postgres
+        target: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=claude_run --dbname=claude_run"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
 networks:
   claude-bot-private:
     name: claude-bot-private
@@ -87,3 +136,19 @@ volumes:
     name: claude-bot-data
   claude-bot-state:
     name: claude-bot-state
+  # CLAUDE-250: only mounted by the profiled claude-bot-postgres service.
+  claude-bot-postgres:
+    name: claude-bot-postgres
+
+# CLAUDE-250: the two files the `postgres` profile needs. Create them before
+# `docker compose --profile postgres up`:
+#   mkdir secrets; chmod 700 secrets
+#   openssl rand -base64 32 | save secrets/postgres-password.txt
+#   $"postgres://claude_run:($password)@claude-bot-postgres:5432/claude_run" | save secrets/database-url.txt
+# The daemon reads the URL only when CLAUDE_RUN_DATABASE_URL_FILE above is
+# uncommented; without it the stack stays on SQLite even with the profile on.
+secrets:
+  claude-run-postgres-password:
+    file: ./secrets/postgres-password.txt
+  claude-run-database-url:
+    file: ./secrets/database-url.txt
