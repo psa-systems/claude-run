@@ -2639,6 +2639,9 @@ struct YoutrackEditForm {
     /// CLAUDE-239: per-action `--model`; blank inherits the global
     /// `config.claude.model`.
     claude_model: String,
+    /// CLAUDE-259: per-action `--effort`; blank inherits the global
+    /// `config.claude.effort`.
+    claude_effort: String,
     limit_max_attempts_per_key: String,
     limit_max_runs_per_day: String,
     limit_claude_timeout_seconds: String,
@@ -2753,6 +2756,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         claude_allowed_tools: s(&a.claude.allowed_tools),
         claude_permission_mode: s(&a.claude.permission_mode),
         claude_model: s(&a.claude.model),
+        claude_effort: s(&a.claude.effort),
         limit_max_attempts_per_key: n(a.limits.max_attempts_per_key),
         limit_max_runs_per_day: n(a.limits.max_runs_per_day),
         limit_claude_timeout_seconds: n(a.limits.claude_timeout_seconds),
@@ -2992,6 +2996,7 @@ fn youtrack_form_to_yaml(
         allowed_tools: opt(&form.claude_allowed_tools),
         permission_mode: opt(&form.claude_permission_mode),
         model: opt(&form.claude_model),
+        effort: opt(&form.claude_effort),
     };
     set_or_remove(
         map,
@@ -3773,11 +3778,18 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "cadence (seconds) the scheduler starts overlapping pickup runs; >= 1.",
             },
         ],
-        Claude => vec![FieldDoc {
-            name: "model",
-            badge: "next invocation",
-            note: "default --model for every action that pins no claude.model; null = the claude CLI's own default. Passed through unvalidated (sonnet, opus, claude-sonnet-4-5-20250929, ...).",
-        }],
+        Claude => vec![
+            FieldDoc {
+                name: "model",
+                badge: "next invocation",
+                note: "default --model for every action that pins no claude.model; null = the claude CLI's own default. Passed through unvalidated (sonnet, opus, claude-sonnet-4-5-20250929, ...).",
+            },
+            FieldDoc {
+                name: "effort",
+                badge: "next invocation",
+                note: "default --effort for every action that pins no claude.effort; null = the claude CLI's own default. low, medium, high, xhigh, max; another value is warned about and still passed through.",
+            },
+        ],
         DbRetention => vec![
             FieldDoc {
                 name: "enabled",
@@ -7096,6 +7108,7 @@ mod tests {
             f.schedule_spec = "5m".to_string();
             f.claude_permission_mode = "acceptEdits".to_string();
             f.claude_model = "opus".to_string();
+            f.claude_effort = "xhigh".to_string();
             f.limit_max_runs_per_day = "24".to_string();
             f.limit_daily_budget_usd = "1.50".to_string();
             f.enabled = Some("on".to_string());
@@ -7126,6 +7139,8 @@ mod tests {
             // CLAUDE-239: the editor carries the per-action model, so saving an
             // action through the form does not drop a pinned `model:`.
             assert_eq!(a.claude.model.as_deref(), Some("opus"));
+            // CLAUDE-259: same for a pinned `effort:`.
+            assert_eq!(a.claude.effort.as_deref(), Some("xhigh"));
             let sched = a.schedule.unwrap();
             assert_eq!(sched.kind, crate::action::ScheduleKind::Interval);
             assert_eq!(sched.spec.as_deref(), Some("5m"));
@@ -7704,6 +7719,44 @@ mod tests {
             assert!(body.contains("value=\"interval\" selected"));
         }
 
+        /// CLAUDE-259: the Effort select preselects the stored level, and a level
+        /// outside the documented set renders as its own selected option instead
+        /// of falling back to blank, so saving the form cannot silently drop or
+        /// rewrite a value written by hand or through the API.
+        #[tokio::test]
+        async fn youtrack_edit_page_preselects_the_stored_effort() {
+            for (stored, expected) in [("xhigh", "xhigh"), ("colossal", "colossal")] {
+                let tmp = tempfile::tempdir().unwrap();
+                let s = web_state(tmp.path()).await;
+                let actions = s.paths.actions_dir();
+                std::fs::create_dir_all(&actions).unwrap();
+                let file = actions.join("yt.yml");
+                std::fs::write(
+                    &file,
+                    format!("name: yt\nkind: youtrack\nnative:\n  youtrack:\n    query: \"q\"\nclaude:\n  effort: {stored}\n"),
+                )
+                .unwrap();
+                index_action(&s.api.pool, "yt", file.to_str().unwrap()).await;
+
+                let resp = youtrack_edit_page(State(s.clone()), AxumPath("yt".to_string()))
+                    .await
+                    .unwrap()
+                    .into_response();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = body_string(resp).await;
+                assert!(
+                    body.contains(&format!("value=\"{expected}\" selected")),
+                    "`{stored}` must render as the selected option"
+                );
+                // The blank "inherit the global default" option is not selected
+                // while a value is stored.
+                assert!(
+                    !body.contains("<option value=\"\" selected>(the config.claude default)"),
+                    "`{stored}` must not fall back to the blank option"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn youtrack_edit_page_redirects_for_scripted_action() {
             let tmp = tempfile::tempdir().unwrap();
@@ -7881,6 +7934,19 @@ mod tests {
             );
             assert!(html.contains("/settings/claude"), "with its form");
             assert!(html.contains("model"), "and its field reference");
+            // CLAUDE-259: the effort field reference plus the level picker that
+            // rewrites the `effort` key in the JSON editor, clear button included.
+            assert!(html.contains("effort"), "the effort field reference");
+            for level in crate::claude::EFFORT_LEVELS {
+                assert!(
+                    html.contains(&format!("data-effort=\"{level}\"")),
+                    "no picker button for `{level}`"
+                );
+            }
+            assert!(
+                html.contains("data-effort=\"\""),
+                "no way to clear the effort back to null"
+            );
 
             let handle = s.api.settings.claude_handle();
             assert_eq!(crate::settings::read_claude(&handle).model, None);
@@ -7900,6 +7966,35 @@ mod tests {
                 crate::settings::read_claude(&handle).model.as_deref(),
                 Some("opus")
             );
+
+            // CLAUDE-259: the effort level saves and clears through the same
+            // document, on the same handle.
+            assert_eq!(crate::settings::read_claude(&handle).effort, None);
+            let saved = settings_save(
+                State(s.clone()),
+                AxumPath("claude".to_string()),
+                Form(SettingsForm {
+                    json: r#"{"model":"opus","effort":"xhigh"}"#.to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                crate::settings::read_claude(&handle).effort.as_deref(),
+                Some("xhigh")
+            );
+            let cleared = settings_save(
+                State(s.clone()),
+                AxumPath("claude".to_string()),
+                Form(SettingsForm {
+                    json: r#"{"model":"opus","effort":null}"#.to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cleared.status(), StatusCode::SEE_OTHER);
+            assert_eq!(crate::settings::read_claude(&handle).effort, None);
 
             // Clearing it returns to "no --model flag".
             let cleared = settings_save(
@@ -8174,6 +8269,7 @@ mod tests {
                 "claude_allowed_tools",
                 "claude_permission_mode",
                 "claude_model",
+                "claude_effort",
             ];
             let log_token_inputs = ["log_token_global", "log_token_repos", "log_token_ref"];
             let cases: [(Response, &str, &str, Vec<&str>); 4] = [

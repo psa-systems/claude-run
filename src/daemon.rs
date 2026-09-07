@@ -596,6 +596,8 @@ fn build_mint_context(
         // CLAUDE-239: triage pins no model, so it follows the global
         // `config.claude.model` (or the CLI default when that is unset).
         model: None,
+        // CLAUDE-259: same for the effort level.
+        effort: None,
     };
     let stream_log = cwd.join("triage-stream.jsonl");
     let classifier: Arc<dyn FailureClassifier> = Arc::new(ClaudeClassifier::new(
