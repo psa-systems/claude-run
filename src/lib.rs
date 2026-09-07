@@ -11,6 +11,8 @@
 //! - [`job`]: per-job pipeline (filter / pre / prompt / claude / post).
 //! - [`state`]: SQLite-backed attempt counters and daily ledger.
 //! - [`migrate`]: one-shot import of legacy state.json files.
+//! - [`import`]: copy an existing SQLite state store into the configured
+//!   backend (CLAUDE-251).
 //!
 //! See `actions/SCHEMA.md` for the user-facing schema, `README.md` for the
 //! runtime contract.
@@ -33,6 +35,7 @@ pub mod db;
 pub mod error;
 pub mod forge_log;
 pub mod gc;
+pub mod import;
 pub mod job;
 pub mod jsonfmt;
 pub mod lock;
