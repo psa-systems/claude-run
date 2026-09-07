@@ -45,6 +45,11 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 /// than waiting out the full `timeout`. A plain constant for now; expose via
 /// config only if real runs show a legitimate longer tail.
 const RESULT_EXIT_GRACE: Duration = Duration::from_secs(30);
+/// CLAUDE-259: the `--effort` levels the `claude` CLI documents. ADVISORY only:
+/// a resolved value outside this set is warned about and then passed through, so
+/// a level Anthropic adds later needs no runner release. Nothing here rejects or
+/// substitutes a value.
+pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaudeResult {
@@ -145,6 +150,36 @@ impl ClaudeInvoker {
         })
     }
 
+    /// CLAUDE-259: the effort level this invocation runs with, resolved exactly
+    /// like the model: the action's own `claude.effort`, else the live global
+    /// default, else `None` (no `--effort` flag).
+    ///
+    /// A value outside [`EFFORT_LEVELS`] is passed through unchanged after one
+    /// `warn` naming it, where it came from, and the known set. Never a
+    /// rejection and never a substitution: the CLI silently ignores an unknown
+    /// level and uses its default, so without this warn a typo would downgrade
+    /// effort for every run with nothing in the log to say so.
+    fn resolve_effort(&self, claude_cfg: &ClaudeBlock) -> Option<String> {
+        let (effort, source) = match claude_cfg.effort.clone() {
+            Some(v) => (v, "the action's claude.effort"),
+            None => {
+                let handle = self.default_claude.as_ref()?;
+                let global = crate::settings::read_claude(handle).effort.clone()?;
+                (global, "the global config.claude.effort")
+            }
+        };
+        if !EFFORT_LEVELS.contains(&effort.as_str()) {
+            warn!(
+                effort = %effort,
+                source,
+                known = %EFFORT_LEVELS.join(", "),
+                "unknown claude effort level; passing it through unchanged (the CLI ignores an \
+                 unknown value and uses its own default effort)"
+            );
+        }
+        Some(effort)
+    }
+
     pub fn stream_log_path(logs_dir: &Path, action: &str, key: &str, attempt: u32) -> PathBuf {
         logs_dir
             .join(action)
@@ -231,6 +266,10 @@ impl ClaudeInvoker {
         // the pre-CLAUDE-239 command line.
         if let Some(model) = self.resolve_model(claude_cfg) {
             command.arg(format!("--model={}", model));
+        }
+        // CLAUDE-259: the resolved effort level, on the same terms as the model.
+        if let Some(effort) = self.resolve_effort(claude_cfg) {
+            command.arg(format!("--effort={}", effort));
         }
         command
             .arg(prompt)
@@ -1200,6 +1239,15 @@ exit "$code"
     fn claude_defaults(model: Option<&str>) -> crate::config::ClaudeConfigHandle {
         std::sync::Arc::new(std::sync::RwLock::new(crate::config::ClaudeConfig {
             model: model.map(|m| m.to_string()),
+            effort: None,
+        }))
+    }
+
+    /// CLAUDE-259: the same handle with a global default effort level.
+    fn effort_defaults(effort: Option<&str>) -> crate::config::ClaudeConfigHandle {
+        std::sync::Arc::new(std::sync::RwLock::new(crate::config::ClaudeConfig {
+            model: None,
+            effort: effort.map(|e| e.to_string()),
         }))
     }
 
@@ -1275,6 +1323,136 @@ exit "$code"
         assert!(
             argv.lines().any(|l| l == "--model=opus"),
             "a settings save must apply to the next invocation, got:\n{argv}"
+        );
+    }
+
+    // ---- CLAUDE-259: effort selection --------------------------------------
+
+    /// Collects the log lines emitted while a closure runs, so the warn path can
+    /// be asserted on rather than assumed.
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(sub, f);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (out, logs)
+    }
+
+    /// Neither the action nor the global default names an effort: no `--effort`
+    /// flag at all, which is the pre-CLAUDE-259 command line.
+    #[test]
+    fn invoke_omits_effort_flag_when_nothing_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = argv_recording_stub(dir.path());
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()))
+            .with_default_claude(effort_defaults(None));
+        let argv = spawn_and_capture_args(&invoker, &ClaudeBlock::default(), dir.path());
+        assert!(
+            !argv.contains("--effort"),
+            "no effort anywhere must pass no --effort flag, got:\n{argv}"
+        );
+    }
+
+    /// Global default set, action silent: the global effort is passed through.
+    #[test]
+    fn invoke_uses_the_global_default_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = argv_recording_stub(dir.path());
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()))
+            .with_default_claude(effort_defaults(Some("low")));
+        let argv = spawn_and_capture_args(&invoker, &ClaudeBlock::default(), dir.path());
+        assert!(
+            argv.lines().any(|l| l == "--effort=low"),
+            "the global default must reach the CLI, got:\n{argv}"
+        );
+    }
+
+    /// The action's own effort wins over the global default, and the prompt
+    /// stays the trailing positional after every flag.
+    #[test]
+    fn invoke_action_effort_overrides_the_global_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = argv_recording_stub(dir.path());
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()))
+            .with_default_claude(effort_defaults(Some("low")));
+        let cfg = ClaudeBlock {
+            effort: Some("xhigh".to_string()),
+            ..Default::default()
+        };
+        let argv = spawn_and_capture_args(&invoker, &cfg, dir.path());
+        assert!(
+            argv.lines().any(|l| l == "--effort=xhigh"),
+            "the action effort must win, got:\n{argv}"
+        );
+        assert!(
+            !argv.contains("--effort=low"),
+            "the global default must not also be passed, got:\n{argv}"
+        );
+        assert_eq!(argv.lines().last(), Some("hi"), "argv:\n{argv}");
+    }
+
+    /// An effort outside the documented set is warned about exactly once, naming
+    /// the value and the known set, and is then passed through unchanged: no
+    /// layer rejects it and no layer substitutes a different value.
+    #[test]
+    fn invoke_warns_once_and_passes_an_unknown_effort_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = argv_recording_stub(dir.path());
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()))
+            .with_default_claude(effort_defaults(None));
+        let cfg = ClaudeBlock {
+            effort: Some("colossal".to_string()),
+            ..Default::default()
+        };
+        let (argv, logs) = capture_logs(|| spawn_and_capture_args(&invoker, &cfg, dir.path()));
+        assert!(
+            argv.lines().any(|l| l == "--effort=colossal"),
+            "the unknown value must pass through unchanged, got:\n{argv}"
+        );
+        assert_eq!(
+            logs.matches("unknown claude effort level").count(),
+            1,
+            "exactly one warn, got:\n{logs}"
+        );
+        assert!(logs.contains("WARN"), "at warn level, got:\n{logs}");
+        assert!(logs.contains("colossal"), "naming the value, got:\n{logs}");
+        assert!(
+            logs.contains("low, medium, high, xhigh, max"),
+            "and the known set, got:\n{logs}"
+        );
+
+        // A documented level is silent.
+        let cfg = ClaudeBlock {
+            effort: Some("max".to_string()),
+            ..Default::default()
+        };
+        let (_, logs) = capture_logs(|| spawn_and_capture_args(&invoker, &cfg, dir.path()));
+        assert!(
+            !logs.contains("unknown claude effort level"),
+            "a known level must not warn, got:\n{logs}"
         );
     }
 

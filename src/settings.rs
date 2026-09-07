@@ -880,7 +880,10 @@ impl LiveSettings {
             Section::Claude => {
                 let v: ClaudeConfig = parse(json)?;
                 // No model-name validation: the `claude` CLI is the source of
-                // truth for which models exist (CLAUDE-239).
+                // truth for which models exist (CLAUDE-239). No effort-level
+                // validation either (CLAUDE-259): an unknown level is warned
+                // about at invocation time, never rejected on save, so a level
+                // added after this release is still settable.
                 set_json(&self.pool, section.key(), &v).await?;
                 *write_claude(&self.claude) = v;
             }
@@ -1356,7 +1359,30 @@ mod tests {
             Some("claude-sonnet-4-5-20250929")
         );
 
-        // Clearing it falls back to the CLI default again.
+        // CLAUDE-259: effort lives in the same document and round-trips beside
+        // the model, including a level outside the documented set (the runner
+        // warns about that and passes it through; nothing rejects it here).
+        assert_eq!(read_claude(&handle).effort, None);
+        live.save_section(Section::Claude, r#"{"model":"opus","effort":"xhigh"}"#)
+            .await
+            .unwrap();
+        let stored: ClaudeConfig = get_json(&pool, Section::Claude.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.effort.as_deref(), Some("xhigh"));
+        assert_eq!(read_claude(&handle).effort.as_deref(), Some("xhigh"));
+        live.save_section(Section::Claude, r#"{"model":"opus","effort":"colossal"}"#)
+            .await
+            .unwrap();
+        assert_eq!(read_claude(&handle).effort.as_deref(), Some("colossal"));
+
+        // Clearing either key falls back to the CLI default again.
+        live.save_section(Section::Claude, r#"{"model":"opus","effort":null}"#)
+            .await
+            .unwrap();
+        assert_eq!(read_claude(&handle).effort, None);
+        assert_eq!(read_claude(&handle).model.as_deref(), Some("opus"));
         live.save_section(Section::Claude, r#"{"model":null}"#)
             .await
             .unwrap();
@@ -1379,14 +1405,14 @@ mod tests {
             Section::Claude.key(),
             &ClaudeConfig {
                 model: Some("sonnet".to_string()),
+                effort: Some("high".to_string()),
             },
         )
         .await
         .unwrap();
-        assert_eq!(
-            effective_claude(&pool).await.unwrap().model.as_deref(),
-            Some("sonnet")
-        );
+        let eff = effective_claude(&pool).await.unwrap();
+        assert_eq!(eff.model.as_deref(), Some("sonnet"));
+        assert_eq!(eff.effort.as_deref(), Some("high"));
     }
 
     #[tokio::test]

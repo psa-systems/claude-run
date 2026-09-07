@@ -153,6 +153,9 @@ pub struct CommonForm {
     /// CLAUDE-239: per-action `--model`; blank inherits the global
     /// `config.claude.model`.
     pub claude_model: String,
+    /// CLAUDE-259: per-action `--effort`; blank inherits the global
+    /// `config.claude.effort`.
+    pub claude_effort: String,
     pub limit_max_attempts_per_key: String,
     pub limit_max_runs_per_day: String,
     pub limit_claude_timeout_seconds: String,
@@ -175,6 +178,7 @@ impl CommonForm {
             claude_allowed_tools: p.get("claude_allowed_tools"),
             claude_permission_mode: p.get("claude_permission_mode"),
             claude_model: p.get("claude_model"),
+            claude_effort: p.get("claude_effort"),
             limit_max_attempts_per_key: p.get("limit_max_attempts_per_key"),
             limit_max_runs_per_day: p.get("limit_max_runs_per_day"),
             limit_claude_timeout_seconds: p.get("limit_claude_timeout_seconds"),
@@ -213,6 +217,7 @@ impl CommonForm {
             claude_allowed_tools: s(&a.claude.allowed_tools),
             claude_permission_mode: s(&a.claude.permission_mode),
             claude_model: s(&a.claude.model),
+            claude_effort: s(&a.claude.effort),
             limit_max_attempts_per_key: n(a.limits.max_attempts_per_key),
             limit_max_runs_per_day: n(a.limits.max_runs_per_day),
             limit_claude_timeout_seconds: n(a.limits.claude_timeout_seconds),
@@ -270,6 +275,7 @@ fn apply_common(
             allowed_tools: opt(&c.claude_allowed_tools),
             permission_mode: opt(&c.claude_permission_mode),
             model: opt(&c.claude_model),
+            effort: opt(&c.claude_effort),
         };
         set_or_remove(
             map,
@@ -2198,6 +2204,38 @@ limits:
         assert!(!yaml.contains("link_template"), "{yaml}");
         let after = crate::action::validate_str(&yaml, "<test>").unwrap();
         assert_eq!(after.action.link_template, None);
+    }
+
+    /// CLAUDE-259: the editor rebuilds the whole `claude:` block on save, so a
+    /// pinned `effort:` survives a prefill -> save round trip (a missing form
+    /// field would silently delete a hand-written key), including a level
+    /// outside the documented set.
+    #[test]
+    fn claude_effort_round_trips_through_the_common_block() {
+        let existing = "name: analysis\nkind: ci-failure-analysis\nnative:\n  query: \"#Unresolved\"\nclaude:\n  model: opus\n  effort: xhigh\n";
+        let loaded = crate::action::validate_str(existing, "<test>").unwrap();
+        let form = action_to_ci_failure_analysis_form(&loaded.action).unwrap();
+        assert_eq!(form.common.claude_effort, "xhigh");
+
+        let yaml = ci_failure_analysis_form_to_yaml(parsed(existing), &form).unwrap();
+        let after = crate::action::validate_str(&yaml, "<test>").unwrap();
+        assert_eq!(after.action.claude.effort.as_deref(), Some("xhigh"));
+        assert_eq!(after.action.claude.model.as_deref(), Some("opus"));
+
+        // An undocumented level is preserved verbatim, never dropped or rewritten.
+        let mut odd = form.clone();
+        odd.common.claude_effort = "colossal".to_string();
+        let yaml = ci_failure_analysis_form_to_yaml(parsed(existing), &odd).unwrap();
+        let after = crate::action::validate_str(&yaml, "<test>").unwrap();
+        assert_eq!(after.action.claude.effort.as_deref(), Some("colossal"));
+
+        // Cleared: the key is removed rather than written as an empty string.
+        let mut cleared = form.clone();
+        cleared.common.claude_effort = String::new();
+        let yaml = ci_failure_analysis_form_to_yaml(parsed(existing), &cleared).unwrap();
+        assert!(!yaml.contains("effort"), "{yaml}");
+        let after = crate::action::validate_str(&yaml, "<test>").unwrap();
+        assert_eq!(after.action.claude.effort, None);
     }
 
     #[test]

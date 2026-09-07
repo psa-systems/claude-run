@@ -673,6 +673,14 @@ pub struct ClaudeConfig {
     /// runner never validates the value: the CLI is the source of truth for
     /// which models exist.
     pub model: Option<String>,
+    /// CLAUDE-259: instance-wide default effort level, passed through to
+    /// `--effort` untouched. An action's own `claude.effort` wins over it; when
+    /// neither is set no `--effort` flag is passed and the `claude` CLI's own
+    /// default applies. A value outside
+    /// [`crate::claude::EFFORT_LEVELS`] is warned about and then passed through:
+    /// the set is advisory, so a level Anthropic adds later works with no runner
+    /// release.
+    pub effort: Option<String>,
 }
 
 /// CLAUDE-239: live handle to the global [`ClaudeConfig`], shared between
