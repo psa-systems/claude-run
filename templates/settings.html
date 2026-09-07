@@ -162,6 +162,19 @@
       <button type="button" class="btn preset-btn" data-format="%Y-%m-%dT%H:%M:%S%:z">RFC3339</button>
     </div>
     {% endif %}
+    {% if sec.path == "claude" %}
+    {# CLAUDE-259: effort buttons rewrite the `effort` key in the JSON editor
+       below (Default sets it back to null); free-form editing still works. #}
+    <div class="dim" style="margin-bottom: 6px;">Default effort level:</div>
+    <div class="preset-row" style="margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 6px;">
+      <button type="button" class="btn effort-btn" data-effort="low">low</button>
+      <button type="button" class="btn effort-btn" data-effort="medium">medium</button>
+      <button type="button" class="btn effort-btn" data-effort="high">high</button>
+      <button type="button" class="btn effort-btn" data-effort="xhigh">xhigh</button>
+      <button type="button" class="btn effort-btn" data-effort="max">max</button>
+      <button type="button" class="btn effort-btn" data-effort="">Default (clear)</button>
+    </div>
+    {% endif %}
     <textarea name="json" rows="12" spellcheck="false"
               style="width: 100%; background: #0a0c10; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 10px; font-family: var(--mono); font-size: 12px; line-height: 1.4;">{{ sec.json }}</textarea>
     <div style="margin-top: 8px;">
@@ -184,6 +197,24 @@
       try {
         var doc = JSON.parse(ta.value);
         doc.datetime_format = fmt;
+        ta.value = JSON.stringify(doc, null, 2);
+      } catch (e) {
+        // Textarea is not valid JSON (mid-edit): leave it for the operator to fix.
+      }
+    });
+  });
+
+  // CLAUDE-259: same pattern for the claude section's effort level. An empty
+  // data-effort writes null, which is "no --effort flag, the CLI's own default".
+  document.querySelectorAll('.effort-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var form = btn.closest('form');
+      var ta = form && form.querySelector('textarea[name="json"]');
+      if (!ta) return;
+      var level = btn.getAttribute('data-effort');
+      try {
+        var doc = JSON.parse(ta.value);
+        doc.effort = level === '' ? null : level;
         ta.value = JSON.stringify(doc, null, 2);
       } catch (e) {
         // Textarea is not valid JSON (mid-edit): leave it for the operator to fix.

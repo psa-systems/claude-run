@@ -36,6 +36,7 @@ claude: # optional, all keys optional
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
   permission_mode: acceptEdits
   model: opus
+  effort: high
 post: # optional, ordered list of nu snippets
   - |
     ...
@@ -760,8 +761,11 @@ Tuning for the `claude` CLI call. All keys are optional.
 | `allowed_tools`   | `Read,Edit,Write,Bash,Glob,Grep` | Passed as `--allowed-tools`.                            |
 | `permission_mode` | `acceptEdits`                    | Passed as `--permission-mode`.                          |
 | `model`           | `config.claude.model`, else the `claude` CLI's own default | Passed as `--model`, verbatim (CLAUDE-239). |
+| `effort`          | `config.claude.effort`, else the `claude` CLI's own default | Passed as `--effort`, verbatim: `low`, `medium`, `high`, `xhigh`, `max` (CLAUDE-259). |
 
 **Model selection (CLAUDE-239).** The effective model is resolved per invocation in this order: this action's `model`, else the global default in the `Claude invocation` settings section (DB key `config.claude`, field `model`, edited on `/settings` or via `GET` / `PUT /api/settings/claude`), else nothing at all - no `--model` flag is passed and the `claude` CLI applies its own default. The runner never validates the value at any layer: it is handed to `--model` untouched, and the CLI is the source of truth for which models exist, so new aliases and dated ids (`sonnet`, `opus`, `claude-sonnet-4-5-20250929`, ...) work without a runner change. Like every DB-backed section, `config.claude` is DB-only from birth (never a `config.toml` key) and applies to the next invocation, with no daemon restart.
+
+**Effort selection (CLAUDE-259).** The effective effort level resolves on exactly the same three-step precedence: this action's `effort`, else `config.claude.effort` (same settings section, same API path), else nothing at all - no `--effort` flag is passed and the `claude` CLI applies its own default. No layer rejects a value and no layer substitutes one, so a level Anthropic adds after this release works without a runner change. What the runner does add is one `warn` per invocation when the resolved value is outside the documented set (`low`, `medium`, `high`, `xhigh`, `max`), naming the value, whether it came from the action or the global default, and the known set. That warn exists because the CLI does NOT fail on an unknown level: it prints `Warning: Unknown --effort value '<x>' - ignoring it and using the default effort` on stderr and carries on at its default, which inside a run lands unstamped in the stream log where nothing notices it. Without the runner's own warn, a typo would silently downgrade effort for every run of that action.
 
 The runner always passes `--print --verbose --output-format stream-json`. It wraps the call in `timeout
 $claude_timeout_seconds`. Stdout+stderr are redirected to a per-job NDJSON stream log:

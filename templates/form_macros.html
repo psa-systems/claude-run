@@ -118,7 +118,7 @@
 </div>
 {% endmacro %}
 
-{% macro claude_block(cwd, allowed_tools, permission_mode, model) %}
+{% macro claude_block(cwd, allowed_tools, permission_mode, model, effort) %}
 <div class="card">
   <h3>Claude</h3>
   <div class="grid2">
@@ -126,6 +126,23 @@
     {% call textfield("Allowed tools", "claude_allowed_tools", allowed_tools, "e.g. Read,Grep,Bash") %}
     {% call textfield("Permission mode", "claude_permission_mode", permission_mode, "e.g. acceptEdits") %}
     {% call textfield("Model", "claude_model", model, "blank = the config.claude default") %}
+    <label class="fld">
+      <span>Effort</span>
+      {# CLAUDE-259: a stored value outside the documented set (hand-written YAML
+         or the API) renders as its own selected option, so saving this form can
+         never drop or rewrite it. #}
+      <select name="claude_effort">
+        <option value=""{% if effort.is_empty() %} selected{% endif %}>(the config.claude default)</option>
+        <option value="low"{% if effort.as_str() == "low" %} selected{% endif %}>low</option>
+        <option value="medium"{% if effort.as_str() == "medium" %} selected{% endif %}>medium</option>
+        <option value="high"{% if effort.as_str() == "high" %} selected{% endif %}>high</option>
+        <option value="xhigh"{% if effort.as_str() == "xhigh" %} selected{% endif %}>xhigh</option>
+        <option value="max"{% if effort.as_str() == "max" %} selected{% endif %}>max</option>
+        {% if !effort.is_empty() && effort.as_str() != "low" && effort.as_str() != "medium" && effort.as_str() != "high" && effort.as_str() != "xhigh" && effort.as_str() != "max" %}
+        <option value="{{ effort }}" selected>{{ effort }} (not a documented level)</option>
+        {% endif %}
+      </select>
+    </label>
   </div>
 </div>
 {% endmacro %}
