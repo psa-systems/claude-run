@@ -254,8 +254,8 @@ deadline (compose can start the daemon first) and then fatal. Neither case ever 
 silently start a second, empty state store.
 
 The file form exists because the URL carries the password, and an environment value is readable through
-`docker inspect` and `/proc/<pid>/environ`. It is the same reasoning that puts the secrets-store age key on a compose
-secret.
+`docker inspect` and `/proc/<pid>/environ`. `CLAUDE_RUN_DATABASE_URL` remains available for a deployment where that
+exposure is acceptable.
 
 ```toml
 # config.toml
@@ -283,7 +283,9 @@ be re-entered on the new backend.
 ## Settings: bootstrap file vs the Settings page (CLAUDE-101)
 
 Configuration splits in two. `config.toml` is the **bootstrap** file: only what the daemon must know before it can open
-the DB and bind the listener, namely `[web]` (bind / port / `auth_token_ref` / login) and `[daemon]` binary overrides (
+the DB and bind the listener, namely `[database]` (CLAUDE-250: which state store to open, see
+[State store backend](#state-store-backend-sqlite-or-postgresql-claude-250)), `[web]` (bind / port / `auth_token_ref` /
+login) and `[daemon]` binary overrides (
 `nu_binary`, `claude_binary`) plus `[daemon].claude_config_dir` (CLAUDE-165: where the spawned agent reads its
 user-level `CLAUDE.md` / credentials from; defaults to `<CLAUDE_RUN_CONFIG_DIR>/claude-agent-home`, seeded at serve
 start with the slim bot `CLAUDE.md`, and with a symlink to the host `~/.claude/.credentials.json` when the host has
@@ -291,7 +293,7 @@ one). Everything runtime-tunable, namely issue minting (`[mint]`), the update tr
 `[update]`), the webhook sources (`[webhook]`), and the log filter (`[daemon].log_filter`), now lives in the database
 and is edited in the app on the **Settings** page (`/settings`, in the nav next to Dashboard), behind the same auth gate
 as the rest of the web UI. A `config.toml` containing only `[web]` and `[daemon]` binary overrides is a complete, valid
-configuration.
+configuration, and so is an empty one.
 
 Each section is one JSON document validated against the same serde struct the file parser used (`deny_unknown_fields`),
 so an invalid edit is rejected inline with the parser's own error and nothing is persisted. Secret values are never
@@ -301,9 +303,9 @@ are rendered as that name only. Each
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
 secret refs, adding a source), `next event` for mint / update, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
-`GET` / `PUT /api/settings/{mint,update,webhook,webhook_comment,log_filter,workdir_gc,preferences,concurrency,db_retention,claude}`.
-The `webhook_comment` (CLAUDE-220), `workdir_gc` (CLAUDE-106), `preferences` (CLAUDE-154), `concurrency` (CLAUDE-162),
-`db_retention` (CLAUDE-175), and `claude` (CLAUDE-239) sections are DB-only from birth (never `config.toml` keys), so
+`GET` / `PUT /api/settings/{mint,update,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,claude}`.
+The `webhook_comment` (CLAUDE-220), `workdir_gc` (CLAUDE-106), `stream_log_gc` (CLAUDE-245), `preferences` (CLAUDE-154),
+`concurrency` (CLAUDE-162), `db_retention` (CLAUDE-175), and `claude` (CLAUDE-239) sections are DB-only from birth (never `config.toml` keys), so
 they are not part of the one-time import below; each simply defaults until edited. `webhook_comment` is additionally rejected by the file parser:
 a `config.toml` declaring `[webhook_comment]` fails to start with serde's unknown-field error naming the section, so
 there is no way to end up with two sources of truth for it.
@@ -349,6 +351,18 @@ losing the configured windows.
 Known limitation: the handful of startup lines emitted before the stored filter is applied (e.g. the config-source line)
 are governed by the initial filter, not the saved one; use `CLAUDE_RUN_LOG` when those specific lines are needed at
 `debug`.
+
+## Stream log retention (CLAUDE-245)
+
+Every claude invocation writes a per-attempt stream log to `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`, and until this sweep nothing ever deleted one: the workdir GC walks `workdirs/*/*` and the DB retention prune touches only database rows, so `logs/` only ever grew. That is not a cosmetic leak. A full log partition is what made the stream-log relay's write fail in the incident diagnosed in CLAUDE-233, which truncated 33 logs mid-line and failed the runs that produced them.
+
+An age-based sweeper (`crate::gc::sweep_stream_logs`) bounds it. It runs on `serve` start and then hourly, walking `logs/<action>/streams/` and deleting every `.jsonl` whose last-modified time is older than the retention window. Every pass logs its `deleted` / `kept` / `bytes_reclaimed` tally at `info`, so the sweep is auditable even when it deletes nothing.
+
+A log whose job is still in flight is never deleted, at any age. Age alone would not prove a run has finished: a job with a long `claude_timeout_seconds` can outlive any window while its log is still being appended to. The sweep runs inside the daemon that owns the runs, so it reads the authoritative set of `(action, job key)` pairs from `run_inflight_jobs` joined to the runs that have not ended, and keeps everything that set names. If that read fails the whole pass is skipped rather than run with an empty set, because the wrong guess would delete a live run's only transcript.
+
+The window is a DB-backed runtime setting edited on the **Settings** page (the `Stream log GC` section, or `GET` / `PUT /api/settings/stream_log_gc`). Fields: `enabled` (master toggle, default `true`) and `retention_days` (default `30`). Edits apply on the next sweep. Set `enabled: false` to park the sweeper without losing the configured window, but nothing then bounds the directory.
+
+The default is deliberately longer than the workdir GC's 14 days and shorter than DB retention's 180: a failure reported weeks late still has its transcript, while at the ~800 MB/month this directory was observed growing at, 30 days holds it near 1 GB. The two windows are independent, so a `job_outcomes` row (180 days) outlives its stream log (30 days): run history, cost, and the reports are unaffected, but the transcript behind an older run is gone. The stream-log search skips a swept log silently, as an absent file rather than a read failure; CLAUDE-246's `unreadable` list is for logs that exist and fail mid-read.
 
 ## DB retention (CLAUDE-175)
 
@@ -1039,7 +1053,8 @@ beside each (CLAUDE-247). Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VE
 need an `fj` carrying `fj actions logs`, `fj actions runs` (FJ-66), and `fj repo file` (FJ-67); the latter two landed on
 `pandoras-box/forgejo-cli` `main` after the `v0.13.0` tag (merge `b08d8bc`) and are in no released version yet, so
 `FJ_VERSION` must point at a build from that commit or newer for those actions to work. The container runs as the
-non-root user `claudebot` with `$HOME=/home/claudebot`.
+non-root user `claudebot` with `$HOME=/home/claudebot`, which holds nothing persistent: everything the operator cares
+about lives on the three flat volumes below.
 
 **Published image (CLAUDE-88).** CI publishes the runtime image to the Forgejo OCI registry on every push to main (
 `:latest`) and every release tag (`:vX.Y.Z`), the same tag set as the binary's Generic Package. The image publish runs
@@ -1058,8 +1073,9 @@ docker compose pull
 docker compose up --detach
 ```
 
-**Slim bot CLAUDE.md.** `deploy/bot-CLAUDE.md` is versioned in this repo and `COPY`d to
-`/home/claudebot/.claude/CLAUDE.md`. It contains only the local-only agent contract (no push, no PR; leave the feature
+**Slim bot CLAUDE.md.** `deploy/bot-CLAUDE.md` is versioned in this repo, `COPY`d to
+`/home/claudebot/.claude/CLAUDE.md` in the image, and written into the agent's own config dir
+(`/config/claude-agent-home/CLAUDE.md`) on every serve start, which is the copy the agent actually reads. It contains only the local-only agent contract (no push, no PR; leave the feature
 branch as HEAD; the runner finalizes), the bounded tracker writes from
 [What the agent may write to the tracker](#what-the-agent-may-write-to-the-tracker-claude-214), the em-dash ban, the
 Nushell 0.112.2 note, and the simplest-solution preference. It has no Git workflow and no lifecycle section, so the
@@ -1069,21 +1085,20 @@ agent is never told to push, open PRs, or transition issue state.
 
 **Self-contained by design (CLAUDE-247).** The container bind-mounts nothing from the host and reads no host credential. The operator logs Claude, YouTrack, Forgejo and git in INSIDE the container once; each login lands on its own named volume and survives restarts and image upgrades. Two reasons: the runner's identity stays separate from the operator's, and the stack deploys on a host where neither `$HOME` nor the invocation directory is available to the compose file (the only path relative to this repo is the age-key secret, and the alternative for that is below).
 
-**Volumes.** What each one is for:
+**Volumes.** Three, flat, named for what they hold:
 
-| Volume                        | Container path                            | Purpose                                                                                             |
-|-------------------------------|-------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| `claude-bot-config`           | `/home/claudebot/.config/claude-run`      | `config.toml` (seeded, binds 0.0.0.0), the actions dir, and the agent's `claude-agent-home`         |
-| `claude-bot-data`             | `/home/claudebot/.local/share/claude-run` | `state.db` (runs, outcomes, encrypted secrets store; empty on the `postgres` profile) and per-job workdirs (`CLAUDE_RUN_DATA_DIR`) |
-| `claude-bot-state`            | `/home/claudebot/.local/state/claude-run` | logs, per-attempt stream JSONL, webhook log artifacts (`CLAUDE_RUN_STATE_DIR`)                      |
-| `claude-bot-claude`           | `/home/claudebot/.claude`                 | the in-container Claude login, plus the baked slim bot CLAUDE.md Docker seeds into the empty volume |
-| `claude-bot-youtrack-cli`     | `/home/claudebot/.config/youtrack-cli`    | `yt` instance store, written by `yt auth login`                                                     |
-| `claude-bot-forgejo-cli`      | `/home/claudebot/.local/share/forgejo-cli`| `fj` `keys.json`; the token needs `write:repository` + `write:issue` (see Install)                  |
-| `claude-bot-git`              | `/home/claudebot/.config/git`             | git identity, at the path `GIT_CONFIG_GLOBAL` names in the image                                    |
-| secret `claude-run-age-key`   | `/run/secrets/claude-run-age-key`         | age identity decrypting the secrets store                                                           |
-| tmpfs                         | `/home/claudebot/.runtime/claude-run`     | pidfile and action locks (`CLAUDE_RUN_RUNTIME_DIR`); ephemeral so nothing stale survives a restart |
+| Volume              | Container path   | Purpose                                                                                                    |
+|---------------------|------------------|------------------------------------------------------------------------------------------------------------|
+| `claude-bot-config` | `/config`        | `config.toml`, `actions/`, `secrets.key`, `claude-agent-home/` (the agent's Claude login), `youtrack-cli/` (`yt`), `git/` (commit identity) |
+| `claude-bot-data`   | `/data`          | `state.db` (runs, outcomes, the encrypted secrets store; unused on the `postgres` profile), per-job `workdirs/`, `forgejo-cli/` (`fj` keys) |
+| `claude-bot-state`  | `/state`         | logs and per-attempt stream JSONL                                                                          |
+| tmpfs               | `/run/claude-run`| pidfile; ephemeral so nothing stale survives a restart                                                     |
 
-One volume per credential store rather than subpaths of a single volume: a compose `volume.subpath` is resolved before the entrypoint runs, is never auto-created, and is not seeded from the image, so a missing subdirectory fails the container create outright.
+Each tool's store is a subdirectory rather than a mount of its own, because the image points every tool at these roots: `CLAUDE_RUN_{CONFIG,DATA,STATE,RUNTIME}_DIR` for the runner, `XDG_CONFIG_HOME=/config` for `yt`, `XDG_DATA_HOME=/data` for `fj` (which has no config-dir variable of its own, and which claude-run resolves the same way through `dirs::data_dir()`), `CLAUDE_CONFIG_DIR=/config/claude-agent-home` for `claude`, and `GIT_CONFIG_GLOBAL=/config/git/config` for git. `$HOME` holds nothing persistent; it is scratch.
+
+`CLAUDE_CONFIG_DIR` deliberately names the same directory the daemon seeds and points its agent children at, so a `claude auth login` run through `docker compose exec` writes the credential where the agent reads it rather than into a second Claude config dir that looks fine and authenticates nothing.
+
+A host install is unaffected by all of this: none of these variables is set there, and every path still resolves through XDG exactly as before.
 
 **Running user.** The image has no `USER` directive. It starts as root so `oci-build/entrypoint.sh` can chown the mounted volumes to `claudebot`, then drops to that user with `su-exec` (pattern 3 in `governance/CONTAINER_UID_GID.md`); the daemon itself runs non-root. Do NOT set `user:` in compose: the entrypoint would lose the privileges the chown needs and a volume owned by another uid could never be repaired from inside. Two consequences for the operator:
 
