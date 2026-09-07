@@ -51,6 +51,9 @@ pub mod service_auth;
 pub mod settings;
 pub mod snippet;
 pub mod state;
+/// Test-only helpers shared across the unit tests (CLAUDE-255).
+#[cfg(test)]
+pub mod testutil;
 pub mod triage;
 pub mod update;
 pub mod web;
