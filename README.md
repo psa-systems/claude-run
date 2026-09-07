@@ -1081,9 +1081,9 @@ branch as HEAD; the runner finalizes), the bounded tracker writes from
 Nushell 0.112.2 note, and the simplest-solution preference. It has no Git workflow and no lifecycle section, so the
 agent is never told to push, open PRs, or transition issue state.
 
-**compose.yml.** Consumes the published image (`image: dev.a8n.run/psa-systems/claude-run:latest`; the local `build:` block stays as a commented development alternative). App-prefixed names (service `claude-bot`, network `claude-bot-private`, volumes `claude-bot-{config,data,state,claude,youtrack-cli,forgejo-cli,git}`; prefix each with `dev-` for a development stack).
+**compose.yml.** Consumes the published image (`image: dev.a8n.run/psa-systems/claude-run:latest`; the local `build:` block stays as a commented development alternative). App-prefixed names (service `claude-bot`, network `claude-bot-private`, volumes `claude-bot-config`, `claude-bot-data` and `claude-bot-state`, plus `claude-bot-postgres` which only the `postgres` profile mounts; prefix each with `dev-` for a development stack). Each tool's store is a subdirectory of one of the three roots rather than a volume of its own (CLAUDE-253); see the volume table below.
 
-**Self-contained by design (CLAUDE-247).** The container bind-mounts nothing from the host and reads no host credential. The operator logs Claude, YouTrack, Forgejo and git in INSIDE the container once; each login lands on its own named volume and survives restarts and image upgrades. Two reasons: the runner's identity stays separate from the operator's, and the stack deploys on a host where neither `$HOME` nor the invocation directory is available to the compose file (the only path relative to this repo is the age-key secret, and the alternative for that is below).
+**Self-contained by design (CLAUDE-247).** The container bind-mounts nothing from the host and reads no host credential. The operator logs Claude, YouTrack, Forgejo and git in INSIDE the container once; each login lands in its own subdirectory of the config or data volume (`claude-agent-home/`, `youtrack-cli/` and `git/` under `/config`, `forgejo-cli/` under `/data`, per the volume table below) and survives restarts and image upgrades. Two reasons: the runner's identity stays separate from the operator's, and the stack deploys on a host where neither `$HOME` nor the invocation directory is available to the compose file. The default stack reads no path relative to this repo at all, including the secrets key, which the daemon generates itself; the only repo-relative paths in the file are the two `secrets/` files the `postgres` profile needs.
 
 **Volumes.** Three, flat, named for what they hold:
 
@@ -1131,29 +1131,54 @@ docker compose restart
 To use an API key instead of an interactive Claude login, set `ANTHROPIC_API_KEY` in the service `environment:` and skip `claude auth login`. Nothing else changes: since CLAUDE-247 the daemon no longer requires a credentials file to start.
 
 **Secrets.** The store itself (web auth token, webhook HMACs, registry token refs) lives encrypted in the state store,
-`state.db` on the data volume or the `secrets` table on a PostgreSQL backend; the only material the container needs
-injected is the age identity that decrypts it. It travels as a
-compose `secrets:` file mount, and `CLAUDE_RUN_SECRETS_KEY_FILE` in the `environment:` block points at
-`/run/secrets/claude-run-age-key`. The env var carries the PATH, never the key itself: key material in a plain
-environment variable is deliberately unsupported (visible to `docker inspect` and `/proc/<pid>/environ`).
-`ANTHROPIC_API_KEY` is the one secret that MAY go through plain env, as the Claude-auth alternative above. Before first
-start:
+`state.db` on the data volume or the `secrets` table on a PostgreSQL backend. The age identity that decrypts it needs no
+injection: the daemon generates it at `/config/secrets.key` (mode `0600`) on the `claude-bot-config` volume the first
+time it starts without one, so there is no `age-keygen` step before first start and the shipped `compose.yml` declares
+no age-key secret. **Back that key up separately**, off the volume: every stored secret is unrecoverable without it, and
+a key the operator never created by hand is easier to lose than one they did. Generation happens only while the store is
+empty; a missing key with secrets already in the database is a hard error naming them rather than a silent replacement
+that would orphan every one (see "Secrets store").
 
-```nu
-mkdir secrets
-chmod 700 secrets
-# migrating from a host install: copy the EXISTING key instead of generating,
-# or the secrets already in the state store cannot be decrypted
-age-keygen | save secrets/age-key.txt
+`CLAUDE_RUN_SECRETS_KEY_FILE` is the bring-your-own-key path, for a key that comes from your own secret store or has to
+be shared with another instance. Its value is a PATH, never the key itself: key material in a plain environment variable
+is deliberately unsupported (visible to `docker inspect` and `/proc/<pid>/environ`), so deliver the file with a bind
+mount or a compose `secrets:` entry you add yourself, and set the variable to where it lands.
+`ANTHROPIC_API_KEY` is the one secret that MAY go through plain env, as the Claude-auth alternative above.
+
+```yaml
+services:
+  claude-bot:
+    environment:
+      CLAUDE_RUN_SECRETS_KEY_FILE: /run/secrets/claude-run-age-key
+    secrets:
+      - claude-run-age-key
+
+secrets:
+  claude-run-age-key:
+    file: ./secrets/age-key.txt
 ```
 
-A deployment that cannot use a path relative to the compose file (one whose config is piped through `docker compose --file -`, where relative paths resolve against the caller's working directory) declares the same secret from an environment value instead, and supplies that value from its own secret store:
+A deployment that cannot use a path relative to the compose file (one whose config is piped through `docker compose --file -`, where relative paths resolve against the caller's working directory) declares that same secret from an environment value instead, and supplies the value from its own secret store. The key still reaches the container as a file at `/run/secrets/claude-run-age-key`; only the source changes:
 
 ```yaml
 secrets:
   claude-run-age-key:
     environment: CLAUDE_RUN_AGE_KEY
 ```
+
+**Migrating from a host install.** Carry the EXISTING key across, or the secrets already in the state store cannot be
+decrypted, and do it before the first start so the daemon finds a key instead of generating one. Either copy it onto the
+config volume:
+
+```nu
+docker compose create
+docker cp ~/.config/claude-run/secrets.key claude-bot:/config/secrets.key
+docker compose up --detach
+```
+
+or leave the host file where it is, mount it, and point `CLAUDE_RUN_SECRETS_KEY_FILE` at the mount as above. `docker cp`
+keeps the source's uid and mode; the entrypoint chowns `/config` to `claudebot` on every start, and a key readable
+beyond its owner still loads with a `warn`, so `chmod 600` the copy if you want that warning gone.
 
 **Networking.** The seeded `config.toml` already binds `0.0.0.0:7321`; publish the port (`ports:` mapping or a
 reverse-proxy network) to reach it. A non-loopback bind requires auth, which the first-run `/setup` page creates. A
