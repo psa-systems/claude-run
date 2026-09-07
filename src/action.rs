@@ -2190,6 +2190,30 @@ native:
             .is_none());
     }
 
+    /// CLAUDE-259: an action may pin an effort level the same way, and any
+    /// string parses (a level added after this release must not fail the
+    /// `deny_unknown_fields` loader).
+    #[test]
+    fn claude_block_accepts_an_effort() {
+        let raw =
+            "name: demo\ninput:\n  command: echo '[]'\nprompt: |\n  'hi'\nclaude:\n  effort: high\n";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        assert_eq!(loaded.action.claude.effort.as_deref(), Some("high"));
+
+        let raw = "name: demo\ninput:\n  command: echo '[]'\nprompt: |\n  'hi'\nclaude:\n  effort: colossal\n";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        assert_eq!(loaded.action.claude.effort.as_deref(), Some("colossal"));
+
+        // Absent stays absent, so the runner passes no `--effort` flag.
+        let raw = "name: demo\ninput:\n  command: echo '[]'\nprompt: |\n  'hi'\n";
+        assert!(validate_str(raw, "<candidate>")
+            .unwrap()
+            .action
+            .claude
+            .effort
+            .is_none());
+    }
+
     /// The shipped `actions/closed-issue-summary.yml` loads, is recognized as a
     /// native closed-issue-summary action with no script-bearing fields, and
     /// round-trips through serialize -> parse unchanged.
@@ -2296,6 +2320,12 @@ pub struct ClaudeBlock {
     /// untouched (no validation here; the `claude` CLI owns that). Unset falls
     /// back to the global `config.claude.model`, then to the CLI's own default.
     pub model: Option<String>,
+    /// CLAUDE-259: effort level this action pins, passed through to `--effort`
+    /// untouched. Unset falls back to the global `config.claude.effort`, then to
+    /// the CLI's own default. Deliberately a string, not an enum: a level
+    /// Anthropic adds later must parse here without a runner release. The runner
+    /// warns about a value outside the documented set but never rejects it.
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

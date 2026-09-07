@@ -223,17 +223,69 @@ XDG-compliant; each path overridable by the matching env var.
 | Default                        | Env override             | What                                                                                            |
 |--------------------------------|--------------------------|-------------------------------------------------------------------------------------------------|
 | `$XDG_CONFIG_HOME/claude-run/` | `CLAUDE_RUN_CONFIG_DIR`  | `config.toml`, `actions/*.yml`                                                                  |
-| `$XDG_DATA_HOME/claude-run/`   | `CLAUDE_RUN_DATA_DIR`    | `state.db`, `workdirs/`                                                                         |
+| `$XDG_DATA_HOME/claude-run/`   | `CLAUDE_RUN_DATA_DIR`    | `state.db` (SQLite backend only; see "State store backend"), `workdirs/`                        |
 | `$XDG_STATE_HOME/claude-run/`  | `CLAUDE_RUN_STATE_DIR`   | `logs/<action>/YYYY-MM-DD.jsonl`, `logs/<action>/streams/<key>-attempt-<n>.jsonl`, `daemon.log` |
 | `$XDG_RUNTIME_DIR/claude-run/` | `CLAUDE_RUN_RUNTIME_DIR` | `daemon.pid`, `daemon.sock` (absent under `serve --no-socket`), `locks/<action>.lock`           |
 
 `workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-job workdirs live; defaults to
 `$DATA_DIR/workdirs/`. Supports `~`, `$VAR`, `${VAR}` expansion.
 
+## State store backend: SQLite or PostgreSQL (CLAUDE-250)
+
+Runtime state (runs, job outcomes, caps, settings, the encrypted secrets store) lives in SQLite at
+`<CLAUDE_RUN_DATA_DIR>/state.db` by default. A deployment that already runs a database server can point the daemon at
+PostgreSQL instead. Both backends run through one sqlx `Any` pool and one set of statements, so nothing else about the
+runner changes with the choice.
+
+**Three inputs, highest precedence first.** The backend has to be known before the DB is open, so this is a bootstrap
+setting, never one of the DB-backed Settings sections:
+
+| Input | Form |
+|---|---|
+| `CLAUDE_RUN_DATABASE_URL_FILE` | path to a file whose contents are the URL |
+| `CLAUDE_RUN_DATABASE_URL` | the URL itself |
+| `[database] url` in `config.toml` | the URL itself |
+
+All three unset means SQLite at `<CLAUDE_RUN_DATA_DIR>/state.db`, exactly as before this existed: an existing install
+needs no config edit, moves no data, and re-runs no migration. A `postgres://` or `postgresql://` URL selects
+PostgreSQL; `sqlite://<path>` selects SQLite explicitly. Any other scheme stops startup with an error naming the scheme,
+and an unreachable PostgreSQL is a startup error naming the host and the driver's own message, retried on a bounded
+deadline (compose can start the daemon first) and then fatal. Neither case ever falls back to SQLite, which would
+silently start a second, empty state store.
+
+The file form exists because the URL carries the password, and an environment value is readable through
+`docker inspect` and `/proc/<pid>/environ`. `CLAUDE_RUN_DATABASE_URL` remains available for a deployment where that
+exposure is acceptable.
+
+```toml
+# config.toml
+[database]
+url = "postgres://claude_run:secret@db.internal:5432/claude_run"
+```
+
+**Compose.** `compose.yml` carries the server behind a `postgres` profile, so `docker compose up` starts exactly the
+service set it started before, and `docker compose --profile postgres up` adds `claude-bot-postgres` (its data on the
+`claude-bot-postgres` volume, its password from a compose secret, a `pg_isready` healthcheck the daemon waits on).
+Point the daemon at it by uncommenting the `CLAUDE_RUN_DATABASE_URL_FILE` environment line and the
+`claude-run-database-url` secret in the `claude-bot` service, then creating the two secret files:
+
+```nu
+openssl rand -base64 32 | save secrets/postgres-password.txt
+"postgres://claude_run:<that password>@claude-bot-postgres:5432/claude_run" | save secrets/database-url.txt
+docker compose --profile postgres up --detach
+```
+
+**Nothing is carried over.** Switching an existing install to PostgreSQL starts a fresh, empty instance: no run history,
+no caps ledger, no stored secrets, and no web administrator, so the browser lands on `/setup` again. Copying an existing
+`state.db` into PostgreSQL is separate work (CLAUDE-251). Back the age key up as usual; the secrets it decrypts have to
+be re-entered on the new backend.
+
 ## Settings: bootstrap file vs the Settings page (CLAUDE-101)
 
 Configuration splits in two. `config.toml` is the **bootstrap** file: only what the daemon must know before it can open
-the DB and bind the listener, namely `[web]` (bind / port / `auth_token_ref` / login) and `[daemon]` binary overrides (
+the DB and bind the listener, namely `[database]` (CLAUDE-250: which state store to open, see
+[State store backend](#state-store-backend-sqlite-or-postgresql-claude-250)), `[web]` (bind / port / `auth_token_ref` /
+login) and `[daemon]` binary overrides (
 `nu_binary`, `claude_binary`) plus `[daemon].claude_config_dir` (CLAUDE-165: where the spawned agent reads its
 user-level `CLAUDE.md` / credentials from; defaults to `<CLAUDE_RUN_CONFIG_DIR>/claude-agent-home`, seeded at serve
 start with the slim bot `CLAUDE.md`, and with a symlink to the host `~/.claude/.credentials.json` when the host has
@@ -241,7 +293,7 @@ one). Everything runtime-tunable, namely issue minting (`[mint]`), the update tr
 `[update]`), the webhook sources (`[webhook]`), and the log filter (`[daemon].log_filter`), now lives in the database
 and is edited in the app on the **Settings** page (`/settings`, in the nav next to Dashboard), behind the same auth gate
 as the rest of the web UI. A `config.toml` containing only `[web]` and `[daemon]` binary overrides is a complete, valid
-configuration.
+configuration, and so is an empty one.
 
 Each section is one JSON document validated against the same serde struct the file parser used (`deny_unknown_fields`),
 so an invalid edit is rejected inline with the parser's own error and nothing is persisted. Secret values are never
@@ -253,7 +305,9 @@ secret refs, adding a source), `next event` for mint / update, and `restart` for
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
 `GET` / `PUT /api/settings/{mint,update,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,claude}`.
 The `webhook_comment` (CLAUDE-220), `workdir_gc` (CLAUDE-106), `stream_log_gc` (CLAUDE-245), `preferences` (CLAUDE-154),
-`concurrency` (CLAUDE-162), `db_retention` (CLAUDE-175), and `claude` (CLAUDE-239) sections are DB-only from birth (never `config.toml` keys), so
+`concurrency` (CLAUDE-162), `db_retention` (CLAUDE-175), and `claude` (CLAUDE-239 `model`, CLAUDE-259 `effort`: the instance-wide `--model` and
+`--effort` defaults an action inherits when it pins neither in its own `claude:` block, each one null by default, which passes no flag and leaves
+the `claude` CLI's own default in force) sections are DB-only from birth (never `config.toml` keys), so
 they are not part of the one-time import below; each simply defaults until edited. `webhook_comment` is additionally rejected by the file parser:
 a `config.toml` declaring `[webhook_comment]` fails to start with serde's unknown-field error naming the section, so
 there is no way to end up with two sources of truth for it.
@@ -314,7 +368,7 @@ The default is deliberately longer than the workdir GC's 14 days and shorter tha
 
 ## DB retention (CLAUDE-175)
 
-The history tables append forever: every job outcome (`job_outcomes`) and every poll-phase diagnostic (`run_events`) is written and nothing deletes them, so the SQLite database grows without bound. An age-based retention prune (`src/retention.rs`) bounds that growth. A daemon sweep runs on `serve` start and then hourly, deleting rows whose stored `ts` is older than the configured window. The delete predicate is an index range seek on the per-table single-column `ts` index (`migrations/0017_job_outcomes_ts_index.sql` for `job_outcomes`, `migrations/0018_run_events_ts_index.sql` for `run_events`), so it never full-scans a large table. `job_outcomes` is the driver; `run_events` (CLAUDE-172) shares the same helper, config, and loop through the `RETENTION_TABLES` list rather than a divergent implementation.
+The history tables append forever: every job outcome (`job_outcomes`) and every poll-phase diagnostic (`run_events`) is written and nothing deletes them, so the state store grows without bound. An age-based retention prune (`src/retention.rs`) bounds that growth. A daemon sweep runs on `serve` start and then hourly, deleting rows whose stored `ts` is older than the configured window. The delete predicate is an index range seek on the per-table single-column `ts` index (`migrations/sqlite/0017_job_outcomes_ts_index.sql` for `job_outcomes`, `migrations/sqlite/0018_run_events_ts_index.sql` for `run_events`, and both indexes in `migrations/postgres/0001_init.sql`), so it never full-scans a large table. `job_outcomes` is the driver; `run_events` (CLAUDE-172) shares the same helper, config, and loop through the `RETENTION_TABLES` list rather than a divergent implementation.
 
 The window is a DB-backed runtime setting edited on the **Settings** page (the `DB retention` section, or `GET` / `PUT /api/settings/db_retention`). Fields: `enabled` (master toggle, default `true`) and `retention_days` (default `180`). Edits apply on the next sweep. Set `enabled: false` to park the prune without losing the configured window.
 
@@ -612,9 +666,10 @@ Auth (and every action `token_ref`) reads from an encrypted secrets store. Two t
    [`age`](https://github.com/FiloSottile/age) X25519 identity at `<CLAUDE_RUN_CONFIG_DIR>/secrets.key`, generated at
    serve start (mode `0600`) when the instance has none. You do not run `age-keygen` to get started.
 
-   The key lives with the config, not the data, on purpose: the ciphertext it decrypts is in `state.db` under the data
-   dir, and a key stored beside its ciphertext buys nothing. Keeping them apart is what lets the database be copied,
-   snapshotted or backed up without carrying the tokens along. **Back the key up separately**, because every stored
+   The key lives with the config, not the data, on purpose: the ciphertext it decrypts is in the state store (the
+   `state.db` file under the data dir, or the `secrets` table on a PostgreSQL backend), and a key stored beside its
+   ciphertext buys nothing. Keeping them apart is what lets the database be copied, snapshotted or backed up without
+   carrying the tokens along. **Back the key up separately**, because every stored
    secret is unrecoverable without it. A key already at the old `<CLAUDE_RUN_DATA_DIR>/secrets.key` is moved to the new
    path on the next start rather than replaced, so an existing deployment keeps reading what it stored.
 
@@ -1028,16 +1083,16 @@ branch as HEAD; the runner finalizes), the bounded tracker writes from
 Nushell 0.112.2 note, and the simplest-solution preference. It has no Git workflow and no lifecycle section, so the
 agent is never told to push, open PRs, or transition issue state.
 
-**compose.yml.** Consumes the published image (`image: dev.a8n.run/psa-systems/claude-run:latest`; the local `build:` block stays as a commented development alternative). App-prefixed names (service `claude-bot`, network `claude-bot-private`, volumes `claude-bot-{config,data,state,claude,youtrack-cli,forgejo-cli,git}`; prefix each with `dev-` for a development stack).
+**compose.yml.** Consumes the published image (`image: dev.a8n.run/psa-systems/claude-run:latest`; the local `build:` block stays as a commented development alternative). App-prefixed names (service `claude-bot`, network `claude-bot-private`, volumes `claude-bot-config`, `claude-bot-data` and `claude-bot-state`, plus `claude-bot-postgres` which only the `postgres` profile mounts; prefix each with `dev-` for a development stack). Each tool's store is a subdirectory of one of the three roots rather than a volume of its own (CLAUDE-253); see the volume table below.
 
-**Self-contained by design (CLAUDE-247).** The container bind-mounts nothing from the host and reads no host credential. The operator logs Claude, YouTrack, Forgejo and git in INSIDE the container once; each login lands on its own named volume and survives restarts and image upgrades. Two reasons: the runner's identity stays separate from the operator's, and the stack deploys on a host where neither `$HOME` nor the invocation directory is available to the compose file (the only path relative to this repo is the age-key secret, and the alternative for that is below).
+**Self-contained by design (CLAUDE-247).** The container bind-mounts nothing from the host and reads no host credential. The operator logs Claude, YouTrack, Forgejo and git in INSIDE the container once; each login lands in its own subdirectory of the config or data volume (`claude-agent-home/`, `youtrack-cli/` and `git/` under `/config`, `forgejo-cli/` under `/data`, per the volume table below) and survives restarts and image upgrades. Two reasons: the runner's identity stays separate from the operator's, and the stack deploys on a host where neither `$HOME` nor the invocation directory is available to the compose file. The default stack reads no path relative to this repo at all, including the secrets key, which the daemon generates itself; the only repo-relative paths in the file are the two `secrets/` files the `postgres` profile needs.
 
 **Volumes.** Three, flat, named for what they hold:
 
 | Volume              | Container path   | Purpose                                                                                                    |
 |---------------------|------------------|------------------------------------------------------------------------------------------------------------|
 | `claude-bot-config` | `/config`        | `config.toml`, `actions/`, `secrets.key`, `claude-agent-home/` (the agent's Claude login), `youtrack-cli/` (`yt`), `git/` (commit identity) |
-| `claude-bot-data`   | `/data`          | `state.db` (runs, outcomes, the encrypted secrets store), per-job `workdirs/`, `forgejo-cli/` (`fj` keys)  |
+| `claude-bot-data`   | `/data`          | `state.db` (runs, outcomes, the encrypted secrets store; unused on the `postgres` profile), per-job `workdirs/`, `forgejo-cli/` (`fj` keys) |
 | `claude-bot-state`  | `/state`         | logs and per-attempt stream JSONL                                                                          |
 | tmpfs               | `/run/claude-run`| pidfile; ephemeral so nothing stale survives a restart                                                     |
 
@@ -1077,29 +1132,55 @@ docker compose restart
 
 To use an API key instead of an interactive Claude login, set `ANTHROPIC_API_KEY` in the service `environment:` and skip `claude auth login`. Nothing else changes: since CLAUDE-247 the daemon no longer requires a credentials file to start.
 
-**Secrets.** The store itself (web auth token, webhook HMACs, registry token refs) lives encrypted inside `state.db` on
-the data volume; the only material the container needs injected is the age identity that decrypts it. It travels as a
-compose `secrets:` file mount, and `CLAUDE_RUN_SECRETS_KEY_FILE` in the `environment:` block points at
-`/run/secrets/claude-run-age-key`. The env var carries the PATH, never the key itself: key material in a plain
-environment variable is deliberately unsupported (visible to `docker inspect` and `/proc/<pid>/environ`).
-`ANTHROPIC_API_KEY` is the one secret that MAY go through plain env, as the Claude-auth alternative above. Before first
-start:
+**Secrets.** The store itself (web auth token, webhook HMACs, registry token refs) lives encrypted in the state store,
+`state.db` on the data volume or the `secrets` table on a PostgreSQL backend. The age identity that decrypts it needs no
+injection: the daemon generates it at `/config/secrets.key` (mode `0600`) on the `claude-bot-config` volume the first
+time it starts without one, so there is no `age-keygen` step before first start and the shipped `compose.yml` declares
+no age-key secret. **Back that key up separately**, off the volume: every stored secret is unrecoverable without it, and
+a key the operator never created by hand is easier to lose than one they did. Generation happens only while the store is
+empty; a missing key with secrets already in the database is a hard error naming them rather than a silent replacement
+that would orphan every one (see "Secrets store").
 
-```nu
-mkdir secrets
-chmod 700 secrets
-# migrating from a host install: copy the EXISTING key instead of generating,
-# or the secrets already in state.db cannot be decrypted
-age-keygen | save secrets/age-key.txt
+`CLAUDE_RUN_SECRETS_KEY_FILE` is the bring-your-own-key path, for a key that comes from your own secret store or has to
+be shared with another instance. Its value is a PATH, never the key itself: key material in a plain environment variable
+is deliberately unsupported (visible to `docker inspect` and `/proc/<pid>/environ`), so deliver the file with a bind
+mount or a compose `secrets:` entry you add yourself, and set the variable to where it lands.
+`ANTHROPIC_API_KEY` is the one secret that MAY go through plain env, as the Claude-auth alternative above.
+
+```yaml
+services:
+  claude-bot:
+    environment:
+      CLAUDE_RUN_SECRETS_KEY_FILE: /run/secrets/claude-run-age-key
+    secrets:
+      - claude-run-age-key
+
+secrets:
+  claude-run-age-key:
+    file: ./secrets/age-key.txt
 ```
 
-A deployment that cannot use a path relative to the compose file (one whose config is piped through `docker compose --file -`, where relative paths resolve against the caller's working directory) declares the same secret from an environment value instead, and supplies that value from its own secret store:
+A deployment that cannot use a path relative to the compose file (one whose config is piped through `docker compose --file -`, where relative paths resolve against the caller's working directory) declares that same secret from an environment value instead, and supplies the value from its own secret store. The key still reaches the container as a file at `/run/secrets/claude-run-age-key`; only the source changes:
 
 ```yaml
 secrets:
   claude-run-age-key:
     environment: CLAUDE_RUN_AGE_KEY
 ```
+
+**Migrating from a host install.** Carry the EXISTING key across, or the secrets already in the state store cannot be
+decrypted, and do it before the first start so the daemon finds a key instead of generating one. Either copy it onto the
+config volume:
+
+```nu
+docker compose create
+docker cp ~/.config/claude-run/secrets.key claude-bot:/config/secrets.key
+docker compose up --detach
+```
+
+or leave the host file where it is, mount it, and point `CLAUDE_RUN_SECRETS_KEY_FILE` at the mount as above. `docker cp`
+keeps the source's uid and mode; the entrypoint chowns `/config` to `claudebot` on every start, and a key readable
+beyond its owner still loads with a `warn`, so `chmod 600` the copy if you want that warning gone.
 
 **Networking.** The seeded `config.toml` already binds `0.0.0.0:7321`; publish the port (`ports:` mapping or a
 reverse-proxy network) to reach it. A non-loopback bind requires auth, which the first-run `/setup` page creates. A

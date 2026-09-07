@@ -18,8 +18,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::db::DbPool;
 use age::secrecy::ExposeSecret;
-use sqlx::SqlitePool;
 
 use crate::action::{ForgejoTarget, GithubTarget, YoutrackSource};
 use crate::error::{Error, Result};
@@ -151,7 +151,7 @@ fn legacy_key_file_path() -> Result<PathBuf> {
 ///
 /// Called once at serve start and by the CLI before it stores a secret, so
 /// [`SecretsKey::load`] elsewhere is a plain read with one behaviour.
-pub async fn ensure_key(pool: &SqlitePool) -> Result<PathBuf> {
+pub async fn ensure_key(pool: &DbPool) -> Result<PathBuf> {
     let path = key_file_path()?;
     if path.exists() {
         return Ok(path);
@@ -293,7 +293,7 @@ fn generate_key_file(path: &Path) -> Result<()> {
 
 /// Decrypt the secret named `name`, bumping its `last_used_at`. Errors when the
 /// name is unknown or the ciphertext does not decrypt under the loaded key.
-pub async fn resolve_secret(pool: &SqlitePool, key: &SecretsKey, name: &str) -> Result<String> {
+pub async fn resolve_secret(pool: &DbPool, key: &SecretsKey, name: &str) -> Result<String> {
     let ciphertext = state::secret_get_ciphertext(pool, name)
         .await?
         .ok_or_else(|| Error::Secret(format!("no secret named `{name}`")))?;
@@ -329,7 +329,7 @@ impl ResolvedCredentials {
 /// decrypted credentials. The key file is loaded only when at least one block
 /// references a secret, so the host-auth path needs no key configured.
 pub async fn resolve_youtrack_credentials(
-    pool: &SqlitePool,
+    pool: &DbPool,
     youtrack: &YoutrackSource,
     forgejo: &ForgejoTarget,
     github: &GithubTarget,
@@ -993,15 +993,8 @@ mod tests {
         assert!(!dir.join("forgejo-cli").exists());
     }
 
-    async fn mem_pool() -> SqlitePool {
-        use sqlx::sqlite::SqlitePoolOptions;
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::db::MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn mem_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     #[tokio::test]

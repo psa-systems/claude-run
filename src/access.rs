@@ -21,8 +21,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::db::DbPool;
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 
 use crate::action::{ActionKind, ForgejoTarget, GithubTarget, NativeConfig, YoutrackSource};
 use crate::error::{Error, Result};
@@ -270,11 +270,7 @@ fn no_actions_row(req: &AccessRequest) -> CheckRow {
 /// A missing `yt` / `fj` is reported as a row rather than propagated, so no
 /// surface 500s on it. With nothing to probe, the no-actions row is the more
 /// useful answer than "the CLI is absent", so it wins.
-pub async fn check(
-    pool: &SqlitePool,
-    cred_base: &Path,
-    req: &AccessRequest,
-) -> Result<AccessReport> {
+pub async fn check(pool: &DbPool, cred_base: &Path, req: &AccessRequest) -> Result<AccessReport> {
     match provider::resolve_runner(provider::DEFAULT_PRIORITY) {
         Ok(runner) => check_with(pool, cred_base, req, runner).await,
         Err(e) => {
@@ -291,7 +287,7 @@ pub async fn check(
 
 /// [`check`] with an injectable [`CommandRunner`] (tests).
 pub async fn check_with(
-    pool: &SqlitePool,
+    pool: &DbPool,
     cred_base: &Path,
     req: &AccessRequest,
     runner: Arc<dyn CommandRunner>,
@@ -348,7 +344,7 @@ pub async fn check_with(
 /// per action whose YAML no longer loads (a check that silently skipped it would
 /// report "all good" for an action it never probed).
 async fn action_targets(
-    pool: &SqlitePool,
+    pool: &DbPool,
     req: &AccessRequest,
 ) -> Result<(Vec<ActionTargets>, Vec<CheckRow>)> {
     let mut targets = Vec::new();
@@ -796,7 +792,7 @@ fn query_remediation(detail: &str, project: Option<&str>) -> String {
 /// dashboard banner still clears (the marker supersedes the open failure) and
 /// the event log stays readable.
 pub async fn retain_access_recoveries(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
     events: &[state::InputEvent],
 ) -> Result<Vec<state::InputEvent>> {
