@@ -36,6 +36,7 @@ pub mod error;
 pub mod forge_log;
 pub mod gc;
 pub mod import;
+pub mod infra_failure;
 pub mod job;
 pub mod jsonfmt;
 pub mod lock;
