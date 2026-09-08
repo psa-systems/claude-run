@@ -924,7 +924,7 @@ is preserved end to end via `forge_log::redact`, so no token lands in a posted c
 below; `query` / `summary_prefixes` / `max_analysis_bytes` tune selection and the comment cap). See `actions/SCHEMA.md`
 (`kind: ci-failure-analysis`).
 
-### Auto-close of fixed and duplicate CI-failure issues (CLAUDE-191, CLAUDE-198)
+### Auto-close of fixed and duplicate CI-failure issues (CLAUDE-191, CLAUDE-198, CLAUDE-265)
 
 The mint path keeps only `action_run_failure` events and drops every success, so nothing in claude-run ever observes a
 run going green: a "CI failure" / "Auto-fix" issue whose root cause is later fixed stays open until a human closes it by
@@ -932,13 +932,22 @@ hand. The `ci-failure-reconcile` native action (`kind: ci-failure-reconcile`, `s
 that gap. On a schedule it scans open CI-failure issues, reads each issue's hidden `Branch:` / `Job:` markers (the
 CLAUDE-190 rekey markers; a pre-rekey issue with no parseable branch/job is left for manual close), then for each
 allow-listed repo pages the Forgejo runs list, reduces it to the LATEST run per `(branch, workflow_id)`, and reads that
-run's per-job status from the jobs endpoint. Every open issue whose `(repo, branch, workflow, job)` is `success` on its
-latest run is closed: State set to `resolved_state` (default `Done`) and a run-linked comment posted ("Auto-closed: run
-#N on `<branch>` succeeded ...; the failing `<job>` is green, root cause resolved.").
+run's per-job status from the jobs endpoint.
 
-Only the LATEST run decides, so a newer failure after an older green run leaves the job red and the issue open; matching is
-exact on all four of `(repo, branch, workflow, job)`, so a green sibling branch or job never closes a still-broken issue.
-The close is idempotent (a resolved issue drops out of the `#Unresolved` scan, and a hidden auto-closed marker guards
+The close scope is `(repo, workflow_id, job_name)`, never the branch the failure happened to occur on (CLAUDE-265): a
+branch that was merged or deleted can never produce another run, so keying the close on it stranded the issue open
+forever. Two scopes cover the two failure kinds. A code issue (no hidden `Infra-Kind:` marker) closes when its
+`(repo, workflow_id, job_name)` is green on the configured `default_branch` (default `main`): the default branch is the
+authority on whether the code is fixed, so a green run on some unrelated feature branch does not close it. An infra
+issue (carrying the CLAUDE-264 `Infra-Kind:` marker) closes when its `(repo, workflow_id, job_name)` is green on ANY
+branch, since a host condition such as a full disk is not a property of a branch. Either way the green run must be
+STRICTLY NEWER than the run the issue itself recorded (its `run_index`, parsed from the `- Run:` URL), so a freshly
+minted issue is never closed by the default branch's ordinary steady-state green. State is set to `resolved_state`
+(default `Done`) and a run-linked comment posted ("Auto-closed: run #N on `<branch>` succeeded ...; the failing `<job>`
+is green, root cause resolved.").
+
+Only the LATEST run decides, so a newer failure after an older green run leaves the job red and the issue open. The
+close is idempotent (a resolved issue drops out of the `#Unresolved` scan, and a hidden auto-closed marker guards
 against a re-comment). When the runs list carries no plain branch name (`fj`'s `head_branch` is Forgejo's `prettyref`,
 which is `#<pr-number>` for a PR run and the bare commit sha for a ref-deleted push), the branch is resolved from the
 run's log environment dump, bounded by `max_branch_resolves`. The reconciler is polling by design (a success webhook
