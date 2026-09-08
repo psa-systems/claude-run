@@ -1088,7 +1088,8 @@ What bounds each path:
 - `logs/daemon.log`: size, `config.stream_log_gc.daemon_log_max_bytes` (default 50 MiB). Past the ceiling the daemon's log GC pass copies the file to `daemon.log.1` and truncates it in place back to its newest half, so the daemon's open append handle keeps writing to the live file.
 - `logs/<name>/<output.file>`: size, `config.stream_log_gc.output_file_max_bytes` (default 50 MiB), same rollover. It is bounded by size and never deleted by age: `output.file` is an operator-configured data sink, so the sweep keeps the newest records in place instead of destroying the record.
 - `logs/<name>/streams/*.jsonl`: age, `config.stream_log_gc.retention_days` (default 30). A log whose job is still in flight is kept at any age.
-- `snippets/` and `webhook-logs/`: nothing bounds these yet; see CLAUDE-262.
+- `snippets/<name>/<key>/`: age, `config.stream_log_gc.snippet_retention_days` (default 30). A directory whose job is still in flight is kept at any age, the same guard the stream logs use.
+- `webhook-logs/`: age, `config.stream_log_gc.webhook_log_retention_days` (default 30), applied to files directly under it. `webhook-logs/triage/`, the mint classifier's reused working directory, is never swept.
 
 Pause state and per-key accounting are NOT files here. Global pause is the `global_pause` flag and per-action pause the
 `paused_actions` table (`src/pause.rs`); attempt counters, daily counts, and daily cost are the `attempt_counters` and

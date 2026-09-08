@@ -68,6 +68,14 @@ impl Paths {
     pub fn workdirs_dir(&self) -> PathBuf {
         self.data_dir.join("workdirs")
     }
+
+    pub fn snippets_dir(&self) -> PathBuf {
+        self.state_dir.join("snippets")
+    }
+
+    pub fn webhook_logs_dir(&self) -> PathBuf {
+        self.state_dir.join("webhook-logs")
+    }
 }
 
 fn resolve_dir(env_var: &str, xdg_default: Option<PathBuf>, subdir: &str) -> Result<PathBuf> {
@@ -610,6 +618,24 @@ pub struct StreamLogGcConfig {
     /// without bound. `0` disables the ceiling for operators who want the sink
     /// kept whole and rotate it themselves.
     pub output_file_max_bytes: u64,
+    /// CLAUDE-262: age, in days, past which a `snippets/<action>/<job_key>/`
+    /// directory is deleted, measured from its last-modified time. One per job
+    /// per scripted step (`filter` / `pre` / `prompt` / `post`), holding the
+    /// rendered snippet plus one `binding-<name>.json` per `$`-binding
+    /// (`binding-job.json` carries the whole job payload), so a scripted action
+    /// polling every few minutes writes one indefinitely without this window. A
+    /// directory whose job is still in flight is kept regardless of age, the
+    /// same guard [`crate::gc::sweep_stream_logs`] applies to a live run's
+    /// stream log.
+    pub snippet_retention_days: u64,
+    /// CLAUDE-262: age, in days, past which a file directly under
+    /// `webhook-logs/` (the redacted, concatenated CI job logs
+    /// [`crate::forge_log::fetch_run_log`] writes per triaged run) is deleted,
+    /// measured from its last-modified time. The `webhook-logs/triage/` working
+    /// directory the mint classifier reuses across triages is not a per-run
+    /// artifact and is left alone by this sweep (it walks files directly under
+    /// `webhook-logs/`, not its subdirectories).
+    pub webhook_log_retention_days: u64,
 }
 
 impl Default for StreamLogGcConfig {
@@ -622,6 +648,11 @@ impl Default for StreamLogGcConfig {
             // rounding error next to the stream logs' ~1 GB window.
             daemon_log_max_bytes: 50 * 1024 * 1024,
             output_file_max_bytes: 50 * 1024 * 1024,
+            // Same 30-day default as the stream logs: both are per-unit-of-work
+            // artifacts with the same "recent failure still has its evidence"
+            // shape, and there is no stated reason yet to diverge the windows.
+            snippet_retention_days: 30,
+            webhook_log_retention_days: 30,
         }
     }
 }
