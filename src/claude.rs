@@ -336,7 +336,28 @@ impl ClaudeInvoker {
         let status = outcome.status;
 
         let exit_code = status.code().unwrap_or(-1);
-        let final_event = parse_final_result(stream_log).unwrap_or(Value::Null);
+        // CLAUDE-256: a stream log the runner cannot READ decides nothing, so it
+        // is reported as the runner's own fault and never as "claude produced no
+        // result event", which is a non-transient failure that spends one of the
+        // job's `max_attempts_per_key`. A relay error that preceded it is named
+        // too: a failed write is the likeliest reason the read now fails.
+        let final_event = match parse_final_result(stream_log) {
+            Ok(event) => event.unwrap_or(Value::Null),
+            Err(err) => {
+                let reason = match &relay_error {
+                    Some(relay) => format!("{err} (the relay had already failed: {relay})"),
+                    None => err.to_string(),
+                };
+                warn!(
+                    stream_log = %stream_log.display(),
+                    error = %err,
+                    relay_error = relay_error.as_deref().unwrap_or(""),
+                    exit_code,
+                    "could not read the stream log; the run outcome cannot be recovered from it"
+                );
+                return Ok(read_failure_result(&reason, stream_log, exit_code));
+            }
+        };
         let have_result = final_event.get("type").and_then(|v| v.as_str()) == Some("result");
 
         // CLAUDE-233: the relay is the stream log's only writer, so a relay that
@@ -466,6 +487,9 @@ fn wait_or_cancel(
     // Set once claude's terminal `result` event is first observed; the child is
     // force-terminated if it is still alive at this instant.
     let mut result_deadline: Option<Instant> = None;
+    // CLAUDE-256: this loop polls the log every 100ms, so a persistently
+    // unreadable log is reported once rather than a hundred times a second.
+    let mut read_error_logged = false;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(WaitOutcome {
@@ -482,11 +506,25 @@ fn wait_or_cancel(
             });
         }
         match result_deadline {
-            None => {
-                if stream_has_terminal_result(stream_log) {
-                    result_deadline = Some(Instant::now() + result_exit_grace);
+            None => match stream_has_terminal_result(stream_log) {
+                Ok(true) => result_deadline = Some(Instant::now() + result_exit_grace),
+                Ok(false) => {}
+                // CLAUDE-256: an unreadable log is not "no result yet". The
+                // grace timer cannot arm from a file we cannot read, so the
+                // child runs to its own exit or the `timeout(1)` wrapper; the
+                // reason is logged instead of discarded, and `invoke` finalizes
+                // the run as a read failure once the child is gone.
+                Err(err) => {
+                    if !read_error_logged {
+                        read_error_logged = true;
+                        warn!(
+                            stream_log = %stream_log.display(),
+                            error = %err,
+                            "could not read the stream log while waiting for claude's terminal result; the result-exit grace timer cannot arm"
+                        );
+                    }
                 }
-            }
+            },
             Some(deadline) => {
                 if Instant::now() >= deadline {
                     warn!(
@@ -513,8 +551,11 @@ fn wait_or_cancel(
 /// as "terminal result observed" here. A partial trailing write fails to parse
 /// and is skipped, so the grace timer only starts once a full `result` event has
 /// landed.
-fn stream_has_terminal_result(stream_log: &Path) -> bool {
-    parse_final_result(stream_log).is_some()
+///
+/// CLAUDE-256: a read failure is carried out rather than read as "no result
+/// yet", so the caller can say why the grace timer never armed.
+fn stream_has_terminal_result(stream_log: &Path) -> std::io::Result<bool> {
+    Ok(parse_final_result(stream_log)?.is_some())
 }
 
 /// Terminate the child's process group: SIGTERM, a short grace window, then
@@ -625,14 +666,23 @@ fn stamp_line(raw: &[u8]) -> Vec<u8> {
 /// the `result` event, so the last non-empty line is not reliably the result.
 /// Scan the stream backward and return the last line that parses as a JSON
 /// object with `type == "result"`, skipping any non-`result` trailing lines.
-/// Returns `None` only when the stream contains no `result` event anywhere
-/// (the genuine no-terminal-result case the `:228` guard catches).
-fn parse_final_result(stream_log: &Path) -> Option<Value> {
-    let raw = std::fs::read_to_string(stream_log).ok()?;
-    raw.lines()
+/// Returns `Ok(None)` only when the stream was read end to end and contains no
+/// `result` event anywhere (the genuine no-terminal-result case the `!have_result`
+/// guard catches).
+///
+/// CLAUDE-256: a read FAILURE comes back as `Err`, never as that same `None`.
+/// The two are different facts - the runner could not read the file, versus
+/// claude never wrote a result - and collapsing them blamed the agent for a log
+/// the runner could not open. `read_to_string` fails with `InvalidData` on a
+/// file ending inside a multi-byte UTF-8 sequence, which is exactly what the
+/// CLAUDE-233 disk-full truncation produced.
+fn parse_final_result(stream_log: &Path) -> std::io::Result<Option<Value>> {
+    let raw = std::fs::read_to_string(stream_log)?;
+    Ok(raw
+        .lines()
         .rev()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))
+        .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("result")))
 }
 
 fn read_tail(p: &Path, max: usize) -> std::io::Result<String> {
@@ -669,12 +719,35 @@ fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -> String {
             return error.to_string();
         }
     }
-    if let Some(text) = last_assistant_text(stream_log) {
-        if !text.is_empty() {
-            return text;
-        }
+    // CLAUDE-256: both remaining sources read the same file, so a read failure
+    // ends the search here. It used to produce an empty summary
+    // (`unwrap_or_default`), which is indistinguishable from an empty log and
+    // leaves the operator looking at nothing with no explanation.
+    match last_assistant_text(stream_log) {
+        Ok(Some(text)) if !text.is_empty() => return text,
+        Ok(_) => {}
+        Err(err) => return unreadable_log_summary(stream_log, &err),
     }
-    read_tail(stream_log, 2000).unwrap_or_default()
+    match read_tail(stream_log, 2000) {
+        Ok(tail) => tail,
+        Err(err) => unreadable_log_summary(stream_log, &err),
+    }
+}
+
+/// CLAUDE-256: the operator-facing summary for a stream log that could not be
+/// read. Never empty, and it names the path so the file can be inspected.
+fn unreadable_log_summary(stream_log: &Path, err: &std::io::Error) -> String {
+    warn!(
+        stream_log = %stream_log.display(),
+        error = %err,
+        "could not read the stream log for the failure summary"
+    );
+    format!(
+        "The runner could not read this run's stream log ({}): {}. \
+         No failure detail could be recovered from it.",
+        stream_log.display(),
+        err
+    )
 }
 
 /// CLAUDE-233: the outcome reported when the runner's own stream-log relay died
@@ -711,10 +784,43 @@ fn relay_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Clau
     }
 }
 
+/// CLAUDE-256: the outcome reported when the runner could not READ the stream
+/// log it just wrote. Same shape and same reasoning as `relay_failure_result`:
+/// the fault is the runner's, claude's real outcome is unknown rather than bad,
+/// and `transient` is what stops a file the runner could not read from spending
+/// one of the job's `max_attempts_per_key`. Without it the run finalized as
+/// "claude stream did not end with a result event", a non-transient failure
+/// pinned on the agent.
+fn read_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> ClaudeResult {
+    ClaudeResult {
+        ok: false,
+        summary: format!(
+            "The runner could not read this run's stream log ({}): {}. \
+             Claude's outcome is recorded only in that file, so it is unknown, not failed. \
+             A log truncated mid-character by a full disk, a permissions problem, or an I/O error on the log partition all read this way. \
+             This attempt was not counted, so the job is picked up again on the next poll.",
+            stream_log.display(),
+            reason
+        ),
+        cost: 0.0,
+        raw: Value::Null,
+        error: format!(
+            "the runner could not read the stream log {}: {}",
+            stream_log.display(),
+            reason
+        ),
+        transient: true,
+        // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
+        timed_out: exit_code == 124,
+    }
+}
+
 /// Scan the stream log backwards for the last `assistant` message event and
-/// concatenate the `text` of its text content blocks.
-fn last_assistant_text(stream_log: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(stream_log).ok()?;
+/// concatenate the `text` of its text content blocks. CLAUDE-256: `Ok(None)`
+/// means the log was read and holds no assistant message; a read failure is
+/// `Err`, so the caller can say so instead of silently degrading the summary.
+fn last_assistant_text(stream_log: &Path) -> std::io::Result<Option<String>> {
+    let raw = std::fs::read_to_string(stream_log)?;
     for line in raw.lines().rev() {
         let line = line.trim();
         if line.is_empty() {
@@ -739,9 +845,9 @@ fn last_assistant_text(stream_log: &Path) -> Option<String> {
             .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
             .collect::<Vec<_>>()
             .join("");
-        return Some(text);
+        return Ok(Some(text));
     }
-    None
+    Ok(None)
 }
 
 /// CLAUDE-56: render the final result event as a collapsed, pretty-printed JSON
@@ -1394,7 +1500,7 @@ exit "$code"
              {\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 529 Overloaded.\"}\n",
         )
         .unwrap();
-        let final_event = parse_final_result(&log).unwrap();
+        let final_event = parse_final_result(&log).unwrap().unwrap();
         assert_eq!(
             friendly_failure_summary(&final_event, &log),
             "API Error: 529 Overloaded."
@@ -1411,7 +1517,7 @@ exit "$code"
             "{\"type\":\"result\",\"is_error\":true,\"result\":\"\",\"error\":\"model overloaded\"}\n",
         )
         .unwrap();
-        let final_event = parse_final_result(&log).unwrap();
+        let final_event = parse_final_result(&log).unwrap().unwrap();
         assert_eq!(
             friendly_failure_summary(&final_event, &log),
             "model overloaded"
@@ -1433,7 +1539,7 @@ exit "$code"
         // CLAUDE-107: no result event in the stream, so `parse_final_result`
         // returns None and the caller falls back to `Value::Null` (mirrors the
         // production call at the `invoke` site).
-        let final_event = parse_final_result(&log).unwrap_or(Value::Null);
+        let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
         assert_eq!(
             friendly_failure_summary(&final_event, &log),
             "API Error: 529 Overloaded."
@@ -1448,7 +1554,7 @@ exit "$code"
         let log = dir.path().join("stream.jsonl");
         std::fs::write(&log, "{\"type\":\"system\",\"subtype\":\"init\"}\n").unwrap();
         // CLAUDE-107: no result event, so the caller falls back to `Value::Null`.
-        let final_event = parse_final_result(&log).unwrap_or(Value::Null);
+        let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
         assert_eq!(
             friendly_failure_summary(&final_event, &log),
             "{\"type\":\"system\",\"subtype\":\"init\"}\n"
@@ -1554,7 +1660,7 @@ exit "$code"
         let log = dir.path().join("stream.jsonl");
         let stamped = String::from_utf8(stamp_line(format!("{RESULT_LINE}\n").as_bytes())).unwrap();
         std::fs::write(&log, stamped).unwrap();
-        let final_event = parse_final_result(&log).unwrap();
+        let final_event = parse_final_result(&log).unwrap().unwrap();
         assert_eq!(
             final_event.get("type").and_then(|t| t.as_str()),
             Some("result")
@@ -1582,8 +1688,9 @@ exit "$code"
             ),
         )
         .unwrap();
-        let final_event =
-            parse_final_result(&log).expect("result event selected past trailing system events");
+        let final_event = parse_final_result(&log)
+            .unwrap()
+            .expect("result event selected past trailing system events");
         assert_eq!(
             final_event.get("type").and_then(|t| t.as_str()),
             Some("result"),
@@ -1610,7 +1717,7 @@ exit "$code"
         )
         .unwrap();
         assert!(
-            parse_final_result(&log).is_none(),
+            parse_final_result(&log).unwrap().is_none(),
             "no result event anywhere yields None"
         );
     }
@@ -1742,6 +1849,156 @@ exit "$code"
     fn relay_failure_preserves_the_timeout_flag() {
         let result = relay_failure_result("write failed", Path::new("/logs/s.jsonl"), 124);
         assert!(result.timed_out, "exit 124 is still surfaced as a timeout");
+    }
+
+    /// CLAUDE-256: a stream log ending inside a multi-byte UTF-8 sequence (what a
+    /// disk-full short write at a page boundary leaves behind) fails to read.
+    /// That failure must not produce the same value as a log that was read end to
+    /// end and holds no `result` event.
+    #[test]
+    fn parse_final_result_reports_a_read_failure_instead_of_no_result_event() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let truncated = dir.path().join("truncated.jsonl");
+        let mut bytes = format!("{RESULT_LINE}\n").into_bytes();
+        // A euro sign cut after its second byte: valid so far, incomplete.
+        bytes.extend_from_slice(&[0xe2, 0x82]);
+        std::fs::write(&truncated, &bytes).unwrap();
+        let err = parse_final_result(&truncated).expect_err("an unreadable log is an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let no_result = dir.path().join("no-result.jsonl");
+        std::fs::write(&no_result, "{\"type\":\"system\",\"subtype\":\"init\"}\n").unwrap();
+        assert!(
+            parse_final_result(&no_result).unwrap().is_none(),
+            "a readable log with no result event is still Ok(None)"
+        );
+    }
+
+    /// CLAUDE-256: the end-to-end outcome. A run whose stream log cannot be read
+    /// finalizes as a runner-side read failure - transient, so it spends none of
+    /// the job's `max_attempts_per_key` - and NOT as the non-transient "claude
+    /// stream did not end with a result event", which blamed the agent for a file
+    /// the runner could not open.
+    #[test]
+    fn invoke_reports_an_unreadable_stream_log_as_a_transient_read_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        // Emit one clean event, then a line cut inside a multi-byte character, so
+        // the log on disk is exactly the shape CLAUDE-233 found on host-a.
+        write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n\
+             printf 'truncated: \\342\\202'\n\
+             exit 0\n",
+        );
+
+        let invoker = ClaudeInvoker {
+            binary: stub.to_str().unwrap().to_string(),
+            result_exit_grace: Duration::from_secs(30),
+            config_dir: None,
+            default_claude: None,
+            api_key: None,
+        };
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let (res, logs) = capture_logs(|| {
+            invoker
+                .invoke(
+                    "hi",
+                    &cfg,
+                    Duration::from_secs(10),
+                    dir.path(),
+                    &log,
+                    &cancel,
+                )
+                .unwrap()
+        });
+
+        assert!(!res.ok, "an undecidable run is not a success");
+        assert!(
+            res.transient,
+            "a log the runner could not read must not count an attempt against the job"
+        );
+        assert!(
+            !res.error.contains("did not end with a result event"),
+            "the failure is no longer attributed to claude, got: {}",
+            res.error
+        );
+        assert!(
+            res.error.contains("could not read the stream log")
+                && res.error.contains("stream.jsonl"),
+            "the reason names the read failure and the log path, got: {}",
+            res.error
+        );
+        assert!(
+            res.summary.contains("stream.jsonl") && res.summary.contains("unknown, not failed"),
+            "the operator-facing summary names the log and does not call the session failed, got: {}",
+            res.summary
+        );
+        assert!(logs.contains("WARN"), "logged at warn, got:\n{logs}");
+        assert!(
+            logs.contains("could not read the stream log") && logs.contains("stream.jsonl"),
+            "the log line carries the cause and the path, got:\n{logs}"
+        );
+    }
+
+    /// CLAUDE-256: the same reasoning as `relay_failure_is_transient...`, for the
+    /// read side. `transient` is the load-bearing field, so it is asserted
+    /// explicitly rather than inferred, and the timeout flag survives.
+    #[test]
+    fn read_failure_is_transient_and_names_the_runner_as_the_cause() {
+        let result = read_failure_result(
+            "stream did not contain valid UTF-8 (os error 22)",
+            Path::new("/logs/YouTrack/streams/CLAUDE-256-attempt-1.jsonl"),
+            0,
+        );
+        assert!(!result.ok, "the run did not succeed");
+        assert!(
+            result.transient,
+            "a runner-side read failure must not count an attempt against the job"
+        );
+        assert!(!result.timed_out, "exit 0 is not a timeout");
+        assert!(
+            result.error.contains("valid UTF-8")
+                && result.error.contains("CLAUDE-256-attempt-1.jsonl"),
+            "the cause and the log are named, got: {}",
+            result.error
+        );
+        assert!(
+            !result.error.contains("did not end with a result event"),
+            "the failure is not attributed to claude, got: {}",
+            result.error
+        );
+        assert!(
+            read_failure_result("read failed", Path::new("/logs/s.jsonl"), 124).timed_out,
+            "exit 124 is still surfaced as a timeout"
+        );
+    }
+
+    /// CLAUDE-256: the last-resort summary path. `read_tail(..).unwrap_or_default()`
+    /// returned an empty string for an unreadable log, which the operator sees as
+    /// a run that said nothing at all. It now says the log was unreadable and
+    /// names it, at `warn`.
+    #[test]
+    fn friendly_summary_names_a_log_it_could_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(&log, [0xe2, 0x82]).unwrap();
+
+        let (summary, logs) = capture_logs(|| friendly_failure_summary(&Value::Null, &log));
+        assert!(!summary.is_empty(), "never an empty summary");
+        assert!(
+            summary.contains("could not read") && summary.contains("stream.jsonl"),
+            "the summary says the log was unreadable and names it, got: {summary}"
+        );
+        assert!(logs.contains("WARN"), "logged at warn, got:\n{logs}");
+        assert!(
+            logs.contains("stream.jsonl"),
+            "the log line names the path, got:\n{logs}"
+        );
     }
 
     /// CLAUDE-63 (smoke): a run through a stub claude that emits several JSON
