@@ -28,8 +28,13 @@
 //!   `Root-Cause-Key:` marker are collapsed onto the oldest of the group; the rest
 //!   are closed as duplicates. Mint's cross-run collapse is a tracker full-text
 //!   search, so a lagging index lets two failures of the same job mint two issues.
-//! - close: every open issue whose `(repo, branch, workflow, job)` exactly matches
-//!   a now-green job is set to `resolved_state` and gets a run-linked comment.
+//! - close (CLAUDE-265): every open issue whose `(repo, workflow, job)` matches a
+//!   now-green job STRICTLY newer than the issue's own recorded run is set to
+//!   `resolved_state` and gets a run-linked comment. The branch is no longer
+//!   compared: a code issue (no `Infra-Kind:` marker) requires the green run to
+//!   be on the configured `default_branch`, an infra issue (carrying the
+//!   CLAUDE-264 marker) accepts any branch, so a merged or deleted PR branch
+//!   never strands an issue open forever.
 //!
 //! All Forgejo reads go through `forge_log` (Rust) and shell out to `fj`: the
 //! runs list via `fj actions runs`, the logs via `fj actions logs` (CLAUDE-205).
@@ -241,10 +246,13 @@ async fn run_ci_failure_reconcile(ctx: NativeContext<'_>) -> Result<()> {
             crate::blocking::in_place(|| gather_now_green(&fj, &cfg, &token, &repo, &repo_targets));
 
         for gt in &repo_targets {
-            if green.iter().any(|g| issue_matches(&gt.coords, &repo, g)) {
+            if green
+                .iter()
+                .any(|g| issue_matches(&gt.coords, &repo, g, &cfg.default_branch))
+            {
                 let g = green
                     .iter()
-                    .find(|g| issue_matches(&gt.coords, &repo, g))
+                    .find(|g| issue_matches(&gt.coords, &repo, g, &cfg.default_branch))
                     .expect("just matched");
                 match close_issue(&tracker, &cfg, &gt.key, g) {
                     Ok(()) => {
@@ -283,6 +291,16 @@ struct IssueCoords {
     /// CLAUDE-190 `Root-Cause-Key:` marker; empty on a pre-rekey issue, which is
     /// then never treated as a duplicate of anything.
     root_cause_key: String,
+    /// The issue's own failing run's per-repo index, parsed from the `- Run:`
+    /// URL suffix (CLAUDE-265). A close is only valid against a green run
+    /// STRICTLY newer than this one, so a steady-state green default branch
+    /// never closes an issue for a failure it has not yet fixed.
+    run_index: i64,
+    /// CLAUDE-264 hidden `Infra-Kind:` marker, present only on an infra/external
+    /// failure. `None` means a code issue: its close scope is the configured
+    /// `default_branch`. `Some(_)` means an infra issue: its close scope is ANY
+    /// branch, since a host condition is not a property of a branch.
+    infra_kind: Option<String>,
 }
 
 /// CLAUDE-198: one duplicate issue and the canonical issue it collapses onto.
@@ -377,10 +395,13 @@ fn parse_issue_coords(inspect: &IssueInspect) -> IssueParse {
     let mut branch_bullet = String::new();
     let mut job_name = String::new();
     let mut root_cause_key = String::new();
+    let mut infra_kind: Option<String> = None;
     for line in inspect.description.lines() {
         let t = line.trim();
         if let Some(v) = t.strip_prefix("Root-Cause-Key:") {
             root_cause_key = v.trim().to_string();
+        } else if let Some(v) = t.strip_prefix("Infra-Kind:") {
+            infra_kind = Some(v.trim().to_string());
         } else if let Some(v) = t.strip_prefix("- Repo:") {
             repo = unbacktick(v);
         } else if let Some(v) = t.strip_prefix("- Workflow:") {
@@ -410,6 +431,20 @@ fn parse_issue_coords(inspect: &IssueInspect) -> IssueParse {
             "no branch/job markers (pre-rekey issue); left for manual close".to_string(),
         );
     }
+    // CLAUDE-265: the issue's own run index, parsed from the `- Run:` URL suffix
+    // (e.g. `.../actions/runs/4034` -> `4034`). Never guessed: an unparseable
+    // index means the freshness comparison against a candidate green run cannot
+    // be made, so the issue is left for manual close rather than closed on an
+    // unverifiable comparison.
+    let Some(run_index) = html_url
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return IssueParse::Skip(format!(
+            "could not parse the issue's own run index from its Run: url `{html_url}`"
+        ));
+    };
     IssueParse::Matched(IssueCoords {
         repo,
         branch,
@@ -417,6 +452,8 @@ fn parse_issue_coords(inspect: &IssueInspect) -> IssueParse {
         job_name,
         html_url,
         root_cause_key,
+        run_index,
+        infra_kind,
     })
 }
 
@@ -556,17 +593,29 @@ fn gather_now_green(
 
     resolve_missing_branches(fj, cfg, token, repo, &out_dir, &mut runs, &target_workflows);
 
-    // The set of (branch, workflow) pairs a target tracks, to skip jobs reads for
-    // runs no open issue references.
-    let target_pairs: HashSet<(&str, &str)> = repo_targets
+    // CLAUDE-265: the workflows an ANY-branch (infra-keyed) target tracks need a
+    // jobs read for every branch; a default-branch (code) target needs one only
+    // for the configured `default_branch`. Neither set is keyed on the issue's
+    // OWN branch anymore, so a merged/deleted PR branch is never what decides
+    // whether a run is worth reading.
+    let any_branch_workflows: HashSet<&str> = repo_targets
         .iter()
-        .map(|t| (t.coords.branch.as_str(), t.coords.workflow_id.as_str()))
+        .filter(|t| t.coords.infra_kind.is_some())
+        .map(|t| t.coords.workflow_id.as_str())
+        .collect();
+    let default_branch_workflows: HashSet<&str> = repo_targets
+        .iter()
+        .filter(|t| t.coords.infra_kind.is_none())
+        .map(|t| t.coords.workflow_id.as_str())
         .collect();
 
     let latest = reduce_latest_runs(&runs);
     let mut green = Vec::new();
     for run in &latest {
-        if !target_pairs.contains(&(run.branch.as_str(), run.workflow_id.as_str())) {
+        let in_scope = any_branch_workflows.contains(run.workflow_id.as_str())
+            || (run.branch == cfg.default_branch
+                && default_branch_workflows.contains(run.workflow_id.as_str()));
+        if !in_scope {
             continue;
         }
         match fetch_run(fj, token, repo, run, &out_dir) {
@@ -692,14 +741,29 @@ fn now_green_jobs(run: &RunEntry, jobs: &[JobLog]) -> Vec<GreenJob> {
         .collect()
 }
 
-/// True when the issue's `(repo, branch, workflow, job)` exactly matches a
-/// now-green job. Exact on all four so a green job for a sibling branch or job
-/// never closes a still-broken issue.
-fn issue_matches(coords: &IssueCoords, repo: &str, green: &GreenJob) -> bool {
+/// True when the issue's `(repo, workflow, job)` matches a now-green job within
+/// its close scope (CLAUDE-265). Always required: same repo, same
+/// `workflow_id`, same `job_name`, and the green run STRICTLY newer than the
+/// issue's own recorded run (`green.run_index > coords.run_index`), so a
+/// steady-state green default branch never closes a freshly minted issue.
+///
+/// The branch scope differs by whether the issue is infra-keyed: a code issue
+/// (no `Infra-Kind:` marker) requires `green.branch == default_branch`, since
+/// the default branch is the authority on whether the code is fixed; an infra
+/// issue (carrying the marker) accepts ANY branch, since a host condition is
+/// not a property of a branch. Neither rule compares `coords.branch` to
+/// `green.branch`, so a merged or deleted PR branch no longer strands the
+/// issue open.
+fn issue_matches(coords: &IssueCoords, repo: &str, green: &GreenJob, default_branch: &str) -> bool {
+    let branch_in_scope = match &coords.infra_kind {
+        Some(_) => true,
+        None => green.branch == default_branch,
+    };
     coords.repo == repo
-        && coords.branch == green.branch
+        && branch_in_scope
         && coords.workflow_id == green.workflow_id
         && coords.job_name == green.job_name
+        && green.run_index > coords.run_index
 }
 
 /// Set the issue's State to `resolved_state` and post the run-linked auto-close
@@ -961,46 +1025,162 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
             job_name: "check".to_string(),
             html_url: String::new(),
             root_cause_key: String::new(),
+            run_index: 5,
+            infra_kind: None,
         };
         assert!(!green
             .iter()
-            .any(|g| issue_matches(&coords, "owner/repo", g)));
+            .any(|g| issue_matches(&coords, "owner/repo", g, "main")));
     }
 
-    // ---- AC 3 + safety: exact matching, sibling guard ---------------------
-
-    #[test]
-    fn matching_is_exact_on_repo_branch_workflow_job() {
-        let coords = IssueCoords {
+    /// A code coords fixture: no `Infra-Kind:`, tracked failure at `run_index`.
+    fn code_coords(run_index: i64) -> IssueCoords {
+        IssueCoords {
             repo: "owner/repo".to_string(),
-            branch: "main".to_string(),
+            branch: "some-pr-branch".to_string(),
             workflow_id: "check.yml".to_string(),
             job_name: "check".to_string(),
             html_url: String::new(),
             root_cause_key: String::new(),
-        };
-        let exact = GreenJob {
-            branch: "main".to_string(),
+            run_index,
+            infra_kind: None,
+        }
+    }
+
+    fn green_job(branch: &str, run_index: i64) -> GreenJob {
+        GreenJob {
+            branch: branch.to_string(),
             workflow_id: "check.yml".to_string(),
             job_name: "check".to_string(),
-            run_index: 1,
+            run_index,
             run_url: String::new(),
-        };
-        assert!(issue_matches(&coords, "owner/repo", &exact));
-        // A green sibling job on the same branch must NOT match a different job.
+        }
+    }
+
+    // ---- AC 1 + AC 2: close scope no longer keys on coords.branch ---------
+
+    #[test]
+    fn code_issue_closes_on_default_branch_green_newer_than_its_own_run() {
+        // The issue's OWN recorded branch (`some-pr-branch`, from `code_coords`)
+        // is long gone; the close is decided by the default branch instead.
+        let coords = code_coords(5);
+        assert!(issue_matches(
+            &coords,
+            "owner/repo",
+            &green_job("main", 6),
+            "main"
+        ));
+    }
+
+    #[test]
+    fn code_issue_does_not_close_on_a_non_default_branch_green() {
+        let coords = code_coords(5);
+        assert!(!issue_matches(
+            &coords,
+            "owner/repo",
+            &green_job("some-other-branch", 6),
+            "main"
+        ));
+    }
+
+    #[test]
+    fn infra_issue_closes_on_any_branch_green_newer_than_its_own_run() {
+        let mut coords = code_coords(5);
+        coords.infra_kind = Some("disk-full".to_string());
+        // Neither the issue's own branch nor the default branch: an infra
+        // issue's scope is ANY branch.
+        assert!(issue_matches(
+            &coords,
+            "owner/repo",
+            &green_job("some-unrelated-branch", 6),
+            "main"
+        ));
+    }
+
+    // ---- AC 4: the green run must be strictly newer than the issue's own --
+
+    #[test]
+    fn a_green_run_not_newer_than_the_issue_never_closes_it_either_rule() {
+        let code = code_coords(10);
+        let mut infra = code_coords(10);
+        infra.infra_kind = Some("disk-full".to_string());
+
+        // Equal run_index: not newer, does not close.
+        assert!(!issue_matches(
+            &code,
+            "owner/repo",
+            &green_job("main", 10),
+            "main"
+        ));
+        assert!(!issue_matches(
+            &infra,
+            "owner/repo",
+            &green_job("any-branch", 10),
+            "main"
+        ));
+        // Older run_index: not newer, does not close.
+        assert!(!issue_matches(
+            &code,
+            "owner/repo",
+            &green_job("main", 9),
+            "main"
+        ));
+        assert!(!issue_matches(
+            &infra,
+            "owner/repo",
+            &green_job("any-branch", 9),
+            "main"
+        ));
+    }
+
+    // ---- AC 3 + safety: workflow/job/repo remain exact --------------------
+
+    #[test]
+    fn matching_is_exact_on_repo_workflow_job() {
+        let coords = code_coords(1);
+        let exact = green_job("main", 2);
+        assert!(issue_matches(&coords, "owner/repo", &exact, "main"));
+        // A green sibling job on the default branch must NOT match a different job.
         let sibling_job = GreenJob {
             job_name: "deploy".to_string(),
             ..exact.clone()
         };
-        assert!(!issue_matches(&coords, "owner/repo", &sibling_job));
-        // A green run on a different branch must NOT match.
-        let sibling_branch = GreenJob {
-            branch: "dev".to_string(),
-            ..exact.clone()
-        };
-        assert!(!issue_matches(&coords, "owner/repo", &sibling_branch));
+        assert!(!issue_matches(&coords, "owner/repo", &sibling_job, "main"));
         // A different repo must NOT match.
-        assert!(!issue_matches(&coords, "owner/other", &exact));
+        assert!(!issue_matches(&coords, "owner/other", &exact, "main"));
+    }
+
+    // ---- AC 5: unparseable run index is skipped, never closed unverifiably
+
+    #[test]
+    fn an_issue_whose_run_index_cannot_be_parsed_is_skipped() {
+        let body = REKEY_BODY.replace(
+            "Run: https://dev.a8n.run/contoso/claude-run/actions/runs/4034",
+            "Run: https://dev.a8n.run/contoso/claude-run/actions/runs/not-a-number",
+        );
+        assert!(matches!(
+            parse_issue_coords(&inspect(&body, &[])),
+            IssueParse::Skip(_)
+        ));
+    }
+
+    #[test]
+    fn infra_kind_marker_is_parsed() {
+        let body = format!("{REKEY_BODY}\nInfra-Kind: disk-full");
+        let IssueParse::Matched(coords) = parse_issue_coords(&inspect(&body, &[])) else {
+            panic!("expected Matched");
+        };
+        assert_eq!(coords.infra_kind, Some("disk-full".to_string()));
+        assert_eq!(coords.run_index, 4034);
+    }
+
+    #[test]
+    fn no_infra_kind_marker_parses_as_a_code_issue() {
+        let IssueParse::Matched(coords) = parse_issue_coords(&inspect(REKEY_BODY, &[])) else {
+            panic!("expected Matched");
+        };
+        assert_eq!(coords.infra_kind, None);
+        assert_eq!(coords.run_index, 4034);
     }
 
     #[test]
@@ -1232,9 +1412,12 @@ Dedupe-Key: crdedupeaaaa crdedupebbbb";
 
         // 3. The canonical issue matches the now-green job, so it closes too.
         let canonical = remaining[0];
-        assert!(green
-            .iter()
-            .any(|g| issue_matches(&canonical.coords, "contoso/claude-run", g)));
+        assert!(green.iter().any(|g| issue_matches(
+            &canonical.coords,
+            "contoso/claude-run",
+            g,
+            "main"
+        )));
 
         // Nothing from the sequence is left open.
         let closed: HashSet<&str> = dup_keys
