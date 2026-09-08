@@ -795,6 +795,28 @@ log, both resolved in Rust. The issue body carries hidden `Dedupe-Key:`, `Root-C
 markers so the CLAUDE-191 auto-close reconciler can find every issue for a `(repo, branch, workflow, job)`; a resolved
 issue is never reopened.
 
+**CLAUDE-264: a host condition keys without the branch.** That root-cause key contains `branch`, which is right for a
+code failure (two unrelated bugs on two branches must not merge, and the auto-fix route needs one branch to deliver
+onto) and wrong for a failure that is a property of the RUNNER. A full disk is identical on every branch and fixable on
+none of them, so with one PR branch per tracker issue it minted a fresh issue per branch and they never collapsed. When
+`infra_failure::detect` recognizes such a condition in the log, the collapse key becomes
+`hash(repo, workflow_id, job_name, infra_kind)` instead: no branch and no commit, so N branches hitting one host
+condition on one `(repo, workflow, job)` collapse onto ONE open issue, while two different kinds on the same job stay
+two issues. The detector is pure string work over the FULL redacted log (no LLM, no I/O) and reads the same text
+`failure_signature` does, not the bounded copy the classifier prompt gets, because a capacity abort is post-steps and
+is exactly what that bound cuts. It ships three deliberately conservative kinds, each requiring an unambiguous phrase:
+`disk-full`, `out-of-memory`, and `runner-unavailable`. An over-broad pattern would merge unrelated code failures
+across branches, so an undetected condition is the preferred failure mode.
+
+Nothing about triage buckets, routing, or the auto-fix path changes: an infra failure is still classified and assigned
+the same way, because reclaiming disk is a human action. The issue body carries a hidden `Infra-Kind:` marker, and its
+`Root-Cause-Key:` marker holds the infra key so the CLAUDE-198 duplicate-collapse groups on it too. `Branch:` and
+`Job:` are unchanged, because the CLAUDE-191 reconciler reads them to auto-close. One deliberate exception: the infra
+key does NOT join the never-reopen-resolved check. A host condition recurs and each recurrence needs a new task, so
+suppressing a mint because a months-old disk-full issue was resolved would silently stop reporting the condition
+entirely. The per-run and branch-scoped keys keep their existing resolved behaviour. With no infra kind detected, every
+key and every decision is exactly as it was.
+
 The listener is multi-source (CLAUDE-87): each `<source>` is a `[webhook.sources.<source>]` config block with its own
 HMAC secret and allow-list, served at its own URL path. One Forgejo org webhook per source means a leaked org secret
 authenticates only that org's allow-listed payloads, and each source has its own rate-limit bucket so one org's failure
