@@ -224,7 +224,7 @@ XDG-compliant; each path overridable by the matching env var.
 |--------------------------------|--------------------------|-------------------------------------------------------------------------------------------------|
 | `$XDG_CONFIG_HOME/claude-run/` | `CLAUDE_RUN_CONFIG_DIR`  | `config.toml`, `actions/*.yml`                                                                  |
 | `$XDG_DATA_HOME/claude-run/`   | `CLAUDE_RUN_DATA_DIR`    | `state.db` (SQLite backend only; see "State store backend"), `workdirs/`                        |
-| `$XDG_STATE_HOME/claude-run/`  | `CLAUDE_RUN_STATE_DIR`   | `logs/<action>/YYYY-MM-DD.jsonl`, `logs/<action>/streams/<key>-attempt-<n>.jsonl`, `daemon.log` |
+| `$XDG_STATE_HOME/claude-run/`  | `CLAUDE_RUN_STATE_DIR`   | `logs/daemon.log`, `logs/<action>/<output.file>`, `logs/<action>/streams/<key>-attempt-<n>.jsonl`, `snippets/`, `webhook-logs/` |
 | `$XDG_RUNTIME_DIR/claude-run/` | `CLAUDE_RUN_RUNTIME_DIR` | `daemon.pid`, `daemon.sock` (absent under `serve --no-socket`), `locks/<action>.lock`           |
 
 `workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-job workdirs live; defaults to
@@ -404,7 +404,7 @@ Known limitation: the handful of startup lines emitted before the stored filter 
 are governed by the initial filter, not the saved one; use `CLAUDE_RUN_LOG` when those specific lines are needed at
 `debug`.
 
-## Stream log retention (CLAUDE-245)
+## Log retention and size ceilings (CLAUDE-245, CLAUDE-257)
 
 Every claude invocation writes a per-attempt stream log to `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`, and until this sweep nothing ever deleted one: the workdir GC walks `workdirs/*/*` and the DB retention prune touches only database rows, so `logs/` only ever grew. That is not a cosmetic leak. A full log partition is what made the stream-log relay's write fail in the incident diagnosed in CLAUDE-233, which truncated 33 logs mid-line and failed the runs that produced them.
 
@@ -412,7 +412,13 @@ An age-based sweeper (`crate::gc::sweep_stream_logs`) bounds it. It runs on `ser
 
 A log whose job is still in flight is never deleted, at any age. Age alone would not prove a run has finished: a job with a long `claude_timeout_seconds` can outlive any window while its log is still being appended to. The sweep runs inside the daemon that owns the runs, so it reads the authoritative set of `(action, job key)` pairs from `run_inflight_jobs` joined to the runs that have not ended, and keeps everything that set names. If that read fails the whole pass is skipped rather than run with an empty set, because the wrong guess would delete a live run's only transcript.
 
-The window is a DB-backed runtime setting edited on the **Settings** page (the `Stream log GC` section, or `GET` / `PUT /api/settings/stream_log_gc`). Fields: `enabled` (master toggle, default `true`) and `retention_days` (default `30`). Edits apply on the next sweep. Set `enabled: false` to park the sweeper without losing the configured window, but nothing then bounds the directory.
+The other two writers under `logs/` are bounded by SIZE, not age (CLAUDE-257). Neither is a per-run artifact: `daemon.log` is the single file `serve --detach` hands the daemon as stdout and stderr, and `logs/<action>/<output.file>` is the single JSONL sink an action's `output.file` field turns on, so each is appended to for the life of the install and an age window would never fire. Past its ceiling a file is copied to one rolled-over predecessor (`daemon.log.1`, `<output.file>.1`) and truncated in place back to its newest half, starting at a line boundary. In place, not renamed: the daemon holds `daemon.log` open in append mode, so a rename would leave it writing into the predecessor while the live log stayed empty.
+
+The `output.file` sink is bounded by size and never deleted by age, unlike the stream logs beside it. An operator turns `output.file` on deliberately to produce a data sink, often read by something outside the runner, so the pass keeps the newest records where that consumer expects them instead of destroying the record it exists to keep.
+
+All of it is one DB-backed runtime setting edited on the **Settings** page (the `Stream log GC` section, or `GET` / `PUT /api/settings/stream_log_gc`). Fields: `enabled` (master toggle, default `true`), `retention_days` (default `30`), `daemon_log_max_bytes` (default 50 MiB) and `output_file_max_bytes` (default 50 MiB). Edits apply on the next sweep. Set `enabled: false` to park all of it without losing the configured values, but nothing then bounds `logs/`; set either ceiling to `0` to leave that one file unbounded and rotate it yourself. The section keeps its original `stream_log_gc` key even though it now covers the whole `logs/` tree: the key is the primary key of the stored document, so renaming it would silently reset a configured window back to the default.
+
+Still unbounded under the state dir, and not covered by any of this: `snippets/` and `webhook-logs/` (CLAUDE-262).
 
 The default is deliberately longer than the workdir GC's 14 days and shorter than DB retention's 180: a failure reported weeks late still has its transcript, while at the ~800 MB/month this directory was observed growing at, 30 days holds it near 1 GB. The two windows are independent, so a `job_outcomes` row (180 days) outlives its stream log (30 days): run history, cost, and the reports are unaffected, but the transcript behind an older run is gone. The stream-log search skips a swept log silently, as an absent file rather than a read failure; CLAUDE-246's `unreadable` list is for logs that exist and fail mid-read.
 
