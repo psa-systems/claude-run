@@ -1598,15 +1598,21 @@ async fn inflight_stream_log_jobs(
     Ok(rows.into_iter().collect())
 }
 
-/// CLAUDE-245: periodic stream-log GC, on the [`GC_TICK_SECS`] cadence the other
-/// two sweeps use. The interval's first tick fires immediately, so a sweep runs
-/// on serve start; the window is read off the shared handle per tick so a
-/// Settings save applies on the next pass. The walk and the unlinks are blocking
-/// filesystem work, so they run on a blocking thread.
+/// CLAUDE-245: periodic log GC, on the [`GC_TICK_SECS`] cadence the other two
+/// sweeps use. The interval's first tick fires immediately, so a sweep runs on
+/// serve start; the config is read off the shared handle per tick so a Settings
+/// save applies on the next pass. The walks, the unlinks and the truncations are
+/// blocking filesystem work, so they run on a blocking thread.
 ///
-/// A failed in-flight read SKIPS the pass rather than sweeping with an empty
-/// set: without that table the sweep cannot tell a finished job's log from a
+/// Two passes on the one tick, because `logs/` has two kinds of writer.
+/// Per-attempt stream logs are per-run artifacts and are swept by AGE; a failed
+/// in-flight read SKIPS that pass rather than sweeping with an empty set,
+/// because without that table the sweep cannot tell a finished job's log from a
 /// running one's, and the wrong guess deletes a live run's only transcript.
+/// CLAUDE-257: `daemon.log` and each `logs/<action>/<output.file>` are single
+/// append-forever files instead, so they are bounded by SIZE
+/// ([`crate::gc::sweep_oversized_logs`]) and that pass runs regardless of the
+/// in-flight read, which it does not depend on.
 async fn stream_log_gc_loop(
     paths: Paths,
     pool: DbPool,
@@ -1620,26 +1626,46 @@ async fn stream_log_gc_loop(
         if !snapshot.enabled {
             continue;
         }
-        let in_flight = match inflight_stream_log_jobs(&pool).await {
-            Ok(set) => set,
-            Err(e) => {
-                warn!(error = %e, "stream-log GC: cannot read in-flight jobs; skipping this sweep rather than risk deleting a live run's log");
-                continue;
+        match inflight_stream_log_jobs(&pool).await {
+            Ok(in_flight) => {
+                let base = base.clone();
+                let cfg = snapshot.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::gc::sweep_stream_logs(
+                        &base,
+                        &cfg,
+                        std::time::SystemTime::now(),
+                        &in_flight,
+                    )
+                })
+                .await;
+                match result {
+                    Ok(stats) => info!(
+                        deleted = stats.deleted,
+                        kept = stats.kept,
+                        bytes_reclaimed = stats.bytes_reclaimed,
+                        "stream-log GC sweep complete"
+                    ),
+                    Err(e) => warn!(error = %e, "stream-log GC sweep task failed"),
+                }
             }
-        };
+            Err(e) => {
+                warn!(error = %e, "stream-log GC: cannot read in-flight jobs; skipping this sweep rather than risk deleting a live run's log")
+            }
+        }
+
         let base = base.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            crate::gc::sweep_stream_logs(&base, &snapshot, std::time::SystemTime::now(), &in_flight)
-        })
-        .await;
+        let cfg = snapshot.clone();
+        let result =
+            tokio::task::spawn_blocking(move || crate::gc::sweep_oversized_logs(&base, &cfg)).await;
         match result {
             Ok(stats) => info!(
-                deleted = stats.deleted,
+                bounded = stats.bounded,
                 kept = stats.kept,
                 bytes_reclaimed = stats.bytes_reclaimed,
-                "stream-log GC sweep complete"
+                "log size GC pass complete"
             ),
-            Err(e) => warn!(error = %e, "stream-log GC sweep task failed"),
+            Err(e) => warn!(error = %e, "log size GC task failed"),
         }
     }
 }
