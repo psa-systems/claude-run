@@ -543,6 +543,12 @@ impl ProcessedJob {
 
 /// Append a job-outcome record to the action's per-action JSONL log (the
 /// `output.file` field on the action). Best-effort; logs but does not fail.
+///
+/// CLAUDE-257: this file is append-only and lives for the life of the install,
+/// so the daemon bounds it by SIZE (`config.stream_log_gc.output_file_max_bytes`,
+/// applied by [`crate::gc::sweep_oversized_logs`]). It is never deleted by age
+/// the way a stream log is: an operator turns `output.file` on to produce a data
+/// sink, and age-sweeping it would destroy the record it exists to keep.
 pub fn append_output_record(paths: &Paths, action: &LoadedAction, record: &Value) {
     let Some(rel) = action.action.output.file.as_deref() else {
         return;

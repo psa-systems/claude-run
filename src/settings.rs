@@ -1312,6 +1312,34 @@ mod tests {
         assert_eq!(stored.retention_days, 7);
         assert_eq!(live.stream_log_gc_handle().read().await.retention_days, 7);
 
+        // CLAUDE-257: the two size ceilings ride the same document, so they
+        // round-trip through `GET` / `PUT /api/settings/stream_log_gc` and apply
+        // on the handle the daemon's log GC pass reads.
+        live.save_section(
+            Section::StreamLogGc,
+            r#"{"enabled":true,"retention_days":7,"daemon_log_max_bytes":1024,"output_file_max_bytes":0}"#,
+        )
+        .await
+        .unwrap();
+        let stored: StreamLogGcConfig = get_json(&pool, Section::StreamLogGc.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.daemon_log_max_bytes, 1024);
+        assert_eq!(stored.output_file_max_bytes, 0);
+        let handle = live.stream_log_gc_handle();
+        let applied = handle.read().await.clone();
+        assert_eq!(applied.daemon_log_max_bytes, 1024);
+        assert_eq!(applied.output_file_max_bytes, 0);
+        // A document written before those fields existed still loads: they take
+        // their defaults rather than failing the whole section.
+        let legacy: StreamLogGcConfig =
+            serde_json::from_str(r#"{"enabled":true,"retention_days":7}"#).unwrap();
+        assert_eq!(
+            legacy.daemon_log_max_bytes,
+            StreamLogGcConfig::default().daemon_log_max_bytes
+        );
+
         // An unknown field is rejected and nothing is persisted over it.
         let err = live
             .save_section(Section::StreamLogGc, r#"{"retention_dayz":7}"#)

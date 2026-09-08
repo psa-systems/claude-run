@@ -346,6 +346,11 @@ fn clap_choice(color: ColorWhen) -> clap::ColorChoice {
     }
 }
 
+/// Fork into the background with `logs/daemon.log` as the daemon's stdout and
+/// stderr. CLAUDE-257: nothing rotates that file here; the daemon's own log GC
+/// pass (`crate::gc::sweep_oversized_logs`, first tick at serve start) keeps it
+/// under `config.stream_log_gc.daemon_log_max_bytes` by truncating it in place,
+/// which the `O_APPEND` handle opened below follows to the new end of file.
 fn detach_now() -> claude_run::error::Result<()> {
     let paths = cfg::Paths::resolve()?;
     let log = paths.state_dir.join("logs").join("daemon.log");

@@ -560,19 +560,28 @@ impl Default for WorkdirGcConfig {
     }
 }
 
-/// CLAUDE-245: age-based retention for the per-attempt stream logs under
-/// `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/`. A DB-backed runtime setting
-/// (settings key `config.stream_log_gc`, editable on the web Settings page) per
-/// the CLAUDE-101 bootstrap-vs-runtime split, so it is NOT a `config.toml` key.
-/// The sweeper ([`crate::gc::sweep_stream_logs`]) runs on `serve` start and on a
-/// periodic tick. Nothing deleted these before: the directory had only ever
-/// grown, and filling the log partition is what truncated the stream logs
-/// diagnosed in CLAUDE-233.
+/// Retention and size ceilings for everything the runner writes under
+/// `$CLAUDE_RUN_STATE_DIR/logs/`. A DB-backed runtime setting (settings key
+/// `config.stream_log_gc`, editable on the web Settings page) per the CLAUDE-101
+/// bootstrap-vs-runtime split, so it is NOT a `config.toml` key. The sweeps
+/// ([`crate::gc::sweep_stream_logs`] and [`crate::gc::sweep_oversized_logs`])
+/// run on `serve` start and on a periodic tick.
+///
+/// CLAUDE-245 covered the per-attempt stream logs under
+/// `logs/<action>/streams/`: nothing deleted those before, the directory had
+/// only ever grown, and filling the log partition is what truncated the stream
+/// logs diagnosed in CLAUDE-233. CLAUDE-257 extended the same section to the two
+/// writers under `logs/` it left unbounded, `daemon.log` and the per-action
+/// `output.file`. The settings key keeps its original `stream_log_gc` name (and
+/// the `Stream log GC` card title) rather than being renamed to match the wider
+/// scope: the key is the primary key of the stored document, so renaming it
+/// would silently reset an operator's configured window back to the default.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct StreamLogGcConfig {
-    /// Master enable toggle. When `false`, no sweep deletes anything, so an
-    /// operator can park the feature without losing the configured window.
+    /// Master enable toggle. When `false`, nothing under `logs/` is swept or
+    /// bounded, so an operator can park the feature without losing the
+    /// configured windows.
     pub enabled: bool,
     /// Age, in days, past which a stream log is deleted, measured from its
     /// last-modified time. Default 30 days: long enough that a failure reported
@@ -581,6 +590,26 @@ pub struct StreamLogGcConfig {
     /// it bounds the directory near 1 GB instead of the 2.8 GB it reached. A log
     /// whose run is still in flight is kept regardless of age.
     pub retention_days: u64,
+    /// CLAUDE-257: size ceiling, in bytes, for `logs/daemon.log`. An age window
+    /// does not apply to it: `serve --detach` opens ONE file in append mode and
+    /// keeps every tracing line the daemon ever emits in it, so what bounds it
+    /// is size. Past the ceiling the file is rolled to `daemon.log.1` and
+    /// truncated in place back to its newest half (in place because the daemon
+    /// holds the fd open; a rename alone would leave it writing into the
+    /// predecessor). `0` disables the ceiling and leaves the file unbounded.
+    pub daemon_log_max_bytes: u64,
+    /// CLAUDE-257: size ceiling, in bytes, for each `logs/<action>/<output.file>`
+    /// (the opt-in per-job JSONL sink an action's `output.file` field turns on).
+    ///
+    /// Decision: this file is bounded by SIZE and never deleted by age, unlike
+    /// the stream logs beside it. An operator sets `output.file` deliberately to
+    /// produce a data sink, often consumed by something outside the runner, and
+    /// age-sweeping it would silently destroy the whole record. A size ceiling
+    /// keeps the newest records in place, hands the previous generation to
+    /// `<output.file>.1`, and still leaves nothing under the state dir growing
+    /// without bound. `0` disables the ceiling for operators who want the sink
+    /// kept whole and rotate it themselves.
+    pub output_file_max_bytes: u64,
 }
 
 impl Default for StreamLogGcConfig {
@@ -588,6 +617,11 @@ impl Default for StreamLogGcConfig {
         Self {
             enabled: true,
             retention_days: 30,
+            // 50 MiB each: large enough that a rotation is rare on a busy
+            // daemon, small enough that both generations of both files stay a
+            // rounding error next to the stream logs' ~1 GB window.
+            daemon_log_max_bytes: 50 * 1024 * 1024,
+            output_file_max_bytes: 50 * 1024 * 1024,
         }
     }
 }
