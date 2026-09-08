@@ -3747,6 +3747,16 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 badge: "next sweep",
                 note: "age past which logs/<action>/streams/<key>-attempt-<n>.jsonl is deleted; a job still in flight keeps its log at any age.",
             },
+            FieldDoc {
+                name: "daemon_log_max_bytes",
+                badge: "next sweep",
+                note: "size ceiling for logs/daemon.log; past it the file rolls to daemon.log.1 and keeps its newest half. 0 = unbounded.",
+            },
+            FieldDoc {
+                name: "output_file_max_bytes",
+                badge: "next sweep",
+                note: "size ceiling for each logs/<action>/<output.file>; bounded by size, never deleted by age, because it is an operator-configured sink. 0 = unbounded.",
+            },
         ],
         Preferences => vec![
             FieldDoc {
@@ -7835,6 +7845,52 @@ mod tests {
                     .unwrap();
                 assert_eq!(del.status(), StatusCode::FORBIDDEN, "{synthetic}");
             }
+        }
+
+        /// CLAUDE-257: the two log size ceilings render on `/settings` in the
+        /// `Stream log GC` card and a POST to `/settings/stream_log_gc` applies
+        /// them live on the handle the daemon's log GC pass reads.
+        #[tokio::test]
+        async fn settings_page_renders_and_saves_the_log_size_ceilings() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let page = settings_page(
+                State(s.clone()),
+                Query(crate::web::SettingsQuery { saved: None }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = String::from_utf8_lossy(&body);
+            assert!(html.contains("Stream log GC"), "the section card renders");
+            assert!(html.contains("/settings/stream_log_gc"), "with its form");
+            assert!(
+                html.contains("daemon_log_max_bytes"),
+                "the daemon.log ceiling has a field reference"
+            );
+            assert!(
+                html.contains("output_file_max_bytes"),
+                "the output.file ceiling has a field reference"
+            );
+
+            let saved = settings_save(
+                State(s.clone()),
+                AxumPath("stream_log_gc".to_string()),
+                Form(SettingsForm {
+                    json: r#"{"enabled":true,"retention_days":30,"daemon_log_max_bytes":4096,"output_file_max_bytes":8192}"#
+                        .to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+            let applied = s.api.settings.stream_log_gc_handle().read().await.clone();
+            assert_eq!(applied.daemon_log_max_bytes, 4096);
+            assert_eq!(applied.output_file_max_bytes, 8192);
         }
 
         /// CLAUDE-220: the `Comment webhook` section renders on `/settings` and a
