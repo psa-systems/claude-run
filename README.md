@@ -275,10 +275,60 @@ openssl rand -base64 32 | save secrets/postgres-password.txt
 docker compose --profile postgres up --detach
 ```
 
-**Nothing is carried over.** Switching an existing install to PostgreSQL starts a fresh, empty instance: no run history,
-no caps ledger, no stored secrets, and no web administrator, so the browser lands on `/setup` again. Copying an existing
-`state.db` into PostgreSQL is separate work (CLAUDE-251). Back the age key up as usual; the secrets it decrypts have to
-be re-entered on the new backend.
+**Nothing is carried over by switching alone.** Pointing an existing install at PostgreSQL and starting it opens a
+fresh, empty instance: no run history, no caps ledger, no stored secrets, and no web administrator, so the browser lands
+on `/setup` again. Move the data first with `claude-run import`.
+
+### Importing an existing SQLite store (CLAUDE-251)
+
+`claude-run import` copies every table out of a SQLite state store and into the database the configuration resolves to,
+so a switched backend keeps the same history, the same attempt and daily caps, the same settings documents, the same
+encrypted secrets and the same web administrator. Stop the daemon, point the configuration at the new database, and run
+it:
+
+```nu
+claude-run stop
+$env.CLAUDE_RUN_DATABASE_URL = "postgres://claude_run:secret@db.internal:5432/claude_run"
+claude-run import
+claude-run serve --detach
+```
+
+```
+table                  source      copied      target
+-----------------  ----------  ----------  ----------
+actions                     3           3           3
+attempt_counters          412         412         412
+...
+```
+
+- **The target is the configured database**, never a flag of its own, so the import and the daemon cannot disagree about
+  where the rows went. Set `[database] url`, `CLAUDE_RUN_DATABASE_URL` or `CLAUDE_RUN_DATABASE_URL_FILE` first; the
+  import runs the target's migrations itself, so the database only has to exist and be reachable.
+- **`--from <file>` reads any SQLite store**, defaulting to `<CLAUDE_RUN_DATA_DIR>/state.db`. Importing a file into
+  itself is refused, which is what the default invocation with no database URL set would otherwise be.
+- **The source is opened read-only** and is never written, so a refused or failed import leaves you exactly where you
+  started, still able to run the daemon off the same file. Stop the daemon first: a read-only open cannot recover a
+  write-ahead log left behind by a killed process, and the open fails naming the file if one is there.
+- **A target that already holds rows is refused**, naming each populated table and its count, unless you pass
+  `--allow-nonempty`. The whole copy is one transaction, so a failure at any table commits nothing.
+- **Both sides are printed per table** (source rows, rows copied, rows the target holds afterwards) rather than a bare
+  success line, and a table whose counts do not add up aborts the import before the commit. On PostgreSQL the identity
+  sequences behind `runs`, `job_outcomes`, `run_events` and `secrets` are advanced past the copied ids, so the daemon's
+  first insert does not collide with imported history.
+- **The two schemas must match exactly.** A source older than the build doing the import is refused, listing every
+  missing column; open that file once with this build (`CLAUDE_RUN_DATABASE_URL=sqlite://<file> claude-run status`) to
+  apply its pending SQLite migrations, then import.
+
+The age key is not in the database and is not copied: back it up as usual and keep it where the new deployment reads it
+(`<CLAUDE_RUN_CONFIG_DIR>/secrets.key`), or the imported ciphertext cannot be decrypted.
+
+In the container the same command runs as a one-off, with the daemon stopped so nothing writes either side:
+
+```nu
+docker compose stop claude-bot
+docker compose --profile postgres run --rm claude-bot import
+docker compose --profile postgres up --detach
+```
 
 ## Settings: bootstrap file vs the Settings page (CLAUDE-101)
 

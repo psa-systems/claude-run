@@ -95,9 +95,9 @@ services:
 
   # CLAUDE-250: the optional PostgreSQL state store. Behind a profile, so a plain
   # `docker compose up` starts exactly the service set it started before this
-  # existed; `docker compose --profile postgres up` adds the database. Nothing
-  # is carried over from an existing state.db (that is CLAUDE-251), so the first
-  # start on this backend is a fresh instance.
+  # existed; `docker compose --profile postgres up` adds the database. The first
+  # start on this backend is a fresh instance: carry an existing state.db over
+  # with `claude-run import` (CLAUDE-251) before starting the daemon on it.
   claude-bot-postgres:
     container_name: claude-bot-postgres
     image: docker.io/postgres:18.4-alpine3.23
