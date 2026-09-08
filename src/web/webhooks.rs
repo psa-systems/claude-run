@@ -990,6 +990,19 @@ fn decide_mint(
     // (`resolve_branch` keeps the run-detail arm for instances that populate it).
     let failure_signature = crate::mint::failure_signature(&log_text);
     let branch = crate::forge_log::resolve_branch(None, &log_text).unwrap_or_default();
+    // CLAUDE-264: the infrastructure detector reads the SAME full redacted log,
+    // not the bounded copy the classifier prompt gets, because a capacity abort
+    // is post-steps and is exactly what the bound cuts.
+    let infra = crate::infra_failure::detect(&log_text);
+    if let Some(f) = &infra {
+        info!(
+            repo = %ev.repo,
+            run = ev.index_in_repo,
+            kind = %f.kind,
+            problem = %f.problem,
+            "infrastructure failure detected; collapsing on the branch-agnostic dedupe key"
+        );
+    }
     let input = TriageInput {
         repo: ev.repo.clone(),
         workflow_id: ev.workflow_id.clone(),
@@ -1017,6 +1030,7 @@ fn decide_mint(
         branch: &branch,
         job_name,
         failure_signature: failure_signature.as_deref(),
+        infra_kind: infra.as_ref().map(|f| f.kind.as_str()),
         html_url: &ev.html_url,
         trigger_user: &ev.trigger_user,
         triage: &verdict,
@@ -2017,6 +2031,61 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains("AI Agent")),
             "fix bot never queued: {calls:?}"
+        );
+    }
+
+    /// CLAUDE-264: the collapse key `decide_mint` searched, i.e. the last
+    /// `#Unresolved` full-text query the mint issued before creating.
+    fn collapse_query(log: &str) -> String {
+        let classifier = StubClassifier::new(TriageBucket::HumanAction);
+        let tracker = StubTracker::new();
+        decide_mint(
+            &classifier,
+            &tracker,
+            &mint_cfg(),
+            &route_cache(),
+            &caps(),
+            &event(),
+            log.to_string(),
+            true,
+            None,
+            None,
+            false,
+            true,
+            "integration tests",
+            &|_| {},
+        )
+        .unwrap();
+        tracker
+            .calls()
+            .into_iter()
+            .rfind(|c| c.starts_with("list ") && c.ends_with("#Unresolved"))
+            .expect("the mint issued a collapse search")
+    }
+
+    #[test]
+    fn an_infra_failure_collapses_across_branches_but_a_code_failure_does_not() {
+        // CLAUDE-264 end-to-end through decide_mint: `infra_kind` is resolved
+        // from the same full redacted log as `failure_signature`, and switches
+        // the collapse search onto the branch-agnostic key. Two runs of one job
+        // on two different PR branches: with a host condition in the log they
+        // search the SAME key (so the second associates with the first's issue),
+        // and without one they search different keys, exactly as before.
+        let a = "GITHUB_HEAD_REF=fix/GAMMA-1041-invoice-module-gate\n";
+        let b = "GITHUB_HEAD_REF=feat/GAMMA-1126-kb-provenance\n";
+        let guard = "Insufficient free space: the suite needs ~25G to link test binaries.\n";
+        assert_eq!(
+            collapse_query(&format!("{a}{guard}")),
+            collapse_query(&format!("{b}{guard}")),
+            "one host condition on one job is one key, whatever the branch"
+        );
+        // The control: the same two branches with an ordinary code failure keep
+        // their per-branch identity (and so their per-branch auto-fix routing).
+        let bug = "error[E0308]: mismatched types\n";
+        assert_ne!(
+            collapse_query(&format!("{a}{bug}")),
+            collapse_query(&format!("{b}{bug}")),
+            "a code failure still keys per branch"
         );
     }
 

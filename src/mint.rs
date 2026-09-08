@@ -13,7 +13,10 @@
 //!            bot's own fix PR) mints nothing; per-PR attempt cap and daily cap
 //!            (the DEV-335 caps, reused not re-derived) gate the rest.
 //! dedupe  -> a resolved issue for the key is never reopened; an open issue for
-//!            the key is left alone (no second issue).
+//!            the key is left alone (no second issue). CLAUDE-264: a failure the
+//!            log shows is a RUNNER condition collapses on a branch-agnostic
+//!            infra key instead, and that key alone is exempt from the
+//!            never-reopen check, because a host condition recurs.
 //! mint    -> create in the mapped project, State=To do, attach the redacted log,
 //!            then route the bucket:
 //!              bucket 1 (code_fix)    -> AI Agent=Queued (forgejo-ci-fix CLAUDE-29
@@ -71,6 +74,13 @@ pub struct MintRequest<'a> {
     /// carries none, or the failure produced no log at all. The key then falls
     /// back to `(repo, branch, workflow, job)`.
     pub failure_signature: Option<&'a str>,
+    /// CLAUDE-264: the stable [`crate::infra_failure`] kind id when the full
+    /// redacted log shows the failure is a property of the RUNNER (a full disk,
+    /// an OOM kill, an unreachable registry) rather than of the commit. `Some`
+    /// switches the cross-run collapse onto the branch-agnostic
+    /// [`infra_marker`]; `None` (a code failure, the common case) leaves every
+    /// key and every decision exactly as it was.
+    pub infra_kind: Option<&'a str>,
     /// Run URL, surfaced in the issue body.
     pub html_url: &'a str,
     /// Login that triggered the run; matched against the loop-safety bot list.
@@ -416,6 +426,23 @@ fn root_cause_marker(req: &MintRequest) -> String {
     }
 }
 
+/// CLAUDE-264 infrastructure dedupe marker: the branch-agnostic collapsing key,
+/// `(repo, workflow_id, job_name, infra_kind)`. `None` unless the consumer
+/// detected an infrastructure condition. It deliberately contains neither
+/// `branch` nor `commit_sha`, because a host condition (a full disk, an OOM
+/// kill, an unreachable registry) is identical on every branch and is not
+/// fixable on any of them: one condition on one `(repo, workflow, job)` must
+/// collapse onto ONE open issue however many PR branches hit it. The stable
+/// `kind` id is hashed rather than the matched line, so the same condition keys
+/// identically however the message is worded or however many bytes free it
+/// reports. A code failure keeps the branch-scoped [`root_cause_marker`]: two
+/// unrelated bugs failing the same job on two branches must NOT merge, and the
+/// auto-fix route needs a single branch to deliver onto (CLAUDE-190).
+fn infra_marker(req: &MintRequest) -> Option<String> {
+    req.infra_kind
+        .map(|kind| marker(&[req.repo, req.workflow_id, req.job_name, kind]))
+}
+
 /// CLAUDE-190: extract a deterministic failure signature from a redacted log,
 /// or `None` when the log carries no recognizable diagnostic line. Pure string
 /// work (no LLM, no I/O): the first diagnostic line, normalized so the same root
@@ -535,20 +562,32 @@ pub fn mint(
         }
     }
 
+    // CLAUDE-264: for an infrastructure failure the branch-agnostic infra marker
+    // REPLACES the root-cause key as the cross-run collapse key (and as the
+    // `Root-Cause-Key:` the CLAUDE-198 duplicate-collapse groups on). It does
+    // NOT join the resolved loop above: a host condition recurs, and each
+    // recurrence needs a new task, so suppressing a mint because a months-old
+    // disk-full issue was resolved would silently stop reporting the condition.
+    // The other three keys keep their existing never-reopen behaviour.
+    let infra = infra_marker(req);
+    let collapse = infra.as_deref().unwrap_or(root_cause.as_str());
+
     // Per-run redelivery of the identical run: idempotency, no second issue.
     if let Some(existing) = find_first(tracker, &format!("{primary} #Unresolved"))? {
         return Ok(MintOutcome::SkippedDuplicateOpen { existing });
     }
 
-    // Cross-run collapse: an OPEN issue for the root-cause key means the same
+    // Cross-run collapse: an OPEN issue for the collapse key means the same
     // failing job / branch / signature already has a task (a later commit that
-    // fails the same way). Append this run to it and mint nothing; a different
-    // signature yields a different key and mints a sibling. The comment carries
+    // fails the same way), or, for an infra failure, the same host condition on
+    // the same job on ANY branch. Append this run to it and mint nothing; a
+    // different signature (or a different infra kind) yields a different key and
+    // mints a sibling. The comment carries
     // this run's own per-run Dedupe-Key so a redelivery of THIS run full-text
     // matches and hits the per-run `SkippedDuplicateOpen` path above (no second
     // comment). No issue is created, so the caps ledger does not advance.
-    if let Some(existing) = find_first(tracker, &format!("{root_cause} #Unresolved"))? {
-        let body = build_association_comment(req, &primary, &root_cause);
+    if let Some(existing) = find_first(tracker, &format!("{collapse} #Unresolved"))? {
+        let body = build_association_comment(req, &primary, collapse);
         tracker.comment(&existing, &body)?;
         return Ok(MintOutcome::AssociatedWithOpen { existing });
     }
@@ -558,7 +597,7 @@ pub fn mint(
     let (project, source) =
         route_cache.resolve_project(tracker, cfg, req.repo, &forge_host(req.html_url));
     let summary = build_summary(req);
-    let description = build_description(req, &primary, &secondary, &root_cause);
+    let description = build_description(req, &primary, &secondary, collapse);
     let assignee = if route.assign_human {
         cfg.human_assignee.as_deref()
     } else {
@@ -636,21 +675,18 @@ fn autofix_label<'a>(detail: &'a crate::autofix::AutoFix, workflow_id: &'a str) 
 
 /// Markdown issue body: the triage analysis, the run metadata, and the hidden
 /// dedupe / reconciler markers a later mint (and the CLAUDE-191 auto-close
-/// reconciler) searches for. `root_cause` is the CLAUDE-190 cross-run collapse
-/// key; it rides the `Dedupe-Key:` line (so a later run's `{root_cause}
-/// #Unresolved` full-text search matches this issue) and is repeated as an
-/// explicit `Root-Cause-Key:` marker alongside `Branch:` / `Job:`.
-fn build_description(
-    req: &MintRequest,
-    primary: &str,
-    secondary: &str,
-    root_cause: &str,
-) -> String {
+/// reconciler) searches for. `collapse` is the cross-run collapse key: the
+/// CLAUDE-190 root-cause key, or the CLAUDE-264 branch-agnostic infra key when
+/// an infrastructure condition was detected. It rides the `Dedupe-Key:` line (so
+/// a later run's `{collapse} #Unresolved` full-text search matches this issue)
+/// and is repeated as an explicit `Root-Cause-Key:` marker alongside `Branch:` /
+/// `Job:`.
+fn build_description(req: &MintRequest, primary: &str, secondary: &str, collapse: &str) -> String {
     // CLAUDE-104: an auto-fix failure gets an implementation-spec body (concrete
     // problem, fix command, new-branch + PR-vs-main delivery instruction) with
     // no "human must commit directly to main" wording.
     if let Some(detail) = &req.triage.auto_fix {
-        return build_auto_fix_description(req, detail, primary, secondary, root_cause);
+        return build_auto_fix_description(req, detail, primary, secondary, collapse);
     }
     let attached = if req.log_path.is_some() {
         "The redacted failing-job log is attached to this issue."
@@ -676,20 +712,28 @@ fn build_description(
         attached.to_string(),
         String::new(),
         "<!-- claude-run dedupe markers; do not edit -->".to_string(),
-        format!("Dedupe-Key: {primary} {secondary} {root_cause}"),
+        format!("Dedupe-Key: {primary} {secondary} {collapse}"),
     ];
-    push_reconciler_markers(&mut lines, req, root_cause);
+    push_reconciler_markers(&mut lines, req, collapse);
     lines.join("\n")
 }
 
 /// CLAUDE-190: append the hidden reconciler markers under the dedupe-marker
 /// comment block. `Root-Cause-Key:` / `Branch:` / `Job:` let the auto-close
 /// reconciler (CLAUDE-191) find every issue for a `(repo, branch, workflow,
-/// job)` by full-text search.
-fn push_reconciler_markers(lines: &mut Vec<String>, req: &MintRequest, root_cause: &str) {
-    lines.push(format!("Root-Cause-Key: {root_cause}"));
+/// job)` by full-text search, and the CLAUDE-198 duplicate-collapse groups on
+/// `Root-Cause-Key:`. CLAUDE-264: that marker carries whichever key the mint
+/// collapsed on, so an infra-keyed issue groups with its own siblings; the
+/// `Infra-Kind:` line (present only for an infra failure) makes such an issue
+/// identifiable without re-parsing the log. `Branch:` and `Job:` are unchanged,
+/// because the reconciler still reads them to auto-close.
+fn push_reconciler_markers(lines: &mut Vec<String>, req: &MintRequest, collapse: &str) {
+    lines.push(format!("Root-Cause-Key: {collapse}"));
     lines.push(format!("Branch: {}", req.branch));
     lines.push(format!("Job: {}", req.job_name));
+    if let Some(kind) = req.infra_kind {
+        lines.push(format!("Infra-Kind: {kind}"));
+    }
 }
 
 /// CLAUDE-104: the implementation-spec body for an auto-fixable failure. Names
@@ -702,7 +746,7 @@ fn build_auto_fix_description(
     detail: &crate::autofix::AutoFix,
     primary: &str,
     secondary: &str,
-    root_cause: &str,
+    collapse: &str,
 ) -> String {
     let short = short_sha(req.commit_sha);
     let branch = format!("chore/{}-{}", detail.kind, short);
@@ -711,7 +755,7 @@ fn build_auto_fix_description(
     } else {
         "No job log was attached."
     };
-    let dedupe_keys = format!("Dedupe-Key: {primary} {secondary} {root_cause}");
+    let dedupe_keys = format!("Dedupe-Key: {primary} {secondary} {collapse}");
 
     // Fix step: the concrete command(s) when the detector knows them, else a
     // reproduce-and-fix instruction for the generic checks-workflow case.
@@ -761,16 +805,16 @@ fn build_auto_fix_description(
     lines.push(String::new());
     lines.push("<!-- claude-run dedupe markers; do not edit -->".to_string());
     lines.push(dedupe_keys);
-    push_reconciler_markers(&mut lines, req, root_cause);
+    push_reconciler_markers(&mut lines, req, collapse);
     lines.join("\n")
 }
 
 /// CLAUDE-190: the comment posted onto an existing open issue when the same
 /// root cause fails again on a later commit. Carries the new run's number, short
 /// SHA, and run link, plus this run's own per-run `Dedupe-Key:` line (the
-/// per-run `primary` and the `root_cause`) so a redelivery of THIS run full-text
-/// matches and hits the per-run duplicate path (no second comment).
-fn build_association_comment(req: &MintRequest, primary: &str, root_cause: &str) -> String {
+/// per-run `primary` and the `collapse` key) so a redelivery of THIS run
+/// full-text matches and hits the per-run duplicate path (no second comment).
+fn build_association_comment(req: &MintRequest, primary: &str, collapse: &str) -> String {
     let short_sha = req.commit_sha.chars().take(8).collect::<String>();
     [
         format!(
@@ -780,7 +824,7 @@ fn build_association_comment(req: &MintRequest, primary: &str, root_cause: &str)
         format!("- Run: {}", req.html_url),
         String::new(),
         "<!-- claude-run dedupe markers; do not edit -->".to_string(),
-        format!("Dedupe-Key: {primary} {root_cause}"),
+        format!("Dedupe-Key: {primary} {collapse}"),
     ]
     .join("\n")
 }
@@ -992,6 +1036,7 @@ mod tests {
             branch: "main",
             job_name: "check",
             failure_signature: None,
+            infra_kind: None,
             html_url: "https://dev.a8n.run/owner/repo/actions/runs/7",
             trigger_user: user,
             triage: t,
@@ -1731,6 +1776,163 @@ mod tests {
         assert!(body.contains(&format!("Root-Cause-Key: {rc}")), "{body}");
         assert!(body.contains("Branch: main"), "{body}");
         assert!(body.contains("Job: check"), "{body}");
+    }
+
+    // ---- CLAUDE-264: branch-agnostic infrastructure collapse --------------
+
+    /// A request carrying a detected infrastructure kind, on a named branch and
+    /// commit (the two fields the infra key must ignore).
+    fn req_infra<'a>(
+        t: &'a Triage,
+        kind: &'a str,
+        branch: &'a str,
+        commit_sha: &'a str,
+    ) -> MintRequest<'a> {
+        let mut r = req("owner/repo", t, "alice");
+        r.infra_kind = Some(kind);
+        r.branch = branch;
+        r.commit_sha = commit_sha;
+        r
+    }
+
+    #[test]
+    fn infra_marker_ignores_branch_and_commit() {
+        // The whole point: two requests differing ONLY in branch and commit key
+        // identically, so one host condition on one job is one issue.
+        let t = triage(TriageBucket::HumanAction);
+        let a = req_infra(
+            &t,
+            "disk-full",
+            "fix/GAMMA-1041-invoice-module-gate",
+            "aaaa1111",
+        );
+        let b = req_infra(&t, "disk-full", "feat/GAMMA-1126-kb-provenance", "bbbb2222");
+        assert_eq!(infra_marker(&a), infra_marker(&b));
+        assert_eq!(
+            infra_marker(&a),
+            Some(marker(&["owner/repo", "ci.yml", "check", "disk-full"]))
+        );
+        // The branch-scoped root-cause key still differs, which is exactly why
+        // these two never collapsed before.
+        assert_ne!(root_cause_marker(&a), root_cause_marker(&b));
+        // No infra kind means no infra marker at all.
+        assert_eq!(infra_marker(&req("owner/repo", &t, "alice")), None);
+    }
+
+    #[test]
+    fn two_branches_with_the_same_infra_kind_mint_one_issue() {
+        // The live GAMMA case: run on branch A minted the issue; the run on
+        // branch B finds it through the branch-agnostic key, comments, and
+        // creates nothing.
+        let t = triage(TriageBucket::HumanAction);
+        let first = req_infra(
+            &t,
+            "disk-full",
+            "fix/GAMMA-1041-invoice-module-gate",
+            "aaaa1111",
+        );
+        let infra = infra_marker(&first).unwrap();
+        let second = req_infra(&t, "disk-full", "feat/GAMMA-1126-kb-provenance", "bbbb2222");
+        let tracker = StubTracker::new().with_search(
+            &format!("{infra} #Unresolved"),
+            r#"[{"idReadable":"GAMMA-1099"}]"#,
+        );
+        let out = mint(&tracker, &cfg(), &route_cache(), &second, &caps()).unwrap();
+        assert_eq!(
+            out,
+            MintOutcome::AssociatedWithOpen {
+                existing: "GAMMA-1099".to_string()
+            }
+        );
+        let calls = tracker.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create")),
+            "no second issue minted: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("comment GAMMA-1099 |") && c.contains(&infra)),
+            "run-association comment carries the infra key: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn different_infra_kinds_on_the_same_job_mint_two_issues() {
+        // A full disk and an OOM kill are separate conditions needing separate
+        // tasks, even on the same job and the same branch.
+        let t = triage(TriageBucket::HumanAction);
+        let disk = req_infra(&t, "disk-full", "main", "aaaa1111");
+        let oom = req_infra(&t, "out-of-memory", "main", "aaaa1111");
+        assert_ne!(infra_marker(&disk), infra_marker(&oom));
+        let tracker = StubTracker::new().with_search(
+            &format!("{} #Unresolved", infra_marker(&disk).unwrap()),
+            r#"[{"idReadable":"GAMMA-1099"}]"#,
+        );
+        let out = mint(&tracker, &cfg(), &route_cache(), &oom, &caps()).unwrap();
+        assert!(
+            matches!(out, MintOutcome::Created { .. }),
+            "a different infra kind mints a sibling: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_resolved_infra_issue_does_not_suppress_a_later_mint() {
+        // Deliberate exception to the never-reopen rule: a host condition
+        // recurs, and each recurrence needs its own task. Suppressing on a
+        // months-old resolved disk-full issue would silently stop reporting it.
+        let t = triage(TriageBucket::HumanAction);
+        let r = req_infra(&t, "disk-full", "main", "aaaa1111");
+        let infra = infra_marker(&r).unwrap();
+        let tracker = StubTracker::new().with_search(
+            &format!("{infra} #Resolved"),
+            r#"[{"idReadable":"GAMMA-741"}]"#,
+        );
+        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
+        assert!(
+            matches!(out, MintOutcome::Created { .. }),
+            "a resolved infra issue never suppresses the next occurrence: {out:?}"
+        );
+        // The infra key is never searched with #Resolved at all.
+        assert!(
+            !tracker
+                .calls()
+                .iter()
+                .any(|c| c == &format!("list {infra} #Resolved")),
+            "{:?}",
+            tracker.calls()
+        );
+    }
+
+    #[test]
+    fn infra_body_carries_the_infra_key_and_kind_markers() {
+        // The Root-Cause-Key marker holds the INFRA key (so the CLAUDE-198
+        // duplicate-collapse groups on it), plus an Infra-Kind marker; Branch
+        // and Job are untouched, because the reconciler reads them to close.
+        let t = triage(TriageBucket::HumanAction);
+        let r = req_infra(&t, "disk-full", "feat/x", "aaaa1111");
+        let infra = infra_marker(&r).unwrap();
+        let body = build_description(&r, &primary_marker(&r), &secondary_marker(&r), &infra);
+        assert!(body.contains(&format!("Root-Cause-Key: {infra}")), "{body}");
+        assert!(body.contains("Infra-Kind: disk-full"), "{body}");
+        assert!(body.contains("Branch: feat/x"), "{body}");
+        assert!(body.contains("Job: check"), "{body}");
+        assert!(
+            !body.contains(&root_cause_marker(&r)),
+            "the branch-scoped key is replaced, not added: {body}"
+        );
+    }
+
+    #[test]
+    fn no_infra_kind_leaves_the_body_and_the_keys_untouched() {
+        // The byte-identical guarantee for a code failure: no Infra-Kind line,
+        // and the collapse key is still the branch-scoped root-cause key.
+        let t = triage(TriageBucket::CodeFix);
+        let r = req_with_sig("owner/repo", &t, "alice", "boom");
+        let rc = root_cause_marker(&r);
+        let body = build_description(&r, &primary_marker(&r), &secondary_marker(&r), &rc);
+        assert!(!body.contains("Infra-Kind:"), "{body}");
+        assert!(body.contains(&format!("Root-Cause-Key: {rc}")), "{body}");
     }
 
     // ---- CLAUDE-104: auto-fix minting -------------------------------------
