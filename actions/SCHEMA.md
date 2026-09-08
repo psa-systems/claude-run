@@ -90,8 +90,8 @@ pre:
 
 ### `name` (string, required)
 
-Identifier used for the lock file, state file, log directory, and PAUSED flag. Should be kebab-case and unique across
-all actions on the host.
+Identifier used for the lock file, the log directory, and every per-action row in the state store (index, pause,
+attempt counters, daily ledger). Should be kebab-case and unique across all actions on the host.
 
 The action index is keyed by this exact string, so two files whose `name:` differ only by case (`youtrack` vs
 `YouTrack`) are indexed as two independent, separately-scheduled actions. At scan time the daemon flags (but does not
@@ -883,7 +883,8 @@ plain convention between an action's prompt and its post step; the runner itself
 If set, the runner appends one JSON line per job to `$CLAUDE_RUN_STATE_DIR/logs/<name>/<output.file>` summarizing the outcome
 (job key, attempt number, claude cost, push/comment results from post steps, etc.).
 
-If omitted, per-job outcomes are only visible in the daily JSONL log.
+If omitted, no JSONL file is written; per-job outcomes are still recorded in the `job_outcomes` table and rendered on the
+run detail page. The file is bounded by size, never by age: see [State + lock layout](#state--lock-layout).
 
 ### `limits` (record, optional)
 
@@ -1057,7 +1058,7 @@ These are the variables an ACTION author meets. Each one below is read by the Ru
 |---------------------------|----------------------------------|--------------------------------------------------------------------------------------------------|
 | `CLAUDE_RUN_CONFIG_DIR`   | `$XDG_CONFIG_HOME/claude-run`    | `config.toml` and `actions/*.yml`.                                                               |
 | `CLAUDE_RUN_DATA_DIR`     | `$XDG_DATA_HOME/claude-run`      | `state.db` (SQLite backend only) and `workdirs/`.                                                |
-| `CLAUDE_RUN_STATE_DIR`    | `$XDG_STATE_HOME/claude-run`     | `logs/`: the daily JSONL log, per-action `output.file`, and the per-attempt stream logs.         |
+| `CLAUDE_RUN_STATE_DIR`    | `$XDG_STATE_HOME/claude-run`     | `logs/`: `daemon.log`, per-action `output.file`, and the per-attempt stream logs. Also `snippets/` and `webhook-logs/`. |
 | `CLAUDE_RUN_RUNTIME_DIR`  | `$XDG_RUNTIME_DIR/claude-run`    | `daemon.pid`, `daemon.sock`, and `locks/<name>.lock`.                                            |
 | `CLAUDE_RUN_ACTIONS_DIR`  | `$CLAUDE_RUN_CONFIG_DIR/actions` | Resolves bare action names to YAML files (same as `--actions-dir`).                              |
 | `CLAUDE_RUN_WORKDIR_BASE` | `$CLAUDE_RUN_DATA_DIR/workdirs`  | Per-job workdir root. Final path = `<base>/<name>/<key>`. The action's `workdir_base` field wins. |
@@ -1073,32 +1074,34 @@ logs live under the state dir as shown above.
 
 ```
 $CLAUDE_RUN_STATE_DIR/
-  PAUSED                       # global pause, applies to all actions
-  <name>.PAUSED                # per-action pause
-  locks/<name>.lock            # PID lock keyed on action name
-  state/<name>.json            # {attempts, daily_count, daily_cost_usd}
-  logs/<name>/YYYY-MM-DD.log   # JSONL runner log
-  logs/<name>/<output.file>    # JSONL per-job outcomes if output.file set
+  logs/daemon.log                              # serve --detach stdout + stderr
+  logs/daemon.log.1                            # its one rolled-over predecessor
+  logs/<name>/<output.file>                    # JSONL per-job outcomes if output.file set
+  logs/<name>/<output.file>.1                  # its one rolled-over predecessor
   logs/<name>/streams/<key>-attempt-<n>.jsonl  # claude stream-json output per attempt
+  snippets/<name>/<key>/                       # rendered snippet scripts + one binding-<name>.json per $-binding
+  webhook-logs/                                # redacted CI job logs the Forgejo webhook triage fetched
 ```
 
-`state/<name>.json` shape:
+What bounds each path:
 
-```json
-{
-  "attempts": {
-    "<dedup_key value>": {
-      "count": 2,
-      "last_at": "2026-05-23T12:34:56-0400"
-    }
-  },
-  "daily_count": {
-    "2026-05-23": 7
-  },
-  "daily_cost_usd": {
-    "2026-05-23": 1.23
-  }
-}
+- `logs/daemon.log`: size, `config.stream_log_gc.daemon_log_max_bytes` (default 50 MiB). Past the ceiling the daemon's log GC pass copies the file to `daemon.log.1` and truncates it in place back to its newest half, so the daemon's open append handle keeps writing to the live file.
+- `logs/<name>/<output.file>`: size, `config.stream_log_gc.output_file_max_bytes` (default 50 MiB), same rollover. It is bounded by size and never deleted by age: `output.file` is an operator-configured data sink, so the sweep keeps the newest records in place instead of destroying the record.
+- `logs/<name>/streams/*.jsonl`: age, `config.stream_log_gc.retention_days` (default 30). A log whose job is still in flight is kept at any age.
+- `snippets/` and `webhook-logs/`: nothing bounds these yet; see CLAUDE-262.
+
+Pause state and per-key accounting are NOT files here. Global pause is the `global_pause` flag and per-action pause the
+`paused_actions` table (`src/pause.rs`); attempt counters, daily counts, and daily cost are the `attempt_counters` and
+`daily_ledger` tables. All of them live in the state store (`state.db`, or PostgreSQL). The legacy nu runner's
+`state/<name>.json` files are read once by `claude-run migrate` and are never written.
+
+The per-action lock is a file, but it lives in the runtime dir, not here:
+
+```
+$CLAUDE_RUN_RUNTIME_DIR/
+  daemon.pid                   # daemon pidfile lock
+  daemon.sock                  # CLI control socket (absent under serve --no-socket)
+  locks/<name>.lock            # flock keyed on action name, held for one run
 ```
 
 ## Synthetic webhook action (`webhook-forgejo`)
@@ -1179,5 +1182,7 @@ To inspect what happened in a failed run, look at the per-attempt stream log
 (`$CLAUDE_RUN_STATE_DIR/logs/<name>/streams/<key>-attempt-<n>.jsonl`); it survives across runs since it lives outside
 `$workdir`, up to the `config.stream_log_gc` retention window (default 30 days) past which the daemon sweep deletes it.
 
-For `filter` and `pre`/`post`, exit code 0 = continue, non-zero = step failure (skip job, count attempt). The snippet's
-stdout is captured into the daily log; stderr passes through.
+For `filter` and `pre`/`post`, exit code 0 = continue, non-zero = step failure (skip job, count attempt). The runner
+captures each snippet's stdout: `input.command`'s is parsed as the job array and `prompt`'s becomes the prompt text,
+while a `filter` / `pre` / `post` step's is read only for its exit code. A failing step's stderr is logged with the
+failure.

@@ -1,7 +1,8 @@
-//! Time-based GC sweepers for the two unbounded on-disk trees: preserved and
-//! aside workdirs ([`sweep`], CLAUDE-106) and per-attempt stream logs
-//! ([`sweep_stream_logs`], CLAUDE-245). Both are scheduled by the daemon on the
-//! same tick and read their own DB-backed retention window.
+//! GC sweepers for the unbounded on-disk trees: preserved and aside workdirs
+//! ([`sweep`], CLAUDE-106), per-attempt stream logs ([`sweep_stream_logs`],
+//! CLAUDE-245), and the two size-bounded files under `logs/`
+//! ([`sweep_oversized_logs`], CLAUDE-257). All are scheduled by the daemon on
+//! the same tick and read their own DB-backed retention window.
 //!
 //! The YouTrack runner intentionally keeps some workdirs rather than deleting
 //! them: [`crate::native::youtrack`] preserves a directory that holds unpushed
@@ -22,7 +23,8 @@
 //! testable without a real git repository.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use tracing::{debug, info, warn};
@@ -30,6 +32,15 @@ use tracing::{debug, info, warn};
 use crate::config::{StreamLogGcConfig, WorkdirGcConfig};
 
 const SECS_PER_DAY: u64 = 86_400;
+
+/// The daemon's own stdout/stderr file, opened by `detach_now` in
+/// `src/bin/claude-run.rs` and bounded by [`sweep_oversized_logs`].
+const DAEMON_LOG: &str = "daemon.log";
+
+/// Suffix of the single rolled-over predecessor [`bound_file`] leaves behind.
+/// The walk skips anything carrying it, so a predecessor is never itself rolled
+/// over into a second generation.
+const ROTATED_SUFFIX: &str = ".1";
 
 /// Tally of one [`sweep`] or [`sweep_stream_logs`] pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,8 +74,14 @@ where
 
     let sources = match std::fs::read_dir(base) {
         Ok(r) => r,
-        // Missing base dir (no workdirs created yet) is a clean no-op.
-        Err(_) => return stats,
+        // Missing base dir (no workdirs created yet) is a clean no-op; any other
+        // error means the sweep swept nothing, so it is logged rather than
+        // reported as an empty pass.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return stats,
+        Err(e) => {
+            warn!(path = %base.display(), error = %e, "workdir GC: cannot read the workdir base; nothing was swept this pass");
+            return stats;
+        }
     };
     for source in sources.flatten() {
         let source_path = source.path();
@@ -159,8 +176,12 @@ pub fn sweep_stream_logs(
     let actions = match std::fs::read_dir(logs_dir) {
         Ok(r) => r,
         // Missing logs dir (nothing has run yet) is a clean no-op, exactly as
-        // `sweep` treats a missing workdir base.
-        Err(_) => return stats,
+        // `sweep` treats a missing workdir base; any other error is logged.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return stats,
+        Err(e) => {
+            warn!(path = %logs_dir.display(), error = %e, "stream-log GC: cannot read the logs dir; nothing was swept this pass");
+            return stats;
+        }
     };
     for action in actions.flatten() {
         let streams_dir = action.path().join("streams");
@@ -233,6 +254,171 @@ fn stream_log_key(file_name: &str) -> Option<String> {
         return None;
     }
     Some(key.to_string())
+}
+
+/// Tally of one [`sweep_oversized_logs`] pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BoundStats {
+    /// Files rolled over and truncated back under their ceiling this pass.
+    pub bounded: u64,
+    /// Files left alone (already under their ceiling, or ceiling disabled).
+    pub kept: u64,
+    /// Total bytes reclaimed from the bounded files themselves. The rolled-over
+    /// predecessors are not subtracted: they are a second copy on disk until the
+    /// next rotation replaces them.
+    pub bytes_reclaimed: u64,
+}
+
+/// CLAUDE-257: bound the two append-forever files under `<logs_dir>` by SIZE:
+/// `daemon.log` and every `logs/<action>/<output.file>`.
+///
+/// Neither is a per-run artifact, so the age window [`sweep_stream_logs`] uses
+/// does not apply: each is one file that a long-lived daemon appends to for the
+/// life of the install. Past its ceiling a file is rolled to `<name>.1` and
+/// truncated in place back to its newest half (see [`bound_file`]).
+///
+/// The action-directory walk treats every regular file directly under
+/// `logs/<action>/` as an output sink, because `append_output_record`
+/// ([`crate::job`]) is the only writer that puts one there; `streams/` is a
+/// directory and is skipped, as is any `<name>.1` predecessor. Per-entry
+/// filesystem errors are logged and skipped; the pass never aborts for one bad
+/// file.
+pub fn sweep_oversized_logs(logs_dir: &Path, cfg: &StreamLogGcConfig) -> BoundStats {
+    let mut stats = BoundStats::default();
+    if !cfg.enabled {
+        return stats;
+    }
+    bound_one(
+        &logs_dir.join(DAEMON_LOG),
+        cfg.daemon_log_max_bytes,
+        "daemon log",
+        &mut stats,
+    );
+
+    let actions = match std::fs::read_dir(logs_dir) {
+        Ok(r) => r,
+        // Missing logs dir (nothing has run yet) is a clean no-op; anything else
+        // means the pass silently bounded nothing, so it is logged.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return stats,
+        Err(e) => {
+            warn!(path = %logs_dir.display(), error = %e, "log size GC: cannot read the logs dir; nothing was bounded this pass");
+            return stats;
+        }
+    };
+    for action in actions.flatten() {
+        let dir = action.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(path = %dir.display(), error = %e, "log size GC: cannot read action log dir; skipping");
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `streams/` is a directory, so this also excludes the stream logs:
+            // those are swept by age, never truncated.
+            if !path.is_file() {
+                continue;
+            }
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(ROTATED_SUFFIX)
+            {
+                continue;
+            }
+            bound_one(&path, cfg.output_file_max_bytes, "output file", &mut stats);
+        }
+    }
+    stats
+}
+
+/// Apply [`bound_file`] to one path, folding the outcome into `stats` and
+/// logging what happened. Only a MISSING file is silent (a foreground daemon
+/// writes no `daemon.log`, an action may have written no records yet) and it is
+/// not counted either way; every other error is a file this pass failed to
+/// bound, so it is logged rather than dropped.
+fn bound_one(path: &Path, max_bytes: u64, what: &str, stats: &mut BoundStats) {
+    match bound_file(path, max_bytes) {
+        Ok(Some((was, now))) => {
+            info!(
+                path = %path.display(),
+                kind = what,
+                bytes_before = was,
+                bytes_after = now,
+                bytes_reclaimed = was - now,
+                predecessor = %rotated_path(path).display(),
+                "log size GC: rolled over a log past its size ceiling and kept its tail"
+            );
+            stats.bounded += 1;
+            stats.bytes_reclaimed += was - now;
+        }
+        Ok(None) => stats.kept += 1,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(path = %path.display(), kind = what, error = %e, "log size GC: bounding failed (continuing)");
+            stats.kept += 1;
+        }
+    }
+}
+
+/// Roll `path` over and truncate it back under `max_bytes`, returning the
+/// `(before, after)` byte sizes when it acted and `None` when the file was
+/// already inside its ceiling (or the ceiling is disabled with `0`).
+///
+/// The newest `max_bytes / 2` bytes are kept, starting at the first line
+/// boundary inside that window so every retained line is whole (a window
+/// carrying no newline at all is kept verbatim rather than emptied). The full
+/// previous content goes to `<name>.1`, one generation only.
+///
+/// The truncation is IN PLACE, not a rename: the daemon holds this file open as
+/// its stdout/stderr, so a rename would leave it appending to the predecessor
+/// and the live log would stay empty. With `O_APPEND` the daemon's next write
+/// lands at the new end of file. A write racing this rewrite can lose a line,
+/// which is the accepted cost of bounding a file that is open for append.
+fn bound_file(path: &Path, max_bytes: u64) -> std::io::Result<Option<(u64, u64)>> {
+    // Stat first even when the ceiling is disabled, so a missing file reports as
+    // `NotFound` (silent, uncounted) rather than as a file that was kept.
+    let len = std::fs::metadata(path)?.len();
+    if max_bytes == 0 {
+        return Ok(None);
+    }
+    if len <= max_bytes {
+        return Ok(None);
+    }
+    let keep = max_bytes / 2;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    file.seek(SeekFrom::Start(len - keep))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    if let Some(nl) = tail.iter().position(|b| *b == b'\n') {
+        tail.drain(..=nl);
+    }
+
+    // Copy before the rewrite: the predecessor is the only surviving copy of
+    // what the truncation drops.
+    std::fs::copy(path, rotated_path(path))?;
+
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&tail)?;
+    file.set_len(tail.len() as u64)?;
+    file.flush()?;
+    Ok(Some((len, tail.len() as u64)))
+}
+
+/// `<path>.1`, the single rolled-over predecessor of `path`.
+fn rotated_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(ROTATED_SUFFIX);
+    path.with_file_name(name)
 }
 
 /// Age of `path` relative to `now`, from its last-modified time. Unreadable
@@ -387,6 +573,10 @@ mod tests {
         StreamLogGcConfig {
             enabled,
             retention_days: 30,
+            // The age sweep reads neither ceiling; `0` keeps these tests to the
+            // one axis they are about.
+            daemon_log_max_bytes: 0,
+            output_file_max_bytes: 0,
         }
     }
 
@@ -515,22 +705,178 @@ mod tests {
         assert_eq!(stats, SweepStats::default());
     }
 
-    /// The daily runner logs (`logs/<action>/YYYY-MM-DD.log`) and any other file
-    /// beside `streams/` are not this sweep's business and stay untouched.
+    /// A file beside `streams/` is the action's `output.file` sink, which
+    /// [`sweep_oversized_logs`] bounds by size. It is never age-swept, so this
+    /// sweep leaves it untouched no matter how old it is.
     #[test]
     fn only_the_streams_dir_is_swept() {
         let tmp = tempfile::tempdir().unwrap();
-        let daily = tmp.path().join("youtrack").join("2026-01-01.log");
-        std::fs::create_dir_all(daily.parent().unwrap()).unwrap();
-        std::fs::write(&daily, b"line").unwrap();
+        let sink = tmp.path().join("youtrack").join("outcomes.jsonl");
+        std::fs::create_dir_all(sink.parent().unwrap()).unwrap();
+        std::fs::write(&sink, b"line").unwrap();
         let stats = sweep_stream_logs(
             tmp.path(),
             &log_cfg(true),
             SystemTime::now() + days(365),
             &in_flight(&[]),
         );
-        assert!(daily.exists(), "a daily runner log is not a stream log");
+        assert!(sink.exists(), "an output.file sink is not a stream log");
         assert_eq!(stats, SweepStats::default());
+    }
+
+    // ---- CLAUDE-257: size ceilings on daemon.log and output.file -----------
+
+    /// `bytes` bytes of numbered lines, so a test can tell head from tail.
+    fn numbered_lines(bytes: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes + 64);
+        let mut n = 0u64;
+        while out.len() < bytes {
+            out.extend_from_slice(format!("line {n}\n").as_bytes());
+            n += 1;
+        }
+        out
+    }
+
+    fn size_cfg(daemon_max: u64, output_max: u64) -> StreamLogGcConfig {
+        StreamLogGcConfig {
+            enabled: true,
+            retention_days: 30,
+            daemon_log_max_bytes: daemon_max,
+            output_file_max_bytes: output_max,
+        }
+    }
+
+    /// AC: an oversized `daemon.log` comes back under the ceiling with its tail
+    /// preserved, and the dropped head survives in the one predecessor.
+    #[test]
+    fn oversized_daemon_log_is_bounded_with_its_tail_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("daemon.log");
+        let content = numbered_lines(40_000);
+        std::fs::write(&log, &content).unwrap();
+
+        let stats = sweep_oversized_logs(tmp.path(), &size_cfg(10_000, 0));
+        let after = std::fs::read(&log).unwrap();
+        assert!(
+            after.len() as u64 <= 10_000,
+            "the log must be back under the ceiling, got {}",
+            after.len()
+        );
+        let tail_text = String::from_utf8(after.clone()).unwrap();
+        let full_text = String::from_utf8(content.clone()).unwrap();
+        assert!(
+            full_text.ends_with(&tail_text),
+            "what remains must be the tail of what was there"
+        );
+        assert!(
+            tail_text.starts_with("line "),
+            "the partial first line is dropped so every kept line is whole"
+        );
+        assert!(!tail_text.contains("line 0\n"), "the head is gone");
+
+        // One rolled-over predecessor holds everything the truncation dropped.
+        let prev = std::fs::read(tmp.path().join("daemon.log.1")).unwrap();
+        assert_eq!(prev, content, "the predecessor is the full previous file");
+
+        assert_eq!(stats.bounded, 1);
+        assert_eq!(stats.kept, 0);
+        assert_eq!(
+            stats.bytes_reclaimed,
+            (content.len() - after.len()) as u64,
+            "the tally is what the truncation actually reclaimed"
+        );
+    }
+
+    #[test]
+    fn daemon_log_inside_its_ceiling_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("daemon.log");
+        std::fs::write(&log, numbered_lines(1_000)).unwrap();
+        let before = std::fs::read(&log).unwrap();
+
+        let stats = sweep_oversized_logs(tmp.path(), &size_cfg(10_000, 0));
+        assert_eq!(std::fs::read(&log).unwrap(), before);
+        assert!(!tmp.path().join("daemon.log.1").exists());
+        assert_eq!(stats.bounded, 0);
+        assert_eq!(stats.kept, 1);
+    }
+
+    /// AC: the `output.file` sink is bounded by size and never deleted, so its
+    /// newest records stay where the operator's consumer expects them.
+    #[test]
+    fn oversized_output_file_is_bounded_never_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("youtrack");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sink = dir.join("outcomes.jsonl");
+        std::fs::write(&sink, numbered_lines(40_000)).unwrap();
+
+        let stats = sweep_oversized_logs(tmp.path(), &size_cfg(0, 10_000));
+        assert!(sink.exists(), "the sink is bounded, never deleted");
+        let after = std::fs::read(&sink).unwrap();
+        assert!(after.len() as u64 <= 10_000);
+        assert!(String::from_utf8(after).unwrap().starts_with("line "));
+        assert!(dir.join("outcomes.jsonl.1").exists());
+        assert_eq!(stats.bounded, 1);
+    }
+
+    /// A predecessor is never itself rolled over: it holds a full pre-truncation
+    /// copy, so a second generation would grow `logs/` instead of bounding it.
+    #[test]
+    fn rolled_over_predecessor_is_not_rotated_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("youtrack");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = dir.join("outcomes.jsonl.1");
+        let content = numbered_lines(40_000);
+        std::fs::write(&prev, &content).unwrap();
+
+        let stats = sweep_oversized_logs(tmp.path(), &size_cfg(0, 10_000));
+        assert_eq!(
+            std::fs::read(&prev).unwrap(),
+            content,
+            "the predecessor is untouched"
+        );
+        assert!(!dir.join("outcomes.jsonl.1.1").exists());
+        assert_eq!(stats, BoundStats::default());
+    }
+
+    /// The stream logs are swept by age, never truncated, so the size pass must
+    /// not reach into `streams/`.
+    #[test]
+    fn the_size_pass_never_touches_a_stream_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = make_stream_log(tmp.path(), "youtrack", "CLAUDE-1", 1, 40_000);
+        let stats = sweep_oversized_logs(tmp.path(), &size_cfg(10_000, 10_000));
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 40_000);
+        assert_eq!(stats, BoundStats::default());
+    }
+
+    /// `0` is the documented opt-out for an operator who rotates the sink
+    /// themselves; the master toggle parks the whole pass.
+    #[test]
+    fn a_zero_ceiling_and_a_disabled_config_bound_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("daemon.log");
+        let content = numbered_lines(40_000);
+        std::fs::write(&log, &content).unwrap();
+
+        let stats = sweep_oversized_logs(tmp.path(), &size_cfg(0, 0));
+        assert_eq!(std::fs::read(&log).unwrap(), content);
+        assert_eq!(stats.bounded, 0);
+
+        let mut off = size_cfg(10_000, 10_000);
+        off.enabled = false;
+        let stats = sweep_oversized_logs(tmp.path(), &off);
+        assert_eq!(std::fs::read(&log).unwrap(), content);
+        assert_eq!(stats, BoundStats::default());
+    }
+
+    #[test]
+    fn missing_logs_dir_bounds_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stats = sweep_oversized_logs(&tmp.path().join("nope"), &size_cfg(10_000, 10_000));
+        assert_eq!(stats, BoundStats::default());
     }
 
     #[test]
