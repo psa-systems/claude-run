@@ -1353,6 +1353,46 @@ mod tests {
         assert_eq!(unchanged.retention_days, 7);
     }
 
+    /// CLAUDE-262: `snippet_retention_days` and `webhook_log_retention_days`
+    /// ride the same `config.stream_log_gc` document, so they round-trip
+    /// through `GET` / `PUT /api/settings/stream_log_gc` and apply live on the
+    /// handle the daemon's sweep loop reads, exactly like the two CLAUDE-257
+    /// size ceilings above.
+    #[tokio::test]
+    async fn stream_log_gc_section_round_trips_the_snippet_and_webhook_log_windows() {
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+
+        live.save_section(
+            Section::StreamLogGc,
+            r#"{"enabled":true,"retention_days":30,"daemon_log_max_bytes":0,"output_file_max_bytes":0,"snippet_retention_days":7,"webhook_log_retention_days":14}"#,
+        )
+        .await
+        .unwrap();
+        let stored: StreamLogGcConfig = get_json(&pool, Section::StreamLogGc.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.snippet_retention_days, 7);
+        assert_eq!(stored.webhook_log_retention_days, 14);
+        let applied = live.stream_log_gc_handle().read().await.clone();
+        assert_eq!(applied.snippet_retention_days, 7);
+        assert_eq!(applied.webhook_log_retention_days, 14);
+
+        // A document written before these fields existed still loads: they
+        // take their defaults rather than failing the whole section.
+        let legacy: StreamLogGcConfig =
+            serde_json::from_str(r#"{"enabled":true,"retention_days":7}"#).unwrap();
+        assert_eq!(
+            legacy.snippet_retention_days,
+            StreamLogGcConfig::default().snippet_retention_days
+        );
+        assert_eq!(
+            legacy.webhook_log_retention_days,
+            StreamLogGcConfig::default().webhook_log_retention_days
+        );
+    }
+
     // ---- CLAUDE-239: global claude invocation defaults ---------------------
 
     #[tokio::test]
