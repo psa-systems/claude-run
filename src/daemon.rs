@@ -367,7 +367,7 @@ impl Daemon {
         // `state_dir/webhook-logs/`. CLAUDE-47: each event is then triaged
         // (CLAUDE-45) and minted / declined (CLAUDE-46) when a provider backend
         // is usable.
-        let webhook_log_dir = self.paths.state_dir.join("webhook-logs");
+        let webhook_log_dir = self.paths.webhook_logs_dir();
         let webhook_logs: Arc<dyn crate::forge_log::ActionLogClient> = Arc::new(
             crate::provider::FjForgeReads::new(Arc::new(crate::provider::ProcessRunner::new())),
         );
@@ -1656,21 +1656,30 @@ async fn inflight_stream_log_jobs(
 /// save applies on the next pass. The walks, the unlinks and the truncations are
 /// blocking filesystem work, so they run on a blocking thread.
 ///
-/// Two passes on the one tick, because `logs/` has two kinds of writer.
-/// Per-attempt stream logs are per-run artifacts and are swept by AGE; a failed
-/// in-flight read SKIPS that pass rather than sweeping with an empty set,
-/// because without that table the sweep cannot tell a finished job's log from a
-/// running one's, and the wrong guess deletes a live run's only transcript.
-/// CLAUDE-257: `daemon.log` and each `logs/<action>/<output.file>` are single
-/// append-forever files instead, so they are bounded by SIZE
-/// ([`crate::gc::sweep_oversized_logs`]) and that pass runs regardless of the
-/// in-flight read, which it does not depend on.
+/// Four passes on the one tick, because this section of config now bounds four
+/// kinds of writer. Per-attempt stream logs (`logs/<action>/streams/`) and
+/// CLAUDE-262's per-job snippet directories (`snippets/<action>/<job_key>/`)
+/// are both per-run artifacts and are swept by AGE, both guarded by the same
+/// in-flight read: a failed read SKIPS both passes rather than sweeping with an
+/// empty set, because without that table neither sweep can tell a finished
+/// job's artifacts from a running one's, and the wrong guess deletes a live
+/// run's only transcript or its snippet directory. CLAUDE-257's `daemon.log`
+/// and each `logs/<action>/<output.file>` are single append-forever files
+/// instead, so they are bounded by SIZE ([`crate::gc::sweep_oversized_logs`])
+/// and that pass runs regardless of the in-flight read, which it does not
+/// depend on. CLAUDE-262's `webhook-logs/` files are per-triaged-run artifacts
+/// like the stream logs, but a webhook run is not tracked in
+/// `run_inflight_jobs` (it goes through the mint pipeline, not a scheduled
+/// job), so [`crate::gc::sweep_webhook_logs`] is age-only and also runs
+/// regardless of the in-flight read.
 async fn stream_log_gc_loop(
     paths: Paths,
     pool: DbPool,
     cfg: Arc<tokio::sync::RwLock<crate::config::StreamLogGcConfig>>,
 ) {
-    let base = paths.logs_dir();
+    let logs_base = paths.logs_dir();
+    let snippets_base = paths.snippets_dir();
+    let webhook_logs_base = paths.webhook_logs_dir();
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(GC_TICK_SECS));
     loop {
         ticker.tick().await;
@@ -1680,15 +1689,11 @@ async fn stream_log_gc_loop(
         }
         match inflight_stream_log_jobs(&pool).await {
             Ok(in_flight) => {
-                let base = base.clone();
+                let base = logs_base.clone();
                 let cfg = snapshot.clone();
+                let flight = in_flight.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    crate::gc::sweep_stream_logs(
-                        &base,
-                        &cfg,
-                        std::time::SystemTime::now(),
-                        &in_flight,
-                    )
+                    crate::gc::sweep_stream_logs(&base, &cfg, std::time::SystemTime::now(), &flight)
                 })
                 .await;
                 match result {
@@ -1700,13 +1705,29 @@ async fn stream_log_gc_loop(
                     ),
                     Err(e) => warn!(error = %e, "stream-log GC sweep task failed"),
                 }
+
+                let base = snippets_base.clone();
+                let cfg = snapshot.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::gc::sweep_snippets(&base, &cfg, std::time::SystemTime::now(), &in_flight)
+                })
+                .await;
+                match result {
+                    Ok(stats) => info!(
+                        deleted = stats.deleted,
+                        kept = stats.kept,
+                        bytes_reclaimed = stats.bytes_reclaimed,
+                        "snippet GC sweep complete"
+                    ),
+                    Err(e) => warn!(error = %e, "snippet GC sweep task failed"),
+                }
             }
             Err(e) => {
-                warn!(error = %e, "stream-log GC: cannot read in-flight jobs; skipping this sweep rather than risk deleting a live run's log")
+                warn!(error = %e, "stream-log/snippet GC: cannot read in-flight jobs; skipping both sweeps rather than risk deleting a live run's artifacts")
             }
         }
 
-        let base = base.clone();
+        let base = logs_base.clone();
         let cfg = snapshot.clone();
         let result =
             tokio::task::spawn_blocking(move || crate::gc::sweep_oversized_logs(&base, &cfg)).await;
@@ -1718,6 +1739,22 @@ async fn stream_log_gc_loop(
                 "log size GC pass complete"
             ),
             Err(e) => warn!(error = %e, "log size GC task failed"),
+        }
+
+        let base = webhook_logs_base.clone();
+        let cfg = snapshot.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::gc::sweep_webhook_logs(&base, &cfg, std::time::SystemTime::now())
+        })
+        .await;
+        match result {
+            Ok(stats) => info!(
+                deleted = stats.deleted,
+                kept = stats.kept,
+                bytes_reclaimed = stats.bytes_reclaimed,
+                "webhook-log GC sweep complete"
+            ),
+            Err(e) => warn!(error = %e, "webhook-log GC sweep task failed"),
         }
     }
 }
