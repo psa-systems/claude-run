@@ -131,6 +131,17 @@ fn parse_opt_u32(label: &str, raw: &str) -> Result<Option<u32>, String> {
     }
 }
 
+/// DEV-705: the dollar / fraction analogue of [`parse_opt_u32`].
+fn parse_opt_f64(label: &str, raw: &str) -> Result<Option<f64>, String> {
+    match raw.trim() {
+        "" => Ok(None),
+        t => t
+            .parse::<f64>()
+            .map(Some)
+            .map_err(|_| format!("{label} must be a number (got `{t}`)")),
+    }
+}
+
 // ---- blocks shared by every kind ------------------------------------------
 
 /// The generic `Action` blocks every structured editor surfaces: identity,
@@ -156,10 +167,17 @@ pub struct CommonForm {
     /// CLAUDE-259: per-action `--effort`; blank inherits the global
     /// `config.claude.effort`.
     pub claude_effort: String,
+    /// DEV-706: per-action `--autocompact`; blank inherits the global
+    /// `config.claude.autocompact`, then the runner's bounded default.
+    pub claude_autocompact: String,
     pub limit_max_attempts_per_key: String,
     pub limit_max_runs_per_day: String,
     pub limit_claude_timeout_seconds: String,
     pub limit_daily_budget_usd: String,
+    /// DEV-705: dollars ONE run may spend; blank inherits the daily budget.
+    pub limit_run_budget_usd: String,
+    /// DEV-705: fraction of the per-run budget at which the run warns once.
+    pub limit_budget_warn_fraction: String,
     /// CLAUDE-234: issues one run may create in the tracker.
     pub limit_max_issues_per_run: String,
 }
@@ -179,10 +197,13 @@ impl CommonForm {
             claude_permission_mode: p.get("claude_permission_mode"),
             claude_model: p.get("claude_model"),
             claude_effort: p.get("claude_effort"),
+            claude_autocompact: p.get("claude_autocompact"),
             limit_max_attempts_per_key: p.get("limit_max_attempts_per_key"),
             limit_max_runs_per_day: p.get("limit_max_runs_per_day"),
             limit_claude_timeout_seconds: p.get("limit_claude_timeout_seconds"),
             limit_daily_budget_usd: p.get("limit_daily_budget_usd"),
+            limit_run_budget_usd: p.get("limit_run_budget_usd"),
+            limit_budget_warn_fraction: p.get("limit_budget_warn_fraction"),
             limit_max_issues_per_run: p.get("limit_max_issues_per_run"),
         }
     }
@@ -190,6 +211,7 @@ impl CommonForm {
     fn from_action(a: &Action) -> Self {
         let s = |o: &Option<String>| o.clone().unwrap_or_default();
         let n = |o: Option<u32>| o.map(|v| v.to_string()).unwrap_or_default();
+        let f = |o: Option<f64>| o.map(|v| v.to_string()).unwrap_or_default();
         Self {
             name: a.name.clone(),
             enabled: a.enabled,
@@ -218,6 +240,7 @@ impl CommonForm {
             claude_permission_mode: s(&a.claude.permission_mode),
             claude_model: s(&a.claude.model),
             claude_effort: s(&a.claude.effort),
+            claude_autocompact: s(&a.claude.autocompact),
             limit_max_attempts_per_key: n(a.limits.max_attempts_per_key),
             limit_max_runs_per_day: n(a.limits.max_runs_per_day),
             limit_claude_timeout_seconds: n(a.limits.claude_timeout_seconds),
@@ -226,6 +249,8 @@ impl CommonForm {
                 .daily_budget_usd
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
+            limit_run_budget_usd: f(a.limits.run_budget_usd),
+            limit_budget_warn_fraction: f(a.limits.budget_warn_fraction),
             limit_max_issues_per_run: n(a.limits.max_issues_per_run),
         }
     }
@@ -276,6 +301,7 @@ fn apply_common(
             permission_mode: opt(&c.claude_permission_mode),
             model: opt(&c.claude_model),
             effort: opt(&c.claude_effort),
+            autocompact: opt(&c.claude_autocompact),
         };
         set_or_remove(
             map,
@@ -298,6 +324,11 @@ fn apply_common(
                     .map_err(|_| format!("Daily budget (USD) must be a number (got `{t}`)"))?,
             ),
         },
+        run_budget_usd: parse_opt_f64("Per-run budget (USD)", &c.limit_run_budget_usd)?,
+        budget_warn_fraction: parse_opt_f64(
+            "Budget warning fraction",
+            &c.limit_budget_warn_fraction,
+        )?,
         max_issues_per_run: parse_opt_u32("Max issues per run", &c.limit_max_issues_per_run)?,
     };
     set_or_remove(

@@ -61,6 +61,11 @@ pub struct NativeContext<'a> {
     /// across its gather step (the `yt list` that opens the run) so the
     /// scheduler does not stack another pickup on a gather still in flight.
     pub gather: crate::concurrency::GatherGate,
+    /// DEV-705 / DEV-707: this run's spend ledger and frozen ceiling, built by
+    /// [`crate::daemon::run_action_inner`] from the action's limits BEFORE the
+    /// handler starts. A handler bills every `claude` invocation against it,
+    /// checks it before each pickup, and finalizes it with its run's exit code.
+    pub spend: crate::usage::RunSpend,
 }
 
 /// Boxed future returned by a [`NativeHandler`]. Hand-rolled (rather than

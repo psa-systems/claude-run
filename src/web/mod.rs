@@ -2642,10 +2642,17 @@ struct YoutrackEditForm {
     /// CLAUDE-259: per-action `--effort`; blank inherits the global
     /// `config.claude.effort`.
     claude_effort: String,
+    /// DEV-706: per-action `--autocompact`; blank inherits the global
+    /// `config.claude.autocompact`, then the runner's bounded default.
+    claude_autocompact: String,
     limit_max_attempts_per_key: String,
     limit_max_runs_per_day: String,
     limit_claude_timeout_seconds: String,
     limit_daily_budget_usd: String,
+    /// DEV-705: dollars ONE run may spend; blank inherits the daily budget.
+    limit_run_budget_usd: String,
+    /// DEV-705: fraction of the per-run budget at which the run warns once.
+    limit_budget_warn_fraction: String,
     /// CLAUDE-234: issues one run may create in the tracker.
     limit_max_issues_per_run: String,
     /// Per-run parallelism cap (number-as-text, like the `limit_*` fields).
@@ -2706,6 +2713,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
     };
     let s = |o: &Option<String>| o.clone().unwrap_or_default();
     let n = |o: Option<u32>| o.map(|v| v.to_string()).unwrap_or_default();
+    let f = |o: Option<f64>| o.map(|v| v.to_string()).unwrap_or_default();
     Some(YoutrackEditForm {
         name: a.name.clone(),
         yt_base_url: s(&yt.youtrack.base_url),
@@ -2757,6 +2765,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         claude_permission_mode: s(&a.claude.permission_mode),
         claude_model: s(&a.claude.model),
         claude_effort: s(&a.claude.effort),
+        claude_autocompact: s(&a.claude.autocompact),
         limit_max_attempts_per_key: n(a.limits.max_attempts_per_key),
         limit_max_runs_per_day: n(a.limits.max_runs_per_day),
         limit_claude_timeout_seconds: n(a.limits.claude_timeout_seconds),
@@ -2765,6 +2774,8 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
             .daily_budget_usd
             .map(|v| v.to_string())
             .unwrap_or_default(),
+        limit_run_budget_usd: f(a.limits.run_budget_usd),
+        limit_budget_warn_fraction: f(a.limits.budget_warn_fraction),
         limit_max_issues_per_run: n(a.limits.max_issues_per_run),
         concurrency_max_parallel: a.concurrency.max_parallel.to_string(),
         concurrency_key: a.concurrency.key.join(", "),
@@ -2968,6 +2979,15 @@ fn youtrack_form_to_yaml(
                 .map_err(|_| format!("{label} must be a whole number (got `{t}`)")),
         }
     };
+    let pf64 = |label: &str, raw: &str| -> Result<Option<f64>, String> {
+        match raw.trim() {
+            "" => Ok(None),
+            t => t
+                .parse::<f64>()
+                .map(Some)
+                .map_err(|_| format!("{label} must be a number (got `{t}`)")),
+        }
+    };
     let limits = Limits {
         max_attempts_per_key: pu32("Max attempts per key", &form.limit_max_attempts_per_key)?,
         max_runs_per_day: pu32("Max runs per day", &form.limit_max_runs_per_day)?,
@@ -2982,6 +3002,8 @@ fn youtrack_form_to_yaml(
                     .map_err(|_| format!("Daily budget (USD) must be a number (got `{t}`)"))?,
             ),
         },
+        run_budget_usd: pf64("Per-run budget (USD)", &form.limit_run_budget_usd)?,
+        budget_warn_fraction: pf64("Budget warning fraction", &form.limit_budget_warn_fraction)?,
         max_issues_per_run: pu32("Max issues per run", &form.limit_max_issues_per_run)?,
     };
     set_or_remove(
@@ -2997,6 +3019,7 @@ fn youtrack_form_to_yaml(
         permission_mode: opt(&form.claude_permission_mode),
         model: opt(&form.claude_model),
         effort: opt(&form.claude_effort),
+        autocompact: opt(&form.claude_autocompact),
     };
     set_or_remove(
         map,
@@ -8355,7 +8378,7 @@ mod tests {
         /// Every input a kind's form must expose: each field of its native
         /// config struct plus the shared blocks. A field dropped from the
         /// template fails here even though the Rust round trip would still pass.
-        const COMMON_INPUTS: [&str; 12] = [
+        const COMMON_INPUTS: [&str; 14] = [
             "name",
             "enabled",
             "workdir_base",
@@ -8366,6 +8389,8 @@ mod tests {
             "limit_max_runs_per_day",
             "limit_claude_timeout_seconds",
             "limit_daily_budget_usd",
+            "limit_run_budget_usd",
+            "limit_budget_warn_fraction",
             "native_enabled",
             "log_token_mode",
         ];
@@ -8380,6 +8405,7 @@ mod tests {
                 "claude_permission_mode",
                 "claude_model",
                 "claude_effort",
+                "claude_autocompact",
             ];
             let log_token_inputs = ["log_token_global", "log_token_repos", "log_token_ref"];
             let cases: [(Response, &str, &str, Vec<&str>); 4] = [

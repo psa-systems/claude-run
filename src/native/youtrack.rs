@@ -369,6 +369,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         let job_cancel = cancel.clone();
         let job_pause = run_pause.clone();
         let job_audit = audit.clone();
+        let job_spend = ctx.spend.clone();
         let fut: crate::concurrency::JobFuture = Box::pin(async move {
             let action = &loaded.action;
             // CLAUDE-28: best-effort cap/budget check before launch; bounded
@@ -379,6 +380,12 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
             }
             if state::daily_cost_get(&pool, &action.name).await? >= limits.daily_budget_usd {
                 warn!(action = %action.name, "daily budget reached, skipping job");
+                return Ok(false);
+            }
+            // DEV-705: the run's own ceiling; a run that reached it picks up
+            // nothing further.
+            if job_spend.exceeded() {
+                warn!(action = %action.name, "{}", job_spend.stop_reason());
                 return Ok(false);
             }
             // CLAUDE-26: materialize this job's own credential files (yt config +
@@ -437,6 +444,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 &limits,
                 &job_cancel,
                 &job_pause,
+                &job_spend,
                 &job,
                 pr_strategy,
                 bypass_backoff,
@@ -514,8 +522,17 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         }
     }
 
-    let exit_code = run_pause.exit_code(cancel.is_cancelled());
+    // DEV-705: an over-budget stop is this run's outcome unless a cancel or a
+    // pause already claimed it.
+    let exit_code = ctx
+        .spend
+        .exit_code(run_pause.exit_code(cancel.is_cancelled()));
+    if exit_code == crate::exit::OVER_BUDGET {
+        warn!(action = %action.name, "{}", ctx.spend.stop_reason());
+    }
     run_guard.finish(exit_code, processed).await?;
+    // DEV-707: one summary line and one machine-readable record per run.
+    ctx.spend.finish(Some(run_id), exit_code);
     if let Some(e) = first_err {
         warn!(action = %action.name, error = %e, "one or more jobs errored during the run");
     }
@@ -946,6 +963,8 @@ async fn process_job(
     limits: &EffectiveLimits,
     cancel: &CancellationToken,
     pause: &crate::pause::RunPause,
+    // DEV-705 / DEV-707: the run's shared ledger and frozen ceiling.
+    spend: &crate::usage::RunSpend,
     job: &YoutrackJob,
     pr_strategy: crate::action::PrStrategy,
     bypass_backoff: bool,
@@ -1079,7 +1098,11 @@ async fn process_job(
                 &workdir_path,
                 &stream_log,
                 cancel,
+                // DEV-705: cap the child at the run's remaining ceiling.
+                Some(spend.remaining_usd()),
             )?;
+            // DEV-707: bill the run before any branch discards `r`.
+            spend.record(&r);
             if cancel.is_cancelled() {
                 // The token tripped mid-run; `invoke` already terminated the
                 // child. Synthesize a cancelled result so finalize runs and no
@@ -2462,6 +2485,7 @@ mod tests {
             ok: true,
             summary: "did the work".into(),
             cost: 0.5,
+            usage: Default::default(),
             raw: Value::Null,
             error: String::new(),
             transient: false,
@@ -2474,6 +2498,7 @@ mod tests {
             ok: false,
             summary: "partial work before kill".into(),
             cost: 0.3,
+            usage: Default::default(),
             raw: Value::Null,
             error: "claude exited 124, see stream.jsonl".into(),
             transient: false,
@@ -2490,6 +2515,7 @@ mod tests {
             ok: false,
             summary: "API Error: 529 Overloaded.".into(),
             cost: 0.01,
+            usage: Default::default(),
             raw: serde_json::json!({"type":"result","is_error":true,"api_error_status":"529"}),
             error: "claude exited 1, see stream.jsonl".into(),
             transient: true,

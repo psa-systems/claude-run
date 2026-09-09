@@ -59,6 +59,11 @@ struct Pending {
     /// refused, so the CLI's own wording reaches the page instead of a generic
     /// failure.
     output: Arc<Mutex<String>>,
+    /// Only what the child wrote to stderr. A refused code is the CLI's own
+    /// `Invalid code...` on stderr, while stdout carries the banner and the
+    /// re-armed prompt; keeping them apart is what stops ordinary stdout
+    /// chatter from reading as a refusal (CLAUDE-267).
+    errors: Arc<Mutex<String>>,
 }
 
 impl Pending {
@@ -124,6 +129,7 @@ impl LoginBroker {
             .ok_or_else(|| Error::Secret("claude login child has no stderr".to_string()))?;
 
         let output = Arc::new(Mutex::new(String::new()));
+        let errors = Arc::new(Mutex::new(String::new()));
         let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
 
         // stdout reader: forwards the authorize URL as soon as it appears, and
@@ -136,23 +142,30 @@ impl LoginBroker {
                     .lines()
                     .map_while(std::result::Result::ok)
                 {
+                    // Append BEFORE announcing the URL. `start()` returns as soon
+                    // as it receives the URL, and `submit_code` marks the output
+                    // length it has already seen; announcing first lets this line
+                    // land after that mark, where it reads as the CLI answering
+                    // the code (CLAUDE-267).
+                    append(&output, &line);
                     if !sent {
                         if let Some(url) = extract_url(&line) {
                             sent = url_tx.send(url).is_ok();
                         }
                     }
-                    append(&output, &line);
                 }
             });
         }
         // stderr reader: this is where `Invalid code` and any real failure land.
         {
             let output = Arc::clone(&output);
+            let errors = Arc::clone(&errors);
             std::thread::spawn(move || {
                 for line in BufReader::new(stderr)
                     .lines()
                     .map_while(std::result::Result::ok)
                 {
+                    append(&errors, &line);
                     append(&output, &line);
                 }
             });
@@ -178,6 +191,7 @@ impl LoginBroker {
             url: url.clone(),
             started: Instant::now(),
             output,
+            errors,
         });
         Ok(url)
     }
@@ -195,8 +209,10 @@ impl LoginBroker {
             ));
         };
 
+        // Mark stderr, not the combined buffer: only the CLI's own error output
+        // answers a submitted code (CLAUDE-267).
         let mark = pending
-            .output
+            .errors
             .lock()
             .map(|o| o.len())
             .map_err(|e| Error::Secret(format!("login output lock poisoned: {e}")))?;
@@ -239,11 +255,29 @@ impl LoginBroker {
                 }
             }
             let fresh = pending
-                .output
+                .errors
                 .lock()
                 .map(|o| o[mark.min(o.len())..].trim().to_string())
                 .unwrap_or_default();
             if !fresh.is_empty() {
+                // An exit outranks late output: closing the pipes flushes the
+                // unterminated prompt as one last line, and reporting that as a
+                // refusal would fail a login that actually succeeded
+                // (CLAUDE-267). Re-check before believing the text.
+                if let Ok(Some(status)) = pending.child.try_wait() {
+                    let seen = pending.output.lock().map(|o| o.clone()).unwrap_or_default();
+                    let _ = pending.child.wait();
+                    *slot = None;
+                    return if status.success() {
+                        Ok(CodeOutcome::LoggedIn)
+                    } else {
+                        Err(Error::Secret(format!(
+                            "`claude auth login` exited {}: {}",
+                            status.code().unwrap_or(-1),
+                            tail(&seen)
+                        )))
+                    };
+                }
                 // The CLI said something without exiting: a refused code. Hand
                 // its own wording back and keep the session for another try.
                 return Ok(CodeOutcome::Retry(tail(&fresh)));
@@ -408,6 +442,74 @@ mod tests {
         let broker = LoginBroker::new();
         let err = broker.submit_code("whatever").unwrap_err();
         assert!(err.to_string().contains("start one first"), "{err}");
+    }
+
+    /// CLAUDE-267: banner lines the child prints after its authorize URL are not
+    /// the CLI answering a code, and must never be reported as a refusal.
+    ///
+    /// The stub emits the URL, then a slow trickle of further banner lines, so
+    /// they are guaranteed to be in flight when the code is submitted. Before
+    /// the fix `start()` announced the URL before appending it, and the poll
+    /// loop read whichever line arrived after its mark, so a correct code came
+    /// back as `Retry` carrying banner text.
+    #[test]
+    fn banner_lines_after_the_url_are_not_a_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = tmp.path().join("chatty");
+        write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             echo \"If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&state=s\"\n\
+             i=0\n\
+             while [ $i -lt 5 ]; do echo \"still working on it $i\"; sleep 0.1; i=$((i+1)); done\n\
+             printf 'Paste code here if prompted > '\n\
+             read code\n\
+             if [ \"$code\" = \"good-code\" ]; then exit 0; fi\n\
+             echo 'Invalid code. Please make sure the full code was copied.' >&2\n\
+             sleep 30\n",
+        );
+
+        let broker = LoginBroker::new();
+        let dir = tmp.path().to_path_buf();
+        broker.start(stub.to_str().unwrap(), &dir).unwrap();
+        assert_eq!(
+            broker.submit_code("good-code").unwrap(),
+            CodeOutcome::LoggedIn,
+            "banner output after the URL must not read as a refused code"
+        );
+        assert!(broker.view().is_none(), "a completed login holds nothing");
+    }
+
+    /// The refusal path still reports the CLI's own wording, so fixing
+    /// CLAUDE-267 did not turn every refusal into a success.
+    #[test]
+    fn a_refused_code_still_reports_the_clis_wording() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = tmp.path().join("refuser");
+        write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             echo \"If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&state=s\"\n\
+             read code\n\
+             echo 'Invalid code. Please make sure the full code was copied.' >&2\n\
+             sleep 30\n",
+        );
+
+        let broker = LoginBroker::new();
+        let dir = tmp.path().to_path_buf();
+        broker.start(stub.to_str().unwrap(), &dir).unwrap();
+        match broker.submit_code("wrong").unwrap() {
+            CodeOutcome::Retry(msg) => {
+                assert!(msg.contains("Invalid code"), "{msg}");
+                assert!(
+                    !msg.contains("oauth/authorize"),
+                    "the banner is not the refusal reason: {msg}"
+                );
+            }
+            other => panic!("expected a retry, got {other:?}"),
+        }
+        assert!(broker.view().is_some(), "a refused code keeps the session");
+        broker.cancel();
     }
 
     /// A child that never prints a URL is killed and reported, not left running.
