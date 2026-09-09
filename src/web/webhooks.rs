@@ -767,6 +767,11 @@ async fn finish_webhook_run(
         job_key,
         attempt: 1,
         ok,
+        // DEV-707: the triage classification this run performed DID spend, and
+        // its tokens / cost land in `logs/usage.jsonl` under this action name.
+        // Carrying that cost onto this row (and into the daily ledger) needs
+        // `FailureClassifier::classify` to return it, which is tracked in
+        // DEV-726.
         claude_ran: false,
         claude_ok: false,
         claude_cost_usd: 0.0,

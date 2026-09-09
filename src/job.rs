@@ -41,6 +41,8 @@ pub struct RunnerDefaults {
     pub max_runs_per_day: u32,
     pub claude_timeout_seconds: u32,
     pub daily_budget_usd: f64,
+    /// DEV-705: fraction of the per-run budget at which a run warns once.
+    pub budget_warn_fraction: f64,
     /// CLAUDE-234: issues one run may create when the action sets no override.
     pub max_issues_per_run: u32,
 }
@@ -52,6 +54,7 @@ impl Default for RunnerDefaults {
             max_runs_per_day: 20,
             claude_timeout_seconds: 600,
             daily_budget_usd: 5.00,
+            budget_warn_fraction: crate::usage::DEFAULT_WARN_FRACTION,
             max_issues_per_run: crate::provider::DEFAULT_MAX_ISSUES_PER_RUN,
         }
     }
@@ -63,13 +66,26 @@ pub struct EffectiveLimits {
     pub max_runs_per_day: u32,
     pub claude_timeout: Duration,
     pub daily_budget_usd: f64,
+    /// DEV-705: this run's spend ceiling, resolved BEFORE the run starts.
+    /// `EffectiveLimits` is `Copy` and is moved into each per-job task by value,
+    /// so no job can raise the ceiling it runs under.
+    pub run_budget_usd: f64,
+    pub budget_warn_fraction: f64,
     /// CLAUDE-234: this run's issue-creation ceiling, enforced at the provider
     /// boundary by [`crate::provider::AuditedTracker`].
     pub max_issues_per_run: u32,
 }
 
+impl EffectiveLimits {
+    /// DEV-705: the frozen ceiling this run bills against.
+    pub fn run_budget(&self) -> crate::usage::RunBudget {
+        crate::usage::RunBudget::new(self.run_budget_usd, self.budget_warn_fraction)
+    }
+}
+
 pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> EffectiveLimits {
     let l = &action.action.limits;
+    let daily_budget_usd = l.daily_budget_usd.unwrap_or(defaults.daily_budget_usd);
     EffectiveLimits {
         max_attempts_per_key: l
             .max_attempts_per_key
@@ -79,7 +95,14 @@ pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> Eff
             l.claude_timeout_seconds
                 .unwrap_or(defaults.claude_timeout_seconds) as u64,
         ),
-        daily_budget_usd: l.daily_budget_usd.unwrap_or(defaults.daily_budget_usd),
+        daily_budget_usd,
+        // DEV-705: an action that sets no per-run ceiling gets its own daily
+        // budget as one, so a single run can never spend more than the day
+        // allows and no shipped action changes behavior.
+        run_budget_usd: l.run_budget_usd.unwrap_or(daily_budget_usd),
+        budget_warn_fraction: l
+            .budget_warn_fraction
+            .unwrap_or(defaults.budget_warn_fraction),
         max_issues_per_run: l.max_issues_per_run.unwrap_or(defaults.max_issues_per_run),
     }
 }
@@ -136,6 +159,9 @@ pub struct JobContext<'a> {
     /// still stops it before it spends a `claude --print` call. The job's
     /// attempt is not counted, exactly as on the cancel path.
     pub pause: crate::pause::RunPause,
+    /// DEV-705 / DEV-707: the run's shared spend ledger. The invocation below
+    /// is capped at what the run has left, and its usage is billed here.
+    pub spend: crate::usage::RunSpend,
 }
 
 /// Compute the job key for a job. If `dedup_key` is set on the action, look
@@ -378,7 +404,13 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                     &workdir_path,
                     &stream_log,
                     &ctx.cancel,
+                    // DEV-705: cap the child at what the run has left, so one
+                    // session cannot overshoot the ceiling between checks.
+                    Some(ctx.spend.remaining_usd()),
                 )?;
+                // DEV-707: bill the run before any branch discards `r`, so a
+                // cancelled invocation still reports what it spent.
+                ctx.spend.record(&r);
                 if ctx.cancel.is_cancelled() {
                     // The token tripped mid-run; `invoke` already terminated the
                     // claude child. Synthesize a cancelled result so post runs
@@ -702,6 +734,36 @@ mod tests {
             None,
             "an unparseable action is left to the caller's default: {caps:?}"
         );
+    }
+
+    /// DEV-705: the per-run ceiling defaults to the action's OWN daily budget,
+    /// so adding it loosens nothing and breaks no shipped action; an explicit
+    /// value wins, and the warn fraction defaults to 80 percent.
+    #[test]
+    fn run_budget_defaults_to_the_effective_daily_budget() {
+        let load = |body: &str| crate::action::validate_str(body, "<test>").unwrap();
+        let defaults = RunnerDefaults::default();
+
+        let inherits = load(
+            "name: a\ninput:\n  command: 'x'\nprompt: 'y'\nlimits:\n  daily_budget_usd: 150.0\n",
+        );
+        let l = effective_limits(&defaults, &inherits);
+        assert_eq!(l.daily_budget_usd, 150.0);
+        assert_eq!(l.run_budget_usd, 150.0, "unset inherits the daily budget");
+        assert_eq!(l.budget_warn_fraction, crate::usage::DEFAULT_WARN_FRACTION);
+
+        let pinned = load("name: a\ninput:\n  command: 'x'\nprompt: 'y'\nlimits:\n  daily_budget_usd: 150.0\n  run_budget_usd: 8.5\n  budget_warn_fraction: 0.5\n");
+        let l = effective_limits(&defaults, &pinned);
+        assert_eq!(l.run_budget_usd, 8.5, "the action's own ceiling wins");
+        assert_eq!(l.budget_warn_fraction, 0.5);
+        let budget = l.run_budget();
+        assert_eq!(budget.budget_usd, 8.5);
+        assert_eq!(budget.warn_at_usd(), 4.25);
+
+        // Neither set: the runner defaults, and the two budgets agree.
+        let bare = load("name: a\ninput:\n  command: 'x'\nprompt: 'y'\n");
+        let l = effective_limits(&defaults, &bare);
+        assert_eq!(l.run_budget_usd, defaults.daily_budget_usd);
     }
 
     fn mk_action(dedup_key: Option<String>) -> LoadedAction {
