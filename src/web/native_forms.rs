@@ -697,6 +697,7 @@ pub struct CiFailureReconcileForm {
     pub max_branch_resolves: String,
     pub close_duplicates: bool,
     pub duplicate_comment: String,
+    pub default_branch: String,
 }
 
 impl CiFailureReconcileForm {
@@ -717,6 +718,7 @@ impl CiFailureReconcileForm {
             max_branch_resolves: d.max_branch_resolves.to_string(),
             close_duplicates: d.close_duplicates,
             duplicate_comment: d.duplicate_comment,
+            default_branch: d.default_branch,
         }
     }
 
@@ -733,6 +735,7 @@ impl CiFailureReconcileForm {
             max_branch_resolves: p.get("max_branch_resolves"),
             close_duplicates: p.checked("close_duplicates"),
             duplicate_comment: p.get("duplicate_comment"),
+            default_branch: p.get("default_branch"),
         }
     }
 }
@@ -755,6 +758,7 @@ pub fn action_to_ci_failure_reconcile_form(a: &Action) -> Option<CiFailureReconc
         max_branch_resolves: c.max_branch_resolves.to_string(),
         close_duplicates: c.close_duplicates,
         duplicate_comment: c.duplicate_comment.clone(),
+        default_branch: c.default_branch.clone(),
     })
 }
 
@@ -790,6 +794,7 @@ pub fn ci_failure_reconcile_form_to_yaml(
         )?,
         close_duplicates: form.close_duplicates,
         duplicate_comment: or_default(&form.duplicate_comment, d.duplicate_comment),
+        default_branch: or_default(&form.default_branch, d.default_branch),
     };
     map.insert(Value::from("kind"), Value::from("ci-failure-reconcile"));
     map.insert(Value::from("native"), native_value(&native)?);

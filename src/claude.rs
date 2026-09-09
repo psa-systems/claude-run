@@ -743,7 +743,15 @@ fn read_tail(p: &Path, max: usize) -> std::io::Result<String> {
     if raw.len() <= max {
         Ok(raw)
     } else {
-        Ok(raw[raw.len() - max..].to_string())
+        // CLAUDE-263: `raw.len() - max` can land inside a multi-byte UTF-8
+        // character; advance to the next char boundary so the slice never
+        // panics. The tail then comes back up to three bytes shorter than
+        // `max`, which is the cost of staying inside `max` bytes.
+        let mut start = raw.len() - max;
+        while !raw.is_char_boundary(start) {
+            start += 1;
+        }
+        Ok(raw[start..].to_string())
     }
 }
 
@@ -1710,6 +1718,26 @@ exit "$code"
             friendly_failure_summary(&final_event, &log),
             "{\"type\":\"system\",\"subtype\":\"init\"}\n"
         );
+    }
+
+    /// CLAUDE-263: the tail fallback used to slice the raw log at a fixed byte
+    /// offset from the end, which panics when that offset lands inside a
+    /// multi-byte character. This log is over the 2000-byte cap with a euro
+    /// sign (3 bytes) straddling the cut point, so a fix that just clamped
+    /// the index instead of walking to a char boundary would still panic.
+    #[test]
+    fn friendly_summary_tail_cut_inside_multibyte_char_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        // Length 2003: the cut at len - 2000 = byte 3 falls inside the euro
+        // sign, which occupies bytes 1..4.
+        let raw = format!("a€{}", "a".repeat(1999));
+        assert_eq!(raw.len(), 2003);
+        std::fs::write(&log, &raw).unwrap();
+        // CLAUDE-107: no result event, so the caller falls back to `Value::Null`.
+        let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
+        let summary = friendly_failure_summary(&final_event, &log);
+        assert_eq!(summary, "a".repeat(1999));
     }
 
     /// CLAUDE-56: a non-zero exit whose stream ends with a `result` event makes
