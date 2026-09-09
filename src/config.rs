@@ -68,6 +68,12 @@ impl Paths {
     pub fn workdirs_dir(&self) -> PathBuf {
         self.data_dir.join("workdirs")
     }
+
+    /// DEV-707: the newline-delimited per-run usage record, one line per run,
+    /// so runs are comparable over time without a provider console.
+    pub fn usage_log(&self) -> PathBuf {
+        self.logs_dir().join("usage.jsonl")
+    }
 }
 
 fn resolve_dir(env_var: &str, xdg_default: Option<PathBuf>, subdir: &str) -> Result<PathBuf> {
@@ -715,6 +721,13 @@ pub struct ClaudeConfig {
     /// the set is advisory, so a level Anthropic adds later works with no runner
     /// release.
     pub effort: Option<String>,
+    /// DEV-706: instance-wide default compaction window, passed through to
+    /// `--autocompact` untouched (`auto`, or 100k-1M tokens). An action's own
+    /// `claude.autocompact` wins over it; when neither is set the runner passes
+    /// [`crate::claude::DEFAULT_AUTOCOMPACT`], because the CLI's own `auto`
+    /// scales to the whole context window and so lets a tool-heavy session
+    /// resend every completed operation's payloads on every turn.
+    pub autocompact: Option<String>,
 }
 
 /// CLAUDE-239: live handle to the global [`ClaudeConfig`], shared between

@@ -2326,6 +2326,12 @@ pub struct ClaudeBlock {
     /// Anthropic adds later must parse here without a runner release. The runner
     /// warns about a value outside the documented set but never rejects it.
     pub effort: Option<String>,
+    /// DEV-706: compaction window this action pins, passed through to
+    /// `--autocompact` untouched (`auto`, or 100k-1M tokens). Unset falls back
+    /// to the global `config.claude.autocompact`, then to
+    /// [`crate::claude::DEFAULT_AUTOCOMPACT`]. A bounded window is what stops a
+    /// completed operation's tool payloads being resent on every later turn.
+    pub autocompact: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2341,6 +2347,17 @@ pub struct Limits {
     pub max_runs_per_day: Option<u32>,
     pub claude_timeout_seconds: Option<u32>,
     pub daily_budget_usd: Option<f64>,
+    /// DEV-705: dollars ONE run may spend. `daily_budget_usd` bounds a whole
+    /// day across runs; this bounds a single firing, so one runaway run cannot
+    /// eat the day. Read once before the run starts and never re-read, so it
+    /// cannot be raised mid-run: raising it means editing this file and
+    /// starting a new run. Unset falls back to the effective
+    /// `daily_budget_usd`, which is why adding the ceiling loosens nothing.
+    pub run_budget_usd: Option<f64>,
+    /// DEV-705: fraction of `run_budget_usd` at which the run warns once.
+    /// Unset (and any value outside `(0, 1]`) is
+    /// [`crate::usage::DEFAULT_WARN_FRACTION`], 80 percent.
+    pub budget_warn_fraction: Option<f64>,
     /// CLAUDE-234: issues ONE run may create in the tracker. `max_runs_per_day`
     /// bounds how often an action fires; this bounds what a single firing can
     /// author, so a misfiring run opens a handful of issues rather than a
