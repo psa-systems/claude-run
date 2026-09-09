@@ -3781,6 +3781,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "size ceiling for each logs/<action>/<output.file>; bounded by size, never deleted by age, because it is an operator-configured sink. 0 = unbounded.",
             },
             FieldDoc {
+                name: "usage_log_max_bytes",
+                badge: "next sweep",
+                note: "size ceiling for logs/usage.jsonl, the per-run token and cost record; past it the file rolls to usage.jsonl.1 and keeps its newest whole records. 0 = unbounded.",
+            },
+            FieldDoc {
                 name: "snippet_retention_days",
                 badge: "next sweep",
                 note: "age past which snippets/<action>/<job_key>/ is deleted; a job still in flight keeps its snippet directory at any age.",
