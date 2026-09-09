@@ -545,12 +545,23 @@ A single flat config record (no sub-records). The mint path only ever observes C
 / "Auto-fix" issue is closed by hand today; this handler closes it automatically once its failing job is green again. On
 each run it scans the tracker for open issues whose summary starts with one of `summary_prefixes`, inspects each and reads
 the hidden `Branch:` / `Job:` markers the CLAUDE-190 rekey embeds (plus the `## Failure` block's `- Repo:` / `- Workflow:`
-/ `- Run:`); a pre-rekey issue whose branch/job are not parseable is skipped and left for manual close. Then for each
-allow-listed repo it pages the Forgejo runs list, reduces it to the LATEST run per `(branch, workflow_id)` (resolving a
-a branch the runs list does not carry as a plain name from the run's log environment dump, bounded by
-`max_branch_resolves`), and reads each latest run's
-per-job status from the jobs endpoint. Every open issue whose `(repo, branch, workflow, job)` exactly matches a now-green
-job (job status `success`) is closed: State set to `resolved_state` and a run-linked comment posted. The dedup key is the
+/ `- Run:`); a pre-rekey issue whose branch/job are not parseable is skipped and left for manual close. It also parses the
+issue's own run index from the `- Run:` URL suffix and its hidden `Infra-Kind:` marker (CLAUDE-264, present only on an
+infra/external failure); an issue whose run index cannot be parsed is skipped and left for manual close rather than
+closed on an unverifiable comparison. Then for each allow-listed repo it pages the Forgejo runs list, reduces it to the
+LATEST run per `(branch, workflow_id)` (resolving a branch the runs list does not carry as a plain name from the run's
+log environment dump, bounded by `max_branch_resolves`), and reads each latest run's per-job status from the jobs
+endpoint.
+
+**Close scope (CLAUDE-265).** The close no longer keys on the branch the failure happened to occur on: a branch that was
+merged or deleted can never produce another run, so an issue keyed on it stayed open forever. Instead the scope is
+`(repo, workflow_id, job_name)`, and which branch's green counts depends on whether the issue is infra-keyed. A code issue
+(no `Infra-Kind:` marker) closes only when the now-green job's branch equals the configured `default_branch`: the default
+branch is the authority on whether the code itself is fixed. An infra issue (carrying the `Infra-Kind:` marker) closes on
+a now-green job on ANY branch, since a host condition (a full disk, an unreachable registry) is not a property of a
+branch. Both rules additionally require the green run to be STRICTLY NEWER than the run the issue itself recorded
+(`green.run_index > issue_run_index`), so a freshly minted issue is never closed by the default branch's ordinary
+steady-state green. Once matched: State set to `resolved_state` and a run-linked comment posted. The dedup key is the
 issue id.
 
 **Duplicate collapse (CLAUDE-198).** Mint's cross-run collapse is a tracker full-text search on the hidden
@@ -563,9 +574,9 @@ issue with no `Root-Cause-Key:` marker (pre-rekey) is never grouped and never cl
 `close_duplicates: false` to leave duplicates open.
 
 **Only the LATEST run decides.** A newer failure after an older green run leaves the job red and the issue open. Matching
-is exact on all four of `(repo, branch, workflow, job)`, so a green sibling branch or job never closes a still-broken
-issue. The close is idempotent: an already-closed issue (its resolved State drops it from `#Unresolved`, and a hidden
-auto-closed comment marker) is never re-closed or re-commented. **Selection is by summary prefix + markers ONLY; it NEVER
+is exact on `(repo, workflow, job)`, so a green sibling job never closes a still-broken issue. The close is idempotent: an
+already-closed issue (its resolved State drops it from `#Unresolved`, and a hidden auto-closed comment marker) is never
+re-closed or re-commented. **Selection is by summary prefix + markers ONLY; it NEVER
 selects by `AI Agent`** (reconcile is independent of the code-fix runner), so `query` must not filter on `AI Agent`. The
 reconciler performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. Log and per-job status
 reads shell out to `fj actions logs` and the runs list to `fj actions runs` (CLAUDE-205). Both go through `forge_log`
@@ -591,6 +602,7 @@ native:
   max_branch_resolves: 40             # cap on per-repo branch-from-log resolutions
   close_duplicates: true              # collapse issues sharing a Root-Cause-Key onto the oldest
   duplicate_comment: "Auto-closed as a duplicate of {canonical}: both issues track the same failing job (root-cause key `{root_cause_key}`). Follow {canonical} for the fix."
+  default_branch: main                # the branch a code issue's close scope is measured against
 ```
 
 | Key                   | Default                        | Meaning                                                                                 |
@@ -605,6 +617,7 @@ native:
 | `max_branch_resolves` | `40`                           | Cap on per-repo branch-from-log resolutions for runs whose branch the runs list does not carry as a plain name (`fj`'s `head_branch` is Forgejo's `prettyref`: `#<pr-number>` on a PR run, the bare sha on a ref-deleted push). Reaching it is logged, never silent. |
 | `close_duplicates`    | `true`                         | Collapse open issues sharing a `(repo, Root-Cause-Key:)` onto the oldest and close the rest as duplicates, before any Forgejo read (CLAUDE-198). |
 | `duplicate_comment`   | (the duplicate sentence)       | Duplicate close-comment template; `{canonical}` (the surviving issue id) and `{root_cause_key}` are substituted, and the same hidden auto-closed marker is appended. |
+| `default_branch`      | `main`                         | The branch a code (non-`Infra-Kind:`) issue's close scope is measured against (CLAUDE-265): such an issue closes only when its `(repo, workflow_id, job_name)` is green on THIS branch. An infra issue ignores this and closes on any branch. |
 
 `repos` and `resolved_state` are the distinctive keys that disambiguate this variant from the other native configs under
 the untagged `native:` block, so a shipped action must set at least one of them (the shipped `ci-failure-reconcile.yml`
