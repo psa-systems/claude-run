@@ -3780,6 +3780,16 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 badge: "next sweep",
                 note: "size ceiling for each logs/<action>/<output.file>; bounded by size, never deleted by age, because it is an operator-configured sink. 0 = unbounded.",
             },
+            FieldDoc {
+                name: "snippet_retention_days",
+                badge: "next sweep",
+                note: "age past which snippets/<action>/<job_key>/ is deleted; a job still in flight keeps its snippet directory at any age.",
+            },
+            FieldDoc {
+                name: "webhook_log_retention_days",
+                badge: "next sweep",
+                note: "age past which a file directly under webhook-logs/ is deleted; the reused webhook-logs/triage/ working directory is never swept.",
+            },
         ],
         Preferences => vec![
             FieldDoc {
@@ -7914,6 +7924,50 @@ mod tests {
             let applied = s.api.settings.stream_log_gc_handle().read().await.clone();
             assert_eq!(applied.daemon_log_max_bytes, 4096);
             assert_eq!(applied.output_file_max_bytes, 8192);
+        }
+
+        /// CLAUDE-262: the two new retention windows (`snippets/` and
+        /// `webhook-logs/`) render on `/settings` in the same `Stream log GC`
+        /// card and round-trip through a save on the handle the daemon's sweep
+        /// loop reads.
+        #[tokio::test]
+        async fn settings_page_renders_and_saves_the_snippet_and_webhook_log_windows() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            let page = settings_page(
+                State(s.clone()),
+                Query(crate::web::SettingsQuery { saved: None }),
+            )
+            .await
+            .unwrap();
+            let body = axum::body::to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = String::from_utf8_lossy(&body);
+            assert!(
+                html.contains("snippet_retention_days"),
+                "the snippets/ window has a field reference"
+            );
+            assert!(
+                html.contains("webhook_log_retention_days"),
+                "the webhook-logs/ window has a field reference"
+            );
+
+            let saved = settings_save(
+                State(s.clone()),
+                AxumPath("stream_log_gc".to_string()),
+                Form(SettingsForm {
+                    json: r#"{"enabled":true,"retention_days":30,"daemon_log_max_bytes":0,"output_file_max_bytes":0,"snippet_retention_days":7,"webhook_log_retention_days":14}"#
+                        .to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+            let applied = s.api.settings.stream_log_gc_handle().read().await.clone();
+            assert_eq!(applied.snippet_retention_days, 7);
+            assert_eq!(applied.webhook_log_retention_days, 14);
         }
 
         /// CLAUDE-220: the `Comment webhook` section renders on `/settings` and a

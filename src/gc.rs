@@ -1,8 +1,10 @@
 //! GC sweepers for the unbounded on-disk trees: preserved and aside workdirs
 //! ([`sweep`], CLAUDE-106), per-attempt stream logs ([`sweep_stream_logs`],
-//! CLAUDE-245), and the two size-bounded files under `logs/`
-//! ([`sweep_oversized_logs`], CLAUDE-257). All are scheduled by the daemon on
-//! the same tick and read their own DB-backed retention window.
+//! CLAUDE-245), the two size-bounded files under `logs/`
+//! ([`sweep_oversized_logs`], CLAUDE-257), per-job snippet directories
+//! ([`sweep_snippets`], CLAUDE-262), and redacted webhook CI logs
+//! ([`sweep_webhook_logs`], CLAUDE-262). All are scheduled by the daemon on the
+//! same tick and read their own DB-backed retention window.
 //!
 //! The YouTrack runner intentionally keeps some workdirs rather than deleting
 //! them: [`crate::native::youtrack`] preserves a directory that holds unpushed
@@ -254,6 +256,166 @@ fn stream_log_key(file_name: &str) -> Option<String> {
         return None;
     }
     Some(key.to_string())
+}
+
+/// CLAUDE-262: walk `<state_dir>/snippets/<action>/<job_key>/` and delete every
+/// snippet directory older than `cfg.snippet_retention_days`, keeping one whose
+/// job is still in flight regardless of age.
+///
+/// The shape is the per-source/per-key walk [`sweep`] already does for
+/// workdirs, but with the stream-log sweep's in-flight guard rather than the
+/// unpushed-commit one: a snippet directory holds no git history to preserve,
+/// only the rendered scripts and JSON bindings of one job's `filter` / `pre` /
+/// `prompt` / `post` steps (`binding-job.json` carries the whole job payload,
+/// so the per-job cost is not negligible). `in_flight` is the same
+/// `(action, job_key)` set [`sweep_stream_logs`] reads from `run_inflight_jobs`
+/// joined to runs that have not ended; a failed read of that set must skip this
+/// sweep too; sweeping with an empty set would delete a live run's own
+/// snippet directory the moment its age crosses the window.
+///
+/// `now` is injected the same way [`sweep`] and [`sweep_stream_logs`] inject
+/// it. Per-entry filesystem errors are logged and skipped; the pass never
+/// aborts for one bad directory.
+pub fn sweep_snippets(
+    base: &Path,
+    cfg: &StreamLogGcConfig,
+    now: SystemTime,
+    in_flight: &HashSet<(String, String)>,
+) -> SweepStats {
+    let mut stats = SweepStats::default();
+    if !cfg.enabled {
+        return stats;
+    }
+    let retention = Duration::from_secs(cfg.snippet_retention_days.saturating_mul(SECS_PER_DAY));
+
+    let actions = match std::fs::read_dir(base) {
+        Ok(r) => r,
+        // Missing base dir (no scripted step has ever run) is a clean no-op,
+        // exactly as `sweep` treats a missing workdir base.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return stats,
+        Err(e) => {
+            warn!(path = %base.display(), error = %e, "snippet GC: cannot read the snippets dir; nothing was swept this pass");
+            return stats;
+        }
+    };
+    for action in actions.flatten() {
+        let action_path = action.path();
+        if !action_path.is_dir() {
+            continue;
+        }
+        let action_name = action.file_name().to_string_lossy().into_owned();
+        let keys = match std::fs::read_dir(&action_path) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(path = %action_path.display(), error = %e, "snippet GC: cannot read action dir; skipping");
+                continue;
+            }
+        };
+        for key in keys.flatten() {
+            let path = key.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let key_name = key.file_name().to_string_lossy().into_owned();
+            if in_flight.contains(&(action_name.clone(), key_name.clone())) {
+                debug!(
+                    action = %action_name,
+                    key = %key_name,
+                    path = %path.display(),
+                    "snippet GC: kept; the job is still in flight"
+                );
+                stats.kept += 1;
+                continue;
+            }
+            let age = dir_age(&path, now);
+            if age < retention {
+                stats.kept += 1;
+                continue;
+            }
+            let bytes = dir_size(&path);
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    debug!(
+                        action = %action_name,
+                        key = %key_name,
+                        path = %path.display(),
+                        age = %humantime::format_duration(whole_secs(age)),
+                        bytes_reclaimed = bytes,
+                        "snippet GC: deleted a snippet directory older than the retention window"
+                    );
+                    stats.deleted += 1;
+                    stats.bytes_reclaimed += bytes;
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "snippet GC: delete failed (continuing)");
+                    stats.kept += 1;
+                }
+            }
+        }
+    }
+    stats
+}
+
+/// CLAUDE-262: walk the files directly under `<state_dir>/webhook-logs/` and
+/// delete every one older than `cfg.webhook_log_retention_days`.
+///
+/// Only files DIRECTLY under `webhook-logs/` are considered: `write_artifact`
+/// ([`crate::forge_log`]) is the only writer that puts one there, one per
+/// triaged CI run. `webhook-logs/triage/` is a subdirectory, not a file, so the
+/// walk skips it: it is the mint classifier's reused working directory
+/// ([`crate::daemon::build_mint_context`]), not a per-run artifact, and ageing
+/// it out from under an in-progress triage would break that triage rather than
+/// reclaim anything meaningful.
+///
+/// `now` is injected the same way the other sweeps in this module inject it.
+/// Per-entry filesystem errors are logged and skipped; the pass never aborts
+/// for one bad file.
+pub fn sweep_webhook_logs(dir: &Path, cfg: &StreamLogGcConfig, now: SystemTime) -> SweepStats {
+    let mut stats = SweepStats::default();
+    if !cfg.enabled {
+        return stats;
+    }
+    let retention =
+        Duration::from_secs(cfg.webhook_log_retention_days.saturating_mul(SECS_PER_DAY));
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        // Missing dir (no webhook run has ever been triaged) is a clean no-op.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return stats,
+        Err(e) => {
+            warn!(path = %dir.display(), error = %e, "webhook-log GC: cannot read the webhook-logs dir; nothing was swept this pass");
+            return stats;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let age = dir_age(&path, now);
+        if age < retention {
+            stats.kept += 1;
+            continue;
+        }
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                debug!(
+                    path = %path.display(),
+                    age = %humantime::format_duration(whole_secs(age)),
+                    bytes_reclaimed = bytes,
+                    "webhook-log GC: deleted a webhook log older than the retention window"
+                );
+                stats.deleted += 1;
+                stats.bytes_reclaimed += bytes;
+            }
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "webhook-log GC: delete failed (continuing)");
+                stats.kept += 1;
+            }
+        }
+    }
+    stats
 }
 
 /// Tally of one [`sweep_oversized_logs`] pass.
@@ -577,6 +739,8 @@ mod tests {
             // one axis they are about.
             daemon_log_max_bytes: 0,
             output_file_max_bytes: 0,
+            snippet_retention_days: 30,
+            webhook_log_retention_days: 30,
         }
     }
 
@@ -724,6 +888,165 @@ mod tests {
         assert_eq!(stats, SweepStats::default());
     }
 
+    // ---- CLAUDE-262: snippet directories ------------------------------------
+
+    /// Create `<base>/<action>/<key>/` with one file of `bytes` bytes inside,
+    /// mirroring what [`crate::snippet::snippet_dir_for`] plus
+    /// [`crate::snippet::SnippetRunner::run`] write for a job.
+    fn make_snippet_dir(base: &Path, action: &str, key: &str, bytes: usize) -> std::path::PathBuf {
+        let dir = base.join(action).join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("binding-job.json"), vec![b'x'; bytes]).unwrap();
+        dir
+    }
+
+    #[test]
+    fn stale_snippet_dir_is_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_snippet_dir(tmp.path(), "youtrack", "CLAUDE-1", 100);
+        let stats = sweep_snippets(
+            tmp.path(),
+            &log_cfg(true),
+            SystemTime::now() + days(60),
+            &in_flight(&[]),
+        );
+        assert!(
+            !dir.exists(),
+            "a snippet directory past the window must be deleted"
+        );
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.kept, 0);
+        assert!(stats.bytes_reclaimed >= 100);
+    }
+
+    #[test]
+    fn fresh_snippet_dir_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_snippet_dir(tmp.path(), "youtrack", "CLAUDE-2", 10);
+        let stats = sweep_snippets(
+            tmp.path(),
+            &log_cfg(true),
+            SystemTime::now(),
+            &in_flight(&[]),
+        );
+        assert!(dir.exists(), "a fresh snippet directory must be kept");
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.kept, 1);
+    }
+
+    /// AC: a job still in flight keeps its snippet directory no matter how far
+    /// past the window its mtime sits, the same guarantee
+    /// [`in_flight_stream_log_is_kept_regardless_of_age`] proves for stream logs.
+    #[test]
+    fn in_flight_snippet_dir_is_kept_regardless_of_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = make_snippet_dir(tmp.path(), "youtrack", "CLAUDE-3", 10);
+        let done = make_snippet_dir(tmp.path(), "youtrack", "CLAUDE-4", 10);
+        let stats = sweep_snippets(
+            tmp.path(),
+            &log_cfg(true),
+            SystemTime::now() + days(365),
+            &in_flight(&[("youtrack", "CLAUDE-3")]),
+        );
+        assert!(
+            live.exists(),
+            "an in-flight job's snippet directory must never be deleted"
+        );
+        assert!(
+            !done.exists(),
+            "a finished job's aged snippet directory is still swept"
+        );
+        assert_eq!(stats.kept, 1);
+        assert_eq!(stats.deleted, 1);
+    }
+
+    #[test]
+    fn disabled_snippet_sweep_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_snippet_dir(tmp.path(), "youtrack", "CLAUDE-5", 10);
+        let stats = sweep_snippets(
+            tmp.path(),
+            &log_cfg(false),
+            SystemTime::now() + days(365),
+            &in_flight(&[]),
+        );
+        assert!(dir.exists(), "a disabled sweep must not delete");
+        assert_eq!(stats, SweepStats::default());
+    }
+
+    #[test]
+    fn missing_snippets_dir_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("does-not-exist");
+        let stats = sweep_snippets(&base, &log_cfg(true), SystemTime::now(), &in_flight(&[]));
+        assert_eq!(stats, SweepStats::default());
+    }
+
+    // ---- CLAUDE-262: webhook-logs/ -------------------------------------------
+
+    fn make_webhook_log(dir: &Path, name: &str, bytes: usize) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, vec![b'x'; bytes]).unwrap();
+        path
+    }
+
+    #[test]
+    fn stale_webhook_log_is_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = make_webhook_log(tmp.path(), "org_repo-run1-all-jobs.log", 42);
+        let stats = sweep_webhook_logs(tmp.path(), &log_cfg(true), SystemTime::now() + days(60));
+        assert!(
+            !log.exists(),
+            "a webhook log past the window must be deleted"
+        );
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.bytes_reclaimed, 42);
+    }
+
+    #[test]
+    fn fresh_webhook_log_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = make_webhook_log(tmp.path(), "org_repo-run2-all-jobs.log", 10);
+        let stats = sweep_webhook_logs(tmp.path(), &log_cfg(true), SystemTime::now());
+        assert!(log.exists(), "a webhook log inside the window must be kept");
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.kept, 1);
+    }
+
+    /// AC: `webhook-logs/triage/` is the mint classifier's reused working
+    /// directory, not a per-run artifact, so this sweep must never descend into
+    /// it or delete it.
+    #[test]
+    fn triage_subdirectory_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let triage = tmp.path().join("triage");
+        make_webhook_log(&triage, "triage-stream.jsonl", 10);
+        let stats = sweep_webhook_logs(tmp.path(), &log_cfg(true), SystemTime::now() + days(365));
+        assert!(
+            triage.exists(),
+            "the triage working directory must never be swept"
+        );
+        assert_eq!(stats, SweepStats::default());
+    }
+
+    #[test]
+    fn disabled_webhook_log_sweep_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = make_webhook_log(tmp.path(), "org_repo-run3-all-jobs.log", 10);
+        let stats = sweep_webhook_logs(tmp.path(), &log_cfg(false), SystemTime::now() + days(365));
+        assert!(log.exists(), "a disabled sweep must not delete");
+        assert_eq!(stats, SweepStats::default());
+    }
+
+    #[test]
+    fn missing_webhook_logs_dir_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("does-not-exist");
+        let stats = sweep_webhook_logs(&dir, &log_cfg(true), SystemTime::now());
+        assert_eq!(stats, SweepStats::default());
+    }
+
     // ---- CLAUDE-257: size ceilings on daemon.log and output.file -----------
 
     /// `bytes` bytes of numbered lines, so a test can tell head from tail.
@@ -743,6 +1066,8 @@ mod tests {
             retention_days: 30,
             daemon_log_max_bytes: daemon_max,
             output_file_max_bytes: output_max,
+            snippet_retention_days: 30,
+            webhook_log_retention_days: 30,
         }
     }
 
