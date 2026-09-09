@@ -37,6 +37,7 @@ claude: # optional, all keys optional
   permission_mode: acceptEdits
   model: opus
   effort: high
+  autocompact: 200000       # compaction window: auto, or 100000-1000000 tokens
 post: # optional, ordered list of nu snippets
   - |
     ...
@@ -47,6 +48,8 @@ limits: # optional per-action overrides of the built-in defaults
   max_runs_per_day: 20
   claude_timeout_seconds: 600
   daily_budget_usd: 5.00
+  run_budget_usd: 5.00      # spend ceiling for ONE run; unset = daily_budget_usd
+  budget_warn_fraction: 0.8 # warn once at this fraction of run_budget_usd
   max_issues_per_run: 25
 concurrency: # optional; default is strictly sequential
   max_parallel: 1           # distinct-key jobs in flight at once, daemon-wide (default 1)
@@ -775,10 +778,13 @@ Tuning for the `claude` CLI call. All keys are optional.
 | `permission_mode` | `acceptEdits`                    | Passed as `--permission-mode`.                          |
 | `model`           | `config.claude.model`, else the `claude` CLI's own default | Passed as `--model`, verbatim (CLAUDE-239). |
 | `effort`          | `config.claude.effort`, else the `claude` CLI's own default | Passed as `--effort`, verbatim: `low`, `medium`, `high`, `xhigh`, `max` (CLAUDE-259). |
+| `autocompact`     | `config.claude.autocompact`, else `200000`                  | Passed as `--autocompact`, verbatim: `auto`, or a window of 100000-1000000 tokens (DEV-706). |
 
 **Model selection (CLAUDE-239).** The effective model is resolved per invocation in this order: this action's `model`, else the global default in the `Claude invocation` settings section (DB key `config.claude`, field `model`, edited on `/settings` or via `GET` / `PUT /api/settings/claude`), else nothing at all - no `--model` flag is passed and the `claude` CLI applies its own default. The runner never validates the value at any layer: it is handed to `--model` untouched, and the CLI is the source of truth for which models exist, so new aliases and dated ids (`sonnet`, `opus`, `claude-sonnet-4-5-20250929`, ...) work without a runner change. Like every DB-backed section, `config.claude` is DB-only from birth (never a `config.toml` key) and applies to the next invocation, with no daemon restart.
 
 **Effort selection (CLAUDE-259).** The effective effort level resolves on exactly the same three-step precedence: this action's `effort`, else `config.claude.effort` (same settings section, same API path), else nothing at all - no `--effort` flag is passed and the `claude` CLI applies its own default. No layer rejects a value and no layer substitutes one, so a level Anthropic adds after this release works without a runner change. What the runner does add is one `warn` per invocation when the resolved value is outside the documented set (`low`, `medium`, `high`, `xhigh`, `max`), naming the value, whether it came from the action or the global default, and the known set. That warn exists because the CLI does NOT fail on an unknown level: it prints `Warning: Unknown --effort value '<x>' - ignoring it and using the default effort` on stderr and carries on at its default, which inside a run lands unstamped in the stream log where nothing notices it. Without the runner's own warn, a typo would silently downgrade effort for every run of that action.
+
+**Compaction window (DEV-706).** The effective `--autocompact` window resolves on the same three-step precedence: this action's `autocompact`, else `config.claude.autocompact`, else the runner's own `200000` (`crate::claude::DEFAULT_AUTOCOMPACT`). Unlike `model` and `effort`, the last step is a VALUE rather than nothing: the CLI's own `auto` scales the window to the model's whole context, so on a 1M-context model a long tool-heavy session never compacts and resends every completed operation's tool payloads on every turn. That is what made cumulative spend grow with the square of the number of tool calls rather than linearly, with tool output rather than reasoning dominating the bill. A bounded window keeps full results for the operation in flight and a short carry-forward summary for the ones already finished. Set `autocompact: auto` on an action to opt back into the CLI's behavior. Values are passed through untouched; the CLI validates them.
 
 The runner always passes `--print --verbose --output-format stream-json`. It wraps the call in `timeout
 $claude_timeout_seconds`. Stdout+stderr are redirected to a per-job NDJSON stream log:
@@ -909,6 +915,8 @@ Per-action overrides for the runner-wide defaults. Any subset of:
 | `max_runs_per_day`       | `20`    |
 | `claude_timeout_seconds` | `600`   |
 | `daily_budget_usd`       | `5.00`  |
+| `run_budget_usd`         | the effective `daily_budget_usd` |
+| `budget_warn_fraction`   | `0.80`  |
 | `max_issues_per_run`     | `25`    |
 
 The defaults are the built-in `RunnerDefaults::default()` (`src/job.rs`); the Rust runner reads no `CLAUDE_RUN_MAX_*` environment variable for them, so an action's YAML is the only override.
@@ -922,6 +930,12 @@ CLAUDE-234: `max_issues_per_run` bounds a different axis from the other caps. `m
 The ceiling covers the writes the RUNNER itself makes through the provider (the mint, the closed-issue-summary filing, every field / state / comment write the native actions perform). It does not reach the `yt` calls an agent session makes inside its own workdir: those are a separate process with its own credentials, bounded by the agent prompt rather than by this cap (tracked separately).
 
 Deletes are denied on this surface by omission: `IssueTracker` exposes no delete, the CLI backend invokes no `yt issue delete`, and `no_delete_on_the_tracker_surface` (`src/provider/audit.rs`) fails if either reappears.
+
+DEV-705: `run_budget_usd` bounds a third axis. `max_runs_per_day` bounds how often an action fires and `daily_budget_usd` bounds a whole day across runs; `run_budget_usd` bounds what ONE firing may spend, so a single runaway run cannot eat the day. It is read from this file BEFORE the run starts, snapshotted into the run's `EffectiveLimits` (which is `Copy` and is moved into each per-job task by value), and never re-read, so it cannot be raised while the run works: raising it means editing the action and starting a new run, which makes the decision deliberate and auditable. Nothing offers to raise it, and there is no interactive path that could. Unset, it falls back to the effective `daily_budget_usd`, so adding the ceiling loosens nothing and changes no shipped action.
+
+Enforcement is two-layered. The runner accumulates each invocation's `total_cost_usd` into one per-run ledger (`crate::usage::RunSpend`, shared by every job of the run) and checks it before every job pickup; a run that has reached the ceiling starts no further job, closes its `runs` row with exit code 6, and logs a reason naming the budget and the spend. Between those checks a single session could still overshoot, so the runner also passes the run's REMAINING dollars to the child as `--max-budget-usd`, which stops the session itself. `budget_warn_fraction` (default `0.80`) emits one `warn` per run when the spend first passes that fraction of the ceiling. A cancel or a global pause keeps its own exit code; the over-budget code only overrides a run that would otherwise have finished cleanly.
+
+DEV-707: every run also reports what it spent. The runner replays each invocation's stream log for input / output / cache-read / cache-write tokens per turn, tool call counts, and per-tool attribution (a turn is attributed to the tool whose result most recently entered its context, so a dominant tool is identifiable), and emits one `run usage` summary line plus one newline-delimited JSON record per run at `$CLAUDE_RUN_STATE_DIR/logs/usage.jsonl`. The record carries the run id, action, exit code, wall-clock duration, invocation count, cost against the budget, tokens by category, turns, tool calls, `peak_context_tokens`, `cumulative_context_tokens`, `context_per_tool_call`, and the per-tool breakdown. `context_per_tool_call` is the DEV-706 measurement: flat as the number of tool calls grows is the linear signature, rising with it is the quadratic one.
 
 ### `concurrency` (record, optional)
 
@@ -1092,6 +1106,7 @@ $CLAUDE_RUN_STATE_DIR/
   logs/<name>/<output.file>                    # JSONL per-job outcomes if output.file set
   logs/<name>/<output.file>.1                  # its one rolled-over predecessor
   logs/<name>/streams/<key>-attempt-<n>.jsonl  # claude stream-json output per attempt
+  logs/usage.jsonl                             # DEV-707: one per-run token / cost record per line
   snippets/<name>/<key>/                       # rendered snippet scripts + one binding-<name>.json per $-binding
   webhook-logs/                                # redacted CI job logs the Forgejo webhook triage fetched
 ```
@@ -1101,6 +1116,7 @@ What bounds each path:
 - `logs/daemon.log`: size, `config.stream_log_gc.daemon_log_max_bytes` (default 50 MiB). Past the ceiling the daemon's log GC pass copies the file to `daemon.log.1` and truncates it in place back to its newest half, so the daemon's open append handle keeps writing to the live file.
 - `logs/<name>/<output.file>`: size, `config.stream_log_gc.output_file_max_bytes` (default 50 MiB), same rollover. It is bounded by size and never deleted by age: `output.file` is an operator-configured data sink, so the sweep keeps the newest records in place instead of destroying the record.
 - `logs/<name>/streams/*.jsonl`: age, `config.stream_log_gc.retention_days` (default 30). A log whose job is still in flight is kept at any age.
+- `logs/usage.jsonl`: nothing bounds this yet; it is one short line per run, and it shares the gap tracked in CLAUDE-262.
 - `snippets/` and `webhook-logs/`: nothing bounds these yet; see CLAUDE-262.
 
 Pause state and per-key accounting are NOT files here. Global pause is the `global_pause` flag and per-action pause the
@@ -1161,7 +1177,7 @@ The index is self-healing: `scan_actions` prunes any `actions` row whose backing
 | 3    | Config error (action YAML missing, malformed, or missing required field). |
 | 4    | Daily cap reached (`max_runs_per_day`).                                   |
 | 5    | Unexpected error (see logs).                                              |
-| 6    | Over daily budget (`daily_budget_usd`).                                   |
+| 6    | Over budget: the daily budget (`daily_budget_usd`) was already spent when the run started, or the run reached its own ceiling (`run_budget_usd`) while working (DEV-705). |
 | 7    | Conflict: a mutating command was refused (e.g. `action delete` while a run for that action is in flight). |
 | 130  | Run cancelled in flight (operator cancel via the API / web UI / CLI).     |
 

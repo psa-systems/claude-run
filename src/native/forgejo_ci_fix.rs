@@ -208,6 +208,11 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
             warn!(cost_usd = cost, "daily budget reached mid-run, stopping");
             break;
         }
+        // DEV-705: the run's own ceiling, checked before every pickup.
+        if ctx.spend.exceeded() {
+            warn!(action = %action.name, "{}", ctx.spend.stop_reason());
+            break;
+        }
         // CLAUDE-162: acquire the daemon-wide caps (global -> per-action) and the
         // per-PR key gate before working the job, so overlapping forgejo-ci-fix
         // runs stay bounded by the global cap and never work the same PR at once.
@@ -249,8 +254,14 @@ async fn run_forgejo_ci_fix(ctx: NativeContext<'_>) -> Result<()> {
         processed += 1;
     }
 
-    let exit_code = run_pause.exit_code(cancel.is_cancelled());
+    // DEV-705: an over-budget stop is this run's outcome unless a cancel or a
+    // pause already claimed it.
+    let exit_code = ctx
+        .spend
+        .exit_code(run_pause.exit_code(cancel.is_cancelled()));
     run_guard.finish(exit_code, processed).await?;
+    // DEV-707: one summary line and one machine-readable record per run.
+    ctx.spend.finish(Some(run_id), exit_code);
     info!(action = %action.name, processed, exit_code, "run complete");
     Ok(())
 }
@@ -435,7 +446,11 @@ async fn process_job(
                 &workdir_path,
                 &stream_log,
                 cancel,
+                // DEV-705: cap the child at the run's remaining ceiling.
+                Some(ctx.spend.remaining_usd()),
             )?;
+            // DEV-707: bill the run before any branch discards `r`.
+            ctx.spend.record(&r);
             if cancel.is_cancelled() {
                 warn!(action = %action.name, key = %key, "run cancelled mid-claude (finalize still runs)");
                 (
@@ -1068,6 +1083,7 @@ mod tests {
             ok: true,
             summary: summary.into(),
             cost: 0.5,
+            usage: Default::default(),
             raw: Value::Null,
             error: String::new(),
             transient: false,

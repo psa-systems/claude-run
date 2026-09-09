@@ -12,7 +12,8 @@ long-running daemon.
   on time without external cron.
 - **Per-job streaming logs**: claude is invoked with `--output-format stream-json` and the NDJSON events land in
   `$STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`. `tail -f` to watch live.
-- **Cost ledger + caps**: per-day Claude-invocation cap, per-day USD budget, per-job attempt cap. All in SQLite.
+- **Cost ledger + caps**: per-day Claude-invocation cap, per-day USD budget, per-RUN USD ceiling, per-job attempt cap. All in SQLite.
+- **Per-run usage accounting** (DEV-707): every run ends with a `run usage` summary line and appends one newline-delimited JSON record to `$STATE_DIR/logs/usage.jsonl` carrying tokens by category, estimated cost against the budget, wall-clock duration, tool call counts, and per-tool attribution, so "what did this run cost, and which tool dominated it" is answerable without a provider console.
 - **Skip-attempt marker**: an action's post step can write `$workdir/.claude-run-skip-attempt` for outcomes that park a
   job pending human input (so the attempt cap doesn't trip).
 - **Pause / resume**: globally or per-action; persisted in SQLite, takes effect on the next scheduler tick. The global switch is also on the **About** page's Activity card, next to a live quiet indicator (see "Global pause and the restart-safety workflow").
@@ -138,6 +139,14 @@ will want to know about:
   logs at `warn`, and records a run event, so a truncated filing run does not read as a clean one. Every issue create
   and every issue update the runner performs is journalled as one `youtrack issue write` line carrying the originating
   run id and the issue key. See `actions/SCHEMA.md`, "`limits`".
+
+  A fourth cap bounds what a single run may SPEND: `limits.run_budget_usd` (DEV-705, unset = the action's own
+  `daily_budget_usd`). It is read from the action's YAML before the run starts and never re-read, so it cannot be raised
+  while the run works; raising it means editing the action and starting a new run. A run that reaches it starts no
+  further job, closes its row with exit code `6`, and logs a reason naming the budget and the spend. Nothing offers to
+  raise it. The runner also hands the run's remaining dollars to each `claude` child as `--max-budget-usd`, so a single
+  session cannot overshoot the ceiling between the runner's own between-job checks, and warns once when the spend passes
+  `limits.budget_warn_fraction` (default 0.80) of the ceiling. See `actions/SCHEMA.md`, "`limits`".
 
 - **New action** (`/actions/new`, CLAUDE-211) is a kind picker: it lists every action kind with a one-line description
   and a link to its editor. Every native kind (`youtrack`, `forgejo-ci-fix`, `ci-failure-analysis`,
