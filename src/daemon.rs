@@ -371,7 +371,13 @@ impl Daemon {
         let webhook_logs: Arc<dyn crate::forge_log::ActionLogClient> = Arc::new(
             crate::provider::FjForgeReads::new(Arc::new(crate::provider::ProcessRunner::new())),
         );
-        let mint_ctx = build_mint_context(&pool, settings.mint_handle(), &claude, &webhook_log_dir);
+        let mint_ctx = build_mint_context(
+            &pool,
+            settings.mint_handle(),
+            &claude,
+            &webhook_log_dir,
+            &self.paths,
+        );
         let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(
             webhook_rx,
             pool.clone(),
@@ -569,6 +575,7 @@ fn build_mint_context(
     mint_cfg: Arc<tokio::sync::RwLock<crate::config::MintConfig>>,
     claude: &Arc<ClaudeInvoker>,
     webhook_log_dir: &Path,
+    paths: &Paths,
 ) -> Option<crate::web::webhooks::MintContext> {
     use crate::action::ClaudeBlock;
     use crate::triage::{ClaudeClassifier, FailureClassifier};
@@ -598,6 +605,10 @@ fn build_mint_context(
         model: None,
         // CLAUDE-259: same for the effort level.
         effort: None,
+        // DEV-706: same for the compaction window. A single bounded-log
+        // classification cannot grow its own context, so the runner default is
+        // simply inherited rather than pinned here.
+        autocompact: None,
     };
     let stream_log = cwd.join("triage-stream.jsonl");
     let classifier: Arc<dyn FailureClassifier> = Arc::new(ClaudeClassifier::new(
@@ -606,6 +617,13 @@ fn build_mint_context(
         std::time::Duration::from_secs(crate::web::webhooks::TRIAGE_TIMEOUT_SECS),
         cwd,
         stream_log,
+        // DEV-705: a classification bills against the runner's default budget,
+        // frozen here; there is no per-action YAML for the webhook mint path.
+        {
+            let defaults = RunnerDefaults::default();
+            crate::usage::RunBudget::new(defaults.daily_budget_usd, defaults.budget_warn_fraction)
+        },
+        Some(paths.usage_log()),
     ));
 
     info!(backend = backend.name(), "webhook mint enabled");
@@ -1226,6 +1244,7 @@ impl Dispatcher {
             &self.gather,
         )
         .await
+        .map(|_| ())
     }
 }
 
@@ -1248,11 +1267,37 @@ pub async fn run_action_inner(
     pause: &crate::pause::PauseGate,
     // CLAUDE-228: per-action gather marker, held across the gather step only.
     gather: &GatherGate,
-) -> Result<()> {
+) -> Result<i32> {
+    let defaults = RunnerDefaults::default();
+    let limits = job::effective_limits(&defaults, loaded);
+    // DEV-705: the run's spend ceiling, resolved from configuration BEFORE any
+    // work starts and shared by every job of this run. Nothing hands back a way
+    // to raise it, which is what makes it a ceiling rather than a prompt.
+    let spend = crate::usage::RunSpend::new(
+        loaded.action.name.clone(),
+        limits.run_budget(),
+        Some(paths.usage_log()),
+    );
+
+    // Pre-run daily caps, checked for EVERY kind. DEV-705: the documented exit
+    // codes 4 and 6 are what a refused run reports; native handlers re-check the
+    // same two conditions themselves, so this only moves WHERE the refusal is
+    // observed, never whether the run is refused.
+    let daily = state::daily_count_get(pool, &loaded.action.name).await?;
+    if daily >= limits.max_runs_per_day {
+        warn!(count = daily, "daily cap reached");
+        return Ok(crate::exit::DAILY_CAP);
+    }
+    let cost = state::daily_cost_get(pool, &loaded.action.name).await?;
+    if cost >= limits.daily_budget_usd {
+        warn!(cost_usd = cost, "daily budget reached");
+        return Ok(crate::exit::OVER_BUDGET);
+    }
+
     // CLAUDE-30: native kinds route to a built-in Rust handler. Scripted
     // actions fall through to the generic nu-snippet pipeline below, unchanged.
     if loaded.action.kind.is_native() {
-        return crate::native::dispatch(crate::native::NativeContext {
+        crate::native::dispatch(crate::native::NativeContext {
             action: loaded,
             paths,
             pool,
@@ -1264,22 +1309,14 @@ pub async fn run_action_inner(
             limiter: limiter.clone(),
             pause: pause.clone(),
             gather: gather.clone(),
+            spend: spend.clone(),
         })
-        .await;
-    }
-
-    let defaults = RunnerDefaults::default();
-    let limits = job::effective_limits(&defaults, loaded);
-
-    let daily = state::daily_count_get(pool, &loaded.action.name).await?;
-    if daily >= limits.max_runs_per_day {
-        warn!(count = daily, "daily cap reached");
-        return Ok(());
-    }
-    let cost = state::daily_cost_get(pool, &loaded.action.name).await?;
-    if cost >= limits.daily_budget_usd {
-        warn!(cost_usd = cost, "daily budget reached");
-        return Ok(());
+        .await?;
+        // DEV-705: the handler owns its own run row and closed it with the
+        // right code; this is the PROCESS exit code, so a standalone
+        // `claude-run run` of a native action that hit its ceiling exits
+        // non-zero too.
+        return Ok(spend.exit_code(crate::exit::OK));
     }
 
     // CLAUDE-228: mark the action as gathering so the scheduler does not stack
@@ -1324,7 +1361,7 @@ pub async fn run_action_inner(
             gathered = jobs.len(),
             "no fresh queued work (all in flight in another run); skipping empty run"
         );
-        return Ok(());
+        return Ok(crate::exit::OK);
     }
 
     let run_id = state::run_begin(pool, &loaded.action.name, triggered_by).await?;
@@ -1377,6 +1414,7 @@ pub async fn run_action_inner(
         let claude = claude.clone();
         let job_cancel = cancel.clone();
         let job_pause = run_pause.clone();
+        let job_spend = spend.clone();
         let fut: crate::concurrency::JobFuture = Box::pin(async move {
             // CLAUDE-28: best-effort cap/budget check before launch. Up to
             // `max_parallel` tasks can pass this before any of them increments
@@ -1388,6 +1426,12 @@ pub async fn run_action_inner(
             }
             if state::daily_cost_get(&pool, &loaded.action.name).await? >= limits.daily_budget_usd {
                 warn!(action = %loaded.action.name, "daily budget reached, skipping job");
+                return Ok(false);
+            }
+            // DEV-705: the run's own ceiling. Checked before every pickup, so a
+            // run that reached it starts no further job.
+            if job_spend.exceeded() {
+                warn!(action = %loaded.action.name, "{}", job_spend.stop_reason());
                 return Ok(false);
             }
             // CLAUDE-28: mark this job in flight (cleared below and by
@@ -1405,6 +1449,7 @@ pub async fn run_action_inner(
                 run_id,
                 cancel: job_cancel,
                 pause: job_pause,
+                spend: job_spend,
             };
             let outcome = job::process_job(&ctx, &job, idx).await;
             if let Err(e) = state::run_inflight_remove(&pool, run_id, &job_key).await {
@@ -1476,13 +1521,20 @@ pub async fn run_action_inner(
         }
     }
 
-    let exit_code = run_pause.exit_code(cancel.is_cancelled());
+    // DEV-705: an over-budget stop is the run's outcome unless a cancel or a
+    // pause already claimed it.
+    let exit_code = spend.exit_code(run_pause.exit_code(cancel.is_cancelled()));
+    if exit_code == crate::exit::OVER_BUDGET {
+        warn!(action = %loaded.action.name, "{}", spend.stop_reason());
+    }
     run_guard.finish(exit_code, processed).await?;
+    // DEV-707: one summary line and one machine-readable record per run.
+    spend.finish(Some(run_id), exit_code);
     if let Some(e) = first_err {
         warn!(action = %loaded.action.name, error = %e, "one or more jobs errored during the run");
     }
     info!(action = %loaded.action.name, processed, exit_code, "run complete");
-    Ok(())
+    Ok(exit_code)
 }
 
 /// CLAUDE-162: resolve the effective global concurrency cap. An explicit
@@ -2215,6 +2267,54 @@ mod tests {
         )
         .await
         .expect("native handler caps out cleanly");
+    }
+
+    /// DEV-705: `run_action_inner` reports the RUN's exit code instead of a
+    /// blanket `OK`, so a standalone `claude-run run` that was refused exits
+    /// non-zero with the code `actions/SCHEMA.md` documents. Both refusals are
+    /// checked for every kind, native included.
+    #[tokio::test]
+    async fn run_action_inner_reports_a_refused_run_as_non_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
+
+        let run = |raw: &'static str| {
+            let paths = paths.clone();
+            let pool = pool.clone();
+            async move {
+                let loaded = crate::action::validate_str(raw, "<test>").unwrap();
+                run_action_inner(
+                    &loaded,
+                    &paths,
+                    &pool,
+                    Arc::new(SnippetRunner::new(None)),
+                    Arc::new(ClaudeInvoker::new(None)),
+                    "test",
+                    None,
+                    &KeyGate::new(),
+                    &Limiter::new(1),
+                    &crate::pause::PauseGate::never(),
+                    &GatherGate::new(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let capped =
+            run("name: yt\nkind: youtrack\nnative: {}\nlimits:\n  max_runs_per_day: 0\n").await;
+        assert_eq!(capped, crate::exit::DAILY_CAP, "exit code 4 is documented");
+
+        let broke = run(
+            "name: yt\nkind: youtrack\nnative: {}\nlimits:\n  daily_budget_usd: 0.0\n  run_budget_usd: 0.0\n",
+        )
+        .await;
+        assert_eq!(
+            broke,
+            crate::exit::OVER_BUDGET,
+            "a run with nothing left to spend exits non-zero"
+        );
     }
 
     // CLAUDE-40: an out-of-band `rm` of an action file must be reconciled by the

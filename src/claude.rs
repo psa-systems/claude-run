@@ -50,12 +50,24 @@ const RESULT_EXIT_GRACE: Duration = Duration::from_secs(30);
 /// a level Anthropic adds later needs no runner release. Nothing here rejects or
 /// substitutes a value.
 pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// DEV-706: the compaction window every invocation runs with when neither the
+/// action's `claude.autocompact` nor the global default sets one. The `claude`
+/// CLI accepts `auto` or 100k-1M tokens; `auto` scales to the model's whole
+/// context window, which on a 1M-context model means a long session never
+/// compacts and resends every completed operation's tool payloads on every
+/// turn. A fixed window bounds what one turn resends, so cumulative spend grows
+/// linearly in the number of tool calls rather than quadratically.
+pub const DEFAULT_AUTOCOMPACT: &str = "200000";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaudeResult {
     pub ok: bool,
     pub summary: String,
     pub cost: f64,
+    /// DEV-707: tokens by category, per-tool attribution and context growth,
+    /// recovered from this invocation's stream log. Empty when the log could not
+    /// be read; accounting never decides a run's outcome.
+    pub usage: crate::usage::StreamUsage,
     pub raw: Value,
     pub error: String,
     pub transient: bool,
@@ -73,6 +85,7 @@ impl ClaudeResult {
             ok: false,
             summary: summary.into(),
             cost: 0.0,
+            usage: crate::usage::StreamUsage::default(),
             raw: Value::Object(Default::default()),
             error: error.into(),
             transient: false,
@@ -180,6 +193,22 @@ impl ClaudeInvoker {
         Some(effort)
     }
 
+    /// DEV-706: the compaction window this invocation runs with. Resolved like
+    /// the model and the effort level (action, then the live global default),
+    /// falling back to [`DEFAULT_AUTOCOMPACT`] rather than to the CLI's own
+    /// `auto`, so the bound holds for every action with no per-action config.
+    /// Values are passed through unchanged; the CLI owns their validation.
+    fn resolve_autocompact(&self, claude_cfg: &ClaudeBlock) -> String {
+        claude_cfg
+            .autocompact
+            .clone()
+            .or_else(|| {
+                let handle = self.default_claude.as_ref()?;
+                crate::settings::read_claude(handle).autocompact.clone()
+            })
+            .unwrap_or_else(|| DEFAULT_AUTOCOMPACT.to_string())
+    }
+
     pub fn stream_log_path(logs_dir: &Path, action: &str, key: &str, attempt: u32) -> PathBuf {
         logs_dir
             .join(action)
@@ -198,6 +227,11 @@ impl ClaudeInvoker {
     /// SIGTERM, a short grace period, then SIGKILL. The caller (`job.rs`)
     /// detects the tripped token and synthesizes a cancelled `$claude_result`
     /// so the action's `post` phase still runs.
+    /// DEV-705: `budget_usd` is what the run has left to spend. It is passed to
+    /// the child as `--max-budget-usd`, so ONE runaway session cannot overshoot
+    /// the run's ceiling between the runner's own between-invocation checks.
+    /// `None` leaves the child uncapped (the pre-DEV-705 command line).
+    #[allow(clippy::too_many_arguments)]
     pub fn invoke(
         &self,
         prompt: &str,
@@ -206,6 +240,7 @@ impl ClaudeInvoker {
         default_cwd: &Path,
         stream_log: &Path,
         cancel: &CancellationToken,
+        budget_usd: Option<f64>,
     ) -> Result<ClaudeResult> {
         if let Some(parent) = stream_log.parent() {
             std::fs::create_dir_all(parent)?;
@@ -270,6 +305,16 @@ impl ClaudeInvoker {
         // CLAUDE-259: the resolved effort level, on the same terms as the model.
         if let Some(effort) = self.resolve_effort(claude_cfg) {
             command.arg(format!("--effort={}", effort));
+        }
+        // DEV-706: bound what one turn resends, so a long tool-heavy session
+        // compacts instead of carrying every completed operation's payloads.
+        command.arg(format!(
+            "--autocompact={}",
+            self.resolve_autocompact(claude_cfg)
+        ));
+        // DEV-705: the run's remaining ceiling, enforced inside the session.
+        if let Some(budget) = budget_usd {
+            command.arg(format!("--max-budget-usd={:.4}", budget.max(0.0)));
         }
         command
             .arg(prompt)
@@ -359,6 +404,11 @@ impl ClaudeInvoker {
             }
         };
         let have_result = final_event.get("type").and_then(|v| v.as_str()) == Some("result");
+        // DEV-707: the stream log is readable here, so replay it once for this
+        // invocation's tokens, per-tool attribution and context growth. Every
+        // outcome below carries it, including the failure ones: a run that
+        // failed still spent what it spent.
+        let usage = crate::usage::parse_stream_usage(stream_log);
 
         // CLAUDE-233: the relay is the stream log's only writer, so a relay that
         // stopped early means the log is missing every event after that point.
@@ -402,6 +452,7 @@ impl ClaudeInvoker {
                     .get("total_cost_usd")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0),
+                usage,
                 raw: final_event.clone(),
                 error: format!("claude exited {}, see {}", exit_code, stream_log.display()),
                 transient: classify_transient(exit_code, &final_event),
@@ -416,6 +467,7 @@ impl ClaudeInvoker {
                 ok: false,
                 summary,
                 cost: 0.0,
+                usage,
                 raw: final_event,
                 error: format!(
                     "claude stream did not end with a result event, see {}",
@@ -440,6 +492,7 @@ impl ClaudeInvoker {
                 .get("total_cost_usd")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0),
+            usage,
             error: final_event
                 .get("error")
                 .and_then(|v| v.as_str())
@@ -772,6 +825,7 @@ fn relay_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Clau
             reason
         ),
         cost: 0.0,
+        usage: crate::usage::StreamUsage::default(),
         raw: Value::Null,
         error: format!(
             "the runner could not write the stream log {}: {}",
@@ -803,6 +857,7 @@ fn read_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Claud
             reason
         ),
         cost: 0.0,
+        usage: crate::usage::StreamUsage::default(),
         raw: Value::Null,
         error: format!(
             "the runner could not read the stream log {}: {}",
@@ -990,6 +1045,7 @@ exit "$code"
                 dir.path(),
                 &log,
                 &cancel,
+                None,
             )
             .unwrap();
         assert!(res.timed_out, "exit 124 should set timed_out");
@@ -1033,6 +1089,7 @@ exit "$code"
                 dir.path(),
                 &log,
                 &cancel,
+                None,
             )
             .unwrap();
         assert!(res.ok, "stub run succeeds");
@@ -1079,6 +1136,7 @@ exit "$code"
                 dir.path(),
                 &log,
                 &cancel,
+                None,
             )
             .unwrap();
         assert!(res.ok, "a success result event finalizes as ok");
@@ -1123,6 +1181,7 @@ exit "$code"
                 dir.path(),
                 &log,
                 &cancel,
+                None,
             )
             .unwrap();
         let elapsed = start.elapsed();
@@ -1178,6 +1237,7 @@ exit "$code"
                 dir.path(),
                 &log,
                 &cancel,
+                None,
             )
             .unwrap();
         assert!(
@@ -1217,6 +1277,7 @@ exit "$code"
             dir.path(),
             &log,
             &cancel,
+            None,
         );
         let elapsed = start.elapsed();
         canceller.join().unwrap();
@@ -1236,6 +1297,16 @@ exit "$code"
     /// those arguments one per line. Asserts on the real spawn path rather than
     /// on a rebuilt `Command`.
     fn spawn_and_capture_args(invoker: &ClaudeInvoker, cfg: &ClaudeBlock, dir: &Path) -> String {
+        spawn_and_capture_args_with_budget(invoker, cfg, dir, None)
+    }
+
+    /// DEV-705: the same helper with an explicit remaining-budget argument.
+    fn spawn_and_capture_args_with_budget(
+        invoker: &ClaudeInvoker,
+        cfg: &ClaudeBlock,
+        dir: &Path,
+        budget_usd: Option<f64>,
+    ) -> String {
         let marker = dir.join("child-argv.txt");
         let res = invoker
             .invoke(
@@ -1245,6 +1316,7 @@ exit "$code"
                 dir,
                 &dir.join("stream.jsonl"),
                 &CancellationToken::new(),
+                budget_usd,
             )
             .unwrap();
         assert!(res.ok, "stub run succeeds");
@@ -1272,6 +1344,7 @@ exit "$code"
         std::sync::Arc::new(std::sync::RwLock::new(crate::config::ClaudeConfig {
             model: model.map(|m| m.to_string()),
             effort: None,
+            autocompact: None,
         }))
     }
 
@@ -1280,6 +1353,7 @@ exit "$code"
         std::sync::Arc::new(std::sync::RwLock::new(crate::config::ClaudeConfig {
             model: None,
             effort: effort.map(|e| e.to_string()),
+            autocompact: None,
         }))
     }
 
@@ -1336,6 +1410,83 @@ exit "$code"
         );
         // The prompt stays the trailing positional, after every flag.
         assert_eq!(argv.lines().last(), Some("hi"), "argv:\n{argv}");
+    }
+
+    /// DEV-706: with nothing configured the invocation still runs with a
+    /// BOUNDED compaction window, so a tool-heavy session cannot resend every
+    /// completed operation's payloads on every turn.
+    #[test]
+    fn invoke_always_passes_a_bounded_autocompact_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = argv_recording_stub(dir.path());
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let argv = spawn_and_capture_args(&invoker, &ClaudeBlock::default(), dir.path());
+        assert!(
+            argv.lines()
+                .any(|l| l == format!("--autocompact={DEFAULT_AUTOCOMPACT}")),
+            "an unconfigured action must still compact, got:\n{argv}"
+        );
+    }
+
+    /// DEV-706: the action's window wins over the global default, and both win
+    /// over the runner default. Values pass through untouched.
+    #[test]
+    fn invoke_autocompact_resolves_action_then_global_then_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = argv_recording_stub(dir.path());
+        let handle = claude_defaults(None);
+        handle.write().unwrap().autocompact = Some("400000".to_string());
+        let invoker =
+            ClaudeInvoker::new(Some(stub.to_str().unwrap())).with_default_claude(handle.clone());
+
+        let argv = spawn_and_capture_args(&invoker, &ClaudeBlock::default(), dir.path());
+        assert!(
+            argv.lines().any(|l| l == "--autocompact=400000"),
+            "the global default must reach the CLI, got:\n{argv}"
+        );
+
+        let cfg = ClaudeBlock {
+            autocompact: Some("auto".to_string()),
+            ..Default::default()
+        };
+        let argv = spawn_and_capture_args(&invoker, &cfg, dir.path());
+        assert!(
+            argv.lines().any(|l| l == "--autocompact=auto"),
+            "the action window must win, got:\n{argv}"
+        );
+        assert!(
+            !argv.contains("--autocompact=400000"),
+            "the global default must not also be passed, got:\n{argv}"
+        );
+    }
+
+    /// DEV-705: the run's remaining ceiling reaches the child, so one session
+    /// cannot overshoot it between the runner's own between-invocation checks.
+    /// `None` (the pre-DEV-705 command line) passes no flag at all.
+    #[test]
+    fn invoke_passes_the_remaining_budget_as_max_budget_usd() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = argv_recording_stub(dir.path());
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cfg = ClaudeBlock::default();
+
+        let argv = spawn_and_capture_args(&invoker, &cfg, dir.path());
+        assert!(
+            !argv.contains("--max-budget-usd"),
+            "no budget means no flag, got:\n{argv}"
+        );
+
+        let argv = spawn_and_capture_args_with_budget(&invoker, &cfg, dir.path(), Some(1.5));
+        assert!(
+            argv.lines().any(|l| l == "--max-budget-usd=1.5000"),
+            "the remaining budget must reach the CLI, got:\n{argv}"
+        );
+        // An exhausted ledger never reports a negative ceiling.
+        let argv = spawn_and_capture_args_with_budget(&invoker, &cfg, dir.path(), Some(-3.0));
+        assert!(
+            argv.lines().any(|l| l == "--max-budget-usd=0.0000"),
+            "an exhausted budget floors at zero, got:\n{argv}"
+        );
     }
 
     /// A live save through the shared handle is picked up by the next
@@ -1591,6 +1742,7 @@ exit "$code"
                 dir.path(),
                 &log,
                 &cancel,
+                None,
             )
             .unwrap();
         assert!(!res.ok, "non-zero exit is a failure");
@@ -1913,6 +2065,7 @@ exit "$code"
                     dir.path(),
                     &log,
                     &cancel,
+                    None,
                 )
                 .unwrap()
         });
@@ -2038,6 +2191,7 @@ exit "$code"
                 dir.path(),
                 &log,
                 &cancel,
+                None,
             )
             .unwrap();
         assert!(res.ok, "stub run succeeds");

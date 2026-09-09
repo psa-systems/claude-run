@@ -1434,6 +1434,7 @@ mod tests {
             &ClaudeConfig {
                 model: Some("sonnet".to_string()),
                 effort: Some("high".to_string()),
+                autocompact: Some("auto".to_string()),
             },
         )
         .await

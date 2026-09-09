@@ -933,6 +933,17 @@ async fn run_instruction(
     // The route: a pull-request comment runs the CLAUDE-220 clone / Claude /
     // push pipeline; a plain-issue comment mints a Queued YouTrack issue and
     // starts no agent session (CLAUDE-221).
+    // DEV-705: one comment delivery is one run, so its ceiling is resolved from
+    // the runner defaults before the agent starts and cannot be raised while it
+    // works.
+    let spend = crate::usage::RunSpend::new(
+        WEBHOOK_COMMENT_ACTION,
+        crate::usage::RunBudget::new(
+            ctx.defaults.daily_budget_usd,
+            ctx.defaults.budget_warn_fraction,
+        ),
+        Some(ctx.paths.usage_log()),
+    );
     let outcome = if cmd.is_pull_request {
         stage(STAGE_RUNNING).await;
         let claude = ctx.claude.clone();
@@ -942,6 +953,7 @@ async fn run_instruction(
         let src = src.clone();
         let workdir = workdir.clone();
         let stream_log = stream_log.clone();
+        let run_spend = spend.clone();
         tokio::task::block_in_place(move || {
             serve_run(
                 backend.as_ref(),
@@ -952,6 +964,7 @@ async fn run_instruction(
                 &workdir,
                 &stream_log,
                 timeout,
+                &run_spend,
             )
         })
     } else {
@@ -988,7 +1001,7 @@ async fn run_instruction(
             warn!(error = %e, "advancing the comment daily ledger failed");
         }
     }
-    finish_comment_run(&ctx.pool, run_id, key, &outcome, &stream_log).await;
+    finish_comment_run(&ctx.pool, run_id, key, &outcome, &stream_log, &spend).await;
     if workdir.exists() {
         if let Err(e) = std::fs::remove_dir_all(&workdir) {
             warn!(workdir = %workdir.display(), error = %e, "comment workdir cleanup failed (continuing)");
@@ -1043,6 +1056,8 @@ fn serve_run(
     workdir: &FsPath,
     stream_log: &FsPath,
     timeout: Duration,
+    // DEV-705 / DEV-707: this delivery's ledger and frozen ceiling.
+    spend: &crate::usage::RunSpend,
 ) -> RunOutcome {
     let cancel = CancellationToken::new();
 
@@ -1089,9 +1104,13 @@ fn serve_run(
                     workdir,
                     stream_log,
                     &cancel,
+                    // DEV-705: cap the child at this run's remaining ceiling.
+                    Some(spend.remaining_usd()),
                 ) {
                     Ok(r) => {
                         claude_ran = true;
+                        // DEV-707: bill the run with what the session spent.
+                        spend.record(&r);
                         r
                     }
                     Err(e) => ClaudeResult::synthesized("claude invocation failed", e.to_string()),
@@ -1684,8 +1703,14 @@ async fn finish_comment_run(
     key: &str,
     outcome: &RunOutcome,
     stream_log: &FsPath,
+    spend: &crate::usage::RunSpend,
 ) {
-    let Some(run_id) = run_id else { return };
+    let Some(run_id) = run_id else {
+        // DEV-707: no run row (the begin failed), but the spend was real, so the
+        // usage record still names the action.
+        spend.finish(None, crate::exit::UNEXPECTED);
+        return;
+    };
     let stream = outcome.claude_ran.then(|| stream_log.display().to_string());
     let record = state::JobOutcome {
         run_id,
@@ -1707,14 +1732,17 @@ async fn finish_comment_run(
     if let Err(e) = state::job_outcome_insert(pool, &record).await {
         warn!(error = %e, "recording the comment run outcome failed");
     }
-    let exit_code = if outcome.ok {
+    // DEV-705: an over-budget stop overrides only an otherwise-clean outcome.
+    let exit_code = spend.exit_code(if outcome.ok {
         crate::exit::OK
     } else {
         crate::exit::UNEXPECTED
-    };
+    });
     if let Err(e) = state::run_finish(pool, run_id, exit_code, 1).await {
         warn!(error = %e, "finalizing the comment run failed");
     }
+    // DEV-707: one summary line and one machine-readable record per run.
+    spend.finish(Some(run_id), exit_code);
 }
 
 /// Root the per-command credential dirs live under. One directory per command,
@@ -2085,6 +2113,7 @@ mod tests {
             ok: true,
             summary: "did the thing".into(),
             cost: 0.1,
+            usage: Default::default(),
             raw: serde_json::Value::Null,
             error: String::new(),
             transient: false,

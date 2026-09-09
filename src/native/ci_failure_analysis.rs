@@ -197,6 +197,11 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
         if state::daily_cost_get(pool, &action.name).await? >= limits.daily_budget_usd {
             break;
         }
+        // DEV-705: the run's own ceiling, checked before every pickup.
+        if ctx.spend.exceeded() {
+            warn!(action = %action.name, "{}", ctx.spend.stop_reason());
+            break;
+        }
 
         let _permits = ctx.limiter.acquire(&action.name, max_parallel).await;
         let _key_guard = ctx.keygate.acquire(key).await;
@@ -216,8 +221,14 @@ async fn run_ci_failure_analysis(ctx: NativeContext<'_>) -> Result<()> {
         processed += 1;
     }
 
-    let exit_code = run_pause.exit_code(cancel.is_cancelled());
+    // DEV-705: an over-budget stop is this run's outcome unless a cancel or a
+    // pause already claimed it.
+    let exit_code = ctx
+        .spend
+        .exit_code(run_pause.exit_code(cancel.is_cancelled()));
     run_guard.finish(exit_code, processed).await?;
+    // DEV-707: one summary line and one machine-readable record per run.
+    ctx.spend.finish(Some(run_id), exit_code);
     Ok(())
 }
 
@@ -351,7 +362,11 @@ async fn process_job(
         &workdir_path,
         &stream_log,
         &CancellationToken::new(),
+        // DEV-705: cap the child at the run's remaining ceiling.
+        Some(ctx.spend.remaining_usd()),
     )?;
+    // DEV-707: bill the run before any branch returns early.
+    ctx.spend.record(&r);
 
     if r.transient {
         info!(action = %action.name, key, "transient claude error; will retry next run");

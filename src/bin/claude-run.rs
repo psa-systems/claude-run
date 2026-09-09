@@ -646,11 +646,12 @@ async fn run_action(
     // CLAUDE-228: the standalone path has no scheduler to defer, so its gather
     // marker is a fresh one nothing else reads.
     let gather = claude_run::concurrency::GatherGate::new();
+    // DEV-705: the run's own exit code, so a standalone run that hit its spend
+    // ceiling exits `exit::OVER_BUDGET` rather than reporting success.
     daemon::run_action_inner(
         &loaded, paths, &pool, snippet, claude, "cli", None, &keygate, &limiter, &pause, &gather,
     )
-    .await?;
-    Ok(exit::OK)
+    .await
 }
 
 async fn serve(

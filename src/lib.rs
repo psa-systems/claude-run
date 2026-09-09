@@ -10,6 +10,7 @@
 //! - [`claude`]: invoke the `claude` CLI with stream-json output.
 //! - [`job`]: per-job pipeline (filter / pre / prompt / claude / post).
 //! - [`state`]: SQLite-backed attempt counters and daily ledger.
+//! - [`usage`]: per-run token / cost accounting and the per-run spend ceiling.
 //! - [`migrate`]: one-shot import of legacy state.json files.
 //! - [`import`]: copy an existing SQLite state store into the configured
 //!   backend (CLAUDE-251).
@@ -60,6 +61,7 @@ pub mod state;
 pub mod testutil;
 pub mod triage;
 pub mod update;
+pub mod usage;
 pub mod web;
 pub mod web_admin;
 pub mod workdir;

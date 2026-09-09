@@ -117,9 +117,9 @@
 
   {% call m::schedule_block(form.schedule_kind, form.schedule_spec) %}
 
-  {% call m::claude_block(form.claude_cwd, form.claude_allowed_tools, form.claude_permission_mode, form.claude_model, form.claude_effort) %}
+  {% call m::claude_block(form.claude_cwd, form.claude_allowed_tools, form.claude_permission_mode, form.claude_model, form.claude_effort, form.claude_autocompact) %}
 
-  {% call m::limits_block(form.limit_max_attempts_per_key, form.limit_max_runs_per_day, form.limit_claude_timeout_seconds, form.limit_daily_budget_usd, form.limit_max_issues_per_run) %}
+  {% call m::limits_block(form.limit_max_attempts_per_key, form.limit_max_runs_per_day, form.limit_claude_timeout_seconds, form.limit_daily_budget_usd, form.limit_run_budget_usd, form.limit_budget_warn_fraction, form.limit_max_issues_per_run) %}
 
   <div class="card">
     <h3>Concurrency</h3>
