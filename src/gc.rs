@@ -431,13 +431,17 @@ pub struct BoundStats {
     pub bytes_reclaimed: u64,
 }
 
-/// CLAUDE-257: bound the two append-forever files under `<logs_dir>` by SIZE:
-/// `daemon.log` and every `logs/<action>/<output.file>`.
+/// CLAUDE-257 / CLAUDE-268: bound the append-forever files under `<logs_dir>`
+/// by SIZE: `daemon.log`, `usage.jsonl`, and every `logs/<action>/<output.file>`.
 ///
-/// Neither is a per-run artifact, so the age window [`sweep_stream_logs`] uses
+/// None is a per-run artifact, so the age window [`sweep_stream_logs`] uses
 /// does not apply: each is one file that a long-lived daemon appends to for the
 /// life of the install. Past its ceiling a file is rolled to `<name>.1` and
 /// truncated in place back to its newest half (see [`bound_file`]).
+///
+/// `usage.jsonl` is newline-delimited JSON, and [`bound_file`] already cuts at
+/// the first line boundary inside the retained window, so the survivor is
+/// still parseable line by line rather than starting mid-record.
 ///
 /// The action-directory walk treats every regular file directly under
 /// `logs/<action>/` as an output sink, because `append_output_record`
@@ -454,6 +458,15 @@ pub fn sweep_oversized_logs(logs_dir: &Path, cfg: &StreamLogGcConfig) -> BoundSt
         &logs_dir.join(DAEMON_LOG),
         cfg.daemon_log_max_bytes,
         "daemon log",
+        &mut stats,
+    );
+    // CLAUDE-268: sits directly under `logs/`, so the action walk below (which
+    // only descends into directories) never reaches it. Bounded explicitly, the
+    // same way `daemon.log` is.
+    bound_one(
+        &logs_dir.join(crate::config::USAGE_LOG),
+        cfg.usage_log_max_bytes,
+        "usage log",
         &mut stats,
     );
 
@@ -739,6 +752,7 @@ mod tests {
             // one axis they are about.
             daemon_log_max_bytes: 0,
             output_file_max_bytes: 0,
+            usage_log_max_bytes: 0,
             snippet_retention_days: 30,
             webhook_log_retention_days: 30,
         }
@@ -1061,11 +1075,16 @@ mod tests {
     }
 
     fn size_cfg(daemon_max: u64, output_max: u64) -> StreamLogGcConfig {
+        size_cfg_with_usage(daemon_max, output_max, 0)
+    }
+
+    fn size_cfg_with_usage(daemon_max: u64, output_max: u64, usage_max: u64) -> StreamLogGcConfig {
         StreamLogGcConfig {
             enabled: true,
             retention_days: 30,
             daemon_log_max_bytes: daemon_max,
             output_file_max_bytes: output_max,
+            usage_log_max_bytes: usage_max,
             snippet_retention_days: 30,
             webhook_log_retention_days: 30,
         }
@@ -1179,6 +1198,94 @@ mod tests {
 
     /// `0` is the documented opt-out for an operator who rotates the sink
     /// themselves; the master toggle parks the whole pass.
+    /// CLAUDE-268 AC: an oversized `usage.jsonl` comes back under its ceiling
+    /// and every surviving line is still a whole JSON record. A cut that landed
+    /// mid-object would leave the file unparseable, which is the specific way
+    /// this sweep could corrupt the thing it is bounding.
+    #[test]
+    fn oversized_usage_log_stays_parseable_newline_delimited_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("usage.jsonl");
+        let mut content = String::new();
+        for i in 0..4_000 {
+            content.push_str(&format!(
+                r#"{{"run_id":"run-{i}","action":"youtrack","exit_code":0,"cost_usd":0.0125,"tool_calls":{i}}}"#
+            ));
+            content.push('\n');
+        }
+        std::fs::write(&log, &content).unwrap();
+
+        let stats = sweep_oversized_logs(tmp.path(), &size_cfg_with_usage(0, 0, 10_000));
+
+        let after = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            after.len() as u64 <= 10_000,
+            "the usage log must be back under its ceiling, got {}",
+            after.len()
+        );
+        assert!(!after.is_empty(), "the sweep must keep the newest records");
+        assert!(
+            content.ends_with(&after),
+            "what remains must be the tail of what was there"
+        );
+
+        // The point of the test: every surviving line parses on its own.
+        let mut parsed = 0;
+        for line in after.lines() {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("surviving line is not whole JSON: {e}: {line}"));
+            assert!(v.get("run_id").is_some(), "record lost its run_id: {line}");
+            parsed += 1;
+        }
+        assert!(parsed > 0, "expected surviving records to parse");
+
+        // The predecessor keeps everything the truncation dropped.
+        let prev = std::fs::read_to_string(tmp.path().join("usage.jsonl.1")).unwrap();
+        assert_eq!(prev, content, "the predecessor is the full previous file");
+
+        assert_eq!(stats.bounded, 1);
+        assert_eq!(stats.kept, 0);
+    }
+
+    /// CLAUDE-268 AC: a usage log already inside its ceiling is left
+    /// byte-for-byte alone and grows no predecessor.
+    #[test]
+    fn usage_log_inside_its_ceiling_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("usage.jsonl");
+        let content = "{\"run_id\":\"run-1\",\"cost_usd\":0.01}\n";
+        std::fs::write(&log, content).unwrap();
+
+        let stats = sweep_oversized_logs(tmp.path(), &size_cfg_with_usage(0, 0, 10_000));
+
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), content);
+        assert!(!tmp.path().join("usage.jsonl.1").exists());
+        assert_eq!(stats.bounded, 0);
+        assert_eq!(stats.kept, 1);
+    }
+
+    /// CLAUDE-268: the usage log sits directly under `logs/`, so the
+    /// action-directory walk must not treat it as an `output.file` sink and
+    /// bound it against the wrong ceiling.
+    #[test]
+    fn the_usage_log_is_not_swept_as_an_action_output_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("usage.jsonl");
+        let content = numbered_lines(40_000);
+        std::fs::write(&log, &content).unwrap();
+
+        // A tight output-file ceiling and NO usage ceiling: if the walk reached
+        // the usage log it would truncate it here.
+        let stats = sweep_oversized_logs(tmp.path(), &size_cfg_with_usage(0, 100, 0));
+
+        assert_eq!(
+            std::fs::read(&log).unwrap(),
+            content,
+            "the usage log answers only to usage_log_max_bytes"
+        );
+        assert_eq!(stats.bounded, 0);
+    }
+
     #[test]
     fn a_zero_ceiling_and_a_disabled_config_bound_nothing() {
         let tmp = tempfile::tempdir().unwrap();

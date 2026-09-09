@@ -25,6 +25,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
+/// DEV-707's per-run usage record, directly under `logs/`. Shared with
+/// `crate::gc` so the writer's path and the sweep's target cannot drift apart
+/// (CLAUDE-268).
+pub const USAGE_LOG: &str = "usage.jsonl";
+
 /// Resolved on-disk locations. Computed once at startup.
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -80,7 +85,7 @@ impl Paths {
     /// DEV-707: the newline-delimited per-run usage record, one line per run,
     /// so runs are comparable over time without a provider console.
     pub fn usage_log(&self) -> PathBuf {
-        self.logs_dir().join("usage.jsonl")
+        self.logs_dir().join(USAGE_LOG)
     }
 }
 
@@ -624,6 +629,16 @@ pub struct StreamLogGcConfig {
     /// without bound. `0` disables the ceiling for operators who want the sink
     /// kept whole and rotate it themselves.
     pub output_file_max_bytes: u64,
+    /// CLAUDE-268: size ceiling, in bytes, for `logs/usage.jsonl` (DEV-707's
+    /// per-run token and cost record, one line per run).
+    ///
+    /// Bounded by SIZE like the two files above rather than by age: it is one
+    /// append-forever file, not a per-unit-of-work artifact, so there is no
+    /// dated entry an age sweep could expire. The ceiling is smaller than
+    /// theirs because a record is one short JSON object rather than a log
+    /// line, so this still holds far more history than anyone reads back. `0`
+    /// disables the ceiling and leaves the file unbounded.
+    pub usage_log_max_bytes: u64,
     /// CLAUDE-262: age, in days, past which a `snippets/<action>/<job_key>/`
     /// directory is deleted, measured from its last-modified time. One per job
     /// per scripted step (`filter` / `pre` / `prompt` / `post`), holding the
@@ -654,6 +669,10 @@ impl Default for StreamLogGcConfig {
             // rounding error next to the stream logs' ~1 GB window.
             daemon_log_max_bytes: 50 * 1024 * 1024,
             output_file_max_bytes: 50 * 1024 * 1024,
+            // CLAUDE-268: 8 MiB. At the ~300 bytes a usage record runs to that
+            // is on the order of 25,000 runs of history, far past what is read
+            // back, and a fraction of the two 50 MiB ceilings above.
+            usage_log_max_bytes: 8 * 1024 * 1024,
             // Same 30-day default as the stream logs: both are per-unit-of-work
             // artifacts with the same "recent failure still has its evidence"
             // shape, and there is no stated reason yet to diverge the windows.

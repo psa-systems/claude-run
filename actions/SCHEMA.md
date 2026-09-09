@@ -1118,7 +1118,7 @@ What bounds each path:
 - `logs/<name>/streams/*.jsonl`: age, `config.stream_log_gc.retention_days` (default 30). A log whose job is still in flight is kept at any age.
 - `snippets/<name>/<key>/`: age, `config.stream_log_gc.snippet_retention_days` (default 30). A directory whose job is still in flight is kept at any age, the same guard the stream logs use.
 - `webhook-logs/`: age, `config.stream_log_gc.webhook_log_retention_days` (default 30), applied to files directly under it. `webhook-logs/triage/`, the mint classifier's reused working directory, is never swept.
-- `logs/usage.jsonl`: nothing bounds this yet; it is one short line per run. This sweep does not cover it, and bounding it is tracked in CLAUDE-268.
+- `logs/usage.jsonl`: size, `config.stream_log_gc.usage_log_max_bytes` (default 8 MiB), same rollover to `usage.jsonl.1`. The truncation cuts at a line boundary, so what survives is still parseable newline-delimited JSON rather than a part-record (CLAUDE-268).
 
 Pause state and per-key accounting are NOT files here. Global pause is the `global_pause` flag and per-action pause the
 `paused_actions` table (`src/pause.rs`); attempt counters, daily counts, and daily cost are the `attempt_counters` and
