@@ -525,17 +525,18 @@ guard is unchanged, and the marker is never an escape hatch for a code task the 
 
 Two actions share `kind: youtrack` and partition the queued issues between them:
 
-- `actions/youtrack.yml` works code issues. Query: `-Resolved AI Agent: Queued project: -AUD`.
-- `actions/audit-run.yml` works read-only repository audits. Query: `-Resolved AI Agent: Queued project: AUD`.
+- `actions/youtrack.yml` works code issues. Query: `-Resolved AI Agent: Queued project: -AUDIT`.
+- `actions/audit-run.yml` works read-only repository audits. Query: `-Resolved AI Agent: Queued project: AUDIT`.
 
 The split exists because the handler resolves a job's repository from the triggering issue's project VCS processor, one
 project to one repo, and an audit writes its deliverable into a **different** repo from the one it reads. Audit issues
-live in the `AUD` project, whose processor points at the audits repo (e.g. `owner/audits`), so the handler clones the audits repo into the
+live in the `AUDIT` project, whose processor points at the audits repo (e.g. `owner/audits`), so the handler clones the audits repo into the
 job workdir and finalize opens the pull request there; the agent clones the audited repo read-only to a path outside the
 workdir and never writes to it. An audit issue picked up by the code-issue action would clone the audited repo and open
 a pull request against it, which is why the exclusion is not optional: both actions poll on the same interval, so
-without it the winner is a race. Note the query syntax - YouTrack rejects `-project: AUD` with a parse error, so the
-negation sits on the value (`project: -AUD`).
+without it the winner is a race. Note the query syntax - YouTrack rejects `-project: AUDIT` with a parse error, so the
+negation sits on the value (`project: -AUDIT`). Name the project by its short name `AUDIT`: `AUD` is a legacy alias
+YouTrack still resolves after the rename, but it appears in no project listing and must not be used in a query.
 
 `audit-run.yml` carries a full-replacement prompt (CLAUDE-125) rather than the built-in one, to permit exactly three
 tracker writes the default prompt forbids outright: the run-summary comment on the parent issue, a `## Result` block on
