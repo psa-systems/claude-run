@@ -394,6 +394,13 @@ pub struct ClaudeClassifier {
     cwd: PathBuf,
     stream_log: PathBuf,
     max_log_bytes: usize,
+    /// DEV-705: the ceiling ONE classification runs under, frozen at build time
+    /// from the runner defaults. A classification is a single tool-less,
+    /// bounded-log call, so it cannot grow its own context; the ceiling exists
+    /// so a runaway session still cannot spend without bound.
+    budget: crate::usage::RunBudget,
+    /// DEV-707: where each classification's usage record is appended.
+    usage_log: Option<PathBuf>,
 }
 
 impl ClaudeClassifier {
@@ -406,6 +413,8 @@ impl ClaudeClassifier {
         timeout: Duration,
         cwd: PathBuf,
         stream_log: PathBuf,
+        budget: crate::usage::RunBudget,
+        usage_log: Option<PathBuf>,
     ) -> Self {
         Self {
             invoker,
@@ -414,6 +423,8 @@ impl ClaudeClassifier {
             cwd,
             stream_log,
             max_log_bytes: DEFAULT_MAX_LOG_BYTES,
+            budget,
+            usage_log,
         }
     }
 
@@ -448,6 +459,13 @@ impl FailureClassifier for ClaudeClassifier {
         let prompt = self.build_prompt(input);
         // Classification is not cancellable on its own; a fresh token never trips.
         let cancel = CancellationToken::new();
+        // DEV-707: a fresh ledger per classification, so each one appends its own
+        // record rather than folding into the last.
+        let spend = crate::usage::RunSpend::new(
+            crate::web::webhooks::WEBHOOK_MINT_ACTION,
+            self.budget,
+            self.usage_log.clone(),
+        );
         let result = self.invoker.invoke(
             &prompt,
             &self.claude_cfg,
@@ -455,7 +473,13 @@ impl FailureClassifier for ClaudeClassifier {
             &self.cwd,
             &self.stream_log,
             &cancel,
+            // DEV-705: cap the child at this classification's ceiling.
+            Some(spend.remaining_usd()),
         )?;
+        // DEV-707: record the classification's tokens and cost, then close the
+        // record: one classification is one unit of spend, with no run row.
+        spend.record(&result);
+        spend.finish(None, spend.exit_code(crate::exit::OK));
         if !result.ok {
             // CLAUDE-146: surface the reason claude actually reported
             // (`result.summary`, built by `friendly_failure_summary`) instead
