@@ -79,10 +79,10 @@ native:
     # --query value the handler passes to `yt list`. Starts with `-Resolved`, which the handler sends as
     # `--query=<value>` so it is not mistaken for a flag.
     #
-    # `project: -AUD` excludes audit issues (CLAUDE-215): they are picked up by `audit-run.yml`, which clones the
+    # `project: -AUDIT` excludes audit issues (CLAUDE-215): they are picked up by `audit-run.yml`, which clones the
     # audits repo rather than the audited one, so a match here would clone the wrong repo and open a pull request
     # against it. Both actions poll on the same interval, so without the exclusion the winner is a race. The negation
-    # goes on the VALUE: YouTrack rejects `-project: AUD` with a parse error.
+    # goes on the VALUE: YouTrack rejects `-project: AUDIT` with a parse error.
     #
     # The reporting action (`closed-issue-summary.yml`, CLAUDE-218) is partitioned off the same way
     # but on the `AI Agent` axis rather than the project axis: this query pins the single value
@@ -92,7 +92,7 @@ native:
     # HTTP 400 rather than returning nothing, so spelling the reporting value out would break THIS
     # action's poll until someone added that value in YouTrack. `shipped_action_queries_are_disjoint`
     # in src/action.rs is the mechanical guard on the partition.
-    query: "-Resolved AI Agent: Queued project: -AUD"
+    query: "-Resolved AI Agent: Queued project: -AUDIT"
     custom_field: "AI Agent"
     # base_url / token_ref (CLAUDE-26): omitted here, so the host-configured yt CLI is used. To inject a token, set
     # base_url plus token_ref: <secret-name>.
