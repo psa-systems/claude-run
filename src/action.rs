@@ -832,6 +832,13 @@ pub struct CiFailureReconcileConfig {
     /// issue id and `{root_cause_key}` the shared marker. The hidden auto-closed
     /// marker is always appended (not part of the template).
     pub duplicate_comment: String,
+    /// The branch a code (non-infra) issue's close scope is measured against
+    /// (CLAUDE-265): closing such an issue requires a green run of its
+    /// `(repo, workflow_id, job_name)` on THIS branch, never any branch, so a
+    /// merged or deleted PR branch no longer strands the issue open forever. An
+    /// infra-keyed issue (carrying the CLAUDE-264 `Infra-Kind:` marker) ignores
+    /// this and closes on ANY branch going green. Default `"main"`.
+    pub default_branch: String,
 }
 
 impl Default for CiFailureReconcileConfig {
@@ -847,6 +854,7 @@ impl Default for CiFailureReconcileConfig {
             max_branch_resolves: 40,
             close_duplicates: true,
             duplicate_comment: "Auto-closed as a duplicate of {canonical}: both issues track the same failing job (root-cause key `{root_cause_key}`). Follow {canonical} for the fix.".to_string(),
+            default_branch: "main".to_string(),
         }
     }
 }
@@ -1807,6 +1815,8 @@ native:
         // CLAUDE-198: duplicate collapse is on unless the action turns it off.
         assert!(cfg.close_duplicates);
         assert!(cfg.duplicate_comment.contains("{canonical}"));
+        // CLAUDE-265: the default close-scope branch for a code issue.
+        assert_eq!(cfg.default_branch, "main");
     }
 
     #[test]
@@ -1825,6 +1835,7 @@ native:
   max_branch_resolves: 5
   close_duplicates: false
   duplicate_comment: \"Dup of {canonical}\"
+  default_branch: develop
 ";
         let loaded = validate_str(raw, "<candidate>").unwrap();
         let Some(NativeConfig::CiFailureReconcile(cfg)) = loaded.action.native else {
@@ -1845,6 +1856,7 @@ native:
         assert_eq!(cfg.max_branch_resolves, 5);
         assert!(!cfg.close_duplicates);
         assert_eq!(cfg.duplicate_comment, "Dup of {canonical}");
+        assert_eq!(cfg.default_branch, "develop");
 
         let bogus = format!("{raw}  bogus: nope\n");
         assert!(matches!(
