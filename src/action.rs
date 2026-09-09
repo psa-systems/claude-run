@@ -1440,7 +1440,7 @@ native:
         // which stays site-agnostic.
         assert_eq!(
             cfg.youtrack.query,
-            "-Resolved AI Agent: Queued project: -AUD"
+            "-Resolved AI Agent: Queued project: -AUDIT"
         );
         assert_eq!(cfg.youtrack.custom_field, "AI Agent");
         // Generic blocks stay on the Action, not in the native config.
@@ -1455,7 +1455,7 @@ native:
     }
 
     /// The shipped `actions/audit-run.yml` (CLAUDE-214): a second youtrack-kind
-    /// action whose only structural difference is the `AUD` query and the
+    /// action whose only structural difference is the `AUDIT` query and the
     /// full-replacement prompt that permits the three audit tracker writes.
     #[test]
     fn shipped_audit_run_action_is_native_and_round_trips() {
@@ -1477,7 +1477,7 @@ native:
         };
         assert_eq!(
             cfg.youtrack.query,
-            "-Resolved AI Agent: Queued project: AUD"
+            "-Resolved AI Agent: Queued project: AUDIT"
         );
         // The prompt override is the reason this action exists (CLAUDE-125).
         let prompt = cfg
@@ -1547,9 +1547,9 @@ native:
     /// an audit issue that means the wrong repo and a pull request against it.
     ///
     /// The queries execute server-side, so this asserts the static half: the
-    /// default action excludes `AUD` and the audit action selects only `AUD`.
-    /// Note the syntax - YouTrack rejects `-project: AUD` as a parse error, so
-    /// the negation has to sit on the value (`project: -AUD`).
+    /// default action excludes `AUDIT` and the audit action selects only `AUDIT`.
+    /// Note the syntax - YouTrack rejects `-project: AUDIT` as a parse error, so
+    /// the negation has to sit on the value (`project: -AUDIT`).
     #[test]
     fn shipped_youtrack_actions_partition_audit_issues() {
         fn query_of(raw: &str, path: &str) -> String {
@@ -1570,7 +1570,7 @@ native:
         );
 
         assert!(
-            default_query.contains("project: -AUD"),
+            default_query.contains("project: -AUDIT"),
             "default action must exclude the audit project, got {default_query:?}"
         );
         assert!(
@@ -1578,10 +1578,29 @@ native:
             "`-project:` is a YouTrack parse error; negate the value instead, got {default_query:?}"
         );
         assert!(
-            audit_query.contains("project: AUD") && !audit_query.contains("project: -AUD"),
+            audit_query.contains("project: AUDIT") && !audit_query.contains("project: -AUDIT"),
             "audit action must select only the audit project, got {audit_query:?}"
         );
         assert_ne!(default_query, audit_query);
+
+        // Both queries name the project by its real short name. `AUD` is a
+        // legacy alias YouTrack still resolves but lists nowhere.
+        fn project_value(q: &str) -> &str {
+            q.rsplit("project: ")
+                .next()
+                .expect("query names a project")
+                .split_whitespace()
+                .next()
+                .expect("project clause carries a value")
+                .trim_start_matches('-')
+        }
+        for q in [&default_query, &audit_query] {
+            assert_eq!(
+                project_value(q),
+                "AUDIT",
+                "name the audit project by its short name, not a legacy alias: {q:?}"
+            );
+        }
     }
 
     #[test]
