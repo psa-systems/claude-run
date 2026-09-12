@@ -50,6 +50,10 @@ pub const TABLES: &[&str] = &[
     "job_outcomes",
     "run_events",
     "run_inflight_jobs",
+    "ci_failures",
+    "ci_failure_tests",
+    "ci_failure_runs",
+    "agent_pull_requests",
 ];
 
 /// sqlx's own bookkeeping table. The target ran its own migration set before
@@ -66,6 +70,9 @@ const IDENTITY_COLUMNS: &[(&str, &str)] = &[
     ("job_outcomes", "id"),
     ("secrets", "id"),
     ("run_events", "id"),
+    ("ci_failures", "id"),
+    ("ci_failure_runs", "id"),
+    ("agent_pull_requests", "id"),
 ];
 
 /// How the import treats a target that already holds rows.
@@ -621,6 +628,60 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        let failure_id: i64 = sqlx::query_scalar(&q(
+            "INSERT INTO ci_failures (repo, workflow_id, job_name, infra_kind, issue_key, state, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        ))
+        .bind("contoso/claude-run")
+        .bind("checks.yml")
+        .bind("test")
+        .bind(None::<String>)
+        .bind("CLAUDE-1")
+        .bind("open")
+        .bind("2026-09-01T00:00:00Z")
+        .bind("2026-09-01T00:00:00Z")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(&q(
+            "INSERT INTO ci_failure_tests (failure_id, test_id) VALUES (?, ?)",
+        ))
+        .bind(failure_id)
+        .bind("lib::a_test")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(&q(
+            "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, pr_number, ts) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        ))
+        .bind(failure_id)
+        .bind(1i64)
+        .bind("abc123")
+        .bind("main")
+        .bind(None::<i64>)
+        .bind("2026-09-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(&q(
+            "INSERT INTO agent_pull_requests \
+             (action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ))
+        .bind("youtrack")
+        .bind("CLAUDE-1")
+        .bind("dev.a8n.run")
+        .bind("contoso/claude-run")
+        .bind(17i64)
+        .bind("fix/CLAUDE-1")
+        .bind(0i64)
+        .bind("open")
+        .bind("2026-09-01T00:00:00Z")
+        .bind("2026-09-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -723,6 +784,15 @@ mod tests {
              VALUES (5000, 5000, 'youtrack', '2026-09-01T00:00:00Z', 'info', 'seeded')",
             "INSERT INTO secrets (id, name, ciphertext, created_at) \
              VALUES (5000, 'other', X'0102', '2026-09-01T00:00:00Z')",
+            "INSERT INTO ci_failures (id, repo, workflow_id, job_name, state, created_at, updated_at) \
+             VALUES (5000, 'contoso/claude-run', 'checks.yml', 'other', 'open', \
+             '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
+            "INSERT INTO ci_failure_runs (id, failure_id, run_index, commit_sha, branch, ts) \
+             VALUES (5000, 5000, 1, 'abc123', 'main', '2026-09-01T00:00:00Z')",
+            "INSERT INTO agent_pull_requests \
+             (id, action_name, issue_key, host, repo, pr_number, head_branch, state, created_at, updated_at) \
+             VALUES (5000, 'youtrack', 'CLAUDE-9', 'dev.a8n.run', 'contoso/claude-run', 99, \
+             'fix/other', 'open', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
         ] {
             sqlx::query(sql).execute(&pool).await.unwrap();
         }
@@ -788,6 +858,63 @@ mod tests {
         .await
         .unwrap();
         assert!(secret_id > 5000, "next secret id was {secret_id}");
+
+        let failure_id: i64 = sqlx::query_scalar(&db::q(
+            &target,
+            "INSERT INTO ci_failures (repo, workflow_id, job_name, state, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        ))
+        .bind("contoso/claude-run")
+        .bind("checks.yml")
+        .bind("test")
+        .bind("open")
+        .bind("2026-09-02T00:00:00Z")
+        .bind("2026-09-02T00:00:00Z")
+        .fetch_one(&target)
+        .await
+        .unwrap();
+        assert!(failure_id > 5000, "next ci_failures id was {failure_id}");
+
+        let run_row_id: i64 = sqlx::query_scalar(&db::q(
+            &target,
+            "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, ts) \
+             VALUES (?, ?, ?, ?, ?) RETURNING id",
+        ))
+        .bind(failure_id)
+        .bind(2i64)
+        .bind("def456")
+        .bind("main")
+        .bind("2026-09-02T00:00:00Z")
+        .fetch_one(&target)
+        .await
+        .unwrap();
+        assert!(
+            run_row_id > 5000,
+            "next ci_failure_runs id was {run_row_id}"
+        );
+
+        let agent_pr_id: i64 = sqlx::query_scalar(&db::q(
+            &target,
+            "INSERT INTO agent_pull_requests \
+             (action_name, issue_key, host, repo, pr_number, head_branch, state, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        ))
+        .bind("youtrack")
+        .bind("CLAUDE-2")
+        .bind("dev.a8n.run")
+        .bind("contoso/claude-run")
+        .bind(100i64)
+        .bind("fix/CLAUDE-2")
+        .bind("open")
+        .bind("2026-09-02T00:00:00Z")
+        .bind("2026-09-02T00:00:00Z")
+        .fetch_one(&target)
+        .await
+        .unwrap();
+        assert!(
+            agent_pr_id > 5000,
+            "next agent_pull_requests id was {agent_pr_id}"
+        );
     }
 
     #[tokio::test]
