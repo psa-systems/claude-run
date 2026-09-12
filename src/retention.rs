@@ -39,6 +39,12 @@ pub struct RetentionTable {
 /// own single-column `ts` index (`idx_job_outcomes_ts` from migration 0017,
 /// `idx_run_events_ts` from migration 0018) so both share this exact helper,
 /// config, and loop.
+/// `ci_failure_runs` (CLAUDE-272) joins the same list: a run sighting is a
+/// per-occurrence history row, pruned the same way. The other three
+/// CI-failure tables (`ci_failures`, `ci_failure_tests`,
+/// `agent_pull_requests`) are deliberately absent: a resolved failure or a
+/// merged PR must still match a regression months later, so only the
+/// per-sighting history is bounded.
 pub const RETENTION_TABLES: &[RetentionTable] = &[
     RetentionTable {
         table: "job_outcomes",
@@ -46,6 +52,10 @@ pub const RETENTION_TABLES: &[RetentionTable] = &[
     },
     RetentionTable {
         table: "run_events",
+        ts_col: "ts",
+    },
+    RetentionTable {
+        table: "ci_failure_runs",
         ts_col: "ts",
     },
 ];
@@ -333,5 +343,110 @@ mod tests {
             "default retention ({}) must cover the 90-day report range",
             default.retention_days
         );
+    }
+
+    /// CLAUDE-272: `ci_failure_runs` rows older than the window are pruned,
+    /// like `job_outcomes` and `run_events`; the other three CI-failure tables
+    /// (`ci_failures`, `ci_failure_tests`, `agent_pull_requests`) are never
+    /// swept, because a resolved failure or a merged PR must still be
+    /// matchable against a regression months later.
+    #[tokio::test]
+    async fn prunes_ci_failure_runs_past_the_window_keeps_the_other_tables() {
+        let pool = pool().await;
+        let now = Utc::now();
+        let old = (now - Duration::days(200)).to_rfc3339();
+        let fresh = (now - Duration::days(10)).to_rfc3339();
+
+        let failure_id: i64 = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "INSERT INTO ci_failures (repo, workflow_id, job_name, state, created_at, updated_at) \
+             VALUES ('acme/widgets', 'checks.yml', 'test', 'open', ?, ?) RETURNING id",
+        ))
+        .bind(&old)
+        .bind(&old)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&crate::db::q(
+            &pool,
+            "INSERT INTO ci_failure_tests (failure_id, test_id) VALUES (?, ?)",
+        ))
+        .bind(failure_id)
+        .bind("lib::a")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&crate::db::q(
+            &pool,
+            "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, ts) \
+             VALUES (?, 1, 'abc', 'main', ?)",
+        ))
+        .bind(failure_id)
+        .bind(&old)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&crate::db::q(
+            &pool,
+            "INSERT INTO ci_failure_runs (failure_id, run_index, commit_sha, branch, ts) \
+             VALUES (?, 2, 'def', 'main', ?)",
+        ))
+        .bind(failure_id)
+        .bind(&fresh)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&crate::db::q(
+            &pool,
+            "INSERT INTO agent_pull_requests \
+             (action_name, issue_key, host, repo, pr_number, head_branch, state, created_at, updated_at) \
+             VALUES ('youtrack', 'CLAUDE-1', 'dev.a8n.run', 'acme/widgets', 1, 'fix/x', 'open', ?, ?)",
+        ))
+        .bind(&old)
+        .bind(&old)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let stats = sweep(&pool, &cfg(true, 180), now).await.unwrap();
+        assert_eq!(
+            stats.deleted, 1,
+            "only the aged ci_failure_runs row is pruned"
+        );
+
+        let runs: i64 = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT COUNT(*) FROM ci_failure_runs WHERE failure_id = ?",
+        ))
+        .bind(failure_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(runs, 1, "the in-window run survives");
+
+        let failures: i64 =
+            sqlx::query_scalar(&crate::db::q(&pool, "SELECT COUNT(*) FROM ci_failures"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(failures, 1, "ci_failures is never pruned by age");
+
+        let tests: i64 = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT COUNT(*) FROM ci_failure_tests",
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tests, 1, "ci_failure_tests is never pruned by age");
+
+        let prs: i64 = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT COUNT(*) FROM agent_pull_requests",
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(prs, 1, "agent_pull_requests is never pruned by age");
     }
 }
