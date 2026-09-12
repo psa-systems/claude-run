@@ -288,6 +288,13 @@ docker compose --profile postgres up --detach
 fresh, empty instance: no run history, no caps ledger, no stored secrets, and no web administrator, so the browser lands
 on `/setup` again. Move the data first with `claude-run import`.
 
+**Adding a table.** `migrations/sqlite/` is a chain (each file byte-identical once shipped, so an existing `state.db`
+matches its recorded checksums); `migrations/postgres/0001_init.sql` is a squash of that chain's end state, spelled per
+the type mapping at the top of that file. A schema change is therefore a new incremental file in EACH directory (e.g.
+`migrations/sqlite/0021_ci_failures.sql` and `migrations/postgres/0002_ci_failures.sql` for CLAUDE-272's CI-failure
+store), with the same end schema on both sides, never an edit to an existing file. `db::tests::the_two_migration_sets_end_on_the_same_schema`
+is what catches the two directories drifting apart.
+
 ### Importing an existing SQLite store (CLAUDE-251)
 
 `claude-run import` copies every table out of a SQLite state store and into the database the configuration resolves to,
@@ -433,7 +440,7 @@ The default is deliberately longer than the workdir GC's 14 days and shorter tha
 
 ## DB retention (CLAUDE-175)
 
-The history tables append forever: every job outcome (`job_outcomes`) and every poll-phase diagnostic (`run_events`) is written and nothing deletes them, so the state store grows without bound. An age-based retention prune (`src/retention.rs`) bounds that growth. A daemon sweep runs on `serve` start and then hourly, deleting rows whose stored `ts` is older than the configured window. The delete predicate is an index range seek on the per-table single-column `ts` index (`migrations/sqlite/0017_job_outcomes_ts_index.sql` for `job_outcomes`, `migrations/sqlite/0018_run_events_ts_index.sql` for `run_events`, and both indexes in `migrations/postgres/0001_init.sql`), so it never full-scans a large table. `job_outcomes` is the driver; `run_events` (CLAUDE-172) shares the same helper, config, and loop through the `RETENTION_TABLES` list rather than a divergent implementation.
+The history tables append forever: every job outcome (`job_outcomes`) and every poll-phase diagnostic (`run_events`) is written and nothing deletes them, so the state store grows without bound. An age-based retention prune (`src/retention.rs`) bounds that growth. A daemon sweep runs on `serve` start and then hourly, deleting rows whose stored `ts` is older than the configured window. The delete predicate is an index range seek on the per-table single-column `ts` index (`migrations/sqlite/0017_job_outcomes_ts_index.sql` for `job_outcomes`, `migrations/sqlite/0018_run_events_ts_index.sql` for `run_events`, and both indexes in `migrations/postgres/0001_init.sql`), so it never full-scans a large table. `job_outcomes` is the driver; `run_events` (CLAUDE-172) and `ci_failure_runs` (CLAUDE-272, one row per sighting of a CI failure) share the same helper, config, and loop through the `RETENTION_TABLES` list rather than a divergent implementation. The other three CI-failure tables (`ci_failures`, `ci_failure_tests`, `agent_pull_requests`) are never pruned: a resolved failure or a merged PR must still be matchable against a regression months later.
 
 The window is a DB-backed runtime setting edited on the **Settings** page (the `DB retention` section, or `GET` / `PUT /api/settings/db_retention`). Fields: `enabled` (master toggle, default `true`) and `retention_days` (default `180`). Edits apply on the next sweep. Set `enabled: false` to park the prune without losing the configured window.
 

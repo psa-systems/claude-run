@@ -3847,7 +3847,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "retention_days",
                 badge: "next sweep",
-                note: "age past which job_outcomes / run_events rows are pruned; must be >= 90 (the longest report range).",
+                note: "age past which job_outcomes / run_events / ci_failure_runs rows are pruned; must be >= 90 (the longest report range).",
             },
         ],
     }
