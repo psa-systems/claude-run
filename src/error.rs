@@ -49,6 +49,9 @@ pub enum Error {
     #[error("native action kind `{kind}` is not implemented yet")]
     NativeUnimplemented { kind: String },
 
+    #[error("action kind `{kind}` was retired in CLAUDE-270 and is no longer supported ({path})")]
+    ActionRetiredKind { kind: String, path: String },
+
     #[error("snippet {phase} failed (exit {exit_code}): {stderr}")]
     SnippetFailed {
         phase: String,

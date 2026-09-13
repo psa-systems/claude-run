@@ -949,34 +949,6 @@ fn native_source_key(action: &crate::action::Action) -> Option<String> {
             let base = cfg.youtrack.base_url.as_deref().unwrap_or("");
             Some(format!("youtrack\u{1f}{base}\u{1f}{}", cfg.youtrack.query))
         }
-        NativeConfig::ForgejoCiFix(cfg) => {
-            // Repos are a set: order in YAML is irrelevant to which PRs are
-            // gathered, so sort before joining to canonicalize the key.
-            let mut repos = cfg.repos.clone();
-            repos.sort();
-            Some(format!(
-                "forgejo-ci-fix\u{1f}{}\u{1f}{}",
-                cfg.host,
-                repos.join(",")
-            ))
-        }
-        NativeConfig::CiFailureAnalysis(cfg) => {
-            // Two analysis actions gather the same jobs iff they scan with the
-            // same query (the summary-prefix + analyzed-marker filtering is
-            // identical logic), so the query is the source key.
-            Some(format!("ci-failure-analysis\u{1f}{}", cfg.query))
-        }
-        NativeConfig::CiFailureReconcile(cfg) => {
-            // Two reconcilers gather the same work iff they scan the same issue
-            // query over the same repo set (order-irrelevant, so sorted).
-            let mut repos = cfg.repos.clone();
-            repos.sort();
-            Some(format!(
-                "ci-failure-reconcile\u{1f}{}\u{1f}{}",
-                cfg.query,
-                repos.join(",")
-            ))
-        }
         NativeConfig::ClosedIssueSummary(cfg) => {
             // Two reporters produce the same report iff they select the same
             // parents (nominated ids plus query) over the same project set. Both

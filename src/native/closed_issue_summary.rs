@@ -5,7 +5,7 @@
 //! the summary, and file it as a new issue hanging off a nominated parent
 //! (typically the milestone being reported against).
 //!
-//! Pipeline (typed Rust, mirroring [`crate::native::ci_failure_reconcile`]):
+//! Pipeline (typed Rust, mirroring [`crate::native::youtrack`]):
 //!
 //! - targets -> the union of `parents` (nominated by id) and the issues
 //!   `query` selects (skipped entirely when `query` is empty).

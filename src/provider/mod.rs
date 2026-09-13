@@ -163,9 +163,7 @@ pub struct IssueLink {
 }
 
 /// CLAUDE-189: an issue's body plus its comment texts, from
-/// `yt issue inspect --json`. Backs the ci-failure-analysis action, which parses
-/// the `## Failure` block out of `description` and detects its own hidden
-/// analyzed-marker (to stay idempotent) across `description` + `comments`.
+/// `yt issue inspect --json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IssueInspect {
     /// The issue's Markdown description / body.
@@ -206,8 +204,7 @@ pub trait IssueTracker: Send + Sync {
     fn issue_links(&self, key: &str) -> Result<Vec<IssueLink>>;
 
     /// CLAUDE-189: read an issue's description and comment texts via
-    /// `yt issue inspect --json`. Backs the ci-failure-analysis action's
-    /// coordinate parsing and idempotent analyzed-marker detection.
+    /// `yt issue inspect --json`.
     fn inspect_issue(&self, key: &str) -> Result<IssueInspect>;
 
     /// Resolve a project's enabled VCS integration to a clonable repo. Errors

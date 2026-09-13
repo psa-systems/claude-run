@@ -15,17 +15,14 @@
 //! [`crate::job::done_record`], [`crate::job::append_output_record`]) so its
 //! outcome records and JSONL output stay byte-identical to the scripted path.
 
-pub mod ci_failure_analysis;
-pub mod ci_failure_reconcile;
 pub mod closed_issue_summary;
-pub mod forgejo_ci_fix;
 pub mod youtrack;
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::action::{ActionKind, LoadedAction, LogTokenRef};
+use crate::action::{ActionKind, LoadedAction};
 use crate::cancel::RunRegistry;
 use crate::claude::ClaudeInvoker;
 use crate::concurrency::{KeyGate, Limiter};
@@ -83,13 +80,6 @@ fn handler_for(kind: ActionKind) -> Option<Box<dyn NativeHandler>> {
     match kind {
         ActionKind::Scripted => None,
         ActionKind::Youtrack => Some(Box::new(youtrack::YoutrackHandler)),
-        ActionKind::ForgejoCiFix => Some(Box::new(forgejo_ci_fix::ForgejoCiFixHandler)),
-        ActionKind::CiFailureAnalysis => {
-            Some(Box::new(ci_failure_analysis::CiFailureAnalysisHandler))
-        }
-        ActionKind::CiFailureReconcile => {
-            Some(Box::new(ci_failure_reconcile::CiFailureReconcileHandler))
-        }
         ActionKind::ClosedIssueSummary => {
             Some(Box::new(closed_issue_summary::ClosedIssueSummaryHandler))
         }
@@ -108,28 +98,6 @@ pub async fn dispatch(ctx: NativeContext<'_>) -> Result<()> {
     }
 }
 
-/// CLAUDE-200: the per-repo Forgejo log-token mapping a CI-failure handler runs
-/// with: the action's own mapping when it configures one, else the mapping
-/// derived from `config.webhook.sources`, so a token is rotated in one place. An
-/// unreadable webhook section yields an empty mapping (every repo skipped with a
-/// warning) rather than a wrong token.
-pub(crate) async fn effective_log_tokens(
-    pool: &DbPool,
-    paths: &Paths,
-    configured: Option<&LogTokenRef>,
-) -> LogTokenRef {
-    if let Some(tokens) = configured {
-        return tokens.clone();
-    }
-    match crate::settings::effective_webhook(pool, paths).await {
-        Ok(webhook) => LogTokenRef::from_webhook_sources(&webhook),
-        Err(e) => {
-            tracing::warn!(error = %e, "reading the webhook sources for the log-token fallback failed; no repo will resolve a token");
-            LogTokenRef::PerRepo(Vec::new())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,21 +110,6 @@ mod tests {
     #[test]
     fn youtrack_has_a_native_handler() {
         assert!(handler_for(ActionKind::Youtrack).is_some());
-    }
-
-    #[test]
-    fn forgejo_ci_fix_has_a_native_handler() {
-        assert!(handler_for(ActionKind::ForgejoCiFix).is_some());
-    }
-
-    #[test]
-    fn ci_failure_analysis_has_a_native_handler() {
-        assert!(handler_for(ActionKind::CiFailureAnalysis).is_some());
-    }
-
-    #[test]
-    fn ci_failure_reconcile_has_a_native_handler() {
-        assert!(handler_for(ActionKind::CiFailureReconcile).is_some());
     }
 
     #[test]

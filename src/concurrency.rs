@@ -236,9 +236,9 @@ impl Limiter {
 
     /// CLAUDE-162: acquire a global then per-action permit, in that fixed order,
     /// returning both owned permits (release together on drop). For a handler
-    /// that runs a sequential per-job loop rather than the parallel [`Executor`]
-    /// (e.g. `forgejo-ci-fix`), so its jobs are still bounded by the daemon-wide
-    /// caps across overlapping runs. The semaphores are never closed in this
+    /// that runs a sequential per-job loop rather than the parallel [`Executor`],
+    /// so its jobs are still bounded by the daemon-wide caps across overlapping
+    /// runs. The semaphores are never closed in this
     /// crate, so acquisition cannot fail.
     pub async fn acquire(
         &self,
