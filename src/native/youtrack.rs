@@ -1668,7 +1668,7 @@ fn install_hooks(workdir: &Path) {
 /// The URL to clone this job's repo from.
 ///
 /// CLAUDE-252: prefer the token-bearing URL the forge builds from its own key
-/// store, the same one `forgejo_ci_fix` and the comment webhook already use.
+/// store, the same one the comment webhook already uses.
 /// `job.clone_url` comes from the YouTrack VCS integration and carries no
 /// credential, so on a host with no git credential of its own (the container,
 /// deliberately) every clone failed with `could not read Username`.

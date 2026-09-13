@@ -356,10 +356,9 @@ struct InspectLinks {
     links: Vec<RawLink>,
 }
 
-/// CLAUDE-189: the `issue` + `comments` of `yt issue inspect --json`, for the
-/// ci-failure-analysis action. Only the description and each comment's text are
-/// consumed; `links` and the rest are ignored here (parsed separately by
-/// [`InspectLinks`]).
+/// CLAUDE-189: the `issue` + `comments` of `yt issue inspect --json`. Only the
+/// description and each comment's text are consumed; `links` and the rest are
+/// ignored here (parsed separately by [`InspectLinks`]).
 #[derive(Debug, Deserialize)]
 struct InspectBody {
     #[serde(default)]

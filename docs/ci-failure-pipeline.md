@@ -97,16 +97,9 @@ flowchart TD
     AM5 --> YT
     AM6 --> YT
 
-    subgraph SC ["scheduled actions, every 60s, independent of each other"]
-        YT --> A1["ci-failure-analysis: analyze the log (scheduled for retirement, CLAUDE-279 - superseded by the webhook's own AnalysisClassifier above)"]:::claude
-        A1 --> A2["comment root cause on the issue"]
-        YT --> R1{"ci-failure-reconcile: duplicate of an older open issue?"}
-        R1 -- yes --> R2["close as duplicate"]
-        R1 -- no --> R3{"job green again on main?"}
-        R3 -- yes --> R4["close issue"]
+    subgraph SC ["scheduled actions, independent of each other"]
         YT -- "AI Agent: Queued" --> Y1["youtrack: fix the code"]:::claude
         Y1 --> Y2["open PR"]
-        FP[("Forgejo: bot's own PRs with failing CI")] --> X1["forgejo-ci-fix: fix and push"]:::claude
     end
 
     Y2 -. "CI runs on the PR" .-> F
@@ -121,10 +114,7 @@ flowchart TD
 | Webhook ingest, store dedupe, and triage | `src/web/webhooks.rs`, `src/triage.rs` |
 | Close-on-merge (`pull_request` delivery) | `src/web/webhooks.rs`, `src/ci_failure/close.rs`, `src/forge_log.rs` (`CommitRunsClient`), `src/provider/cli.rs` |
 | Event-driven automerge (`success`/`recover` delivery) | `src/web/webhooks.rs` (`consume_action_success_events`), `src/native/youtrack.rs` (`complete_automerge`) |
-| At-ingest analysis (`AnalysisClassifier`), shared with the scheduled action below | `src/ci_failure/analysis.rs` |
+| At-ingest analysis (`AnalysisClassifier`) | `src/ci_failure/analysis.rs` |
 | Failing-test fingerprint and the `ci_failures` store | `src/ci_failure/fingerprint.rs`, `src/ci_failure/store.rs` |
 | Gates and issue creation (no dedupe)     | `src/mint.rs`                   |
-| ci-failure-analysis               | `src/native/ci_failure_analysis.rs`   |
-| ci-failure-reconcile              | `src/native/ci_failure_reconcile.rs`  |
 | youtrack                          | `src/native/youtrack.rs`              |
-| forgejo-ci-fix                    | `src/native/forgejo_ci_fix.rs`        |

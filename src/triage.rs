@@ -449,8 +449,9 @@ pub fn parse_analysis_verdict(reply: &str) -> Triage {
 /// [`bound_log`]-based classifier used) plus the failing workflow YAML, ending
 /// with a fenced JSON verdict ([`parse_analysis_verdict`]) that routes the
 /// failure. Replaces the old two-pass split (a tool-less classifier at ingest,
-/// a separate scheduled `ci-failure-analysis` over the full log later): the
-/// analysis and the routing decision now come from the SAME session, so the
+/// a separate scheduled deep-analysis action over the full log later, since
+/// retired in CLAUDE-279): the analysis and the routing decision now come from
+/// the SAME session, so the
 /// deep, log-grounded report is available before the issue is even minted.
 /// Any non-completion reply degrades to human review, same as the old
 /// classifier.

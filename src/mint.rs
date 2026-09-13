@@ -19,17 +19,17 @@
 //! mint    -> create in the mapped project, State=To do, attach the redacted log,
 //!            then route the bucket:
 //!              bucket 1 (code_fix)    -> AI Agent=Queued when the webhook's
-//!                                        `auto_fix` toggle is on (forgejo-ci-fix
-//!                                        CLAUDE-29 then picks it up and opens
-//!                                        the fix PR); off, the issue is still
-//!                                        created with no AI Agent write.
+//!                                        `auto_fix` toggle is on (the
+//!                                        `youtrack` action then picks it up
+//!                                        and opens the fix PR); off, the
+//!                                        issue is still created with no AI
+//!                                        Agent write.
 //!              bucket 2 (human_action)-> assign a human (no AI Agent, no PR)
 //! ```
 //!
-//! The `Dedupe-Key:` / `Root-Cause-Key:` / `Branch:` / `Job:` body markers are
-//! still written (`ci-failure-reconcile` reads them until it is retired onto
-//! the store too), but nothing in this module searches YouTrack for them
-//! anymore.
+//! The `Dedupe-Key:` body marker is still written (the legacy-adoption lookup
+//! searches YouTrack for it), but nothing else in this module searches
+//! YouTrack for a marker anymore.
 //!
 //! The minting logic is pure / trait-driven so it is unit-tested against a stub
 //! [`IssueTracker`] with no real `yt` calls. Wiring the chain (log fetch ->
@@ -155,7 +155,7 @@ pub enum MintOutcome {
 /// How a (non-transient) bucket routes once an issue is minted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Route {
-    /// Set `AI Agent = Queued` so forgejo-ci-fix (CLAUDE-29) opens the fix PR.
+    /// Set `AI Agent = Queued` so the `youtrack` action opens the fix PR.
     queue_for_fix: bool,
     /// Assign the configured human (bucket 2): no AI Agent, no PR.
     assign_human: bool,
@@ -556,9 +556,8 @@ pub fn mint(
     }
 
     // The markers below no longer drive a dedupe decision (CLAUDE-273 moved
-    // that to the `ci_failure` store), but `Dedupe-Key:` / `Root-Cause-Key:`
-    // are still written into the body because `ci-failure-reconcile` reads
-    // them until it is retired onto the store too.
+    // that to the `ci_failure` store), but `Dedupe-Key:` is still written into
+    // the body because the legacy-adoption lookup searches YouTrack for it.
     let primary = primary_marker(req);
     let secondary = secondary_marker(req);
     let root_cause = root_cause_marker(req);
@@ -587,9 +586,9 @@ pub fn mint(
     }
 
     // State first, then the authoritative AI Agent write last (bucket 1 only):
-    // forgejo-ci-fix only picks the issue up once it is fully formed. CLAUDE-273:
-    // `auto_fix_enabled` now decides only this write, never whether the issue
-    // gets created at all.
+    // the `youtrack` action only picks the issue up once it is fully formed.
+    // CLAUDE-273: `auto_fix_enabled` now decides only this write, never
+    // whether the issue gets created at all.
     tracker.set_state(&key, &cfg.target_state)?;
     if route.queue_for_fix && req.auto_fix_enabled {
         tracker.set_field(&key, &cfg.ai_agent_field, &cfg.queued_value)?;
@@ -652,13 +651,11 @@ fn autofix_label<'a>(detail: &'a crate::autofix::AutoFix, workflow_id: &'a str) 
 }
 
 /// Markdown issue body: the triage analysis, the run metadata, and the hidden
-/// dedupe / reconciler markers a later mint (and the CLAUDE-191 auto-close
-/// reconciler) searches for. `collapse` is the cross-run collapse key: the
-/// CLAUDE-190 root-cause key, or the CLAUDE-264 branch-agnostic infra key when
-/// an infrastructure condition was detected. It rides the `Dedupe-Key:` line (so
-/// a later run's `{collapse} #Unresolved` full-text search matches this issue)
-/// and is repeated as an explicit `Root-Cause-Key:` marker alongside `Branch:` /
-/// `Job:`.
+/// `Dedupe-Key:` marker the legacy-adoption lookup searches for. `collapse` is
+/// the cross-run collapse key: the CLAUDE-190 root-cause key, or the CLAUDE-264
+/// branch-agnostic infra key when an infrastructure condition was detected. It
+/// rides the `Dedupe-Key:` line, so a later run's `{collapse} #Unresolved`
+/// full-text search matches this issue.
 fn build_description(req: &MintRequest, primary: &str, secondary: &str, collapse: &str) -> String {
     // CLAUDE-104: an auto-fix failure gets an implementation-spec body (concrete
     // problem, fix command, new-branch + PR-vs-main delivery instruction) with
@@ -671,7 +668,7 @@ fn build_description(req: &MintRequest, primary: &str, secondary: &str, collapse
     } else {
         "No job log was available (transient miss); none attached."
     };
-    let mut lines = vec![
+    let lines = vec![
         "## Triage".to_string(),
         format!(
             "Bucket: `{}` (classified by {:?}).",
@@ -680,8 +677,8 @@ fn build_description(req: &MintRequest, primary: &str, secondary: &str, collapse
         String::new(),
         // CLAUDE-274: the analysis text now carries the AnalysisClassifier's
         // full log-grounded report (not just a short classification
-        // sentence), so it is capped here the same way the (now-retired)
-        // scheduled ci-failure-analysis capped its own comment.
+        // sentence), so it is capped here the same way the retired scheduled
+        // analysis action capped its own comment.
         crate::ci_failure::analysis::cap_comment(
             &req.triage.analysis,
             crate::ci_failure::analysis::DEFAULT_MAX_ANALYSIS_BYTES,
@@ -699,26 +696,7 @@ fn build_description(req: &MintRequest, primary: &str, secondary: &str, collapse
         "<!-- claude-run dedupe markers; do not edit -->".to_string(),
         format!("Dedupe-Key: {primary} {secondary} {collapse}"),
     ];
-    push_reconciler_markers(&mut lines, req, collapse);
     lines.join("\n")
-}
-
-/// CLAUDE-190: append the hidden reconciler markers under the dedupe-marker
-/// comment block. `Root-Cause-Key:` / `Branch:` / `Job:` let the auto-close
-/// reconciler (CLAUDE-191) find every issue for a `(repo, branch, workflow,
-/// job)` by full-text search, and the CLAUDE-198 duplicate-collapse groups on
-/// `Root-Cause-Key:`. CLAUDE-264: that marker carries whichever key the mint
-/// collapsed on, so an infra-keyed issue groups with its own siblings; the
-/// `Infra-Kind:` line (present only for an infra failure) makes such an issue
-/// identifiable without re-parsing the log. `Branch:` and `Job:` are unchanged,
-/// because the reconciler still reads them to auto-close.
-fn push_reconciler_markers(lines: &mut Vec<String>, req: &MintRequest, collapse: &str) {
-    lines.push(format!("Root-Cause-Key: {collapse}"));
-    lines.push(format!("Branch: {}", req.branch));
-    lines.push(format!("Job: {}", req.job_name));
-    if let Some(kind) = req.infra_kind {
-        lines.push(format!("Infra-Kind: {kind}"));
-    }
 }
 
 /// CLAUDE-104: the implementation-spec body for an auto-fixable failure. Names
@@ -790,7 +768,6 @@ fn build_auto_fix_description(
     lines.push(String::new());
     lines.push("<!-- claude-run dedupe markers; do not edit -->".to_string());
     lines.push(dedupe_keys);
-    push_reconciler_markers(&mut lines, req, collapse);
     lines.join("\n")
 }
 
@@ -1575,8 +1552,8 @@ mod tests {
     #[test]
     fn different_signatures_on_same_job_yield_distinct_root_cause_keys() {
         // The root-cause marker is still computed (it rides the `Dedupe-Key:`
-        // / `Root-Cause-Key:` body markers the reconciler reads), and a
-        // different signature on the same job still yields a distinct key.
+        // body marker the legacy-adoption lookup reads), and a different
+        // signature on the same job still yields a distinct key.
         let t = triage(TriageBucket::CodeFix);
         let a = req_with_sig("owner/repo", &t, "alice", "error[e#]: mismatched types");
         let b = req_with_sig("owner/repo", &t, "alice", "error[e#]: cannot find value");
@@ -1633,9 +1610,10 @@ mod tests {
     }
 
     #[test]
-    fn description_embeds_root_cause_branch_and_job_markers() {
-        // AC 7: the body carries hidden Root-Cause-Key / Branch / Job markers and
-        // the root-cause key rides the Dedupe-Key line (searchable).
+    fn description_embeds_the_dedupe_key_and_no_reconciler_markers() {
+        // The root-cause key rides the Dedupe-Key line (searchable by the
+        // legacy-adoption lookup). CLAUDE-279: the reconciler-only
+        // Root-Cause-Key / Branch / Job markers are no longer written.
         let t = triage(TriageBucket::CodeFix);
         let r = req_with_sig("owner/repo", &t, "alice", "boom");
         let p = primary_marker(&r);
@@ -1646,9 +1624,13 @@ mod tests {
             body.contains(&format!("Dedupe-Key: {p} {s} {rc}")),
             "{body}"
         );
-        assert!(body.contains(&format!("Root-Cause-Key: {rc}")), "{body}");
-        assert!(body.contains("Branch: main"), "{body}");
-        assert!(body.contains("Job: check"), "{body}");
+        assert!(!body.contains("Root-Cause-Key:"), "{body}");
+        // The hidden marker was a bare `Branch: main` / `Job: check` line (no
+        // backticks, unlike the visible `- Branch: \`main\`` line under
+        // `## Failure`, which stays).
+        assert!(!body.contains("Branch: main"), "{body}");
+        assert!(!body.contains("Job: check"), "{body}");
+        assert!(!body.contains("Infra-Kind:"), "{body}");
     }
 
     // ---- CLAUDE-264: branch-agnostic infrastructure collapse --------------
@@ -1728,22 +1710,23 @@ mod tests {
     }
 
     #[test]
-    fn infra_body_carries_the_infra_key_and_kind_markers() {
-        // The Root-Cause-Key marker holds the INFRA key (so the CLAUDE-198
-        // duplicate-collapse groups on it), plus an Infra-Kind marker; Branch
-        // and Job are untouched, because the reconciler reads them to close.
+    fn infra_body_carries_the_infra_key_in_the_dedupe_line_only() {
+        // The Dedupe-Key line's collapse segment holds the INFRA key, and no
+        // Root-Cause-Key / Infra-Kind / Branch / Job marker lines are written
+        // (CLAUDE-279 removed the reconciler-only markers).
         let t = triage(TriageBucket::HumanAction);
         let r = req_infra(&t, "disk-full", "feat/x", "aaaa1111");
         let infra = infra_marker(&r).unwrap();
-        let body = build_description(&r, &primary_marker(&r), &secondary_marker(&r), &infra);
-        assert!(body.contains(&format!("Root-Cause-Key: {infra}")), "{body}");
-        assert!(body.contains("Infra-Kind: disk-full"), "{body}");
-        assert!(body.contains("Branch: feat/x"), "{body}");
-        assert!(body.contains("Job: check"), "{body}");
+        let p = primary_marker(&r);
+        let s = secondary_marker(&r);
+        let body = build_description(&r, &p, &s, &infra);
         assert!(
-            !body.contains(&root_cause_marker(&r)),
-            "the branch-scoped key is replaced, not added: {body}"
+            body.contains(&format!("Dedupe-Key: {p} {s} {infra}")),
+            "{body}"
         );
+        assert!(!body.contains("Root-Cause-Key:"), "{body}");
+        assert!(!body.contains("Infra-Kind:"), "{body}");
+        assert!(!body.contains("Job: check"), "{body}");
     }
 
     #[test]
@@ -1753,9 +1736,14 @@ mod tests {
         let t = triage(TriageBucket::CodeFix);
         let r = req_with_sig("owner/repo", &t, "alice", "boom");
         let rc = root_cause_marker(&r);
-        let body = build_description(&r, &primary_marker(&r), &secondary_marker(&r), &rc);
+        let p = primary_marker(&r);
+        let s = secondary_marker(&r);
+        let body = build_description(&r, &p, &s, &rc);
         assert!(!body.contains("Infra-Kind:"), "{body}");
-        assert!(body.contains(&format!("Root-Cause-Key: {rc}")), "{body}");
+        assert!(
+            body.contains(&format!("Dedupe-Key: {p} {s} {rc}")),
+            "{body}"
+        );
     }
 
     // ---- CLAUDE-104: auto-fix minting -------------------------------------
