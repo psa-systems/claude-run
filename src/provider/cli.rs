@@ -557,19 +557,22 @@ impl CliBackend {
         match candidates.len() {
             1 => Ok(candidates.pop().unwrap()),
             0 => Err(Error::Other(anyhow::anyhow!(
-                // CLAUDE-193: state the condition, not an outcome the later
-                // `cleanup_or_preserve` decision can contradict.
+                // CLAUDE-193 / CLAUDE-281: state the condition, not an outcome
+                // the later `cleanup_or_preserve` decision can contradict: it
+                // is the one that checks the workdir and decides whether
+                // anything is preserved.
                 "no feature branch with commits ahead of `{base_ref}`; the agent \
                  produced no branch or no commits (base `{base_branch}`). Any \
-                 unpushed work in the workdir `{}` is preserved; branches already \
-                 pushed remain on the remote.",
+                 unpushed work in the workdir `{}` is preserved only if the \
+                 cleanup check finds it there; branches already pushed remain on \
+                 the remote regardless.",
                 workdir.display()
             ))),
             _ => Err(Error::Other(anyhow::anyhow!(
                 "multiple candidate feature branches ahead of `{base_ref}`: {}; \
                  refusing to guess which to open a PR for. Any unpushed work in \
-                 the workdir `{}` is preserved; branches already pushed remain on \
-                 the remote.",
+                 the workdir `{}` is preserved only if the cleanup check finds it \
+                 there; branches already pushed remain on the remote regardless.",
                 candidates.join(", "),
                 workdir.display()
             ))),
@@ -608,10 +611,11 @@ impl CliBackend {
     /// fail loudly naming both SHAs and the workdir. No `--force` /
     /// `--force-with-lease` is ever issued.
     ///
-    /// CLAUDE-193: the error text states the retention CONDITION ("any unpushed
-    /// work in the workdir is preserved; branches already pushed remain on the
-    /// remote"), never a flat outcome, because `cleanup_or_preserve` makes the
-    /// keep-or-delete decision later and can legitimately delete the directory.
+    /// CLAUDE-193 / CLAUDE-281: the error text states the retention CONDITION
+    /// ("preserved only if the cleanup check finds it there"), never a flat
+    /// outcome, because `cleanup_or_preserve` makes the keep-or-delete
+    /// decision later, from its own check of the workdir, and can legitimately
+    /// delete the directory.
     fn create_pr_branch(&self, workdir: &Path, host: &str, branch: &str) -> Result<PullRequest> {
         // Repo path (`owner/repo`) for the open-PR lookup, derived from the
         // workdir's `origin` remote (the form `list_open_prs` expects).
@@ -654,8 +658,8 @@ impl CliBackend {
                             "remote branch `{branch}` has diverged from the local work \
                              (local {local_sha}, remote {remote_sha}) and no open PR exists \
                              for it; refusing to force-push over it. Any unpushed work in the \
-                             workdir `{}` is preserved; branches already pushed remain on the \
-                             remote.",
+                             workdir `{}` is preserved only if the cleanup check finds it \
+                             there; branches already pushed remain on the remote regardless.",
                             workdir.display()
                         ))),
                         Err(e) => Err(Error::Other(anyhow::anyhow!(
@@ -663,7 +667,8 @@ impl CliBackend {
                              (local {local_sha}, remote {remote_sha}) and the open-PR lookup \
                              failed ({e}), so whether an open PR exists for it is UNKNOWN; \
                              refusing to force-push over it. Any unpushed work in the workdir \
-                             `{}` is preserved; branches already pushed remain on the remote.",
+                             `{}` is preserved only if the cleanup check finds it there; \
+                             branches already pushed remain on the remote regardless.",
                             workdir.display()
                         ))),
                     }
