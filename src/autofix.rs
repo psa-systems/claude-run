@@ -144,6 +144,7 @@ mod tests {
             // ignore this field, which is exactly the point - they route the
             // same regardless of `has_open_pr`.
             has_open_pr: false,
+            log_token: None,
         }
     }
 

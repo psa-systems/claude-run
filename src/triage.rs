@@ -14,16 +14,21 @@
 //!
 //! The engine is **hybrid**: a cheap deterministic [`triage_rules`] pass runs
 //! first and short-circuits clear transient/infra failures to bucket 3 with *no*
-//! LLM call. Only the residue it cannot label is handed to an [`FailureClassifier`]
+//! LLM call. Only the residue it cannot label is handed to a [`FailureClassifier`]
 //! (the LLM pass), which separates bucket 1 from bucket 2 and writes the analysis
 //! string. The classifier is a trait so tests inject a stub and never shell out;
-//! the production [`ClaudeClassifier`] reuses the existing [`ClaudeInvoker`]
-//! (`claude --print`) the runner already uses. Logs are bounded by [`bound_log`]
-//! before the call so a huge job log cannot blow the prompt budget.
+//! the production [`AnalysisClassifier`] (CLAUDE-274) reuses the existing
+//! [`ClaudeInvoker`] (`claude --print`) the runner already uses, running one
+//! tool-using session (`Read,Grep,Bash`) over the COMPLETE log plus the failing
+//! workflow YAML and ending with a fenced JSON verdict
+//! ([`parse_analysis_verdict`]). This replaces the old two-pass split (a
+//! tool-less classifier at ingest bounded by [`bound_log`], a separate scheduled
+//! deep analysis later): one session now produces both the routing decision and
+//! the analysis text the minted issue carries.
 //!
-//! This subtask delivers the engine and its types; wiring the result into the
-//! issue-minting step (and into [`crate::web::webhooks::consume_events`]) is a
-//! sibling subtask, so nothing here is called from the webhook consumer yet.
+//! Wiring the result into the issue-minting step is
+//! [`crate::web::webhooks::consume_events`], which runs each event's triage +
+//! mint under a worker pool bounded by `config.webhook.analysis_concurrency`.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -33,13 +38,16 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 
 use crate::action::ClaudeBlock;
 use crate::autofix::{self, AutoFix};
 use crate::cancel::CancellationToken;
+use crate::ci_failure::analysis::{self as analysis, AnalysisInputs, RunCoordinates};
 use crate::claude::ClaudeInvoker;
 use crate::config::AutoFixConfig;
 use crate::error::Result;
+use crate::forge_log::ForgeReads;
 
 /// Default cap (bytes) for the log text inlined into the classifier prompt.
 pub const DEFAULT_MAX_LOG_BYTES: usize = 48 * 1024;
@@ -179,6 +187,11 @@ pub struct TriageInput {
     /// Whether the failing branch has an open PR. Strong bucket-1-vs-2 signal
     /// passed to the classifier (bucket 1 needs a PR to fix).
     pub has_open_pr: bool,
+    /// CLAUDE-274: the resolved `log_token_ref` secret that authorized the log
+    /// fetch, carried through so [`AnalysisClassifier`] can fetch the failing
+    /// workflow YAML with the same credential. `None` reads it unauthenticated
+    /// (a public repo).
+    pub log_token: Option<String>,
 }
 
 /// Infra / transient signatures (lowercased substrings) that mark a bucket-3
@@ -351,68 +364,126 @@ fn take_suffix(s: &str, max: usize) -> &str {
     &s[start..]
 }
 
-/// Parse a classifier reply into a [`Triage`]. Reads the first JSON object in the
-/// reply (`{"bucket": "code_fix"|"human_action", "analysis": "..."}`) and degrades
-/// to [`TriageBucket::HumanAction`] on any malformed / unexpected reply, so a bad
-/// model response routes to a human instead of crashing.
-pub fn parse_classification(reply: &str) -> Triage {
-    if let Some(obj) = extract_json_object(reply) {
-        let analysis = obj
-            .get("analysis")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        match obj.get("bucket").and_then(Value::as_str) {
-            Some("code_fix") => return Triage::llm(TriageBucket::CodeFix, analysis),
-            Some("human_action") => return Triage::llm(TriageBucket::HumanAction, analysis),
+/// Find and parse the LAST balanced `{...}` JSON object in `s`, scanning
+/// backward from the final `}` and matching braces so a Markdown report
+/// (which may itself contain `{`/`}`, e.g. in a code block) before the fenced
+/// verdict does not corrupt the span. `None` when `s` has no `}` or the
+/// balanced span is not valid JSON.
+fn extract_last_json_object(s: &str) -> Option<Value> {
+    let bytes = s.as_bytes();
+    let end = s.rfind('}')?;
+    let mut depth = 0i32;
+    let mut start = None;
+    for (i, &b) in bytes[..=end].iter().enumerate().rev() {
+        match b {
+            b'}' => depth += 1,
+            b'{' => {
+                depth -= 1;
+                if depth == 0 {
+                    start = Some(i);
+                    break;
+                }
+            }
             _ => {}
         }
     }
-    Triage::llm(
-        TriageBucket::HumanAction,
-        "could not parse classifier reply; defaulting to human review",
-    )
-}
-
-/// Find and parse the first `{...}` JSON object in `s`.
-fn extract_json_object(s: &str) -> Option<Value> {
-    let start = s.find('{')?;
-    let end = s.rfind('}')?;
-    if end < start {
-        return None;
-    }
+    let start = start?;
     serde_json::from_str(&s[start..=end]).ok()
 }
 
-/// Production [`FailureClassifier`]: shells out to `claude --print` via the same
-/// [`ClaudeInvoker`] the runner uses, with a strict-JSON prompt over the bounded
-/// log. Any non-completion or unparseable reply degrades to human review.
-pub struct ClaudeClassifier {
+/// CLAUDE-274: the four verdicts [`AnalysisClassifier`]'s prompt asks for, and
+/// how each routes.
+const VERDICT_CODE_DEFECT: &str = "code_defect";
+const VERDICT_NEEDS_HUMAN: &str = "needs_human";
+const VERDICT_FLAKY: &str = "flaky";
+const VERDICT_INFRA: &str = "infra";
+
+/// Parse an [`AnalysisClassifier`] reply into a [`Triage`]. Reads the LAST
+/// JSON object in the reply (the fenced verdict [`analysis::build_prompt`]
+/// asks for at the end): `{"verdict": "code_defect"|"needs_human"|"flaky"|
+/// "infra", "failing_tests": [...], "summary": "..."}`. `code_defect` maps to
+/// [`TriageBucket::CodeFix`], `needs_human` to [`TriageBucket::HumanAction`],
+/// and `flaky` / `infra` both to [`TriageBucket::Transient`] (CLAUDE-274 step
+/// 3: neither warrants a fix PR, and the existing dedupe/reopen machinery
+/// already handles a flake resurfacing). An unparseable or missing verdict
+/// degrades to [`TriageBucket::HumanAction`] and logs at `warn` with a reply
+/// excerpt - it must NEVER silently become `code_fix`. The full Markdown
+/// report is kept as the analysis text (falling back to the parsed "summary"
+/// only when the whole reply is empty), so the issue carries the deep
+/// analysis, not just the one-line verdict summary.
+pub fn parse_analysis_verdict(reply: &str) -> Triage {
+    if let Some(obj) = extract_last_json_object(reply) {
+        if let Some(bucket) = obj
+            .get("verdict")
+            .and_then(Value::as_str)
+            .and_then(|v| match v {
+                VERDICT_CODE_DEFECT => Some(TriageBucket::CodeFix),
+                VERDICT_NEEDS_HUMAN => Some(TriageBucket::HumanAction),
+                VERDICT_FLAKY | VERDICT_INFRA => Some(TriageBucket::Transient),
+                _ => None,
+            })
+        {
+            let analysis_text = if reply.trim().is_empty() {
+                obj.get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                reply.trim().to_string()
+            };
+            return Triage::llm(bucket, analysis_text);
+        }
+    }
+    warn!(
+        reply_excerpt = %reply.chars().take(500).collect::<String>(),
+        "analysis reply carried no parseable verdict; routing to a human"
+    );
+    Triage::llm(
+        TriageBucket::HumanAction,
+        "the analysis reply carried no parseable verdict; routing to a human review",
+    )
+}
+
+/// CLAUDE-274: production [`FailureClassifier`]: one tool-using `claude`
+/// session per failure, over the COMPLETE log (not the bounded copy the old
+/// [`bound_log`]-based classifier used) plus the failing workflow YAML, ending
+/// with a fenced JSON verdict ([`parse_analysis_verdict`]) that routes the
+/// failure. Replaces the old two-pass split (a tool-less classifier at ingest,
+/// a separate scheduled `ci-failure-analysis` over the full log later): the
+/// analysis and the routing decision now come from the SAME session, so the
+/// deep, log-grounded report is available before the issue is even minted.
+/// Any non-completion reply degrades to human review, same as the old
+/// classifier.
+pub struct AnalysisClassifier {
     invoker: Arc<ClaudeInvoker>,
     claude_cfg: ClaudeBlock,
     timeout: Duration,
-    cwd: PathBuf,
-    stream_log: PathBuf,
-    max_log_bytes: usize,
+    /// `webhook-logs/analysis/`; each classification gets its own
+    /// `<owner>_<repo>-run<N>/` subdirectory, removed when the classification
+    /// returns (CLAUDE-274 step 6).
+    analysis_base_dir: PathBuf,
+    logs_dir: PathBuf,
+    fj: Arc<dyn ForgeReads>,
     /// DEV-705: the ceiling ONE classification runs under, frozen at build time
-    /// from the runner defaults. A classification is a single tool-less,
-    /// bounded-log call, so it cannot grow its own context; the ceiling exists
-    /// so a runaway session still cannot spend without bound.
+    /// from the runner defaults.
     budget: crate::usage::RunBudget,
     /// DEV-707: where each classification's usage record is appended.
     usage_log: Option<PathBuf>,
 }
 
-impl ClaudeClassifier {
-    /// Build a classifier. `stream_log` is the per-classification NDJSON log path
-    /// (see [`ClaudeInvoker::stream_log_path`]); `cwd` is the working directory
-    /// the classification runs in (no repo checkout is needed to classify).
+impl AnalysisClassifier {
+    /// Build a classifier. `analysis_base_dir` is `webhook-logs/analysis/`
+    /// (each call gets its own subdirectory under it); `logs_dir` is where the
+    /// per-classification NDJSON stream log lands (see
+    /// [`ClaudeInvoker::stream_log_path`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         invoker: Arc<ClaudeInvoker>,
         claude_cfg: ClaudeBlock,
         timeout: Duration,
-        cwd: PathBuf,
-        stream_log: PathBuf,
+        analysis_base_dir: PathBuf,
+        logs_dir: PathBuf,
+        fj: Arc<dyn ForgeReads>,
         budget: crate::usage::RunBudget,
         usage_log: Option<PathBuf>,
     ) -> Self {
@@ -420,43 +491,122 @@ impl ClaudeClassifier {
             invoker,
             claude_cfg,
             timeout,
-            cwd,
-            stream_log,
-            max_log_bytes: DEFAULT_MAX_LOG_BYTES,
+            analysis_base_dir,
+            logs_dir,
+            fj,
             budget,
             usage_log,
         }
     }
 
-    fn build_prompt(&self, input: &TriageInput) -> String {
-        let log = bound_log(&input.log, self.max_log_bytes);
-        [
-            "You are triaging a failed CI run for an automation system.".to_string(),
-            "Deterministic rules already ruled out transient/infra failures, so this is NOT transient.".to_string(),
-            "Classify it into exactly one of two buckets:".to_string(),
-            "  - \"code_fix\": a pull-request check failed and a code change on the PR branch will fix it.".to_string(),
-            "  - \"human_action\": no PR code change fixes it (a push to a protected/main branch, a tag/release/build-publish failure with no PR, a missing secret or config, or an infra change a human must make).".to_string(),
-            String::new(),
-            format!("repo: {}", input.repo),
-            format!("workflow: {}", input.workflow_id),
-            format!("commit: {}", input.commit_sha),
-            format!("run: {}", input.html_url),
-            format!("open PR for this branch: {}", input.has_open_pr),
-            String::new(),
-            "Failing job log (redacted, possibly truncated):".to_string(),
-            "---".to_string(),
-            log,
-            "---".to_string(),
-            String::new(),
-            "Reply with ONLY a JSON object: {\"bucket\": \"code_fix\" | \"human_action\", \"analysis\": \"<2-4 sentences: root cause and the suggested next step>\"}.".to_string(),
-        ]
-        .join("\n")
+    /// This classification's dedicated working directory,
+    /// `<owner>_<repo>-run<N>/` under `analysis_base_dir`.
+    fn event_dir(&self, coords: &RunCoordinates) -> PathBuf {
+        let slug = coords.repo.replace('/', "_");
+        self.analysis_base_dir
+            .join(format!("{slug}-run{}", coords.index_in_repo))
     }
 }
 
-impl FailureClassifier for ClaudeClassifier {
+impl FailureClassifier for AnalysisClassifier {
     fn classify(&self, input: &TriageInput) -> Result<Triage> {
-        let prompt = self.build_prompt(input);
+        let Some(index_in_repo) = analysis::run_index_from_url(&input.html_url) else {
+            warn!(html_url = %input.html_url, "could not derive the run number from the run URL; routing to a human");
+            return Ok(Triage::llm(
+                TriageBucket::HumanAction,
+                "could not derive the run number from the run URL; routing to a human",
+            ));
+        };
+        let coords = RunCoordinates {
+            repo: input.repo.clone(),
+            index_in_repo,
+            commit_sha: input.commit_sha.clone(),
+            workflow_id: input.workflow_id.clone(),
+            html_url: input.html_url.clone(),
+        };
+        let cwd = self.event_dir(&coords);
+        // CLAUDE-274 step 6: the directory is removed when the classification
+        // returns, on every exit path (an early `?` included), so a failure
+        // never leaks a live event's workdir. The redacted log artifact under
+        // `webhook-logs/` (a sibling of `analysis/`, written by the caller
+        // before triage ever runs) is untouched by this guard.
+        struct CleanupGuard(PathBuf);
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                if let Err(e) = std::fs::remove_dir_all(&self.0) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!(dir = %self.0.display(), error = %e, "removing the per-event analysis directory failed");
+                    }
+                }
+            }
+        }
+        if let Err(e) = std::fs::create_dir_all(&cwd) {
+            warn!(dir = %cwd.display(), error = %e, "creating the analysis workdir failed; routing to a human");
+            return Ok(Triage::llm(
+                TriageBucket::HumanAction,
+                format!("could not create the analysis workdir ({e}); routing to a human"),
+            ));
+        }
+        let _cleanup = CleanupGuard(cwd.clone());
+
+        let log_path = cwd.join("run.log");
+        if let Err(e) = std::fs::write(&log_path, &input.log) {
+            warn!(path = %log_path.display(), error = %e, "writing the run log for analysis failed; routing to a human");
+            return Ok(Triage::llm(
+                TriageBucket::HumanAction,
+                format!("could not write the run log for analysis ({e}); routing to a human"),
+            ));
+        }
+
+        // Best-effort workflow YAML + timing, same as the (now-retired) scheduled
+        // analysis: neither failure blocks the analysis, which proceeds over the
+        // log alone and says so.
+        let workflow_path = crate::forge_log::host_from_html_url(&input.html_url).and_then(|host| {
+            crate::forge_log::read_workflow_yaml(
+                self.fj.as_ref(),
+                &host,
+                &input.repo,
+                &input.commit_sha,
+                &input.workflow_id,
+                input.log_token.as_deref(),
+                &[],
+            )
+            .and_then(|yaml| {
+                let path = cwd.join("failing-workflow.yml");
+                match std::fs::write(&path, yaml) {
+                    Ok(()) => Some(path),
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "writing the failing workflow YAML failed; the analysis proceeds over the log alone");
+                        None
+                    }
+                }
+            })
+        });
+        let timing = crate::forge_log::host_from_html_url(&input.html_url).and_then(|host| {
+            match self
+                .fj
+                .run_timing(&host, &input.repo, coords.index_in_repo, input.log_token.as_deref())
+            {
+                Ok(t) => Some(t),
+                Err(reason) => {
+                    warn!(repo = %input.repo, run = coords.index_in_repo, %reason, "reading the run timing failed; the analysis states the timing is unavailable");
+                    None
+                }
+            }
+        });
+        let inputs = AnalysisInputs {
+            log_path,
+            workflow_path,
+            timing,
+        };
+        let prompt = analysis::build_prompt(&inputs, &coords);
+
+        let stream_log = ClaudeInvoker::stream_log_path(
+            &self.logs_dir,
+            "webhook-forgejo-analysis",
+            &format!("{}#{}", coords.repo, coords.index_in_repo),
+            1,
+        );
         // Classification is not cancellable on its own; a fresh token never trips.
         let cancel = CancellationToken::new();
         // DEV-707: a fresh ledger per classification, so each one appends its own
@@ -470,8 +620,8 @@ impl FailureClassifier for ClaudeClassifier {
             &prompt,
             &self.claude_cfg,
             self.timeout,
-            &self.cwd,
-            &self.stream_log,
+            &cwd,
+            &stream_log,
             &cancel,
             // DEV-705: cap the child at this classification's ceiling.
             Some(spend.remaining_usd()),
@@ -485,32 +635,27 @@ impl FailureClassifier for ClaudeClassifier {
             // (`result.summary`, built by `friendly_failure_summary`) instead
             // of the opaque `claude exited N`, so the minted issue names the
             // real cause. Fall back to `result.error` only when the summary is
-            // empty. Note whether the failing job log is attached, and flag a
-            // transient claude error (rate / usage limit) so the reader knows a
-            // re-run may classify cleanly rather than treating it as a CI bug.
+            // empty. Flag a transient claude error (rate / usage limit) so the
+            // reader knows a re-run may classify cleanly rather than treating it
+            // as a CI bug.
             let reason = if result.summary.trim().is_empty() {
                 result.error.trim().to_string()
             } else {
                 result.summary.trim().to_string()
             };
-            let log_note = if input.log_available {
-                "the failing job log is attached below for diagnosis"
-            } else {
-                "no failing job log was available"
-            };
             let transient_note = if result.transient {
-                " This looks like a transient claude error (e.g. rate / usage limit), not a CI problem; re-running triage may classify it cleanly."
+                " This looks like a transient claude error (e.g. rate / usage limit), not a CI problem; re-running may classify it cleanly."
             } else {
                 ""
             };
             return Ok(Triage::llm(
                 TriageBucket::HumanAction,
                 format!(
-                    "Automated classification did not complete ({reason}); routing to a human. For diagnosis, {log_note}.{transient_note}"
+                    "Automated analysis did not complete ({reason}); routing to a human.{transient_note}"
                 ),
             ));
         }
-        Ok(parse_classification(&result.summary))
+        Ok(parse_analysis_verdict(&result.summary))
     }
 }
 
@@ -555,6 +700,7 @@ mod tests {
             log: log.to_string(),
             log_available: true,
             has_open_pr: true,
+            log_token: None,
         }
     }
 
@@ -841,24 +987,187 @@ mod tests {
         assert!(bounded.chars().count() > 0);
     }
 
-    // ---- AC 2/4: parsing helper degrades on a bad reply ------------------
+    // ---- CLAUDE-274 AC 2: analysis verdict mapping, all four values plus an
+    // unparseable reply -----------------------------------------------------
 
     #[test]
-    fn parse_classification_reads_a_good_reply() {
-        let reply = r#"Here is my verdict:
-            {"bucket": "human_action", "analysis": "the release tag job failed; rotate the publish token"}"#;
-        let verdict = parse_classification(reply);
-        assert_eq!(verdict.bucket, TriageBucket::HumanAction);
+    fn analysis_verdict_maps_code_defect_to_code_fix() {
+        let reply = "## Root cause\nthe assertion is wrong.\n\n```json\n{\"verdict\": \"code_defect\", \"failing_tests\": [\"t\"], \"summary\": \"fix the assertion\"}\n```";
+        let verdict = parse_analysis_verdict(reply);
+        assert_eq!(verdict.bucket, TriageBucket::CodeFix);
         assert_eq!(verdict.classified_by, ClassifiedBy::Llm);
-        assert!(verdict.analysis.contains("publish token"));
+        assert!(verdict.analysis.contains("Root cause"));
     }
 
     #[test]
-    fn parse_classification_degrades_to_human_on_malformed_reply() {
-        for reply in ["not json at all {", "{\"bucket\": \"banana\"}", ""] {
-            let verdict = parse_classification(reply);
+    fn analysis_verdict_maps_needs_human_to_human_action() {
+        let reply =
+            "analysis\n```json\n{\"verdict\": \"needs_human\", \"summary\": \"rotate the token\"}\n```";
+        let verdict = parse_analysis_verdict(reply);
+        assert_eq!(verdict.bucket, TriageBucket::HumanAction);
+        assert_eq!(verdict.classified_by, ClassifiedBy::Llm);
+    }
+
+    #[test]
+    fn analysis_verdict_maps_flaky_and_infra_to_transient() {
+        for kind in ["flaky", "infra"] {
+            let reply =
+                format!("analysis\n```json\n{{\"verdict\": \"{kind}\", \"summary\": \"s\"}}\n```");
+            let verdict = parse_analysis_verdict(&reply);
+            assert_eq!(verdict.bucket, TriageBucket::Transient, "{kind}");
+            assert_eq!(verdict.classified_by, ClassifiedBy::Llm, "{kind}");
+        }
+    }
+
+    /// AC 2: an unparseable / missing verdict routes `human_action`, never
+    /// `code_fix`, and (separately, informally) logs at `warn`.
+    #[test]
+    fn analysis_verdict_degrades_to_human_action_on_an_unparseable_reply() {
+        for reply in [
+            "not json at all {",
+            "```json\n{\"verdict\": \"banana\", \"summary\": \"s\"}\n```",
+            "",
+            "some prose with a stray brace } but no object",
+        ] {
+            let verdict = parse_analysis_verdict(reply);
             assert_eq!(verdict.bucket, TriageBucket::HumanAction, "{reply:?}");
             assert_eq!(verdict.classified_by, ClassifiedBy::Llm, "{reply:?}");
         }
+    }
+
+    /// The verdict object is found even when the Markdown report before it
+    /// contains braces of its own (e.g. a code block), by scanning from the
+    /// end and matching braces rather than taking the first `{` in the reply.
+    #[test]
+    fn analysis_verdict_ignores_braces_in_the_report_body() {
+        let reply = "```rust\nfn f() { 1 }\n```\nsee above.\n```json\n{\"verdict\": \"code_defect\", \"summary\": \"s\"}\n```";
+        let verdict = parse_analysis_verdict(reply);
+        assert_eq!(verdict.bucket, TriageBucket::CodeFix);
+    }
+
+    // ---- CLAUDE-274 AC 1: AnalysisClassifier session shape -----------------
+
+    use crate::forge_log::{ActionLogClient, ActionRunsClient, RepoFileClient, RunLogsOutcome};
+
+    /// A [`ForgeReads`] stub with no workflow files and a timing error, so the
+    /// analysis proceeds over the log alone; the point of this test is the
+    /// `claude` invocation shape, not the forge reads.
+    struct NoForgeReads;
+    impl ActionLogClient for NoForgeReads {
+        fn run_logs(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _run_number: i64,
+            _token: Option<&str>,
+        ) -> RunLogsOutcome {
+            unreachable!("the analysis classifier never re-fetches the log")
+        }
+    }
+    impl ActionRunsClient for NoForgeReads {
+        fn list_runs(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _max_pages: u32,
+            _token: Option<&str>,
+        ) -> crate::forge_log::RunsListOutcome {
+            unreachable!("the analysis classifier never lists runs")
+        }
+        fn run_timing(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _run_number: i64,
+            _token: Option<&str>,
+        ) -> std::result::Result<crate::forge_log::RunTiming, String> {
+            Err("no timing in this test".to_string())
+        }
+    }
+    impl RepoFileClient for NoForgeReads {
+        fn read_file(
+            &self,
+            _host: &str,
+            _repo: &str,
+            path: &str,
+            _git_ref: &str,
+            _token: Option<&str>,
+        ) -> std::result::Result<String, String> {
+            Err(format!("no such file: {path}"))
+        }
+    }
+
+    /// AC 1: a failure with no store match runs exactly one analysis session
+    /// with the configured allowed tools, timeout, and a prompt naming the log
+    /// and workflow files. Asserted against a stub `claude` binary recording
+    /// its own argv and the prompt it was invoked with.
+    #[test]
+    fn analysis_classifier_invokes_claude_with_the_configured_session_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        let argv_file = dir.path().join("argv.txt");
+        let result_text =
+            "analysis done\n```json\n{\"verdict\": \"code_defect\", \"summary\": \"s\"}\n```";
+        let result_line = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": result_text,
+            "total_cost_usd": 0.1,
+        })
+        .to_string();
+        crate::testutil::write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\nprintf '%s\\n' '{result_line}'\nexit 0\n",
+                argv_file.display()
+            ),
+        );
+        let invoker = Arc::new(ClaudeInvoker::new(Some(stub.to_str().unwrap())));
+        let classifier = AnalysisClassifier::new(
+            invoker,
+            ClaudeBlock {
+                allowed_tools: Some("Read,Grep,Bash".to_string()),
+                ..ClaudeBlock::default()
+            },
+            Duration::from_secs(600),
+            dir.path().join("analysis"),
+            dir.path().join("logs"),
+            Arc::new(NoForgeReads),
+            crate::usage::RunBudget::new(1.0, 0.8),
+            None,
+        );
+        // The configured timeout, asserted on the struct directly: the actual
+        // wall-clock bound is enforced by the `timeout(1)` wrapper `invoke`
+        // shells out to, which is outside what this stub's own argv can see.
+        assert_eq!(classifier.timeout, Duration::from_secs(600));
+        let input = input_with_log("test foo ... FAILED");
+        let verdict = classifier.classify(&input).unwrap();
+        assert_eq!(verdict.bucket, TriageBucket::CodeFix);
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            argv.lines().any(|l| l == "--allowed-tools=Read,Grep,Bash"),
+            "allowed tools passed through, got:\n{argv}"
+        );
+        // The prompt is the trailing positional argument and itself spans many
+        // lines, so it is checked against the whole recorded argv text rather
+        // than a single line of it.
+        assert!(argv.contains("run.log"), "prompt names the log file");
+        assert!(
+            argv.contains("workflow YAML could not be fetched"),
+            "prompt says the workflow YAML is unavailable when the fetch misses"
+        );
+
+        // AC 6: the per-event analysis directory is gone once classification
+        // returns.
+        assert!(
+            !dir.path().join("analysis").exists()
+                || std::fs::read_dir(dir.path().join("analysis"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+            "the per-event analysis directory is removed after classification"
+        );
     }
 }
