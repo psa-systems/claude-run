@@ -2242,16 +2242,15 @@ fn cleanup_workdir(workdir: &Path) {
     crate::workdir::force_remove(workdir);
 }
 
-/// CLAUDE-105 / CLAUDE-281: true when [`crate::workdir::local_only_work`]
-/// finds a local branch tip the remote does not have under its own name -
-/// exactly the work deleting the directory would destroy. Any git or network
-/// failure errs toward `true`: preserving costs disk, a wrong delete costs the
-/// run. Deliberately branch-only (ignores a dirty tree / stash) to keep
-/// `crate::gc`'s age-based sweep decision, the other caller of this function,
-/// unchanged by this issue.
-pub(crate) fn has_unpushed_commits(workdir: &Path) -> bool {
+/// CLAUDE-105 / CLAUDE-281 / CLAUDE-284: true when [`crate::workdir::local_only_work`]
+/// finds anything a delete would destroy: a local branch tip the remote does
+/// not have under its own name, a dirty tracked/untracked tree, or a stash.
+/// Any git or network failure errs toward `true`: preserving costs disk, a
+/// wrong delete costs the run. Used by both `cleanup_or_preserve`'s per-job
+/// callers and `crate::gc`'s age-based sweep, so the two decisions agree.
+pub(crate) fn has_local_only_work(workdir: &Path) -> bool {
     match crate::workdir::local_only_work(workdir) {
-        Ok(w) => !w.unpushed_branches.is_empty(),
+        Ok(w) => !w.is_clean(),
         Err(_) => true,
     }
 }
@@ -2280,7 +2279,7 @@ enum WorkLocation {
 }
 
 fn work_location(workdir: &Path) -> WorkLocation {
-    // A failed query errs toward preserve, matching `has_unpushed_commits`.
+    // A failed query errs toward preserve, matching `has_local_only_work`.
     let work = match crate::workdir::local_only_work(workdir) {
         Ok(w) => w,
         Err(_) => return WorkLocation::PreservedWorkdir(workdir.to_path_buf()),
@@ -3700,7 +3699,7 @@ mod tests {
     fn workdir_with_unpushed_commits_is_preserved() {
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
-        assert!(has_unpushed_commits(dir.path()));
+        assert!(has_local_only_work(dir.path()));
         cleanup_or_preserve(dir.path(), "YouTrack", "MK-16");
         assert!(dir.path().exists(), "unpushed commits must survive cleanup");
     }
@@ -3718,12 +3717,64 @@ mod tests {
             base.path(),
             &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
         );
-        assert!(!has_unpushed_commits(&clone));
+        assert!(!has_local_only_work(&clone));
         cleanup_or_preserve(&clone, "YouTrack", "MK-16");
         assert!(
             !clone.exists(),
             "a workdir with no unpushed work is removed"
         );
+    }
+
+    #[test]
+    fn dirty_tree_with_no_unpushed_branch_counts_as_local_only_work() {
+        // CLAUDE-284: a workdir on a branch fully pushed under its own name
+        // (so no unpushed commit exists) but with an uncommitted change must
+        // still be reported as local-only work, since `crate::gc`'s age-based
+        // sweep uses exactly this predicate to decide whether a workdir past
+        // its retention window may be deleted.
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        repo_with_commit(&origin);
+        let clone = base.path().join("clone");
+        git_in(
+            base.path(),
+            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        set_identity(&clone);
+        std::fs::write(clone.join("f.txt"), "changed").unwrap();
+
+        assert!(
+            has_local_only_work(&clone),
+            "a dirty tree with no unpushed branch must still count as local-only work"
+        );
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        assert!(clone.exists(), "a dirty tree must survive cleanup");
+    }
+
+    #[test]
+    fn stash_with_no_unpushed_branch_counts_as_local_only_work() {
+        // CLAUDE-284: same shape as the dirty-tree case above, but for a
+        // stash with no corresponding unpushed branch.
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        repo_with_commit(&origin);
+        let clone = base.path().join("clone");
+        git_in(
+            base.path(),
+            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        set_identity(&clone);
+        std::fs::write(clone.join("f.txt"), "changed").unwrap();
+        git_in(&clone, &["stash"]);
+
+        assert!(
+            has_local_only_work(&clone),
+            "a stash with no unpushed branch must still count as local-only work"
+        );
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        assert!(clone.exists(), "a stash must survive cleanup");
     }
 
     // ---- CLAUDE-120: post-clone pre-commit hook install -----------------
@@ -3831,7 +3882,7 @@ mod tests {
         let clone = origin_and_single_branch_clone(base.path());
         git_in(&clone, &["checkout", "-b", "feat/x"]);
         git_in(&clone, &["push", "origin", "feat/x"]);
-        assert!(!has_unpushed_commits(&clone));
+        assert!(!has_local_only_work(&clone));
         cleanup_or_preserve(&clone, "YouTrack", "MK-16");
         assert!(!clone.exists(), "tip present on remote must be deleted");
     }
@@ -3845,7 +3896,7 @@ mod tests {
         std::fs::write(clone.join("new.txt"), "work").unwrap();
         git_in(&clone, &["add", "."]);
         git_in(&clone, &["commit", "-m", "feat: y"]);
-        assert!(has_unpushed_commits(&clone));
+        assert!(has_local_only_work(&clone));
         cleanup_or_preserve(&clone, "YouTrack", "MK-16");
         assert!(clone.exists(), "an unpushed commit must survive cleanup");
     }
@@ -3974,7 +4025,7 @@ mod tests {
             dir.path(),
             &["remote", "add", "origin", "/nonexistent/repo.git"],
         );
-        assert!(has_unpushed_commits(dir.path()));
+        assert!(has_local_only_work(dir.path()));
     }
 
     #[test]
