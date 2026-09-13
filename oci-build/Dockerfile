@@ -73,8 +73,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Runtime stage (CLAUDE-37): the daemon plus its full runtime toolchain in one
 # image. Based on the same musl rust-builder image so cargo/rust and the C
 # toolchain are present if a target-repo check needs them; the runtime tools
-# (nu, claude, yt, fj, timeout, git) are added and pinned via build args so the
-# image is reproducible instead of depending on whatever the operator installed.
+# (nu, claude, yt, fj, just, kingfisher, timeout, git) are added and pinned via
+# build args so the image is reproducible instead of depending on whatever the
+# operator installed.
 #
 # CLAUDE-247: the image is self-contained. It mounts nothing from the host, and
 # the operator logs claude / yt / fj / git in INSIDE the container, onto named
@@ -89,6 +90,14 @@ ARG FJ_VERSION=v0.15.0
 # CLAUDE-247: yt and fj come from this org's own Forgejo generic packages, which
 # publish prebuilt static binaries. Both are anonymous downloads.
 ARG PKG_BASE=https://dev.a8n.run/api/packages/pandoras-box/generic
+# CLAUDE-282: just and kingfisher come from the org's Dufs binary mirror. The
+# checksum is pinned here rather than read from Dufs' own `?hash` at build
+# time, because a hash served by the same host as the file verifies nothing.
+ARG BINARIES_BASE=https://files.example.com/public/linux/x86_64
+ARG JUST_VERSION=1.57.0
+ARG JUST_SHA256=8545d0880e84bbd6c9d6a5dc2681df2a6315455bc2a2f1d7bca52085d6adb8e3
+ARG KINGFISHER_VERSION=1.59.0
+ARG KINGFISHER_SHA256=ae94fdc3fad5ad18b39c7f3c0742a34b98f7359eea9eaa39c22ecc3129577155
 
 # Runtime dependencies:
 #   coreutils -> the `timeout(1)` wall-clock wrapper src/claude.rs delegates to
@@ -132,6 +141,26 @@ RUN cd /tmp \
     && install -m 0755 fj-linux-x86_64-static /usr/local/bin/fj \
     && rm -f fj-linux-x86_64-static fj-linux-x86_64-static.sha256 \
     && fj --help >/dev/null
+
+# just: the check-suite runner target repos are built against (src/native/youtrack.rs
+# step 6, "the repo's 'just check'"), from the org's Dufs binary mirror
+# (NiceGuyIT/binaries). Static musl binary, verified against its pinned checksum.
+RUN cd /tmp \
+    && curl -fsSLo just "${BINARIES_BASE}/just/${JUST_VERSION}/just" \
+    && echo "${JUST_SHA256}  just" | sha256sum -c \
+    && install -m 0755 just /usr/local/bin/just \
+    && rm -f just \
+    && just --version
+
+# kingfisher: the secret scanner org repos gate on (a8n-run/docker's
+# check-secrets recipe, another repo's justfile), from the same Dufs mirror.
+# Static musl binary, verified against its pinned checksum.
+RUN cd /tmp \
+    && curl -fsSLo kingfisher "${BINARIES_BASE}/kingfisher/${KINGFISHER_VERSION}/kingfisher" \
+    && echo "${KINGFISHER_SHA256}  kingfisher" | sha256sum -c \
+    && install -m 0755 kingfisher /usr/local/bin/kingfisher \
+    && rm -f kingfisher \
+    && kingfisher --version
 
 # claude-run itself, from the builder stage above.
 COPY --from=builder /build/target/release/claude-run /usr/local/bin/claude-run
