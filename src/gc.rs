@@ -7,21 +7,24 @@
 //! same tick and read their own DB-backed retention window.
 //!
 //! The YouTrack runner intentionally keeps some workdirs rather than deleting
-//! them: [`crate::native::youtrack`] preserves a directory that holds unpushed
-//! commits, and moves a leftover workdir aside (`<key>.kept-<n>`) out of the way
-//! of a fresh attempt. Nothing else ever deletes these, so preserved and aside
-//! workdirs accumulate without bound under
+//! them: [`crate::native::youtrack`] preserves a directory that holds
+//! local-only work (unpushed commits, a dirty tree, or a stash), and moves a
+//! leftover workdir aside (`<key>.kept-<n>`) out of the way of a fresh
+//! attempt. Nothing else ever deletes these, so preserved and aside workdirs
+//! accumulate without bound under
 //! `$CLAUDE_RUN_DATA_DIR/workdirs/<source>/<key>` (a single preserved Rust
 //! workdir can be tens of GB of `target/` output).
 //!
 //! [`sweep`] walks `<base>/*/*` and deletes any directory older than the
-//! configured retention window. A directory that still holds unpushed commits is
-//! respected (kept) until a separate, longer hard-cap age, so genuinely un-saved
-//! work is not discarded the moment the window passes. Every deletion is logged
-//! with action, key, path, age, and bytes reclaimed so a sweep is auditable.
+//! configured retention window. A directory that still holds local-only work
+//! (CLAUDE-281 / CLAUDE-284: unpushed commits, a dirty tracked/untracked
+//! tree, or a stash) is respected (kept) until a separate, longer hard-cap
+//! age, so genuinely un-saved work is not discarded the moment the window
+//! passes. Every deletion is logged with action, key, path, age, and bytes
+//! reclaimed so a sweep is auditable.
 //!
-//! The unpushed-commit predicate is injected (production passes
-//! [`crate::native::youtrack::has_unpushed_commits`]) so the decision logic is
+//! The local-only-work predicate is injected (production passes
+//! [`crate::native::youtrack::has_local_only_work`]) so the decision logic is
 //! testable without a real git repository.
 
 use std::collections::HashSet;
@@ -56,14 +59,20 @@ pub struct SweepStats {
 }
 
 /// Walk `<base>/<source>/<key>` and delete every workdir older than the
-/// retention window, keeping unpushed-commit workdirs until the longer hard cap.
+/// retention window, keeping workdirs holding local-only work (unpushed
+/// commits, a dirty tree, or a stash - CLAUDE-284) until the longer hard cap.
 ///
 /// `now` is injected (production passes [`SystemTime::now`]) so a test can age a
 /// directory by passing a future instant rather than mutating its mtime. A
 /// directory whose mtime is unreadable, or is newer than `now`, is treated as
 /// age zero (kept). Filesystem errors on individual entries are logged and
 /// skipped; the sweep never aborts the whole pass for one bad directory.
-pub fn sweep<F>(base: &Path, cfg: &WorkdirGcConfig, now: SystemTime, is_unpushed: F) -> SweepStats
+pub fn sweep<F>(
+    base: &Path,
+    cfg: &WorkdirGcConfig,
+    now: SystemTime,
+    has_local_only_work: F,
+) -> SweepStats
 where
     F: Fn(&Path) -> bool,
 {
@@ -109,14 +118,14 @@ where
                 stats.kept += 1;
                 continue;
             }
-            let unpushed = is_unpushed(&path);
-            if unpushed && age < hard_cap {
+            let local_only_work = has_local_only_work(&path);
+            if local_only_work && age < hard_cap {
                 debug!(
                     action = %action,
                     key = %key_name,
                     path = %path.display(),
                     age = %humantime::format_duration(whole_secs(age)),
-                    "workdir GC: kept; holds unpushed commits and is under the hard cap"
+                    "workdir GC: kept; holds local-only work and is under the hard cap"
                 );
                 stats.kept += 1;
                 continue;
@@ -130,7 +139,7 @@ where
                         path = %path.display(),
                         age = %humantime::format_duration(whole_secs(age)),
                         bytes_reclaimed = bytes,
-                        unpushed,
+                        local_only_work,
                         "workdir GC: deleted workdir older than the retention window"
                     );
                     stats.deleted += 1;

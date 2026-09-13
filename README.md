@@ -434,9 +434,10 @@ a fresh attempt. Nothing else ever deletes these, so preserved and aside workdir
 `$CLAUDE_RUN_DATA_DIR/workdirs/<source>/<key>` (a single preserved Rust workdir can be tens of GB of `target/` output).
 
 A time-based sweeper bounds that disk use. It runs on `serve` start and then hourly, walking `workdirs/*/*` and deleting
-any directory whose last-modified time is older than the retention window. A directory that still holds unpushed commits
-is respected (kept) until a separate, longer hard-cap age, so genuinely un-saved work is not discarded the moment the
-window passes. Every deletion logs the action, key, path, age, and bytes reclaimed, so a sweep is auditable.
+any directory whose last-modified time is older than the retention window. A directory that still holds local-only work
+(CLAUDE-281 / CLAUDE-284: unpushed commits, a dirty tracked/untracked tree, or a stash) is respected (kept) until a
+separate, longer hard-cap age, so genuinely un-saved work is not discarded the moment the window passes. Every deletion
+logs the action, key, path, age, and bytes reclaimed, so a sweep is auditable.
 
 The windows are a DB-backed runtime setting edited on the **Settings** page (the `Workdir GC` section, or `GET` /
 `PUT /api/settings/workdir_gc`). Fields: `enabled` (master toggle, default `true`), `retention_days` (default `14`), and
