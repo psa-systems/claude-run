@@ -11,7 +11,8 @@ flowchart TD
 
     subgraph WH ["webhook-forgejo"]
         W1{"run failed?"}
-        W1 -- "no: success, recover, cancelled" --> N1["ignored"]
+        W1 -- "no: cancelled" --> N1["ignored"]
+        W1 -- "no: success, recover" --> AM1
         W1 -- yes --> W2["fetch run logs"]
         W2 --> FP0["fingerprint failing tests"]
         FP0 --> PR1["resolve_open_pr: this commit's own open PR, if any"]
@@ -80,6 +81,22 @@ flowchart TD
     M6 --> YT
     M7 --> YT
 
+    subgraph WHAM ["webhook-forgejo: success/recover (CLAUDE-126, event-driven since CLAUDE-278, same endpoint, dispatched by payload.action)"]
+        AM1["find open PR matching this commit"]
+        AM1 -- "no match" --> AN1["ignored"]
+        AM1 -- match --> AM2{"agent_pull_requests row open for this PR?"}
+        AM2 -- no --> AN1
+        AM2 -- yes --> AM3{"that PR's action: automerge.enabled?"}
+        AM3 -- no --> AN1
+        AM3 -- yes --> AM4["fj pr status"]
+        AM4 -- "success, mergeable" --> AM5["merge_pr; State=state_done; comment; AI Agent=done"]
+        AM4 -- "success, not mergeable" --> AM6["comment: needs branch update; leave at Code Review"]
+        AM4 -- "pending / failure" --> AN1
+    end
+
+    AM5 --> YT
+    AM6 --> YT
+
     subgraph SC ["scheduled actions, every 60s, independent of each other"]
         YT --> A1["ci-failure-analysis: analyze the log (scheduled for retirement, CLAUDE-279 - superseded by the webhook's own AnalysisClassifier above)"]:::claude
         A1 --> A2["comment root cause on the issue"]
@@ -103,6 +120,7 @@ flowchart TD
 |-----------------------------------|---------------------------------------|
 | Webhook ingest, store dedupe, and triage | `src/web/webhooks.rs`, `src/triage.rs` |
 | Close-on-merge (`pull_request` delivery) | `src/web/webhooks.rs`, `src/ci_failure/close.rs`, `src/forge_log.rs` (`CommitRunsClient`), `src/provider/cli.rs` |
+| Event-driven automerge (`success`/`recover` delivery) | `src/web/webhooks.rs` (`consume_action_success_events`), `src/native/youtrack.rs` (`complete_automerge`) |
 | At-ingest analysis (`AnalysisClassifier`), shared with the scheduled action below | `src/ci_failure/analysis.rs` |
 | Failing-test fingerprint and the `ci_failures` store | `src/ci_failure/fingerprint.rs`, `src/ci_failure/store.rs` |
 | Gates and issue creation (no dedupe)     | `src/mint.rs`                   |
