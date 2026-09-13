@@ -372,7 +372,14 @@ impl Forge for GithubForge {
                         Ok(()) => {
                             return self
                                 .open_via_mcp(&repo, &branch, &base, &title, &body)
-                                .map_err(|e| pr_create_error(&repo, host, &branch, e))
+                                .map(|mut pr| {
+                                    // CLAUDE-275: GitHub PRs are always
+                                    // branch-backed; this is the branch just
+                                    // pushed above.
+                                    pr.head_branch = Some(branch.clone());
+                                    pr
+                                })
+                                .map_err(|e| pr_create_error(&repo, host, &branch, e));
                         }
                         Err(e) => tried.push(format!("mcp: {e}")),
                     }
@@ -381,6 +388,10 @@ impl Forge for GithubForge {
                     Ok(out) if out.ok => {
                         return self
                             .open_via_gh(workdir, &branch, &base, &title, &body)
+                            .map(|mut pr| {
+                                pr.head_branch = Some(branch.clone());
+                                pr
+                            })
                             .map_err(|e| pr_create_error(&repo, host, &branch, e))
                     }
                     Ok(out) => tried.push(format!("gh: --version exited {}", out.exit_code)),
@@ -566,6 +577,9 @@ fn parse_pr_from_mcp(result: &Value) -> Result<PullRequest> {
             return Ok(PullRequest {
                 number,
                 url: url.unwrap_or_default().to_string(),
+                // CLAUDE-275: filled in by the caller, which knows the branch it
+                // pushed; the MCP result carries no head-branch field of its own.
+                head_branch: None,
             });
         }
     }
@@ -609,7 +623,12 @@ fn parse_pr_from_gh(stdout: &str) -> PullRequest {
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         digits.parse::<u64>().ok()
     });
-    PullRequest { number, url }
+    PullRequest {
+        number,
+        url,
+        // CLAUDE-275: filled in by the caller, which knows the branch it pushed.
+        head_branch: None,
+    }
 }
 
 #[cfg(test)]
