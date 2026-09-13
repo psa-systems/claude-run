@@ -111,6 +111,13 @@ pub struct PullRequest {
     /// PR web URL as the forge CLI reported it (the `html_url` field of
     /// `fj pr create --json`).
     pub url: String,
+    /// CLAUDE-275: the server-side head branch this PR was opened from, when the
+    /// strategy produced one (the Forgejo branch strategy, and GitHub, which is
+    /// always branch-backed). `None` for the AGit strategy, which pushes to
+    /// `refs/for/<base>` and never creates a server branch, so a re-queued issue
+    /// has nothing to resume there.
+    #[serde(default)]
+    pub head_branch: Option<String>,
 }
 
 /// Direction of an issue link, mirroring the YouTrack REST `IssueLink.direction`
@@ -354,6 +361,14 @@ pub trait Forge: Send + Sync {
     fn take_notices(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// CLAUDE-275: record an operator-visible notice from OUTSIDE this backend
+    /// (the native handler, which knows about the `agent_pull_requests` store
+    /// this trait has no knowledge of), so a DB-write failure after a successful
+    /// `create_pr` surfaces through the same [`Self::take_notices`] /
+    /// `run_events` path as a lookup degradation rather than only the daemon
+    /// journal. The default is a no-op, matching a backend with no notice queue.
+    fn note(&self, _message: String) {}
 
     /// Resolve an authenticated clone URL for `repo` on `host` using the forge
     /// CLI's stored credentials (no token in YAML or env). `repo` is the

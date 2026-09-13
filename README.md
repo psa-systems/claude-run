@@ -60,6 +60,15 @@ the whole reason the comment listener is a separate section from `webhook`: the 
 write-scoped token. Per-command breakdown with the endpoint each call maps to: `actions/SCHEMA.md`, "Forgejo token
 scopes".
 
+**Resuming a PR on re-queue (CLAUDE-275).** Every PR the `youtrack` action opens is recorded in the `agent_pull_requests`
+table (`src/ci_failure/store.rs`), keyed on `(host, repo, pr_number)`. If its issue is re-queued (`AI Agent = Queued`
+again, e.g. after a CI failure sends it back) while that PR is still open, the runner clones its head branch instead of
+the default branch and tells the agent, in the prompt, to fix the issue on that same branch rather than opening a
+second PR; pushing to it lands on the existing PR through the same branch-strategy idempotency reconcile that already
+adopts a pre-existing remote branch. A PR that is no longer open is marked closed and pickup falls back to the default
+branch. The AGit PR strategy has no server branch to resume, so it always opens a fresh PR. See `actions/SCHEMA.md`,
+"Resuming an open PR on re-queue".
+
 ## Use
 
 ```nu
