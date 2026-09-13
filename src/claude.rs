@@ -77,6 +77,13 @@ pub struct ClaudeResult {
     /// surfaces it as a "Timed Out" outcome rather than "Failed". Always paired
     /// with `ok = false`.
     pub timed_out: bool,
+    /// CLAUDE-269: the CLI reported a structured `authentication_failed`, on
+    /// this invocation's own terminal event or via three-or-more
+    /// `system`/`api_retry` events. Always paired with `transient = true` (so
+    /// no attempt is spent) and `ok = false`. Callers that want to react
+    /// specifically (rather than just retry later, the generic transient path)
+    /// branch on this field.
+    pub login_required: bool,
 }
 
 impl ClaudeResult {
@@ -90,6 +97,7 @@ impl ClaudeResult {
             error: error.into(),
             transient: false,
             timed_out: false,
+            login_required: false,
         }
     }
 }
@@ -115,6 +123,12 @@ pub struct ClaudeInvoker {
     /// `ANTHROPIC_API_KEY`. `None` (the default and every test) leaves the
     /// child's auth to whatever its config dir holds.
     api_key: Option<crate::service_auth::ApiKeyHandle>,
+    /// CLAUDE-269: tripped when the CLI itself reports an authentication
+    /// failure, so the scheduler/dispatcher/webhooks stop starting new Claude
+    /// work until a fresh sign-in. `None` (the default and every test that does
+    /// not build one) means detection is a no-op: `invoke` still reports
+    /// `login_required` on the result, but nothing daemon-wide changes.
+    readiness: Option<crate::readiness::ReadinessGate>,
 }
 
 impl ClaudeInvoker {
@@ -125,6 +139,7 @@ impl ClaudeInvoker {
             config_dir: None,
             default_claude: None,
             api_key: None,
+            readiness: None,
         }
     }
 
@@ -149,6 +164,14 @@ impl ClaudeInvoker {
     /// agent config dir keeps working and takes over when no key is stored.
     pub fn with_api_key(mut self, handle: Option<crate::service_auth::ApiKeyHandle>) -> Self {
         self.api_key = handle;
+        self
+    }
+
+    /// CLAUDE-269: the readiness gate this invoker trips when the CLI reports
+    /// an authentication failure. A builder for the same reason `with_api_key`
+    /// is one: existing callers/tests stay unchanged with detection a no-op.
+    pub fn with_readiness(mut self, gate: crate::readiness::ReadinessGate) -> Self {
+        self.readiness = Some(gate);
         self
     }
 
@@ -378,6 +401,19 @@ impl ClaudeInvoker {
                 };
                 Ok((outcome, relay_error))
             })?;
+
+        // CLAUDE-269: the wait loop terminated the group after repeated
+        // authentication-retry events, well below `claude_timeout_seconds`.
+        // Finalize directly from that rather than the signal-induced exit
+        // code, and trip the readiness gate so nothing else starts new Claude
+        // work until a fresh sign-in.
+        if let Some(message) = &outcome.login_required_message {
+            if let Some(gate) = &self.readiness {
+                gate.trip_login_required(message.clone(), "invocation");
+            }
+            return Ok(login_required_result(message));
+        }
+
         let status = outcome.status;
 
         let exit_code = status.code().unwrap_or(-1);
@@ -444,6 +480,19 @@ impl ClaudeInvoker {
         // The exit-code / timeout path is reserved for runs where NO terminal
         // result was ever observed (a genuine hang or crash).
         if exit_code != 0 && !outcome.finalized_on_result {
+            // CLAUDE-269: a structured `authentication_failed`, anywhere in the
+            // stream (the terminal `result` event or an `assistant` event that
+            // preceded it), means the CLI itself is reporting the login is
+            // dead. Trip the gate and finalize as transient (no attempt spent)
+            // rather than falling into `classify_transient`'s rate-limit check,
+            // which would otherwise report this as a plain non-transient
+            // failure and burn one of the job's `max_attempts_per_key`.
+            if let Ok(Some(message)) = find_authentication_failure(stream_log) {
+                if let Some(gate) = &self.readiness {
+                    gate.trip_login_required(message.clone(), "invocation");
+                }
+                return Ok(login_required_result(&message));
+            }
             let summary = friendly_failure_summary(&final_event, stream_log);
             return Ok(ClaudeResult {
                 ok: false,
@@ -458,6 +507,7 @@ impl ClaudeInvoker {
                 transient: classify_transient(exit_code, &final_event),
                 // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
                 timed_out: exit_code == 124,
+                login_required: false,
             });
         }
 
@@ -475,6 +525,7 @@ impl ClaudeInvoker {
                 ),
                 transient: false,
                 timed_out: false,
+                login_required: false,
             });
         }
 
@@ -501,6 +552,7 @@ impl ClaudeInvoker {
             raw: final_event,
             transient: false,
             timed_out: false,
+            login_required: false,
         })
     }
 }
@@ -513,6 +565,11 @@ struct WaitOutcome {
     /// group. The caller must build the outcome from the captured result event,
     /// not from the signal-induced exit code.
     finalized_on_result: bool,
+    /// CLAUDE-269: set when the loop force-terminated the group after seeing
+    /// [`AUTH_RETRY_LIMIT`] `system`/`api_retry` events carrying
+    /// `"error":"authentication_failed"`, far below `claude_timeout_seconds`.
+    /// The caller finalizes directly from this rather than the exit code.
+    login_required_message: Option<String>,
 }
 
 /// Wait for the child to exit, watching `cancel` and the stream log. Returns the
@@ -548,6 +605,7 @@ fn wait_or_cancel(
             return Ok(WaitOutcome {
                 status,
                 finalized_on_result: false,
+                login_required_message: None,
             });
         }
         // Cancellation wins over the result-event path and terminates immediately.
@@ -556,6 +614,7 @@ fn wait_or_cancel(
             return Ok(WaitOutcome {
                 status,
                 finalized_on_result: false,
+                login_required_message: None,
             });
         }
         match result_deadline {
@@ -590,12 +649,110 @@ fn wait_or_cancel(
                     return Ok(WaitOutcome {
                         status,
                         finalized_on_result: true,
+                        login_required_message: None,
+                    });
+                }
+            }
+        }
+        // CLAUDE-269: no terminal result yet (the branch above only arms the
+        // grace timer once one lands), so also watch for repeated
+        // authentication-retry events. Three is assumed low enough that a
+        // single retry during a token-refresh race never trips this, while a
+        // genuinely dead login (which the CLI retries indefinitely, per the
+        // invalid-API-key case in the issue) is caught far below
+        // `claude_timeout_seconds` instead of waiting out the full timeout.
+        if result_deadline.is_none() {
+            if let Ok(count) = count_auth_retry_events(stream_log) {
+                if count >= AUTH_RETRY_LIMIT {
+                    let message = find_authentication_failure(stream_log)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "authentication_failed".to_string());
+                    warn!(
+                        pid = child.id(),
+                        pgid,
+                        count,
+                        "repeated authentication-retry events; terminating the process group rather than waiting out the timeout"
+                    );
+                    let status = terminate_group(child, pgid)?;
+                    return Ok(WaitOutcome {
+                        status,
+                        finalized_on_result: false,
+                        login_required_message: Some(message),
                     });
                 }
             }
         }
         std::thread::sleep(CANCEL_POLL);
     }
+}
+
+/// CLAUDE-269: the number of `system`/`api_retry` events carrying
+/// `"error":"authentication_failed"` observed before the child is
+/// force-terminated rather than left to exhaust `claude_timeout_seconds`. A
+/// single retry during a token-refresh race is not evidence of a dead login;
+/// three in a row is.
+const AUTH_RETRY_LIMIT: usize = 3;
+
+/// Count `system`/`api_retry` events in the stream log whose top-level `error`
+/// is `authentication_failed`. Detection keys ONLY on the structured `error`
+/// field, never on human-readable text, which the CLI rewords between
+/// releases.
+fn count_auth_retry_events(stream_log: &Path) -> std::io::Result<usize> {
+    let raw = std::fs::read_to_string(stream_log)?;
+    Ok(raw
+        .lines()
+        .filter(|line| {
+            let Ok(event) = serde_json::from_str::<Value>(line) else {
+                return false;
+            };
+            event.get("type").and_then(|v| v.as_str()) == Some("system")
+                && event.get("subtype").and_then(|v| v.as_str()) == Some("api_retry")
+                && event.get("error").and_then(|v| v.as_str()) == Some("authentication_failed")
+        })
+        .count())
+}
+
+/// CLAUDE-269: scan the whole stream log for the first event (of any type)
+/// whose top-level `error` is `authentication_failed`, and pull a
+/// human-readable message out of it for the operator-facing banner: the
+/// `result` string if present, else the concatenated text of an `assistant`
+/// message's content blocks, else the literal `authentication_failed`.
+/// Detection keys ONLY on the `error` field.
+fn find_authentication_failure(stream_log: &Path) -> std::io::Result<Option<String>> {
+    let raw = std::fs::read_to_string(stream_log)?;
+    for line in raw.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("error").and_then(|v| v.as_str()) != Some("authentication_failed") {
+            continue;
+        }
+        if let Some(result) = event.get("result").and_then(|v| v.as_str()) {
+            if !result.is_empty() {
+                return Ok(Some(result.to_string()));
+            }
+        }
+        if let Some(text) = event
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+        {
+            if !text.is_empty() {
+                return Ok(Some(text));
+            }
+        }
+        return Ok(Some("authentication_failed".to_string()));
+    }
+    Ok(None)
 }
 
 /// Whether the stream log contains a terminal `result` event. CLAUDE-107:
@@ -820,6 +977,31 @@ fn unreadable_log_summary(stream_log: &Path, err: &std::io::Error) -> String {
 ///
 /// `transient` is the load-bearing field: it is what keeps a runner-side I/O
 /// fault from spending one of the job's `max_attempts_per_key`.
+/// CLAUDE-269: the outcome reported when the CLI itself reported an
+/// authentication failure (a structured `authentication_failed`, on the
+/// terminal result, an `assistant` event, or repeated `api_retry` events).
+/// `transient` is the load-bearing field: it is what keeps a dead login from
+/// spending one of the job's `max_attempts_per_key`, exactly like the
+/// `relay_failure_result` / `read_failure_result` runner-fault outcomes above.
+/// `login_required` additionally lets a caller that wants to react
+/// specifically (rather than just retry later) branch on it.
+fn login_required_result(message: &str) -> ClaudeResult {
+    ClaudeResult {
+        ok: false,
+        summary: format!(
+            "Claude login required: {message}. Sign in again at Settings -> Auth; \
+             this attempt was not counted, so the job is picked up again once signed in."
+        ),
+        cost: 0.0,
+        usage: crate::usage::StreamUsage::default(),
+        raw: Value::Null,
+        error: format!("claude reported authentication_failed: {message}"),
+        transient: true,
+        timed_out: false,
+        login_required: true,
+    }
+}
+
 fn relay_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> ClaudeResult {
     ClaudeResult {
         ok: false,
@@ -843,6 +1025,7 @@ fn relay_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Clau
         transient: true,
         // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
         timed_out: exit_code == 124,
+        login_required: false,
     }
 }
 
@@ -875,6 +1058,7 @@ fn read_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Claud
         transient: true,
         // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
         timed_out: exit_code == 124,
+        login_required: false,
     }
 }
 
@@ -1061,6 +1245,101 @@ exit "$code"
         assert!(!res.transient, "a timeout is never transient");
     }
 
+    /// CLAUDE-269 acceptance criterion 1: a stub that emits an `assistant`
+    /// event with `"error":"authentication_failed"` and a terminal `result`
+    /// with `is_error: true`, exiting 1, makes `invoke` return `transient: true`
+    /// with `login_required` flagged, and trips the gate.
+    #[test]
+    fn invoke_detects_authentication_failed_and_trips_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"assistant\",\"error\":\"authentication_failed\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Failed to authenticate: OAuth session expired\"}]}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":true,\"error\":\"authentication_failed\"}'\n\
+             exit 1\n",
+        );
+
+        let readiness = crate::readiness::ReadinessGate::new(dir.path().to_path_buf(), None);
+        let invoker =
+            ClaudeInvoker::new(Some(stub.to_str().unwrap())).with_readiness(readiness.clone());
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let res = invoker
+            .invoke(
+                "hi",
+                &cfg,
+                Duration::from_secs(10),
+                dir.path(),
+                &log,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert!(res.transient, "an auth failure must not spend an attempt");
+        assert!(res.login_required, "login_required must be flagged");
+        assert!(!res.ok);
+        assert!(
+            readiness.is_login_required(),
+            "the readiness gate must be tripped"
+        );
+        assert_eq!(
+            readiness.check().kind,
+            Some(crate::readiness::NotReadyKind::LoginRequired)
+        );
+    }
+
+    /// CLAUDE-269 acceptance criterion 2: a stub that emits repeated
+    /// `system`/`api_retry` events with `"error":"authentication_failed"` and
+    /// never exits is terminated after the third such event, far below its
+    /// configured timeout.
+    #[test]
+    fn invoke_terminates_after_the_third_auth_retry_event_well_below_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             i=0\n\
+             while [ $i -lt 6 ]; do\n\
+               printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"api_retry\",\"error\":\"authentication_failed\"}'\n\
+               i=$((i+1))\n\
+               sleep 0.05\n\
+             done\n\
+             sleep 30\n",
+        );
+
+        let readiness = crate::readiness::ReadinessGate::new(dir.path().to_path_buf(), None);
+        let invoker =
+            ClaudeInvoker::new(Some(stub.to_str().unwrap())).with_readiness(readiness.clone());
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let start = Instant::now();
+        let res = invoker
+            .invoke(
+                "hi",
+                &cfg,
+                // Configured timeout the fix must beat by a wide margin.
+                Duration::from_secs(30),
+                dir.path(),
+                &log,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(res.transient);
+        assert!(res.login_required);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should terminate on the third retry, not wait out the 30s timeout (took {elapsed:?})"
+        );
+        assert!(readiness.is_login_required());
+    }
+
     const RESULT_LINE: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.42}"#;
 
     /// CLAUDE-165: when the invoker carries a `config_dir`, the spawned child
@@ -1132,6 +1411,7 @@ exit "$code"
             config_dir: None,
             default_claude: None,
             api_key: None,
+            readiness: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -1174,6 +1454,7 @@ exit "$code"
             config_dir: None,
             default_claude: None,
             api_key: None,
+            readiness: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -1233,6 +1514,7 @@ exit "$code"
             config_dir: None,
             default_claude: None,
             api_key: None,
+            readiness: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -1758,6 +2040,7 @@ exit "$code"
             config_dir: None,
             default_claude: None,
             api_key: None,
+            readiness: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -2080,6 +2363,7 @@ exit "$code"
             config_dir: None,
             default_claude: None,
             api_key: None,
+            readiness: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
@@ -2207,6 +2491,7 @@ exit "$code"
             config_dir: None,
             default_claude: None,
             api_key: None,
+            readiness: None,
         };
         let cancel = CancellationToken::new();
         let log = dir.path().join("stream.jsonl");
