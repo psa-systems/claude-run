@@ -4,6 +4,16 @@
 # Mirrors the local `just check` recipe. This stays a standalone workflow rather
 # than calling common's reusable check.yml, which hardcodes `cargo test --bins`
 # and would skip this crate's library-target unit tests; see PC-6.
+#
+# CLAUDE-286: the compile job is skipped when a push or pull request changes
+# only documentation (docs/**, README.md, CLAUDE.md). This is NOT a workflow-
+# level `paths-ignore`: Forgejo drops a workflow whose path filter does not
+# match before any run is created, so no status is posted, and branch
+# protection's required context pattern stays `pending` forever, blocking
+# every docs-only PR. Instead the `changes` job always runs (on the cheap base
+# runner) and the compile job's own `if:` skips it; a skipped job still posts
+# commit status `skipped`, which outranks `success` and satisfies the
+# required check.
 name: Check
 
 on:
@@ -15,7 +25,83 @@ on:
       - main
 
 jobs:
+  changes:
+    name: classify changed files
+    # Base image, not dev: this job only diffs file paths and compiles
+    # nothing (governance CI.md "Runner labels").
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: classify
+        shell: nu {0}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          let event = $env.EVENT_NAME
+          let base_ref = $env.BASE_REF
+          let before = $env.BEFORE
+
+          def is_doc [path: string] {
+              ($path starts-with "docs/") or ($path == "README.md") or ($path == "CLAUDE.md")
+          }
+
+          def diff_names [range: string] {
+              let result = (^git diff --name-only $range | complete)
+              if $result.exit_code != 0 {
+                  print --stderr $result.stderr
+                  exit 1
+              }
+              $result.stdout | lines | where {|it| $it != ""}
+          }
+
+          # push events where `before` is empty or all-zeros have no previous
+          # commit to diff against (e.g. the branch's first push); treat that
+          # as a code change rather than guessing.
+          let no_previous_commit = (
+              $event == "push"
+              and (($before | is-empty) or ($before == "0000000000000000000000000000000000000000"))
+          )
+
+          let changed = if $no_previous_commit {
+              []
+          } else if $event == "pull_request" {
+              let fetch = (^git fetch origin $base_ref | complete)
+              if $fetch.exit_code != 0 {
+                  print --stderr $fetch.stderr
+                  exit 1
+              }
+              # Three-dot diff against the merge base, matching Forgejo's own
+              # path-filter semantics.
+              diff_names "FETCH_HEAD...HEAD"
+          } else {
+              diff_names $"($before)...HEAD"
+          }
+
+          let code = if $no_previous_commit {
+              print "push event has no previous commit \(before is empty/all-zeros\); treating as code"
+              true
+          } else if ($changed | is-empty) {
+              true
+          } else {
+              not ($changed | all {|p| is_doc $p})
+          }
+
+          print $"changed files: ($changed)"
+          print $"code=($code)"
+          $"code=($code)\n" | save --append $env.GITHUB_OUTPUT
+
   check:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: fmt + clippy + build + tests
     # Dev image, not base: this job compiles natively, and base ships cargo/rustc but no
     # `cc`, so crate build scripts fail to link (CLAUDE-203). The sibling workflows only
