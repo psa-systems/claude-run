@@ -222,11 +222,16 @@ impl Daemon {
         // CLAUDE-239: the invoker also takes the live `config.claude` handle, so
         // an action with no `claude.model` inherits the global default and a
         // Settings save applies to the next invocation with no restart.
+        // CLAUDE-269: the invoker trips `readiness` on a structured
+        // `authentication_failed`, so every caller sharing this `Arc` (the
+        // dispatcher, the CI-triage classifier, the comment-webhook route)
+        // detects an expired/revoked login from its own invocations.
         let claude = Arc::new(
             ClaudeInvoker::new(self.on_disk.daemon.claude_binary.as_deref())
                 .with_config_dir(Some(agent_config_dir.clone()))
                 .with_default_claude(settings.claude_handle())
-                .with_api_key(Some(anthropic_key.clone())),
+                .with_api_key(Some(anthropic_key.clone()))
+                .with_readiness(readiness.clone()),
         );
 
         // CLAUDE-9: one registry shared between the dispatcher (which registers
@@ -298,7 +303,8 @@ impl Daemon {
             settings.webhook_rate_handle(),
             replay_window_secs,
             webhook_tx,
-        );
+        )
+        .with_readiness(readiness.clone());
         // CLAUDE-220: the `/claude` comment listener is a SECOND endpoint with
         // its own config section, write-scoped token, and Pause switch. It shares
         // the CI-failure listener's replay-store INSTANCE (so one delivery id
@@ -413,6 +419,7 @@ impl Daemon {
             defaults: crate::job::RunnerDefaults::default(),
             keygate: keygate.clone(),
             denials: Arc::new(crate::web::comment_webhooks::DenialReplyLimiter::new()),
+            readiness: Some(readiness.clone()),
         });
         let comment_consumer = tokio::spawn(crate::web::comment_webhooks::consume_commands(
             comment_rx,
@@ -444,7 +451,9 @@ impl Daemon {
             // CLAUDE-162: daemon-wide caps + continuous-pickup state.
             limiter,
             concurrency,
-            pause: crate::pause::PauseGate::new(pool.clone()),
+            // CLAUDE-269: attached so every `RunPause` this gate mints also
+            // stops a run when the Claude login needs renewing.
+            pause: crate::pause::PauseGate::new(pool.clone()).with_readiness(readiness.clone()),
             readiness: readiness.clone(),
             last_fire: Mutex::new(HashMap::new()),
         });
@@ -475,6 +484,22 @@ impl Daemon {
             self.paths.clone(),
             pool.clone(),
             settings.stream_log_gc_handle(),
+        ));
+
+        // CLAUDE-269: the status probe. Detects an expired/revoked login even
+        // between invocations (a quiet action, or an invalid API key, which
+        // never trips the invocation-side detection). Skipped entirely on the
+        // `always()` gate (no daemon holds it) and while unready for the
+        // no-credential reason (nothing to probe yet).
+        let login_probe_task = tokio::spawn(login_probe_loop(
+            readiness.clone(),
+            self.on_disk
+                .daemon
+                .claude_binary
+                .clone()
+                .unwrap_or_else(|| "claude".to_string()),
+            agent_config_dir.clone(),
+            anthropic_key.clone(),
         ));
 
         // Graceful shutdown on SIGINT (Ctrl-C), SIGTERM (service managers,
@@ -516,6 +541,7 @@ impl Daemon {
         gc_task.abort();
         retention_task.abort();
         stream_log_gc_task.abort();
+        login_probe_task.abort();
 
         // CLAUDE-11: cancel in-flight runs through the CLAUDE-9 path (child
         // terminated, `post` run with a synthesized cancelled result,
@@ -1759,6 +1785,90 @@ async fn stream_log_gc_loop(
     }
 }
 
+/// CLAUDE-269: how often the `claude auth status --json` probe runs while the
+/// daemon reads as ready.
+const LOGIN_PROBE_INTERVAL_READY_SECS: u64 = 600;
+/// How often it runs while login-required, so the daemon notices a fresh
+/// sign-in (from outside the web UI's own clear-on-success path, e.g. an
+/// operator running `claude auth login` by hand inside the container) sooner
+/// than the ready-state cadence.
+const LOGIN_PROBE_INTERVAL_LOGIN_REQUIRED_SECS: u64 = 60;
+
+/// CLAUDE-269: periodically probe whether the agent's own Claude login is
+/// still usable, independent of whether any action happens to invoke `claude`
+/// right now. Runs once immediately at serve start, then on a cadence that
+/// tightens while login-required so a fresh sign-in is noticed quickly.
+///
+/// Skipped on the `always()` gate (empty `agent_config_dir`: nothing holds
+/// this state, by construction) and while unready for the no-credential
+/// reason (there is no login to probe yet; probing then would only ever
+/// report `loggedIn: false` for a reason readiness already reports).
+async fn login_probe_loop(
+    readiness: crate::readiness::ReadinessGate,
+    claude_binary: String,
+    agent_config_dir: PathBuf,
+    api_key: crate::service_auth::ApiKeyHandle,
+) {
+    if agent_config_dir.as_os_str().is_empty() {
+        return;
+    }
+    loop {
+        login_probe_tick(&readiness, &claude_binary, &agent_config_dir, &api_key).await;
+        let interval = if readiness.is_login_required() {
+            LOGIN_PROBE_INTERVAL_LOGIN_REQUIRED_SECS
+        } else {
+            LOGIN_PROBE_INTERVAL_READY_SECS
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+    }
+}
+
+/// One pass of [`login_probe_loop`], factored out so it is unit-testable
+/// without driving an infinite loop. Skips the probe (and touches nothing)
+/// while the gate is unready for the no-credential reason: there is no login
+/// to probe yet, and probing then would only ever report `loggedIn: false` for
+/// a reason readiness already reports.
+async fn login_probe_tick(
+    readiness: &crate::readiness::ReadinessGate,
+    claude_binary: &str,
+    agent_config_dir: &Path,
+    api_key: &crate::service_auth::ApiKeyHandle,
+) {
+    let check = readiness.check();
+    if check.kind == Some(crate::readiness::NotReadyKind::NoCredential) {
+        return;
+    }
+    let key = match api_key.read() {
+        Ok(slot) => slot.clone(),
+        Err(e) => {
+            warn!(error = %e, "Anthropic key handle is poisoned; the probe runs without ANTHROPIC_API_KEY");
+            None
+        }
+    };
+    let binary = claude_binary.to_string();
+    let dir = agent_config_dir.to_path_buf();
+    let outcome = crate::blocking::in_place(move || {
+        crate::service_auth::probe_claude_login(&binary, &dir, key.as_deref())
+    });
+    match outcome {
+        crate::service_auth::LoginProbeOutcome::LoggedOut => {
+            readiness.trip_login_required(
+                "the status probe reports the Claude CLI is not logged in",
+                "probe",
+            );
+        }
+        crate::service_auth::LoginProbeOutcome::LoggedIn => {
+            readiness.clear_login_required();
+        }
+        crate::service_auth::LoginProbeOutcome::Indeterminate(reason) => {
+            // Neither logged in nor logged out: change nothing. A spawn
+            // failure, a timeout, or unparseable output must never be
+            // collapsed into either answer.
+            tracing::error!(reason = %reason, "Claude login status probe inconclusive; leaving readiness unchanged");
+        }
+    }
+}
+
 async fn scheduler_loop(
     dispatch: Arc<Dispatcher>,
     _trigger_tx: mpsc::Sender<String>,
@@ -1921,6 +2031,72 @@ mod tests {
             state_dir: dir.to_path_buf(),
             runtime_dir: dir.to_path_buf(),
         }
+    }
+
+    /// CLAUDE-269: a `loggedIn: false` probe trips the gate; a subsequent
+    /// `loggedIn: true` clears it.
+    #[tokio::test]
+    async fn login_probe_tick_trips_and_clears_the_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".credentials.json"), "{}").unwrap();
+        let readiness = crate::readiness::ReadinessGate::new(tmp.path().to_path_buf(), None);
+        assert!(readiness.check().ready);
+
+        let stub = tmp.path().join("claude-stub.sh");
+        crate::testutil::write_stub(&stub, "#!/bin/sh\nprintf '%s' '{\"loggedIn\":false}'\n");
+        let key: crate::service_auth::ApiKeyHandle = Arc::new(std::sync::RwLock::new(None));
+        login_probe_tick(&readiness, stub.to_str().unwrap(), tmp.path(), &key).await;
+        assert!(!readiness.check().ready);
+        assert_eq!(
+            readiness.check().kind,
+            Some(crate::readiness::NotReadyKind::LoginRequired)
+        );
+
+        crate::testutil::write_stub(&stub, "#!/bin/sh\nprintf '%s' '{\"loggedIn\":true}'\n");
+        login_probe_tick(&readiness, stub.to_str().unwrap(), tmp.path(), &key).await;
+        assert!(readiness.check().ready);
+    }
+
+    /// The probe is skipped entirely while unready for the no-credential
+    /// reason: there is no login to probe, and the stub would fail loudly if
+    /// it were ever invoked (no canned behavior needed to prove the skip).
+    #[tokio::test]
+    async fn login_probe_tick_skips_the_probe_with_no_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No `.credentials.json`: the gate reads not-ready for `NoCredential`.
+        let readiness = crate::readiness::ReadinessGate::new(tmp.path().to_path_buf(), None);
+        assert_eq!(
+            readiness.check().kind,
+            Some(crate::readiness::NotReadyKind::NoCredential)
+        );
+
+        let key: crate::service_auth::ApiKeyHandle = Arc::new(std::sync::RwLock::new(None));
+        // A binary that does not exist: if the tick tried to probe, it would
+        // still resolve to `Indeterminate` (a spawn failure) rather than
+        // panicking, so this alone would not prove the skip. The real proof is
+        // the kind staying `NoCredential` (a probe outcome never sets that
+        // kind) with no `login_required` state ever appearing.
+        login_probe_tick(&readiness, "/nonexistent/claude-binary", tmp.path(), &key).await;
+        assert!(!readiness.is_login_required());
+        assert_eq!(
+            readiness.check().kind,
+            Some(crate::readiness::NotReadyKind::NoCredential)
+        );
+    }
+
+    /// An indeterminate probe outcome (unparseable output) changes nothing.
+    #[tokio::test]
+    async fn login_probe_tick_leaves_state_unchanged_on_an_indeterminate_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".credentials.json"), "{}").unwrap();
+        let readiness = crate::readiness::ReadinessGate::new(tmp.path().to_path_buf(), None);
+        let stub = tmp.path().join("claude-stub.sh");
+        crate::testutil::write_stub(&stub, "#!/bin/sh\nprintf 'garbage'\nexit 1\n");
+        let key: crate::service_auth::ApiKeyHandle = Arc::new(std::sync::RwLock::new(None));
+
+        login_probe_tick(&readiness, stub.to_str().unwrap(), tmp.path(), &key).await;
+        assert!(readiness.check().ready, "unchanged: still ready");
+        assert!(!readiness.is_login_required());
     }
 
     #[test]
@@ -2351,6 +2527,65 @@ mod tests {
             broke,
             crate::exit::OVER_BUDGET,
             "a run with nothing left to spend exits non-zero"
+        );
+    }
+
+    /// CLAUDE-269 acceptance criterion 3: a job whose invocation hits the
+    /// authentication failure spends no attempt against
+    /// `max_attempts_per_key` and runs no `post`, through the scripted (job.rs)
+    /// transient path.
+    #[tokio::test]
+    async fn a_scripted_job_hitting_auth_failure_spends_no_attempt_and_skips_post() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let pool = crate::db::open_sqlite(&paths.state_db()).await.unwrap();
+        let snippet = SnippetRunner::new(None);
+
+        let stub = tmp.path().join("claude-stub.sh");
+        crate::testutil::write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"assistant\",\"error\":\"authentication_failed\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"OAuth session expired\"}]}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":true,\"error\":\"authentication_failed\"}'\n\
+             exit 1\n",
+        );
+        // The post step writes a marker file only if it ran, so its ABSENCE
+        // proves post was skipped (the transient path, not merely a passing
+        // assertion on the return value).
+        let post_marker = tmp.path().join("post-ran");
+        // `sh`, not `nu`: the `just pre-commit` image has no `nu` (see snippet.rs tests).
+        let raw = format!(
+            "name: t\ninput:\n  command:\n    run: printf '[{{}}]'\n    shell: sh\nprompt:\n  run: echo hi\n  shell: sh\npost:\n  - run: touch '{}'\n    shell: sh\n",
+            post_marker.display()
+        );
+        let loaded = crate::action::validate_str(&raw, "<test>").unwrap();
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+
+        let exit_code = run_action_inner(
+            &loaded,
+            &paths,
+            &pool,
+            Arc::new(snippet),
+            Arc::new(claude),
+            "test",
+            None,
+            &KeyGate::new(),
+            &Limiter::new(1),
+            &crate::pause::PauseGate::never(),
+            &GatherGate::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(exit_code, crate::exit::OK, "the run itself is not refused");
+        assert_eq!(
+            state::attempts_get(&pool, "t", "job-0").await.unwrap(),
+            0,
+            "an authentication failure must not spend an attempt"
+        );
+        assert!(
+            !post_marker.exists(),
+            "post must not run on the transient auth-failure path"
         );
     }
 

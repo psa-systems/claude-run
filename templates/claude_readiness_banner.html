@@ -1,0 +1,16 @@
+{# CLAUDE-269: the shared not-ready banner, polled by every page that extends
+   base.html (on load and every 30s). Covers both not-ready axes: no Claude
+   credential at all, and a credential that the CLI itself reported as expired
+   or revoked. Renders nothing when ready, so a ready daemon's poll is an empty
+   swap. #}
+{% if let Some(reason) = reason %}
+  <div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
+    {% if login_required %}
+      <strong style="color: var(--bad);">Claude login required: actions are paused.</strong>
+    {% else %}
+      <strong style="color: var(--bad);">Setup incomplete: actions are not running.</strong>
+    {% endif %}
+    <span>{{ reason }}</span>
+    <a href="/settings#section-auth">Finish setup</a>
+  </div>
+{% endif %}

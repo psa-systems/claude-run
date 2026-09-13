@@ -1214,12 +1214,19 @@ The index is self-healing: `scan_actions` prunes any `actions` row whose backing
 | 5    | Unexpected error (see logs).                                              |
 | 6    | Over budget: the daily budget (`daily_budget_usd`) was already spent when the run started, or the run reached its own ceiling (`run_budget_usd`) while working (DEV-705). |
 | 7    | Conflict: a mutating command was refused (e.g. `action delete` while a run for that action is in flight). |
+| 8    | Login required: the run stopped picking up new jobs because the Claude login needs renewing (CLAUDE-269). |
 | 130  | Run cancelled in flight (operator cancel via the API / web UI / CLI).     |
 
 Exit code 130 is recorded on the `runs` row, not returned by the `run` subcommand; the web UI and CLI render it as a
 distinct "canceled" badge. CLAUDE-223: exit code 1 is likewise recorded on the `runs` row of a run that stopped picking
 up new jobs because the operator paused globally mid-run, and badges as "paused"; it is excluded from the run list's
 "failed" filter, because the run did not fail.
+
+CLAUDE-269: exit code 8 is recorded the same way, on a run that stopped picking up new jobs because the CLI itself
+reported an authentication failure (a structured `authentication_failed`, on an invocation or the periodic `claude
+auth status --json` probe), distinct from a pause (an operator decision) and badged "login required" rather than
+"paused" or "failed". An operator cancel wins over both; a global pause wins over login-required when both apply to
+the same run.
 
 ## Snippet execution model
 

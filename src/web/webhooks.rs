@@ -131,6 +131,38 @@ pub(crate) async fn paused_accept_and_drop(
     }
 }
 
+/// CLAUDE-269: right after the pause check, accept-and-drop a delivery while
+/// the Claude login needs renewing. 2xx for the same reason as a pause: a
+/// retry cannot help (the delivery id is already in the replay store), and the
+/// scheduled `youtrack` / `forgejo-ci-fix` poll is the backstop that re-finds
+/// the work once signed in again. Unlike a pause, this ALSO records a
+/// `run_events` row (`state::run_events_record`), because a login-required
+/// drop is unusual enough that "on screen, not only in the log" earns it a
+/// dedicated row rather than riding the pause's log-only treatment.
+async fn login_required_accept_and_drop(st: &WebhookState, source: &str, delivery: &str) -> bool {
+    let Some(gate) = &st.readiness else {
+        return false;
+    };
+    let check = gate.check();
+    if check.kind != Some(crate::readiness::NotReadyKind::LoginRequired) {
+        return false;
+    }
+    let reason = check
+        .reason()
+        .unwrap_or_else(|| "Claude login required".to_string());
+    warn!(source = %source, delivery, "{reason}; delivery accepted and dropped");
+    let now = state::now_iso();
+    let event = state::InputEvent {
+        level: "warn".to_string(),
+        context: Some(source.to_string()),
+        message: format!("{reason}; delivery accepted and dropped"),
+    };
+    if let Err(e) = state::run_events_record(&st.pool, WEBHOOK_MINT_ACTION, &now, &[event]).await {
+        warn!(source = %source, delivery, error = %e, "recording the login-required drop as a run_events row failed (continuing)");
+    }
+    true
+}
+
 /// `runs.triggered_by` value for the event-driven webhook, alongside
 /// the existing `scheduler` / `trigger` / `cli` sources (CLAUDE-61). Each
 /// consumed verified failure becomes one run recorded under this source so the
@@ -258,6 +290,10 @@ pub struct WebhookState {
     seen: Arc<Mutex<SeenDeliveries>>,
     /// CLAUDE-101: live per-source limiter map, rebuilt by `LiveSettings` on save.
     rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
+    /// CLAUDE-269: `None` outside the daemon (tests, standalone callers).
+    /// When set, a login-required delivery is accepted and dropped exactly
+    /// like a pause, and the drop is recorded as a `run_events` row.
+    readiness: Option<crate::readiness::ReadinessGate>,
 }
 
 /// CLAUDE-87/101: build one fixed-window rate limiter per source, so exhausting
@@ -306,6 +342,7 @@ impl WebhookState {
             events,
             seen: Arc::new(Mutex::new(seen)),
             rate: Arc::new(RwLock::new(rate)),
+            readiness: None,
         }
     }
 
@@ -326,7 +363,16 @@ impl WebhookState {
             events,
             seen: Arc::new(Mutex::new(seen)),
             rate,
+            readiness: None,
         }
+    }
+
+    /// CLAUDE-269: attach the daemon's readiness gate, so a login-required
+    /// delivery is accepted and dropped like a pause. A builder so every
+    /// existing constructor call site stays source-compatible.
+    pub fn with_readiness(mut self, gate: crate::readiness::ReadinessGate) -> Self {
+        self.readiness = Some(gate);
+        self
     }
 
     /// CLAUDE-220: the SHARED replay store handle. The comment listener records
@@ -1692,6 +1738,9 @@ async fn forgejo_webhook(
     );
 
     if paused_accept_and_drop(&st.pool, WEBHOOK_MINT_ACTION, &source, delivery).await {
+        return StatusCode::OK.into_response();
+    }
+    if login_required_accept_and_drop(&st, &source, delivery).await {
         return StatusCode::OK.into_response();
     }
 
@@ -3990,6 +4039,52 @@ mod tests {
             assert!(
                 rx.try_recv().is_err(),
                 "paused action must not emit a mint event"
+            );
+        }
+
+        /// CLAUDE-269: while the Claude login needs renewing, a delivery is
+        /// accepted and dropped exactly like a pause (2xx, no classifier, no
+        /// mint), AND a `run_events` row records why, so the drop is visible
+        /// on the action page and not only in the daemon log.
+        #[tokio::test]
+        async fn login_required_accepts_and_drops_and_records_a_run_event() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut st, mut rx) = state(tmp.path()).await;
+            let readiness = crate::readiness::ReadinessGate::new(
+                tempfile::tempdir().unwrap().path().to_path_buf(),
+                None,
+            );
+            readiness.trip_login_required("OAuth session expired", "invocation");
+            st = st.with_readiness(readiness);
+
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st.clone()),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig), Some("lr-1")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "2xx so Forgejo does not retry"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "a login-required delivery must not emit a mint event"
+            );
+
+            let events = state::run_events_for_action(&st.pool, WEBHOOK_MINT_ACTION, 10)
+                .await
+                .unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.message.contains("Claude login required")),
+                "the drop must be recorded as a run_events row: {events:?}"
             );
         }
 

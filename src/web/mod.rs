@@ -157,6 +157,9 @@ pub fn router(
         .route("/settings/auth/claude/login", post(auth_login_start))
         .route("/settings/auth/claude/code", post(auth_login_code))
         .route("/settings/auth/claude/cancel", post(auth_login_cancel))
+        // CLAUDE-269: the shared not-ready banner fragment, polled from every
+        // page's base template.
+        .route("/settings/auth/claude/banner", get(auth_claude_banner))
         .route("/settings/auth/youtrack", post(auth_save_youtrack))
         .route("/settings/auth/forgejo", post(auth_save_forgejo))
         .route("/settings/:section", post(settings_save))
@@ -1078,9 +1081,6 @@ async fn search_jobs(
 struct DashboardTpl {
     version: &'static str,
     global_pause: Option<PauseInfo>,
-    /// Set when setup is unfinished (no Claude credential): the scheduler is
-    /// idle by design, which otherwise looks exactly like having no work.
-    not_ready_reason: Option<&'static str>,
     today_runs: u32,
     today_actions: usize,
     today_cost: f64,
@@ -1522,7 +1522,6 @@ async fn dashboard(
     .await?;
 
     let tpl = DashboardTpl {
-        not_ready_reason: s.api.readiness.as_ref().and_then(|g| g.check().reason()),
         version: s.api.version,
         global_pause,
         today_runs: today_runs as u32,
@@ -3626,6 +3625,12 @@ struct AuthCardView {
     /// config dir, a stored API key, or the env). This is what gates the
     /// scheduler, so the card says so plainly.
     claude_ready: bool,
+    /// CLAUDE-269: a credential exists but the CLI itself reported an
+    /// authentication failure (an expired/revoked login), distinct from never
+    /// having signed in at all. Takes the badge over `claude_ready`.
+    claude_login_expired: bool,
+    /// The CLI's own message when `claude_login_expired` is set.
+    claude_login_message: Option<String>,
     /// An interactive sign-in waiting for its code.
     login_url: Option<String>,
     /// The CLI's own message after a refused code, shown above the field.
@@ -3910,17 +3915,24 @@ async fn render_settings_full(
         });
     }
     let auth_cfg = s.api.settings.auth_config().await;
+    let readiness_check = s.api.readiness.as_ref().map(|g| g.check());
     let tpl = SettingsTpl {
         version: s.api.version,
         sections,
         saved,
         auth: AuthCardView {
-            claude_ready: s
-                .api
-                .readiness
+            claude_ready: readiness_check.as_ref().map(|r| r.ready).unwrap_or(true),
+            // CLAUDE-269: distinct from "never signed in" so the badge and the
+            // card above the sign-in control read "login expired" (with the
+            // CLI's own message) rather than the plain "required" state.
+            claude_login_expired: readiness_check
                 .as_ref()
-                .map(|g| g.check().ready)
-                .unwrap_or(true),
+                .and_then(|r| r.kind)
+                .map(|k| k == crate::readiness::NotReadyKind::LoginRequired)
+                .unwrap_or(false),
+            claude_login_message: readiness_check
+                .as_ref()
+                .and_then(|r| r.login_message.clone()),
             login_url: s
                 .api
                 .claude_login
@@ -4087,6 +4099,11 @@ async fn auth_save_claude(
         return render_settings_with(&s, StatusCode::UNPROCESSABLE_ENTITY, None, None, Some(e))
             .await;
     }
+    // CLAUDE-269: an API key save is one of the ways login-required clears
+    // with no restart, alongside a brokered sign-in and the status probe.
+    if let Some(gate) = &s.api.readiness {
+        gate.clear_login_required();
+    }
     Ok(Redirect::to("/settings?saved=Claude+auth").into_response())
 }
 
@@ -4242,6 +4259,13 @@ async fn auth_login_code(
     match outcome {
         Ok(crate::claude_login::CodeOutcome::LoggedIn) => {
             tracing::info!("claude sign-in completed from the web UI");
+            // CLAUDE-269: clear login-required immediately, rather than
+            // waiting for the next status probe tick, so the banner and the
+            // Auth card badge drop right away and the next scheduler tick
+            // dispatches normally.
+            if let Some(gate) = &s.api.readiness {
+                gate.clear_login_required();
+            }
             Ok(Redirect::to("/settings?saved=Claude+sign-in").into_response())
         }
         // The CLI refused the code and is still waiting: show its wording and
@@ -4278,6 +4302,31 @@ async fn auth_login_cancel(State(s): State<WebState>) -> Result<Response, WebErr
         broker.cancel();
     }
     Ok(Redirect::to("/settings#section-auth").into_response())
+}
+
+/// CLAUDE-269: the shared not-ready banner fragment, polled from every page via
+/// `templates/base.html`. Behind the same CLAUDE-48 auth gate as the rest of
+/// `/settings` (mounted on the same router); `templates/login.html` and
+/// `templates/setup.html` do not extend `base.html`, so the poll never runs
+/// unauthenticated.
+#[derive(Template)]
+#[template(path = "claude_readiness_banner.html")]
+struct ClaudeReadinessBannerTpl {
+    reason: Option<String>,
+    login_required: bool,
+}
+
+async fn auth_claude_banner(State(s): State<WebState>) -> Result<Html<String>, WebError> {
+    let check = s.api.readiness.as_ref().map(|g| g.check());
+    let tpl = ClaudeReadinessBannerTpl {
+        reason: check.as_ref().and_then(|r| r.reason()),
+        login_required: check
+            .as_ref()
+            .and_then(|r| r.kind)
+            .map(|k| k == crate::readiness::NotReadyKind::LoginRequired)
+            .unwrap_or(false),
+    };
+    Ok(Html(tpl.render()?))
 }
 
 // ---- About page (CLAUDE-129) ----------------------------------------------
@@ -5764,7 +5813,6 @@ mod tests {
             ..RunsView::default()
         };
         let tpl = DashboardTpl {
-            not_ready_reason: None,
             version: "test",
             global_pause: None,
             today_runs: 0,
@@ -5870,7 +5918,6 @@ mod tests {
         use askama::Template;
 
         let tpl = |stale_gates: Vec<StaleGateRow>| DashboardTpl {
-            not_ready_reason: None,
             version: "test",
             global_pause: None,
             today_runs: 0,
@@ -5945,7 +5992,6 @@ mod tests {
         use askama::Template;
 
         let tpl = |attempt_cap_hits: Vec<state::CappedKey>| DashboardTpl {
-            not_ready_reason: None,
             version: "test",
             global_pause: None,
             today_runs: 0,
@@ -6144,10 +6190,12 @@ mod tests {
     mod editor {
         use super::super::{
             action_create, action_delete, action_detail, action_edit_page, action_edit_save,
-            action_events_redirect, action_export, action_to_youtrack_form, dashboard, logs,
-            settings_page, settings_save, youtrack_create, youtrack_edit_page, youtrack_edit_save,
+            action_events_redirect, action_export, action_to_youtrack_form, auth_claude_banner,
+            auth_login_code, auth_login_start, auth_save_claude, dashboard, logs, settings_page,
+            settings_save, youtrack_create, youtrack_edit_page, youtrack_edit_save,
             youtrack_form_to_yaml, youtrack_new_page, ActionDetailQuery, ActionForm,
-            DashboardQuery, EventsView, LogsQuery, SettingsForm, WebState, YoutrackEditForm,
+            AuthClaudeForm, AuthCodeForm, DashboardQuery, EventsView, LogsQuery, SettingsForm,
+            WebState, YoutrackEditForm,
         };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
@@ -6203,6 +6251,24 @@ mod tests {
                 paths,
                 webhook_enabled: false,
                 comment_webhook_enabled: false,
+            }
+        }
+
+        /// CLAUDE-269: [`web_state`] with a real readiness gate attached, so a
+        /// test can trip / clear login-required and observe it through the
+        /// banner fragment, the settings page, and the auth-save handlers.
+        async fn web_state_with_readiness(
+            tmp: &std::path::Path,
+            gate: crate::readiness::ReadinessGate,
+        ) -> WebState {
+            let s = web_state(tmp).await;
+            let api = AppState {
+                readiness: Some(gate),
+                ..(*s.api).clone()
+            };
+            WebState {
+                api: Arc::new(api),
+                ..s
             }
         }
 
@@ -8164,6 +8230,192 @@ mod tests {
             .unwrap();
             assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
             assert_eq!(crate::settings::read_claude(&handle).model, None);
+        }
+
+        /// CLAUDE-269: while login-required, the Auth card badge reads "login
+        /// expired" (not "authenticated" or "required") and shows the CLI's own
+        /// message above the sign-in control.
+        #[tokio::test]
+        async fn settings_page_shows_login_expired_while_login_required() {
+            let tmp = tempfile::tempdir().unwrap();
+            let gate = crate::readiness::ReadinessGate::new(
+                tempfile::tempdir().unwrap().path().to_path_buf(),
+                None,
+            );
+            gate.trip_login_required("OAuth session expired", "invocation");
+            let s = web_state_with_readiness(tmp.path(), gate).await;
+
+            let page = settings_page(
+                State(s.clone()),
+                Query(crate::web::SettingsQuery { saved: None }),
+            )
+            .await
+            .unwrap();
+            let html = body_string(page).await;
+            assert!(html.contains("login expired"), "{html}");
+            assert!(html.contains("OAuth session expired"), "{html}");
+            assert!(
+                !html.contains(">required<"),
+                "must not ALSO show the plain no-credential badge"
+            );
+        }
+
+        /// CLAUDE-269: an Anthropic API key save clears login-required with no
+        /// restart, alongside a brokered sign-in and the status probe.
+        #[tokio::test]
+        async fn saving_an_api_key_clears_login_required() {
+            use age::secrecy::ExposeSecret;
+            // The save encrypts through the process-global key env; without a
+            // key of its own this fails with 422 wherever no operator key exists.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let key_path = tmp.path().join("key.txt");
+            let identity = age::x25519::Identity::generate();
+            std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();
+            std::env::set_var(crate::secrets::KEY_FILE_ENV, &key_path);
+            let gate = crate::readiness::ReadinessGate::new(
+                tempfile::tempdir().unwrap().path().to_path_buf(),
+                None,
+            );
+            gate.trip_login_required("OAuth session expired", "invocation");
+            assert!(gate.is_login_required());
+            let s = web_state_with_readiness(tmp.path(), gate.clone()).await;
+
+            let resp = auth_save_claude(
+                State(s.clone()),
+                Form(AuthClaudeForm {
+                    api_key: "sk-ant-test-key".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            assert!(
+                !gate.is_login_required(),
+                "saving an API key must clear login-required"
+            );
+
+            std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+        }
+
+        /// CLAUDE-269: a completed brokered sign-in clears login-required with
+        /// no restart, the same as an API-key save.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_completed_sign_in_clears_login_required() {
+            let tmp = tempfile::tempdir().unwrap();
+            let gate = crate::readiness::ReadinessGate::new(
+                tempfile::tempdir().unwrap().path().to_path_buf(),
+                None,
+            );
+            gate.trip_login_required("OAuth session expired", "invocation");
+            let base = web_state_with_readiness(tmp.path(), gate.clone()).await;
+
+            let stub = tmp.path().join("claude-stub");
+            crate::testutil::write_stub(
+                &stub,
+                "#!/bin/sh\n\
+                 echo \"If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true&state=s\"\n\
+                 printf 'Paste code here if prompted > '\n\
+                 read code\n\
+                 if [ \"$code\" = \"good-code\" ]; then exit 0; fi\n\
+                 echo 'Invalid code.' >&2\n\
+                 sleep 30\n",
+            );
+            let s = WebState {
+                api: Arc::new(AppState {
+                    claude_login: Some(Arc::new(crate::claude_login::LoginBroker::new())),
+                    claude_binary: stub.to_str().unwrap().to_string(),
+                    agent_config_dir: Some(tmp.path().to_path_buf()),
+                    ..(*base.api).clone()
+                }),
+                ..base
+            };
+
+            let started = auth_login_start(State(s.clone())).await.unwrap();
+            assert_eq!(started.status(), StatusCode::SEE_OTHER);
+
+            let code_resp = auth_login_code(
+                State(s.clone()),
+                Form(AuthCodeForm {
+                    code: "good-code".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(code_resp.status(), StatusCode::SEE_OTHER);
+            assert!(
+                !gate.is_login_required(),
+                "a completed sign-in must clear login-required"
+            );
+        }
+
+        /// CLAUDE-269: the shared banner fragment renders nothing when ready,
+        /// the setup-incomplete wording with no credential, and the
+        /// login-required wording (with the CLI's message) when tripped.
+        #[tokio::test]
+        async fn claude_banner_fragment_covers_both_not_ready_kinds_and_ready() {
+            let tmp = tempfile::tempdir().unwrap();
+
+            // No readiness gate at all (`None`, e.g. a test/CLI-direct context):
+            // never blocks, renders nothing.
+            let s = web_state(tmp.path()).await;
+            let html =
+                body_string(auth_claude_banner(State(s)).await.unwrap().into_response()).await;
+            assert!(html.trim().is_empty(), "{html}");
+
+            // No credential: the setup-incomplete wording, no "login required".
+            let no_cred_gate = crate::readiness::ReadinessGate::new(
+                tempfile::tempdir().unwrap().path().to_path_buf(),
+                None,
+            );
+            let s = web_state_with_readiness(tmp.path(), no_cred_gate).await;
+            let html =
+                body_string(auth_claude_banner(State(s)).await.unwrap().into_response()).await;
+            assert!(html.contains("Setup incomplete"), "{html}");
+            assert!(!html.contains("Claude login required"), "{html}");
+
+            // Login required: the distinct wording plus the CLI's message.
+            let login_gate = crate::readiness::ReadinessGate::new(
+                tempfile::tempdir().unwrap().path().to_path_buf(),
+                None,
+            );
+            login_gate.trip_login_required("OAuth session expired", "invocation");
+            let s = web_state_with_readiness(tmp.path(), login_gate).await;
+            let html =
+                body_string(auth_claude_banner(State(s)).await.unwrap().into_response()).await;
+            assert!(html.contains("Claude login required"), "{html}");
+            assert!(html.contains("OAuth session expired"), "{html}");
+
+            // Ready: nothing rendered.
+            let ready_dir = tempfile::tempdir().unwrap();
+            std::fs::write(ready_dir.path().join(".credentials.json"), "{}").unwrap();
+            let ready_gate =
+                crate::readiness::ReadinessGate::new(ready_dir.path().to_path_buf(), None);
+            let s = web_state_with_readiness(tmp.path(), ready_gate).await;
+            let html =
+                body_string(auth_claude_banner(State(s)).await.unwrap().into_response()).await;
+            assert!(html.trim().is_empty(), "{html}");
+        }
+
+        /// CLAUDE-269: the dashboard no longer renders its own setup banner;
+        /// the shared `base.html` poll region is what every page (dashboard
+        /// included) carries instead.
+        #[tokio::test]
+        async fn dashboard_carries_the_shared_banner_poll_and_not_its_own() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let page = dashboard(State(s), Query(DashboardQuery::default()))
+                .await
+                .unwrap();
+            let html = body_string(page.into_response()).await;
+            assert!(
+                html.contains("/settings/auth/claude/banner"),
+                "the shared poll region must be present: {html}"
+            );
+            assert!(
+                !html.contains("Setup incomplete: actions are not running"),
+                "the dashboard's own separate banner must be gone: {html}"
+            );
         }
 
         /// CLAUDE-220: the comment listener gets its own synthetic entry, injected

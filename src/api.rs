@@ -141,8 +141,16 @@ struct StatusResponse {
     /// unfinished (no Claude credential) and the scheduler is idle by design,
     /// which otherwise looks identical to a daemon that has no work.
     ready: bool,
-    /// Why not, when `ready` is false.
-    not_ready_reason: Option<&'static str>,
+    /// Why not, when `ready` is false. Owned rather than `&'static str`
+    /// because CLAUDE-269's login-required reason carries the CLI's own
+    /// message and a detection timestamp.
+    not_ready_reason: Option<String>,
+    /// CLAUDE-269: which not-ready axis, if any: `no_credential` |
+    /// `login_required` | `null` (ready).
+    not_ready_kind: Option<&'static str>,
+    /// CLAUDE-269: when the login-required state was first observed, RFC 3339,
+    /// or `null` when not in that state.
+    login_required_since: Option<String>,
     /// CLAUDE-225: dependency gates holding an issue past the staleness
     /// threshold, so an operator without the web UI sees the same signal the
     /// dashboard banner shows.
@@ -261,6 +269,16 @@ async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusRespons
             .map(|g| g.check().ready)
             .unwrap_or(true),
         not_ready_reason: s.readiness.as_ref().and_then(|g| g.check().reason()),
+        not_ready_kind: s
+            .readiness
+            .as_ref()
+            .and_then(|g| g.check().kind)
+            .map(|k| k.as_str()),
+        login_required_since: s
+            .readiness
+            .as_ref()
+            .and_then(|g| g.check().login_required_since)
+            .map(|t| t.to_rfc3339()),
         stale_gates: state::dependency_gates_stale(
             &s.pool,
             state::now_epoch_ms(),
@@ -881,6 +899,61 @@ mod tests {
         assert!(ack.ok);
     }
 
+    /// CLAUDE-269: while login-required, the trigger endpoint answers 409
+    /// naming the reason, exactly like a global pause, and never lies with a
+    /// "queued trigger" ack for work that would just be dropped.
+    #[tokio::test]
+    async fn trigger_is_refused_while_login_required() {
+        let (mut s, _rx) = app_state_with_triggers().await;
+        state::action_index_upsert(
+            &s.pool,
+            &state::ActionIndexRow {
+                name: "act".into(),
+                file_path: "/dev/null".into(),
+                yaml_sha256: String::new(),
+                enabled: true,
+                schedule_kind: Some("manual".into()),
+                schedule_spec: None,
+                last_seen_at: state::now_iso(),
+                parse_error: None,
+                link_template: None,
+                max_parallel: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".credentials.json"), "{}").unwrap();
+        let gate = crate::readiness::ReadinessGate::new(tmp.path().to_path_buf(), None);
+        s = Arc::new(AppState {
+            readiness: Some(gate.clone()),
+            ..(*s).clone()
+        });
+
+        let Json(ack) = trigger_action(State(s.clone()), AxumPath("act".into()))
+            .await
+            .expect("ready and unpaused: the trigger is accepted");
+        assert!(ack.ok);
+
+        gate.trip_login_required("OAuth session expired", "invocation");
+        let err = trigger_action(State(s.clone()), AxumPath("act".into()))
+            .await
+            .expect_err("a login-required trigger must be refused");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(
+            err.message.contains("Claude login required"),
+            "{}",
+            err.message
+        );
+
+        gate.clear_login_required();
+        let Json(ack) = trigger_action(State(s.clone()), AxumPath("act".into()))
+            .await
+            .expect("a fresh sign-in restores the trigger");
+        assert!(ack.ok);
+    }
+
     /// CLAUDE-223: quiet needs BOTH signals clear. An open `runs` row makes it
     /// false, and so does a non-empty in-flight map with no row yet written.
     #[tokio::test]
@@ -921,6 +994,39 @@ mod tests {
         let Json(status) = get_status(State(s.clone())).await.unwrap();
         assert!(!status.activity.quiet);
         assert_eq!(status.activity.active_runs[0].id, run);
+    }
+
+    /// CLAUDE-269: `/status` carries `not_ready_kind` and `login_required_since`,
+    /// null while ready, `no_credential` with no gate reason, and
+    /// `login_required` plus an RFC 3339 timestamp once tripped.
+    #[tokio::test]
+    async fn status_reports_not_ready_kind_and_login_required_since() {
+        let mut s = app_state().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".credentials.json"), "{}").unwrap();
+        let gate = crate::readiness::ReadinessGate::new(tmp.path().to_path_buf(), None);
+        s = Arc::new(AppState {
+            readiness: Some(gate.clone()),
+            ..(*s).clone()
+        });
+
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert!(status.ready);
+        assert_eq!(status.not_ready_kind, None);
+        assert_eq!(status.login_required_since, None);
+
+        gate.trip_login_required("OAuth session expired", "invocation");
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert!(!status.ready);
+        assert_eq!(status.not_ready_kind, Some("login_required"));
+        assert!(
+            status.login_required_since.is_some(),
+            "must carry a detection timestamp"
+        );
+        assert!(status
+            .not_ready_reason
+            .unwrap()
+            .contains("OAuth session expired"));
     }
 
     /// CLAUDE-225: `/status` carries the stale-gate block, so an operator with no
