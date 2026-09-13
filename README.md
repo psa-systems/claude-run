@@ -408,11 +408,23 @@ through the tracing reload handle and logs a `log filter applied from settings` 
 for that run. An invalid filter is rejected inline (and at startup logs a warning naming the value and the parse error,
 keeping the current filter rather than aborting).
 
+## Workdir preservation (CLAUDE-102, CLAUDE-193, CLAUDE-281)
+
+A job workdir is deleted only after `crate::workdir::local_only_work` proves nothing in it exists only locally, and every
+message saying where the work is comes from that same check. "Only locally" means any of: commits on a local branch the
+remote does not have under that branch name (a branch whose tip merely equals the remote default branch's tip has no
+commits of its own, so it does not count); tracked or staged modifications; untracked files that are not ignored; or
+stashes. A git or network failure preserves rather than guesses. Every runner (`youtrack`, the scripted-action pipeline,
+`forgejo-ci-fix`, the PR-comment webhook route) calls `crate::workdir::cleanup_or_preserve`, which runs this check and, on
+anything local-only, prunes gitignored build artifacts (`git clean -fdX`) and keeps the directory rather than deleting it.
+A PR-creation failure's issue comment (`pr_failure_comment`) is computed from the same check, so it can never call an
+unpushed branch "safe on the remote" or claim work is preserved when the check could not run.
+
 ## Workdir GC (CLAUDE-106)
 
-The YouTrack runner intentionally keeps some workdirs rather than deleting them: a directory that holds unpushed commits
-is preserved when no PR was opened, and a leftover workdir is moved aside (`<key>.kept-<n>`) out of the way of a fresh
-attempt. Nothing else ever deletes these, so preserved and aside workdirs accumulate without bound under
+The YouTrack runner intentionally keeps some workdirs rather than deleting them: a directory that holds local-only work
+(see above) is preserved when no PR was opened, and a leftover workdir is moved aside (`<key>.kept-<n>`) out of the way of
+a fresh attempt. Nothing else ever deletes these, so preserved and aside workdirs accumulate without bound under
 `$CLAUDE_RUN_DATA_DIR/workdirs/<source>/<key>` (a single preserved Rust workdir can be tens of GB of `target/` output).
 
 A time-based sweeper bounds that disk use. It runs on `serve` start and then hourly, walking `workdirs/*/*` and deleting

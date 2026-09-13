@@ -1241,17 +1241,41 @@ async fn process_job(
     }
 
     // CLAUDE-102: a finalize failure can cost a retry, never the work. Only a
-    // successfully opened PR makes deletion unconditional (the AGit push leaves
-    // no remote-tracking ref, so the unpushed check cannot clear it); every
+    // successfully opened PR skips the branch-vs-remote check (the AGit push
+    // leaves no remote-tracking ref, so that check cannot clear it); every
     // other outcome deletes only when no unpushed commits would be lost. A
     // panic anywhere above preserves trivially: deletion only ever happens
     // here, explicitly.
     // CLAUDE-228: same as above, the preserve branch shells out to git.
+    // CLAUDE-281: a Code Review / Merged PR still leaves the branch-vs-remote
+    // check skipped, but a dirty tree or stash is work that never made it
+    // into the PR at all, so it is checked and preserved just the same.
     crate::blocking::in_place(|| match &finalize_res {
         // A merged PR (CLAUDE-126) is as safe to delete as a Code Review PR: the
         // work reached the server and, for Merged, was merged into the base.
         Ok(Finalized::CodeReview { .. }) | Ok(Finalized::Merged { .. }) => {
-            cleanup_workdir(&workdir_path)
+            match crate::workdir::uncommitted_or_stashed(&workdir_path) {
+                Ok(dirty) if dirty.is_empty() => cleanup_workdir(&workdir_path),
+                Ok(dirty) => {
+                    warn!(
+                        action = %action.name,
+                        key = %key,
+                        workdir = %workdir_path.display(),
+                        dirty_paths = dirty.paths.len(),
+                        stashes = dirty.stashes.len(),
+                        "workdir preserved after PR: uncommitted work not in the PR"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        action = %action.name,
+                        key = %key,
+                        workdir = %workdir_path.display(),
+                        error = %e,
+                        "workdir preserved after PR: uncommitted-work check failed"
+                    );
+                }
+            }
         }
         _ => cleanup_or_preserve(&workdir_path, &action.name, key),
     });
@@ -2257,6 +2281,11 @@ fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> Str
             "The committed branch is PRESERVED on the daemon host at: `{}` (push it manually or re-run after the PR path is fixed).",
             p.display()
         ),
+        WorkLocation::UncommittedChanges { workdir, paths } => format!(
+            "The work was never committed and is PRESERVED on the daemon host at: `{}` ({} changed path(s), uncommitted). It is not on the remote under any branch; commit and push it manually, or re-run after the PR path is fixed.",
+            workdir.display(),
+            paths.len()
+        ),
         WorkLocation::RemoteBranch { branch, sha } => format!(
             "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before the PR call failed, so nothing was lost. No PR was ever opened here, so nothing was recorded for this issue (CLAUDE-275): re-queuing it (set AI Agent = Queued) clones the default branch again and opens a fresh PR, it does NOT resume this branch by name. Push the same branch again from a fresh clone, or open the PR for it by hand, if this exact work should not be redone. The workdir on the daemon host is not kept, because the forge holds the same commits."
         ),
@@ -2365,142 +2394,62 @@ async fn record_outcome(
 }
 
 fn cleanup_workdir(workdir: &Path) {
-    if workdir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(workdir) {
-            warn!(workdir = %workdir.display(), error = %e, "workdir cleanup failed (continuing)");
-        }
-    }
+    crate::workdir::force_remove(workdir);
 }
 
-/// CLAUDE-193: one local branch and whether its tip is on the live remote.
-struct BranchTip {
-    branch: String,
-    sha: String,
-    on_remote: bool,
-}
-
-/// CLAUDE-193: every local branch tip classified against the live remote, plus
-/// the remote's default branch (its `HEAD` symref) when advertised.
-struct RepoTips {
-    tips: Vec<BranchTip>,
-    default_branch: Option<String>,
-}
-
-/// CLAUDE-193: the single `git ls-remote origin` code path, shared by
-/// [`has_unpushed_commits`] (preserve-or-delete) and [`work_location`] (what the
-/// PR-failure comment tells a human). `None` means a git or network failure, on
-/// which both callers err toward preserving.
-fn branch_tips(workdir: &Path) -> Option<RepoTips> {
-    fn git(workdir: &Path, args: &[&str]) -> Option<String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(workdir)
-            .args(args)
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
-    // Local branch tips. No branches means nothing local to lose, and no remote
-    // query is needed.
-    let branches = git(
-        workdir,
-        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
-    )?;
-    let branches: Vec<&str> = branches
-        .lines()
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .collect();
-    if branches.is_empty() {
-        return Some(RepoTips {
-            tips: Vec::new(),
-            default_branch: None,
-        });
-    }
-
-    // The live remote's advertised SHAs, plus the `ref: refs/heads/<x>\tHEAD`
-    // symref line that names the default branch.
-    let remote = git(workdir, &["ls-remote", "--symref", "origin"])?;
-    let mut remote_shas: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut default_branch = None;
-    for line in remote.lines() {
-        let mut fields = line.split_whitespace();
-        match (fields.next(), fields.next(), fields.next()) {
-            (Some("ref:"), Some(target), Some("HEAD")) => {
-                default_branch = target.strip_prefix("refs/heads/").map(str::to_string);
-            }
-            (Some(sha), Some(_), None) => {
-                remote_shas.insert(sha);
-            }
-            _ => {}
-        }
-    }
-
-    let mut tips = Vec::new();
-    for branch in branches {
-        let sha = git(workdir, &["rev-parse", branch])?.trim().to_string();
-        let on_remote = remote_shas.contains(sha.as_str());
-        tips.push(BranchTip {
-            branch: branch.to_string(),
-            sha,
-            on_remote,
-        });
-    }
-    Some(RepoTips {
-        tips,
-        default_branch,
-    })
-}
-
-/// CLAUDE-105: true when any local branch tip in `workdir` is absent from the
-/// live remote as reported by `git ls-remote origin` - exactly the work
-/// deleting the directory would destroy. This asks the source of truth rather
-/// than trusting remote-tracking refs: a `--depth` clone is `--single-branch`,
-/// so its only tracking ref is `origin/main` and the old `--not --remotes`
-/// heuristic false-positived on every non-`main` branch (CLAUDE-102's intent
-/// was to save unpushed work, not preserve every feature-branch run). Any git
-/// or network failure errs toward `true`: preserving costs disk, a wrong delete
-/// costs the run.
+/// CLAUDE-105 / CLAUDE-281: true when [`crate::workdir::local_only_work`]
+/// finds a local branch tip the remote does not have under its own name -
+/// exactly the work deleting the directory would destroy. Any git or network
+/// failure errs toward `true`: preserving costs disk, a wrong delete costs the
+/// run. Deliberately branch-only (ignores a dirty tree / stash) to keep
+/// `crate::gc`'s age-based sweep decision, the other caller of this function,
+/// unchanged by this issue.
 pub(crate) fn has_unpushed_commits(workdir: &Path) -> bool {
-    match branch_tips(workdir) {
-        Some(r) => r.tips.iter().any(|t| !t.on_remote),
-        None => true,
+    match crate::workdir::local_only_work(workdir) {
+        Ok(w) => !w.unpushed_branches.is_empty(),
+        Err(_) => true,
     }
 }
 
-/// CLAUDE-193: where a failed-PR run's work actually is, for the comment a human
-/// reads. Computed from the same [`branch_tips`] query that decides
-/// preserve-or-delete, so the comment can never contradict
-/// [`cleanup_or_preserve`].
+/// CLAUDE-193 / CLAUDE-281: where a failed-PR run's work actually is, for the
+/// comment a human reads. Computed from the same
+/// [`crate::workdir::local_only_work`] query that decides preserve-or-delete,
+/// so the comment can never contradict [`cleanup_or_preserve`].
 enum WorkLocation {
-    /// Unpushed commits exist, so the workdir is kept on the daemon host.
+    /// Unpushed commits or a stash exist, so the workdir is kept on the
+    /// daemon host.
     PreservedWorkdir(PathBuf),
-    /// Every local tip is on the remote: the push landed and only the PR call
-    /// failed, so the work is safe on the forge under this branch.
+    /// A dirty working tree (tracked or untracked changes) with no local
+    /// commits ahead: still only on the daemon host, but never pushed as a
+    /// branch.
+    UncommittedChanges {
+        workdir: PathBuf,
+        paths: Vec<String>,
+    },
+    /// Every local tip is on the remote under its own name: the push landed
+    /// and only the PR call failed, so the work is safe on the forge under
+    /// this branch.
     RemoteBranch { branch: String, sha: String },
-    /// Nothing local beyond the remote's default branch.
+    /// Nothing local beyond the remote's default branch, clean working tree.
     None,
 }
 
 fn work_location(workdir: &Path) -> WorkLocation {
     // A failed query errs toward preserve, matching `has_unpushed_commits`.
-    let Some(RepoTips {
-        tips,
-        default_branch,
-    }) = branch_tips(workdir)
-    else {
-        return WorkLocation::PreservedWorkdir(workdir.to_path_buf());
+    let work = match crate::workdir::local_only_work(workdir) {
+        Ok(w) => w,
+        Err(_) => return WorkLocation::PreservedWorkdir(workdir.to_path_buf()),
     };
-    if tips.iter().any(|t| !t.on_remote) {
+    if !work.unpushed_branches.is_empty() || !work.dirty.stashes.is_empty() {
         return WorkLocation::PreservedWorkdir(workdir.to_path_buf());
     }
-    match tips
-        .into_iter()
-        .find(|t| default_branch.as_deref() != Some(t.branch.as_str()))
-    {
+    if !work.dirty.paths.is_empty() {
+        return WorkLocation::UncommittedChanges {
+            workdir: workdir.to_path_buf(),
+            paths: work.dirty.paths,
+        };
+    }
+    match work.remote_branch {
         Some(t) => WorkLocation::RemoteBranch {
             branch: t.branch,
             sha: t.sha,
@@ -2509,53 +2458,15 @@ fn work_location(workdir: &Path) -> WorkLocation {
     }
 }
 
-/// CLAUDE-105: remove gitignored build artifacts from a workdir about to be
-/// preserved. `git clean -fdX` deletes only ignored files and directories; a
-/// failure is logged and tolerated (the directory is still preserved).
-fn prune_ignored_artifacts(workdir: &Path) {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(workdir)
-        .args(["clean", "-fdX"])
-        .output();
-    match out {
-        Err(e) => {
-            warn!(workdir = %workdir.display(), error = %e, "pruning gitignored artifacts failed (preserving anyway)");
-        }
-        Ok(o) if !o.status.success() => {
-            warn!(
-                workdir = %workdir.display(),
-                stderr = %String::from_utf8_lossy(&o.stderr),
-                "git clean -fdX failed (preserving anyway)"
-            );
-        }
-        Ok(_) => {}
-    }
-}
-
-/// CLAUDE-102: delete the workdir unless it holds unpushed commits. The
-/// preserve branch is the data-loss guard from the CLAUDE-101 incident, where
-/// a failed `create_pr` plus an unconditional cleanup destroyed the run's only
-/// copy of the committed work.
+/// CLAUDE-102 / CLAUDE-281: delete the workdir unless
+/// [`crate::workdir::local_only_work`] finds unpushed commits, a dirty tree,
+/// or a stash. The preserve branch is the data-loss guard from the CLAUDE-101
+/// incident, where a failed `create_pr` plus an unconditional cleanup
+/// destroyed the run's only copy of the committed work; CLAUDE-281 extended it
+/// past committed-but-unpushed branches to the uncommitted and stashed work
+/// the old branch-only check never looked at.
 fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
-    if !workdir.exists() {
-        return;
-    }
-    if has_unpushed_commits(workdir) {
-        // CLAUDE-105: the guard only protects committed work in `.git`, so drop
-        // regenerable gitignored output (`target/`, `node_modules/`, ...) before
-        // keeping the directory. `-X` touches only ignored files, leaving source,
-        // `.git`, unpushed commits, and uncommitted tracked changes intact.
-        prune_ignored_artifacts(workdir);
-        warn!(
-            action = %action,
-            key = %key,
-            workdir = %workdir.display(),
-            "workdir preserved: it holds unpushed commits and no PR was opened"
-        );
-    } else {
-        cleanup_workdir(workdir);
-    }
+    crate::workdir::cleanup_or_preserve(workdir, action, key);
 }
 
 /// CLAUDE-102: move a leftover (preserved) workdir out of the way of a fresh
@@ -4054,6 +3965,42 @@ mod tests {
         let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone));
 
         assert!(body.contains("No local commits were found to preserve."));
+    }
+
+    #[test]
+    fn pr_failure_comment_names_uncommitted_changes_not_safe_on_remote() {
+        // Run 10822 shape (CLAUDE-281): a brand-new branch left at `main`'s tip
+        // (no commits of its own) with a dirty working tree. The old SHA-
+        // membership check called this branch "on the remote" and the comment
+        // claimed the work was SAFE there; it must now be reported as
+        // uncommitted and preserved, never "safe on the remote".
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(
+            &clone,
+            &["checkout", "-b", "feat/CLAUDE-269-login-required-gate"],
+        );
+        std::fs::write(clone.join("f.txt"), "edited but never committed").unwrap();
+
+        let loc = work_location(&clone);
+        assert!(
+            matches!(loc, WorkLocation::UncommittedChanges { .. }),
+            "expected UncommittedChanges"
+        );
+
+        let body = pr_failure_comment(&ok_result(), &pr_error(), &loc);
+        assert!(
+            !body.contains("SAFE on the remote"),
+            "an unpushed branch must never read as safe on the remote: {body}"
+        );
+        assert!(
+            body.contains("PRESERVED on the daemon host"),
+            "uncommitted work must point at the preserved workdir: {body}"
+        );
+        assert!(body.contains(&clone.display().to_string()));
+
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        assert!(clone.exists(), "the dirty tree must survive cleanup");
     }
 
     #[test]
