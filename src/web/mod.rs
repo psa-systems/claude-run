@@ -8259,7 +8259,15 @@ mod tests {
         /// restart, alongside a brokered sign-in and the status probe.
         #[tokio::test]
         async fn saving_an_api_key_clears_login_required() {
+            use age::secrecy::ExposeSecret;
+            // The save encrypts through the process-global key env; without a
+            // key of its own this fails with 422 wherever no operator key exists.
+            let _env = crate::secrets::key_file_env_lock().await;
             let tmp = tempfile::tempdir().unwrap();
+            let key_path = tmp.path().join("key.txt");
+            let identity = age::x25519::Identity::generate();
+            std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();
+            std::env::set_var(crate::secrets::KEY_FILE_ENV, &key_path);
             let gate = crate::readiness::ReadinessGate::new(
                 tempfile::tempdir().unwrap().path().to_path_buf(),
                 None,
@@ -8281,6 +8289,8 @@ mod tests {
                 !gate.is_login_required(),
                 "saving an API key must clear login-required"
             );
+
+            std::env::remove_var(crate::secrets::KEY_FILE_ENV);
         }
 
         /// CLAUDE-269: a completed brokered sign-in clears login-required with
