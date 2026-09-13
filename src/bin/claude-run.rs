@@ -624,10 +624,16 @@ async fn run_action(
     let claude_defaults = Arc::new(std::sync::RwLock::new(
         settings::effective_claude(&pool).await?,
     ));
+    // CLAUDE-269: a fresh, run-scoped gate. It has nothing to persist across
+    // invocations of the CLI (there is no daemon), but it still stops a LATER
+    // job in the SAME multi-job run once an earlier invocation trips it, via
+    // the same `PauseGate`/`RunPause` wiring the daemon uses.
+    let readiness = claude_run::readiness::ReadinessGate::new(agent_config_dir.clone(), None);
     let claude = Arc::new(
         claude_mod::ClaudeInvoker::new(on_disk.daemon.claude_binary.as_deref())
             .with_config_dir(Some(agent_config_dir))
-            .with_default_claude(claude_defaults),
+            .with_default_claude(claude_defaults)
+            .with_readiness(readiness.clone()),
     );
     // CLAUDE-28: a standalone `run` is a single process with no daemon, so it
     // gets its own ephemeral key gate; the per-action lock already prevents it
@@ -642,7 +648,7 @@ async fn run_action(
     // CLAUDE-223: the standalone path takes the same live global-pause gate as
     // the daemon, so a pause taken while it works stops it picking up new jobs
     // (the up-front check above only covers the moment the run started).
-    let pause = claude_run::pause::PauseGate::new(pool.clone());
+    let pause = claude_run::pause::PauseGate::new(pool.clone()).with_readiness(readiness);
     // CLAUDE-228: the standalone path has no scheduler to defer, so its gather
     // marker is a fresh one nothing else reads.
     let gather = claude_run::concurrency::GatherGate::new();

@@ -649,6 +649,10 @@ pub struct CommentContext {
     pub keygate: KeyGate,
     /// Per-(repo, login) denial-reply throttle.
     pub denials: Arc<DenialReplyLimiter>,
+    /// CLAUDE-269: `None` outside the daemon (tests). When set, a command is
+    /// refused with a reply naming the reason instead of invoking `claude`,
+    /// while the Claude login needs renewing.
+    pub readiness: Option<crate::readiness::ReadinessGate>,
 }
 
 /// Drain accepted commands for the daemon's lifetime. Each command is served on
@@ -889,6 +893,23 @@ async fn run_instruction(
     src: &CommentWebhookSource,
     instruction: String,
 ) {
+    // CLAUDE-269: right after the pause check (already taken before this
+    // command was accepted), refuse before admission so no attempt counter is
+    // advanced and no `claude` runs. Unlike the CI-triage webhook's silent
+    // accept-and-drop, this route knows the thread, so it replies naming the
+    // reason instead of leaving the commenter to wonder why nothing happened.
+    if let Some(gate) = &ctx.readiness {
+        let check = gate.check();
+        if check.kind == Some(crate::readiness::NotReadyKind::LoginRequired) {
+            let reason = check
+                .reason()
+                .unwrap_or_else(|| "Claude login required".to_string());
+            info!(repo = %cmd.repo, number = cmd.number, "Claude login required; replying and running nothing");
+            reply(ctx, env, cmd, key, login_required_comment(&reason)).await;
+            return;
+        }
+    }
+
     // Reused DEV-335 caps. The per-key counter also IS the redelivery guard: a
     // comment is a one-shot, so its effective cap is one attempt however high the
     // runner default is, and the counter is advanced BEFORE the work so a
@@ -1601,6 +1622,17 @@ pub fn busy_comment(is_pull_request: bool) -> String {
     .join("\n")
 }
 
+/// CLAUDE-269: reply when the Claude login needs renewing, so the commenter
+/// is told why nothing ran instead of hearing silence.
+pub fn login_required_comment(reason: &str) -> String {
+    [
+        "**Command dropped: the runner's Claude login needs renewing.**".to_string(),
+        String::new(),
+        format!("{reason} Nothing was run; comment again once the operator has signed in."),
+    ]
+    .join("\n")
+}
+
 /// Reply when the daily run cap is already spent.
 pub fn cap_comment() -> String {
     [
@@ -2118,6 +2150,7 @@ mod tests {
             error: String::new(),
             transient: false,
             timed_out: false,
+            login_required: false,
         };
         let pushed = outcome_comment(&Decision::Push { files: 1, lines: 2 }, &ok, None);
         assert!(pushed.contains("Claude pushed a commit."));
@@ -2557,6 +2590,7 @@ mod tests {
             defaults: RunnerDefaults::default(),
             keygate: KeyGate::new(),
             denials: Arc::new(DenialReplyLimiter::new()),
+            readiness: None,
         };
         let cmd = command_of(&payload_json(
             "created",
@@ -2614,6 +2648,76 @@ mod tests {
         assert!(!dir.exists(), "the temp credential dir is removed on drop");
     }
 
+    /// CLAUDE-269: while the Claude login needs renewing, `run_instruction`
+    /// replies naming the reason, invokes no `claude`, and advances no counter
+    /// (checked before `admit`, so a redelivery still sees zero attempts once
+    /// signed in again).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn login_required_replies_and_runs_nothing() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = setup_pool(tmp.path()).await;
+        let key = SecretsKey::load().unwrap();
+        let ciphertext = key.encrypt("super-secret-write-pat").unwrap();
+        state::secret_create(&pool, "write-pat", &ciphertext)
+            .await
+            .unwrap();
+
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let readiness = crate::readiness::ReadinessGate::new(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            None,
+        );
+        readiness.trip_login_required("OAuth session expired", "invocation");
+        let ctx = CommentContext {
+            pool: pool.clone(),
+            paths: paths.clone(),
+            claude: Arc::new(ClaudeInvoker::new(None)),
+            config: Arc::new(RwLock::new(config())),
+            mint_cfg: Arc::new(RwLock::new(MintConfig::default())),
+            route_cache: Arc::new(crate::mint::VcsRouteCache::new(
+                crate::mint::DEFAULT_VCS_MAP_TTL,
+            )),
+            defaults: RunnerDefaults::default(),
+            keygate: KeyGate::new(),
+            denials: Arc::new(DenialReplyLimiter::new()),
+            readiness: Some(readiness),
+        };
+        let cmd = command_of(&payload_json(
+            "created",
+            REPO,
+            "/claude fix it",
+            "alice",
+            true,
+        ))
+        .unwrap();
+        let key_str = cmd.key();
+        let src = config().sources[SOURCE].clone();
+        let env = build_env(&ctx, &cmd, &src).await.expect("env built");
+
+        run_instruction(&ctx, &env, &cmd, &key_str, &src, "fix it".to_string()).await;
+
+        assert_eq!(
+            state::attempts_get(&pool, WEBHOOK_COMMENT_ACTION, &key_str)
+                .await
+                .unwrap(),
+            0,
+            "a login-required refusal must not advance the attempt counter"
+        );
+        assert_eq!(
+            state::daily_count_get(&pool, WEBHOOK_COMMENT_ACTION)
+                .await
+                .unwrap(),
+            0,
+            "no claude invocation means no daily count either"
+        );
+    }
+
     #[tokio::test]
     async fn a_source_without_a_write_token_cannot_be_served() {
         let _env = crate::secrets::key_file_env_lock().await;
@@ -2637,6 +2741,7 @@ mod tests {
             defaults: RunnerDefaults::default(),
             keygate: KeyGate::new(),
             denials: Arc::new(DenialReplyLimiter::new()),
+            readiness: None,
         };
         let cmd = command_of(&payload_json(
             "created",

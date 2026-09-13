@@ -147,6 +147,56 @@ pub async fn materialize(
     Ok((status, api_key))
 }
 
+/// CLAUDE-269: outcome of one `claude auth status --json` probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginProbeOutcome {
+    /// `{"loggedIn": true, ...}`.
+    LoggedIn,
+    /// `{"loggedIn": false, ...}`.
+    LoggedOut,
+    /// The probe could not spawn, timed out, or printed something that did not
+    /// parse as the expected JSON shape. Neither logged in nor logged out: the
+    /// caller must change nothing on this outcome rather than guess.
+    Indeterminate(String),
+}
+
+/// Run `claude auth status --json` under the agent's own config dir (and its
+/// `ANTHROPIC_API_KEY`, when one is stored), with a 30s wall-clock timeout via
+/// the same coreutils `timeout(1)` wrapper [`crate::claude::ClaudeInvoker`]
+/// uses. Blocking (a real subprocess spawn and wait): callers run this off the
+/// tokio worker (`crate::blocking::in_place` or `spawn_blocking`), per
+/// CLAUDE-228.
+pub fn probe_claude_login(
+    claude_binary: &str,
+    config_dir: &Path,
+    api_key: Option<&str>,
+) -> LoginProbeOutcome {
+    let mut cmd = std::process::Command::new("timeout");
+    cmd.arg("30s")
+        .arg(claude_binary)
+        .arg("auth")
+        .arg("status")
+        .arg("--json")
+        .env("CLAUDE_CONFIG_DIR", config_dir)
+        .stdin(std::process::Stdio::null());
+    if let Some(key) = api_key {
+        cmd.env("ANTHROPIC_API_KEY", key);
+    }
+    let out = match cmd.output() {
+        Ok(out) => out,
+        Err(e) => return LoginProbeOutcome::Indeterminate(format!("spawn failed: {e}")),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        Ok(v) => match v.get("loggedIn").and_then(|b| b.as_bool()) {
+            Some(true) => LoginProbeOutcome::LoggedIn,
+            Some(false) => LoginProbeOutcome::LoggedOut,
+            None => LoginProbeOutcome::Indeterminate(format!("no `loggedIn` field in: {stdout}")),
+        },
+        Err(e) => LoginProbeOutcome::Indeterminate(format!("unparseable output ({e}): {stdout}")),
+    }
+}
+
 /// Write the single-file `yt` config: `url:` + `token:`, 0600, parent created.
 /// Same two-line shape [`crate::secrets::JobCredentials::materialize`] writes for
 /// a per-job credential, so there is one format in the tree, not two.
@@ -228,6 +278,58 @@ mod tests {
         // The one permitted resolver lives in its own function, so a caller that
         // wants the real location has to say so.
         assert!(src.contains("pub fn default_fj_data_home"));
+    }
+
+    /// CLAUDE-269: `loggedIn: true` / `loggedIn: false` are the two decisive
+    /// outcomes; anything else (a spawn failure, a timeout, unparseable
+    /// output) is `Indeterminate` and must never be collapsed into either.
+    #[test]
+    fn probe_reads_logged_in_and_logged_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        crate::testutil::write_stub(
+            &stub,
+            "#!/bin/sh\nprintf '%s' '{\"loggedIn\":true,\"authMethod\":\"oauth\"}'\n",
+        );
+        assert_eq!(
+            probe_claude_login(stub.to_str().unwrap(), dir.path(), None),
+            LoginProbeOutcome::LoggedIn
+        );
+
+        crate::testutil::write_stub(&stub, "#!/bin/sh\nprintf '%s' '{\"loggedIn\":false}'\n");
+        assert_eq!(
+            probe_claude_login(stub.to_str().unwrap(), dir.path(), None),
+            LoginProbeOutcome::LoggedOut
+        );
+    }
+
+    /// A spawn failure (binary absent) is indeterminate, not logged-out.
+    #[test]
+    fn probe_reports_a_missing_binary_as_indeterminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = probe_claude_login(
+            dir.path().join("no-such-claude-binary").to_str().unwrap(),
+            dir.path(),
+            None,
+        );
+        assert!(
+            matches!(outcome, LoginProbeOutcome::Indeterminate(_)),
+            "{outcome:?}"
+        );
+    }
+
+    /// Unparseable output (a crash, a non-JSON error message) is indeterminate,
+    /// never guessed as either logged-in or logged-out state.
+    #[test]
+    fn probe_reports_unparseable_output_as_indeterminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        crate::testutil::write_stub(&stub, "#!/bin/sh\nprintf 'not json'\nexit 1\n");
+        let outcome = probe_claude_login(stub.to_str().unwrap(), dir.path(), None);
+        assert!(
+            matches!(outcome, LoginProbeOutcome::Indeterminate(_)),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]

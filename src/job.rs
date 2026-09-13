@@ -380,15 +380,23 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                 // it reached claude. Don't spend an API call; synthesize a
                 // result so post still runs, and leave the attempt uncounted so
                 // the job is retried after Resume.
+                // CLAUDE-269: the same checkpoint also stops a run when the
+                // Claude login needs renewing (`RunPause` checks both), so the
+                // synthesized reason names whichever actually tripped it.
                 paused_before_claude = true;
-                warn!(action = %action.name, key = %key, "globally paused before claude started (post still runs)");
-                (
-                    ClaudeResult::synthesized(
+                let (reason, summary) = if ctx.pause.login_tripped() {
+                    (
+                        "run stopped: Claude login required",
+                        "Claude login required before claude started",
+                    )
+                } else {
+                    (
                         "run stopped by global pause",
                         "globally paused before claude started",
-                    ),
-                    false,
-                )
+                    )
+                };
+                warn!(action = %action.name, key = %key, "{summary} (post still runs)");
+                (ClaudeResult::synthesized(reason, summary), false)
             } else {
                 let stream_log = ClaudeInvoker::stream_log_path(
                     &ctx.paths.logs_dir(),
