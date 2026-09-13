@@ -99,20 +99,6 @@ pub fn router(
             get(youtrack_new_page).post(youtrack_create),
         )
         .route(
-            "/actions/new/forgejo-ci-fix",
-            get(native_forms::forgejo_ci_fix_new_page).post(native_forms::forgejo_ci_fix_create),
-        )
-        .route(
-            "/actions/new/ci-failure-analysis",
-            get(native_forms::ci_failure_analysis_new_page)
-                .post(native_forms::ci_failure_analysis_create),
-        )
-        .route(
-            "/actions/new/ci-failure-reconcile",
-            get(native_forms::ci_failure_reconcile_new_page)
-                .post(native_forms::ci_failure_reconcile_create),
-        )
-        .route(
             "/actions/new/closed-issue-summary",
             get(native_forms::closed_issue_summary_new_page)
                 .post(native_forms::closed_issue_summary_create),
@@ -2408,24 +2394,6 @@ fn kind_card(kind: ActionKind) -> KindCard {
             "Work tracker issues end to end: pick up a queued YouTrack issue, run the agent on a \
              clone, open the PR, and drive the AI Agent state field.",
             "/actions/new/youtrack",
-            "Structured form",
-        ),
-        ActionKind::ForgejoCiFix => (
-            "Fix failing CI on the bot's own Forgejo PRs: clone the PR branch, run the agent, and \
-             push a corrective commit when the diff stays inside the size gate.",
-            "/actions/new/forgejo-ci-fix",
-            "Structured form",
-        ),
-        ActionKind::CiFailureAnalysis => (
-            "Comment a log-grounded root-cause analysis on each open CI-failure issue, from the \
-             complete run log plus the failing workflow YAML.",
-            "/actions/new/ci-failure-analysis",
-            "Structured form",
-        ),
-        ActionKind::CiFailureReconcile => (
-            "Close each open CI-failure issue whose failing job is green again on its latest run, \
-             and collapse issues that share a root-cause key.",
-            "/actions/new/ci-failure-reconcile",
             "Structured form",
         ),
         ActionKind::ClosedIssueSummary => (
@@ -5459,16 +5427,16 @@ mod tests {
 
     // ---- run-detail link_template links (CLAUDE-222) ----------------------
 
-    /// A CI-failure run links every key from the shipped action's
-    /// `link_template`: the planned-jobs table, the outcomes table, and the
-    /// summary-modal heading. The template comes from the shipped YAML, so a
-    /// run screen and the config it ships with are checked together.
+    /// A run links every key from the shipped action's `link_template`: the
+    /// planned-jobs table, the outcomes table, and the summary-modal heading.
+    /// The template comes from the shipped YAML, so a run screen and the
+    /// config it ships with are checked together.
     #[test]
-    fn ci_failure_run_links_every_key_from_the_shipped_link_template() {
+    fn run_links_every_key_from_the_shipped_link_template() {
         use super::{JobOutcomeRow, PlannedJob, RunDetailTpl, RunRow};
         use askama::Template;
 
-        const SHIPPED: &str = include_str!("../../actions/ci-failure-analysis.yml");
+        const SHIPPED: &str = include_str!("../../actions/closed-issue-summary.yml");
         let template = crate::action::validate_str(SHIPPED, "<test>")
             .unwrap()
             .action
@@ -5479,7 +5447,7 @@ mod tests {
 
         let run = RunRow {
             id: 3,
-            action_name: "ci-failure-analysis".to_string(),
+            action_name: "closed-issue-summary".to_string(),
             started_at: "2026-08-08T00:00:00Z".to_string(),
             ended_at: Some("2026-08-08T00:01:00Z".to_string()),
             exit_code: Some(0),
@@ -8632,9 +8600,6 @@ mod tests {
             // Every native kind links to its structured form; scripted and the
             // paste-YAML escape hatch both point at the raw editor.
             assert!(body.contains("/actions/new/youtrack"));
-            assert!(body.contains("/actions/new/forgejo-ci-fix"));
-            assert!(body.contains("/actions/new/ci-failure-analysis"));
-            assert!(body.contains("/actions/new/ci-failure-reconcile"));
             assert!(body.contains("/actions/new/closed-issue-summary"));
             assert!(body.contains("/actions/new/raw"));
             // The raw textarea is not the default any more.
@@ -8660,7 +8625,7 @@ mod tests {
         /// Every input a kind's form must expose: each field of its native
         /// config struct plus the shared blocks. A field dropped from the
         /// template fails here even though the Rust round trip would still pass.
-        const COMMON_INPUTS: [&str; 14] = [
+        const COMMON_INPUTS: [&str; 13] = [
             "name",
             "enabled",
             "workdir_base",
@@ -8674,118 +8639,40 @@ mod tests {
             "limit_run_budget_usd",
             "limit_budget_warn_fraction",
             "native_enabled",
-            "log_token_mode",
         ];
 
         #[tokio::test]
         async fn native_new_pages_render_every_field() {
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
-            let claude_inputs = [
-                "claude_cwd",
-                "claude_allowed_tools",
-                "claude_permission_mode",
-                "claude_model",
-                "claude_effort",
-                "claude_autocompact",
-            ];
-            let log_token_inputs = ["log_token_global", "log_token_repos", "log_token_ref"];
-            let cases: [(Response, &str, &str, Vec<&str>); 4] = [
-                (
-                    native_forms::forgejo_ci_fix_new_page(State(s.clone()))
-                        .await
-                        .unwrap(),
-                    "forgejo-ci-fix",
-                    "/actions/new/forgejo-ci-fix",
-                    [
-                        "host",
-                        "repos",
-                        "window_minutes",
-                        "max_files",
-                        "max_lines",
-                        "bot_author",
-                        "bot_email",
-                        "skip_marker",
-                        "max_pr_attempts",
-                        "needs_review_label",
-                        "needs_review_state",
-                        "review_assignee",
-                        "token",
-                        "token_clear",
-                    ]
-                    .into_iter()
-                    .chain(claude_inputs)
-                    .collect(),
-                ),
-                (
-                    native_forms::ci_failure_analysis_new_page(State(s.clone()))
-                        .await
-                        .unwrap(),
-                    "ci-failure-analysis",
-                    "/actions/new/ci-failure-analysis",
-                    ["query", "summary_prefixes", "max_analysis_bytes"]
-                        .into_iter()
-                        .chain(claude_inputs)
-                        .chain(log_token_inputs)
-                        .collect(),
-                ),
-                (
-                    native_forms::ci_failure_reconcile_new_page(State(s.clone()))
-                        .await
-                        .unwrap(),
-                    "ci-failure-reconcile",
-                    "/actions/new/ci-failure-reconcile",
-                    [
-                        "query",
-                        "summary_prefixes",
-                        "repos",
-                        "resolved_state",
-                        "close_comment",
-                        "max_branch_resolves",
-                        "close_duplicates",
-                        "duplicate_comment",
-                    ]
-                    .into_iter()
-                    .chain(log_token_inputs)
-                    .collect(),
-                ),
-                (
-                    native_forms::closed_issue_summary_new_page(State(s.clone()))
-                        .await
-                        .unwrap(),
-                    "closed-issue-summary",
-                    "/actions/new/closed-issue-summary",
-                    [
-                        "parents",
-                        "query",
-                        "custom_field",
-                        "done_label",
-                        "failed_label",
-                        "projects",
-                        "window_days",
-                        "report_project",
-                        "link_type",
-                        "summary_template",
-                        "max_listed_per_project",
-                    ]
-                    .into_iter()
-                    .collect(),
-                ),
-            ];
+            let cases: [(Response, &str, &str, Vec<&str>); 1] = [(
+                native_forms::closed_issue_summary_new_page(State(s.clone()))
+                    .await
+                    .unwrap(),
+                "closed-issue-summary",
+                "/actions/new/closed-issue-summary",
+                [
+                    "parents",
+                    "query",
+                    "custom_field",
+                    "done_label",
+                    "failed_label",
+                    "projects",
+                    "window_days",
+                    "report_project",
+                    "link_type",
+                    "summary_template",
+                    "max_listed_per_project",
+                ]
+                .into_iter()
+                .collect(),
+            )];
             for (resp, kind, post_url, fields) in cases {
                 assert_eq!(resp.status(), StatusCode::OK, "{kind}");
                 let body = body_string(resp).await;
-                // `ci-failure-reconcile` and `closed-issue-summary` run no agent
-                // session, so they expose no claude block; every other input is
-                // required of every kind. `closed-issue-summary` reads no forge
-                // logs either, so it has no log-token block.
-                let expected = fields.into_iter().chain(
-                    COMMON_INPUTS
-                        .into_iter()
-                        .filter(|f| *f != "log_token_mode" || kind != "forgejo-ci-fix")
-                        .filter(|f| *f != "log_token_mode" || kind != "closed-issue-summary"),
-                );
-                for field in expected {
+                // `closed-issue-summary` runs no agent session, so it exposes no
+                // claude block; every other input is required.
+                for field in fields.into_iter().chain(COMMON_INPUTS) {
                     assert!(
                         body.contains(&format!("name=\"{field}\"")),
                         "{kind}: no input for `{field}`"
@@ -8799,42 +8686,17 @@ mod tests {
 
         #[tokio::test]
         async fn native_create_writes_each_kind() {
-            for (kind, body) in [
-                ("forgejo-ci-fix", "name=fix&enabled=on&native_enabled=on"),
-                (
-                    "ci-failure-analysis",
-                    "name=analysis&enabled=on&native_enabled=on",
-                ),
-                (
-                    "ci-failure-reconcile",
-                    "name=reconcile&enabled=on&native_enabled=on",
-                ),
-                (
-                    "closed-issue-summary",
-                    "name=report&enabled=on&native_enabled=on&window_days=7&projects=CLAUDE",
-                ),
-            ] {
+            for (kind, body) in [(
+                "closed-issue-summary",
+                "name=report&enabled=on&native_enabled=on&window_days=7&projects=CLAUDE",
+            )] {
                 let tmp = tempfile::tempdir().unwrap();
                 let s = web_state(tmp.path()).await;
                 let name = body.split('&').next().unwrap().trim_start_matches("name=");
-                let resp = match kind {
-                    "forgejo-ci-fix" => {
-                        native_forms::forgejo_ci_fix_create(State(s.clone()), raw_form(body)).await
-                    }
-                    "ci-failure-analysis" => {
-                        native_forms::ci_failure_analysis_create(State(s.clone()), raw_form(body))
-                            .await
-                    }
-                    "ci-failure-reconcile" => {
-                        native_forms::ci_failure_reconcile_create(State(s.clone()), raw_form(body))
-                            .await
-                    }
-                    _ => {
-                        native_forms::closed_issue_summary_create(State(s.clone()), raw_form(body))
-                            .await
-                    }
-                }
-                .unwrap();
+                let resp =
+                    native_forms::closed_issue_summary_create(State(s.clone()), raw_form(body))
+                        .await
+                        .unwrap();
                 assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{kind}");
                 let file = s.paths.actions_dir().join(format!("{name}.yml"));
                 let written = std::fs::read_to_string(&file).unwrap();
@@ -8855,7 +8717,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             let resp =
-                native_forms::ci_failure_analysis_create(State(s.clone()), raw_form("enabled=on"))
+                native_forms::closed_issue_summary_create(State(s.clone()), raw_form("enabled=on"))
                     .await
                     .unwrap();
             assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -8873,19 +8735,9 @@ mod tests {
                     "name=\"yt_query\"",
                 ),
                 (
-                    "fix",
-                    "name: fix\nkind: forgejo-ci-fix\nnative:\n  host: dev.a8n.run\n",
-                    "name=\"bot_author\"",
-                ),
-                (
-                    "analysis",
-                    "name: analysis\nkind: ci-failure-analysis\nnative:\n  max_analysis_bytes: 1024\n",
-                    "name=\"max_analysis_bytes\"",
-                ),
-                (
-                    "reconcile",
-                    "name: reconcile\nkind: ci-failure-reconcile\nnative:\n  resolved_state: Done\n",
-                    "name=\"max_branch_resolves\"",
+                    "report",
+                    "name: report\nkind: closed-issue-summary\nnative:\n  window_days: 7\n  projects: [CLAUDE]\n",
+                    "name=\"window_days\"",
                 ),
             ];
             for (name, yaml, marker) in cases {
@@ -8937,16 +8789,16 @@ mod tests {
             let s = web_state(tmp.path()).await;
             let file = seed_action(
                 &s,
-                "reconcile",
-                "name: reconcile\nkind: ci-failure-reconcile\nnative:\n  resolved_state: Done\n",
+                "report",
+                "name: report\nkind: closed-issue-summary\nnative:\n  window_days: 7\n  projects: [CLAUDE]\n",
             )
             .await;
             let resp = action_form_save(
                 State(s.clone()),
-                AxumPath("reconcile".to_string()),
+                AxumPath("report".to_string()),
                 raw_form(
-                    "name=reconcile&enabled=on&native_enabled=on&resolved_state=Fixed\
-                     &log_token_mode=per_repo&log_token_repos=contoso%2F*&log_token_ref=logs",
+                    "name=report&enabled=on&native_enabled=on&window_days=7&projects=CLAUDE\
+                     &custom_field=Reporter",
                 ),
             )
             .await
@@ -8954,20 +8806,10 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::SEE_OTHER);
             let written = std::fs::read_to_string(&file).unwrap();
             let loaded = crate::action::validate_str(&written, file.to_str().unwrap()).unwrap();
-            let Some(NativeConfig::CiFailureReconcile(cfg)) = loaded.action.native else {
-                panic!("expected a reconcile config");
+            let Some(NativeConfig::ClosedIssueSummary(cfg)) = loaded.action.native else {
+                panic!("expected a closed-issue-summary config");
             };
-            assert_eq!(cfg.resolved_state, "Fixed");
-            // The repeated per-repo rows survive the raw-body decode.
-            assert_eq!(
-                cfg.log_token_ref,
-                Some(crate::action::LogTokenRef::PerRepo(vec![
-                    crate::action::LogTokenEntry {
-                        repos: vec!["contoso/*".to_string()],
-                        token_ref: "logs".to_string(),
-                    }
-                ]))
-            );
+            assert_eq!(cfg.custom_field, "Reporter");
         }
 
         #[tokio::test]
@@ -8995,18 +8837,6 @@ mod tests {
         async fn edit_page_offers_the_form_for_every_native_kind() {
             for (name, yaml) in [
                 ("yt", "name: yt\nkind: youtrack\nnative: {}\n"),
-                (
-                    "fix",
-                    "name: fix\nkind: forgejo-ci-fix\nnative:\n  host: dev.a8n.run\n",
-                ),
-                (
-                    "analysis",
-                    "name: analysis\nkind: ci-failure-analysis\nnative:\n  max_analysis_bytes: 1024\n",
-                ),
-                (
-                    "reconcile",
-                    "name: reconcile\nkind: ci-failure-reconcile\nnative:\n  resolved_state: Done\n",
-                ),
                 (
                     "report",
                     "name: report\nkind: closed-issue-summary\nnative:\n  window_days: 7\n  projects: [CLAUDE]\n",
