@@ -476,7 +476,7 @@ async fn process_job(
     // Transient claude error: no finalize, no attempt counted, no daily count.
     if claude_result.transient {
         info!(action = %action.name, key = %key, error = %claude_result.error, "transient claude error, not counting attempt");
-        cleanup_workdir(&workdir_path);
+        workdir::cleanup_or_preserve(&workdir_path, &action.name, key);
         return Ok(ProcessedJob::Transient { key: key.clone() });
     }
 
@@ -536,7 +536,7 @@ async fn process_job(
         state::daily_count_increment(ctx.pool, &action.name).await?;
     }
 
-    cleanup_workdir(&workdir_path);
+    workdir::cleanup_or_preserve(&workdir_path, &action.name, key);
 
     Ok(ProcessedJob::Done {
         key: key.clone(),
@@ -992,7 +992,7 @@ async fn flag_needs_review(
                     warn!(pr = job.pr_number, error = %e, "needs-review: writing comment body failed (skipping comment)")
                 }
             }
-            cleanup_workdir(&workdir_path);
+            workdir::cleanup_or_preserve(&workdir_path, &ctx.action.action.name, &job.key);
         }
         Err(e) => {
             warn!(pr = job.pr_number, error = %e, "needs-review: workdir create failed (skipping comment)")
@@ -1040,14 +1040,6 @@ fn needs_review_comment(max_pr_attempts: u64, job: &ForgejoCiFixJob) -> String {
         "A human should take it from here.".to_string(),
     ]
     .join("\n")
-}
-
-fn cleanup_workdir(workdir: &Path) {
-    if workdir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(workdir) {
-            warn!(workdir = %workdir.display(), error = %e, "workdir cleanup failed (continuing)");
-        }
-    }
 }
 
 #[cfg(test)]
