@@ -496,6 +496,9 @@ impl CliBackend {
         Ok(PullRequest {
             number,
             url: created.html_url,
+            // CLAUDE-275: the caller (branch-backed create, or AGit) fills in
+            // `head_branch` when it has one; AGit has none.
+            head_branch: None,
         })
     }
 
@@ -593,9 +596,11 @@ impl CliBackend {
     /// caller ([`Forge::create_pr`]) so both strategies share the ahead check.
     ///
     /// CLAUDE-170: idempotent against a pre-existing `origin/<branch>`. The
-    /// feature-branch name is deterministic per issue key, so a re-run, a
-    /// concurrent duplicate run, or a manual pre-push of the same branch is a
-    /// DETERMINISTIC collision, not a transient one. Before pushing, the remote
+    /// feature-branch name is chosen by the agent and not deterministic per issue
+    /// key; a pre-existing remote branch of the same name is legitimate, not just
+    /// a collision, because CLAUDE-275's resume path clones a re-queued issue's
+    /// recorded PR branch by name and continues committing on it. Before pushing,
+    /// the remote
     /// state of the branch is read (`git ls-remote`) and reconciled WITHOUT force:
     /// absent -> push + create; local fast-forwards or equals remote -> (fast-
     /// forward) push then find-or-create the PR; diverged (or remote-ahead) ->
@@ -750,6 +755,7 @@ impl CliBackend {
             .map(|p| PullRequest {
                 number: Some(p.number),
                 url: p.html_url,
+                head_branch: Some(branch.to_string()),
             }))
     }
 
@@ -813,6 +819,10 @@ impl CliBackend {
             .run_in_env(Some(workdir), &self.fj, &create_args, &self.fj_envs())
             .and_then(|out| Self::checked(&self.fj, out, &create_args));
         let _ = std::fs::remove_file(workdir.join(BODY_FILE));
+        // CLAUDE-275: the branch-backed create just pushed this exact server
+        // branch (`self.push_branch` / the fast-forward arm above), so it is
+        // always the resulting PR's head, whatever `fj pr create --json` itself
+        // reports.
         let stdout = match res {
             Ok(stdout) => stdout,
             // CLAUDE-206: the forge says a PR for this head already exists (a
@@ -842,7 +852,10 @@ impl CliBackend {
                 ));
             }
         };
-        self.created_pr(&stdout)
+        self.created_pr(&stdout).map(|mut pr| {
+            pr.head_branch = Some(branch.to_string());
+            pr
+        })
     }
 
     /// CLAUDE-206: record a lookup failure that was degraded to a create, in the
@@ -1349,6 +1362,10 @@ impl Forge for CliBackend {
 
     fn take_notices(&self) -> Vec<String> {
         std::mem::take(&mut *self.notices.lock().unwrap())
+    }
+
+    fn note(&self, message: String) {
+        self.notices.lock().unwrap().push(message);
     }
 
     /// CLAUDE-194 / CLAUDE-207: two probes, one per scope category the PR path
