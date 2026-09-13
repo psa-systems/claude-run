@@ -230,6 +230,11 @@ pub struct WebhookConfig {
     /// analyzes concurrently, each behind its own `analysis_timeout_secs`
     /// session. Must be at least 1 (validated in `src/settings.rs`); default 2.
     pub analysis_concurrency: usize,
+    /// CLAUDE-276: how many CI failures on the agent's own open PR are routed
+    /// back to its issue (comment + `AI Agent = Queued`) before the issue is
+    /// flagged `Needs Review` instead. Matched against
+    /// `agent_pull_requests.fix_attempts`. Default 3.
+    pub agent_pr_fix_attempts: u32,
 }
 
 impl Default for WebhookConfig {
@@ -240,6 +245,7 @@ impl Default for WebhookConfig {
             analysis_timeout_secs: 600,
             analysis_concurrency: 2,
             auto_fix: false,
+            agent_pr_fix_attempts: 3,
         }
     }
 }
@@ -321,6 +327,15 @@ pub struct WebhookSource {
     /// runs unauthenticated, which serves a public repo; a private failure then
     /// mints a human-action issue with no log attached (the CLAUDE-92 outcome).
     pub log_token_ref: Option<String>,
+    /// CLAUDE-276: name of the secret (in the `secrets` table) holding a
+    /// Forgejo PAT that authorizes commenting on this source's pull requests
+    /// (routing a CI failure on an open PR back to its issue, or onto the
+    /// human author's PR). Reaches `fj` the same way `log_token_ref` does: a
+    /// temp single-host `keys.json` carrying only this one secret. Unset, a
+    /// failure that needs a PR comment logs at `error`, writes a `run_events`
+    /// row naming this source, and fails the run rather than posting nothing
+    /// silently.
+    pub write_token_ref: Option<String>,
 }
 
 impl Default for WebhookSource {
@@ -330,6 +345,7 @@ impl Default for WebhookSource {
             allowed_repos: Vec::new(),
             rate_limit_per_min: 60,
             log_token_ref: None,
+            write_token_ref: None,
         }
     }
 }

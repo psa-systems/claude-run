@@ -263,6 +263,56 @@ pub async fn distinct_branches(pool: &DbPool, failure_id: i64) -> Result<Vec<Str
     Ok(branches)
 }
 
+/// The `ci_failures` row currently claimed by `issue_key`, if any (CLAUDE-276:
+/// used to find or lazily create the store row backing an agent's own PR, whose
+/// `ci_failures` row is addressed by issue key rather than by test overlap).
+pub async fn failure_for_issue(pool: &DbPool, issue_key: &str) -> Result<Option<Failure>> {
+    let row = sqlx::query(&db::q(
+        pool,
+        "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, created_at, updated_at \
+         FROM ci_failures WHERE issue_key = ?",
+    ))
+    .bind(issue_key)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(failure_from_row).transpose()
+}
+
+/// Every distinct non-null PR number `failure_id` has been seen sighted on,
+/// sorted. CLAUDE-276: used to comment the same issue link onto every open
+/// PR a `pr_only` failure's two distinct branches turned out to be on.
+pub async fn pr_numbers_for_failure(pool: &DbPool, failure_id: i64) -> Result<Vec<i64>> {
+    let numbers: Vec<i64> = sqlx::query_scalar(&db::q(
+        pool,
+        "SELECT DISTINCT pr_number FROM ci_failure_runs \
+         WHERE failure_id = ? AND pr_number IS NOT NULL ORDER BY pr_number",
+    ))
+    .bind(failure_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(numbers)
+}
+
+/// Every run index `failure_id` was sighted at on PR `pr_number`, sorted.
+/// CLAUDE-276: used to list every fix attempt's run when an agent's own PR
+/// hits the `agent_pr_fix_attempts` ceiling and is flagged `Needs Review`.
+pub async fn run_indexes_for_failure_pr(
+    pool: &DbPool,
+    failure_id: i64,
+    pr_number: i64,
+) -> Result<Vec<i64>> {
+    let indexes: Vec<i64> = sqlx::query_scalar(&db::q(
+        pool,
+        "SELECT run_index FROM ci_failure_runs \
+         WHERE failure_id = ? AND pr_number = ? ORDER BY run_index",
+    ))
+    .bind(failure_id)
+    .bind(pr_number)
+    .fetch_all(pool)
+    .await?;
+    Ok(indexes)
+}
+
 /// Record a PR the agent opened. Returns its `agent_pull_requests` id.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_agent_pr(
@@ -671,6 +721,96 @@ mod tests {
         assert_eq!(after.fix_attempts, 1);
         assert_eq!(after.state, "merged");
         assert_eq!(after.updated_at, "2026-09-03T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn failure_for_issue_finds_the_claiming_row() {
+        let pool = test_pool().await;
+        let id = record_failure(
+            &pool,
+            "acme/widgets",
+            "checks.yml",
+            "test",
+            None,
+            Some("CLAUDE-42"),
+            "open",
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let found = failure_for_issue(&pool, "CLAUDE-42")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, id);
+        assert_eq!(failure_for_issue(&pool, "CLAUDE-999").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn pr_numbers_and_run_indexes_roundtrip() {
+        let pool = test_pool().await;
+        let id = record_failure(
+            &pool,
+            "acme/widgets",
+            "checks.yml",
+            "test",
+            None,
+            Some("CLAUDE-42"),
+            "open",
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        attach_run(&pool, id, 1, "abc123", "main", None, "2026-09-01T00:00:00Z")
+            .await
+            .unwrap();
+        attach_run(
+            &pool,
+            id,
+            2,
+            "def456",
+            "fix/thing",
+            Some(17),
+            "2026-09-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        attach_run(
+            &pool,
+            id,
+            3,
+            "ghi789",
+            "fix/thing",
+            Some(17),
+            "2026-09-03T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        attach_run(
+            &pool,
+            id,
+            4,
+            "jkl012",
+            "main",
+            Some(23),
+            "2026-09-04T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            pr_numbers_for_failure(&pool, id).await.unwrap(),
+            vec![17, 23]
+        );
+        assert_eq!(
+            run_indexes_for_failure_pr(&pool, id, 17).await.unwrap(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            run_indexes_for_failure_pr(&pool, id, 23).await.unwrap(),
+            vec![4]
+        );
     }
 
     #[tokio::test]

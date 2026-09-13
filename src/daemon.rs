@@ -676,6 +676,8 @@ fn build_mint_context(
         route_cache: Arc::new(crate::mint::VcsRouteCache::new(
             crate::mint::DEFAULT_VCS_MAP_TTL,
         )),
+        paths: paths.clone(),
+        pr_comment_runner: Arc::new(crate::provider::ProcessRunner::new()),
     })
 }
 
