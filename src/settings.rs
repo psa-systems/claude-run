@@ -929,9 +929,15 @@ fn comment_rate_map(cfg: &CommentWebhookConfig) -> HashMap<String, Mutex<RateLim
 /// CLAUDE-274: `analysis_concurrency` must be at least 1 - a `0` would leave
 /// [`crate::web::webhooks::consume_events`]'s worker-pool semaphore permanently
 /// starved, so no event would ever be analyzed.
+/// CLAUDE-276: `agent_pr_fix_attempts` must be at least 1 - a `0` would flag
+/// the agent's own PR `Needs Review` on its very first failure, never giving
+/// it a chance to fix its own regression.
 pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> {
     if cfg.analysis_concurrency < 1 {
         return Err("analysis_concurrency must be >= 1".to_string());
+    }
+    if cfg.agent_pr_fix_attempts < 1 {
+        return Err("agent_pr_fix_attempts must be >= 1".to_string());
     }
     Ok(())
 }

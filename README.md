@@ -58,13 +58,14 @@ at gather time by the repo-access preflight, which probes one read per category 
 missing scope is named before a Claude run is paid for. If the open-PR lookup fails anyway (a mid-run permission
 change, or a transient forge error) the runner creates the PR instead of failing the run, logging a `warn` run event
 with the CLI error. The read-only log-fetch token
-(`log_token_ref`, used by the CI-failure actions) needs only `read:repository`. The comment-command token
-(`write_token_ref`, CLAUDE-220) is a third, separate credential: it reads the commenter's effective repository
-permission (`fj repo collaborator ... permission`), posts the PR replies, and authenticates the branch push, so it needs
-`write:repository` plus `write:issue` (PR comments go through the issues API). Keeping it in its own settings section is
-the whole reason the comment listener is a separate section from `webhook`: the CI-failure sources never hold a
-write-scoped token. Per-command breakdown with the endpoint each call maps to: `actions/SCHEMA.md`, "Forgejo token
-scopes".
+(`log_token_ref`, used by the CI-failure sources' log fetch) needs only `read:repository`. Two, separate write-scoped
+tokens exist for two, separate reasons: the CI-failure webhook source's own `write_token_ref` (CLAUDE-276) posts the
+PR comment a CI-failure routing decision needs (the analysis on a human's PR, the agent's own re-queued issue, the
+"already tracked" note), needing `write:issue` (PR comments go through the issues API) and nothing else - it never
+pushes a branch or opens a PR. The comment-command token (`write_token_ref`, CLAUDE-220, on the SEPARATE
+`webhook_comment` section) reads the commenter's effective repository permission (`fj repo collaborator ...
+permission`), posts the PR replies, and authenticates the branch push, so it needs `write:repository` plus
+`write:issue`. Per-command breakdown with the endpoint each call maps to: `actions/SCHEMA.md`, "Forgejo token scopes".
 
 **Resuming a PR on re-queue (CLAUDE-275).** Every PR the `youtrack` action opens is recorded in the `agent_pull_requests`
 table (`src/ci_failure/store.rs`), keyed on `(host, repo, pr_number)`. If its issue is re-queued (`AI Agent = Queued`
@@ -379,8 +380,8 @@ configuration, and so is an empty one.
 Each section is one JSON document validated against the same serde struct the file parser used (`deny_unknown_fields`),
 so an invalid edit is rejected inline with the parser's own error and nothing is persisted. Secret values are never
 shown or stored on the page: fields ending in `_ref` (`auth_token_ref`, a webhook source's `secret_ref` /
-`log_token_ref`, a comment source's `write_token_ref`, `[update].token_ref`) name a credential in the Secrets store and
-are rendered as that name only. Each
+`log_token_ref` / `write_token_ref`, a comment source's `write_token_ref`, `[update].token_ref`) name a credential in
+the Secrets store and are rendered as that name only. Each
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
 secret refs, adding a source), `next event` for mint / update, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
@@ -913,21 +914,50 @@ verbatim, so use lowercase `[a-z0-9_-]`; a name needing URL escaping is warned a
 Triage sorts each verified failure into one of three buckets: a failing PR check that a code change fixes (`code_fix`)
 mints an issue and sets `AI Agent = Queued` so the runner opens the fix PR; a failure no PR fixes (`human_action`,
 e.g. a main-branch / tag / release / missing-secret failure) mints a human-assigned issue with no PR; a transient /
-infra / flaky failure (`transient`) mints nothing. A failing run triggered by the fix bot's own login mints nothing (
-loop safety), and the reused per-key + daily caps throttle a storm of failures.
+infra / flaky failure (`transient`) mints nothing. The reused per-key + daily caps throttle a storm of failures.
 
 **CLAUDE-208: a stopped run is not a broken one.** Forgejo fires `action_run_failure` for every non-success done status, and it reports run-level `failure` for a run whose jobs were merely CANCELLED, which is what a newer push to the same ref produces when it supersedes an in-flight run. The run-level status alone therefore cannot tell a broken build from a stopped one, so the consumer reads the per-job statuses that come back with the log: when no job failed and every job ended `cancelled` or `skipped`, the delivery is acked and the run closed with a summary naming those statuses, with no triage and no issue. Any other status set (including an all-`success` run under a run-level `failure`) still triages and mints, and a job list that did not resolve at all (a rejected log token, a pruned run) fails open and mints as before.
 
-**CLAUDE-149: a human's failing PR is left to its author; the bot only fixes its own.** When the failing run already has
-an open PR, the webhook `code_fix` (queue-for-fix) route is suppressed: no issue is minted and no fix is queued, because
-the author owns the red CI on their own branch. A `human_action` failure on an open PR still mints (it needs a human, not
-the bot). The `forgejo-ci-fix` action is retargeted to match: it now auto-fixes ONLY the bot's own failing PRs (those
-authored by `bot_author`, the PRs the bot opened working a queued issue) and skips everyone else's. On its own PR the bot
-keeps pushing corrective commits until CI passes; after `max_pr_attempts` distinct fix pushes it stops and flags the PR
-Needs Review (a PR comment, the `needs-review` label, and best-effort sets the source issue's State and assignee). The
-`enabled` toggle defaults to `true` and is a master kill switch.
+**CLAUDE-276: a failure on an open PR routes by who opened the PR, not by matching a bot login.** Before triage runs,
+the consumer resolves whether the failing commit itself is the head of some open PR (`resolve_open_pr`, listing the
+repo's open PRs and matching by `head_sha`); a lookup failure is never read as "no PR" - it fails the run (`ok =
+false`) with an `error` log, and nothing is minted or commented, because the old CLAUDE-149 `resolve_has_open_pr`
+degrading a forge error to "no PR" is exactly the kind of silent miss this issue closes. `None` (no open PR at all,
+e.g. a push to `main`) runs the ordinary store-match / triage / mint pipeline below unchanged. `Some(pr)` routes by
+whether `agent_pull_requests` has an `open` row for `(host, repo, pr.number)`:
 
-**CLAUDE-153/CLAUDE-273: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies (still subject to the CLAUDE-149 open-PR suppression, which is a separate gate that DOES still suppress the mint itself). This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
+- **The agent's own PR** (an `open` `agent_pull_requests` row): below `config.webhook.agent_pr_fix_attempts` (default
+  3), the run comments the recorded issue with the run link, the failing tests, and the analysis, bumps
+  `fix_attempts`, and sets `AI Agent = Queued` so the runner picks the SAME issue back up on the SAME branch (CLAUDE-275)
+  instead of a second issue ever being filed for it. At the ceiling, the issue is flagged `AI Agent = Needs Review`
+  instead, with a comment listing every fix attempt's run. Either way: no PR comment, no new issue - the failure
+  belongs to an issue that already exists. This replaces matching `trigger_user` against `bot_logins`, which is what
+  silently dropped a real incident (run 5874 on PR 766, opened by the bot as `Claude-Run`, never matched the
+  lowercase-only `claude-run` in `bot_logins`).
+- **A human's PR** always gets the analysis, one way or another: sharing a failing test with an already-`open` failure
+  gets a PR comment naming the issue ("This failure is already tracked in \<KEY\>; it is not caused by this PR.") and
+  the run attached, with no analysis (the failure is already fully triaged); sharing a failing test with a `pr_only`
+  failure whose sightings now span two distinct branches means the failure belongs to `main`, not either PR, so an
+  issue is minted for real (triage + `mint::mint`, DEV-335 caps applied and advanced exactly like a fresh mint) and
+  both PRs get a comment linking it; anything else (no store match at all) runs the analysis and comments it on the PR
+  - always - then records a `pr_only` row (branch, PR number) with no issue yet, so a second branch hitting the same
+  failure is what promotes it.
+
+PR comments post through a webhook source's own `write_token_ref` (a Forgejo PAT that can comment on pull requests),
+reaching `fj` the same temp single-host `keys.json` way `log_token_ref` and the comment listener's own `write_token_ref`
+do. A source with none configured is a hard failure the moment a PR comment is needed: logged at `error`, recorded as
+a `run_events` row naming the source, and the run finishes `ok = false` - it is never silently skipped.
+
+`mint::mint` itself no longer applies a bot-loop or open-PR guard of its own (the old `SkippedBotLoop` /
+`MintOutcome::SkippedOpenPr`, CLAUDE-149's `is_bot_loop`): the caller now decides open-PR routing, including the
+agent's-own-PR case, before `mint` is ever reached. `config.mint.bot_logins` is unchanged and still used by the
+`/claude` PR-comment listener's own, separate bot-login check.
+
+The `forgejo-ci-fix` action (CLAUDE-149's `bot_author`-matched auto-fixer) and its `Needs Review` flagging on
+`max_pr_attempts` are retired by CLAUDE-279 onto this same mechanism; until that lands they continue to run
+alongside it.
+
+**CLAUDE-153/CLAUDE-273: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
 
 A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then
 the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the
@@ -943,8 +973,9 @@ wrong destination is diagnosable.
 
 The webhook sources and the mint routing are edited on the **Settings** page (the `Webhook sources` and `Issue minting`
 sections, formerly `[webhook]` and `[mint]` in `config.toml`; CLAUDE-101), or over the API. Adding / editing a source (
-allow-list, rate limit, `secret_ref`, `log_token_ref`) and the webhook `auto_fix` toggle (CLAUDE-153) take effect live;
-`replay_window_secs` applies on restart. A mint edit is honored by the next event.
+allow-list, rate limit, `secret_ref`, `log_token_ref`, `write_token_ref`) and the webhook `auto_fix` toggle (CLAUDE-153)
+take effect live, as does `agent_pr_fix_attempts` (CLAUDE-276, default 3, applies to the next event); `replay_window_secs`
+applies on restart. A mint edit is honored by the next event.
 
 ### Auto-fix for mechanically-fixable failures (CLAUDE-104)
 
@@ -959,16 +990,16 @@ inside triage AFTER the transient/no-log rules (so a flaky run of a checks workf
 but BEFORE the LLM classifier. Two detectors ship: `cargo-fmt` (matches the rustfmt `Diff in ...` signature, fix
 `cargo fmt --all`) and `checks-workflow` (matches `workflow_id` against `checks_workflows`, handing the runner the
 failing step). A match short-circuits to the `auto_fix` triage bucket, which routes exactly like `code_fix` (mint a
-queued issue, `AI Agent=Queued`, no human assignee) but applies regardless of `has_open_pr` and on a push to a
-protected/main branch, so it never reaches the classifier prompt that would label it `human_action`. The minted issue's
-summary (`Auto-fix: cargo fmt on <repo> (run #N, <sha>)`) and description name the concrete problem, the fix command,
-and the delivery instruction: commit on a fresh `chore/<kind>-<short-sha>` branch and open a PR against `main` via the
-configured PR strategy (CLAUDE-103), never a direct push to main. The `has_open_pr == true` case is handled by CLAUDE-149
-instead: this auto-fix path applies only when there is no open PR. When a PR is already open the webhook `code_fix` route
-is suppressed (a human's PR is left to its author), and `forgejo-ci-fix` separately fixes the bot's own failing PRs,
-iterating until green or flagging Needs Review. Repeats of the same failure group by the CLAUDE-273 `ci_failure` store's
-failing-test overlap, not the commit SHA, so an auto-fix failure that recurs on a later commit attaches to the same
-open issue instead of minting a sibling.
+queued issue, `AI Agent=Queued`, no human assignee) and never reaches the classifier prompt that would label it
+`human_action`. The minted issue's summary (`Auto-fix: cargo fmt on <repo> (run #N, <sha>)`) and description name the
+concrete problem, the fix command, and the delivery instruction: commit on a fresh `chore/<kind>-<short-sha>` branch
+and open a PR against `main` via the configured PR strategy (CLAUDE-103), never a direct push to main. In practice this
+mint only happens on a push with no open PR (a direct push to `main`, or a protected branch): CLAUDE-276's open-PR
+routing (above) decides everything before triage even runs when the failing commit IS on an open PR, so an auto-fix
+verdict there reaches a PR comment (as this issue's analysis) rather than a fresh mint - the agent's own PR is re-queued
+onto its existing issue instead, and a human's PR is left to its author with the fix described in the comment. Repeats
+of the same failure group by the CLAUDE-273 `ci_failure` store's failing-test overlap, not the commit SHA, so an
+auto-fix failure that recurs on a later commit attaches to the same open issue instead of minting a sibling.
 
 ### Deep CI-failure analysis (CLAUDE-189)
 
