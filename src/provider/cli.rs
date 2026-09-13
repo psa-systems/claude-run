@@ -2457,10 +2457,21 @@ mod tests {
             b.yt_config_path().as_deref(),
             Some(cfg.to_string_lossy().as_ref())
         );
-        // Host-auth fallback (no injected config) yields no base URL.
+        // Host-auth fallback (no injected config) yields no base URL. This
+        // reads the AMBIENT `YOUTRACK_CLI_CONFIG` env var (see
+        // `yt_config_path`), which a host or container running the daemon's
+        // own service login (`service_auth::export_yt_config_env`) may have
+        // set for the whole test process (CLAUDE-283), so save and restore it
+        // around the assertion rather than trusting the ambient env is clean.
+        let prior = std::env::var(crate::service_auth::YT_CONFIG_ENV).ok();
+        std::env::remove_var(crate::service_auth::YT_CONFIG_ENV);
         let host_auth = CliBackend::new(Arc::new(StubRunner::new()));
         assert_eq!(host_auth.yt_base_url(), None);
         assert_eq!(host_auth.yt_config_path(), None);
+        match prior {
+            Some(v) => std::env::set_var(crate::service_auth::YT_CONFIG_ENV, v),
+            None => std::env::remove_var(crate::service_auth::YT_CONFIG_ENV),
+        }
     }
 
     #[test]
