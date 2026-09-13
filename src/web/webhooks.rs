@@ -173,6 +173,74 @@ pub const WEBHOOK_TRIGGERED_BY: &str = "webhook";
 pub const SIGNATURE_HEADER: &str = "X-Forgejo-Signature";
 /// Per-delivery unique id, used for replay protection.
 pub const DELIVERY_HEADER: &str = "X-Forgejo-Delivery";
+/// CLAUDE-277: the delivery's event type, mirroring Gitea's `X-Gitea-Event`
+/// (Forgejo forked Gitea's webhook notifier and kept its header naming,
+/// rebranded to `X-Forgejo-*` the same way it renamed the signature and
+/// delivery headers above). Its value for an Action-run delivery is
+/// `action_run_failure` / `action_run_success` / `action_run_recover`
+/// (`services/webhook/notifier.go` `ActionRunNowDone`, the same notifier
+/// [`VerifiedFailureEvent::status`]'s doc comment cites); for a pull-request
+/// delivery it is [`PULL_REQUEST_EVENT_TYPE`]. Operators must confirm this
+/// against their deployed Forgejo's actual delivery before relying on it (see
+/// the README "Webhook (Forgejo)" operator-setup note): a missing or
+/// unrecognized header still falls back to the pre-existing Action-run parse
+/// path, so an Action-run-only deployment that never sends this header is
+/// unaffected.
+pub const EVENT_HEADER: &str = "X-Forgejo-Event";
+/// [`EVENT_HEADER`] value for a pull-request delivery.
+pub const PULL_REQUEST_EVENT_TYPE: &str = "pull_request";
+/// [`EVENT_HEADER`] value prefix for every Action-run delivery kind.
+const ACTION_RUN_EVENT_PREFIX: &str = "action_run_";
+/// `pull_request.action` value for a PR closed (merged or not) delivery. Every
+/// other action (`opened`, `edited`, `synchronized`, ...) is acked and dropped:
+/// nothing to reconcile until the PR is terminal.
+const PR_ACTION_CLOSED: &str = "closed";
+
+/// CLAUDE-277: the subset of Forgejo's `pull_request` webhook payload the
+/// merge-close path consumes. Extra fields are ignored (no
+/// `deny_unknown_fields`), matching [`ActionPayload`]'s tolerance of a Forgejo
+/// upgrade that adds keys.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequestPayload {
+    /// `opened` | `edited` | `closed` | `synchronized` | ... . Only
+    /// [`PR_ACTION_CLOSED`] is acted on.
+    pub action: String,
+    pub number: i64,
+    pub pull_request: PullRequestInfo,
+    pub repository: Repository,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequestInfo {
+    /// True when the PR was merged rather than closed unmerged. Only
+    /// meaningful when `action == "closed"`.
+    #[serde(default)]
+    pub merged: bool,
+    pub head: PullRequestHead,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequestHead {
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    pub sha: String,
+}
+
+/// The typed event emitted downstream for a verified, allow-listed, terminal
+/// (`closed`) pull-request delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPullRequestEvent {
+    pub repo: String,
+    pub number: i64,
+    pub merged: bool,
+    pub head_sha: String,
+    pub head_ref: String,
+    pub html_url: String,
+    /// CLAUDE-96-style: the webhook source this event arrived through, so the
+    /// consumer can resolve the source's `log_token_ref`.
+    pub source: String,
+}
 
 /// Subset of the Forgejo Action-run webhook payload we consume. Extra fields in
 /// the delivery are ignored (no `deny_unknown_fields`) so a Forgejo upgrade that
@@ -290,6 +358,14 @@ pub struct WebhookState {
     /// When set, a login-required delivery is accepted and dropped exactly
     /// like a pause, and the drop is recorded as a `run_events` row.
     readiness: Option<crate::readiness::ReadinessGate>,
+    /// CLAUDE-277: `None` outside the daemon and in every pre-existing test
+    /// (a separate `with_pr_events` builder, not a constructor parameter, so
+    /// `WebhookState::new`'s call sites - including
+    /// `comment_webhooks`'s cross-listener replay-store test - stay
+    /// source-compatible). A `pull_request` delivery with no sender configured
+    /// is acked and dropped with a log, exactly like a delivery arriving while
+    /// the daemon has no usable provider backend.
+    pr_events: Option<mpsc::Sender<VerifiedPullRequestEvent>>,
 }
 
 /// CLAUDE-87/101: build one fixed-window rate limiter per source, so exhausting
@@ -339,6 +415,7 @@ impl WebhookState {
             seen: Arc::new(Mutex::new(seen)),
             rate: Arc::new(RwLock::new(rate)),
             readiness: None,
+            pr_events: None,
         }
     }
 
@@ -360,6 +437,7 @@ impl WebhookState {
             seen: Arc::new(Mutex::new(seen)),
             rate,
             readiness: None,
+            pr_events: None,
         }
     }
 
@@ -368,6 +446,14 @@ impl WebhookState {
     /// existing constructor call site stays source-compatible.
     pub fn with_readiness(mut self, gate: crate::readiness::ReadinessGate) -> Self {
         self.readiness = Some(gate);
+        self
+    }
+
+    /// CLAUDE-277: attach the channel a verified `pull_request` delivery is
+    /// dispatched onto. A builder for the same source-compatibility reason as
+    /// [`Self::with_readiness`].
+    pub fn with_pr_events(mut self, events: mpsc::Sender<VerifiedPullRequestEvent>) -> Self {
+        self.pr_events = Some(events);
         self
     }
 
@@ -394,6 +480,10 @@ pub fn router(state: WebhookState) -> Router {
 /// on-disk mint config, and the shared `claude` invoker behind a
 /// [`FailureClassifier`]. When the daemon cannot build one (no usable `yt`/`fj`
 /// backend) it passes `None` and the consumer falls back to log-only behaviour.
+/// CLAUDE-277: `Clone` so the daemon can hand the same context to both
+/// [`consume_events`] and [`consume_pr_events`] - every field is already
+/// `Arc`-shaped or cheap to clone.
+#[derive(Clone)]
 pub struct MintContext {
     /// State DB, for the reused DEV-335 caps ledger.
     pub pool: DbPool,
@@ -422,6 +512,10 @@ pub struct MintContext {
     /// can exercise a PR-comment routing decision against a canned `fj`
     /// response with no real subprocess or network call.
     pub pr_comment_runner: Arc<dyn CommandRunner>,
+    /// CLAUDE-277: seam over `fj actions runs` carrying the commit sha, used by
+    /// the merge-close pull-request path to find the failing workflow's run at
+    /// a merged PR's head commit.
+    pub commit_runs: Arc<dyn crate::forge_log::CommitRunsClient>,
 }
 
 /// Drain emitted events. For each verified failure this fetches the run's logs
@@ -2860,6 +2954,28 @@ async fn forgejo_webhook(
         return StatusCode::OK.into_response();
     }
 
+    // CLAUDE-277: dispatch on the event-type header before parsing. A
+    // pull-request delivery takes its own path; an empty/missing header or an
+    // Action-run header keeps the pre-existing path below; anything else is an
+    // event type this endpoint does not handle, acked and dropped.
+    let event_type = headers
+        .get(EVENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if event_type == PULL_REQUEST_EVENT_TYPE {
+        return handle_pull_request_delivery(&st, &src_cfg, &source, delivery, &body).await;
+    }
+    if !event_type.is_empty() && !event_type.starts_with(ACTION_RUN_EVENT_PREFIX) {
+        info!(
+            source = %source,
+            delivery,
+            event = %event_type,
+            "forgejo webhook delivery of an unhandled event type acked and dropped"
+        );
+        return StatusCode::OK.into_response();
+    }
+
     // Parse only after the request is authenticated and de-duplicated.
     let payload: ActionPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
@@ -2895,6 +3011,355 @@ async fn forgejo_webhook(
                 "forgejo webhook event dropped"
             );
             StatusCode::OK.into_response()
+        }
+    }
+}
+
+/// CLAUDE-277: parse and route an authenticated, de-duplicated `pull_request`
+/// delivery. Only a terminal `closed` action does anything; every other
+/// action (`opened`, `edited`, `synchronized`, ...) and a repo outside the
+/// source's allow-list is acked and dropped, exactly like the Action-run
+/// path's own ack-drop branch.
+async fn handle_pull_request_delivery(
+    st: &WebhookState,
+    src_cfg: &WebhookSource,
+    source: &str,
+    delivery: &str,
+    body: &Bytes,
+) -> Response {
+    let payload: PullRequestPayload = match serde_json::from_slice(body) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(source = %source, delivery, error = %e, "forgejo pull_request payload parse failed");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
+    if payload.action != PR_ACTION_CLOSED {
+        info!(
+            source = %source,
+            delivery,
+            action = %payload.action,
+            repo = %payload.repository.full_name,
+            "pull_request event dropped: non-terminal action"
+        );
+        return StatusCode::OK.into_response();
+    }
+    if !repo_allowed(&src_cfg.allowed_repos, &payload.repository.full_name) {
+        info!(
+            source = %source,
+            delivery,
+            repo = %payload.repository.full_name,
+            "pull_request event dropped: repo not in allowed_repos"
+        );
+        return StatusCode::OK.into_response();
+    }
+
+    let event = VerifiedPullRequestEvent {
+        repo: payload.repository.full_name.clone(),
+        number: payload.number,
+        merged: payload.pull_request.merged,
+        head_sha: payload.pull_request.head.sha.clone(),
+        head_ref: payload.pull_request.head.git_ref.clone(),
+        html_url: payload.pull_request.html_url.clone(),
+        source: source.to_string(),
+    };
+
+    let Some(sender) = &st.pr_events else {
+        warn!(
+            source = %source,
+            delivery,
+            repo = %event.repo,
+            number = event.number,
+            "pull_request event accepted but no pr_events channel is configured; dropping"
+        );
+        return StatusCode::OK.into_response();
+    };
+    if sender.send(event).await.is_err() {
+        warn!(source = %source, delivery, "pull-request event channel closed; dropping event");
+    }
+    StatusCode::ACCEPTED.into_response()
+}
+
+/// CLAUDE-277: drain verified `pull_request` deliveries for the lifetime of
+/// the daemon, mirroring [`consume_events`]'s shape. `mint` carries the
+/// backend + store access every close/left-open/mark-merged decision needs;
+/// `None` (no usable provider backend) drops every event with a log, the same
+/// degrade-to-log-only behaviour the Action-run path takes.
+pub async fn consume_pr_events(
+    mut rx: mpsc::Receiver<VerifiedPullRequestEvent>,
+    pool: DbPool,
+    mint: Option<MintContext>,
+    webhook_cfg: Arc<RwLock<WebhookConfig>>,
+    keygate: crate::concurrency::KeyGate,
+) {
+    let mint = mint.map(Arc::new);
+    let mut tasks = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        let pool = pool.clone();
+        let mint = mint.clone();
+        let webhook_cfg = webhook_cfg.clone();
+        let keygate = keygate.clone();
+        tasks.push(tokio::spawn(async move {
+            process_pr_event(ev, pool, mint, webhook_cfg, keygate).await;
+        }));
+        tasks.retain(|t| !t.is_finished());
+    }
+    for t in tasks {
+        if let Err(e) = t.await {
+            warn!(error = %e, "a pull-request webhook event task panicked");
+        }
+    }
+}
+
+/// CLAUDE-277: one merged-or-closed PR's whole handling: mark its
+/// `agent_pull_requests` row (merged / closed), and on a merge, close or leave
+/// open every open store failure the PR references.
+async fn process_pr_event(
+    ev: VerifiedPullRequestEvent,
+    pool: DbPool,
+    mint: Option<Arc<MintContext>>,
+    webhook_cfg: Arc<RwLock<WebhookConfig>>,
+    keygate: crate::concurrency::KeyGate,
+) {
+    let Some(mint) = mint else {
+        info!(
+            repo = %ev.repo,
+            number = ev.number,
+            "pull-request event dropped: no usable provider backend (mint disabled)"
+        );
+        return;
+    };
+
+    // CLAUDE-274-style: one key per (repo, PR), so two deliveries of the same
+    // PR (a retried delivery, or closed-then-reopened-then-merged in quick
+    // succession) never race each other's store/issue writes.
+    let key = format!("{}#{}", ev.repo, ev.number);
+    let _key_guard = keygate.acquire(&key).await;
+
+    let Some(host) = forge_host_from_url(&ev.html_url) else {
+        warn!(repo = %ev.repo, number = ev.number, html_url = %ev.html_url, "could not derive forge host from pull_request html_url");
+        return;
+    };
+
+    let job_key = format!("pr-{}-{}", ev.repo.replace('/', "_"), ev.number);
+    let run_id = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
+
+    let result = if ev.merged {
+        let webhook_cfg = webhook_cfg.read().await.clone();
+        let token = source_log_token(&pool, &webhook_cfg, &ev.source).await;
+        handle_merged_pr(&mint, &pool, &host, &ev, token).await
+    } else {
+        handle_closed_unmerged_pr(&pool, &host, &ev).await
+    };
+
+    let (ok, summary) = match &result {
+        Ok(s) => (true, s.clone()),
+        Err(e) => {
+            warn!(repo = %ev.repo, number = ev.number, error = %e, "pull-request event handling failed");
+            (false, e.clone())
+        }
+    };
+    finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None).await;
+}
+
+/// CLAUDE-277: a PR closed WITHOUT merging. The only action is marking the
+/// agent's own PR record `closed` when one exists; a human's PR (no record)
+/// changes nothing.
+async fn handle_closed_unmerged_pr(
+    pool: &DbPool,
+    host: &str,
+    ev: &VerifiedPullRequestEvent,
+) -> Result<String, String> {
+    let row = ci_failure_store::agent_pr(pool, host, &ev.repo, ev.number)
+        .await
+        .map_err(|e| format!("agent_pull_requests lookup failed: {e}"))?;
+    let Some(row) = row else {
+        return Ok(format!(
+            "PR #{} closed without merging; no agent_pull_requests row",
+            ev.number
+        ));
+    };
+    let now = state::now_iso();
+    ci_failure_store::set_agent_pr_state(pool, row.id, "closed", &now)
+        .await
+        .map_err(|e| format!("marking agent_pull_requests closed failed: {e}"))?;
+    Ok(format!(
+        "agent PR #{} closed without merging; marked closed",
+        ev.number
+    ))
+}
+
+/// CLAUDE-277: a merged PR. Marks the agent's own PR record `merged` when one
+/// exists, collects every open store failure the PR references (its own
+/// agent-PR issue key, plus [`Forge::pr_referenced_issues`]), and for each,
+/// closes the issue when the failing workflow is green at the PR's head
+/// commit, else leaves it open with an explanatory comment.
+async fn handle_merged_pr(
+    mint: &MintContext,
+    pool: &DbPool,
+    host: &str,
+    ev: &VerifiedPullRequestEvent,
+    log_token: Option<String>,
+) -> Result<String, String> {
+    let now = state::now_iso();
+
+    let agent_row = ci_failure_store::agent_pr(pool, host, &ev.repo, ev.number)
+        .await
+        .map_err(|e| format!("agent_pull_requests lookup failed: {e}"))?;
+    if let Some(row) = &agent_row {
+        ci_failure_store::set_agent_pr_state(pool, row.id, "merged", &now)
+            .await
+            .map_err(|e| format!("marking agent_pull_requests merged failed: {e}"))?;
+    }
+
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(row) = &agent_row {
+        keys.push(row.issue_key.clone());
+    }
+    let backend = mint.backend.clone();
+    let host_owned = host.to_string();
+    let repo = ev.repo.clone();
+    let number = ev.number as u64;
+    let referenced = tokio::task::spawn_blocking(move || {
+        backend.pr_referenced_issues(&host_owned, &repo, number)
+    })
+    .await
+    .map_err(|e| format!("pr_referenced_issues task panicked: {e}"))?
+    .map_err(|e| format!("pr_referenced_issues failed: {e}"))?;
+    for k in referenced {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+
+    if keys.is_empty() {
+        return Ok(format!(
+            "PR #{} merged; no linked issue keys found",
+            ev.number
+        ));
+    }
+
+    let mint_cfg = mint.mint_cfg.read().await.clone();
+    let mut summaries = Vec::new();
+    for key in keys {
+        let failure = match ci_failure_store::failure_for_issue(pool, &key).await {
+            Ok(Some(f)) if f.state == "open" => f,
+            Ok(_) => continue,
+            Err(e) => {
+                summaries.push(format!("{key}: store read failed: {e}"));
+                continue;
+            }
+        };
+        match close_or_leave_open(
+            mint,
+            pool,
+            host,
+            ev,
+            log_token.as_deref(),
+            &mint_cfg,
+            &key,
+            &failure,
+        )
+        .await
+        {
+            Ok(s) => summaries.push(s),
+            Err(e) => summaries.push(format!("{key}: {e}")),
+        }
+    }
+    Ok(summaries.join("; "))
+}
+
+/// CLAUDE-277: paged deep enough to find a run that finished moments ago (this
+/// fires right at merge time, not a scan over deep history), the same shape
+/// the reconciler's own page ceiling uses for the same reason.
+const MERGE_CHECK_MAX_PAGES: u32 = 10;
+
+/// CLAUDE-277: the per-issue decision - find the failing workflow's run at the
+/// merged PR's head commit ("failing workflow green at the head commit" is a
+/// RUN-level status, not a job-level one: the acceptance criterion speaks of
+/// the workflow, not a specific job within it), then close the issue when it
+/// is green, or comment "left open" when it is red or no run was found.
+#[allow(clippy::too_many_arguments)]
+async fn close_or_leave_open(
+    mint: &MintContext,
+    pool: &DbPool,
+    host: &str,
+    ev: &VerifiedPullRequestEvent,
+    log_token: Option<&str>,
+    mint_cfg: &MintConfig,
+    key: &str,
+    failure: &ci_failure_store::Failure,
+) -> Result<String, String> {
+    let runs =
+        match mint
+            .commit_runs
+            .list_commit_runs(host, &ev.repo, MERGE_CHECK_MAX_PAGES, log_token)
+        {
+            crate::forge_log::CommitRunsOutcome::Resolved(r) => r,
+            crate::forge_log::CommitRunsOutcome::NotFound => Vec::new(),
+            crate::forge_log::CommitRunsOutcome::AuthDenied(code) => {
+                return Err(format!("commit-runs list auth denied ({code})"));
+            }
+            crate::forge_log::CommitRunsOutcome::Failed(reason) => {
+                return Err(format!("commit-runs list failed: {reason}"));
+            }
+        };
+    let matched =
+        crate::ci_failure::close::latest_run_at_commit(&runs, &failure.workflow_id, &ev.head_sha)
+            .cloned();
+
+    match matched {
+        Some(run) if crate::ci_failure::close::is_green(&run.status) => {
+            let backend = mint.backend.clone();
+            let key_owned = key.to_string();
+            let state_owned = mint_cfg.resolved_state.clone();
+            let body = format!(
+                "Closed: {} merged and `{}` is green at {}.",
+                ev.html_url, failure.workflow_id, run.html_url
+            );
+            let body_for_task = body.clone();
+            let close_result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
+                backend.set_state(&key_owned, &state_owned)?;
+                backend.comment(&key_owned, &body_for_task)?;
+                Ok(())
+            })
+            .await;
+            match close_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(format!("closing issue failed: {e}")),
+                Err(e) => return Err(format!("close task panicked: {e}")),
+            }
+            let now = state::now_iso();
+            ci_failure_store::set_failure_state(pool, failure.id, "resolved", &now)
+                .await
+                .map_err(|e| format!("store resolve failed: {e}"))?;
+            Ok(format!("closed ({body})"))
+        }
+        other => {
+            let workflow_url = other.map(|r| r.html_url);
+            let body = match workflow_url {
+                Some(url) => format!(
+                    "Merged without a green `{}` run; left open. PR: {}. Run: {url}.",
+                    failure.workflow_id, ev.html_url
+                ),
+                None => format!(
+                    "Merged without a green `{}` run; left open. PR: {}. No run found at the head commit.",
+                    failure.workflow_id, ev.html_url
+                ),
+            };
+            let backend = mint.backend.clone();
+            let key_owned = key.to_string();
+            let body_for_task = body.clone();
+            let comment_result =
+                tokio::task::spawn_blocking(move || backend.comment(&key_owned, &body_for_task))
+                    .await;
+            match comment_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(format!("left-open comment failed: {e}")),
+                Err(e) => return Err(format!("left-open comment task panicked: {e}")),
+            }
+            Ok(format!("left open ({body})"))
         }
     }
 }
@@ -3537,6 +4002,38 @@ mod tests {
         }
     }
 
+    /// CLAUDE-277: a canned [`crate::forge_log::CommitRunsClient`], returning
+    /// one fixed outcome for every call. Defaults to an empty resolved list (no
+    /// run found), which is what every PRE-EXISTING failure-event test needs
+    /// (they never reach the merge-close path).
+    struct ScriptedCommitRuns {
+        outcome: StdMutex<crate::forge_log::CommitRunsOutcome>,
+    }
+
+    impl ScriptedCommitRuns {
+        fn new(outcome: crate::forge_log::CommitRunsOutcome) -> Self {
+            Self {
+                outcome: StdMutex::new(outcome),
+            }
+        }
+
+        fn empty() -> Self {
+            Self::new(crate::forge_log::CommitRunsOutcome::Resolved(Vec::new()))
+        }
+    }
+
+    impl crate::forge_log::CommitRunsClient for ScriptedCommitRuns {
+        fn list_commit_runs(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _max_pages: u32,
+            _token: Option<&str>,
+        ) -> crate::forge_log::CommitRunsOutcome {
+            self.outcome.lock().unwrap().clone()
+        }
+    }
+
     /// A [`FailureClassifier`] that always returns `code_fix`, recording how
     /// many times it ran so a test can assert the store dedupe skipped it.
     struct CountingClassifier {
@@ -3614,6 +4111,27 @@ mod tests {
         paths_dir: &std::path::Path,
         pr_comment_runner: Arc<dyn CommandRunner>,
     ) -> MintContext {
+        store_mint_context_with_commit_runs(
+            pool,
+            backend,
+            classifier,
+            paths_dir,
+            pr_comment_runner,
+            Arc::new(ScriptedCommitRuns::empty()),
+        )
+    }
+
+    /// CLAUDE-277: like [`store_mint_context_in`], with an injectable
+    /// [`crate::forge_log::CommitRunsClient`] for the merge-close tests.
+    #[allow(clippy::too_many_arguments)]
+    fn store_mint_context_with_commit_runs(
+        pool: DbPool,
+        backend: Arc<StoreBackend>,
+        classifier: Arc<dyn FailureClassifier>,
+        paths_dir: &std::path::Path,
+        pr_comment_runner: Arc<dyn CommandRunner>,
+        commit_runs: Arc<dyn crate::forge_log::CommitRunsClient>,
+    ) -> MintContext {
         MintContext {
             pool,
             classifier,
@@ -3623,6 +4141,7 @@ mod tests {
             route_cache: Arc::new(route_cache()),
             paths: test_paths(paths_dir),
             pr_comment_runner,
+            commit_runs,
         }
     }
 
@@ -5661,6 +6180,461 @@ mod tests {
         );
     }
 
+    // ---- CLAUDE-277: merge-close - PR merges with the failing workflow green ----
+    mod merge_close {
+        use super::*;
+
+        fn merge_event(repo: &str, number: i64, head_sha: &str) -> VerifiedPullRequestEvent {
+            VerifiedPullRequestEvent {
+                repo: repo.to_string(),
+                number,
+                merged: true,
+                head_sha: head_sha.to_string(),
+                head_ref: "fix-branch".to_string(),
+                html_url: format!("https://dev.a8n.run/{repo}/pulls/{number}"),
+                source: "test-source".to_string(),
+            }
+        }
+
+        fn closed_unmerged_event(repo: &str, number: i64) -> VerifiedPullRequestEvent {
+            VerifiedPullRequestEvent {
+                merged: false,
+                ..merge_event(repo, number, "deadbeef")
+            }
+        }
+
+        fn commit_run(
+            global_id: i64,
+            workflow_id: &str,
+            commit_sha: &str,
+            status: &str,
+        ) -> crate::forge_log::CommitRun {
+            crate::forge_log::CommitRun {
+                global_id,
+                index: global_id,
+                workflow_id: workflow_id.to_string(),
+                commit_sha: commit_sha.to_string(),
+                status: status.to_string(),
+                html_url: format!("https://dev.a8n.run/acme/widgets/actions/runs/{global_id}"),
+            }
+        }
+
+        fn ctx_with_runs(
+            pool: DbPool,
+            backend: Arc<StoreBackend>,
+            outcome: crate::forge_log::CommitRunsOutcome,
+        ) -> MintContext {
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            store_mint_context_with_commit_runs(
+                pool,
+                backend,
+                classifier,
+                std::env::temp_dir().as_path(),
+                Arc::new(crate::provider::cli::testutil::StubRunner::new()),
+                Arc::new(ScriptedCommitRuns::new(outcome)),
+            )
+        }
+
+        #[tokio::test]
+        async fn merged_pr_with_green_workflow_closes_the_issue_and_resolves_the_store_row() {
+            // Acceptance criterion 1: a merged PR referencing an open store
+            // failure, with the failing workflow green at the head commit,
+            // closes the issue (state write plus comment) and marks the store
+            // row `resolved`.
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            let failure_id = ci_failure_store::record_failure(
+                &pool,
+                "acme/widgets",
+                "ci.yml",
+                "test",
+                None,
+                Some("CLAUDE-50"),
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-50",
+                "dev.a8n.run",
+                "acme/widgets",
+                99,
+                "fix/CLAUDE-50",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+
+            let backend = Arc::new(StoreBackend::new());
+            let ctx = ctx_with_runs(
+                pool.clone(),
+                backend.clone(),
+                crate::forge_log::CommitRunsOutcome::Resolved(vec![commit_run(
+                    1,
+                    "ci.yml",
+                    "deadbeefcafefeed",
+                    "success",
+                )]),
+            );
+
+            let ev = merge_event("acme/widgets", 99, "deadbeefcafefeed");
+            process_pr_event(
+                ev,
+                pool.clone(),
+                Some(Arc::new(ctx)),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+
+            let calls = backend.calls();
+            assert!(
+                calls.iter().any(|c| c == "set_state CLAUDE-50 Done"),
+                "{calls:?}"
+            );
+            assert!(
+                calls.iter().any(|c| c.starts_with("comment CLAUDE-50")),
+                "{calls:?}"
+            );
+
+            let row = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 99)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "merged");
+
+            let failure = ci_failure_store::get_failure(&pool, failure_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(failure.state, "resolved");
+        }
+
+        #[tokio::test]
+        async fn merged_pr_with_red_workflow_leaves_the_issue_open() {
+            // Acceptance criterion 2: a merged PR with that workflow red gets
+            // the "left open" comment, and the issue stays open.
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            let failure_id = ci_failure_store::record_failure(
+                &pool,
+                "acme/widgets",
+                "ci.yml",
+                "test",
+                None,
+                Some("CLAUDE-51"),
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-51",
+                "dev.a8n.run",
+                "acme/widgets",
+                100,
+                "fix/CLAUDE-51",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+
+            let backend = Arc::new(StoreBackend::new());
+            let ctx = ctx_with_runs(
+                pool.clone(),
+                backend.clone(),
+                crate::forge_log::CommitRunsOutcome::Resolved(vec![commit_run(
+                    1,
+                    "ci.yml",
+                    "cafefeeddeadbeef",
+                    "failure",
+                )]),
+            );
+
+            let ev = merge_event("acme/widgets", 100, "cafefeeddeadbeef");
+            process_pr_event(
+                ev,
+                pool.clone(),
+                Some(Arc::new(ctx)),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("set_state")),
+                "issue state must not change: {calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with("comment CLAUDE-51") && c.contains("left open")),
+                "{calls:?}"
+            );
+
+            let failure = ci_failure_store::get_failure(&pool, failure_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(failure.state, "open");
+        }
+
+        #[tokio::test]
+        async fn merged_pr_with_no_run_at_the_head_commit_leaves_the_issue_open() {
+            // Same "left open" outcome when no run matches the head commit at
+            // all (the workflow may not have run there, or the runs list is
+            // stale).
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_failure(
+                &pool,
+                "acme/widgets",
+                "ci.yml",
+                "test",
+                None,
+                Some("CLAUDE-52"),
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-52",
+                "dev.a8n.run",
+                "acme/widgets",
+                101,
+                "fix/CLAUDE-52",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+
+            let backend = Arc::new(StoreBackend::new());
+            let ctx = ctx_with_runs(
+                pool.clone(),
+                backend.clone(),
+                crate::forge_log::CommitRunsOutcome::Resolved(Vec::new()),
+            );
+
+            let ev = merge_event("acme/widgets", 101, "no-such-commit");
+            process_pr_event(
+                ev,
+                pool.clone(),
+                Some(Arc::new(ctx)),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("set_state")),
+                "{calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with("comment CLAUDE-52") && c.contains("left open")),
+                "{calls:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn closed_unmerged_agent_pr_is_marked_closed_and_changes_no_issue() {
+            // Acceptance criterion 3: a closed, unmerged agent PR sets
+            // `agent_pull_requests.state = closed` and changes no issue.
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_failure(
+                &pool,
+                "acme/widgets",
+                "ci.yml",
+                "test",
+                None,
+                Some("CLAUDE-53"),
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-53",
+                "dev.a8n.run",
+                "acme/widgets",
+                102,
+                "fix/CLAUDE-53",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+
+            let backend = Arc::new(StoreBackend::new());
+            let ctx = ctx_with_runs(
+                pool.clone(),
+                backend.clone(),
+                crate::forge_log::CommitRunsOutcome::Resolved(Vec::new()),
+            );
+
+            let ev = closed_unmerged_event("acme/widgets", 102);
+            process_pr_event(
+                ev,
+                pool.clone(),
+                Some(Arc::new(ctx)),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+
+            assert!(
+                backend.calls().is_empty(),
+                "no issue write for a closed-unmerged PR: {:?}",
+                backend.calls()
+            );
+            let row = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 102)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "closed");
+        }
+
+        #[tokio::test]
+        async fn no_usable_backend_drops_the_event_with_no_panic() {
+            let pool = crate::db::test_pool().await;
+            let ev = merge_event("acme/widgets", 103, "deadbeef");
+            // `mint: None` is what the daemon passes when no `yt`/`fj` backend is
+            // usable; the event must simply be dropped, not panic.
+            process_pr_event(
+                ev,
+                pool,
+                None,
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_close_then_a_shared_failing_test_reopens_the_issue() {
+            // Acceptance criterion 6, end to end: after this issue's merge-close
+            // sets a store row `resolved`, a later failure sharing one of its
+            // originally-recorded failing tests reopens the issue - exercising
+            // the merge-close write and the pre-existing CLAUDE-273 reopen path
+            // together.
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            let failure_id = ci_failure_store::record_failure(
+                &pool,
+                "acme/widgets",
+                "ci.yml",
+                "test",
+                None,
+                Some("CLAUDE-54"),
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            ci_failure_store::add_tests(&pool, failure_id, &["mod_a::test_one".to_string()])
+                .await
+                .unwrap();
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-54",
+                "dev.a8n.run",
+                "acme/widgets",
+                104,
+                "fix/CLAUDE-54",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+
+            let backend = Arc::new(StoreBackend::new());
+            let close_ctx = ctx_with_runs(
+                pool.clone(),
+                backend.clone(),
+                crate::forge_log::CommitRunsOutcome::Resolved(vec![commit_run(
+                    1,
+                    "ci.yml",
+                    "deadbeefcafefeed",
+                    "success",
+                )]),
+            );
+            let ev = merge_event("acme/widgets", 104, "deadbeefcafefeed");
+            process_pr_event(
+                ev,
+                pool.clone(),
+                Some(Arc::new(close_ctx)),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+            let closed = ci_failure_store::get_failure(&pool, failure_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                closed.state, "resolved",
+                "merge-close must resolve it first"
+            );
+
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            let mint_ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+            let regression_ev = store_event(9001);
+            let log = failing_test_log("mod_a", "test_one", "main");
+            let result = triage_and_mint(
+                &mint_ctx,
+                None,
+                &regression_ev,
+                log,
+                true,
+                None,
+                None,
+                true,
+                "test".to_string(),
+                None,
+                &crate::concurrency::KeyGate::new(),
+                &WebhookConfig::default(),
+            )
+            .await;
+            assert!(result.ok, "{}", result.text);
+
+            let calls = backend.calls();
+            assert!(
+                calls.iter().any(|c| c == "set_state CLAUDE-54 To do"),
+                "the reopen must set the target_state: {calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with("comment CLAUDE-54 | Regression")),
+                "{calls:?}"
+            );
+
+            let reopened = ci_failure_store::get_failure(&pool, failure_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reopened.state, "open");
+        }
+    }
+
     // ---- CLAUDE-64 / CLAUDE-87: every auth-rejection branch is reachable ----
     //
     // Drive `forgejo_webhook` directly so each rejection branch (and the
@@ -6210,6 +7184,217 @@ mod tests {
             // Drop path ("repo not in allowed_repos"): same 200 ack, no event.
             assert_eq!(resp.status(), StatusCode::OK);
             assert!(rx.try_recv().is_err());
+        }
+
+        // CLAUDE-277: the pull-request event-type dispatch and its gates.
+
+        fn headers_with_event(
+            signature: Option<&str>,
+            delivery: Option<&str>,
+            event: Option<&str>,
+        ) -> HeaderMap {
+            let mut h = headers(signature, delivery);
+            if let Some(e) = event {
+                h.insert(EVENT_HEADER, HeaderValue::from_str(e).unwrap());
+            }
+            h
+        }
+
+        fn pull_request_payload(repo: &str, number: i64, action: &str, merged: bool) -> String {
+            format!(
+                r#"{{"action":"{action}","number":{number},"pull_request":{{"merged":{merged},
+                "head":{{"ref":"fix-branch","sha":"deadbeefcafefeed"}},
+                "html_url":"https://dev.a8n.run/{repo}/pulls/{number}"}},
+                "repository":{{"full_name":"{repo}"}}}}"#
+            )
+        }
+
+        /// A [`WebhookState`] over [`two_source_config`], with a `pr_events`
+        /// channel attached so a `pull_request` delivery dispatches instead of
+        /// being acked-and-dropped for lack of a configured sender.
+        async fn state_with_pr_events(
+            tmp: &std::path::Path,
+        ) -> (
+            WebhookState,
+            mpsc::Receiver<VerifiedFailureEvent>,
+            mpsc::Receiver<VerifiedPullRequestEvent>,
+        ) {
+            let pool = setup_pool(tmp).await;
+            let (tx, rx) = mpsc::channel(8);
+            let (pr_tx, pr_rx) = mpsc::channel(8);
+            let st = WebhookState::new(pool, two_source_config(60), tx).with_pr_events(pr_tx);
+            (st, rx, pr_rx)
+        }
+
+        #[tokio::test]
+        async fn unrecognized_event_type_is_acked_and_dropped() {
+            // A header value that is neither an Action-run kind nor
+            // `pull_request` (e.g. "issues") is acked and dropped without being
+            // parsed as either payload shape.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(Some(&sig), Some("u-1"), Some("issues")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn action_run_event_header_still_takes_the_failure_path() {
+            // An explicit `action_run_failure` header (the value the deployed
+            // Forgejo's Action-run notifier sends) keeps the pre-existing path.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(Some(&sig), Some("ar-1"), Some("action_run_failure")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            assert!(rx.try_recv().is_ok());
+        }
+
+        #[tokio::test]
+        async fn pull_request_event_missing_signature_is_401() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, _pr_rx) = state_with_pr_events(tmp.path()).await;
+            let raw = pull_request_payload("contoso/claude-run", 42, "closed", true);
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(None, Some("pr-1"), Some(PULL_REQUEST_EVENT_TYPE)),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn pull_request_event_replay_is_rejected() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, mut pr_rx) = state_with_pr_events(tmp.path()).await;
+            let raw = pull_request_payload("contoso/claude-run", 42, "closed", true);
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let headers1 =
+                headers_with_event(Some(&sig), Some("pr-dup"), Some(PULL_REQUEST_EVENT_TYPE));
+            let r1 = forgejo_webhook(
+                State(st.clone()),
+                Path(SOURCE_A.to_string()),
+                headers1,
+                Bytes::from(raw.clone()),
+            )
+            .await;
+            assert_eq!(r1.status(), StatusCode::ACCEPTED);
+            assert!(pr_rx.try_recv().is_ok());
+
+            let headers2 =
+                headers_with_event(Some(&sig), Some("pr-dup"), Some(PULL_REQUEST_EVENT_TYPE));
+            let r2 = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers2,
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(r2.status(), StatusCode::CONFLICT);
+        }
+
+        #[tokio::test]
+        async fn pull_request_event_paused_action_accepts_and_drops() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, mut pr_rx) = state_with_pr_events(tmp.path()).await;
+            state::action_pause_set(&st.pool, WEBHOOK_MINT_ACTION, Some("maintenance"))
+                .await
+                .unwrap();
+            let raw = pull_request_payload("contoso/claude-run", 42, "closed", true);
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(Some(&sig), Some("pr-pause"), Some(PULL_REQUEST_EVENT_TYPE)),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(pr_rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn pull_request_event_non_terminal_action_is_acked_and_dropped() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, mut pr_rx) = state_with_pr_events(tmp.path()).await;
+            let raw = pull_request_payload("contoso/claude-run", 42, "synchronize", false);
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(Some(&sig), Some("pr-sync"), Some(PULL_REQUEST_EVENT_TYPE)),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(pr_rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn pull_request_event_unlisted_repo_is_acked_and_dropped() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, mut pr_rx) = state_with_pr_events(tmp.path()).await;
+            let raw = pull_request_payload("someone-else/other-repo", 42, "closed", true);
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(
+                    Some(&sig),
+                    Some("pr-unlisted"),
+                    Some(PULL_REQUEST_EVENT_TYPE),
+                ),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(pr_rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn merged_pull_request_event_is_accepted_and_dispatched() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, mut pr_rx) = state_with_pr_events(tmp.path()).await;
+            let raw = pull_request_payload("contoso/claude-run", 42, "closed", true);
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(Some(&sig), Some("pr-merged"), Some(PULL_REQUEST_EVENT_TYPE)),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            let ev = pr_rx.try_recv().unwrap();
+            assert_eq!(ev.repo, "contoso/claude-run");
+            assert_eq!(ev.number, 42);
+            assert!(ev.merged);
+            assert_eq!(ev.head_sha, "deadbeefcafefeed");
         }
     }
 }

@@ -584,6 +584,87 @@ pub enum RunsListOutcome {
     Failed(String),
 }
 
+/// CLAUDE-277: one run reduced to the fields the merge-close webhook path
+/// matches on: which workflow ran, at which commit, and whether it succeeded.
+/// A second, narrower parse of the same `fj actions runs --json` page
+/// [`parse_runs_list_entries`] reads, kept as its own type rather than adding a
+/// `commit_sha` field to [`RunEntry`]: `RunEntry` is shared with the
+/// `ci-failure-reconcile` reconciler's own test literals, outside this issue's
+/// scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRun {
+    /// The run's GLOBAL id (`run.id`); orders runs by recency.
+    pub global_id: i64,
+    /// The run's per-repo index (`index_in_repo`); the `/actions/runs/<N>` URL.
+    pub index: i64,
+    /// Workflow filename, e.g. `ci.yml`.
+    pub workflow_id: String,
+    /// The commit the run executed against (`commit_sha` / `head_sha`).
+    pub commit_sha: String,
+    /// The run outcome: the `conclusion` when present, else the `status`.
+    pub status: String,
+    /// The run web URL, linked from the close / left-open comment.
+    pub html_url: String,
+}
+
+/// CLAUDE-277: outcome of fetching the runs list for a commit match, on the
+/// same shape as [`RunsListOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitRunsOutcome {
+    Resolved(Vec<CommitRun>),
+    AuthDenied(u16),
+    NotFound,
+    Failed(String),
+}
+
+/// CLAUDE-277: seam over `fj actions runs` for the merge-close webhook path,
+/// which needs the commit sha [`ActionRunsClient::list_runs`] does not carry
+/// (see [`CommitRun`]). Implemented by
+/// [`crate::provider::cli::FjForgeReads`].
+pub trait CommitRunsClient: Send + Sync {
+    /// List `repo`'s workflow runs on forge `host`, newest-first, over at most
+    /// `max_pages` pages. `token` is the resolved `log_token_ref`; `None` reads
+    /// unauthenticated, which is enough for a public repo.
+    fn list_commit_runs(
+        &self,
+        host: &str,
+        repo: &str,
+        max_pages: u32,
+        token: Option<&str>,
+    ) -> CommitRunsOutcome;
+}
+
+/// CLAUDE-277: parse a `fj actions runs --json` page into [`CommitRun`]s,
+/// tolerant of Forgejo's field naming exactly like [`parse_runs_list_entries`].
+/// Runs missing an `id` are skipped.
+pub fn parse_runs_list_commits(stdout: &str) -> std::result::Result<Vec<CommitRun>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).map_err(|e| e.to_string())?;
+    let arr = runs_array(&value);
+    let mut out = Vec::new();
+    for run in arr {
+        let Some(global_id) = run.get("id").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        let status = run
+            .get("conclusion")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| run.get("status").and_then(serde_json::Value::as_str))
+            .unwrap_or("")
+            .to_string();
+        out.push(CommitRun {
+            global_id,
+            index: run_index(&run),
+            workflow_id: str_field(&run, &["workflow_id", "workflow_name", "workflow"]),
+            commit_sha: str_field(&run, &["commit_sha", "head_sha", "sha"]),
+            status,
+            html_url: str_field(&run, &["html_url", "url"]),
+        });
+    }
+    Ok(out)
+}
+
 /// CLAUDE-189: candidate repo paths a failing workflow file may live under, tried
 /// in order. `workflow_id` is the payload's workflow filename (e.g. `check.yml`).
 const WORKFLOW_DIRS: &[&str] = &[
@@ -1329,6 +1410,35 @@ mod tests {
             e.html_url,
             "https://dev.a8n.run/fabrikam/forgejo-cli/actions/runs/469"
         );
+    }
+
+    #[test]
+    fn parse_commits_reads_the_commit_sha_a_real_fj_actions_runs_page_carries() {
+        // CLAUDE-277: the same fixture `parse_runs_list_entries` reads, carries
+        // `commit_sha`, which `RunEntry` (and its parser) does not expose.
+        let entries = parse_runs_list_commits(REAL_RUNS_PAGE).unwrap();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.global_id, 22958);
+        assert_eq!(e.index, 469);
+        assert_eq!(e.workflow_id, "check.yml");
+        assert_eq!(e.status, "success");
+        assert_eq!(e.commit_sha, "b08d8bcd98e2fff274c070849793da5a9d3c88a2");
+        assert_eq!(
+            e.html_url,
+            "https://dev.a8n.run/fabrikam/forgejo-cli/actions/runs/469"
+        );
+    }
+
+    #[test]
+    fn parse_commits_falls_back_to_head_sha_then_sha() {
+        let head_sha = r#"[{"id":1,"workflow_id":"ci.yml","status":"success","head_sha":"abc"}]"#;
+        assert_eq!(
+            parse_runs_list_commits(head_sha).unwrap()[0].commit_sha,
+            "abc"
+        );
+        let sha = r#"[{"id":1,"workflow_id":"ci.yml","status":"success","sha":"def"}]"#;
+        assert_eq!(parse_runs_list_commits(sha).unwrap()[0].commit_sha, "def");
     }
 
     /// CLAUDE-240 AC: a run entry carries the run's stop time, read from

@@ -3691,6 +3691,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "State set on a minted issue.",
             },
             FieldDoc {
+                name: "resolved_state",
+                badge: "next event",
+                note: "State set on a CI-failure issue when its fix PR merges with the failing workflow green.",
+            },
+            FieldDoc {
                 name: "ai_agent_field",
                 badge: "next event",
                 note: "AI Agent custom-field name.",

@@ -1938,6 +1938,82 @@ impl crate::forge_log::ActionRunsClient for FjForgeReads {
     }
 }
 
+impl crate::forge_log::CommitRunsClient for FjForgeReads {
+    /// CLAUDE-277: same paging shape as `ActionRunsClient::list_runs` above,
+    /// duplicated rather than shared because the two parse into different
+    /// types ([`crate::forge_log::RunEntry`] vs [`crate::forge_log::CommitRun`])
+    /// and `RunEntry` cannot gain a `commit_sha` field without also editing the
+    /// reconciler's test literals, outside this issue's file scope.
+    fn list_commit_runs(
+        &self,
+        host: &str,
+        repo: &str,
+        max_pages: u32,
+        token: Option<&str>,
+    ) -> crate::forge_log::CommitRunsOutcome {
+        use crate::forge_log::CommitRunsOutcome;
+        let creds = match FjCreds::create(host, token) {
+            Ok(c) => c,
+            Err(e) => return CommitRunsOutcome::Failed(e),
+        };
+        let envs = creds.envs();
+        let limit = RUNS_PAGE_LIMIT.to_string();
+
+        let mut all = Vec::new();
+        for page in 1..=max_pages {
+            let page = page.to_string();
+            let args = [
+                "--host", host, "actions", "runs", "--repo", repo, "--json", "--page", &page,
+                "--limit", &limit,
+            ];
+            let out = match self.runner.run_in_env(None, &self.fj, &args, &envs) {
+                Ok(out) => out,
+                Err(e) => {
+                    if !all.is_empty() {
+                        break;
+                    }
+                    return CommitRunsOutcome::Failed(format!(
+                        "running {} actions runs: {e}",
+                        self.fj
+                    ));
+                }
+            };
+            if !out.ok {
+                if !all.is_empty() {
+                    break;
+                }
+                return match classify_fj_runs_error(&out.stderr, out.exit_code) {
+                    crate::forge_log::RunsListOutcome::AuthDenied(c) => {
+                        CommitRunsOutcome::AuthDenied(c)
+                    }
+                    crate::forge_log::RunsListOutcome::NotFound => CommitRunsOutcome::NotFound,
+                    crate::forge_log::RunsListOutcome::Failed(r) => CommitRunsOutcome::Failed(r),
+                    crate::forge_log::RunsListOutcome::Resolved(_) => unreachable!(
+                        "classify_fj_runs_error never returns Resolved on a non-ok command"
+                    ),
+                };
+            }
+            let entries = match crate::forge_log::parse_runs_list_commits(&out.stdout) {
+                Ok(e) => e,
+                Err(e) => {
+                    if !all.is_empty() {
+                        break;
+                    }
+                    return CommitRunsOutcome::Failed(format!(
+                        "parsing fj actions runs --json: {e}"
+                    ));
+                }
+            };
+            let short = entries.len() < RUNS_PAGE_LIMIT as usize;
+            all.extend(entries);
+            if short {
+                break;
+            }
+        }
+        CommitRunsOutcome::Resolved(all)
+    }
+}
+
 impl crate::forge_log::RepoFileClient for FjForgeReads {
     fn read_file(
         &self,
@@ -4474,6 +4550,68 @@ mod tests {
         let envs = runner.envs.lock().unwrap();
         let (_, env) = envs.iter().find(|(b, _)| b == "fj").expect("fj child ran");
         assert!(env.is_empty(), "no env injected without a token: {env:?}");
+    }
+
+    // ---- CLAUDE-277: `list_commit_runs`, the commit-carrying runs-list read ----
+
+    #[test]
+    fn commit_runs_list_pages_until_a_short_page() {
+        use crate::forge_log::{CommitRunsClient, CommitRunsOutcome};
+        let runner = with_runs_page(StubRunner::new(), "1", &runs_page(50, 90000, "main"));
+        let runner = with_runs_page(runner, "2", &runs_page(1, 21077, "feature"));
+        let runner = Arc::new(runner);
+        let out = FjForgeReads::new(runner.clone()).list_commit_runs(
+            "dev.a8n.run",
+            RUNS_REPO,
+            RUNS_MAX_PAGES,
+            Some("test-pat"),
+        );
+        let CommitRunsOutcome::Resolved(entries) = out else {
+            panic!("expected Resolved, got {out:?}");
+        };
+        assert_eq!(entries.len(), 51);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "stopped at the short page: {calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("test-pat")), "{calls:?}");
+    }
+
+    #[test]
+    fn commit_runs_list_auth_denied_on_the_first_page_is_terminal() {
+        use crate::forge_log::{CommitRunsClient, CommitRunsOutcome};
+        let args = runs_args("1");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let runner = Arc::new(StubRunner::new().fail(
+            "fj",
+            &args,
+            1,
+            "Error: unexpected status code 401 Unauthorized\n",
+        ));
+        let out = FjForgeReads::new(runner.clone()).list_commit_runs(
+            "dev.a8n.run",
+            RUNS_REPO,
+            RUNS_MAX_PAGES,
+            Some("test-pat"),
+        );
+        assert_eq!(out, CommitRunsOutcome::AuthDenied(401));
+    }
+
+    #[test]
+    fn commit_runs_list_error_after_the_first_page_returns_what_was_collected() {
+        use crate::forge_log::{CommitRunsClient, CommitRunsOutcome};
+        let runner = with_runs_page(StubRunner::new(), "1", &runs_page(50, 90000, "main"));
+        let args = runs_args("2");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let runner = Arc::new(runner.fail("fj", &args, 1, "Error: connection refused\n"));
+        let out = FjForgeReads::new(runner).list_commit_runs(
+            "dev.a8n.run",
+            RUNS_REPO,
+            RUNS_MAX_PAGES,
+            Some("test-pat"),
+        );
+        let CommitRunsOutcome::Resolved(entries) = out else {
+            panic!("expected Resolved with the collected page-1 entries, got {out:?}");
+        };
+        assert_eq!(entries.len(), 50);
     }
 
     // ---- CLAUDE-236: `fj actions runs --run-number` (one run's timing) ----
