@@ -977,6 +977,36 @@ allow-list, rate limit, `secret_ref`, `log_token_ref`, `write_token_ref`) and th
 take effect live, as does `agent_pr_fix_attempts` (CLAUDE-276, default 3, applies to the next event); `replay_window_secs`
 applies on restart. A mint edit is honored by the next event.
 
+### Closing a CI-failure issue on merge (CLAUDE-277)
+
+`ci-failure-reconcile` (below) closes a code issue only by finding the failing job green on the repo's `default_branch`,
+which never happens for a workflow that only ever runs on pull requests: it has no run on `main` at all. CLAUDE-277 adds
+a second, event-driven close: `POST /webhooks/forgejo/<source>` now also accepts Forgejo `pull_request` deliveries,
+dispatched by the delivery's event-type header (`X-Forgejo-Event`, mirroring Gitea's `X-Gitea-Event`; a deployment must
+confirm this against its own Forgejo's actual delivery, since Forgejo's webhook headers are undocumented upstream - see
+the operator note below). A `pull_request` delivery runs through the SAME signature / replay / rate-limit / pause /
+allow-list gates the Action-run path does; only a terminal `action: "closed"` delivery does anything, everything else is
+acked and dropped.
+
+- **Merged, with the failing workflow green at the PR's head commit:** every open `ci_failures` row the PR references
+  (its own `agent_pull_requests` issue, plus every key `Forge::pr_referenced_issues` finds) is closed -
+  `set_state(mint.resolved_state)` (a new setting, default `Done`, separate from `mint.target_state`, which is what a
+  fresh mint or a regression reopen sets) plus a comment linking the PR and the green run - and the store row is marked
+  `resolved`. "Green" is the run's own status, not a specific job's: the acceptance criterion speaks of the workflow, not
+  one job within it.
+- **Merged, with that workflow red or no run found at the head commit:** the issue is left open with a comment saying
+  so; nothing else changes. A later run of the same failing test still reopens it the ordinary CLAUDE-273 way.
+- **Closed without merging:** the only effect is marking the PR's own `agent_pull_requests` row `closed` (a human's PR,
+  with no such row, changes nothing); the runner's own re-queue logic (CLAUDE-275) then treats it as needing a fresh
+  branch rather than resuming a dead one.
+
+The failing workflow's run at the merge commit is found by paging `fj actions runs` for the commit (`CommitRunsClient`,
+a second seam over the same JSON `ActionRunsClient::list_runs` reads, needed because `RunEntry` carries no commit sha).
+
+**Operator setup:** each Forgejo webhook pointed at `/webhooks/forgejo/<source>` must also send "Pull Request" events,
+alongside the Action-run events it already sends. Until it does, nothing closes on merge, and the run list shows no
+pull-request deliveries.
+
 ### Auto-fix for mechanically-fixable failures (CLAUDE-104)
 
 Some CI failures are verification-only and have a known, judgement-free fix. The canonical case is `cargo fmt --check`:

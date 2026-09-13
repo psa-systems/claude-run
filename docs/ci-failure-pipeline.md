@@ -64,6 +64,22 @@ flowchart TD
     AG4 --> YT
     H3 --> YT
 
+    FPR(["Forgejo: pull_request closed"])
+
+    subgraph WHPR ["webhook-forgejo: pull_request closed (CLAUDE-277, same endpoint, dispatched by X-Forgejo-Event)"]
+        M1{"merged?"}
+        M1 -- no --> M2["mark this PR's agent_pull_requests row closed, if any"]
+        M1 -- yes --> M3["mark this PR's agent_pull_requests row merged, if any"]
+        M3 --> M4["collect open ci_failures rows this PR references: its agent-PR issue key + pr_referenced_issues"]
+        M4 --> M5{"failing workflow green at the PR's head commit?"}
+        M5 -- yes --> M6["close issue: State=mint.resolved_state, comment; store row resolved"]
+        M5 -- "no / not found" --> M7["comment: left open"]
+    end
+
+    FPR --> M1
+    M6 --> YT
+    M7 --> YT
+
     subgraph SC ["scheduled actions, every 60s, independent of each other"]
         YT --> A1["ci-failure-analysis: analyze the log (scheduled for retirement, CLAUDE-279 - superseded by the webhook's own AnalysisClassifier above)"]:::claude
         A1 --> A2["comment root cause on the issue"]
@@ -86,6 +102,7 @@ flowchart TD
 | Step                              | Code                                  |
 |-----------------------------------|---------------------------------------|
 | Webhook ingest, store dedupe, and triage | `src/web/webhooks.rs`, `src/triage.rs` |
+| Close-on-merge (`pull_request` delivery) | `src/web/webhooks.rs`, `src/ci_failure/close.rs`, `src/forge_log.rs` (`CommitRunsClient`), `src/provider/cli.rs` |
 | At-ingest analysis (`AnalysisClassifier`), shared with the scheduled action below | `src/ci_failure/analysis.rs` |
 | Failing-test fingerprint and the `ci_failures` store | `src/ci_failure/fingerprint.rs`, `src/ci_failure/store.rs` |
 | Gates and issue creation (no dedupe)     | `src/mint.rs`                   |
