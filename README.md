@@ -459,7 +459,7 @@ The other three writers under `logs/` are bounded by SIZE, not age (CLAUDE-257, 
 
 The `output.file` sink is bounded by size and never deleted by age, unlike the stream logs beside it. An operator turns `output.file` on deliberately to produce a data sink, often read by something outside the runner, so the pass keeps the newest records where that consumer expects them instead of destroying the record it exists to keep.
 
-Two more trees under the state dir grow the same way and are bounded by the same section (CLAUDE-262). `snippets/<action>/<job_key>/` holds the rendered snippet script plus one `binding-<name>.json` per `$`-binding for every `filter` / `pre` / `prompt` / `post` step of every job (`binding-job.json` carries the whole job payload), and nothing removed it before: `crate::gc::sweep_snippets` bounds it by age, on the same hourly tick, reusing the same `run_inflight_jobs` in-flight guard the stream-log sweep uses so a still-running job's snippet directory is never deleted out from under it. `webhook-logs/` holds the redacted, concatenated CI job logs the Forgejo webhook triage fetches, one file per triaged run, and `crate::gc::sweep_webhook_logs` bounds the files directly under it by age on the same tick; `webhook-logs/triage/`, the mint classifier's reused working directory, is a subdirectory rather than a per-run file and is left alone.
+Two more trees under the state dir grow the same way and are bounded by the same section (CLAUDE-262). `snippets/<action>/<job_key>/` holds the rendered snippet script plus one `binding-<name>.json` per `$`-binding for every `filter` / `pre` / `prompt` / `post` step of every job (`binding-job.json` carries the whole job payload), and nothing removed it before: `crate::gc::sweep_snippets` bounds it by age, on the same hourly tick, reusing the same `run_inflight_jobs` in-flight guard the stream-log sweep uses so a still-running job's snippet directory is never deleted out from under it. `webhook-logs/` holds the redacted, concatenated CI job logs the Forgejo webhook triage fetches, one file per triaged run, and `crate::gc::sweep_webhook_logs` bounds the files directly under it by age on the same tick; `webhook-logs/analysis/<owner>_<repo>-run<N>/` (CLAUDE-274), the per-event working directory the at-ingest analysis classifier creates and removes itself, is a subdirectory rather than a per-run file and needs no sweep of its own.
 
 All of it is one DB-backed runtime setting edited on the **Settings** page (the `Stream log GC` section, or `GET` / `PUT /api/settings/stream_log_gc`). Fields: `enabled` (master toggle, default `true`), `retention_days` (default `30`), `daemon_log_max_bytes` (default 50 MiB), `output_file_max_bytes` (default 50 MiB), `usage_log_max_bytes` (default 8 MiB), `snippet_retention_days` (default `30`), and `webhook_log_retention_days` (default `30`). Edits apply on the next sweep. Set `enabled: false` to park all of it without losing the configured values, but nothing then bounds any of these trees; set any of the three size ceilings to `0` to leave that one file unbounded and rotate it yourself. The section keeps its original `stream_log_gc` key even though it now covers more than stream logs: the key is the primary key of the stored document, so renaming it would silently reset a configured window back to the default.
 
@@ -864,6 +864,25 @@ for a duplicate or a resolved issue: dedupe is entirely the caller's job now. Th
 `Dedupe-Key:`, `Root-Cause-Key:`, `Branch:`, and `Job:` markers (the pre-store `hash(repo, branch, workflow_id,
 job_name, failure_signature)` collapse key, falling back to `hash(repo, branch, workflow_id, job_name)` with no
 derivable signature), because `ci-failure-reconcile` and the legacy-adoption lookup above still read them.
+
+**CLAUDE-274: a new failure gets one tool-using analysis at ingest, on a bounded worker pool.** A failure the store does
+not already track (the `none` / `pr_only` case above) is analyzed by `AnalysisClassifier`: one `claude` session with
+`Read,Grep,Bash` over the COMPLETE redacted log and the failing workflow YAML, in its own
+`webhook-logs/analysis/<owner>_<repo>-run<N>/` working directory (removed once the session ends), timeout
+`config.webhook.analysis_timeout_secs` (default 600s). This replaces the old split between a tool-less classifier at
+ingest (bounded to a 48 KiB copy of the log) and a separate scheduled `ci-failure-analysis` action that ran later over
+the full log with no way to route the failure: the analysis and the routing decision now come from the same session.
+The prompt ends with a fenced JSON verdict, `{"verdict": "code_defect" | "needs_human" | "flaky" | "infra", ...}`,
+parsed the way the old classifier parsed its reply; an unparseable or missing verdict routes `needs_human` and logs at
+`warn` (it never becomes `code_defect`). `code_defect` maps to the code-fix route, `needs_human` to the human-assigned
+route, and `flaky` / `infra` both mint nothing (transient). The session's own Markdown report becomes the minted
+issue's `## Triage` analysis text (capped at 24 KiB, the same cap the old scheduled analysis used), so the issue
+carries the deep, log-grounded analysis from the moment it is filed. `consume_events` spawns each event's processing
+as its own task behind a semaphore sized by `config.webhook.analysis_concurrency` (default 2, at least 1), so a burst
+of failures runs at most that many 600s analyses at once rather than one blocking every later event (the old inline
+loop) or an unbounded number starting together. The store lookup, analysis, and mint for one event additionally run
+under a `concurrency::KeyGate` keyed on `(repo, workflow_id, job_name)`: a second failure of the same job waits for the
+first's gate to release, then matches its store row and attaches instead of starting a second analysis.
 
 **CLAUDE-264: a host condition keys without the branch, for the markers and the legacy lookup alike.** The
 `Root-Cause-Key:` marker contains `branch`, which is right for a code failure (two unrelated bugs on two branches must

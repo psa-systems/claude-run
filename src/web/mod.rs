@@ -3729,6 +3729,16 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 badge: "next event",
                 note: "queuing only (CLAUDE-273): every code failure still mints; off just leaves AI Agent unset.",
             },
+            FieldDoc {
+                name: "analysis_timeout_secs",
+                badge: "restart",
+                note: "timeout for the at-ingest analysis session (Read,Grep,Bash over the full log); the classifier is built once at daemon start.",
+            },
+            FieldDoc {
+                name: "analysis_concurrency",
+                badge: "restart",
+                note: "how many events are analyzed at once; the worker pool's semaphore is sized once at daemon start.",
+            },
         ],
         WebhookComment => vec![
             FieldDoc {
