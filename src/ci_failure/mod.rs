@@ -14,6 +14,7 @@
 //! issues under CLAUDE-270 wire it in. This module is public so that
 //! not-yet-called API is not dead code.
 
+pub mod close;
 pub mod fingerprint;
 pub mod store;
 

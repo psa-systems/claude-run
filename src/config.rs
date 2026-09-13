@@ -485,6 +485,12 @@ pub struct MintConfig {
     pub human_assignee: Option<String>,
     /// `State` value set on a freshly minted issue. Default `To do`.
     pub target_state: String,
+    /// CLAUDE-277: `State` value set on a CI-failure issue when its fix PR
+    /// merges with the failing workflow green at the merge commit. Default
+    /// `Done`. Separate from [`MintConfig::target_state`], which is what a
+    /// fresh mint (or a regression reopen) sets, not what a merge-driven close
+    /// sets.
+    pub resolved_state: String,
     /// `AI Agent` custom-field name driven on the minted issue.
     pub ai_agent_field: String,
     /// `AI Agent` value set on a bucket-1 (code-fix) issue so the existing
@@ -507,6 +513,7 @@ impl Default for MintConfig {
             bot_logins: vec!["claude-run".to_string()],
             human_assignee: None,
             target_state: "To do".to_string(),
+            resolved_state: "Done".to_string(),
             ai_agent_field: "AI Agent".to_string(),
             queued_value: "Queued".to_string(),
             auto_fix: AutoFixConfig::default(),
