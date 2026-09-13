@@ -576,6 +576,7 @@ impl ClaudeInvoker {
                     ),
                     transient: false,
                     timed_out: false,
+                    login_required: false,
                 });
             }
             Ok(_) => {}

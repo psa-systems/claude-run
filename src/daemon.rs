@@ -2553,8 +2553,9 @@ mod tests {
         // proves post was skipped (the transient path, not merely a passing
         // assertion on the return value).
         let post_marker = tmp.path().join("post-ran");
+        // `sh`, not `nu`: the `just pre-commit` image has no `nu` (see snippet.rs tests).
         let raw = format!(
-            "name: t\ninput:\n  command: print '[{{}}]'\nprompt: print 'hi'\npost:\n  - touch '{}'\n",
+            "name: t\ninput:\n  command:\n    run: printf '[{{}}]'\n    shell: sh\nprompt:\n  run: echo hi\n  shell: sh\npost:\n  - run: touch '{}'\n    shell: sh\n",
             post_marker.display()
         );
         let loaded = crate::action::validate_str(&raw, "<test>").unwrap();
