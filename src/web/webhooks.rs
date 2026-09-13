@@ -329,6 +329,21 @@ pub struct VerifiedFailureEvent {
     pub source: String,
 }
 
+/// CLAUDE-278: the typed event emitted downstream for a verified, allow-listed
+/// `success` or `recover` Action-run delivery - an agent PR's checks may have
+/// just gone green. Deliberately thin: which PR (if any) this run belongs to,
+/// whether its action has automerge enabled, and its CI/mergeable state are
+/// all resolved downstream in `process_action_success_event`, so a slow forge
+/// call never blocks the HTTP response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedActionSuccessEvent {
+    pub repo: String,
+    pub commit_sha: String,
+    pub html_url: String,
+    /// CLAUDE-96-style: the webhook source this event arrived through.
+    pub source: String,
+}
+
 /// CLAUDE-85: the one `run.status` the pipeline acts on. Forgejo's status enum
 /// (`models/actions/status.go`) is `unknown, success, failure, cancelled,
 /// skipped, waiting, running, blocked`; of the done statuses that reach the
@@ -366,6 +381,10 @@ pub struct WebhookState {
     /// is acked and dropped with a log, exactly like a delivery arriving while
     /// the daemon has no usable provider backend.
     pr_events: Option<mpsc::Sender<VerifiedPullRequestEvent>>,
+    /// CLAUDE-278: same source-compatibility shape as `pr_events`, for a
+    /// verified `success`/`recover` Action-run delivery. `None` (no daemon
+    /// wiring, every pre-existing test) acks and drops with a log.
+    success_events: Option<mpsc::Sender<VerifiedActionSuccessEvent>>,
 }
 
 /// CLAUDE-87/101: build one fixed-window rate limiter per source, so exhausting
@@ -416,6 +435,7 @@ impl WebhookState {
             rate: Arc::new(RwLock::new(rate)),
             readiness: None,
             pr_events: None,
+            success_events: None,
         }
     }
 
@@ -438,6 +458,7 @@ impl WebhookState {
             rate,
             readiness: None,
             pr_events: None,
+            success_events: None,
         }
     }
 
@@ -454,6 +475,14 @@ impl WebhookState {
     /// [`Self::with_readiness`].
     pub fn with_pr_events(mut self, events: mpsc::Sender<VerifiedPullRequestEvent>) -> Self {
         self.pr_events = Some(events);
+        self
+    }
+
+    /// CLAUDE-278: attach the channel a verified `success`/`recover`
+    /// Action-run delivery is dispatched onto. A builder for the same
+    /// source-compatibility reason as [`Self::with_readiness`].
+    pub fn with_success_events(mut self, events: mpsc::Sender<VerifiedActionSuccessEvent>) -> Self {
+        self.success_events = Some(events);
         self
     }
 
@@ -2985,6 +3014,13 @@ async fn forgejo_webhook(
         }
     };
 
+    // CLAUDE-278: a `success` or `recover` action is routed to the automerge
+    // success-event pipeline instead of `verified_failure_event`, which only
+    // ever keeps `failure`.
+    if payload.action == "success" || payload.action == "recover" {
+        return handle_action_success(&st, &src_cfg, &source, delivery, &payload).await;
+    }
+
     match verified_failure_event(&payload, &src_cfg.allowed_repos, &source) {
         Some(event) => {
             if st.events.send(event).await.is_err() {
@@ -3013,6 +3049,51 @@ async fn forgejo_webhook(
             StatusCode::OK.into_response()
         }
     }
+}
+
+/// CLAUDE-278: parse and route an authenticated, de-duplicated `success` or
+/// `recover` Action-run delivery: an agent PR's checks may have just gone
+/// green. Repo-allow-listed only; which PR (if any) this belongs to, and
+/// whether automerge is even enabled for it, are resolved downstream in
+/// `process_action_success_event` so a slow forge call never blocks the HTTP
+/// response.
+async fn handle_action_success(
+    st: &WebhookState,
+    src_cfg: &WebhookSource,
+    source: &str,
+    delivery: &str,
+    payload: &ActionPayload,
+) -> Response {
+    let repo = &payload.run.repository.full_name;
+    if !repo_allowed(&src_cfg.allowed_repos, repo) {
+        info!(
+            source = %source,
+            delivery,
+            action = %payload.action,
+            repo = %repo,
+            "forgejo webhook event dropped: repo not in allowed_repos"
+        );
+        return StatusCode::OK.into_response();
+    }
+    let event = VerifiedActionSuccessEvent {
+        repo: repo.clone(),
+        commit_sha: payload.run.commit_sha.clone(),
+        html_url: payload.run.html_url.clone(),
+        source: source.to_string(),
+    };
+    let Some(sender) = &st.success_events else {
+        info!(
+            source = %source,
+            delivery,
+            repo = %event.repo,
+            "action-run success event accepted but no success_events channel is configured; dropping"
+        );
+        return StatusCode::OK.into_response();
+    };
+    if sender.send(event).await.is_err() {
+        warn!(source = %source, delivery, "action-run success event channel closed; dropping event");
+    }
+    StatusCode::ACCEPTED.into_response()
 }
 
 /// CLAUDE-277: parse and route an authenticated, de-duplicated `pull_request`
@@ -3360,6 +3441,223 @@ async fn close_or_leave_open(
                 Err(e) => return Err(format!("left-open comment task panicked: {e}")),
             }
             Ok(format!("left open ({body})"))
+        }
+    }
+}
+
+/// CLAUDE-278: drain verified `success`/`recover` Action-run deliveries for the
+/// lifetime of the daemon, mirroring [`consume_pr_events`]'s shape. `mint`
+/// carries the backend every routing decision needs; `None` (no usable
+/// provider backend) drops every event with a log, the same degrade-to-log-only
+/// behaviour the other two Action-run consumers take.
+pub async fn consume_action_success_events(
+    mut rx: mpsc::Receiver<VerifiedActionSuccessEvent>,
+    pool: DbPool,
+    mint: Option<MintContext>,
+    keygate: crate::concurrency::KeyGate,
+) {
+    let mint = mint.map(Arc::new);
+    let mut tasks = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        let pool = pool.clone();
+        let mint = mint.clone();
+        let keygate = keygate.clone();
+        tasks.push(tokio::spawn(async move {
+            process_action_success_event(ev, pool, mint, keygate).await;
+        }));
+        tasks.retain(|t| !t.is_finished());
+    }
+    for t in tasks {
+        if let Err(e) = t.await {
+            warn!(error = %e, "an action-run success webhook event task panicked");
+        }
+    }
+}
+
+/// CLAUDE-278: one success event's whole handling. Finds the open PR matching
+/// the run's commit, looks it up in `agent_pull_requests`, and (only when it
+/// is a recorded, still-open agent PR whose action has automerge enabled)
+/// reads the PR's CI status and merges it, comments that it needs a branch
+/// update, or does nothing while checks are still pending - `finalize` no
+/// longer polls, so this event is the only thing that ever looks again.
+async fn process_action_success_event(
+    ev: VerifiedActionSuccessEvent,
+    pool: DbPool,
+    mint: Option<Arc<MintContext>>,
+    keygate: crate::concurrency::KeyGate,
+) {
+    let Some(mint) = mint else {
+        info!(
+            repo = %ev.repo,
+            commit = %ev.commit_sha,
+            "action-run success event dropped: no usable provider backend (mint disabled)"
+        );
+        return;
+    };
+
+    let Some(host) = forge_host_from_url(&ev.html_url) else {
+        warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge host from action-run html_url");
+        return;
+    };
+
+    let backend = mint.backend.clone();
+    let host_for_list = host.clone();
+    let repo_for_list = ev.repo.clone();
+    let prs = match tokio::task::spawn_blocking(move || {
+        backend.list_open_prs(&host_for_list, &repo_for_list)
+    })
+    .await
+    {
+        Ok(Ok(prs)) => prs,
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, error = %e, "action-run success: list_open_prs failed");
+            return;
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, error = %e, "action-run success: list_open_prs task panicked");
+            return;
+        }
+    };
+    let Some(pr) = pr_matching_commit(&prs, &ev.commit_sha) else {
+        info!(repo = %ev.repo, commit = %ev.commit_sha, "action-run success: no open PR matches the commit; dropping");
+        return;
+    };
+    let pr_number = pr.number;
+    let pr_url = pr.html_url.clone();
+
+    // CLAUDE-274-style: one key per (repo, PR), so two success deliveries for
+    // the same PR never race each other's merge / comment.
+    let key = format!("{}#{}", ev.repo, pr_number);
+    let _key_guard = keygate.acquire(&key).await;
+
+    let job_key = format!("automerge-{}-{}", ev.repo.replace('/', "_"), pr_number);
+    let run_id = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
+
+    let result =
+        handle_action_success_for_pr(&mint, &pool, &host, &ev.repo, pr_number, &pr_url).await;
+
+    let (ok, summary) = match &result {
+        Ok(s) => (true, s.clone()),
+        Err(e) => (false, e.clone()),
+    };
+    if !ok {
+        warn!(repo = %ev.repo, pr = pr_number, error = %summary, "action-run success handling failed");
+    }
+    finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None).await;
+}
+
+/// CLAUDE-278: the per-PR decision once a success event's PR is known. Looks
+/// up the `agent_pull_requests` row, loads that row's action to check
+/// `automerge.enabled`, and on green+mergeable calls
+/// [`crate::native::youtrack::complete_automerge`] - the same merge + State +
+/// AI-Agent write sequence the old CLAUDE-126 poll loop made.
+async fn handle_action_success_for_pr(
+    mint: &MintContext,
+    pool: &DbPool,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    pr_url: &str,
+) -> Result<String, String> {
+    let row = ci_failure_store::agent_pr(pool, host, repo, pr_number as i64)
+        .await
+        .map_err(|e| format!("agent_pull_requests lookup failed: {e}"))?;
+    let Some(row) = row else {
+        info!(repo = %repo, pr = pr_number, "action-run success: PR is not a recorded agent PR; no action");
+        return Ok("not a recorded agent PR; no action".to_string());
+    };
+    if row.state != "open" {
+        info!(repo = %repo, pr = pr_number, state = %row.state, "action-run success: recorded PR is no longer open; no action");
+        return Ok(format!(
+            "agent PR #{pr_number} already {}; no action",
+            row.state
+        ));
+    }
+
+    let actions_dir = mint.paths.actions_dir();
+    let action_name = row.action_name.clone();
+    let loaded =
+        tokio::task::spawn_blocking(move || crate::action::load(&action_name, &actions_dir))
+            .await
+            .map_err(|e| format!("loading action `{}` task panicked: {e}", row.action_name))?
+            .map_err(|e| format!("loading action `{}` failed: {e}", row.action_name))?;
+    let youtrack_cfg = match loaded.action.native {
+        Some(crate::action::NativeConfig::Youtrack(cfg)) => cfg.youtrack,
+        _ => {
+            info!(repo = %repo, pr = pr_number, action = %row.action_name, "action-run success: recorded action is not a youtrack action; no action");
+            return Ok(format!(
+                "action `{}` is not a youtrack action; no action",
+                row.action_name
+            ));
+        }
+    };
+    if !youtrack_cfg.automerge.enabled {
+        info!(repo = %repo, pr = pr_number, action = %row.action_name, "action-run success: automerge disabled for this action; no action");
+        return Ok("automerge disabled for this action; no action".to_string());
+    }
+
+    let backend = mint.backend.clone();
+    let host_owned = host.to_string();
+    let repo_owned = repo.to_string();
+    let status =
+        tokio::task::spawn_blocking(move || backend.pr_status(&host_owned, &repo_owned, pr_number))
+            .await
+            .map_err(|e| format!("pr_status task panicked: {e}"))?
+            .map_err(|e| format!("pr_status failed: {e}"))?;
+
+    match status.state.trim() {
+        "success" if status.mergeable => {
+            let backend = mint.backend.clone();
+            let host_owned = host.to_string();
+            let repo_owned = repo.to_string();
+            let issue_key = row.issue_key.clone();
+            let pr_url_owned = pr_url.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::native::youtrack::complete_automerge(
+                    backend.as_ref(),
+                    backend.as_ref(),
+                    &youtrack_cfg,
+                    &issue_key,
+                    &host_owned,
+                    &repo_owned,
+                    pr_number,
+                    &pr_url_owned,
+                )
+            })
+            .await
+            .map_err(|e| format!("complete_automerge task panicked: {e}"))?
+            .map_err(|e| format!("complete_automerge failed: {e}"))?;
+            info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: merged PR and advanced issue to Done");
+            Ok(format!(
+                "merged PR #{pr_number}; issue {} advanced to Done",
+                row.issue_key
+            ))
+        }
+        "success" => {
+            let body = crate::native::youtrack::automerge_needs_update_comment(pr_url);
+            let backend = mint.backend.clone();
+            let issue_key = row.issue_key.clone();
+            let comment_result =
+                tokio::task::spawn_blocking(move || backend.comment(&issue_key, &body)).await;
+            match comment_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(repo = %repo, pr = pr_number, error = %e, "action-run success: needs-update comment failed (continuing)");
+                }
+                Err(e) => {
+                    warn!(repo = %repo, pr = pr_number, error = %e, "action-run success: needs-update comment task panicked (continuing)");
+                }
+            }
+            info!(repo = %repo, pr = pr_number, "action-run success: green but not mergeable; commented, left at Code Review");
+            Ok(format!(
+                "PR #{pr_number} green but not mergeable; commented, left at Code Review"
+            ))
+        }
+        other => {
+            info!(repo = %repo, pr = pr_number, state = %other, "action-run success: checks not successful; no action");
+            Ok(format!(
+                "PR #{pr_number} checks not successful ({other}); no action"
+            ))
         }
     }
 }
@@ -3839,6 +4137,10 @@ mod tests {
         open_prs: StdMutex<Vec<ForgePullRequest>>,
         /// CLAUDE-276: when set, `list_open_prs` fails with this message.
         open_prs_error: StdMutex<Option<String>>,
+        /// CLAUDE-278: canned `pr_status` result for the automerge success-event
+        /// tests. `None` (the default) errors, matching every pre-existing test
+        /// that never reaches the automerge path.
+        pr_status: StdMutex<Option<crate::provider::PrStatus>>,
     }
 
     impl StoreBackend {
@@ -3849,6 +4151,7 @@ mod tests {
                 legacy_match: StdMutex::new(None),
                 open_prs: StdMutex::new(Vec::new()),
                 open_prs_error: StdMutex::new(None),
+                pr_status: StdMutex::new(None),
             }
         }
         fn with_legacy_match(self, key: &str) -> Self {
@@ -3861,6 +4164,13 @@ mod tests {
         }
         fn with_open_prs_error(self, message: &str) -> Self {
             *self.open_prs_error.lock().unwrap() = Some(message.to_string());
+            self
+        }
+        fn with_pr_status(self, state: &str, mergeable: bool) -> Self {
+            *self.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
+                state: state.to_string(),
+                mergeable,
+            });
             self
         }
         fn calls(&self) -> Vec<String> {
@@ -3993,6 +4303,29 @@ mod tests {
             _body_file: &Path,
         ) -> crate::error::Result<()> {
             unreachable!()
+        }
+        fn pr_status(
+            &self,
+            _host: &str,
+            _repo: &str,
+            pr_number: u64,
+        ) -> crate::error::Result<crate::provider::PrStatus> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("pr_status {pr_number}"));
+            self.pr_status
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| crate::error::Error::Other(anyhow::anyhow!("no canned pr_status")))
+        }
+        fn merge_pr(&self, _host: &str, _repo: &str, pr_number: u64) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("merge_pr {pr_number}"));
+            Ok(())
         }
     }
 
@@ -7395,6 +7728,262 @@ mod tests {
             assert_eq!(ev.number, 42);
             assert!(ev.merged);
             assert_eq!(ev.head_sha, "deadbeefcafefeed");
+        }
+    }
+
+    // ---- CLAUDE-278: event-driven automerge on a success/recover event -----
+    mod automerge_success {
+        use super::*;
+
+        /// Writes a minimal youtrack action YAML under `dir/actions/<name>.yml`
+        /// (the layout `crate::action::load` resolves against), with automerge
+        /// set to `enabled`.
+        fn write_youtrack_action(dir: &std::path::Path, name: &str, automerge_enabled: bool) {
+            let actions_dir = dir.join("actions");
+            std::fs::create_dir_all(&actions_dir).unwrap();
+            let yaml = format!(
+                "name: {name}\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: {automerge_enabled}\n"
+            );
+            std::fs::write(actions_dir.join(format!("{name}.yml")), yaml).unwrap();
+        }
+
+        fn ctx_for(
+            pool: DbPool,
+            backend: Arc<StoreBackend>,
+            paths_dir: &std::path::Path,
+        ) -> MintContext {
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            store_mint_context_in(
+                pool,
+                backend,
+                classifier,
+                paths_dir,
+                Arc::new(crate::provider::cli::testutil::StubRunner::new()),
+            )
+        }
+
+        #[tokio::test]
+        async fn success_and_mergeable_merges_and_advances_to_done() {
+            // Acceptance criterion 1: a success event on a recorded agent PR,
+            // with automerge enabled and pr_status success+mergeable, merges the
+            // PR and advances the issue to Done.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("merged"), "{result}");
+            let calls = backend.calls();
+            assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
+            assert!(
+                calls.iter().any(|c| c == "set_state MK-16 Done"),
+                "{calls:?}"
+            );
+            assert!(
+                calls.iter().any(|c| c == "set_field MK-16 AI Agent Done"),
+                "{calls:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn pending_does_nothing_then_a_later_success_merges() {
+            // Acceptance criterion 2: a success event while other checks are
+            // pending does nothing, and a later success event (once the forge
+            // reports green + mergeable) merges.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("pending", false));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(
+                result.contains("not action") || result.contains("no action"),
+                "{result}"
+            );
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+            assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
+
+            // A later success event: the forge now reports green + mergeable.
+            *backend.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
+                state: "success".to_string(),
+                mergeable: true,
+            });
+            let result2 = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result2.contains("merged"), "{result2}");
+            let calls = backend.calls();
+            assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
+        }
+
+        #[tokio::test]
+        async fn not_a_recorded_pr_changes_nothing() {
+            // Acceptance criterion 3 (part 1): a success event on a PR that is
+            // not a recorded agent PR changes nothing.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                999,
+                "https://dev.a8n.run/contoso/claude-run/pulls/999",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("not a recorded agent PR"), "{result}");
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+        }
+
+        #[tokio::test]
+        async fn automerge_disabled_action_changes_nothing() {
+            // Acceptance criterion 3 (part 2): a recorded agent PR whose action
+            // has automerge disabled changes nothing.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", false);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("automerge disabled"), "{result}");
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+        }
+
+        #[tokio::test]
+        async fn not_mergeable_comments_and_leaves_code_review() {
+            // Acceptance criterion 4: a success event that is not mergeable
+            // comments and leaves the issue at Code Review (no State / AI Agent
+            // write).
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", false));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("not mergeable"), "{result}");
+            let calls = backend.calls();
+            assert!(
+                calls.iter().any(|c| c.starts_with("comment MK-16")),
+                "{calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+            assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
         }
     }
 }
