@@ -284,6 +284,28 @@ case-sensitive, and the runner's own Forgejo login (`Claude-Run`) never matched 
 `config.mint.bot_logins` is unchanged and still used by the separate `/claude` PR-comment listener's own bot-login
 check.
 
+##### Closing a CI-failure issue on merge (CLAUDE-277)
+
+`ci-failure-reconcile` (below) closes a code issue only by finding its failing job green on `default_branch`, which a
+PR-only workflow never satisfies (it has no run on `main` at all). The CI-failure webhook (`webhook-forgejo`) closes
+that gap with a second delivery kind on the same endpoint: `POST /webhooks/forgejo/<source>` now also accepts Forgejo
+`pull_request` deliveries, dispatched by the delivery's `X-Forgejo-Event` header before parsing (a value the deployed
+Forgejo's Action-run notifier does not send; an operator adding this must confirm the header against their own
+instance's actual delivery). A `pull_request` delivery runs through the same signature / replay / rate-limit / pause /
+allow-list gates the Action-run path does; only a terminal `action: "closed"` delivery does anything.
+
+- **Merged, with the failing workflow green at the PR's head commit:** every open `ci_failures` row the PR
+  references (its own `agent_pull_requests` issue, plus every key `Forge::pr_referenced_issues` finds) is closed -
+  `State` set to `config.mint.resolved_state` (default `Done`, distinct from `mint.target_state`) plus a comment
+  linking the PR and the run - and the store row marked `resolved`.
+- **Merged, with that workflow red or no run found at the head commit:** the issue is left open with a comment
+  saying so.
+- **Closed without merging:** the PR's own `agent_pull_requests` row (if any) is marked `closed`; a human's PR, with
+  no such row, is unaffected.
+
+Finding the failing workflow's run at the head commit reads `fj actions runs` again, through the same `log_token_ref`
+this listener already resolves for the Action-run path - no new credential.
+
 ##### The no-code completion path (CLAUDE-214)
 
 A run whose deliverable is tracker output rather than code (survey several repos, file the findings as issues, link them
