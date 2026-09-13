@@ -481,7 +481,7 @@ pub async fn run_stage_set(pool: &DbPool, run_id: i64, stage: Option<&str>) -> R
 /// CLAUDE-163: also records the job's `concurrency_key` so the admission dedup
 /// can drop gathered jobs whose concurrency key (project / repo) is already in
 /// flight, not just those whose issue id is. For a path with one job per key
-/// (webhook, forgejo-ci-fix) the concurrency key equals `key`.
+/// (webhook) the concurrency key equals `key`.
 pub async fn run_inflight_add(
     pool: &DbPool,
     run_id: i64,
@@ -935,8 +935,8 @@ pub async fn run_finish(
 /// awaits before reaching [`run_finish`]. One transient failure (in the incident
 /// it was `pool timed out while waiting for an open connection`) returned from
 /// the handler with the row still open, and nothing closed it while the daemon
-/// lived: `ci-failure-analysis` accumulated 19 rows over three days, every one
-/// of them rendered as a running job in the web UI.
+/// lived: a scheduled CI-failure action accumulated 19 rows over three days,
+/// every one of them rendered as a running job in the web UI.
 ///
 /// The happy path calls [`RunGuard::finish`]. Anything else (an early `?`, an
 /// error return, a panic unwinding through the handler) hits `Drop`, which
@@ -1808,8 +1808,8 @@ mod tests {
     /// CLAUDE-228: the startup reap. A row still open when the daemon starts was
     /// stranded by a process that died without finalizing, not cancelled by an
     /// operator, so it closes as `UNEXPECTED` and stays distinguishable from a
-    /// `claude-run stop`. This is what cleared the 19 `ci-failure-analysis` rows
-    /// the web UI had been rendering as running jobs for three days.
+    /// `claude-run stop`. This is what cleared the 19 stranded rows a scheduled
+    /// CI-failure action had left, rendered as running jobs for three days.
     #[tokio::test]
     async fn reap_orphaned_runs_closes_open_rows_as_unexpected() {
         let pool = mem_pool().await;
@@ -1851,9 +1851,6 @@ mod tests {
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let runners = [
             "native/youtrack.rs",
-            "native/forgejo_ci_fix.rs",
-            "native/ci_failure_analysis.rs",
-            "native/ci_failure_reconcile.rs",
             "native/closed_issue_summary.rs",
             "daemon.rs",
         ];

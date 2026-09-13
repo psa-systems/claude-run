@@ -19,6 +19,6 @@ pub mod fingerprint;
 pub mod store;
 
 /// CLAUDE-274: reusable pieces of a deep, log-grounded CI-failure analysis,
-/// shared by the at-ingest classifier and the scheduled `ci-failure-analysis`
-/// handler. Crate-internal: nothing here is a stable API surface.
+/// used by the at-ingest classifier. Crate-internal: nothing here is a stable
+/// API surface.
 pub(crate) mod analysis;

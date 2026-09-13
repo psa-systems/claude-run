@@ -222,9 +222,8 @@ pub struct WebhookConfig {
     pub auto_fix: bool,
     /// CLAUDE-274: timeout (seconds) for the at-ingest [`crate::triage::AnalysisClassifier`]
     /// session, which runs `Read,Grep,Bash` over the complete log and the
-    /// failing workflow YAML. Default 600 (the old scheduled
-    /// `ci-failure-analysis` action's timeout), well past the old tool-less
-    /// classifier's 120s.
+    /// failing workflow YAML. Default 600 (the retired scheduled analysis
+    /// action's timeout), well past the old tool-less classifier's 120s.
     pub analysis_timeout_secs: u64,
     /// CLAUDE-274: how many events [`crate::web::webhooks::consume_events`]
     /// analyzes concurrently, each behind its own `analysis_timeout_secs`
@@ -427,7 +426,7 @@ pub struct CommentWebhookSource {
     /// edit, not a code change. Matched case-insensitively.
     pub allowed_permissions: Vec<String>,
     /// Decision-gate cap: a working-tree diff touching more files than this is
-    /// commented on rather than pushed (the `forgejo-ci-fix` shape).
+    /// commented on rather than pushed.
     pub max_files: u64,
     /// Decision-gate cap: a working-tree diff changing more lines than this is
     /// commented on rather than pushed.
@@ -493,8 +492,8 @@ pub struct MintConfig {
     pub resolved_state: String,
     /// `AI Agent` custom-field name driven on the minted issue.
     pub ai_agent_field: String,
-    /// `AI Agent` value set on a bucket-1 (code-fix) issue so the existing
-    /// forgejo-ci-fix pickup logic (CLAUDE-29) opens the fix PR. Default `Queued`.
+    /// `AI Agent` value set on a bucket-1 (code-fix) issue so the `youtrack`
+    /// action's pickup logic opens the fix PR. Default `Queued`.
     pub queued_value: String,
     /// CLAUDE-104: auto-fix framework settings. A nested `[mint]` subsection (so
     /// it rides the existing DB-backed mint section per CLAUDE-101 rather than

@@ -1136,7 +1136,7 @@ fn serve_run(
         }
     };
 
-    // ---- decision gate (the `forgejo-ci-fix` shape) ----
+    // ---- decision gate ----
     let decision = if !claude_result.ok {
         Decision::ClaudeFailed
     } else {
@@ -1356,7 +1356,7 @@ fn build_prompt(cmd: &VerifiedCommentCommand, branch: &str) -> String {
     .join("\n")
 }
 
-/// The decision gate outcome, the `forgejo-ci-fix` shape.
+/// The decision gate outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     ClaudeFailed,

@@ -30,10 +30,10 @@
 //! sibling subtasks - log fetch + redaction (CLAUDE-44), the hybrid triage
 //! engine (CLAUDE-45), and the triage-driven issue mint + dedupe + loop safety
 //! (CLAUDE-46) - so a verified failure turns into a minted issue (bucket 1 ->
-//! `AI Agent=Queued` for forgejo-ci-fix, bucket 2 -> a human-assigned issue) or
-//! nothing (bucket 3, transient). The scheduled `youtrack` / `forgejo-ci-fix`
-//! actions stay as the backstop and dedupe against webhook-minted issues through
-//! the same [`crate::mint`] markers.
+//! `AI Agent=Queued`, picked up by the `youtrack` action, bucket 2 -> a
+//! human-assigned issue) or nothing (bucket 3, transient). The scheduled
+//! `youtrack` action stays as the backstop and dedupes against webhook-minted
+//! issues through the same [`crate::mint`] markers.
 //!
 //! TLS / reverse proxy and service authentication are out of scope here per the
 //! epic decision (handled by the external proxy / the linked auth issue).
@@ -88,8 +88,8 @@ pub const WEBHOOK_MINT_ACTION: &str = "webhook-forgejo";
 ///   work against a pause we could not read.
 ///
 /// 2xx (not 4xx/5xx) because a retry cannot help: the delivery id is already in
-/// the replay store, so a same-id retry would 409, and the scheduled `youtrack`
-/// / `forgejo-ci-fix` poll is the backstop that re-finds the work after Resume.
+/// the replay store, so a same-id retry would 409, and the scheduled
+/// `youtrack` poll is the backstop that re-finds the work after Resume.
 pub(crate) async fn paused_accept_and_drop(
     pool: &DbPool,
     action: &str,
@@ -134,8 +134,8 @@ pub(crate) async fn paused_accept_and_drop(
 /// CLAUDE-269: right after the pause check, accept-and-drop a delivery while
 /// the Claude login needs renewing. 2xx for the same reason as a pause: a
 /// retry cannot help (the delivery id is already in the replay store), and the
-/// scheduled `youtrack` / `forgejo-ci-fix` poll is the backstop that re-finds
-/// the work once signed in again. Unlike a pause, this ALSO records a
+/// scheduled `youtrack` poll is the backstop that re-finds the work once
+/// signed in again. Unlike a pause, this ALSO records a
 /// `run_events` row (`state::run_events_record`), because a login-required
 /// drop is unusual enough that "on screen, not only in the log" earns it a
 /// dedicated row rather than riding the pause's log-only treatment.

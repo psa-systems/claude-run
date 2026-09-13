@@ -588,9 +588,8 @@ pub enum RunsListOutcome {
 /// matches on: which workflow ran, at which commit, and whether it succeeded.
 /// A second, narrower parse of the same `fj actions runs --json` page
 /// [`parse_runs_list_entries`] reads, kept as its own type rather than adding a
-/// `commit_sha` field to [`RunEntry`]: `RunEntry` is shared with the
-/// `ci-failure-reconcile` reconciler's own test literals, outside this issue's
-/// scope.
+/// `commit_sha` field to [`RunEntry`]: `RunEntry` was shared with another
+/// caller's own test literals, outside this issue's scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRun {
     /// The run's GLOBAL id (`run.id`); orders runs by recency.
