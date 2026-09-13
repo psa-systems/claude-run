@@ -810,6 +810,7 @@ impl LiveSettings {
             }
             Section::Webhook => {
                 let v: WebhookConfig = parse(json)?;
+                validate_webhook(&v).map_err(SaveError::Invalid)?;
                 v.warn_unusual_source_names();
                 set_json(&self.pool, section.key(), &v).await?;
                 // Rebuild the per-source rate limiters from the new map, then
@@ -925,6 +926,16 @@ fn comment_rate_map(cfg: &CommentWebhookConfig) -> HashMap<String, Mutex<RateLim
 /// CLAUDE-220: validate a [`CommentWebhookConfig`] before it is persisted. An
 /// empty trigger would match every comment and a zero instruction cap would
 /// refuse every command, so both are rejected rather than stored.
+/// CLAUDE-274: `analysis_concurrency` must be at least 1 - a `0` would leave
+/// [`crate::web::webhooks::consume_events`]'s worker-pool semaphore permanently
+/// starved, so no event would ever be analyzed.
+pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> {
+    if cfg.analysis_concurrency < 1 {
+        return Err("analysis_concurrency must be >= 1".to_string());
+    }
+    Ok(())
+}
+
 pub fn validate_comment_webhook(cfg: &CommentWebhookConfig) -> std::result::Result<(), String> {
     if cfg.trigger.trim().is_empty() {
         return Err("trigger must not be empty".to_string());

@@ -24,9 +24,10 @@ flowchart TD
         T1 -- yes --> N2["no issue"]
         T1 -- no --> T2{"known mechanical fix? cargo fmt, checks workflow"}
         T2 -- yes --> BA["auto_fix"]
-        T2 -- no --> T3["classify the failure"]:::claude
-        T3 --> BC["code_fix"]
-        T3 --> BH["human_action"]
+        T2 -- no --> T3["AnalysisClassifier: Read/Grep/Bash over the full log + failing workflow YAML, one fenced JSON verdict"]:::claude
+        T3 -- "code_defect" --> BC["code_fix"]
+        T3 -- "needs_human" --> BH["human_action"]
+        T3 -- "flaky / infra" --> N2
         BA --> G1{"has_open_pr?"}
         BC --> G1
         G1 -- yes --> N3["no issue (left to the author)"]
@@ -50,7 +51,7 @@ flowchart TD
     L2 --> YT
 
     subgraph SC ["scheduled actions, every 60s, independent of each other"]
-        YT --> A1["ci-failure-analysis: analyze the log"]:::claude
+        YT --> A1["ci-failure-analysis: analyze the log (scheduled for retirement, CLAUDE-279 - superseded by the webhook's own AnalysisClassifier above)"]:::claude
         A1 --> A2["comment root cause on the issue"]
         YT --> R1{"ci-failure-reconcile: duplicate of an older open issue?"}
         R1 -- yes --> R2["close as duplicate"]
@@ -71,6 +72,7 @@ flowchart TD
 | Step                              | Code                                  |
 |-----------------------------------|---------------------------------------|
 | Webhook ingest, store dedupe, and triage | `src/web/webhooks.rs`, `src/triage.rs` |
+| At-ingest analysis (`AnalysisClassifier`), shared with the scheduled action below | `src/ci_failure/analysis.rs` |
 | Failing-test fingerprint and the `ci_failures` store | `src/ci_failure/fingerprint.rs`, `src/ci_failure/store.rs` |
 | Gates and issue creation (no dedupe)     | `src/mint.rs`                   |
 | ci-failure-analysis               | `src/native/ci_failure_analysis.rs`   |

@@ -695,7 +695,14 @@ fn build_description(req: &MintRequest, primary: &str, secondary: &str, collapse
             req.triage.bucket, req.triage.classified_by
         ),
         String::new(),
-        req.triage.analysis.clone(),
+        // CLAUDE-274: the analysis text now carries the AnalysisClassifier's
+        // full log-grounded report (not just a short classification
+        // sentence), so it is capped here the same way the (now-retired)
+        // scheduled ci-failure-analysis capped its own comment.
+        crate::ci_failure::analysis::cap_comment(
+            &req.triage.analysis,
+            crate::ci_failure::analysis::DEFAULT_MAX_ANALYSIS_BYTES,
+        ),
         String::new(),
         "## Failure".to_string(),
         format!("- Repo: `{}`", req.repo),
@@ -1044,6 +1051,37 @@ mod tests {
             })
         );
         assert_eq!(route(TriageBucket::Transient), None);
+    }
+
+    // ---- CLAUDE-274: the description carries the (capped) analysis --------
+
+    #[test]
+    fn build_description_carries_the_analysis_capped_at_the_shared_default() {
+        let long_analysis = "x".repeat(40_000);
+        let t = Triage {
+            bucket: TriageBucket::CodeFix,
+            analysis: long_analysis.clone(),
+            classified_by: ClassifiedBy::Llm,
+            auto_fix: None,
+        };
+        let r = req("owner/repo", &t, "alice");
+        let description = build_description(&r, "primary", "secondary", "collapse-key");
+        assert!(
+            description.len() < long_analysis.len(),
+            "the oversized analysis is capped, not carried verbatim"
+        );
+        assert!(
+            description.contains("analysis truncated"),
+            "the cap's truncation marker is present: {description}"
+        );
+    }
+
+    #[test]
+    fn build_description_carries_a_short_analysis_verbatim() {
+        let t = triage(TriageBucket::CodeFix);
+        let r = req("owner/repo", &t, "alice");
+        let description = build_description(&r, "primary", "secondary", "collapse-key");
+        assert!(description.contains(&t.analysis));
     }
 
     // ---- CLAUDE-86: VCS-integration routing -------------------------------

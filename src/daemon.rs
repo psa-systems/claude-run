@@ -373,13 +373,28 @@ impl Daemon {
         // `state_dir/webhook-logs/`. CLAUDE-47: each event is then triaged
         // (CLAUDE-45) and minted / declined (CLAUDE-46) when a provider backend
         // is usable.
+        // CLAUDE-28: one daemon-wide key gate, shared across every dispatch, so
+        // two executions sharing a concurrency key never overlap even across a
+        // scheduled run and a manual trigger. CLAUDE-220: the comment consumer
+        // takes the same gate on its per-(repo, PR) key. CLAUDE-274: the
+        // webhook event consumer takes it too, on a (repo, workflow, job) key,
+        // so two concurrent failures of the same job never both run an
+        // analysis.
+        let keygate = KeyGate::new();
+
         let webhook_log_dir = self.paths.webhook_logs_dir();
         let webhook_logs: Arc<dyn crate::forge_log::ActionLogClient> = Arc::new(
             crate::provider::FjForgeReads::new(Arc::new(crate::provider::ProcessRunner::new())),
         );
+        // CLAUDE-274: `analysis_timeout_secs` is read once here: the
+        // classifier is built once and shared for the daemon's lifetime, so a
+        // later Settings save to it needs a restart (unlike the rest of
+        // `[webhook]`, which the consumer re-reads live per event).
+        let analysis_timeout_secs = settings.webhook_handle().read().await.analysis_timeout_secs;
         let mint_ctx = build_mint_context(
             &pool,
             settings.mint_handle(),
+            analysis_timeout_secs,
             &claude,
             &webhook_log_dir,
             &self.paths,
@@ -394,13 +409,8 @@ impl Daemon {
             // `log_token_ref` to authorize the log fetch. CLAUDE-101: the live
             // handle so a Settings save is picked up by the next event.
             settings.webhook_handle(),
+            keygate.clone(),
         ));
-
-        // CLAUDE-28: one daemon-wide key gate, shared across every dispatch, so
-        // two executions sharing a concurrency key never overlap even across a
-        // scheduled run and a manual trigger. CLAUDE-220: the comment consumer
-        // takes the same gate on its per-(repo, PR) key.
-        let keygate = KeyGate::new();
 
         // CLAUDE-220: serve accepted `/claude` comment commands off the request
         // path for the daemon's lifetime. Each command authorizes against a live
@@ -591,20 +601,22 @@ impl Daemon {
 }
 
 /// Build the webhook [`crate::web::webhooks::MintContext`] (CLAUDE-47):
-/// resolve a provider backend (CLI-first), wrap the shared `claude` invoker in a
-/// triage [`crate::triage::ClaudeClassifier`], and bundle the on-disk mint
-/// config + caps. Returns `None` (mint disabled, the consumer runs log-only)
-/// when no `yt`/`fj` backend is usable or the triage workdir cannot be created,
-/// so a daemon on a host without the forge CLIs still ingests and logs failures.
+/// resolve a provider backend (CLI-first), wrap the shared `claude` invoker in
+/// an at-ingest [`crate::triage::AnalysisClassifier`] (CLAUDE-274), and bundle
+/// the on-disk mint config + caps. Returns `None` (mint disabled, the consumer
+/// runs log-only) when no `yt`/`fj` backend is usable or the analysis base
+/// directory cannot be created, so a daemon on a host without the forge CLIs
+/// still ingests and logs failures.
 fn build_mint_context(
     pool: &DbPool,
     mint_cfg: Arc<tokio::sync::RwLock<crate::config::MintConfig>>,
+    analysis_timeout_secs: u64,
     claude: &Arc<ClaudeInvoker>,
     webhook_log_dir: &Path,
     paths: &Paths,
 ) -> Option<crate::web::webhooks::MintContext> {
     use crate::action::ClaudeBlock;
-    use crate::triage::{ClaudeClassifier, FailureClassifier};
+    use crate::triage::{AnalysisClassifier, FailureClassifier};
 
     let backend: Arc<dyn crate::provider::Backend> =
         match crate::provider::resolve(crate::provider::DEFAULT_PRIORITY) {
@@ -615,34 +627,36 @@ fn build_mint_context(
             }
         };
 
-    // Classification is a single bounded-log JSON reply: no repo checkout, no
-    // edit tools. Run claude read-only in a stable cwd under the webhook log dir.
-    let cwd = webhook_log_dir.join("triage");
-    if let Err(e) = std::fs::create_dir_all(&cwd) {
-        warn!(error = %e, "creating triage workdir failed; webhook runs log-only (no mint)");
+    // CLAUDE-274: each analysis gets its own `<owner>_<repo>-run<N>/`
+    // subdirectory under here, holding the full log and the failing workflow
+    // YAML; removed when the classification returns.
+    let analysis_base_dir = webhook_log_dir.join("analysis");
+    if let Err(e) = std::fs::create_dir_all(&analysis_base_dir) {
+        warn!(error = %e, "creating the analysis base directory failed; webhook runs log-only (no mint)");
         return None;
     }
     let claude_cfg = ClaudeBlock {
         cwd: None,
-        allowed_tools: Some(String::new()),
+        allowed_tools: Some("Read,Grep,Bash".to_string()),
         permission_mode: Some("default".to_string()),
-        // CLAUDE-239: triage pins no model, so it follows the global
+        // CLAUDE-239: the analysis pins no model, so it follows the global
         // `config.claude.model` (or the CLI default when that is unset).
         model: None,
         // CLAUDE-259: same for the effort level.
         effort: None,
-        // DEV-706: same for the compaction window. A single bounded-log
-        // classification cannot grow its own context, so the runner default is
-        // simply inherited rather than pinned here.
+        // DEV-706: same for the compaction window.
         autocompact: None,
     };
-    let stream_log = cwd.join("triage-stream.jsonl");
-    let classifier: Arc<dyn FailureClassifier> = Arc::new(ClaudeClassifier::new(
+    let fj: Arc<dyn crate::forge_log::ForgeReads> = Arc::new(crate::provider::FjForgeReads::new(
+        Arc::new(crate::provider::ProcessRunner::new()),
+    ));
+    let classifier: Arc<dyn FailureClassifier> = Arc::new(AnalysisClassifier::new(
         claude.clone(),
         claude_cfg,
-        std::time::Duration::from_secs(crate::web::webhooks::TRIAGE_TIMEOUT_SECS),
-        cwd,
-        stream_log,
+        std::time::Duration::from_secs(analysis_timeout_secs),
+        analysis_base_dir,
+        paths.logs_dir(),
+        fj,
         // DEV-705: a classification bills against the runner's default budget,
         // frozen here; there is no per-action YAML for the webhook mint path.
         {

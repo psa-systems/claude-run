@@ -220,6 +220,16 @@ pub struct WebhookConfig {
     /// and edited live on the Settings page / via `PUT /api/settings/webhook`
     /// with no restart.
     pub auto_fix: bool,
+    /// CLAUDE-274: timeout (seconds) for the at-ingest [`crate::triage::AnalysisClassifier`]
+    /// session, which runs `Read,Grep,Bash` over the complete log and the
+    /// failing workflow YAML. Default 600 (the old scheduled
+    /// `ci-failure-analysis` action's timeout), well past the old tool-less
+    /// classifier's 120s.
+    pub analysis_timeout_secs: u64,
+    /// CLAUDE-274: how many events [`crate::web::webhooks::consume_events`]
+    /// analyzes concurrently, each behind its own `analysis_timeout_secs`
+    /// session. Must be at least 1 (validated in `src/settings.rs`); default 2.
+    pub analysis_concurrency: usize,
 }
 
 impl Default for WebhookConfig {
@@ -227,6 +237,8 @@ impl Default for WebhookConfig {
         Self {
             replay_window_secs: 300,
             sources: BTreeMap::new(),
+            analysis_timeout_secs: 600,
+            analysis_concurrency: 2,
             auto_fix: false,
         }
     }
