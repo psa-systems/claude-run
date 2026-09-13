@@ -432,13 +432,76 @@ pub async fn consume_events(
     out_dir: PathBuf,
     mint: Option<MintContext>,
     webhook_cfg: Arc<RwLock<WebhookConfig>>,
+    keygate: crate::concurrency::KeyGate,
 ) {
-    let cfg = crate::forge_log::LogFetchConfig::default();
+    // CLAUDE-274: bound the number of events processed concurrently, so a
+    // burst of failures does not start one 600s analysis session per event at
+    // once (`config.webhook.analysis_concurrency`, default 2). The snapshot is
+    // taken once at start: resizing the pool live is not required by this
+    // issue and the DB-backed setting is otherwise honored per event as
+    // before.
+    let concurrency = webhook_cfg.read().await.analysis_concurrency.max(1);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    // Built once so every spawned event shares one classifier/backend/route
+    // cache, exactly as the old inline loop did.
+    let mint = mint.map(Arc::new);
+    // CLAUDE-274: joined once the channel closes, so a caller awaiting
+    // `consume_events` (every existing test, and the daemon's own shutdown)
+    // observes every spawned event's completed side effects, not just that
+    // they were scheduled.
+    let mut tasks = Vec::new();
     while let Some(ev) = rx.recv().await {
         // CLAUDE-101: snapshot the live webhook config for this event so a
         // Settings save (e.g. a source's `log_token_ref`) is picked up by the
         // next event without a restart.
-        let webhook_cfg = webhook_cfg.read().await.clone();
+        let webhook_cfg_snapshot = webhook_cfg.read().await.clone();
+        // CLAUDE-274: acquire a permit before spawning, so the loop itself
+        // (not the spawned task) is what bounds how many events are ever
+        // in flight; a saturated pool simply leaves later events queued in
+        // the channel until one finishes.
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore is never closed");
+        let pool = pool.clone();
+        let logs = logs.clone();
+        let out_dir = out_dir.clone();
+        let mint = mint.clone();
+        let keygate = keygate.clone();
+        tasks.push(tokio::spawn(async move {
+            process_event(ev, pool, logs, out_dir, mint, webhook_cfg_snapshot, keygate).await;
+            drop(permit);
+        }));
+        // Bound the join set's own growth: a task that already finished is
+        // dropped from the list immediately rather than accumulating for the
+        // whole (potentially unbounded) lifetime of the consumer.
+        tasks.retain(|t| !t.is_finished());
+    }
+    for t in tasks {
+        if let Err(e) = t.await {
+            warn!(error = %e, "a webhook event task panicked");
+        }
+    }
+}
+
+/// One verified failure's whole pipeline (CLAUDE-61/CLAUDE-44/CLAUDE-45/
+/// CLAUDE-46/CLAUDE-273/CLAUDE-274): fetch the run's logs, redact, and (when a
+/// [`MintContext`] is configured) triage and mint. Spawned as its own task by
+/// [`consume_events`]'s worker pool so a slow analysis for one event never
+/// delays another's.
+async fn process_event(
+    ev: VerifiedFailureEvent,
+    pool: DbPool,
+    logs: Arc<dyn crate::forge_log::ActionLogClient>,
+    out_dir: PathBuf,
+    mint: Option<Arc<MintContext>>,
+    webhook_cfg: WebhookConfig,
+    keygate: crate::concurrency::KeyGate,
+) {
+    let cfg = crate::forge_log::LogFetchConfig::default();
+    let mint = mint.as_deref();
+    {
         info!(
             repo = %ev.repo,
             run = ev.index_in_repo,
@@ -477,7 +540,7 @@ pub async fn consume_events(
                 ev.status
             );
             finish_webhook_run(&pool, run_id, &job_key, &summary, true, None).await;
-            continue;
+            return;
         }
 
         // CLAUDE-204: ONE fetch path for public and private repos. `fj actions
@@ -487,6 +550,9 @@ pub async fn consume_events(
         // the no-log triage rule routes it to a human (bucket 2) rather than
         // silently dropping it as transient.
         let token = source_log_token(&pool, &webhook_cfg, &ev.source).await;
+        // CLAUDE-274: kept for the analysis classifier's own workflow-YAML fetch
+        // (it authorizes the log fetch below, then travels via `TriageInput`).
+        let log_token = token.clone();
         let Some(target) =
             crate::forge_log::LogTarget::for_run(&ev.html_url, &ev.repo, ev.index_in_repo, token)
         else {
@@ -500,7 +566,7 @@ pub async fn consume_events(
                 None,
             )
             .await;
-            continue;
+            return;
         };
         if let Some(id) = run_id {
             if let Err(e) = state::run_stage_set(&pool, id, Some(STAGE_FETCHING_LOGS)).await {
@@ -635,7 +701,7 @@ pub async fn consume_events(
                     log_artifact.as_deref(),
                 )
                 .await;
-                continue;
+                return;
             }
             info!(
                 repo = %ev.repo,
@@ -645,7 +711,7 @@ pub async fn consume_events(
             );
         }
 
-        let Some(ctx) = mint.as_ref() else {
+        let Some(ctx) = mint else {
             // No mint configured (no usable backend): log-only, as before. The
             // run is still recorded so the operator sees the event landed.
             let summary = if log_available {
@@ -662,7 +728,7 @@ pub async fn consume_events(
                 log_artifact.as_deref(),
             )
             .await;
-            continue;
+            return;
         };
         let artifact = log_artifact.clone();
         // CLAUDE-190/204: the failing job's name comes from the jobs `fj` already
@@ -683,6 +749,8 @@ pub async fn consume_events(
             log_unavailable_reason,
             webhook_cfg.auto_fix,
             job_name,
+            log_token,
+            &keygate,
         )
         .await;
         finish_webhook_run(
@@ -943,7 +1011,16 @@ async fn triage_and_mint(
     log_unavailable_reason: Option<String>,
     auto_fix_enabled: bool,
     job_name: String,
+    log_token: Option<String>,
+    keygate: &crate::concurrency::KeyGate,
 ) -> WebhookRunSummary {
+    // CLAUDE-274: the store lookup, analysis and mint for one event run under a
+    // key gate on (repo, workflow_id, job_name), so two concurrent failures of
+    // the same job never both run an analysis: the second waits here and then
+    // finds the first one's store row, attaching instead of re-analyzing.
+    let key = format!("{}#{}#{}", ev.repo, ev.workflow_id, job_name);
+    let _key_guard = keygate.acquire(&key).await;
+
     // CLAUDE-190: derive the deterministic failure signature and the branch
     // from the redacted log up front (pure string work); CLAUDE-273 fingerprint
     // is the failing-test overlap key the store matches on.
@@ -997,6 +1074,7 @@ async fn triage_and_mint(
                 auto_fix_enabled,
                 branch,
                 test_ids,
+                log_token,
                 m,
             )
             .await
@@ -1018,6 +1096,7 @@ async fn triage_and_mint(
                 failure_signature,
                 infra_kind,
                 test_ids,
+                log_token,
             )
             .await
         }
@@ -1120,6 +1199,7 @@ async fn reopen_resolved_failure(
     auto_fix_enabled: bool,
     branch: String,
     test_ids: Vec<String>,
+    log_token: Option<String>,
     m: ci_failure_store::FailureMatch,
 ) -> WebhookRunSummary {
     let Some(key) = m.issue_key.clone() else {
@@ -1170,6 +1250,7 @@ async fn reopen_resolved_failure(
                 log_available,
                 log_unavailable_reason,
                 has_open_pr,
+                log_token,
             };
             let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
             backend.comment(&key2, &verdict.analysis)?;
@@ -1255,6 +1336,7 @@ async fn classify_and_mint(
     failure_signature: Option<String>,
     infra_kind: Option<String>,
     test_ids: Vec<String>,
+    log_token: Option<String>,
 ) -> WebhookRunSummary {
     // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
     // run's (repo, index); the daily ledger is per synthetic action. The
@@ -1334,6 +1416,7 @@ async fn classify_and_mint(
             &branch_for_blocking,
             sig_for_blocking.as_deref(),
             infra_for_blocking.as_deref(),
+            log_token,
             &report_stage,
         )
     })
@@ -1430,6 +1513,7 @@ fn decide_with_legacy_adoption(
     branch: &str,
     failure_signature: Option<&str>,
     infra_kind: Option<&str>,
+    log_token: Option<String>,
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
 ) -> crate::error::Result<DecideOutcome> {
     // CLAUDE-273: before spending a `claude` classification, check whether this
@@ -1460,6 +1544,7 @@ fn decide_with_legacy_adoption(
         has_open_pr,
         auto_fix_enabled,
         job_name,
+        log_token,
         report_stage,
     )?;
     Ok(DecideOutcome::Mint(bucket, outcome))
@@ -1487,6 +1572,7 @@ fn decide_mint(
     has_open_pr: bool,
     auto_fix_enabled: bool,
     job_name: &str,
+    log_token: Option<String>,
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
 ) -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
     // CLAUDE-190: derive the deterministic failure signature and the branch from
@@ -1518,6 +1604,7 @@ fn decide_mint(
         log_available,
         log_unavailable_reason,
         has_open_pr,
+        log_token,
     };
     // CLAUDE-80: the classify stage only exists when the deterministic rules
     // abstain, so the label is reported from inside the classifier call rather
@@ -2555,6 +2642,7 @@ mod tests {
                     classifier.clone(),
                 )),
                 Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
             )
             .await;
         }
@@ -2568,6 +2656,158 @@ mod tests {
             "the three repeats each attach with one comment: {calls:?}"
         );
         assert_eq!(counting.call_count(), 1, "the classifier ran exactly once");
+    }
+
+    /// A classifier that sleeps `delay` while classifying, tracking how many
+    /// calls overlap (`peak`) so a test can observe the worker pool's actual
+    /// concurrency rather than inferring it from timing.
+    struct SlowClassifier {
+        delay: Duration,
+        live: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SlowClassifier {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                live: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl FailureClassifier for SlowClassifier {
+        fn classify(&self, _input: &TriageInput) -> crate::error::Result<Triage> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.fetch_add(1, SeqCst);
+            let now = self.live.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            std::thread::sleep(self.delay);
+            self.live.fetch_sub(1, SeqCst);
+            Ok(Triage {
+                bucket: TriageBucket::CodeFix,
+                analysis: "slow analysis".to_string(),
+                classified_by: ClassifiedBy::Llm,
+                auto_fix: None,
+            })
+        }
+    }
+
+    /// Two events for two DIFFERENT jobs (distinct `workflow_id`, so the
+    /// CLAUDE-274 key gate never serializes them against each other), sent
+    /// through one `consume_events` call. Returns the peak observed
+    /// concurrent classification count for the given `analysis_concurrency`.
+    async fn run_two_distinct_jobs_at_concurrency(analysis_concurrency: usize) -> usize {
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new());
+        let slow = Arc::new(SlowClassifier::new(Duration::from_millis(150)));
+        let classifier: Arc<dyn FailureClassifier> = slow.clone();
+
+        let mut logs = HashMap::new();
+        logs.insert(1, failing_test_log("mod_a", "test_one", "main"));
+        logs.insert(2, failing_test_log("mod_b", "test_two", "main"));
+
+        let mut ev1 = store_event(1);
+        ev1.workflow_id = "ci-one.yml".to_string();
+        let mut ev2 = store_event(2);
+        ev2.workflow_id = "ci-two.yml".to_string();
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(ev1).await.unwrap();
+        tx.send(ev2).await.unwrap();
+        drop(tx);
+
+        let cfg = WebhookConfig {
+            analysis_concurrency,
+            ..WebhookConfig::default()
+        };
+        consume_events(
+            rx,
+            pool.clone(),
+            Arc::new(ScriptedFailingLogs { logs }),
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            Some(store_mint_context(pool, backend, classifier)),
+            Arc::new(RwLock::new(cfg)),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+        slow.peak()
+    }
+
+    /// AC 5: with `analysis_concurrency = 2`, a slow stub shows a second event
+    /// starting before the first finishes.
+    #[tokio::test]
+    async fn analysis_concurrency_two_overlaps_two_distinct_jobs() {
+        assert_eq!(
+            run_two_distinct_jobs_at_concurrency(2).await,
+            2,
+            "both distinct-job events analyze concurrently under a pool of 2"
+        );
+    }
+
+    /// AC 5: with `analysis_concurrency = 1`, the second waits for the first.
+    #[tokio::test]
+    async fn analysis_concurrency_one_serializes_distinct_jobs() {
+        assert_eq!(
+            run_two_distinct_jobs_at_concurrency(1).await,
+            1,
+            "a pool of 1 never runs two analyses at once"
+        );
+    }
+
+    /// AC 5 (racing duplicates): two concurrent failures of the SAME job
+    /// (same repo/workflow_id/job_name) with an overlapping failing test,
+    /// submitted together into one `consume_events` call with a slow
+    /// classifier so they would genuinely overlap without the key gate.
+    /// Exactly one analysis runs and exactly one issue is created; the second
+    /// event's store lookup (after it waits its turn on the gate) finds the
+    /// first's row and attaches instead of re-analyzing.
+    #[tokio::test]
+    async fn concurrent_failures_of_the_same_job_produce_one_issue_and_one_analysis() {
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new());
+        let slow = Arc::new(SlowClassifier::new(Duration::from_millis(150)));
+        let classifier: Arc<dyn FailureClassifier> = slow.clone();
+
+        let mut logs = HashMap::new();
+        logs.insert(10, failing_test_log("shared_mod", "shared_test", "fix/a"));
+        logs.insert(11, failing_test_log("shared_mod", "shared_test", "fix/b"));
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(store_event(10)).await.unwrap();
+        tx.send(store_event(11)).await.unwrap();
+        drop(tx);
+
+        let cfg = WebhookConfig {
+            analysis_concurrency: 2,
+            ..WebhookConfig::default()
+        };
+        consume_events(
+            rx,
+            pool.clone(),
+            Arc::new(ScriptedFailingLogs { logs }),
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            Some(store_mint_context(pool, backend.clone(), classifier)),
+            Arc::new(RwLock::new(cfg)),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+
+        assert_eq!(slow.calls(), 1, "exactly one analysis runs");
+        let calls = backend.calls();
+        let creates: Vec<_> = calls.iter().filter(|c| c.starts_with("create")).collect();
+        assert_eq!(creates.len(), 1, "exactly one issue created: {calls:?}");
+        let comments: Vec<_> = calls.iter().filter(|c| c.starts_with("comment")).collect();
+        assert_eq!(comments.len(), 1, "the second attaches: {calls:?}");
     }
 
     #[tokio::test]
@@ -2615,6 +2855,8 @@ mod tests {
             None,
             true,
             "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -2690,6 +2932,8 @@ mod tests {
             None,
             true,
             "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -2725,6 +2969,8 @@ mod tests {
             None,
             true,
             "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -2777,6 +3023,8 @@ mod tests {
             None,
             true,
             "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
         )
         .await;
         assert!(!result.ok, "a store read failure must fail the run");
@@ -2851,6 +3099,7 @@ mod tests {
             false,
             true, // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -2892,6 +3141,7 @@ mod tests {
             true,
             true, // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -2922,6 +3172,7 @@ mod tests {
             false, // has_open_pr: no PR, so the code_fix route still queues
             true,  // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -2967,6 +3218,7 @@ mod tests {
             false,
             true, // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -3011,6 +3263,7 @@ mod tests {
             false, // has_open_pr: push to main, no PR
             true,  // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -3066,6 +3319,7 @@ mod tests {
             true, // has_open_pr: a failing open PR
             true, // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -3108,6 +3362,7 @@ mod tests {
             &branch,
             failure_signature.as_deref(),
             infra_kind.as_deref(),
+            None,
             &|_| {},
         );
         tracker
@@ -3165,6 +3420,7 @@ mod tests {
             false, // has_open_pr: no PR; the toggle, not open-PR, does the gating
             false, // auto_fix_enabled: OFF
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -3278,6 +3534,7 @@ mod tests {
                 out_dir.path().to_path_buf(),
                 None,
                 Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
             )
             .await;
 
@@ -3436,6 +3693,7 @@ mod tests {
                 tmp.path().to_path_buf(),
                 None,
                 cfg,
+                crate::concurrency::KeyGate::new(),
             )
             .await;
 
@@ -3490,6 +3748,7 @@ mod tests {
             tmp.path().to_path_buf(),
             None,
             cfg,
+            crate::concurrency::KeyGate::new(),
         )
         .await;
 
@@ -3545,6 +3804,7 @@ mod tests {
                 out_dir.path().to_path_buf(),
                 None,
                 Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
             )
             .await;
 
@@ -3597,6 +3857,7 @@ mod tests {
                 out_dir.path().to_path_buf(),
                 None,
                 Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
             )
             .await;
 
@@ -3628,6 +3889,7 @@ mod tests {
             out_dir.path().to_path_buf(),
             None,
             Arc::new(RwLock::new(WebhookConfig::default())),
+            crate::concurrency::KeyGate::new(),
         )
         .await;
 
@@ -3711,6 +3973,7 @@ mod tests {
             true,
             true, // auto_fix_enabled
             "",
+            None,
             &report,
         )
         .unwrap();
@@ -3742,6 +4005,7 @@ mod tests {
             true,
             true, // auto_fix_enabled
             "",
+            None,
             &report,
         )
         .unwrap();
@@ -3840,6 +4104,8 @@ mod tests {
                 replay_window_secs: 300,
                 sources,
                 auto_fix: false,
+                analysis_timeout_secs: 600,
+                analysis_concurrency: 2,
             }
         }
 
@@ -3960,6 +4226,8 @@ mod tests {
                 replay_window_secs: 300,
                 sources,
                 auto_fix: false,
+                analysis_timeout_secs: 600,
+                analysis_concurrency: 2,
             };
             let (tx, _rx) = mpsc::channel(8);
             let st = WebhookState::new(pool, config, tx);

@@ -33,7 +33,6 @@
 //! tooling-gap rule. Redaction is preserved end to end by reusing
 //! `forge_log::redact`.
 
-use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use tracing::{info, warn};
@@ -41,9 +40,13 @@ use tracing::{info, warn};
 use super::{HandlerFuture, NativeContext, NativeHandler};
 use crate::action::{CiFailureAnalysisConfig, LogTokenRef, NativeConfig};
 use crate::cancel::{CancellationToken, RegistryGuard};
+use crate::ci_failure::analysis::{
+    build_analysis_comment, build_prompt, cap_comment, fetch_analysis_inputs, run_index_from_url,
+    FetchResult, Miss, MissVerdict, RunCoordinates,
+};
 use crate::claude::ClaudeInvoker;
 use crate::error::{Error, Result};
-use crate::forge_log::{self, ForgeReads, LogFetchConfig, LogOutcome, LogTarget};
+use crate::forge_log::{self, ForgeReads};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
 use crate::provider::{self, AuditedTracker, IssueInspect, IssueTracker, IssueWriteAudit};
 use crate::secrets::{self, SecretsKey};
@@ -413,69 +416,6 @@ async fn process_job(
     })
 }
 
-/// The redacted-log + workflow-YAML inputs claude reads.
-struct AnalysisInputs {
-    /// Path to the complete redacted run log written under the workdir.
-    log_path: PathBuf,
-    /// Path to the failing workflow YAML, or `None` if it could not be fetched.
-    workflow_path: Option<PathBuf>,
-    /// CLAUDE-236: the run's forge-reported start / stop times, or `None` when
-    /// they could not be read (the prompt then says the timing is unavailable).
-    timing: Option<forge_log::RunTiming>,
-}
-
-/// Fetch result: inputs ready, or the log is unavailable (with a reason).
-enum FetchResult {
-    Ready(AnalysisInputs),
-    Unavailable(Miss),
-}
-
-/// CLAUDE-240: a log that could not be read, and what the fetch itself knows
-/// about whether asking again could ever help.
-struct Miss {
-    /// Operator-facing cause, as the note and the log line carry it.
-    reason: String,
-    verdict: MissVerdict,
-}
-
-/// CLAUDE-240: what the fetch knows about the permanence of a miss. Advisory in
-/// one direction only: it may only ever mark a log gone, never resurrect one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MissVerdict {
-    /// `fj` reported the log gone for good (the FJ-79 signal). Decided here,
-    /// with no age check.
-    Gone,
-    /// Retryable whatever the run's age: a credential problem is fixable, so a
-    /// rejected token must never terminate an issue.
-    Retryable,
-    /// Nothing known about permanence; the run's age decides.
-    Unknown,
-}
-
-impl Miss {
-    /// A miss `fj` reported as permanent (FJ-79).
-    fn gone(reason: String) -> Self {
-        Self {
-            reason,
-            verdict: MissVerdict::Gone,
-        }
-    }
-    /// A miss that stays retryable however old the run is.
-    fn retryable(reason: String) -> Self {
-        Self {
-            reason,
-            verdict: MissVerdict::Retryable,
-        }
-    }
-    /// A miss whose permanence the run's age decides.
-    fn unknown(reason: String) -> Self {
-        Self {
-            reason,
-            verdict: MissVerdict::Unknown,
-        }
-    }
-}
-
 /// CLAUDE-240: what to do with an issue whose run log could not be fetched.
 enum MissAction {
     /// Leave the issue un-marked so a later run retries. `note` is the one-time
@@ -562,141 +502,11 @@ fn run_stopped_long_ago(
     }
 }
 
-/// Fetch the complete redacted run log through `fj actions logs` and, best-effort,
-/// the failing workflow YAML into `out_dir`. Never errors: any miss becomes
-/// [`FetchResult::Unavailable`].
-fn fetch_analysis_inputs(
-    fj: &dyn ForgeReads,
-    coords: &RunCoordinates,
-    token: &str,
-    out_dir: &Path,
-) -> FetchResult {
-    // CLAUDE-204: the issue names a run that finished long ago, so one call decides.
-    let fetch_cfg = LogFetchConfig::no_retry();
-
-    // 1. Fetch the complete redacted log. CLAUDE-204: `fj` takes the per-repo run
-    // number the `## Failure` block already carries, so there is no id to resolve.
-    let Some(log_target) = LogTarget::for_run(
-        &coords.html_url,
-        &coords.repo,
-        coords.index_in_repo,
-        Some(token.to_string()),
-    ) else {
-        return FetchResult::Unavailable(Miss::retryable(
-            "could not derive the forge host from the run URL".to_string(),
-        ));
-    };
-    let log_path = match forge_log::fetch_run_log(
-        fj,
-        &fetch_cfg,
-        &log_target,
-        out_dir,
-        &[],
-        std::thread::sleep,
-    ) {
-        Ok(LogOutcome::Fetched(log)) => {
-            // CLAUDE-240: post-FJ-79 `fj` ANSWERS for a run whose log blobs are
-            // gone, handing back every job with an empty log. There is nothing
-            // to analyze and re-asking can never help, so that is a permanent
-            // miss, not an input.
-            match forge_log::logs_permanently_missing(&log.jobs) {
-                Some(reason) => return FetchResult::Unavailable(Miss::gone(reason)),
-                None => log.artifact,
-            }
-        }
-        Ok(LogOutcome::AuthDenied { reason }) => {
-            // A rejected or under-scoped token is fixable, so this stays
-            // retryable however old the run is.
-            return FetchResult::Unavailable(Miss::retryable(format!(
-                "run-logs auth denied ({reason})"
-            )));
-        }
-        Ok(LogOutcome::TransientMiss { reason }) => {
-            return FetchResult::Unavailable(Miss::unknown(format!(
-                "run logs not available yet or pruned: {reason}"
-            )))
-        }
-        Ok(LogOutcome::Failed { reason }) => {
-            return FetchResult::Unavailable(Miss::unknown(format!(
-                "fetching the run logs failed: {reason}"
-            )))
-        }
-        Err(e) => {
-            return FetchResult::Unavailable(Miss::unknown(format!(
-                "fetching the run logs errored: {e}"
-            )))
-        }
-    };
-
-    // 2. Best-effort workflow YAML at the failing commit, through `fj repo file`
-    // (CLAUDE-205). Redacted by `read_workflow_yaml` before it is written.
-    let workflow_path = forge_log::read_workflow_yaml(
-        fj,
-        &log_target.host,
-        &coords.repo,
-        &coords.commit_sha,
-        &coords.workflow_id,
-        Some(token),
-        &[],
-    )
-    .and_then(|yaml| {
-        // A write failure is best-effort (the analysis proceeds over the log
-        // alone) but never silent: without the log line the prompt's "could not
-        // be fetched" would misreport a local I/O fault as a forge miss.
-        let path = out_dir.join("failing-workflow.yml");
-        match std::fs::write(&path, yaml) {
-            Ok(()) => Some(path),
-            Err(e) => {
-                warn!(path = %path.display(), error = %e, "writing the failing workflow YAML failed; the analysis proceeds over the log alone");
-                None
-            }
-        }
-    });
-
-    // 3. CLAUDE-236: the run's start / stop times, so the analysis can tell a job
-    // that stopped emitting output and was killed from a capture that lost data.
-    // Best effort: a failed or run-less read is logged and the prompt says the
-    // timing is unavailable, rather than the agent inventing a reason.
-    let timing = match fj.run_timing(
-        &log_target.host,
-        &coords.repo,
-        coords.index_in_repo,
-        Some(token),
-    ) {
-        Ok(t) => Some(t),
-        Err(reason) => {
-            warn!(
-                repo = %coords.repo,
-                run = coords.index_in_repo,
-                reason = %reason,
-                "reading the run timing failed; the analysis states the timing is unavailable"
-            );
-            None
-        }
-    };
-
-    FetchResult::Ready(AnalysisInputs {
-        log_path,
-        workflow_path,
-        timing,
-    })
-}
-
 /// Resolve the decrypted, trimmed Forgejo PAT from the secrets store.
 async fn resolve_token(pool: &crate::db::DbPool, name: &str) -> Result<String> {
     let key = SecretsKey::load()?;
     let token = secrets::resolve_secret(pool, &key, name).await?;
     Ok(token.trim().to_string())
-}
-
-/// CLAUDE-189: coordinates parsed from an issue's `## Failure` block.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RunCoordinates {
-    repo: String,
-    index_in_repo: i64,
-    commit_sha: String,
-    workflow_id: String,
-    html_url: String,
 }
 
 /// True when `summary` starts with any of `prefixes` (both trimmed).
@@ -751,93 +561,6 @@ fn parse_failure_block(description: &str) -> Option<RunCoordinates> {
 /// Strip surrounding whitespace and backticks from a `- Key: `value`` value.
 fn unbacktick(v: &str) -> String {
     v.trim().trim_matches('`').trim().to_string()
-}
-
-/// The trailing `/actions/runs/<N>` index in a run URL.
-fn run_index_from_url(url: &str) -> Option<i64> {
-    let after = url.split("/actions/runs/").nth(1)?;
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse::<i64>().ok()
-}
-
-/// Cap `text` to `max_bytes`, keeping the head and appending a truncation note.
-/// UTF-8 safe.
-fn cap_comment(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n\n_[analysis truncated to {} bytes]_",
-        &text[..end],
-        max_bytes
-    )
-}
-
-/// The agentic-analysis prompt. Directs claude to identify the failing step by
-/// mapping log position to workflow step order, state the root-cause diagnostic
-/// or, when the log carries none, classify on the run's timing whether the job
-/// stopped emitting output and was killed or the run ended with no diagnostic,
-/// and give remediation. CLAUDE-236: the stored log is never truncated by this
-/// tool, so the prompt never offers truncation as an explanation.
-fn build_prompt(inputs: &AnalysisInputs, coords: &RunCoordinates) -> String {
-    let log_name = inputs
-        .log_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "run.log".to_string());
-    let workflow_line = match &inputs.workflow_path {
-        Some(p) => format!(
-            "The failing workflow YAML (fetched at the failing commit) is at `./{}`.",
-            p.file_name().unwrap().to_string_lossy()
-        ),
-        None => "The failing workflow YAML could not be fetched; analyze the log alone and say so."
-            .to_string(),
-    };
-    // CLAUDE-236: the run's own start / stop times are the evidence that tells a
-    // job killed after going silent from a capture that lost data.
-    let timing_line = match &inputs.timing {
-        Some(t) => format!(
-            "The forge reports the run started at `{}` and stopped at `{}`; when the log stops mid-step, compare that stop time against the last timestamp in the log.",
-            t.started, t.stopped
-        ),
-        None => "The run's start / stop times could not be read from the forge; say so where they would matter rather than assuming why the log stops.".to_string(),
-    };
-    [
-        "You are analyzing a failed CI run to produce a deep, log-grounded root-cause report.".to_string(),
-        format!(
-            "The complete redacted run log is at `./{log_name}` (repo `{}`, workflow `{}`, commit `{}`, run #{}).",
-            coords.repo, coords.workflow_id, coords.commit_sha, coords.index_in_repo
-        ),
-        "That file is the whole log exactly as the forge stores it: this tool applies no size cap and never shortens it, so where the log stops is where the run stopped writing.".to_string(),
-        format!("Run URL: {}", coords.html_url),
-        timing_line,
-        workflow_line,
-        String::new(),
-        "Use Read/Grep/Bash to read both files. Then report, in Markdown:".to_string(),
-        "1. **Failing step**: the exact workflow step that failed, identified by mapping the point where the log stops against the workflow's step order.".to_string(),
-        "2. **Root cause**: the concrete diagnostic (the compiler/clippy/test error line). If the log stops mid-step with no diagnostic, classify which of these holds and justify it from the evidence: (a) the job stopped emitting output and was killed or timed out, shown by the gap between the last log timestamp and the run's stop time, or (b) the run ended and the failing step emitted no diagnostic at all. Then give the leading hypothesis (e.g. an OOM if the workflow caps build parallelism).".to_string(),
-        "3. **Remediation**: concrete next steps to fix or to capture a diagnostic on the next run.".to_string(),
-        String::new(),
-        "Ground every claim in the actual log/workflow contents. Be concise. Do not modify any files, push, open a PR, or touch YouTrack: output only the analysis text, which is posted verbatim as a comment.".to_string(),
-    ]
-    .join("\n")
-}
-
-/// The analysis comment: the agent's report plus the hidden analyzed marker.
-fn build_analysis_comment(analysis: &str, marker: &str) -> String {
-    [
-        "## CI-failure analysis".to_string(),
-        String::new(),
-        analysis.trim().to_string(),
-        String::new(),
-        "<!-- claude-run ci-failure-analysis; do not edit -->".to_string(),
-        format!("Ci-Analysis: {marker}"),
-    ]
-    .join("\n")
 }
 
 /// The "log unavailable" note: a short reason plus the hidden unavailable marker
@@ -930,7 +653,9 @@ async fn record_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ci_failure::analysis::AnalysisInputs;
     use crate::forge_log::{ActionLogClient, JobLog, RunLogsOutcome};
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     fn inspect(description: &str, comments: &[&str]) -> IssueInspect {
