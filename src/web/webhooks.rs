@@ -57,11 +57,11 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::ci_failure::{fingerprint, store as ci_failure_store};
-use crate::config::{MintConfig, WebhookConfig, WebhookSource};
+use crate::config::{MintConfig, Paths, WebhookConfig, WebhookSource};
 use crate::forge_log::LogOutcome;
 use crate::job::RunnerDefaults;
 use crate::mint::{self, MintCaps, MintOutcome, MintRequest, VcsRouteCache};
-use crate::provider::{Backend, ForgePullRequest};
+use crate::provider::{Backend, CliBackend, CommandRunner, ForgePullRequest};
 use crate::secrets::{self, SecretsKey};
 use crate::state;
 use crate::triage::{self, FailureClassifier, TriageInput};
@@ -412,6 +412,16 @@ pub struct MintContext {
     /// CLAUDE-86: TTL-cached inverse VCS routing map (repo -> project), built
     /// from YouTrack project VCS integrations and shared across mints.
     pub route_cache: Arc<VcsRouteCache>,
+    /// CLAUDE-276: resolved on-disk locations, so a PR comment's write-scoped
+    /// backend can materialize its temp single-host `keys.json` under the
+    /// daemon's own runtime dir (the same CLAUDE-26 mechanism
+    /// `comment_webhooks::build_env` uses).
+    pub paths: Paths,
+    /// CLAUDE-276: the [`CommandRunner`] the PR-comment backend's `fj` child
+    /// runs through. Real [`ProcessRunner`] in production; injectable so a test
+    /// can exercise a PR-comment routing decision against a canned `fj`
+    /// response with no real subprocess or network call.
+    pub pr_comment_runner: Arc<dyn CommandRunner>,
 }
 
 /// Drain emitted events. For each verified failure this fetches the run's logs
@@ -747,6 +757,7 @@ async fn process_event(
             job_name,
             log_token,
             &keygate,
+            &webhook_cfg,
         )
         .await;
         finish_webhook_run(
@@ -970,8 +981,6 @@ fn mint_summary(outcome: &MintOutcome) -> String {
     match outcome {
         MintOutcome::Created { key, project, .. } => format!("minted {key} in {project}"),
         MintOutcome::SkippedTransient => "no issue (transient)".to_string(),
-        MintOutcome::SkippedBotLoop => "no issue (bot-loop guard)".to_string(),
-        MintOutcome::SkippedOpenPr => "no issue (open PR; left to author)".to_string(),
         MintOutcome::SkippedAttemptCap => "no issue (per-key attempt cap)".to_string(),
         MintOutcome::SkippedDailyCap => "no issue (daily run cap)".to_string(),
     }
@@ -1009,6 +1018,7 @@ async fn triage_and_mint(
     job_name: String,
     log_token: Option<String>,
     keygate: &crate::concurrency::KeyGate,
+    webhook_cfg: &WebhookConfig,
 ) -> WebhookRunSummary {
     // CLAUDE-274: the store lookup, analysis and mint for one event run under a
     // key gate on (repo, workflow_id, job_name), so two concurrent failures of
@@ -1055,12 +1065,108 @@ async fn triage_and_mint(
         None
     };
 
-    match store_match {
-        Some(m) if m.state == "open" => {
-            attach_to_open_failure(ctx, ev, &branch, &test_ids, m).await
+    // CLAUDE-276: resolve whether the failing commit itself is on an open PR
+    // BEFORE the store-match dispatch, not as a fallback from it: an agent's
+    // own PR must intercept before the ordinary open/resolved handling runs,
+    // and a human's PR always needs a PR comment, including one that shares a
+    // failing test with an already-`open` failure. A lookup error is never
+    // read as "no PR" (see [`resolve_open_pr`]).
+    let backend = ctx.backend.clone();
+    let event = ev.clone();
+    let pr_result =
+        tokio::task::spawn_blocking(move || resolve_open_pr(backend.as_ref(), &event)).await;
+    let pr = match pr_result {
+        Ok(Ok(pr)) => pr,
+        Ok(Err(e)) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "open-PR lookup failed; not routing");
+            record_run_event(
+                &ctx.pool,
+                run_id,
+                WEBHOOK_MINT_ACTION,
+                "error",
+                format!("open-PR lookup failed: {e}"),
+            )
+            .await;
+            return WebhookRunSummary::error(format!("open-PR lookup failed: {e}"));
         }
-        Some(m) if m.state == "resolved" => {
-            reopen_resolved_failure(
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "open-PR lookup task panicked");
+            return WebhookRunSummary::error(format!("task panicked: {e}"));
+        }
+    };
+
+    let Some(pr) = pr else {
+        // No open PR for this commit: the pre-CLAUDE-276 store dispatch, run
+        // exactly as before this issue.
+        if let Some(m) = store_match {
+            if m.state == "open" {
+                return attach_to_open_failure(ctx, ev, &branch, &test_ids, m).await;
+            }
+            if m.state == "resolved" {
+                return reopen_resolved_failure(
+                    ctx,
+                    run_id,
+                    ev,
+                    log_text,
+                    log_available,
+                    log_unavailable_reason,
+                    auto_fix_enabled,
+                    branch,
+                    test_ids,
+                    log_token,
+                    m,
+                )
+                .await;
+            }
+        }
+        // `None` and `pr_only` both fall through to the ordinary classify +
+        // mint path, as they did before this issue.
+        return classify_and_mint(
+            ctx,
+            run_id,
+            ev,
+            log_text,
+            log_available,
+            log_artifact,
+            log_unavailable_reason,
+            auto_fix_enabled,
+            job_name,
+            branch,
+            failure_signature,
+            infra_kind,
+            test_ids,
+            log_token,
+        )
+        .await;
+    };
+
+    let Some(host) = forge_host_from_url(&ev.html_url) else {
+        // Unreachable in practice: resolve_open_pr above already needed this
+        // same host to find the PR it just returned.
+        error!(repo = %ev.repo, run = ev.index_in_repo, "could not derive forge host after resolving an open PR");
+        return WebhookRunSummary::error("could not derive forge host".to_string());
+    };
+
+    match ci_failure_store::agent_pr(&ctx.pool, &host, &ev.repo, pr.number as i64).await {
+        Ok(Some(record)) if record.state == "open" => {
+            route_agent_pr_failure(
+                ctx,
+                ev,
+                log_text,
+                log_available,
+                log_unavailable_reason,
+                log_token,
+                &job_name,
+                &branch,
+                infra_kind.as_deref(),
+                &test_ids,
+                record,
+                webhook_cfg,
+            )
+            .await
+        }
+        Ok(_) => {
+            route_human_pr_failure(
                 ctx,
                 run_id,
                 ev,
@@ -1068,33 +1174,22 @@ async fn triage_and_mint(
                 log_available,
                 log_unavailable_reason,
                 auto_fix_enabled,
-                branch,
-                test_ids,
+                &job_name,
+                &branch,
+                failure_signature.as_deref(),
+                infra_kind.as_deref(),
+                &test_ids,
                 log_token,
-                m,
+                store_match,
+                &pr,
+                &host,
+                webhook_cfg,
             )
             .await
         }
-        // `None` (no store row) and `pr_only` (owned by the PR-routing issue)
-        // both fall through to the ordinary classify + mint path.
-        _ => {
-            classify_and_mint(
-                ctx,
-                run_id,
-                ev,
-                log_text,
-                log_available,
-                log_artifact,
-                log_unavailable_reason,
-                auto_fix_enabled,
-                job_name,
-                branch,
-                failure_signature,
-                infra_kind,
-                test_ids,
-                log_token,
-            )
-            .await
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store read failed");
+            WebhookRunSummary::error(format!("ci-failure store error: {e}"))
         }
     }
 }
@@ -1309,6 +1404,950 @@ async fn record_new_store_row(
     )
     .await?;
     Ok(())
+}
+
+/// CLAUDE-276: best-effort record a `run_events` row for something that went
+/// wrong outside the ordinary per-job accounting (an open-PR lookup failure, a
+/// missing `write_token_ref`): attaches to the run when one exists, else a
+/// standalone row (never backfilled, but still visible on the action's event
+/// log) like [`login_required_accept_and_drop`] writes.
+async fn record_run_event(
+    pool: &DbPool,
+    run_id: Option<i64>,
+    action: &str,
+    level: &str,
+    message: String,
+) {
+    let event = state::InputEvent {
+        level: level.to_string(),
+        context: Some(action.to_string()),
+        message,
+    };
+    let result = match run_id {
+        Some(id) => state::run_events_record_for_run(pool, id, action, &[event]).await,
+        None => state::run_events_record(pool, action, &state::now_iso(), &[event]).await,
+    };
+    if let Err(e) = result {
+        warn!(error = %e, "recording a run_events row failed (continuing)");
+    }
+}
+
+/// True when some open PR's head commit matches `commit_sha`, and the PR
+/// itself (tolerant of a short / long SHA mismatch, accepting a prefix
+/// relationship in either direction).
+fn pr_matching_commit<'a>(
+    prs: &'a [ForgePullRequest],
+    commit_sha: &str,
+) -> Option<&'a ForgePullRequest> {
+    prs.iter().find(|p| {
+        !p.head_sha.is_empty()
+            && (p.head_sha == commit_sha
+                || commit_sha.starts_with(&p.head_sha)
+                || p.head_sha.starts_with(commit_sha))
+    })
+}
+
+/// CLAUDE-276: find the open PR (if any) whose head matches the failing
+/// commit. Replaces the old CLAUDE-149 `resolve_has_open_pr` for the routing
+/// decision: that helper degraded a forge error or an underivable host to
+/// `false` ("no PR"), which is safe only as advisory context for the triage
+/// classifier. For routing it is not safe - it would send the agent's own
+/// failing PR through the create-a-new-issue path instead of re-queuing it,
+/// and would drop a human's failure with no comment. A lookup error (or an
+/// underivable host) is therefore returned as an error, never folded into
+/// `Ok(None)`.
+fn resolve_open_pr(
+    backend: &dyn Backend,
+    ev: &VerifiedFailureEvent,
+) -> crate::error::Result<Option<ForgePullRequest>> {
+    let Some(host) = forge_host_from_url(&ev.html_url) else {
+        return Err(crate::error::Error::Other(anyhow::anyhow!(
+            "could not derive forge host from html_url `{}`",
+            ev.html_url
+        )));
+    };
+    let prs = backend.list_open_prs(&host, &ev.repo)?;
+    Ok(pr_matching_commit(&prs, &ev.commit_sha).cloned())
+}
+
+/// CLAUDE-276: on-disk root for a PR-comment backend's temp single-host
+/// `keys.json`, alongside `comment_webhooks::creds_root`'s own `comment-creds`
+/// sibling.
+fn pr_creds_root(paths: &Paths) -> PathBuf {
+    paths.runtime_dir.join("webhook-pr-creds")
+}
+
+/// A forge backend scoped to one webhook source's `write_token_ref`. Held
+/// until every `pr_comment` call for this routing decision has run, then
+/// dropped: `_creds`'s `Drop` scrubs its temp `keys.json` directory.
+struct PrCommentEnv {
+    backend: Box<dyn Backend>,
+    _creds: secrets::JobCredentials,
+}
+
+/// CLAUDE-276: where a PR comment's body is staged before posting: a
+/// deterministic path (not the ephemeral, randomly-suffixed credential
+/// directory `PrCommentEnv` holds), so a repeated comment on the same PR
+/// simply overwrites its own scratch file rather than accumulating one per
+/// routing decision.
+fn pr_comment_body_path(paths: &Paths, repo: &str, pr_number: u64) -> PathBuf {
+    paths.state_dir.join(format!(
+        "webhook-pr-comment-{}-{pr_number}.md",
+        repo.replace('/', "_")
+    ))
+}
+
+/// CLAUDE-276: resolve `source`'s `write_token_ref` and build a forge backend
+/// carrying it in a temp single-host `keys.json` (the CLAUDE-26 mechanism
+/// `comment_webhooks::build_env` also uses), so a PR-comment token never
+/// appears in YAML, env, a process argument, or a settings response. A source
+/// with no `write_token_ref` configured is a hard failure: it must never be
+/// silent about being unable to post.
+async fn build_pr_comment_backend(
+    ctx: &MintContext,
+    webhook_cfg: &WebhookConfig,
+    source: &str,
+    host: &str,
+) -> crate::error::Result<PrCommentEnv> {
+    let token_ref = webhook_cfg
+        .sources
+        .get(source)
+        .and_then(|s| s.write_token_ref.as_deref())
+        .ok_or_else(|| {
+            crate::error::Error::Secret(format!(
+                "webhook source `{source}` has no write_token_ref; it cannot comment on pull requests"
+            ))
+        })?;
+    let key = SecretsKey::load()?;
+    let token = secrets::resolve_secret(&ctx.pool, &key, token_ref)
+        .await?
+        .trim()
+        .to_string();
+    let dir = pr_creds_root(&ctx.paths).join(secrets::unique_suffix());
+    let creds = secrets::JobCredentials::materialize(
+        &dir,
+        &secrets::ResolvedCredentials {
+            fj_token: Some(token),
+            ..Default::default()
+        },
+        Some(host),
+    )?;
+    let mut backend =
+        CliBackend::new(ctx.pr_comment_runner.clone()).with_fj_env(creds.fj_env.clone());
+    if let Some(keys) = &creds.fj_keys_path {
+        backend = backend.with_keys_path(keys.clone());
+    }
+    Ok(PrCommentEnv {
+        backend: Box::new(backend),
+        _creds: creds,
+    })
+}
+
+/// CLAUDE-276: [`build_pr_comment_backend`], with the missing-token failure
+/// already logged and recorded as a `run_events` row - the shape every PR-
+/// commenting caller in this module needs.
+async fn require_pr_comment_backend(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> Result<PrCommentEnv, WebhookRunSummary> {
+    match build_pr_comment_backend(ctx, webhook_cfg, &ev.source, host).await {
+        Ok(env) => Ok(env),
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, source = %ev.source, error = %e, "no write-scoped forge backend for this webhook source; cannot comment on the PR");
+            record_run_event(
+                &ctx.pool,
+                run_id,
+                WEBHOOK_MINT_ACTION,
+                "error",
+                format!("PR comment failed: {e}"),
+            )
+            .await;
+            Err(WebhookRunSummary::error(format!(
+                "PR comment backend error: {e}"
+            )))
+        }
+    }
+}
+
+/// Write `body` to `body_file` and post it on PR `pr_number`.
+fn write_and_post_pr_comment(
+    backend: &dyn Backend,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    body_file: &std::path::Path,
+    body: &str,
+) -> crate::error::Result<()> {
+    std::fs::write(body_file, body)?;
+    backend.pr_comment(host, repo, pr_number, body_file)
+}
+
+/// Run triage (for its analysis text) and post that text as a PR comment
+/// through `env`'s write-scoped backend. Returns the analysis text.
+#[allow(clippy::too_many_arguments)]
+async fn analyze_and_comment_pr(
+    ctx: &MintContext,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    log_token: Option<String>,
+    pr_number: u64,
+    host: &str,
+    env: PrCommentEnv,
+) -> crate::error::Result<String> {
+    let classifier = ctx.classifier.clone();
+    let mint_cfg = ctx.mint_cfg.read().await.clone();
+    let event = ev.clone();
+    let host_owned = host.to_string();
+    let body_file = pr_comment_body_path(&ctx.paths, &ev.repo, pr_number);
+    let result = tokio::task::spawn_blocking(move || -> crate::error::Result<String> {
+        let input = TriageInput {
+            repo: event.repo.clone(),
+            workflow_id: event.workflow_id.clone(),
+            commit_sha: event.commit_sha.clone(),
+            html_url: event.html_url.clone(),
+            log: log_text,
+            log_available,
+            log_unavailable_reason,
+            has_open_pr: true,
+            log_token,
+        };
+        let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+        write_and_post_pr_comment(
+            env.backend.as_ref(),
+            &host_owned,
+            &event.repo,
+            pr_number,
+            &body_file,
+            &verdict.analysis,
+        )?;
+        Ok(verdict.analysis)
+    })
+    .await;
+    match result {
+        Ok(inner) => inner,
+        Err(e) => Err(crate::error::Error::Other(anyhow::anyhow!(
+            "PR analysis task panicked: {e}"
+        ))),
+    }
+}
+
+/// `AI Agent` value flagging an issue for a human to look at, mirroring
+/// `youtrack.states.needs_review`'s default (`src/action.rs`); this path has
+/// no dependency on the `youtrack` action's own config, so the value is
+/// spelled directly rather than threaded through another config section.
+const NEEDS_REVIEW_VALUE: &str = "Needs Review";
+
+/// CLAUDE-276: `ev` failed on an open PR the agent itself opened (an `open`
+/// `agent_pull_requests` row). Below `webhook_cfg.agent_pr_fix_attempts`,
+/// comment the recorded issue with the run, the failing tests and the
+/// analysis, bump the attempt counter, and re-queue it (`AI Agent = Queued`);
+/// at the ceiling, flag the issue `Needs Review` instead, listing every
+/// attempt's run. Either way: no PR comment, no new issue - the failure
+/// belongs to an issue that already exists.
+#[allow(clippy::too_many_arguments)]
+async fn route_agent_pr_failure(
+    ctx: &MintContext,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    log_token: Option<String>,
+    job_name: &str,
+    branch: &str,
+    infra_kind: Option<&str>,
+    test_ids: &[String],
+    record: ci_failure_store::AgentPullRequest,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    let now = state::now_iso();
+    let failure_id = match ci_failure_store::failure_for_issue(&ctx.pool, &record.issue_key).await {
+        Ok(Some(f)) => f.id,
+        Ok(None) => {
+            match ci_failure_store::record_failure(
+                &ctx.pool,
+                &ev.repo,
+                &ev.workflow_id,
+                job_name,
+                infra_kind,
+                Some(&record.issue_key),
+                "open",
+                &now,
+            )
+            .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "creating the ci-failure store row for the agent's PR failed");
+                    return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+                }
+            }
+        }
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store read failed");
+            return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+        }
+    };
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, failure_id, test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        failure_id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        Some(record.pr_number),
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    if (record.fix_attempts as u32) < webhook_cfg.agent_pr_fix_attempts {
+        let backend = ctx.backend.clone();
+        let classifier = ctx.classifier.clone();
+        let mint_cfg = ctx.mint_cfg.read().await.clone();
+        let event = ev.clone();
+        let key = record.issue_key.clone();
+        let tests = test_ids.to_vec();
+        let branch_owned = branch.to_string();
+        let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
+            let input = TriageInput {
+                repo: event.repo.clone(),
+                workflow_id: event.workflow_id.clone(),
+                commit_sha: event.commit_sha.clone(),
+                html_url: event.html_url.clone(),
+                log: log_text,
+                log_available,
+                log_unavailable_reason,
+                has_open_pr: true,
+                log_token,
+            };
+            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+            let tests_display = if tests.is_empty() {
+                "(no test ids parsed)".to_string()
+            } else {
+                tests.join(", ")
+            };
+            let body = format!(
+                "CI failed again on this PR (run #{}, branch `{branch_owned}`).\n- Run: {}\n- Failing tests: {tests_display}\n\n{}",
+                event.index_in_repo, event.html_url, verdict.analysis
+            );
+            backend.comment(&key, &body)?;
+            backend.set_field(&key, &mint_cfg.ai_agent_field, &mint_cfg.queued_value)?;
+            Ok(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "re-queuing the agent's own PR failed");
+                return WebhookRunSummary::error(e.to_string());
+            }
+            Err(e) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "re-queue task panicked");
+                return WebhookRunSummary::error(format!("task panicked: {e}"));
+            }
+        }
+        if let Err(e) = ci_failure_store::bump_fix_attempts(&ctx.pool, record.id, &now).await {
+            warn!(error = %e, "bumping the agent PR's fix-attempt counter failed (continuing)");
+        }
+        info!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, "CI failure on the agent's own open PR; re-queued its issue");
+        WebhookRunSummary {
+            text: format!("re-queued {} (agent PR fix attempt)", record.issue_key),
+            ok: true,
+        }
+    } else {
+        let runs =
+            ci_failure_store::run_indexes_for_failure_pr(&ctx.pool, failure_id, record.pr_number)
+                .await
+                .unwrap_or_default();
+        let base = ev.html_url.rsplit_once("/actions/runs/").map(|(b, _)| b);
+        let links = runs
+            .iter()
+            .map(|idx| match base {
+                Some(b) => format!("- {b}/actions/runs/{idx}"),
+                None => format!("- run #{idx}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!(
+            "Fix-attempt ceiling ({}) reached on this PR; flagging Needs Review.\nAttempts:\n{links}",
+            webhook_cfg.agent_pr_fix_attempts
+        );
+        let backend = ctx.backend.clone();
+        let mint_cfg = ctx.mint_cfg.read().await.clone();
+        let key = record.issue_key.clone();
+        let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
+            backend.comment(&key, &body)?;
+            backend.set_field(&key, &mint_cfg.ai_agent_field, NEEDS_REVIEW_VALUE)?;
+            Ok(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "flagging the agent's PR Needs Review failed");
+                return WebhookRunSummary::error(e.to_string());
+            }
+            Err(e) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "flag task panicked");
+                return WebhookRunSummary::error(format!("task panicked: {e}"));
+            }
+        }
+        info!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, "agent PR fix-attempt ceiling reached; flagged Needs Review");
+        WebhookRunSummary {
+            text: format!(
+                "{} flagged Needs Review (agent PR fix ceiling)",
+                record.issue_key
+            ),
+            ok: true,
+        }
+    }
+}
+
+/// CLAUDE-276: `ev` failed on an open PR that is NOT the agent's own. Routes by
+/// whether its failing tests overlap an already-tracked failure.
+#[allow(clippy::too_many_arguments)]
+async fn route_human_pr_failure(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    auto_fix_enabled: bool,
+    job_name: &str,
+    branch: &str,
+    failure_signature: Option<&str>,
+    infra_kind: Option<&str>,
+    test_ids: &[String],
+    log_token: Option<String>,
+    store_match: Option<ci_failure_store::FailureMatch>,
+    pr: &ForgePullRequest,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    match store_match {
+        Some(m) if m.state == "open" => {
+            route_pr_matches_open_failure(
+                ctx,
+                run_id,
+                ev,
+                branch,
+                test_ids,
+                &m,
+                pr,
+                host,
+                webhook_cfg,
+            )
+            .await
+        }
+        // A human PR matching a `resolved` failure is a regression exactly as
+        // it would be off a PR: reopen and triage for the analysis comment on
+        // the issue, unchanged by this issue (it is not one of the three
+        // human-PR cases the issue enumerates).
+        Some(m) if m.state == "resolved" => {
+            reopen_resolved_failure(
+                ctx,
+                run_id,
+                ev,
+                log_text,
+                log_available,
+                log_unavailable_reason,
+                auto_fix_enabled,
+                branch.to_string(),
+                test_ids.to_vec(),
+                log_token,
+                m,
+            )
+            .await
+        }
+        Some(m) if m.state == "pr_only" => {
+            route_pr_matches_pr_only_failure(
+                ctx,
+                run_id,
+                ev,
+                log_text,
+                log_available,
+                log_unavailable_reason,
+                auto_fix_enabled,
+                job_name,
+                branch,
+                failure_signature,
+                infra_kind,
+                test_ids,
+                log_token,
+                &m,
+                pr,
+                host,
+                webhook_cfg,
+            )
+            .await
+        }
+        _ => {
+            route_new_pr_only_failure(
+                ctx,
+                run_id,
+                ev,
+                log_text,
+                log_available,
+                log_unavailable_reason,
+                job_name,
+                branch,
+                infra_kind,
+                test_ids,
+                log_token,
+                pr,
+                host,
+                webhook_cfg,
+            )
+            .await
+        }
+    }
+}
+
+/// CLAUDE-276: `ev`'s failing tests overlap an `open` `ci_failures` row (that
+/// row may or may not itself be on a PR). Attach the run, comment the PR
+/// naming the issue, and run no analysis: the failure is already filed.
+#[allow(clippy::too_many_arguments)]
+async fn route_pr_matches_open_failure(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    branch: &str,
+    test_ids: &[String],
+    m: &ci_failure_store::FailureMatch,
+    pr: &ForgePullRequest,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    let Some(key) = m.issue_key.clone() else {
+        error!(repo = %ev.repo, run = ev.index_in_repo, failure_id = m.id, "open ci_failures row has no issue_key");
+        return WebhookRunSummary::error("ci-failure store row has no issue_key".to_string());
+    };
+    let now = state::now_iso();
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, m.id, test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        m.id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        Some(pr.number as i64),
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    let env = match require_pr_comment_backend(ctx, run_id, ev, host, webhook_cfg).await {
+        Ok(env) => env,
+        Err(summary) => return summary,
+    };
+    let body = format!("This failure is already tracked in {key}; it is not caused by this PR.");
+    let pr_number = pr.number;
+    let repo = ev.repo.clone();
+    let host_owned = host.to_string();
+    let body_file = pr_comment_body_path(&ctx.paths, &ev.repo, pr_number);
+    let result = tokio::task::spawn_blocking(move || {
+        write_and_post_pr_comment(
+            env.backend.as_ref(),
+            &host_owned,
+            &repo,
+            pr_number,
+            &body_file,
+            &body,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "commenting on the human PR failed (continuing)");
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "PR comment task panicked (continuing)");
+        }
+    }
+    WebhookRunSummary::store_decided(&StoreOutcome::Attached { key })
+}
+
+/// CLAUDE-276: `ev`'s failing tests overlap a `pr_only` row: a prior sighting
+/// on some open PR (possibly this same one). If the attach brings the row's
+/// distinct branches to 2 or more, the failure belongs to `main`: mint a real
+/// issue and comment its link onto every PR it was sighted on. Otherwise this
+/// is another sighting of the same still-single-branch failure: analyze again
+/// and comment the PR, same as a fresh sighting.
+#[allow(clippy::too_many_arguments)]
+async fn route_pr_matches_pr_only_failure(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    auto_fix_enabled: bool,
+    job_name: &str,
+    branch: &str,
+    failure_signature: Option<&str>,
+    infra_kind: Option<&str>,
+    test_ids: &[String],
+    log_token: Option<String>,
+    m: &ci_failure_store::FailureMatch,
+    pr: &ForgePullRequest,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    let now = state::now_iso();
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, m.id, test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        m.id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        Some(pr.number as i64),
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    let branches = match ci_failure_store::distinct_branches(&ctx.pool, m.id).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store read failed");
+            return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+        }
+    };
+
+    if branches.len() >= 2 {
+        return mint_for_two_branch_pr_only_failure(
+            ctx,
+            ev,
+            log_text,
+            log_available,
+            log_unavailable_reason,
+            auto_fix_enabled,
+            job_name,
+            branch,
+            failure_signature,
+            infra_kind,
+            log_token,
+            m.id,
+            host,
+            webhook_cfg,
+        )
+        .await;
+    }
+
+    let env = match require_pr_comment_backend(ctx, run_id, ev, host, webhook_cfg).await {
+        Ok(env) => env,
+        Err(summary) => return summary,
+    };
+    match analyze_and_comment_pr(
+        ctx,
+        ev,
+        log_text,
+        log_available,
+        log_unavailable_reason,
+        log_token,
+        pr.number,
+        host,
+        env,
+    )
+    .await
+    {
+        Ok(_) => WebhookRunSummary {
+            text: format!(
+                "commented analysis on PR #{} (pr_only, still one branch)",
+                pr.number
+            ),
+            ok: true,
+        },
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "PR analysis/comment failed");
+            WebhookRunSummary::error(e.to_string())
+        }
+    }
+}
+
+/// CLAUDE-276: a `pr_only` failure's tests just appeared on a second distinct
+/// branch: promote it to a real issue (triage + mint, DEV-335 caps applied and
+/// advanced exactly like a fresh mint), point the existing store row at it
+/// instead of inserting a duplicate, and comment the issue link onto every
+/// open PR the failure was sighted on.
+#[allow(clippy::too_many_arguments)]
+async fn mint_for_two_branch_pr_only_failure(
+    ctx: &MintContext,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    auto_fix_enabled: bool,
+    job_name: &str,
+    branch: &str,
+    failure_signature: Option<&str>,
+    infra_kind: Option<&str>,
+    log_token: Option<String>,
+    failure_id: i64,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
+    let attempts = state::attempts_get(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key)
+        .await
+        .unwrap_or(0);
+    let daily = state::daily_count_get(&ctx.pool, WEBHOOK_MINT_ACTION)
+        .await
+        .unwrap_or(0);
+    let caps = MintCaps {
+        attempts,
+        max_attempts: ctx.defaults.max_attempts_per_key,
+        daily,
+        max_runs_per_day: ctx.defaults.max_runs_per_day,
+    };
+
+    let backend = ctx.backend.clone();
+    let classifier = ctx.classifier.clone();
+    let audit = crate::provider::IssueWriteAudit::new(None, ctx.defaults.max_issues_per_run);
+    let mint_cfg = ctx.mint_cfg.read().await.clone();
+    let route_cache = ctx.route_cache.clone();
+    let event = ev.clone();
+    let job_name_owned = job_name.to_string();
+    let branch_owned = branch.to_string();
+    let sig_owned = failure_signature.map(str::to_string);
+    let infra_owned = infra_kind.map(str::to_string);
+
+    let decision = tokio::task::spawn_blocking(
+        move || -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
+            let tracker = crate::provider::AuditedTracker::new(backend.as_ref(), audit);
+            let input = TriageInput {
+                repo: event.repo.clone(),
+                workflow_id: event.workflow_id.clone(),
+                commit_sha: event.commit_sha.clone(),
+                html_url: event.html_url.clone(),
+                log: log_text,
+                log_available,
+                log_unavailable_reason,
+                has_open_pr: true,
+                log_token,
+            };
+            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+            let req = MintRequest {
+                repo: &event.repo,
+                index_in_repo: event.index_in_repo,
+                commit_sha: &event.commit_sha,
+                workflow_id: &event.workflow_id,
+                branch: &branch_owned,
+                job_name: &job_name_owned,
+                failure_signature: sig_owned.as_deref(),
+                infra_kind: infra_owned.as_deref(),
+                html_url: &event.html_url,
+                trigger_user: &event.trigger_user,
+                triage: &verdict,
+                log_path: None,
+                private: event.private,
+                has_open_pr: true,
+                auto_fix_enabled,
+            };
+            let outcome = mint::mint(&tracker, &mint_cfg, route_cache.as_ref(), &req, &caps)?;
+            Ok((verdict.bucket, outcome))
+        },
+    )
+    .await;
+
+    let (bucket, outcome) = match decision {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "two-branch mint failed");
+            return WebhookRunSummary::error(e.to_string());
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "two-branch mint task panicked");
+            return WebhookRunSummary::error(format!("task panicked: {e}"));
+        }
+    };
+
+    let key = match &outcome {
+        MintOutcome::Created { key, .. } => key.clone(),
+        other => {
+            log_mint_outcome(ev, other);
+            return WebhookRunSummary::decided(bucket, other);
+        }
+    };
+
+    if let Err(e) = state::attempts_increment(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key).await {
+        warn!(error = %e, "advancing webhook attempt counter failed");
+    }
+    if let Err(e) = state::daily_count_increment(&ctx.pool, WEBHOOK_MINT_ACTION).await {
+        warn!(error = %e, "advancing webhook daily ledger failed");
+    }
+
+    let now = state::now_iso();
+    if let Err(e) = ci_failure_store::set_issue(&ctx.pool, failure_id, Some(&key), &now).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::set_failure_state(&ctx.pool, failure_id, "open", &now).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    let pr_numbers = ci_failure_store::pr_numbers_for_failure(&ctx.pool, failure_id)
+        .await
+        .unwrap_or_default();
+    if !pr_numbers.is_empty() {
+        match require_pr_comment_backend(ctx, None, ev, host, webhook_cfg).await {
+            Ok(env) => {
+                let body =
+                    format!("Filed as {key}; the same failure was seen on another branch's PR.");
+                let repo = ev.repo.clone();
+                let host_owned = host.to_string();
+                let backend = env.backend;
+                let paths = ctx.paths.clone();
+                let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
+                    for pr_number in pr_numbers {
+                        let body_file = pr_comment_body_path(&paths, &repo, pr_number as u64);
+                        write_and_post_pr_comment(
+                            backend.as_ref(),
+                            &host_owned,
+                            &repo,
+                            pr_number as u64,
+                            &body_file,
+                            &body,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "commenting the issue link onto a PR failed (continuing)");
+                    }
+                    Err(e) => {
+                        warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "commenting the issue link onto every PR task panicked (continuing)");
+                    }
+                }
+            }
+            Err(_) => {
+                // Already logged and recorded by require_pr_comment_backend; the
+                // issue itself is already filed, so this is best-effort only.
+            }
+        }
+    }
+
+    log_mint_outcome(ev, &outcome);
+    WebhookRunSummary::decided(bucket, &outcome)
+}
+
+/// CLAUDE-276: `ev`'s failing tests matched no store row at all, on an open PR
+/// that is not the agent's own: the first sighting of this failure. Run the
+/// analysis, comment it on the PR (always), and record a `pr_only` row - no
+/// issue yet.
+#[allow(clippy::too_many_arguments)]
+async fn route_new_pr_only_failure(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    job_name: &str,
+    branch: &str,
+    infra_kind: Option<&str>,
+    test_ids: &[String],
+    log_token: Option<String>,
+    pr: &ForgePullRequest,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    let env = match require_pr_comment_backend(ctx, run_id, ev, host, webhook_cfg).await {
+        Ok(env) => env,
+        Err(summary) => return summary,
+    };
+    if let Err(e) = analyze_and_comment_pr(
+        ctx,
+        ev,
+        log_text,
+        log_available,
+        log_unavailable_reason,
+        log_token,
+        pr.number,
+        host,
+        env,
+    )
+    .await
+    {
+        warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "PR analysis/comment failed");
+        return WebhookRunSummary::error(e.to_string());
+    }
+
+    let now = state::now_iso();
+    let id = match ci_failure_store::record_failure(
+        &ctx.pool,
+        &ev.repo,
+        &ev.workflow_id,
+        job_name,
+        infra_kind,
+        None,
+        "pr_only",
+        &now,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
+            return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+        }
+    };
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, id, test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        Some(pr.number as i64),
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    WebhookRunSummary {
+        text: format!(
+            "commented analysis on PR #{}; no issue (pr_only, first sighting)",
+            pr.number
+        ),
+        ok: true,
+    }
 }
 
 /// CLAUDE-273: the classify + mint path for a failure the `ci_failure` store
@@ -1699,12 +2738,6 @@ fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
         }
         MintOutcome::SkippedTransient => {
             info!(repo = %ev.repo, run = ev.index_in_repo, "transient failure; minted nothing")
-        }
-        MintOutcome::SkippedBotLoop => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, trigger_user = %ev.trigger_user, "bot-loop guard; minted nothing")
-        }
-        MintOutcome::SkippedOpenPr => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, "open PR for this run; auto-fix suppressed (CLAUDE-149), minted nothing")
         }
         MintOutcome::SkippedAttemptCap => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, "per-key attempt cap reached; minted nothing")
@@ -2336,6 +3369,11 @@ mod tests {
         /// When set, `list_queued` returns this issue for any query: the
         /// legacy-adoption lookup's canned hit.
         legacy_match: StdMutex<Option<String>>,
+        /// CLAUDE-276: canned `list_open_prs` result, so a test can put the
+        /// failing commit on an open PR.
+        open_prs: StdMutex<Vec<ForgePullRequest>>,
+        /// CLAUDE-276: when set, `list_open_prs` fails with this message.
+        open_prs_error: StdMutex<Option<String>>,
     }
 
     impl StoreBackend {
@@ -2344,10 +3382,20 @@ mod tests {
                 next_key: StdMutex::new(100),
                 calls: StdMutex::new(Vec::new()),
                 legacy_match: StdMutex::new(None),
+                open_prs: StdMutex::new(Vec::new()),
+                open_prs_error: StdMutex::new(None),
             }
         }
         fn with_legacy_match(self, key: &str) -> Self {
             *self.legacy_match.lock().unwrap() = Some(key.to_string());
+            self
+        }
+        fn with_open_prs(self, prs: Vec<ForgePullRequest>) -> Self {
+            *self.open_prs.lock().unwrap() = prs;
+            self
+        }
+        fn with_open_prs_error(self, message: &str) -> Self {
+            *self.open_prs_error.lock().unwrap() = Some(message.to_string());
             self
         }
         fn calls(&self) -> Vec<String> {
@@ -2450,7 +3498,10 @@ mod tests {
             _host: &str,
             _repo: &str,
         ) -> crate::error::Result<Vec<ForgePullRequest>> {
-            Ok(Vec::new())
+            if let Some(message) = self.open_prs_error.lock().unwrap().clone() {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(message)));
+            }
+            Ok(self.open_prs.lock().unwrap().clone())
         }
         fn pr_ci_state(
             &self,
@@ -2533,10 +3584,35 @@ mod tests {
         }
     }
 
+    fn test_paths(dir: &std::path::Path) -> Paths {
+        Paths {
+            config_dir: dir.to_path_buf(),
+            data_dir: dir.to_path_buf(),
+            state_dir: dir.to_path_buf(),
+            runtime_dir: dir.to_path_buf(),
+        }
+    }
+
     fn store_mint_context(
         pool: DbPool,
         backend: Arc<StoreBackend>,
         classifier: Arc<dyn FailureClassifier>,
+    ) -> MintContext {
+        store_mint_context_in(
+            pool,
+            backend,
+            classifier,
+            std::env::temp_dir().as_path(),
+            Arc::new(crate::provider::cli::testutil::StubRunner::new()),
+        )
+    }
+
+    fn store_mint_context_in(
+        pool: DbPool,
+        backend: Arc<StoreBackend>,
+        classifier: Arc<dyn FailureClassifier>,
+        paths_dir: &std::path::Path,
+        pr_comment_runner: Arc<dyn CommandRunner>,
     ) -> MintContext {
         MintContext {
             pool,
@@ -2545,6 +3621,8 @@ mod tests {
             mint_cfg: Arc::new(RwLock::new(store_mint_cfg())),
             defaults: RunnerDefaults::default(),
             route_cache: Arc::new(route_cache()),
+            paths: test_paths(paths_dir),
+            pr_comment_runner,
         }
     }
 
@@ -2853,6 +3931,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -2930,6 +4009,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -2967,6 +4047,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -3021,6 +4102,7 @@ mod tests {
             "test".to_string(),
             None,
             &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
         )
         .await;
         assert!(!result.ok, "a store read failure must fail the run");
@@ -3149,9 +4231,10 @@ mod tests {
     #[test]
     fn code_fix_classification_mints_and_queues() {
         // A non-transient log + a code_fix verdict with NO open PR -> issue in the
-        // mapped project, queued for the fix bot, no human assignee. (With an open
-        // PR the code_fix route is suppressed per CLAUDE-149; see
-        // `open_pr_code_fix_is_left_to_the_author_and_mints_nothing`.)
+        // mapped project, queued for the fix bot, no human assignee. (CLAUDE-276:
+        // an open PR no longer suppresses this route inside `decide_mint`; see
+        // `decide_mint_applies_no_open_pr_suppression_of_its_own`. Open-PR
+        // routing is decided by the caller before `decide_mint` is reached.)
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let (bucket, out) = decide_mint(
@@ -3293,11 +4376,12 @@ mod tests {
     }
 
     #[test]
-    fn open_pr_code_fix_is_left_to_the_author_and_mints_nothing() {
-        // CLAUDE-149 end-to-end through decide_mint: a failure WITH an open PR
-        // that the classifier calls code_fix is the author's to fix. The
-        // queue-for-fix route is suppressed, so no issue is minted and the fix
-        // bot is never queued.
+    fn decide_mint_applies_no_open_pr_suppression_of_its_own() {
+        // CLAUDE-276: the open-PR routing decision (agent PR re-queue / human PR
+        // comment) is now made by the caller BEFORE `decide_mint` is ever
+        // reached; `decide_mint` (and `mint::mint` underneath it) no longer
+        // suppresses a code-fix mint for `has_open_pr: true` the way CLAUDE-149's
+        // `SkippedOpenPr` used to.
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let ev = event();
@@ -3312,7 +4396,7 @@ mod tests {
             true,
             None,
             None,
-            true, // has_open_pr: a failing open PR
+            true, // has_open_pr: context only, no longer a suppression signal
             true, // auto_fix_enabled
             "",
             None,
@@ -3320,15 +4404,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::CodeFix);
-        assert_eq!(out, MintOutcome::SkippedOpenPr);
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
         let calls = tracker.calls();
+        assert!(calls.iter().any(|c| c.starts_with("create")), "{calls:?}");
         assert!(
-            !calls.iter().any(|c| c.starts_with("create")),
-            "no issue minted for an open-PR failure: {calls:?}"
-        );
-        assert!(
-            !calls.iter().any(|c| c.contains("AI Agent")),
-            "fix bot never queued: {calls:?}"
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+            "{calls:?}"
         );
     }
 
@@ -4031,6 +5114,553 @@ mod tests {
         assert!(!WebhookRunSummary::error("boom".to_string()).ok);
     }
 
+    // ---- CLAUDE-276: route a CI failure on an open PR by who opened it ----
+
+    fn pr(number: u64, head_sha: &str) -> ForgePullRequest {
+        ForgePullRequest {
+            number,
+            title: String::new(),
+            head_sha: head_sha.to_string(),
+            head_ref: String::new(),
+            author: String::new(),
+            html_url: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// Point the process-global key-file env at a fresh (or reused, within one
+    /// test) `age` key and store `value` under `name`, the same setup
+    /// `comment_webhooks::tests::setup_pool` uses for its own write-token test.
+    async fn setup_write_secret(pool: &DbPool, tmp: &std::path::Path, name: &str, value: &str) {
+        use age::secrecy::ExposeSecret;
+        let key_path = tmp.join("key.txt");
+        if !key_path.exists() {
+            let identity = age::x25519::Identity::generate();
+            std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();
+        }
+        std::env::set_var(crate::secrets::KEY_FILE_ENV, &key_path);
+        let key = SecretsKey::load().unwrap();
+        let ciphertext = key.encrypt(value).unwrap();
+        state::secret_create(pool, name, &ciphertext).await.unwrap();
+    }
+
+    /// A [`WebhookConfig`] with one source (`store_event`'s `"test-source"`)
+    /// carrying `write_token_ref`, so a PR-comment routing decision has a
+    /// backend to build.
+    fn webhook_cfg_with_write_token(token_ref: Option<&str>) -> WebhookConfig {
+        let mut cfg = WebhookConfig::default();
+        cfg.sources.insert(
+            "test-source".to_string(),
+            WebhookSource {
+                write_token_ref: token_ref.map(str::to_string),
+                ..WebhookSource::default()
+            },
+        );
+        cfg
+    }
+
+    #[tokio::test]
+    async fn open_pr_lookup_error_fails_the_run_and_mints_nothing() {
+        // CLAUDE-276 acceptance criterion: an open-PR lookup error fails the run
+        // with `ok = false` and an `error` log, and nothing is minted or
+        // commented - never silently read as "no PR".
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new().with_open_prs_error("forge unreachable"));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(7101);
+        let log = failing_test_log("mod_a", "test_one", "feature/x");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(
+            !result.ok,
+            "a lookup error must fail the run: {}",
+            result.text
+        );
+        assert!(
+            result.text.contains("open-PR lookup failed"),
+            "{}",
+            result.text
+        );
+        assert!(
+            !backend.calls().iter().any(|c| c.starts_with("create")),
+            "nothing minted: {:?}",
+            backend.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_pr_under_limit_requeues_its_issue_and_bumps_fix_attempts() {
+        // CLAUDE-276 acceptance criterion: a failure recorded in
+        // `agent_pull_requests` with `fix_attempts` below the ceiling comments
+        // its issue, bumps `fix_attempts`, and sets `AI Agent = Queued` - no PR
+        // comment, no new issue.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        ci_failure_store::record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-40",
+            "dev.a8n.run",
+            "acme/widgets",
+            17,
+            "fix/CLAUDE-40",
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(17, "commit-7102")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(7102);
+        let log = failing_test_log("mod_a", "test_one", "fix/CLAUDE-40");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create")),
+            "no new issue: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("comment CLAUDE-40")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-40 AI Agent Queued"),
+            "{calls:?}"
+        );
+
+        let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 17)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.fix_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_pr_at_limit_flags_needs_review_listing_every_attempt() {
+        // CLAUDE-276 acceptance criterion: at the fix-attempt ceiling, the next
+        // failure sets `AI Agent = Needs Review` with every attempt's run
+        // listed, instead of re-queuing again.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        let agent_pr_id = ci_failure_store::record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-41",
+            "dev.a8n.run",
+            "acme/widgets",
+            18,
+            "fix/CLAUDE-41",
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            ci_failure_store::bump_fix_attempts(&pool, agent_pr_id, now)
+                .await
+                .unwrap();
+        }
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(18, "commit-7103")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(7103);
+        let log = failing_test_log("mod_a", "test_one", "fix/CLAUDE-41");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        let calls = backend.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-41 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("comment CLAUDE-41") && c.contains("7103")),
+            "the comment names this attempt's run: {calls:?}"
+        );
+
+        let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 18)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.fix_attempts, 3,
+            "a ceiling hit does not itself bump the counter further"
+        );
+    }
+
+    #[tokio::test]
+    async fn human_pr_no_match_comments_the_pr_and_records_a_pr_only_row() {
+        // CLAUDE-276 acceptance criterion: a human PR with no store match gets
+        // one PR comment carrying the analysis, a `pr_only` store row, and no
+        // issue.
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = crate::db::test_pool().await;
+        setup_write_secret(&pool, tmp.path(), "write-ref", "secret-pat").await;
+
+        let paths = test_paths(tmp.path());
+        let body_file = pr_comment_body_path(&paths, "acme/widgets", 17);
+        let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "comment",
+                "acme/widgets#17",
+                "--body-file",
+                body_file.to_str().unwrap(),
+            ],
+            "",
+        ));
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(17, "commit-7104")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context_in(
+            pool.clone(),
+            backend.clone(),
+            classifier,
+            tmp.path(),
+            runner.clone(),
+        );
+        let ev = store_event(7104);
+        let log = failing_test_log("mod_a", "test_one", "human/branch");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg_with_write_token(Some("write-ref")),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        assert!(
+            runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("pr comment acme/widgets#17")),
+            "{:?}",
+            runner.calls.lock().unwrap()
+        );
+        assert!(
+            !backend.calls().iter().any(|c| c.starts_with("create")),
+            "no issue: {:?}",
+            backend.calls()
+        );
+
+        let m = ci_failure_store::find_match(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            &["mod_a::test_one".to_string()],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(m.state, "pr_only");
+        assert_eq!(m.issue_key, None);
+    }
+
+    #[tokio::test]
+    async fn human_pr_sharing_an_open_failure_comments_and_attaches_with_no_analysis() {
+        // CLAUDE-276 acceptance criterion: a human PR sharing a failing test
+        // with an open failure gets a PR comment naming the issue, the run is
+        // attached, and no analysis runs.
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = crate::db::test_pool().await;
+        setup_write_secret(&pool, tmp.path(), "write-ref", "secret-pat").await;
+
+        let now = "2026-09-01T00:00:00Z";
+        let failure_id = ci_failure_store::record_failure(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            None,
+            Some("CLAUDE-42"),
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+        ci_failure_store::add_tests(&pool, failure_id, &["mod_a::test_one".to_string()])
+            .await
+            .unwrap();
+
+        let paths = test_paths(tmp.path());
+        let body_file = pr_comment_body_path(&paths, "acme/widgets", 19);
+        let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "comment",
+                "acme/widgets#19",
+                "--body-file",
+                body_file.to_str().unwrap(),
+            ],
+            "",
+        ));
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(19, "commit-7105")]));
+        let counting = Arc::new(CountingClassifier::new());
+        let classifier: Arc<dyn FailureClassifier> = counting.clone();
+        let ctx = store_mint_context_in(
+            pool.clone(),
+            backend.clone(),
+            classifier,
+            tmp.path(),
+            runner.clone(),
+        );
+        let ev = store_event(7105);
+        let log = failing_test_log("mod_a", "test_one", "human/branch2");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg_with_write_token(Some("write-ref")),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        assert_eq!(
+            counting.call_count(),
+            0,
+            "no analysis runs: {}",
+            result.text
+        );
+        assert!(
+            runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("pr comment acme/widgets#19")),
+            "{:?}",
+            runner.calls.lock().unwrap()
+        );
+        let body = std::fs::read_to_string(&body_file).unwrap();
+        assert!(body.contains("CLAUDE-42"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn human_pr_on_a_second_branch_mints_one_issue_and_comments_both_prs() {
+        // CLAUDE-276 acceptance criterion: the same failing tests on a second
+        // branch's PR create one issue, and both PRs get the issue link.
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = crate::db::test_pool().await;
+        setup_write_secret(&pool, tmp.path(), "write-ref", "secret-pat").await;
+
+        let paths = test_paths(tmp.path());
+        let body_file_a = pr_comment_body_path(&paths, "acme/widgets", 21);
+        let body_file_b = pr_comment_body_path(&paths, "acme/widgets", 22);
+        let runner = Arc::new(
+            crate::provider::cli::testutil::StubRunner::new()
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "acme/widgets#21",
+                        "--body-file",
+                        body_file_a.to_str().unwrap(),
+                    ],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "acme/widgets#22",
+                        "--body-file",
+                        body_file_b.to_str().unwrap(),
+                    ],
+                    "",
+                ),
+        );
+
+        let backend = Arc::new(
+            StoreBackend::new().with_open_prs(vec![pr(21, "commit-7106"), pr(22, "commit-7107")]),
+        );
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context_in(
+            pool.clone(),
+            backend.clone(),
+            classifier,
+            tmp.path(),
+            runner.clone(),
+        );
+        let webhook_cfg = webhook_cfg_with_write_token(Some("write-ref"));
+
+        let ev_a = store_event(7106);
+        let log_a = failing_test_log("mod_a", "test_one", "branch/a");
+        let result_a = triage_and_mint(
+            &ctx,
+            None,
+            &ev_a,
+            log_a,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg,
+        )
+        .await;
+        assert!(result_a.ok, "{}", result_a.text);
+
+        let ev_b = store_event(7107);
+        let log_b = failing_test_log("mod_a", "test_one", "branch/b");
+        let result_b = triage_and_mint(
+            &ctx,
+            None,
+            &ev_b,
+            log_b,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg,
+        )
+        .await;
+        assert!(result_b.ok, "{}", result_b.text);
+
+        let calls = backend.calls();
+        let creates: Vec<_> = calls.iter().filter(|c| c.starts_with("create")).collect();
+        assert_eq!(creates.len(), 1, "exactly one issue created: {calls:?}");
+
+        let runner_calls = runner.calls.lock().unwrap();
+        assert!(
+            runner_calls
+                .iter()
+                .any(|c| c.contains("pr comment acme/widgets#21")),
+            "{runner_calls:?}"
+        );
+        assert!(
+            runner_calls
+                .iter()
+                .any(|c| c.contains("pr comment acme/widgets#22")),
+            "{runner_calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_write_token_ref_fails_the_run_and_records_a_run_event() {
+        // CLAUDE-276 acceptance criterion: a source without `write_token_ref`
+        // logs at `error`, writes a `run_events` row, and fails the run.
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(23, "commit-7108")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(7108);
+        let log = failing_test_log("mod_a", "test_one", "human/branch3");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg_with_write_token(None),
+        )
+        .await;
+        assert!(!result.ok, "no write_token_ref must fail the run");
+        assert!(result.text.contains("PR comment"), "{}", result.text);
+        let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 10)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|e| e.message.contains("write_token_ref")),
+            "a run_events row names the missing token: {events:?}"
+        );
+    }
+
     // ---- CLAUDE-64 / CLAUDE-87: every auth-rejection branch is reachable ----
     //
     // Drive `forgejo_webhook` directly so each rejection branch (and the
@@ -4082,6 +5712,7 @@ mod tests {
                         allowed_repos: vec!["contoso/claude-run".to_string()],
                         rate_limit_per_min: rate_per_min,
                         log_token_ref: None,
+                        write_token_ref: None,
                     },
                 ),
                 (
@@ -4091,6 +5722,7 @@ mod tests {
                         allowed_repos: vec!["fabrikam/*".to_string()],
                         rate_limit_per_min: rate_per_min,
                         log_token_ref: None,
+                        write_token_ref: None,
                     },
                 ),
             ]
@@ -4102,6 +5734,7 @@ mod tests {
                 auto_fix: false,
                 analysis_timeout_secs: 600,
                 analysis_concurrency: 2,
+                agent_pr_fix_attempts: 3,
             }
         }
 
@@ -4214,6 +5847,7 @@ mod tests {
                     allowed_repos: vec!["*".to_string()],
                     rate_limit_per_min: 60,
                     log_token_ref: None,
+                    write_token_ref: None,
                 },
             )]
             .into_iter()
@@ -4224,6 +5858,7 @@ mod tests {
                 auto_fix: false,
                 analysis_timeout_secs: 600,
                 analysis_concurrency: 2,
+                agent_pr_fix_attempts: 3,
             };
             let (tx, _rx) = mpsc::channel(8);
             let st = WebhookState::new(pool, config, tx);

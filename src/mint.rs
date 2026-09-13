@@ -11,9 +11,11 @@
 //!
 //! ```text
 //! route   -> bucket 3 (transient) mints nothing.
-//! guard   -> loop safety: a failing run triggered by a bot login (the CI-fix
-//!            bot's own fix PR) mints nothing; per-PR attempt cap and daily cap
-//!            (the DEV-335 caps, reused not re-derived) gate the rest.
+//! guard   -> per-key attempt cap and daily cap (the DEV-335 caps, reused not
+//!            re-derived) gate the rest. CLAUDE-276: open-PR routing (the
+//!            agent's own PR re-queues its issue, a human's PR gets a PR
+//!            comment) is decided by the caller before `mint` is ever reached,
+//!            so it takes no bot-loop or open-PR guard of its own.
 //! mint    -> create in the mapped project, State=To do, attach the redacted log,
 //!            then route the bucket:
 //!              bucket 1 (code_fix)    -> AI Agent=Queued when the webhook's
@@ -89,7 +91,7 @@ pub struct MintRequest<'a> {
     pub infra_kind: Option<&'a str>,
     /// Run URL, surfaced in the issue body.
     pub html_url: &'a str,
-    /// Login that triggered the run; matched against the loop-safety bot list.
+    /// Login that triggered the run, surfaced as context on the mint decision.
     pub trigger_user: &'a str,
     /// The triage verdict (bucket + analysis).
     pub triage: &'a Triage,
@@ -99,9 +101,12 @@ pub struct MintRequest<'a> {
     /// gates dedupe (the root-cause key collapses repeats for public and private
     /// repos alike); retained as context on the request.
     pub private: bool,
-    /// CLAUDE-149: whether the failing run has an open PR for its branch. When
-    /// set, the auto-fix (queue-for-fix) route is suppressed so the PR author
-    /// owns the fix; a human-action failure still mints.
+    /// Whether the failing run has an open PR for its branch, surfaced to the
+    /// triage classifier as bucket-1-vs-2 context. CLAUDE-276: `mint` is only
+    /// ever reached for a failure with no open PR, or for the "same failure on
+    /// two branches" case the PR-routing caller mints deliberately; either way
+    /// this no longer gates the route (the caller decides PR routing before
+    /// `mint` runs, replacing the old CLAUDE-149 `SkippedOpenPr` suppression).
     pub has_open_pr: bool,
     /// CLAUDE-153/CLAUDE-273: the webhook-scoped auto-fix toggle
     /// (`[webhook].auto_fix`). It no longer decides whether an issue is
@@ -141,13 +146,6 @@ pub enum MintOutcome {
     },
     /// Bucket 3 (transient/infra): mint nothing.
     SkippedTransient,
-    /// Loop safety: the failing run was triggered by a bot login (a fix-PR run).
-    SkippedBotLoop,
-    /// CLAUDE-149: the failing run has an open PR, so the auto-fix (queued)
-    /// route is suppressed: a failing open PR is the author's to fix, not the
-    /// bot's. Only the queue-for-fix buckets are suppressed; a human-action
-    /// failure on an open PR still mints.
-    SkippedOpenPr,
     /// The per-key attempt cap was already reached.
     SkippedAttemptCap,
     /// The daily run cap was already reached.
@@ -180,13 +178,6 @@ fn route(bucket: TriageBucket) -> Option<Route> {
         }),
         TriageBucket::Transient => None,
     }
-}
-
-/// True when `trigger_user` is one of the loop-safety bot logins: a failing run
-/// the CI-fix bot itself triggered (its own fix PR) must never mint a new task,
-/// or a failing fix recurses.
-pub fn is_bot_loop(trigger_user: &str, cfg: &MintConfig) -> bool {
-    cfg.bot_logins.iter().any(|b| b == trigger_user)
 }
 
 /// CLAUDE-273: whether `bucket` routes to the queue-for-fix path (`code_fix` /
@@ -535,11 +526,15 @@ fn mask_digit_runs(s: &str) -> String {
 
 /// Mint (or decline to mint) a YouTrack issue from a triaged failure. Pure
 /// decision flow over the [`IssueTracker`] trait; see the module docs for the
-/// ordering (route -> loop safety -> caps -> create). CLAUDE-273: dedupe by
-/// failing-test overlap now happens in the caller (`src/web/webhooks.rs`,
-/// against the `ci_failure` store) BEFORE this is ever called, so `mint` only
-/// creates; it no longer searches YouTrack or ever declines for a duplicate or
-/// a resolved issue.
+/// ordering (route -> caps -> create). CLAUDE-273: dedupe by failing-test
+/// overlap now happens in the caller (`src/web/webhooks.rs`, against the
+/// `ci_failure` store) BEFORE this is ever called, so `mint` only creates; it
+/// no longer searches YouTrack or ever declines for a duplicate or a resolved
+/// issue. CLAUDE-276: the caller also now decides open-PR routing before this
+/// is ever called (the agent's own PR re-queues its issue directly, a human's
+/// PR gets a comment), so `mint` no longer takes a bot-loop or open-PR
+/// suppression decision either; every failure it is handed is one the caller
+/// has already decided belongs to a fresh issue.
 pub fn mint(
     tracker: &dyn IssueTracker,
     cfg: &MintConfig,
@@ -551,18 +546,6 @@ pub fn mint(
     let Some(route) = route(req.triage.bucket) else {
         return Ok(MintOutcome::SkippedTransient);
     };
-
-    // CLAUDE-149: a failing open PR is the author's to fix. Suppress the auto-fix
-    // (queue-for-fix) route for it so no corrective PR is queued; a human-action
-    // failure on an open PR still mints (it needs a human, not the bot).
-    if req.has_open_pr && route.queue_for_fix {
-        return Ok(MintOutcome::SkippedOpenPr);
-    }
-
-    // Loop safety: a fix-PR run the bot triggered must not mint a new task.
-    if is_bot_loop(req.trigger_user, cfg) {
-        return Ok(MintOutcome::SkippedBotLoop);
-    }
 
     // DEV-335 caps, reused: per-key attempt cap, then daily run cap.
     if caps.attempts >= caps.max_attempts {
@@ -1328,21 +1311,27 @@ mod tests {
         assert!(!calls.iter().any(|c| c.contains("AI Agent")), "{calls:?}");
     }
 
-    // ---- CLAUDE-149: a failing open PR is left to its author --------------
+    // ---- CLAUDE-276: open-PR routing is decided by the caller, not `mint` --
 
     #[test]
-    fn open_pr_suppresses_the_auto_fix_mint() {
-        // A code-fix failure on a run WITH an open PR is the author's to fix:
-        // the queue-for-fix route is suppressed and nothing is minted.
+    fn open_pr_no_longer_suppresses_the_auto_fix_mint() {
+        // CLAUDE-276: `mint` is only ever reached for a failure the caller has
+        // already decided belongs to a fresh issue (no open PR, or the "same
+        // failure on two branches" case), so `has_open_pr` alone no longer
+        // suppresses the queue-for-fix route the way CLAUDE-149's `SkippedOpenPr`
+        // used to.
         let t = triage(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let mut r = req("fabrikam/forgejo-cli", &t, "alice");
         r.has_open_pr = true;
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert_eq!(out, MintOutcome::SkippedOpenPr);
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
         assert!(
-            tracker.calls().is_empty(),
-            "no yt calls for an open-PR failure: {:?}",
+            tracker
+                .calls()
+                .iter()
+                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+            "{:?}",
             tracker.calls()
         );
     }
@@ -1482,12 +1471,15 @@ mod tests {
         );
     }
 
-    // ---- AC 3: loop safety -------------------------------------------------
+    // ---- CLAUDE-276: `mint` applies no bot-login guard of its own ----------
 
     #[test]
-    fn bot_authored_run_mints_nothing() {
-        // Default bot login is "claude-run"; a failing fix-PR run it triggered
-        // must not recurse into a new task.
+    fn mint_applies_no_bot_login_guard() {
+        // CLAUDE-149's `is_bot_loop` gate (matching `trigger_user` against
+        // `bot_logins`) is gone from `mint`: the login mismatch that dropped run
+        // 5874 (`claude-run` vs the real `Claude-Run` login) is why CLAUDE-276
+        // replaced login matching with the `agent_pull_requests` store lookup,
+        // which intercepts the agent's own PR before `mint` is ever reached.
         let t = triage(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let out = mint(
@@ -1498,8 +1490,7 @@ mod tests {
             &caps(),
         )
         .unwrap();
-        assert_eq!(out, MintOutcome::SkippedBotLoop);
-        assert!(tracker.calls().is_empty());
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
     }
 
     #[test]

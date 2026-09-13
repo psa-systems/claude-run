@@ -3722,7 +3722,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "sources",
                 badge: "live",
-                note: "per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref.",
+                note: "per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref, write_token_ref (WRITE scope, CLAUDE-276: required to comment on a PR).",
             },
             FieldDoc {
                 name: "auto_fix",
@@ -3738,6 +3738,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "analysis_concurrency",
                 badge: "restart",
                 note: "how many events are analyzed at once; the worker pool's semaphore is sized once at daemon start.",
+            },
+            FieldDoc {
+                name: "agent_pr_fix_attempts",
+                badge: "next event",
+                note: "CLAUDE-276: fix attempts on the agent's own open PR before its issue is flagged Needs Review instead of re-queued.",
             },
         ],
         WebhookComment => vec![
