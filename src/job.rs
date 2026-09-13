@@ -440,7 +440,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     // Transient claude error: no post, no attempt counted, no daily count++.
     if claude_result.transient {
         info!(action = %action.name, key = %key, error = %claude_result.error, "transient claude error, not counting attempt");
-        cleanup_workdir(&workdir_path);
+        workdir::cleanup_or_preserve(&workdir_path, &action.name, &key);
         return Ok(ProcessedJob::Transient { key });
     }
 
@@ -498,7 +498,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
         state::daily_count_increment(ctx.pool, &action.name).await?;
     }
 
-    cleanup_workdir(&workdir_path);
+    workdir::cleanup_or_preserve(&workdir_path, &action.name, &key);
 
     Ok(ProcessedJob::Done {
         key,
@@ -513,14 +513,6 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
         duration_ms: started.elapsed().as_millis() as i64,
         timed_out: claude_result.timed_out,
     })
-}
-
-fn cleanup_workdir(workdir: &Path) {
-    if workdir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(workdir) {
-            warn!(workdir = %workdir.display(), error = %e, "workdir cleanup failed (continuing)");
-        }
-    }
 }
 
 /// Outcome of `process_job`, kept simple enough to fold into both the JSONL

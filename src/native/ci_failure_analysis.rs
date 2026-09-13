@@ -297,7 +297,11 @@ async fn process_job(
     // Per-job workdir (the log + workflow YAML are written here for claude).
     let wb_base = workdir::resolve_workdir_base(action.workdir_base.as_deref(), ctx.paths);
     let workdir_path = workdir::job_workdir(&wb_base, &action.name, key);
-    let _ = std::fs::remove_dir_all(&workdir_path);
+    if let Err(e) = std::fs::remove_dir_all(&workdir_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(key, error = %e, "clearing the analysis workdir before reuse failed (continuing)");
+        }
+    }
     if let Err(e) = std::fs::create_dir_all(&workdir_path) {
         warn!(key, error = %e, "creating the analysis workdir failed; skipping");
         return Ok(ProcessedJob::Filtered {
