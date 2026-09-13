@@ -54,8 +54,9 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
+use crate::ci_failure::{fingerprint, store as ci_failure_store};
 use crate::config::{MintConfig, WebhookConfig, WebhookSource};
 use crate::forge_log::LogOutcome;
 use crate::job::RunnerDefaults;
@@ -811,12 +812,46 @@ impl WebhookRunSummary {
         }
     }
 
+    /// CLAUDE-273: a decision the `ci_failure` store made without ever calling
+    /// `mint::mint` (an attach, a reopen, or a legacy adoption).
+    fn store_decided(outcome: &StoreOutcome) -> Self {
+        Self {
+            text: store_outcome_summary(outcome),
+            ok: true,
+        }
+    }
+
     fn error(message: String) -> Self {
         Self {
             text: format!("triage/mint error: {message}"),
             ok: false,
         }
     }
+}
+
+/// CLAUDE-273: the outcomes the `ci_failure` store drives directly, with no
+/// `mint::mint` call (and, for [`StoreOutcome::Attached`], no `claude` call
+/// either).
+enum StoreOutcome {
+    /// The fingerprint matched an `open` `ci_failures` row: attached, no
+    /// triage, no mint.
+    Attached { key: String },
+    /// The fingerprint matched a `resolved` row: reopened, triaged, and the
+    /// analysis posted as a comment.
+    Reopened { key: String },
+    /// No store row matched, but a legacy YouTrack full-text search (the
+    /// pre-store mechanism) found an issue minted before the store existed.
+    Adopted { key: String },
+}
+
+/// CLAUDE-273: what [`decide_mint`] decided, inside the blocking task, before
+/// any of its async store bookkeeping runs.
+enum DecideOutcome {
+    /// No store row, but the legacy YouTrack marker search adopted an issue
+    /// minted before the store existed.
+    LegacyAdopted { key: String },
+    /// The ordinary triage + mint path ran to a decision.
+    Mint(triage::TriageBucket, MintOutcome),
 }
 
 /// One-line description of a [`MintOutcome`] for the run summary: the minted
@@ -827,28 +862,30 @@ fn mint_summary(outcome: &MintOutcome) -> String {
         MintOutcome::SkippedTransient => "no issue (transient)".to_string(),
         MintOutcome::SkippedBotLoop => "no issue (bot-loop guard)".to_string(),
         MintOutcome::SkippedOpenPr => "no issue (open PR; left to author)".to_string(),
-        MintOutcome::SkippedAutoFixDisabled => {
-            "no issue (webhook auto-fix off; left on PR)".to_string()
-        }
         MintOutcome::SkippedAttemptCap => "no issue (per-key attempt cap)".to_string(),
         MintOutcome::SkippedDailyCap => "no issue (daily run cap)".to_string(),
-        MintOutcome::SkippedDuplicateOpen { existing } => {
-            format!("no issue (duplicate of open {existing})")
-        }
-        MintOutcome::SkippedResolved { existing } => {
-            format!("no issue (resolved {existing} not reopened)")
-        }
-        MintOutcome::AssociatedWithOpen { existing } => {
-            format!("associated with open {existing}")
-        }
     }
 }
 
-/// Triage a verified failure and mint (or decline to mint) a YouTrack issue.
-/// Reads the reused DEV-335 caps from the DB, resolves the `has_open_pr` signal
-/// from the forge, runs the hybrid triage + mint on a blocking thread (every
-/// step shells out), and advances the caps ledger only when an issue was
-/// actually created. Logs the decision; never propagates an error to the loop.
+/// CLAUDE-273: one-line description of the store-driven outcomes that never
+/// reach [`mint::mint`] at all: an attach onto an already-tracked failure, or a
+/// reopen of a resolved one.
+fn store_outcome_summary(outcome: &StoreOutcome) -> String {
+    match outcome {
+        StoreOutcome::Attached { key } => format!("attached to {key}"),
+        StoreOutcome::Reopened { key } => format!("regression; reopened {key}"),
+        StoreOutcome::Adopted { key } => format!("adopted legacy issue {key}"),
+    }
+}
+
+/// CLAUDE-273: fingerprint the log and look it up in the `ci_failure` store
+/// BEFORE triage. A store read failure fails the run rather than falling
+/// through to a mint, which would recreate the duplicate this issue removes.
+/// `open` attaches with no triage and no `claude` call; `resolved` reopens and
+/// triages for the analysis comment and the `AI Agent` write; `none` and
+/// `pr_only` (the PR-routing issue owns `pr_only`) fall through to the
+/// ordinary classify + mint path, itself preceded by one legacy adoption
+/// lookup for an issue minted before the store existed.
 #[allow(clippy::too_many_arguments)]
 async fn triage_and_mint(
     ctx: &MintContext,
@@ -860,6 +897,318 @@ async fn triage_and_mint(
     log_unavailable_reason: Option<String>,
     auto_fix_enabled: bool,
     job_name: String,
+) -> WebhookRunSummary {
+    // CLAUDE-190: derive the deterministic failure signature and the branch
+    // from the redacted log up front (pure string work); CLAUDE-273 fingerprint
+    // is the failing-test overlap key the store matches on.
+    let failure_signature = crate::mint::failure_signature(&log_text);
+    let branch = crate::forge_log::resolve_branch(None, &log_text).unwrap_or_default();
+    let infra = crate::infra_failure::detect(&log_text);
+    if let Some(f) = &infra {
+        info!(
+            repo = %ev.repo,
+            run = ev.index_in_repo,
+            kind = %f.kind,
+            problem = %f.problem,
+            "infrastructure failure detected"
+        );
+    }
+    let infra_kind = infra.as_ref().map(|f| f.kind.clone());
+    let test_ids = fingerprint::fingerprint(&log_text);
+
+    let store_match = if log_available {
+        match ci_failure_store::find_match(
+            &ctx.pool,
+            &ev.repo,
+            &ev.workflow_id,
+            &job_name,
+            &test_ids,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store read failed; not minting");
+                return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+            }
+        }
+    } else {
+        None
+    };
+
+    match store_match {
+        Some(m) if m.state == "open" => {
+            attach_to_open_failure(ctx, ev, &branch, &test_ids, m).await
+        }
+        Some(m) if m.state == "resolved" => {
+            reopen_resolved_failure(
+                ctx,
+                run_id,
+                ev,
+                log_text,
+                log_available,
+                log_unavailable_reason,
+                auto_fix_enabled,
+                branch,
+                test_ids,
+                m,
+            )
+            .await
+        }
+        // `None` (no store row) and `pr_only` (owned by the PR-routing issue)
+        // both fall through to the ordinary classify + mint path.
+        _ => {
+            classify_and_mint(
+                ctx,
+                run_id,
+                ev,
+                log_text,
+                log_available,
+                log_artifact,
+                log_unavailable_reason,
+                auto_fix_enabled,
+                job_name,
+                branch,
+                failure_signature,
+                infra_kind,
+                test_ids,
+            )
+            .await
+        }
+    }
+}
+
+/// CLAUDE-273: the comment posted when a failure attaches to an already-open
+/// `ci_failures` row. No triage ran, so this names the run and the
+/// overlapping failing tests rather than an analysis.
+fn attach_comment_body(ev: &VerifiedFailureEvent, branch: &str, test_ids: &[String]) -> String {
+    let short_sha: String = ev.commit_sha.chars().take(8).collect();
+    let tests = if test_ids.is_empty() {
+        "(no test ids parsed)".to_string()
+    } else {
+        test_ids.join(", ")
+    };
+    format!(
+        "`{}` failed again on `{}` (run #{}, {}, branch `{}`).\n- Run: {}\n- Failing tests: {tests}",
+        ev.workflow_id, ev.repo, ev.index_in_repo, short_sha, branch, ev.html_url
+    )
+}
+
+/// CLAUDE-273: attach `ev` to the already-tracked, still-`open` failure `m`
+/// matched. No triage, no mint, no `claude` call: the failure is already
+/// filed and this run is just another sighting of it.
+async fn attach_to_open_failure(
+    ctx: &MintContext,
+    ev: &VerifiedFailureEvent,
+    branch: &str,
+    test_ids: &[String],
+    m: ci_failure_store::FailureMatch,
+) -> WebhookRunSummary {
+    let Some(key) = m.issue_key.clone() else {
+        error!(repo = %ev.repo, run = ev.index_in_repo, failure_id = m.id, "open ci_failures row has no issue_key");
+        return WebhookRunSummary::error("ci-failure store row has no issue_key".to_string());
+    };
+    let now = state::now_iso();
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, m.id, test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        m.id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        None,
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    let backend = ctx.backend.clone();
+    let body = attach_comment_body(ev, branch, test_ids);
+    let key_for_comment = key.clone();
+    let result =
+        tokio::task::spawn_blocking(move || backend.comment(&key_for_comment, &body)).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "commenting on attached issue failed");
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "attach comment task panicked");
+        }
+    }
+    WebhookRunSummary::store_decided(&StoreOutcome::Attached { key })
+}
+
+/// CLAUDE-273: the comment posted immediately on reopening a resolved
+/// `ci_failures` row, before the triage analysis is posted separately.
+fn regression_comment_body(ev: &VerifiedFailureEvent, branch: &str, test_ids: &[String]) -> String {
+    let tests = if test_ids.is_empty() {
+        "(no test ids parsed)".to_string()
+    } else {
+        test_ids.join(", ")
+    };
+    format!(
+        "Regression: run {} on `{branch}` fails {tests} again; reopened.",
+        ev.html_url
+    )
+}
+
+/// CLAUDE-273: reopen the resolved failure `m` matched: `set_state` back to
+/// `target_state`, comment the regression, mark the store row `open` and
+/// attach this run, then triage (for the analysis comment) and set `AI Agent`
+/// exactly as a freshly created issue of that bucket would be.
+#[allow(clippy::too_many_arguments)]
+async fn reopen_resolved_failure(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    auto_fix_enabled: bool,
+    branch: String,
+    test_ids: Vec<String>,
+    m: ci_failure_store::FailureMatch,
+) -> WebhookRunSummary {
+    let Some(key) = m.issue_key.clone() else {
+        error!(repo = %ev.repo, run = ev.index_in_repo, failure_id = m.id, "resolved ci_failures row has no issue_key");
+        return WebhookRunSummary::error("ci-failure store row has no issue_key".to_string());
+    };
+    let now = state::now_iso();
+    if let Err(e) = ci_failure_store::set_failure_state(&ctx.pool, m.id, "open", &now).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "reopening ci-failure store row failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, m.id, &test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        m.id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        &branch,
+        None,
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    let backend = ctx.backend.clone();
+    let classifier = ctx.classifier.clone();
+    let mint_cfg = ctx.mint_cfg.read().await.clone();
+    let event = ev.clone();
+    let key2 = key.clone();
+    let regression_body = regression_comment_body(ev, &branch, &test_ids);
+    let bucket =
+        tokio::task::spawn_blocking(move || -> crate::error::Result<triage::TriageBucket> {
+            backend.set_state(&key2, &mint_cfg.target_state)?;
+            backend.comment(&key2, &regression_body)?;
+            let has_open_pr = resolve_has_open_pr(backend.as_ref(), &event);
+            let input = TriageInput {
+                repo: event.repo.clone(),
+                workflow_id: event.workflow_id.clone(),
+                commit_sha: event.commit_sha.clone(),
+                html_url: event.html_url.clone(),
+                log: log_text,
+                log_available,
+                log_unavailable_reason,
+                has_open_pr,
+            };
+            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+            backend.comment(&key2, &verdict.analysis)?;
+            if mint::queues_for_fix(verdict.bucket) && auto_fix_enabled {
+                backend.set_field(&key2, &mint_cfg.ai_agent_field, &mint_cfg.queued_value)?;
+            }
+            Ok(verdict.bucket)
+        })
+        .await;
+
+    let bucket = match bucket {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "reopen triage failed");
+            return WebhookRunSummary::error(e.to_string());
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "reopen triage task panicked");
+            return WebhookRunSummary::error(format!("task panicked: {e}"));
+        }
+    };
+    let _ = run_id;
+    info!(repo = %ev.repo, run = ev.index_in_repo, %key, bucket = %bucket, "regression reopened a resolved ci-failure issue");
+    WebhookRunSummary::store_decided(&StoreOutcome::Reopened { key })
+}
+
+/// CLAUDE-273: record a brand-new `ci_failures` row for `issue_key` (either
+/// freshly minted, or a legacy issue this delivery adopted), and the tests /
+/// run this delivery already carries.
+async fn record_new_store_row(
+    pool: &DbPool,
+    ev: &VerifiedFailureEvent,
+    job_name: &str,
+    infra_kind: Option<&str>,
+    issue_key: &str,
+    branch: &str,
+    test_ids: &[String],
+) -> crate::error::Result<()> {
+    let now = state::now_iso();
+    let id = ci_failure_store::record_failure(
+        pool,
+        &ev.repo,
+        &ev.workflow_id,
+        job_name,
+        infra_kind,
+        Some(issue_key),
+        "open",
+        &now,
+    )
+    .await?;
+    ci_failure_store::add_tests(pool, id, test_ids).await?;
+    ci_failure_store::attach_run(
+        pool,
+        id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        None,
+        &now,
+    )
+    .await?;
+    Ok(())
+}
+
+/// CLAUDE-273: the classify + mint path for a failure the `ci_failure` store
+/// does not yet track (`none`) or that is on an open PR (`pr_only`, treated as
+/// `none` here; the PR-routing issue owns that case). One legacy adoption
+/// lookup runs first (an issue minted before the store existed); on a miss,
+/// this is the pre-existing triage + mint pipeline, and a `Created` outcome
+/// (or a legacy hit) is recorded into the store so the next sighting matches.
+#[allow(clippy::too_many_arguments)]
+async fn classify_and_mint(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_artifact: Option<PathBuf>,
+    log_unavailable_reason: Option<String>,
+    auto_fix_enabled: bool,
+    job_name: String,
+    branch: String,
+    failure_signature: Option<String>,
+    infra_kind: Option<String>,
+    test_ids: Vec<String>,
 ) -> WebhookRunSummary {
     // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
     // run's (repo, index); the daily ledger is per synthetic action. The
@@ -911,14 +1260,18 @@ async fn triage_and_mint(
     let mint_cfg = ctx.mint_cfg.read().await.clone();
     let route_cache = ctx.route_cache.clone();
     let event = ev.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let branch_for_blocking = branch.clone();
+    let job_name_for_blocking = job_name.clone();
+    let sig_for_blocking = failure_signature.clone();
+    let infra_for_blocking = infra_kind.clone();
+    let decision = tokio::task::spawn_blocking(move || {
         let report_stage = move |stage: &'static str| {
             let _ = stage_tx.send(stage);
         };
         report_stage(STAGE_TRIAGING);
         let has_open_pr = resolve_has_open_pr(backend.as_ref(), &event);
         let tracker = crate::provider::AuditedTracker::new(backend.as_ref(), audit);
-        decide_mint(
+        decide_with_legacy_adoption(
             classifier.as_ref(),
             &tracker,
             &mint_cfg,
@@ -931,15 +1284,18 @@ async fn triage_and_mint(
             log_unavailable_reason,
             has_open_pr,
             auto_fix_enabled,
-            &job_name,
+            &job_name_for_blocking,
+            &branch_for_blocking,
+            sig_for_blocking.as_deref(),
+            infra_for_blocking.as_deref(),
             &report_stage,
         )
     })
     .await;
     let _ = stage_drainer.await;
 
-    let (bucket, outcome) = match outcome {
-        Ok(Ok(o)) => o,
+    let decision = match decision {
+        Ok(Ok(d)) => d,
         Ok(Err(e)) => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "triage/mint failed");
             return WebhookRunSummary::error(e.to_string());
@@ -950,27 +1306,126 @@ async fn triage_and_mint(
         }
     };
 
-    // Advance the caps ledger only on a real mint, so repeated failures for the
-    // same key (and a busy day) throttle exactly like the scheduled path. Skips
-    // (transient, dedupe, cap-hit, loop) create no issue and must not count.
-    if matches!(outcome, MintOutcome::Created { .. }) {
-        if let Err(e) = state::attempts_increment(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key).await {
-            warn!(error = %e, "advancing webhook attempt counter failed");
+    match decision {
+        DecideOutcome::LegacyAdopted { key } => {
+            if let Err(e) = record_new_store_row(
+                &ctx.pool,
+                ev,
+                &job_name,
+                infra_kind.as_deref(),
+                &key,
+                &branch,
+                &test_ids,
+            )
+            .await
+            {
+                error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
+                return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+            }
+            WebhookRunSummary::store_decided(&StoreOutcome::Adopted { key })
         }
-        if let Err(e) = state::daily_count_increment(&ctx.pool, WEBHOOK_MINT_ACTION).await {
-            warn!(error = %e, "advancing webhook daily ledger failed");
+        DecideOutcome::Mint(bucket, outcome) => {
+            // Advance the caps ledger only on a real mint, so repeated failures
+            // for the same key (and a busy day) throttle exactly like the
+            // scheduled path. Skips (transient, cap-hit, loop, open-PR) create
+            // no issue and must not count.
+            if matches!(outcome, MintOutcome::Created { .. }) {
+                if let Err(e) =
+                    state::attempts_increment(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key).await
+                {
+                    warn!(error = %e, "advancing webhook attempt counter failed");
+                }
+                if let Err(e) = state::daily_count_increment(&ctx.pool, WEBHOOK_MINT_ACTION).await {
+                    warn!(error = %e, "advancing webhook daily ledger failed");
+                }
+            }
+            if let MintOutcome::Created { key, .. } = &outcome {
+                if let Err(e) = record_new_store_row(
+                    &ctx.pool,
+                    ev,
+                    &job_name,
+                    infra_kind.as_deref(),
+                    key,
+                    &branch,
+                    &test_ids,
+                )
+                .await
+                {
+                    error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
+                    return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+                }
+            }
+            log_mint_outcome(ev, &outcome);
+            WebhookRunSummary::decided(bucket, &outcome)
         }
     }
+}
 
-    log_mint_outcome(ev, &outcome);
-    WebhookRunSummary::decided(bucket, &outcome)
+/// CLAUDE-273: one legacy adoption lookup, then the ordinary triage + mint
+/// pipeline. Factored out from [`classify_and_mint`] so the blocking work (the
+/// legacy search, triage, and mint all shell out) stays inside one
+/// `spawn_blocking` task. Returns [`DecideOutcome::LegacyAdopted`] on a legacy
+/// hit (no triage, no mint) or [`DecideOutcome::Mint`] otherwise.
+#[allow(clippy::too_many_arguments)]
+fn decide_with_legacy_adoption(
+    classifier: &dyn FailureClassifier,
+    tracker: &dyn crate::provider::IssueTracker,
+    mint_cfg: &MintConfig,
+    route_cache: &VcsRouteCache,
+    caps: &MintCaps,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_artifact: Option<&std::path::Path>,
+    log_unavailable_reason: Option<String>,
+    has_open_pr: bool,
+    auto_fix_enabled: bool,
+    job_name: &str,
+    branch: &str,
+    failure_signature: Option<&str>,
+    infra_kind: Option<&str>,
+    report_stage: &(dyn Fn(&'static str) + Send + Sync),
+) -> crate::error::Result<DecideOutcome> {
+    // CLAUDE-273: before spending a `claude` classification, check whether this
+    // exact collapse key already has an issue minted before the `ci_failure`
+    // store existed (the caller already established this is a store miss).
+    let collapse = mint::legacy_collapse_key(
+        &ev.repo,
+        branch,
+        &ev.workflow_id,
+        job_name,
+        failure_signature,
+        infra_kind,
+    );
+    if let Some(existing) = mint::find_first(tracker, &format!("{collapse} #Unresolved"))? {
+        return Ok(DecideOutcome::LegacyAdopted { key: existing });
+    }
+    let (bucket, outcome) = decide_mint(
+        classifier,
+        tracker,
+        mint_cfg,
+        route_cache,
+        caps,
+        ev,
+        log_text,
+        log_available,
+        log_artifact,
+        log_unavailable_reason,
+        has_open_pr,
+        auto_fix_enabled,
+        job_name,
+        report_stage,
+    )?;
+    Ok(DecideOutcome::Mint(bucket, outcome))
 }
 
 /// Pure triage + mint composition over the two traits, with `has_open_pr`
-/// already resolved. Factored out so the bucket routing and dedupe are unit
-/// tested against stub a classifier / tracker with no forge, DB, or process
-/// spawn. Builds the [`TriageInput`], runs the hybrid [`triage::triage`], then
-/// [`mint::mint`] on the result.
+/// already resolved. Factored out so the bucket routing is unit tested against
+/// a stub classifier / tracker with no forge, DB, or process spawn. Builds the
+/// [`TriageInput`], runs the hybrid [`triage::triage`], then [`mint::mint`] on
+/// the result. CLAUDE-273: dedupe by failing-test overlap is decided by the
+/// caller against the `ci_failure` store before this is ever reached, so this
+/// function itself issues no dedupe search.
 #[allow(clippy::too_many_arguments)]
 fn decide_mint(
     classifier: &dyn FailureClassifier,
@@ -1122,23 +1577,11 @@ fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
         MintOutcome::SkippedOpenPr => {
             info!(repo = %ev.repo, run = ev.index_in_repo, "open PR for this run; auto-fix suppressed (CLAUDE-149), minted nothing")
         }
-        MintOutcome::SkippedAutoFixDisabled => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, "webhook auto-fix toggle off (CLAUDE-153); no fixup queued, failure left on the PR")
-        }
         MintOutcome::SkippedAttemptCap => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, "per-key attempt cap reached; minted nothing")
         }
         MintOutcome::SkippedDailyCap => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, "daily run cap reached; minted nothing")
-        }
-        MintOutcome::SkippedDuplicateOpen { existing } => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, %existing, "open issue already exists; minted nothing")
-        }
-        MintOutcome::SkippedResolved { existing } => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, %existing, "resolved issue exists; not reopening")
-        }
-        MintOutcome::AssociatedWithOpen { existing } => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, %existing, "grouped onto existing open issue; minted nothing")
         }
     }
 }
@@ -1749,6 +2192,557 @@ mod tests {
         }
     }
 
+    // ---- CLAUDE-273: `ci_failure` store dedupe through the full pipeline ---
+
+    /// A [`Backend`] (IssueTracker + Forge) driving `consume_events` end to
+    /// end for the store-dedupe tests: `create_issue` hands out incrementing
+    /// keys, every mutation is recorded, and there is never an open PR (the
+    /// Forge surface the CLAUDE-149 `has_open_pr` signal reads).
+    struct StoreBackend {
+        next_key: StdMutex<u32>,
+        calls: StdMutex<Vec<String>>,
+        /// When set, `list_queued` returns this issue for any query: the
+        /// legacy-adoption lookup's canned hit.
+        legacy_match: StdMutex<Option<String>>,
+    }
+
+    impl StoreBackend {
+        fn new() -> Self {
+            Self {
+                next_key: StdMutex::new(100),
+                calls: StdMutex::new(Vec::new()),
+                legacy_match: StdMutex::new(None),
+            }
+        }
+        fn with_legacy_match(self, key: &str) -> Self {
+            *self.legacy_match.lock().unwrap() = Some(key.to_string());
+            self
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::provider::IssueTracker for StoreBackend {
+        fn list_queued(&self, query: &str) -> crate::error::Result<Vec<serde_json::Value>> {
+            self.calls.lock().unwrap().push(format!("list {query}"));
+            match self.legacy_match.lock().unwrap().as_ref() {
+                Some(key) => Ok(vec![serde_json::json!({"idReadable": key})]),
+                None => Ok(Vec::new()),
+            }
+        }
+        fn get_field(&self, _key: &str, _field: &str) -> crate::error::Result<String> {
+            unreachable!()
+        }
+        fn set_field(&self, key: &str, field: &str, value: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_field {key} {field} {value}"));
+            Ok(())
+        }
+        fn set_state(&self, key: &str, state: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_state {key} {state}"));
+            Ok(())
+        }
+        fn set_assignee(&self, key: &str, login: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_assignee {key} {login}"));
+            Ok(())
+        }
+        fn comment(&self, key: &str, body: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("comment {key} | {body}"));
+            Ok(())
+        }
+        fn issue_links(&self, _key: &str) -> crate::error::Result<Vec<crate::provider::IssueLink>> {
+            unreachable!()
+        }
+        fn inspect_issue(&self, _key: &str) -> crate::error::Result<crate::provider::IssueInspect> {
+            unreachable!()
+        }
+        fn resolve_vcs(
+            &self,
+            _project_key: &str,
+        ) -> crate::error::Result<crate::provider::VcsRepo> {
+            unreachable!()
+        }
+        fn vcs_repo_map(&self) -> crate::error::Result<Vec<crate::provider::VcsMapEntry>> {
+            Ok(Vec::new())
+        }
+        fn create_issue(
+            &self,
+            project: &str,
+            summary: &str,
+            _description: &str,
+            assignee: Option<&str>,
+        ) -> crate::error::Result<String> {
+            let mut next = self.next_key.lock().unwrap();
+            let key = format!("CLAUDE-{next}");
+            *next += 1;
+            self.calls.lock().unwrap().push(format!(
+                "create {project} {key} | {summary} | assignee={}",
+                assignee.unwrap_or("-")
+            ));
+            Ok(key)
+        }
+        fn attach_file(&self, _key: &str, _file: &Path) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::provider::Forge for StoreBackend {
+        fn create_pr(
+            &self,
+            _workdir: &Path,
+            _host: &str,
+            _strategy: crate::action::PrStrategy,
+        ) -> crate::error::Result<crate::provider::PullRequest> {
+            unreachable!()
+        }
+        fn clone_url(&self, _host: &str, _repo: &str) -> crate::error::Result<String> {
+            unreachable!()
+        }
+        fn repo_access(&self, _host: &str, _repo: &str) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        fn list_open_prs(
+            &self,
+            _host: &str,
+            _repo: &str,
+        ) -> crate::error::Result<Vec<ForgePullRequest>> {
+            Ok(Vec::new())
+        }
+        fn pr_ci_state(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _pr_number: u64,
+        ) -> crate::error::Result<String> {
+            unreachable!()
+        }
+        fn pr_comment(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _pr_number: u64,
+            _body_file: &Path,
+        ) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        fn issue_comment(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _issue_number: u64,
+            _body_file: &Path,
+        ) -> crate::error::Result<()> {
+            unreachable!()
+        }
+    }
+
+    impl Backend for StoreBackend {
+        fn name(&self) -> &'static str {
+            "store-backend-stub"
+        }
+    }
+
+    /// A [`FailureClassifier`] that always returns `code_fix`, recording how
+    /// many times it ran so a test can assert the store dedupe skipped it.
+    struct CountingClassifier {
+        calls: StdMutex<u32>,
+    }
+
+    impl CountingClassifier {
+        fn new() -> Self {
+            Self {
+                calls: StdMutex::new(0),
+            }
+        }
+        fn call_count(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl FailureClassifier for CountingClassifier {
+        fn classify(&self, _input: &TriageInput) -> crate::error::Result<Triage> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(Triage {
+                bucket: TriageBucket::CodeFix,
+                analysis: "root cause and next step".to_string(),
+                classified_by: ClassifiedBy::Llm,
+                auto_fix: None,
+            })
+        }
+    }
+
+    /// A log carrying `test_id` as its one failing test (cargo-test-shaped, so
+    /// [`fingerprint::fingerprint`] parses it), on `branch`, resolvable to a
+    /// non-transient signature.
+    fn failing_test_log(target: &str, test_id: &str, branch: &str) -> String {
+        format!(
+            "GITHUB_HEAD_REF={branch}\n     Running tests/{target}.rs (target/debug/deps/{target}-abc123)\ntest {test_id} ... FAILED\n"
+        )
+    }
+
+    fn store_mint_cfg() -> MintConfig {
+        MintConfig {
+            repo_project_map: [("acme/widgets".to_string(), "CLAUDE".to_string())]
+                .into_iter()
+                .collect(),
+            ..MintConfig::default()
+        }
+    }
+
+    fn store_mint_context(
+        pool: DbPool,
+        backend: Arc<StoreBackend>,
+        classifier: Arc<dyn FailureClassifier>,
+    ) -> MintContext {
+        MintContext {
+            pool,
+            classifier,
+            backend,
+            mint_cfg: Arc::new(RwLock::new(store_mint_cfg())),
+            defaults: RunnerDefaults::default(),
+            route_cache: Arc::new(route_cache()),
+        }
+    }
+
+    /// One `action_run_failure` event for `acme/widgets`, run `index_in_repo`,
+    /// with a distinct commit per run. The branch itself travels in the job
+    /// log's `GITHUB_HEAD_REF` line, not on the event.
+    fn store_event(index_in_repo: i64) -> VerifiedFailureEvent {
+        VerifiedFailureEvent {
+            repo: "acme/widgets".to_string(),
+            index_in_repo,
+            commit_sha: format!("commit-{index_in_repo}"),
+            workflow_id: "ci.yml".to_string(),
+            private: false,
+            source: "test-source".to_string(),
+            trigger_user: "alice".to_string(),
+            html_url: format!("https://dev.a8n.run/acme/widgets/actions/runs/{index_in_repo}"),
+            status: "failure".to_string(),
+        }
+    }
+
+    /// [`ActionLogClient`] returning one canned failing job's log per repo/run
+    /// number, keyed the way the worked-example test needs it.
+    struct ScriptedFailingLogs {
+        /// `(run_number, job_log)`.
+        logs: HashMap<i64, String>,
+    }
+
+    impl crate::forge_log::ActionLogClient for ScriptedFailingLogs {
+        fn run_logs(
+            &self,
+            _host: &str,
+            _repo: &str,
+            run_number: i64,
+            _token: Option<&str>,
+        ) -> crate::forge_log::RunLogsOutcome {
+            let log = self.logs.get(&run_number).cloned().unwrap_or_default();
+            crate::forge_log::RunLogsOutcome::Fetched(vec![crate::forge_log::JobLog {
+                name: "test".to_string(),
+                status: "failure".to_string(),
+                log,
+                ..Default::default()
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn worked_example_dedupes_by_failing_test_overlap_and_classifies_once() {
+        // CLAUDE-273 acceptance criterion 1: runs 5845, 5850, 5859 and 5871 on
+        // four branches, each failing `invitation_team_id::create_refuses_a_
+        // foreign_tenant_team` plus other tests, produce one `Created` and
+        // three attachments; the classifier runs exactly once (for the first,
+        // creating run only - the three repeats attach with no triage at all).
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new());
+        let counting = Arc::new(CountingClassifier::new());
+        let classifier: Arc<dyn FailureClassifier> = counting.clone();
+
+        let branches = [
+            "fix/GAMMA-1041-invoice-module-gate",
+            "feat/GAMMA-1126-kb-provenance",
+            "chore/GAMMA-1130-cleanup",
+            "fix/GAMMA-1140-retry-logic",
+        ];
+        let runs = [5845, 5850, 5859, 5871];
+        let mut logs = HashMap::new();
+        for (run, branch) in runs.iter().zip(branches.iter()) {
+            let mut log = failing_test_log(
+                "invitation_team_id",
+                "create_refuses_a_foreign_tenant_team",
+                branch,
+            );
+            log.push_str(&format!(
+                "     Running tests/other_{run}.rs (target/debug/deps/other_{run}-abc)\ntest some_other_test ... FAILED\n"
+            ));
+            logs.insert(*run, log);
+        }
+
+        for run in runs.iter() {
+            let (tx, rx) = mpsc::channel(4);
+            tx.send(store_event(*run)).await.unwrap();
+            drop(tx);
+            let out_dir = tempfile::tempdir().unwrap();
+            consume_events(
+                rx,
+                pool.clone(),
+                Arc::new(ScriptedFailingLogs { logs: logs.clone() }),
+                out_dir.path().to_path_buf(),
+                Some(store_mint_context(
+                    pool.clone(),
+                    backend.clone(),
+                    classifier.clone(),
+                )),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+            )
+            .await;
+        }
+        let calls = backend.calls();
+        let creates: Vec<_> = calls.iter().filter(|c| c.starts_with("create")).collect();
+        assert_eq!(creates.len(), 1, "exactly one issue created: {calls:?}");
+        let comments: Vec<_> = calls.iter().filter(|c| c.starts_with("comment")).collect();
+        assert_eq!(
+            comments.len(),
+            3,
+            "the three repeats each attach with one comment: {calls:?}"
+        );
+        assert_eq!(counting.call_count(), 1, "the classifier ran exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_failure_sharing_a_test_with_a_resolved_issue_reopens_it() {
+        // CLAUDE-273 acceptance criterion 2: a shared test with a RESOLVED
+        // issue reopens it (a state write plus a comment) and creates none.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        let failure_id = ci_failure_store::record_failure(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            None,
+            Some("CLAUDE-40"),
+            "resolved",
+            now,
+        )
+        .await
+        .unwrap();
+        ci_failure_store::add_tests(
+            &pool,
+            failure_id,
+            &["invitation_team_id::create_refuses_a_foreign_tenant_team".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let backend = Arc::new(StoreBackend::new());
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(6001);
+        let log = failing_test_log(
+            "invitation_team_id",
+            "create_refuses_a_foreign_tenant_team",
+            "main",
+        );
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        assert!(result.text.contains("CLAUDE-40"), "{}", result.text);
+
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create")),
+            "no new issue: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "set_state CLAUDE-40 To do"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("comment CLAUDE-40 | Regression")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-40 AI Agent Queued"),
+            "AI Agent set exactly as a fresh code_fix issue would be: {calls:?}"
+        );
+
+        let failure = ci_failure_store::get_failure(&pool, failure_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.state, "open");
+    }
+
+    #[tokio::test]
+    async fn a_failure_with_no_shared_test_creates_a_second_issue() {
+        // CLAUDE-273 acceptance criterion 3: a failure on the same job with no
+        // shared test creates a second issue.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        let failure_id = ci_failure_store::record_failure(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            None,
+            Some("CLAUDE-50"),
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+        ci_failure_store::add_tests(&pool, failure_id, &["other::already_tracked".to_string()])
+            .await
+            .unwrap();
+
+        let backend = Arc::new(StoreBackend::new());
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(6002);
+        let log = failing_test_log(
+            "invitation_team_id",
+            "create_refuses_a_foreign_tenant_team",
+            "main",
+        );
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("create")),
+            "a distinct failing test mints a second issue: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_issue_found_by_marker_search_is_adopted_not_duplicated() {
+        // CLAUDE-273 acceptance criterion 4: an open legacy issue found by the
+        // marker search, with no store row, is adopted and not duplicated.
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new().with_legacy_match("CLAUDE-70"));
+        let counting = Arc::new(CountingClassifier::new());
+        let classifier: Arc<dyn FailureClassifier> = counting.clone();
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(6003);
+        let log = failing_test_log(
+            "invitation_team_id",
+            "create_refuses_a_foreign_tenant_team",
+            "main",
+        );
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        assert!(result.text.contains("CLAUDE-70"), "{}", result.text);
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create")),
+            "adopted, not duplicated: {calls:?}"
+        );
+        assert_eq!(counting.call_count(), 0, "no triage for a legacy adoption");
+
+        // The adoption is now recorded, so the next sighting of this test
+        // attaches instead of searching YouTrack again.
+        let m = ci_failure_store::find_match(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            &["invitation_team_id::create_refuses_a_foreign_tenant_team".to_string()],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(m.issue_key, Some("CLAUDE-70".to_string()));
+        assert_eq!(m.state, "open");
+    }
+
+    #[tokio::test]
+    async fn a_ci_failure_store_read_error_fails_the_run_and_mints_nothing() {
+        // A store read failure logs at error and fails the run rather than
+        // falling through to a mint, which would recreate a duplicate.
+        let pool = crate::db::test_pool().await;
+        pool.close().await;
+        let backend = Arc::new(StoreBackend::new());
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(9001);
+        let log = failing_test_log(
+            "invitation_team_id",
+            "create_refuses_a_foreign_tenant_team",
+            "main",
+        );
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+        )
+        .await;
+        assert!(!result.ok, "a store read failure must fail the run");
+        assert!(
+            result.text.contains("ci-failure store error"),
+            "{}",
+            result.text
+        );
+        assert!(
+            backend.calls().is_empty(),
+            "nothing minted on a store error: {:?}",
+            backend.calls()
+        );
+    }
+
     fn event() -> VerifiedFailureEvent {
         VerifiedFailureEvent {
             repo: "fabrikam/forgejo-cli".to_string(),
@@ -2039,12 +3033,16 @@ mod tests {
         );
     }
 
-    /// CLAUDE-264: the collapse key `decide_mint` searched, i.e. the last
-    /// `#Unresolved` full-text query the mint issued before creating.
+    /// CLAUDE-264/CLAUDE-273: the collapse key the legacy adoption lookup
+    /// searches, i.e. the `#Unresolved` full-text query
+    /// `decide_with_legacy_adoption` issues before falling through to triage.
     fn collapse_query(log: &str) -> String {
         let classifier = StubClassifier::new(TriageBucket::HumanAction);
         let tracker = StubTracker::new();
-        decide_mint(
+        let failure_signature = crate::mint::failure_signature(log);
+        let branch = crate::forge_log::resolve_branch(None, log).unwrap_or_default();
+        let infra_kind = crate::infra_failure::detect(log).map(|f| f.kind);
+        let _ = decide_with_legacy_adoption(
             &classifier,
             &tracker,
             &mint_cfg(),
@@ -2058,24 +3056,26 @@ mod tests {
             false,
             true,
             "integration tests",
+            &branch,
+            failure_signature.as_deref(),
+            infra_kind.as_deref(),
             &|_| {},
-        )
-        .unwrap();
+        );
         tracker
             .calls()
             .into_iter()
             .rfind(|c| c.starts_with("list ") && c.ends_with("#Unresolved"))
-            .expect("the mint issued a collapse search")
+            .expect("the legacy lookup issued a collapse search")
     }
 
     #[test]
     fn an_infra_failure_collapses_across_branches_but_a_code_failure_does_not() {
-        // CLAUDE-264 end-to-end through decide_mint: `infra_kind` is resolved
-        // from the same full redacted log as `failure_signature`, and switches
-        // the collapse search onto the branch-agnostic key. Two runs of one job
-        // on two different PR branches: with a host condition in the log they
-        // search the SAME key (so the second associates with the first's issue),
-        // and without one they search different keys, exactly as before.
+        // CLAUDE-264/CLAUDE-273: `infra_kind` is resolved from the same full
+        // redacted log as `failure_signature`, and switches the legacy
+        // adoption lookup's collapse search onto the branch-agnostic key. Two
+        // runs of one job on two different PR branches: with a host condition
+        // in the log they search the SAME key, and without one they search
+        // different keys, exactly as before.
         let a = "GITHUB_HEAD_REF=fix/GAMMA-1041-invoice-module-gate\n";
         let b = "GITHUB_HEAD_REF=feat/GAMMA-1126-kb-provenance\n";
         let guard = "Insufficient free space: the suite needs ~25G to link test binaries.\n";
@@ -2095,11 +3095,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_fix_off_code_fix_mints_nothing_and_leaves_it_on_the_pr() {
-        // CLAUDE-153 end-to-end through decide_mint: with the webhook auto-fix
-        // toggle OFF, a code_fix failure (even with no open PR) mints nothing and
-        // queues no fixup PR, so the red check stays reported on the PR
-        // (CLAUDE-152). No `create` and no `AI Agent` write reach the tracker.
+    fn auto_fix_off_code_fix_still_creates_but_leaves_it_on_the_pr() {
+        // CLAUDE-153/CLAUDE-273 end-to-end through decide_mint: with the webhook
+        // auto-fix toggle OFF, a code_fix failure (even with no open PR) still
+        // creates an issue, but queues no fixup PR (no `AI Agent` write), so the
+        // red check stays reported on the PR (CLAUDE-152).
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let (bucket, out) = decide_mint(
@@ -2120,11 +3120,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::CodeFix);
-        assert_eq!(out, MintOutcome::SkippedAutoFixDisabled);
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
         let calls = tracker.calls();
         assert!(
-            !calls.iter().any(|c| c.starts_with("create")),
-            "no issue minted when auto-fix is off: {calls:?}"
+            calls.iter().any(|c| c.starts_with("create")),
+            "issue still minted when auto-fix is off: {calls:?}"
         );
         assert!(
             !calls.iter().any(|c| c.contains("AI Agent")),

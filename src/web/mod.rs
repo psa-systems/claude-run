@@ -3719,6 +3719,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 badge: "live",
                 note: "per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref.",
             },
+            FieldDoc {
+                name: "auto_fix",
+                badge: "next event",
+                note: "queuing only (CLAUDE-273): every code failure still mints; off just leaves AI Agent unset.",
+            },
         ],
         WebhookComment => vec![
             FieldDoc {
