@@ -1172,10 +1172,13 @@ credentials live in the Keychain rather than `.credentials.json`, so the symlink
 
 **Image.** `oci-build/Dockerfile` has a `runtime` target built on the CI image (`dev.a8n.run/pandoras-box/rust-builder-musl`).
 It carries `claude-run` plus the pinned runtime toolchain: `nu`, the `claude` CLI, coreutils `timeout`, `git`, `yt` (
-youtrack-cli), and `fj` (forgejo-cli). `yt` and `fj` are the org's own prebuilt static binaries, pulled from the Forgejo
+youtrack-cli), `fj` (forgejo-cli), `just`, and `kingfisher`. `yt` and `fj` are the org's own prebuilt static binaries, pulled from the Forgejo
 generic packages `fabrikam/youtrack-cli` and `pandoras-box/forgejo-cli` and verified against the `.sha256` published
-beside each (CLAUDE-247). Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VERSION`, `YT_VERSION`, `FJ_VERSION`, plus
-`PKG_BASE` for the registry); override any one with `--build-arg`. The two CI-failure actions read the forge only through `fj`, so they
+beside each (CLAUDE-247). `just` and `kingfisher` are pulled from the org's Dufs binary mirror
+(`https://files.example.com/public/{os}/{arch}/{name}/{version}/{file}`) and verified against a checksum pinned in the
+Dockerfile itself (CLAUDE-282), so an agent's check suite (`just check`) and secret scan (`kingfisher scan`) run without
+installing either tool into `$HOME` on every fresh container. Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VERSION`, `YT_VERSION`, `FJ_VERSION`,
+`JUST_VERSION`, `KINGFISHER_VERSION`, plus `PKG_BASE` and `BINARIES_BASE` for the two registries); override any one with `--build-arg`. The two CI-failure actions read the forge only through `fj`, so they
 need an `fj` carrying `fj actions logs`, `fj actions runs` (FJ-66), and `fj repo file` (FJ-67); the latter two landed on
 `pandoras-box/forgejo-cli` `main` after the `v0.13.0` tag (merge `b08d8bc`) and are in no released version yet, so
 `FJ_VERSION` must point at a build from that commit or newer for those actions to work. The container runs as the
