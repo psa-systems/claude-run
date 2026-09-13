@@ -12,6 +12,12 @@ long-running daemon.
   on time without external cron.
 - **Per-job streaming logs**: claude is invoked with `--output-format stream-json` and the NDJSON events land in
   `$STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`. `tail -f` to watch live.
+- **No background work survives a turn** (CLAUDE-280): every `claude` child runs with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`
+  and `--disallowedTools Monitor,ScheduleWakeup`, because a session run under `--print` is over the moment its turn ends,
+  so nothing it starts in the background can be waited on afterwards. As a backstop, if a stream log's terminal `result`
+  event is followed by a `system`/`task_updated` event reporting `patch.status: killed` (a leftover background task the
+  runner had to terminate), the run finalizes as a non-transient failure naming the task, never as the success the
+  `result` event claimed.
 - **Cost ledger + caps**: per-day Claude-invocation cap, per-day USD budget, per-RUN USD ceiling, per-job attempt cap. All in SQLite.
 - **Per-run usage accounting** (DEV-707): every run ends with a `run usage` summary line and appends one newline-delimited JSON record to `$STATE_DIR/logs/usage.jsonl` carrying tokens by category, estimated cost against the budget, wall-clock duration, tool call counts, and per-tool attribution, so "what did this run cost, and which tool dominated it" is answerable without a provider console.
 - **Skip-attempt marker**: an action's post step can write `$workdir/.claude-run-skip-attempt` for outcomes that park a

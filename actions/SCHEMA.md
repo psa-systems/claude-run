@@ -814,6 +814,15 @@ Tuning for the `claude` CLI call. All keys are optional.
 The runner always passes `--print --verbose --output-format stream-json`. It wraps the call in `timeout
 $claude_timeout_seconds`. Stdout+stderr are redirected to a per-job NDJSON stream log:
 
+**Background work is disallowed, unconditionally (CLAUDE-280).** No action setting turns this off. Every `claude`
+child runs with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` in its environment and `--disallowedTools=Monitor,ScheduleWakeup`
+on its command line, because a session run under `--print` is over the instant its turn ends: a turn that ends
+"waiting" on a backgrounded `Bash` command, a `Monitor` call, or a `ScheduleWakeup` call never gets to resume, and the
+work it left running is not part of the outcome the runner reads. As a backstop, if a stream log's terminal `result`
+event is followed by a `system`/`task_updated` event reporting `patch.status: killed` (the shape produced when the
+runner terminates a leftover background task that outlived the result), the run finalizes as a non-transient failure
+naming the task id rather than the success the `result` event reported.
+
 ```
 $CLAUDE_RUN_STATE_DIR/logs/<name>/streams/<key>-attempt-<n>.jsonl
 ```

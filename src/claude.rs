@@ -339,13 +339,22 @@ impl ClaudeInvoker {
         if let Some(budget) = budget_usd {
             command.arg(format!("--max-budget-usd={:.4}", budget.max(0.0)));
         }
+        // CLAUDE-280: a session run under `claude --print` is over the moment its
+        // turn ends, so nothing is left to wait on. `Monitor` and `ScheduleWakeup`
+        // let a session end its turn while still expecting to resume, and
+        // background tasks (`run_in_background`) let it end while work is still
+        // running unattended; both are disallowed unconditionally, for every
+        // invoker (native runners, the triage classifier, the comment webhook,
+        // scripted jobs).
+        command.arg("--disallowedTools=Monitor,ScheduleWakeup");
         command
             .arg(prompt)
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log_err))
-            .process_group(0);
+            .process_group(0)
+            .env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
         // CLAUDE-165: point the agent at its dedicated user-level config dir
         // (slim bot CLAUDE.md + linked host credentials). HOME is left inherited.
         if let Some(dir) = &self.config_dir {
@@ -527,6 +536,54 @@ impl ClaudeInvoker {
                 timed_out: false,
                 login_required: false,
             });
+        }
+
+        // CLAUDE-280 backstop: step 6 of the prompt and the flags above are the
+        // primary defense against a session that leaves work in the background,
+        // but neither stops a session already running before this change, or a
+        // future CLI that still lets `Bash` background a command despite the
+        // env var. `wait_or_cancel` kills a leftover background task, which
+        // appears in the stream log as a `system`/`task_updated` event with
+        // `patch.status: killed` AFTER the terminal `result` - a shape that
+        // `parse_final_result` deliberately ignores (CLAUDE-107) when picking the
+        // result event itself, but that is exactly the signal that the "success"
+        // it reported was never really final.
+        match killed_tasks_after_result(stream_log) {
+            Ok(ids) if !ids.is_empty() => {
+                let ids = ids.join(", ");
+                warn!(
+                    stream_log = %stream_log.display(),
+                    task_ids = %ids,
+                    "claude's terminal result was followed by a killed background task; finalizing as a failure"
+                );
+                return Ok(ClaudeResult {
+                    ok: false,
+                    summary: format!(
+                        "Claude ended its session with background work still running (task {ids}), \
+                         which the runner terminated. A session run under `claude --print` is over \
+                         the moment its turn ends, so nothing can safely be left running in the \
+                         background. See {}.",
+                        stream_log.display()
+                    ),
+                    cost: final_event
+                        .get("total_cost_usd")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
+                    usage,
+                    raw: final_event,
+                    error: format!(
+                        "claude ended its session with background work still running: task {ids}"
+                    ),
+                    transient: false,
+                    timed_out: false,
+                });
+            }
+            Ok(_) => {}
+            Err(err) => warn!(
+                stream_log = %stream_log.display(),
+                error = %err,
+                "could not scan the stream log for a killed background task after the terminal result"
+            ),
         }
 
         Ok(ClaudeResult {
@@ -893,6 +950,45 @@ fn parse_final_result(stream_log: &Path) -> std::io::Result<Option<Value>> {
         .rev()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("result")))
+}
+
+/// CLAUDE-280: task ids for every `system`/`task_updated` event with
+/// `patch.status: killed` that appears AFTER the terminal `result` event in the
+/// stream log. Empty when the log holds no `result` event (that case is handled
+/// elsewhere) or no such trailing event.
+///
+/// Shape observed in run 10822's log (a `task_updated` event with
+/// `patch.status: killed` following a successful `result`) and in the CLI
+/// verification in CLAUDE-280; revise if a CLI release renames these fields.
+fn killed_tasks_after_result(stream_log: &Path) -> std::io::Result<Vec<String>> {
+    let raw = std::fs::read_to_string(stream_log)?;
+    let lines: Vec<&str> = raw.lines().collect();
+    let Some(result_idx) = lines.iter().enumerate().rev().find_map(|(i, l)| {
+        let event: Value = serde_json::from_str(l).ok()?;
+        (event.get("type").and_then(|t| t.as_str()) == Some("result")).then_some(i)
+    }) else {
+        return Ok(Vec::new());
+    };
+    Ok(lines[result_idx + 1..]
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|event| {
+            event.get("type").and_then(|t| t.as_str()) == Some("system")
+                && event.get("subtype").and_then(|t| t.as_str()) == Some("task_updated")
+                && event
+                    .get("patch")
+                    .and_then(|p| p.get("status"))
+                    .and_then(|s| s.as_str())
+                    == Some("killed")
+        })
+        .map(|event| {
+            event
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string()
+        })
+        .collect())
 }
 
 fn read_tail(p: &Path, max: usize) -> std::io::Result<String> {
@@ -1433,6 +1529,53 @@ exit "$code"
         assert!(!res.timed_out, "a clean exit is not a timeout");
     }
 
+    /// CLAUDE-280: a `result` event followed by a `system`/`task_updated` event
+    /// reporting `patch.status: killed` (the shape `wait_or_cancel` produces when
+    /// it terminates a leftover background task) must never finalize as success,
+    /// even though the result event itself claimed success. This is the exact
+    /// shape from run 10822.
+    #[test]
+    fn invoke_result_then_killed_background_task_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' '{RESULT_LINE}'\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"task_updated\",\"task_id\":\"bg-1\",\"patch\":{{\"status\":\"killed\"}}}}'\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"background_tasks_changed\",\"tasks\":[]}}'\n\
+                 exit 0\n"
+            ),
+        );
+
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let res = invoker
+            .invoke(
+                "hi",
+                &cfg,
+                Duration::from_secs(10),
+                dir.path(),
+                &log,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !res.ok,
+            "a killed background task after the result must not finalize as success"
+        );
+        assert!(!res.transient, "this is a non-transient failure");
+        assert!(
+            res.error.contains("bg-1"),
+            "the error must name the killed task id, got: {}",
+            res.error
+        );
+    }
+
     /// CLAUDE-53: claude emits its terminal result event but does NOT exit (a
     /// leftover background task holds it open). The runner force-terminates the
     /// group after the grace window and finalizes from the captured result, so a
@@ -1659,6 +1802,42 @@ exit "$code"
         assert!(
             !argv.contains("--model"),
             "no model anywhere must pass no --model flag, got:\n{argv}"
+        );
+    }
+
+    /// CLAUDE-280: every invocation disallows `Monitor` and `ScheduleWakeup` and
+    /// disables background tasks, unconditionally - there is no action setting
+    /// that turns this off. A session run under `claude --print` is over the
+    /// moment its turn ends, so nothing it starts can be waited on afterwards.
+    #[test]
+    fn invoke_always_disallows_background_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-env.txt");
+        let stub = dir.path().join("claude-stub.sh");
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\n\
+                 printf 'BG=%s\\n' \"$CLAUDE_CODE_DISABLE_BACKGROUND_TASKS\" > '{}'\n\
+                 for a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n\
+                 printf '%s\\n' '{RESULT_LINE}'\n\
+                 exit 0\n",
+                marker.display(),
+                dir.path().join("child-argv.txt").display()
+            ),
+        );
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let argv = spawn_and_capture_args(&invoker, &ClaudeBlock::default(), dir.path());
+        assert!(
+            argv.lines()
+                .any(|l| l == "--disallowedTools=Monitor,ScheduleWakeup"),
+            "Monitor and ScheduleWakeup must always be disallowed, got:\n{argv}"
+        );
+        let env = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            env.trim(),
+            "BG=1",
+            "background tasks must be disabled via the env var, got:\n{env}"
         );
     }
 
