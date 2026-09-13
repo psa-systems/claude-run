@@ -1256,7 +1256,9 @@ mod tests {
     /// once, so the exit-code contract is exercised deterministically regardless
     /// of which `timeout` the host happens to ship. For non-timeout runs the shim
     /// forwards the child's own exit status, so other `invoke` tests are
-    /// unaffected.
+    /// unaffected; CLAUDE-285 is what makes that true (the watchdog `sleep` is
+    /// killed on every exit path instead of surviving as an orphan for the rest
+    /// of its duration).
     fn ensure_coreutils_timeout_on_path() {
         use std::sync::OnceLock;
 
@@ -1272,6 +1274,18 @@ mod tests {
             // child's own exit status. This reproduces coreutils' contract that
             // the only `invoke` test asserting on it (`invoke_timeout_sets_timed_out`)
             // depends on.
+            // CLAUDE-285: the watcher's own `sleep "$secs"` must be killable
+            // directly. Killing only the watcher subshell (the old shape) does
+            // NOT kill a child that subshell already forked: `sleep` survives
+            // as an orphan, reparented to init, and keeps running for the rest
+            // of its duration. An orphaned `sleep` inherits this script's
+            // stdout/stderr fds (the pipe `ClaudeInvoker::invoke` reads to
+            // EOF), so on every run that finishes before `secs` elapses, the
+            // caller's relay thread blocks reading that pipe until the orphan
+            // itself exits, i.e. for the full `secs`. The trap lets the normal
+            // exit path (`kill "$watcher"`, below) reach the grandchild `sleep`
+            // and terminate it immediately instead of leaving it to run out
+            // its clock.
             let body = r#"#!/bin/sh
 secs=$1; shift
 secs=${secs%s}
@@ -1279,7 +1293,16 @@ fired="$(mktemp)"
 rm -f "$fired"
 "$@" &
 child=$!
-( sleep "$secs"; : > "$fired"; kill -TERM "$child" 2>/dev/null; sleep 1; kill -KILL "$child" 2>/dev/null ) &
+(
+    trap 'kill -TERM "$spid" 2>/dev/null; exit 0' TERM
+    sleep "$secs" &
+    spid=$!
+    wait "$spid"
+    : > "$fired"
+    kill -TERM "$child" 2>/dev/null
+    sleep 1
+    kill -KILL "$child" 2>/dev/null
+) &
 watcher=$!
 wait "$child"
 code=$?
@@ -1340,6 +1363,52 @@ exit "$code"
         assert!(res.timed_out, "exit 124 should set timed_out");
         assert!(!res.ok, "a timeout is not ok");
         assert!(!res.transient, "a timeout is never transient");
+    }
+
+    /// CLAUDE-285: a run that finishes well inside its budget must not block on
+    /// the shim's own watchdog `sleep`. Before the fix, killing the watcher
+    /// subshell left its already-forked `sleep "$secs"` running as an orphan
+    /// that kept the invocation's stdout pipe open, so `invoke` (which reads
+    /// that pipe to EOF via its relay thread) did not return until the full
+    /// budget elapsed even though the stub exited immediately. This pins a
+    /// wall-clock bound far under the budget so the test fails on the
+    /// unfixed shim and passes once the watchdog is killed on every exit path.
+    #[test]
+    fn invoke_returns_promptly_when_the_child_exits_well_under_the_budget() {
+        ensure_coreutils_timeout_on_path();
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude-stub.sh");
+        write_stub(
+            &stub,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"is_error\":false}'\nexit 0\n",
+        );
+
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let started = Instant::now();
+        let res = invoker
+            .invoke(
+                "hi",
+                &cfg,
+                // A budget the orphaned watchdog would have blocked for if it
+                // survived being killed; the assertion below is well under it.
+                Duration::from_secs(10),
+                dir.path(),
+                &log,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert!(res.ok, "a clean immediate exit is ok");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "invoke took {:?}, which means something still holds the stdout \
+             pipe open past the stub's own exit",
+            started.elapsed()
+        );
     }
 
     /// CLAUDE-269 acceptance criterion 1: a stub that emits an `assistant`
