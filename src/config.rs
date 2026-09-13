@@ -206,16 +206,19 @@ pub struct WebhookConfig {
     /// names with other characters are warned about at load. An empty map
     /// disables the listener (no endpoints, fail-closed like an unset secret).
     pub sources: BTreeMap<String, WebhookSource>,
-    /// CLAUDE-153: webhook-scoped auto-fix switch. When `false` (the default,
-    /// opt-in), a failure the webhook triage routes to a queue-for-fix bucket
-    /// (`code_fix` / `auto_fix`) mints nothing and queues no corrective fixup
-    /// PR, so a red PR check stays reported on the original PR for its author to
-    /// fix in place (the CLAUDE-152 behavior). A `human_action` failure still
-    /// mints. This gates only the webhook fixup routing; it is independent of the
-    /// framework-wide `[mint].auto_fix.enabled` detector switch and of the
-    /// CLAUDE-149 open-PR suppression. Being on `WebhookConfig` it is DB-backed
-    /// (`config.webhook`) and edited live on the Settings page / via
-    /// `PUT /api/settings/webhook` with no restart.
+    /// CLAUDE-153/CLAUDE-273: webhook-scoped auto-fix switch. It no longer
+    /// decides whether an issue is minted at all (every code failure is filed,
+    /// so `No orphan notes` holds even with this off): `false` (the default,
+    /// opt-in) still creates a `code_fix` / `auto_fix` issue but leaves it with
+    /// no `AI Agent` write, so no corrective fixup PR is queued and a red PR
+    /// check stays reported on the original PR for its author to fix in place
+    /// (the CLAUDE-152 behavior); `true` sets `AI Agent = Queued` on that issue
+    /// as before. A `human_action` failure is unaffected either way. This gates
+    /// only the webhook fixup queuing; it is independent of the framework-wide
+    /// `[mint].auto_fix.enabled` detector switch and of the CLAUDE-149 open-PR
+    /// suppression. Being on `WebhookConfig` it is DB-backed (`config.webhook`)
+    /// and edited live on the Settings page / via `PUT /api/settings/webhook`
+    /// with no restart.
     pub auto_fix: bool,
 }
 

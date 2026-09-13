@@ -843,43 +843,46 @@ rate-limited) -> internal-route log fetch + redaction -> hybrid triage -> issue 
 scheduled `youtrack` / `forgejo-ci-fix` actions remain the backstop and dedupe against webhook-minted issues through the
 same hidden markers, so a poll that races the webhook never files a second issue.
 
-**CLAUDE-190: dedup keys on the failure, not the commit.** The cross-run collapse key is
-`hash(repo, branch, workflow_id, job_name, failure_signature)`, so N commits that each fail the same job on the same
-branch with the same failure collapse onto ONE open issue (later runs append a run-association comment instead of minting
-a duplicate), while a genuinely different failure signature on the same job stays a separate issue. The
-`failure_signature` is a deterministic, pure-string signature of the first diagnostic line in the redacted log
-(lowercased, path prefixes dropped, digit runs masked, whitespace collapsed): no LLM, computed on every event. When no
-diagnostic line is derivable (the log stops before a diagnostic was emitted, carries none, or the failure produced no
-log at all) the key falls back to `hash(repo, branch, workflow_id, job_name)`, which still collapses a "branch is
-broken" storm onto one issue (two
-indistinguishable logless failures on the same job are intentionally grouped; the CLAUDE-189 analysis can later split a
-mis-grouped issue). The branch is read from the run's log environment dump (`GITHUB_HEAD_REF` on a PR run, else the `refs/heads/` short name, in either the `setupEnv => map[...]` or the `KEY=value` form; the deployed
-Forgejo returns `head_branch: null` from run detail) and the job name from the jobs `fj actions logs` returns with the
-log, both resolved in Rust. The issue body carries hidden `Dedupe-Key:`, `Root-Cause-Key:`, `Branch:`, and `Job:`
-markers so the CLAUDE-191 auto-close reconciler can find every issue for a `(repo, branch, workflow, job)`; a resolved
-issue is never reopened.
+**CLAUDE-273: dedupe is a database lookup by failing-test overlap, not a YouTrack search.** Before triage runs, the
+webhook consumer fingerprints the redacted log (`ci_failure::fingerprint`, the same cargo-test-output parser CLAUDE-272
+introduced for the `ci_failure` store) into a set of `<target>::<test>` ids, or a single infra/signature id when nothing
+cargo-shaped parses, and looks it up in `ci_failures` by `(repo, workflow_id, job_name)` overlap:
 
-**CLAUDE-264: a host condition keys without the branch.** That root-cause key contains `branch`, which is right for a
-code failure (two unrelated bugs on two branches must not merge, and the auto-fix route needs one branch to deliver
-onto) and wrong for a failure that is a property of the RUNNER. A full disk is identical on every branch and fixable on
-none of them, so with one PR branch per tracker issue it minted a fresh issue per branch and they never collapsed. When
-`infra_failure::detect` recognizes such a condition in the log, the collapse key becomes
-`hash(repo, workflow_id, job_name, infra_kind)` instead: no branch and no commit, so N branches hitting one host
-condition on one `(repo, workflow, job)` collapse onto ONE open issue, while two different kinds on the same job stay
-two issues. The detector is pure string work over the FULL redacted log (no LLM, no I/O) and reads the same text
-`failure_signature` does, not the bounded copy the classifier prompt gets, because a capacity abort is post-steps and
-is exactly what that bound cuts. It ships three deliberately conservative kinds, each requiring an unambiguous phrase:
-`disk-full`, `out-of-memory`, and `runner-unavailable`. An over-broad pattern would merge unrelated code failures
-across branches, so an undetected condition is the preferred failure mode.
+- **A hit on an `open` row** attaches this run (`attach_run`, `add_tests` for any new failing test, a comment naming the
+  run, branch, and failing tests) and mints nothing - no triage, no `claude` call at all.
+- **A hit on a `resolved` row** is a regression: the issue reopens (`set_state(mint.target_state)`), a "regression"
+  comment posts immediately, the store row flips back to `open`, and only THEN does triage run so the analysis lands as
+  a follow-up comment and `AI Agent` is set exactly as a freshly minted issue of that bucket would be.
+- **No row matches** falls through to one legacy lookup (a YouTrack `#Unresolved` full-text search on the pre-store
+  collapse marker, adopting an issue minted before the store existed) and, on a miss there too, the ordinary triage +
+  mint pipeline; a `Created` outcome (or the legacy adoption) is then recorded into the store so the next sighting
+  matches by test overlap instead of searching YouTrack again.
+
+A store read or write failure is logged at `error` and fails the run rather than falling through to a mint, which
+would recreate the very duplicate this issue removes. `mint::mint` itself no longer searches YouTrack or ever declines
+for a duplicate or a resolved issue: dedupe is entirely the caller's job now. The issue body still carries hidden
+`Dedupe-Key:`, `Root-Cause-Key:`, `Branch:`, and `Job:` markers (the pre-store `hash(repo, branch, workflow_id,
+job_name, failure_signature)` collapse key, falling back to `hash(repo, branch, workflow_id, job_name)` with no
+derivable signature), because `ci-failure-reconcile` and the legacy-adoption lookup above still read them.
+
+**CLAUDE-264: a host condition keys without the branch, for the markers and the legacy lookup alike.** The
+`Root-Cause-Key:` marker contains `branch`, which is right for a code failure (two unrelated bugs on two branches must
+not merge, and the auto-fix route needs one branch to deliver onto) and wrong for a failure that is a property of the
+RUNNER. A full disk is identical on every branch and fixable on none of them, so keying on it would mint (or search
+for) a fresh marker per branch. When `infra_failure::detect` recognizes such a condition in the log, the key becomes
+`hash(repo, workflow_id, job_name, infra_kind)` instead: no branch and no commit. The detector is pure string work over
+the FULL redacted log (no LLM, no I/O) and reads the same text `failure_signature` does, not the bounded copy the
+classifier prompt gets, because a capacity abort is post-steps and is exactly what that bound cuts. It ships three
+deliberately conservative kinds, each requiring an unambiguous phrase: `disk-full`, `out-of-memory`, and
+`runner-unavailable`. An over-broad pattern would merge unrelated code failures across branches, so an undetected
+condition is the preferred failure mode. The `ci_failure` store dedupes an infra failure the same way as a code failure
+now (by its `infra:<kind>` fingerprint id, CLAUDE-272's `fingerprint::fingerprint`), so the branch-agnostic collapse
+described here matters mainly to the legacy-adoption fallback and the reconciler markers, not to the primary path.
 
 Nothing about triage buckets, routing, or the auto-fix path changes: an infra failure is still classified and assigned
 the same way, because reclaiming disk is a human action. The issue body carries a hidden `Infra-Kind:` marker, and its
 `Root-Cause-Key:` marker holds the infra key so the CLAUDE-198 duplicate-collapse groups on it too. `Branch:` and
-`Job:` are unchanged, because the CLAUDE-191 reconciler reads them to auto-close. One deliberate exception: the infra
-key does NOT join the never-reopen-resolved check. A host condition recurs and each recurrence needs a new task, so
-suppressing a mint because a months-old disk-full issue was resolved would silently stop reporting the condition
-entirely. The per-run and branch-scoped keys keep their existing resolved behaviour. With no infra kind detected, every
-key and every decision is exactly as it was.
+`Job:` are unchanged, because the CLAUDE-191 reconciler reads them to auto-close.
 
 The listener is multi-source (CLAUDE-87): each `<source>` is a `[webhook.sources.<source>]` config block with its own
 HMAC secret and allow-list, served at its own URL path. One Forgejo org webhook per source means a leaked org secret
@@ -905,7 +908,7 @@ keeps pushing corrective commits until CI passes; after `max_pr_attempts` distin
 Needs Review (a PR comment, the `needs-review` label, and best-effort sets the source issue's State and assignee). The
 `enabled` toggle defaults to `true` and is a master kill switch.
 
-**CLAUDE-153: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings gates whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) queues a corrective fixup PR. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check mints nothing and queues no fixup PR, so the failure stays reported on the original PR for its author to fix in place (a `human_action` failure still mints); with it on, the corrective-fixup behavior above applies, still subject to the CLAUDE-149 open-PR suppression. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
+**CLAUDE-153/CLAUDE-273: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies (still subject to the CLAUDE-149 open-PR suppression, which is a separate gate that DOES still suppress the mint itself). This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
 
 A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then
 the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the
@@ -944,9 +947,9 @@ and the delivery instruction: commit on a fresh `chore/<kind>-<short-sha>` branc
 configured PR strategy (CLAUDE-103), never a direct push to main. The `has_open_pr == true` case is handled by CLAUDE-149
 instead: this auto-fix path applies only when there is no open PR. When a PR is already open the webhook `code_fix` route
 is suppressed (a human's PR is left to its author), and `forgejo-ci-fix` separately fixes the bot's own failing PRs,
-iterating until green or flagging Needs Review. Repeats of the same failure group by the CLAUDE-190 root-cause key
-(`hash(repo, branch, workflow_id, job_name, failure_signature)`), not the commit SHA, so an auto-fix failure that recurs
-on a later commit lands on the same open issue.
+iterating until green or flagging Needs Review. Repeats of the same failure group by the CLAUDE-273 `ci_failure` store's
+failing-test overlap, not the commit SHA, so an auto-fix failure that recurs on a later commit attaches to the same
+open issue instead of minting a sibling.
 
 ### Deep CI-failure analysis (CLAUDE-189)
 

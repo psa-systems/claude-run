@@ -2,32 +2,38 @@
 //! epic CLAUDE-36).
 //!
 //! Turns a triaged failure ([`crate::triage::Triage`]) plus its
-//! `action_run_failure` metadata and redacted job log into exactly one YouTrack
-//! task issue, routed to the repo's own YouTrack project (with `CLAUDE` as the
-//! fallback per the 2026-05-31 decision). The pipeline never duplicates and never
-//! reopens a resolved issue:
+//! `action_run_failure` metadata and redacted job log into a YouTrack task
+//! issue, routed to the repo's own YouTrack project (with `CLAUDE` as the
+//! fallback per the 2026-05-31 decision). CLAUDE-273: dedupe by failing-test
+//! overlap now happens in the caller, against the `ci_failure` store, before
+//! `mint` is ever called for a failure the store already tracks; `mint` itself
+//! only creates:
 //!
 //! ```text
 //! route   -> bucket 3 (transient) mints nothing.
 //! guard   -> loop safety: a failing run triggered by a bot login (the CI-fix
 //!            bot's own fix PR) mints nothing; per-PR attempt cap and daily cap
 //!            (the DEV-335 caps, reused not re-derived) gate the rest.
-//! dedupe  -> a resolved issue for the key is never reopened; an open issue for
-//!            the key is left alone (no second issue). CLAUDE-264: a failure the
-//!            log shows is a RUNNER condition collapses on a branch-agnostic
-//!            infra key instead, and that key alone is exempt from the
-//!            never-reopen check, because a host condition recurs.
 //! mint    -> create in the mapped project, State=To do, attach the redacted log,
 //!            then route the bucket:
-//!              bucket 1 (code_fix)    -> AI Agent=Queued (forgejo-ci-fix CLAUDE-29
-//!                                        picks it up and opens the fix PR)
+//!              bucket 1 (code_fix)    -> AI Agent=Queued when the webhook's
+//!                                        `auto_fix` toggle is on (forgejo-ci-fix
+//!                                        CLAUDE-29 then picks it up and opens
+//!                                        the fix PR); off, the issue is still
+//!                                        created with no AI Agent write.
 //!              bucket 2 (human_action)-> assign a human (no AI Agent, no PR)
 //! ```
 //!
+//! The `Dedupe-Key:` / `Root-Cause-Key:` / `Branch:` / `Job:` body markers are
+//! still written (`ci-failure-reconcile` reads them until it is retired onto
+//! the store too), but nothing in this module searches YouTrack for them
+//! anymore.
+//!
 //! The minting logic is pure / trait-driven so it is unit-tested against a stub
 //! [`IssueTracker`] with no real `yt` calls. Wiring the chain (log fetch ->
-//! triage -> mint) into [`crate::web::webhooks::consume_events`] is the daemon
-//! integration step: this module delivers the engine and its types.
+//! store lookup -> triage -> mint) into [`crate::web::webhooks::consume_events`]
+//! is the daemon integration step: this module delivers the engine and its
+//! types.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -97,10 +103,12 @@ pub struct MintRequest<'a> {
     /// set, the auto-fix (queue-for-fix) route is suppressed so the PR author
     /// owns the fix; a human-action failure still mints.
     pub has_open_pr: bool,
-    /// CLAUDE-153: the webhook-scoped auto-fix toggle (`[webhook].auto_fix`).
-    /// When `false`, a queue-for-fix route (`code_fix` / `auto_fix`) is
-    /// suppressed so no corrective fixup PR is queued and the failure stays
-    /// reported on the original PR; a human-action failure still mints.
+    /// CLAUDE-153/CLAUDE-273: the webhook-scoped auto-fix toggle
+    /// (`[webhook].auto_fix`). It no longer decides whether an issue is
+    /// minted (every code failure is filed): `false` still creates a
+    /// `code_fix` / `auto_fix` issue but leaves `AI Agent` unset, so the
+    /// failure is reported without queuing a corrective fixup PR; `true` sets
+    /// `AI Agent = cfg.queued_value` as before.
     pub auto_fix_enabled: bool,
 }
 
@@ -140,22 +148,10 @@ pub enum MintOutcome {
     /// bot's. Only the queue-for-fix buckets are suppressed; a human-action
     /// failure on an open PR still mints.
     SkippedOpenPr,
-    /// CLAUDE-153: the webhook-scoped auto-fix toggle (`[webhook].auto_fix`) is
-    /// off, so a queue-for-fix bucket (`code_fix` / `auto_fix`) mints nothing
-    /// and queues no fixup PR; the failure stays on the original PR. Only the
-    /// queue-for-fix buckets are suppressed; a human-action failure still mints.
-    SkippedAutoFixDisabled,
     /// The per-key attempt cap was already reached.
     SkippedAttemptCap,
     /// The daily run cap was already reached.
     SkippedDailyCap,
-    /// An open issue already exists for this key: do not duplicate.
-    SkippedDuplicateOpen { existing: String },
-    /// A resolved issue exists for this key: never reopen.
-    SkippedResolved { existing: String },
-    /// CLAUDE-100: a private-repo repeat of the same `(repo, workflow_id)`
-    /// commented onto the existing OPEN issue instead of minting a sibling.
-    AssociatedWithOpen { existing: String },
 }
 
 /// How a (non-transient) bucket routes once an issue is minted.
@@ -191,6 +187,15 @@ fn route(bucket: TriageBucket) -> Option<Route> {
 /// or a failing fix recurses.
 pub fn is_bot_loop(trigger_user: &str, cfg: &MintConfig) -> bool {
     cfg.bot_logins.iter().any(|b| b == trigger_user)
+}
+
+/// CLAUDE-273: whether `bucket` routes to the queue-for-fix path (`code_fix` /
+/// `auto_fix`), i.e. whether a freshly-created issue of this bucket would get
+/// `AI Agent` set (subject to the webhook `auto_fix` toggle). Exposed so the
+/// webhook consumer's reopen-on-regression path can set `AI Agent` exactly as
+/// a new issue of that bucket would, without duplicating [`route`]'s table.
+pub(crate) fn queues_for_fix(bucket: TriageBucket) -> bool {
+    route(bucket).is_some_and(|r| r.queue_for_fix)
 }
 
 /// How a mint's destination project was chosen, surfaced in the journal so a
@@ -443,6 +448,28 @@ fn infra_marker(req: &MintRequest) -> Option<String> {
         .map(|kind| marker(&[req.repo, req.workflow_id, req.job_name, kind]))
 }
 
+/// CLAUDE-273: the same collapse key [`root_cause_marker`] / [`infra_marker`]
+/// compute from a [`MintRequest`], but over plain arguments so the webhook
+/// consumer's legacy-adoption lookup (a `ci_failures` store miss, searched
+/// against YouTrack for an issue minted before the store existed) can build it
+/// without first assembling a triage verdict it does not have yet.
+pub(crate) fn legacy_collapse_key(
+    repo: &str,
+    branch: &str,
+    workflow_id: &str,
+    job_name: &str,
+    failure_signature: Option<&str>,
+    infra_kind: Option<&str>,
+) -> String {
+    if let Some(kind) = infra_kind {
+        return marker(&[repo, workflow_id, job_name, kind]);
+    }
+    match failure_signature {
+        Some(sig) => marker(&[repo, branch, workflow_id, job_name, sig]),
+        None => marker(&[repo, branch, workflow_id, job_name]),
+    }
+}
+
 /// CLAUDE-190: extract a deterministic failure signature from a redacted log,
 /// or `None` when the log carries no recognizable diagnostic line. Pure string
 /// work (no LLM, no I/O): the first diagnostic line, normalized so the same root
@@ -508,7 +535,11 @@ fn mask_digit_runs(s: &str) -> String {
 
 /// Mint (or decline to mint) a YouTrack issue from a triaged failure. Pure
 /// decision flow over the [`IssueTracker`] trait; see the module docs for the
-/// ordering (route -> loop safety -> caps -> dedupe -> create).
+/// ordering (route -> loop safety -> caps -> create). CLAUDE-273: dedupe by
+/// failing-test overlap now happens in the caller (`src/web/webhooks.rs`,
+/// against the `ci_failure` store) BEFORE this is ever called, so `mint` only
+/// creates; it no longer searches YouTrack or ever declines for a duplicate or
+/// a resolved issue.
 pub fn mint(
     tracker: &dyn IssueTracker,
     cfg: &MintConfig,
@@ -520,14 +551,6 @@ pub fn mint(
     let Some(route) = route(req.triage.bucket) else {
         return Ok(MintOutcome::SkippedTransient);
     };
-
-    // CLAUDE-153: the webhook-scoped auto-fix toggle. When off, a queue-for-fix
-    // route mints nothing and queues no corrective fixup PR, leaving the failure
-    // reported on the original PR for its author (the CLAUDE-152 behavior). Only
-    // the queue-for-fix buckets are gated; a human-action failure still mints.
-    if !req.auto_fix_enabled && route.queue_for_fix {
-        return Ok(MintOutcome::SkippedAutoFixDisabled);
-    }
 
     // CLAUDE-149: a failing open PR is the author's to fix. Suppress the auto-fix
     // (queue-for-fix) route for it so no corrective PR is queued; a human-action
@@ -549,48 +572,15 @@ pub fn mint(
         return Ok(MintOutcome::SkippedDailyCap);
     }
 
-    // Dedupe (CLAUDE-190). Three keys: the per-run `primary` (webhook-redelivery
-    // idempotency), the commit-scoped `secondary` (back-compat only), and the
-    // cross-run `root_cause` (the collapse). A resolved issue for ANY key is
-    // never reopened.
+    // The markers below no longer drive a dedupe decision (CLAUDE-273 moved
+    // that to the `ci_failure` store), but `Dedupe-Key:` / `Root-Cause-Key:`
+    // are still written into the body because `ci-failure-reconcile` reads
+    // them until it is retired onto the store too.
     let primary = primary_marker(req);
     let secondary = secondary_marker(req);
     let root_cause = root_cause_marker(req);
-    for m in [&primary, &secondary, &root_cause] {
-        if let Some(existing) = find_first(tracker, &format!("{m} #Resolved"))? {
-            return Ok(MintOutcome::SkippedResolved { existing });
-        }
-    }
-
-    // CLAUDE-264: for an infrastructure failure the branch-agnostic infra marker
-    // REPLACES the root-cause key as the cross-run collapse key (and as the
-    // `Root-Cause-Key:` the CLAUDE-198 duplicate-collapse groups on). It does
-    // NOT join the resolved loop above: a host condition recurs, and each
-    // recurrence needs a new task, so suppressing a mint because a months-old
-    // disk-full issue was resolved would silently stop reporting the condition.
-    // The other three keys keep their existing never-reopen behaviour.
     let infra = infra_marker(req);
     let collapse = infra.as_deref().unwrap_or(root_cause.as_str());
-
-    // Per-run redelivery of the identical run: idempotency, no second issue.
-    if let Some(existing) = find_first(tracker, &format!("{primary} #Unresolved"))? {
-        return Ok(MintOutcome::SkippedDuplicateOpen { existing });
-    }
-
-    // Cross-run collapse: an OPEN issue for the collapse key means the same
-    // failing job / branch / signature already has a task (a later commit that
-    // fails the same way), or, for an infra failure, the same host condition on
-    // the same job on ANY branch. Append this run to it and mint nothing; a
-    // different signature (or a different infra kind) yields a different key and
-    // mints a sibling. The comment carries
-    // this run's own per-run Dedupe-Key so a redelivery of THIS run full-text
-    // matches and hits the per-run `SkippedDuplicateOpen` path above (no second
-    // comment). No issue is created, so the caps ledger does not advance.
-    if let Some(existing) = find_first(tracker, &format!("{collapse} #Unresolved"))? {
-        let body = build_association_comment(req, &primary, collapse);
-        tracker.comment(&existing, &body)?;
-        return Ok(MintOutcome::AssociatedWithOpen { existing });
-    }
 
     // Create the issue in the mapped project, bucket 2 pre-assigned to a human.
     // Routing order: explicit override, the project's VCS integration, fallback.
@@ -614,9 +604,11 @@ pub fn mint(
     }
 
     // State first, then the authoritative AI Agent write last (bucket 1 only):
-    // forgejo-ci-fix only picks the issue up once it is fully formed.
+    // forgejo-ci-fix only picks the issue up once it is fully formed. CLAUDE-273:
+    // `auto_fix_enabled` now decides only this write, never whether the issue
+    // gets created at all.
     tracker.set_state(&key, &cfg.target_state)?;
-    if route.queue_for_fix {
+    if route.queue_for_fix && req.auto_fix_enabled {
         tracker.set_field(&key, &cfg.ai_agent_field, &cfg.queued_value)?;
     }
 
@@ -630,7 +622,10 @@ pub fn mint(
 
 /// First matching issue's `idReadable` for `query`, or `None` when the query
 /// matches nothing. Reuses the tracker's `yt list --query=<q> --json` surface.
-fn find_first(tracker: &dyn IssueTracker, query: &str) -> Result<Option<String>> {
+/// CLAUDE-273: kept `pub(crate)` for the webhook consumer's legacy adoption
+/// lookup (a `ci_failures` miss falls back to this one YouTrack full-text
+/// search, for an issue minted before the store existed).
+pub(crate) fn find_first(tracker: &dyn IssueTracker, query: &str) -> Result<Option<String>> {
     let issues = tracker.list_queued(query)?;
     Ok(issues.into_iter().find_map(|v| {
         v.get("idReadable")
@@ -809,26 +804,6 @@ fn build_auto_fix_description(
     lines.join("\n")
 }
 
-/// CLAUDE-190: the comment posted onto an existing open issue when the same
-/// root cause fails again on a later commit. Carries the new run's number, short
-/// SHA, and run link, plus this run's own per-run `Dedupe-Key:` line (the
-/// per-run `primary` and the `collapse` key) so a redelivery of THIS run
-/// full-text matches and hits the per-run duplicate path (no second comment).
-fn build_association_comment(req: &MintRequest, primary: &str, collapse: &str) -> String {
-    let short_sha = req.commit_sha.chars().take(8).collect::<String>();
-    [
-        format!(
-            "`{}` failed again on `{}` (run #{}, {}).",
-            req.workflow_id, req.repo, req.index_in_repo, short_sha
-        ),
-        format!("- Run: {}", req.html_url),
-        String::new(),
-        "<!-- claude-run dedupe markers; do not edit -->".to_string(),
-        format!("Dedupe-Key: {primary} {collapse}"),
-    ]
-    .join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,11 +834,6 @@ mod tests {
                 vcs_responses: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
             }
-        }
-        fn with_search(mut self, query: &str, json_array: &str) -> Self {
-            self.searches
-                .insert(query.to_string(), json_array.to_string());
-            self
         }
         /// One canned `vcs_repo_map` result, reused for every call.
         fn with_vcs(self, entries: Vec<VcsMapEntry>) -> Self {
@@ -1381,33 +1351,38 @@ mod tests {
     // ---- CLAUDE-153: the webhook-scoped auto-fix toggle -------------------
 
     #[test]
-    fn auto_fix_off_suppresses_the_queue_for_fix_mint() {
-        // With the webhook auto-fix toggle off, a code-fix failure mints nothing
-        // and queues no fixup PR (CLAUDE-152): the failure stays on the PR.
+    fn auto_fix_off_still_creates_the_issue_but_leaves_ai_agent_unset() {
+        // CLAUDE-273: the webhook auto-fix toggle no longer decides whether an
+        // issue is minted (every code failure is filed); off, a code-fix
+        // failure still creates an issue but `AI Agent` is left unset, so no
+        // fixup PR is queued (CLAUDE-152: the failure stays on the PR).
         let t = triage(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let mut r = req("fabrikam/forgejo-cli", &t, "alice");
         r.auto_fix_enabled = false;
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert_eq!(out, MintOutcome::SkippedAutoFixDisabled);
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
+        let calls = tracker.calls();
+        assert!(calls.iter().any(|c| c.starts_with("create")), "{calls:?}");
         assert!(
-            tracker.calls().is_empty(),
-            "no yt calls when auto-fix is off: {:?}",
-            tracker.calls()
+            !calls.iter().any(|c| c.contains("AI Agent")),
+            "no AI Agent write when auto-fix is off: {calls:?}"
         );
     }
 
     #[test]
-    fn auto_fix_off_also_suppresses_the_auto_fix_bucket() {
+    fn auto_fix_off_also_leaves_the_auto_fix_bucket_unqueued() {
         // The `auto_fix` bucket routes like a code-fix (queue-for-fix), so the
-        // toggle gates it too: no mint, no queued fixup.
+        // toggle gates the `AI Agent` write for it too: the issue still mints.
         let t = auto_fix_triage(cargo_fmt_detail());
         let tracker = StubTracker::new();
         let mut r = req("fabrikam/forgejo-cli", &t, "alice");
         r.auto_fix_enabled = false;
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert_eq!(out, MintOutcome::SkippedAutoFixDisabled);
-        assert!(tracker.calls().is_empty(), "{:?}", tracker.calls());
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
+        let calls = tracker.calls();
+        assert!(calls.iter().any(|c| c.starts_with("create")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("AI Agent")), "{calls:?}");
     }
 
     #[test]
@@ -1531,48 +1506,7 @@ mod tests {
         assert!(tracker.calls().is_empty());
     }
 
-    // ---- AC 2: dedupe -----------------------------------------------------
-
-    #[test]
-    fn open_issue_for_key_is_not_duplicated() {
-        let t = triage(TriageBucket::CodeFix);
-        let r = req("owner/repo", &t, "alice");
-        let primary = primary_marker(&r);
-        let tracker = StubTracker::new().with_search(
-            &format!("{primary} #Unresolved"),
-            r#"[{"idReadable":"CLAUDE-50","summary":"already open"}]"#,
-        );
-        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert_eq!(
-            out,
-            MintOutcome::SkippedDuplicateOpen {
-                existing: "CLAUDE-50".to_string()
-            }
-        );
-        // Searched, but never created.
-        assert!(!tracker.calls().iter().any(|c| c.starts_with("create")));
-    }
-
-    #[test]
-    fn resolved_issue_for_key_is_never_reopened() {
-        let t = triage(TriageBucket::CodeFix);
-        let r = req("owner/repo", &t, "alice");
-        let primary = primary_marker(&r);
-        let tracker = StubTracker::new().with_search(
-            &format!("{primary} #Resolved"),
-            r#"[{"idReadable":"CLAUDE-40","summary":"done last week"}]"#,
-        );
-        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert_eq!(
-            out,
-            MintOutcome::SkippedResolved {
-                existing: "CLAUDE-40".to_string()
-            }
-        );
-        assert!(!tracker.calls().iter().any(|c| c.starts_with("create")));
-    }
-
-    // ---- CLAUDE-190: root-cause cross-run collapse ------------------------
+    // ---- CLAUDE-273: mint no longer dedupes; it only creates --------------
 
     /// A request carrying a derived failure signature (the common case).
     fn req_with_sig<'a>(
@@ -1587,10 +1521,11 @@ mod tests {
     }
 
     #[test]
-    fn root_cause_collapses_repeats_across_commits() {
-        // AC 4: a later commit that fails the same job on the same branch with
-        // the same signature finds the OPEN root-cause issue, appends a
-        // run-association comment, and mints nothing (regardless of commit SHA).
+    fn a_repeat_with_no_prior_yt_search_still_creates() {
+        // CLAUDE-273: dedupe by failing-test overlap now happens in the caller
+        // against the `ci_failure` store, before `mint` is ever reached, so
+        // `mint` issues no YouTrack search at all and always creates when the
+        // gates above it (bucket, open-PR, bot-loop, caps) let it through.
         let t = triage(TriageBucket::CodeFix);
         let r = req_with_sig(
             "owner/repo",
@@ -1598,128 +1533,37 @@ mod tests {
             "alice",
             "assertion failed: expected # got #",
         );
-        let root_cause = root_cause_marker(&r);
-        let tracker = StubTracker::new().with_search(
-            &format!("{root_cause} #Unresolved"),
-            r#"[{"idReadable":"CLAUDE-60","summary":"CI failure: ci.yml"}]"#,
-        );
+        let tracker = StubTracker::new();
         let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert_eq!(
-            out,
-            MintOutcome::AssociatedWithOpen {
-                existing: "CLAUDE-60".to_string()
-            }
-        );
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
         let calls = tracker.calls();
         assert!(
-            !calls.iter().any(|c| c.starts_with("create")),
-            "no second issue minted: {calls:?}"
-        );
-        // The comment carries this run's per-run primary and the root-cause key.
-        let primary = primary_marker(&r);
-        assert!(
-            calls.iter().any(|c| c.starts_with("comment CLAUDE-60 |")
-                && c.contains(&primary)
-                && c.contains(&root_cause)),
-            "comment carries per-run + root-cause keys: {calls:?}"
+            !calls.iter().any(|c| c.starts_with("list")),
+            "mint issues no dedupe search: {calls:?}"
         );
     }
 
     #[test]
-    fn different_signatures_on_same_job_mint_two_issues() {
-        // AC 5: same branch / workflow / job but a DIFFERENT signature is a
-        // different root cause -> a distinct key -> a second issue is minted.
+    fn different_signatures_on_same_job_yield_distinct_root_cause_keys() {
+        // The root-cause marker is still computed (it rides the `Dedupe-Key:`
+        // / `Root-Cause-Key:` body markers the reconciler reads), and a
+        // different signature on the same job still yields a distinct key.
         let t = triage(TriageBucket::CodeFix);
-        // The open issue is keyed on signature A.
         let a = req_with_sig("owner/repo", &t, "alice", "error[e#]: mismatched types");
-        let key_a = root_cause_marker(&a);
-        // The new failure carries signature B, so its root-cause search misses.
         let b = req_with_sig("owner/repo", &t, "alice", "error[e#]: cannot find value");
-        let tracker = StubTracker::new().with_search(
-            &format!("{key_a} #Unresolved"),
-            r#"[{"idReadable":"CLAUDE-60"}]"#,
-        );
-        let out = mint(&tracker, &cfg(), &route_cache(), &b, &caps()).unwrap();
-        assert!(
-            matches!(out, MintOutcome::Created { .. }),
-            "a different signature mints a sibling: {out:?}"
-        );
-        assert_ne!(key_a, root_cause_marker(&b), "distinct keys per signature");
+        assert_ne!(root_cause_marker(&a), root_cause_marker(&b));
     }
 
     #[test]
-    fn resolved_root_cause_key_is_never_reopened() {
-        // AC 6: a RESOLVED issue for the root-cause key is not reopened.
-        let t = triage(TriageBucket::CodeFix);
-        let r = req_with_sig("owner/repo", &t, "alice", "panicked at boom");
-        let root_cause = root_cause_marker(&r);
-        let tracker = StubTracker::new().with_search(
-            &format!("{root_cause} #Resolved"),
-            r#"[{"idReadable":"CLAUDE-40"}]"#,
-        );
-        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert_eq!(
-            out,
-            MintOutcome::SkippedResolved {
-                existing: "CLAUDE-40".to_string()
-            }
-        );
-        assert!(!tracker.calls().iter().any(|c| c.starts_with("create")));
-    }
-
-    #[test]
-    fn no_signature_fallback_key_still_collapses_the_storm() {
-        // AC 3 fallback: with no derivable signature the key degrades to
-        // (repo, branch, workflow, job), which still collapses a logless
-        // "branch is broken" storm onto one open issue.
+    fn no_signature_fallback_key_is_job_scoped() {
+        // With no derivable signature the key degrades to
+        // (repo, branch, workflow, job), not the commit.
         let t = triage(TriageBucket::HumanAction);
         let r = req("owner/repo", &t, "alice"); // failure_signature: None
-        let root_cause = root_cause_marker(&r);
-        // The fallback key is job-scoped, not commit-scoped.
         assert_eq!(
-            root_cause,
+            root_cause_marker(&r),
             marker(&["owner/repo", "main", "ci.yml", "check"])
         );
-        let tracker = StubTracker::new().with_search(
-            &format!("{root_cause} #Unresolved"),
-            r#"[{"idReadable":"CLAUDE-60"}]"#,
-        );
-        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert_eq!(
-            out,
-            MintOutcome::AssociatedWithOpen {
-                existing: "CLAUDE-60".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn per_run_redelivery_takes_precedence_over_root_cause_association() {
-        // Ordering: an open per-run match short-circuits before the root-cause
-        // search, so an exact-run redelivery never comments a second time.
-        let t = triage(TriageBucket::CodeFix);
-        let r = req_with_sig("owner/repo", &t, "alice", "boom");
-        let primary = primary_marker(&r);
-        let root_cause = root_cause_marker(&r);
-        let tracker = StubTracker::new()
-            .with_search(
-                &format!("{primary} #Unresolved"),
-                r#"[{"idReadable":"CLAUDE-50"}]"#,
-            )
-            .with_search(
-                &format!("{root_cause} #Unresolved"),
-                r#"[{"idReadable":"CLAUDE-60"}]"#,
-            );
-        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert_eq!(
-            out,
-            MintOutcome::SkippedDuplicateOpen {
-                existing: "CLAUDE-50".to_string()
-            }
-        );
-        let calls = tracker.calls();
-        assert!(!calls.iter().any(|c| c.starts_with("comment")), "{calls:?}");
-        assert!(!calls.iter().any(|c| c.starts_with("create")), "{calls:?}");
     }
 
     // ---- CLAUDE-190: signature extraction + normalization -----------------
@@ -1820,10 +1664,11 @@ mod tests {
     }
 
     #[test]
-    fn two_branches_with_the_same_infra_kind_mint_one_issue() {
-        // The live GAMMA case: run on branch A minted the issue; the run on
-        // branch B finds it through the branch-agnostic key, comments, and
-        // creates nothing.
+    fn two_branches_with_the_same_infra_kind_both_create_with_no_search() {
+        // CLAUDE-273: `mint` itself no longer collapses cross-branch infra
+        // repeats onto one issue via a YouTrack search (that dedupe now lives
+        // in the caller, against the `ci_failure` store); each call here
+        // creates independently and issues no dedupe search.
         let t = triage(TriageBucket::HumanAction);
         let first = req_infra(
             &t,
@@ -1831,77 +1676,26 @@ mod tests {
             "fix/GAMMA-1041-invoice-module-gate",
             "aaaa1111",
         );
-        let infra = infra_marker(&first).unwrap();
         let second = req_infra(&t, "disk-full", "feat/GAMMA-1126-kb-provenance", "bbbb2222");
-        let tracker = StubTracker::new().with_search(
-            &format!("{infra} #Unresolved"),
-            r#"[{"idReadable":"GAMMA-1099"}]"#,
-        );
+        assert_eq!(infra_marker(&first), infra_marker(&second));
+        let tracker = StubTracker::new();
         let out = mint(&tracker, &cfg(), &route_cache(), &second, &caps()).unwrap();
-        assert_eq!(
-            out,
-            MintOutcome::AssociatedWithOpen {
-                existing: "GAMMA-1099".to_string()
-            }
-        );
-        let calls = tracker.calls();
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
         assert!(
-            !calls.iter().any(|c| c.starts_with("create")),
-            "no second issue minted: {calls:?}"
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|c| c.starts_with("comment GAMMA-1099 |") && c.contains(&infra)),
-            "run-association comment carries the infra key: {calls:?}"
+            !tracker.calls().iter().any(|c| c.starts_with("list")),
+            "mint issues no dedupe search: {:?}",
+            tracker.calls()
         );
     }
 
     #[test]
-    fn different_infra_kinds_on_the_same_job_mint_two_issues() {
-        // A full disk and an OOM kill are separate conditions needing separate
-        // tasks, even on the same job and the same branch.
+    fn different_infra_kinds_on_the_same_job_yield_distinct_markers() {
+        // A full disk and an OOM kill are separate conditions and still key
+        // differently, even on the same job and the same branch.
         let t = triage(TriageBucket::HumanAction);
         let disk = req_infra(&t, "disk-full", "main", "aaaa1111");
         let oom = req_infra(&t, "out-of-memory", "main", "aaaa1111");
         assert_ne!(infra_marker(&disk), infra_marker(&oom));
-        let tracker = StubTracker::new().with_search(
-            &format!("{} #Unresolved", infra_marker(&disk).unwrap()),
-            r#"[{"idReadable":"GAMMA-1099"}]"#,
-        );
-        let out = mint(&tracker, &cfg(), &route_cache(), &oom, &caps()).unwrap();
-        assert!(
-            matches!(out, MintOutcome::Created { .. }),
-            "a different infra kind mints a sibling: {out:?}"
-        );
-    }
-
-    #[test]
-    fn a_resolved_infra_issue_does_not_suppress_a_later_mint() {
-        // Deliberate exception to the never-reopen rule: a host condition
-        // recurs, and each recurrence needs its own task. Suppressing on a
-        // months-old resolved disk-full issue would silently stop reporting it.
-        let t = triage(TriageBucket::HumanAction);
-        let r = req_infra(&t, "disk-full", "main", "aaaa1111");
-        let infra = infra_marker(&r).unwrap();
-        let tracker = StubTracker::new().with_search(
-            &format!("{infra} #Resolved"),
-            r#"[{"idReadable":"GAMMA-741"}]"#,
-        );
-        let out = mint(&tracker, &cfg(), &route_cache(), &r, &caps()).unwrap();
-        assert!(
-            matches!(out, MintOutcome::Created { .. }),
-            "a resolved infra issue never suppresses the next occurrence: {out:?}"
-        );
-        // The infra key is never searched with #Resolved at all.
-        assert!(
-            !tracker
-                .calls()
-                .iter()
-                .any(|c| c == &format!("list {infra} #Resolved")),
-            "{:?}",
-            tracker.calls()
-        );
     }
 
     #[test]
