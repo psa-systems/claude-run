@@ -299,6 +299,12 @@ impl Daemon {
         // own channel, drained by `consume_pr_events`, which closes (or leaves
         // open) the issue a merged fix PR references.
         let (pr_tx, pr_rx) = mpsc::channel::<crate::web::webhooks::VerifiedPullRequestEvent>(64);
+        // CLAUDE-278: verified `success`/`recover` Action-run deliveries are
+        // emitted onto their own channel, drained by
+        // `consume_action_success_events`, which merges a recorded agent PR
+        // whose action has automerge enabled once its checks go green.
+        let (success_tx, success_rx) =
+            mpsc::channel::<crate::web::webhooks::VerifiedActionSuccessEvent>(64);
         // CLAUDE-101: the listener routes against the live config + limiter map
         // shared with LiveSettings, so a Settings save is routable immediately.
         let webhook_state = crate::web::webhooks::WebhookState::from_shared(
@@ -309,7 +315,8 @@ impl Daemon {
             webhook_tx,
         )
         .with_readiness(readiness.clone())
-        .with_pr_events(pr_tx);
+        .with_pr_events(pr_tx)
+        .with_success_events(success_tx);
         // CLAUDE-220: the `/claude` comment listener is a SECOND endpoint with
         // its own config section, write-scoped token, and Pause switch. It shares
         // the CI-failure listener's replay-store INSTANCE (so one delivery id
@@ -404,14 +411,20 @@ impl Daemon {
             &webhook_log_dir,
             &self.paths,
         );
-        // CLAUDE-277: the pull-request consumer shares the same MintContext
-        // (backend, mint config, commit-runs client) as the failure consumer;
-        // built once, cloned for the second task.
+        // CLAUDE-277/278: the pull-request and success-event consumers share
+        // the same MintContext (backend, mint config, commit-runs client) as
+        // the failure consumer; built once, cloned for each extra task.
         let pr_consumer = tokio::spawn(crate::web::webhooks::consume_pr_events(
             pr_rx,
             pool.clone(),
             mint_ctx.clone(),
             settings.webhook_handle(),
+            keygate.clone(),
+        ));
+        let success_consumer = tokio::spawn(crate::web::webhooks::consume_action_success_events(
+            success_rx,
+            pool.clone(),
+            mint_ctx.clone(),
             keygate.clone(),
         ));
         let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(
@@ -607,6 +620,7 @@ impl Daemon {
         }
         webhook_consumer.abort();
         pr_consumer.abort();
+        success_consumer.abort();
         comment_consumer.abort();
         // pidfile lock released on drop
         if unix_socket {
