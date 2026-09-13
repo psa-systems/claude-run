@@ -1080,6 +1080,7 @@ mod tests {
             error: String::new(),
             transient: false,
             timed_out: false,
+            login_required: false,
         }
     }
 

@@ -39,10 +39,17 @@
   {% endif %}
 
   <h4 style="margin: 16px 0 4px;">Claude
-    {% if auth.claude_ready %}<span class="badge ok">authenticated</span>
+    {% if auth.claude_login_expired %}<span class="badge bad">login expired</span>
+    {% else if auth.claude_ready %}<span class="badge ok">authenticated</span>
     {% else %}<span class="badge bad">required</span>{% endif %}
   </h4>
-  {% if !auth.claude_ready %}
+  {% if auth.claude_login_expired %}
+  <div class="card" style="border-color: var(--bad); margin: 8px 0;">
+    <strong style="color: var(--bad);">Actions are paused: the Claude login needs renewing.</strong>
+    {% if let Some(m) = auth.claude_login_message %}<span class="dim">{{ m }}</span>{% endif %}
+    <span class="dim">Sign in again below to resume.</span>
+  </div>
+  {% else if !auth.claude_ready %}
   <div class="card" style="border-color: var(--bad); margin: 8px 0;">
     <strong style="color: var(--bad);">Actions are not running.</strong>
     <span class="dim">The runner spawns <code>claude</code> for every job, so with no Claude

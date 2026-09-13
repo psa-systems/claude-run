@@ -757,6 +757,26 @@ defaults for everything else, including the daemon's own polling. An operator wh
 `claude auth login`, `yt auth login` and `fj auth add-key` inside the container; leaving the Auth card empty writes
 nothing and does not disturb those files.
 
+**An expired or revoked login is a second, independent not-ready state (CLAUDE-269): `login_required`, distinct from
+the `no_credential` state above.** `.credentials.json` stays on disk when a login expires, so the credential check
+alone keeps answering ready; the runner instead notices the CLI itself saying so. Detection matches only the CLI's
+structured `error: "authentication_failed"` field, never its human-readable wording (which is reworded between
+releases): every `claude` invocation is scanned for it (a terminal `result`/`assistant` event, or three repeated
+`system`/`api_retry` events, whichever comes first, so a dead login is caught well below `claude_timeout_seconds`
+rather than exhausting it), and a background probe additionally runs `claude auth status --json` at startup, every 10
+minutes while ready, and every 60 seconds while login-required (skipped entirely on the `no_credential` state, since
+there is nothing to probe yet). A spawn failure, a timeout, or unparseable probe output is logged and changes
+nothing: it is neither evidence of a login nor of its absence. While login-required, exactly like `no_credential`,
+the scheduler dispatches nothing, the trigger endpoint answers `409`, the CI-triage webhook accepts and drops each
+delivery (recording why as a `run_events` row), and the `/claude` comment webhook replies on the thread naming the
+reason instead of running anything; unlike a global pause, no job spends an attempt because of it. A run already in
+flight stops picking up new jobs and closes with `exit::LOGIN_REQUIRED` (8), distinct from `exit::PAUSED`: an operator
+cancel wins over both, and a global pause wins over login-required when both hold. The dashboard-and-every-page banner,
+the Settings Auth card (badged `login expired`, with the CLI's own message), and `/api/status`'s `not_ready_kind` /
+`login_required_since` fields all cover this state alongside `no_credential`. It clears with no restart the moment any
+of the following happens: a brokered sign-in completes, an Anthropic API key is saved, or the status probe reports
+`loggedIn: true`.
+
 ### Secrets store
 
 Auth (and every action `token_ref`) reads from an encrypted secrets store. Two things are required before

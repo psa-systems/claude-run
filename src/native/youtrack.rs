@@ -2556,6 +2556,131 @@ mod tests {
         assert!(!rendered.contains("oauth2:"), "{rendered}");
     }
 
+    /// CLAUDE-269 acceptance criterion 3: a job whose invocation hits the
+    /// authentication failure spends no attempt against
+    /// `max_attempts_per_key` and runs no finalize, through the native
+    /// YouTrack `process_job` pipeline (not merely the generic scripted one in
+    /// `job.rs`). The pre steps (field/state writes, clone) run for real
+    /// against a stub `yt` and a local git repo, so the transient outcome is
+    /// reached exactly as production does, then claude's stub reports the
+    /// structured auth failure.
+    #[tokio::test]
+    async fn process_job_hitting_auth_failure_is_transient_and_skips_finalize() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A real local repo to clone, so `run_pre`'s git clone succeeds with no
+        // network. `clone_url_for` falls back to the job's own (unauthenticated)
+        // URL because the stub CliBackend has no forge key store configured.
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t.example"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(Command::new("git")
+                .args(&args)
+                .current_dir(&origin)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(&origin)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&origin)
+            .status()
+            .unwrap()
+            .success());
+
+        let stub = tmp.path().join("claude-stub.sh");
+        crate::testutil::write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"assistant\",\"error\":\"authentication_failed\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"OAuth session expired\"}]}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":true,\"error\":\"authentication_failed\"}'\n\
+             exit 1\n",
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("yt", &["issue", "get-field", "MK-16", "AI Agent"], "Queued")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    "",
+                )
+                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], ""),
+        );
+        let backend = CliBackend::new(runner.clone());
+
+        let mut j = job();
+        j.clone_url = format!("file://{}", origin.display());
+        let mut s = src();
+        s.dependencies.enabled = false;
+
+        let pool = mem_pool().await;
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+        };
+        let cancel = CancellationToken::new();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            &pool,
+            &claude,
+            &backend,
+            &backend,
+            &s,
+            &limits,
+            &cancel,
+            &crate::pause::RunPause::never(),
+            &spend,
+            &j,
+            PrStrategy::Branch,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, ProcessedJob::Transient { .. }),
+            "an authentication failure must finalize as transient, got {outcome:?}"
+        );
+        assert_eq!(
+            state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
+            0,
+            "no attempt is spent on a transient auth failure"
+        );
+        // No `set-field` past `Working` and no comment were registered on the
+        // stub, so a call to either would have failed with "no canned
+        // response"; reaching this point proves finalize never ran.
+    }
+
     fn job() -> YoutrackJob {
         YoutrackJob {
             key: "MK-16".into(),
@@ -2580,6 +2705,7 @@ mod tests {
             error: String::new(),
             transient: false,
             timed_out: false,
+            login_required: false,
         }
     }
 
@@ -2593,6 +2719,7 @@ mod tests {
             error: "claude exited 124, see stream.jsonl".into(),
             transient: false,
             timed_out: true,
+            login_required: false,
         }
     }
 
@@ -2610,6 +2737,7 @@ mod tests {
             error: "claude exited 1, see stream.jsonl".into(),
             transient: true,
             timed_out: false,
+            login_required: false,
         };
         let body = failure_comment(&r);
         assert!(body.starts_with("Claude AI agent run FAILED (claude exited 1, see stream.jsonl):"));

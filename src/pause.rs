@@ -40,6 +40,12 @@ pub struct PauseGate {
     /// When `paused` was last read from the DB; `None` means never.
     read_at: Arc<Mutex<Option<Instant>>>,
     ttl: Duration,
+    /// CLAUDE-269: carried into every [`RunPause`] this gate mints, so a run
+    /// already in flight stops picking up new jobs when the Claude login needs
+    /// renewing, with no new call site at any of the existing per-job
+    /// checkpoints. `None` where there is nothing to check (tests, the
+    /// `never()` gate).
+    readiness: Option<crate::readiness::ReadinessGate>,
 }
 
 impl PauseGate {
@@ -49,7 +55,17 @@ impl PauseGate {
             paused: Arc::new(AtomicBool::new(false)),
             read_at: Arc::new(Mutex::new(None)),
             ttl: DEFAULT_TTL,
+            readiness: None,
         }
+    }
+
+    /// CLAUDE-269: attach the daemon's readiness gate, so [`RunPause::stop`] /
+    /// [`RunPause::stop_cached`] also stop a run when the Claude login needs
+    /// renewing. A builder so every existing `PauseGate::new` call site stays
+    /// source-compatible.
+    pub fn with_readiness(mut self, gate: crate::readiness::ReadinessGate) -> Self {
+        self.readiness = Some(gate);
+        self
     }
 
     /// An inert gate that is never paused. Used where there is no DB to read
@@ -61,6 +77,7 @@ impl PauseGate {
             paused: Arc::new(AtomicBool::new(false)),
             read_at: Arc::new(Mutex::new(None)),
             ttl: DEFAULT_TTL,
+            readiness: None,
         }
     }
 
@@ -111,6 +128,7 @@ impl PauseGate {
         RunPause {
             gate: self.clone(),
             tripped: Arc::new(AtomicBool::new(false)),
+            login_tripped: Arc::new(AtomicBool::new(false)),
             action: None,
         }
     }
@@ -120,6 +138,7 @@ impl PauseGate {
         RunPause {
             gate: self.clone(),
             tripped: Arc::new(AtomicBool::new(false)),
+            login_tripped: Arc::new(AtomicBool::new(false)),
             action: Some(Arc::from(action)),
         }
     }
@@ -132,6 +151,10 @@ impl PauseGate {
 pub struct RunPause {
     gate: PauseGate,
     tripped: Arc<AtomicBool>,
+    /// CLAUDE-269: set the first time this run was stopped because the Claude
+    /// login needs renewing, rather than by an operator pause. Kept separate
+    /// from `tripped` so the run's exit code can tell the two apart.
+    login_tripped: Arc<AtomicBool>,
     action: Option<Arc<str>>,
 }
 
@@ -142,14 +165,21 @@ impl RunPause {
         PauseGate::never().for_run()
     }
 
-    /// True when the run must stop picking up new work. Records the trip, so
-    /// the run finalizes with `exit::PAUSED`, and logs the reason once.
+    /// True when the run must stop picking up new work: either the operator
+    /// paused globally, or (CLAUDE-269) the Claude login needs renewing.
+    /// Records whichever tripped, so the run finalizes with the right exit
+    /// code, and logs the reason once.
     pub async fn stop(&self) -> bool {
         let paused = self.gate.paused().await;
         if paused {
             self.record();
+            return true;
         }
-        paused
+        if self.login_required() {
+            self.record_login();
+            return true;
+        }
+        false
     }
 
     /// [`Self::stop`] for the blocking paths: reads the last known value with
@@ -158,8 +188,20 @@ impl RunPause {
         let paused = self.gate.last_known();
         if paused {
             self.record();
+            return true;
         }
-        paused
+        if self.login_required() {
+            self.record_login();
+            return true;
+        }
+        false
+    }
+
+    fn login_required(&self) -> bool {
+        self.gate
+            .readiness
+            .as_ref()
+            .is_some_and(|g| g.is_login_required())
     }
 
     /// True when the pause stopped work at least once during this run.
@@ -167,15 +209,22 @@ impl RunPause {
         self.tripped.load(Ordering::SeqCst)
     }
 
-    /// The run's exit code: an operator cancel wins over a pause, a pause over
-    /// a clean finish. One helper so every runner spells the three-way choice
-    /// the same way and a paused run is never mistaken for either of the other
-    /// two in the run list.
+    /// True when the Claude login stopped work at least once during this run.
+    pub fn login_tripped(&self) -> bool {
+        self.login_tripped.load(Ordering::SeqCst)
+    }
+
+    /// The run's exit code: an operator cancel wins over everything, a global
+    /// pause wins over a login-required stop, and either wins over a clean
+    /// finish. One helper so every runner spells the choice the same way and
+    /// each outcome is never mistaken for another in the run list.
     pub fn exit_code(&self, cancelled: bool) -> i32 {
         if cancelled {
             crate::exit::CANCELLED
         } else if self.tripped() {
             crate::exit::PAUSED
+        } else if self.login_tripped() {
+            crate::exit::LOGIN_REQUIRED
         } else {
             crate::exit::OK
         }
@@ -188,6 +237,20 @@ impl RunPause {
                     info!(action, "globally paused; the run stops picking up new jobs")
                 }
                 None => info!("globally paused; the run stops picking up new jobs"),
+            }
+        }
+    }
+
+    fn record_login(&self) {
+        if !self.login_tripped.swap(true, Ordering::SeqCst) {
+            match self.action.as_deref() {
+                Some(action) => {
+                    info!(
+                        action,
+                        "Claude login required; the run stops picking up new jobs"
+                    )
+                }
+                None => info!("Claude login required; the run stops picking up new jobs"),
             }
         }
     }
@@ -261,5 +324,63 @@ mod tests {
         assert!(!gate.paused().await);
         assert!(gate.refresh().await);
         assert!(gate.paused().await);
+    }
+
+    /// CLAUDE-269: a login-required trip stops a run exactly like a global
+    /// pause does, and the run's exit code names it distinctly (`LOGIN_REQUIRED`
+    /// rather than `PAUSED`), including against an operator cancel.
+    #[tokio::test]
+    async fn login_required_stops_the_run_with_its_own_exit_code() {
+        let pool = pool().await;
+        let readiness = crate::readiness::ReadinessGate::new(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            None,
+        );
+        let gate = PauseGate::new(pool).with_readiness(readiness.clone());
+        let run = gate.for_action_run("t");
+        assert!(!run.stop().await);
+        assert_eq!(run.exit_code(false), crate::exit::OK);
+
+        readiness.trip_login_required("OAuth session expired", "invocation");
+        assert!(run.stop().await);
+        assert!(run.login_tripped());
+        assert!(!run.tripped(), "a login trip is not a pause trip");
+        assert_eq!(run.exit_code(false), crate::exit::LOGIN_REQUIRED);
+        // An operator cancel still wins over a login-required stop.
+        assert_eq!(run.exit_code(true), crate::exit::CANCELLED);
+        assert_ne!(crate::exit::LOGIN_REQUIRED, crate::exit::PAUSED);
+    }
+
+    /// A global pause and a login-required trip can both hold; the pause's exit
+    /// code wins, matching the "a global pause keeps its code when both hold"
+    /// contract.
+    #[tokio::test]
+    async fn a_global_pause_wins_over_a_login_required_trip() {
+        let pool = pool().await;
+        let readiness = crate::readiness::ReadinessGate::new(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            None,
+        );
+        readiness.trip_login_required("expired", "invocation");
+        let gate = PauseGate::new(pool.clone()).with_readiness(readiness);
+        let run = gate.for_action_run("t");
+
+        state::global_pause_set(&pool, Some("reboot"))
+            .await
+            .unwrap();
+        assert!(gate.refresh().await);
+        assert!(run.stop().await);
+        assert!(run.tripped());
+        assert_eq!(run.exit_code(false), crate::exit::PAUSED);
+    }
+
+    /// With no readiness gate attached (the default), a `PauseGate` behaves
+    /// exactly as before: login-required can never be the reason a run stops.
+    #[tokio::test]
+    async fn no_readiness_attached_never_trips_login_required() {
+        let pool = pool().await;
+        let run = PauseGate::new(pool).for_run();
+        assert!(!run.stop().await);
+        assert!(!run.login_tripped());
     }
 }

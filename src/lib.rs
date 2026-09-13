@@ -102,6 +102,13 @@ pub mod exit {
     /// state, e.g. `action delete` while a run for that action is in flight.
     /// The web UI / API map the same condition to HTTP 409.
     pub const CONFLICT: i32 = 7;
+    /// CLAUDE-269: a run stopped picking up new jobs because the Claude login
+    /// needs renewing (the CLI reported `authentication_failed`, or the status
+    /// probe found `loggedIn: false`), distinct from [`PAUSED`] (an operator
+    /// decision) and from [`OK`]. An operator cancel wins over both, and a
+    /// global pause wins over this when both hold; see
+    /// [`crate::pause::RunPause::exit_code`].
+    pub const LOGIN_REQUIRED: i32 = 8;
     /// Sentinel exit_code for a run that was cancelled rather than finished,
     /// following the SIGINT convention (128 + SIGINT). Used both for live
     /// cancel on demand (CLAUDE-9) and for the shutdown sweep of runs the
