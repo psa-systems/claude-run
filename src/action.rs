@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 use crate::error::{Error, Result};
 
@@ -329,9 +330,10 @@ fn default_block_on() -> Vec<String> {
 }
 
 /// Opt-in, CI-gated automerge of the PR the runner opens after a successful
-/// native YouTrack run (CLAUDE-126). When `enabled`, finalize polls the PR's
-/// combined CI status every `check_interval_seconds` up to `wait_seconds`, and
-/// on green (with an up-to-date branch) merges the PR as a merge-commit and
+/// native YouTrack run (CLAUDE-126). CLAUDE-278: finalize no longer waits for
+/// the PR's checks itself; when `enabled`, a `success`/`recover` Action-run
+/// webhook event on the recorded agent PR is what triggers the check, and on
+/// green (with an up-to-date branch) merges the PR as a merge-commit and
 /// advances the issue to Done. Disabled by default, leaving the existing
 /// stop-at-Code-Review behavior unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -340,10 +342,11 @@ pub struct Automerge {
     /// Master switch. `false` (the default) keeps finalize stopping at Code
     /// Review with no CI wait and no merge.
     pub enabled: bool,
-    /// Maximum total seconds to wait for the PR's checks to go green (and the
-    /// branch to be up to date) before giving up and leaving the PR open.
+    /// CLAUDE-278: deprecated. The runner no longer polls, so this is parsed
+    /// (existing action files keep loading) but otherwise ignored; setting it
+    /// away from its default logs one deprecation warning at load.
     pub wait_seconds: u64,
-    /// Seconds between CI status polls.
+    /// CLAUDE-278: deprecated, same as `wait_seconds`.
     pub check_interval_seconds: u64,
 }
 
@@ -1218,6 +1221,74 @@ post:
             matches!(&err, Error::ActionInvalidField { field, .. }
                 if field == "native.youtrack.dependencies.recheck_timeout"),
             "got {err:?}"
+        );
+    }
+
+    /// Collects the log lines emitted while a closure runs, so the deprecation
+    /// warn path can be asserted on rather than assumed (mirrors
+    /// `claude.rs`'s `capture_logs`).
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(sub, f);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (out, logs)
+    }
+
+    /// CLAUDE-278: an action file that still sets `wait_seconds` or
+    /// `check_interval_seconds` keeps loading (they are parsed, not rejected),
+    /// with one deprecation warning naming them.
+    #[test]
+    fn automerge_deprecated_wait_fields_still_load_with_one_warning() {
+        let raw = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\n      wait_seconds: 600\n      check_interval_seconds: 15\n";
+        let (loaded, logs) = capture_logs(|| validate_str(raw, "<candidate>").unwrap());
+        let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert!(cfg.youtrack.automerge.enabled);
+        assert_eq!(cfg.youtrack.automerge.wait_seconds, 600);
+        assert_eq!(cfg.youtrack.automerge.check_interval_seconds, 15);
+        assert_eq!(
+            logs.matches("deprecated").count(),
+            1,
+            "expected exactly one deprecation warning, got:\n{logs}"
+        );
+    }
+
+    /// An action that only sets `automerge.enabled` (the still-live field)
+    /// loads with no deprecation warning.
+    #[test]
+    fn automerge_enabled_alone_loads_with_no_deprecation_warning() {
+        let raw =
+            "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\n";
+        let (loaded, logs) = capture_logs(|| validate_str(raw, "<candidate>").unwrap());
+        assert!(loaded.action.native.is_some());
+        assert!(
+            !logs.contains("deprecated"),
+            "expected no deprecation warning, got:\n{logs}"
         );
     }
 
@@ -2578,6 +2649,21 @@ fn validate_native(action: &Action, label: &str) -> Result<()> {
                 reason: format!("`{raw}` is not a valid duration: {e}"),
                 path: label.to_string(),
             });
+        }
+        // CLAUDE-278: `wait_seconds` / `check_interval_seconds` no longer do
+        // anything (finalize no longer polls), but an action file that still
+        // sets them away from their default must keep loading rather than
+        // failing `deny_unknown_fields`-style. One warning per load names them
+        // as deprecated so an operator notices without breaking the action.
+        let default = Automerge::default();
+        if cfg.youtrack.automerge.wait_seconds != default.wait_seconds
+            || cfg.youtrack.automerge.check_interval_seconds != default.check_interval_seconds
+        {
+            warn!(
+                action = %action.name,
+                path = %label,
+                "automerge.wait_seconds / automerge.check_interval_seconds are deprecated and ignored: automerge is now triggered by the run-succeeded webhook instead of a polling wait"
+            );
         }
     }
     Ok(())

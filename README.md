@@ -1007,6 +1007,43 @@ a second seam over the same JSON `ActionRunsClient::list_runs` reads, needed bec
 alongside the Action-run events it already sends. Until it does, nothing closes on merge, and the run list shows no
 pull-request deliveries.
 
+### Event-driven automerge (CLAUDE-126, CLAUDE-278)
+
+A `youtrack` action with `automerge.enabled: true` opts a successful run into merging its own PR once CI passes, instead
+of leaving it at Code Review for a human. Before CLAUDE-278, that wait was a blocking poll inside `finalize`: it held a
+job slot for up to `automerge.wait_seconds` (1800s in the shipped action), and a suite slower than that budget - as
+happened for billing-service's ~25-minute integration suite (GAMMA-1174) - timed out with the PR left at Code Review and
+nothing watching it afterward.
+
+`finalize` no longer waits for CI at all: a successful run opens the PR and stops at Code Review immediately, whether or
+not automerge is enabled. The merge instead happens later, driven by a `success` or `recover` Action-run webhook event
+on `POST /webhooks/forgejo/<source>` - the same endpoint the CI-failure listener uses, dispatched on the payload's
+`action` field rather than dropped as "non-failure" the way it used to be. On such an event the daemon:
+
+1. Finds the open PR (if any) whose head matches the run's commit.
+2. Looks it up in the `agent_pull_requests` store (CLAUDE-275); a PR the runner did not open, or one no longer marked
+   `open` there, is left alone.
+3. Loads that PR's own action from disk to check `automerge.enabled`; if it is not (or the action no longer exists),
+   nothing happens.
+4. Reads the PR's combined CI status (`fj pr status`):
+   - **Success and mergeable:** merges it as a merge-commit, sets State to `state_done` and AI Agent to `done`, and
+     posts a "runner merged" comment - the same sequence the old poll loop made on green.
+   - **Success but not mergeable** (the branch is behind its base): comments that the branch needs updating and leaves
+     the issue at Code Review. Unlike the old poll loop, the webhook handler has no workdir to run `Forge::update_branch`
+     from, so it does not attempt one; updating the branch (or pushing a new commit) retriggers CI, and the next
+     `success` event tries again.
+   - **Anything else** (other checks still pending, or a failure): no action. There is no budget to exhaust and nothing
+     to time out - a later `success` event on the same PR is what retries, for as long as CI takes.
+
+Because the wait is event-driven, no job slot, timeout, or `check_interval_seconds` poll is involved any more; both
+`automerge.wait_seconds` and `automerge.check_interval_seconds` are deprecated (parsed, for a still-loading action file,
+but otherwise ignored - one deprecation warning is logged per action at load if either is set away from its default).
+
+**Operator setup:** each Forgejo webhook pointed at `/webhooks/forgejo/<source>` must send Action Run **Success** and
+**Recover** events, in addition to Failure, for any org running a `youtrack` action with automerge enabled (see the
+migration note above). Without them, a PR opened by such an action sits at Code Review forever, exactly as if automerge
+were disabled.
+
 ### Auto-fix for mechanically-fixable failures (CLAUDE-104)
 
 Some CI failures are verification-only and have a known, judgement-free fix. The canonical case is `cargo fmt --check`:
@@ -1160,9 +1197,11 @@ migration signal. To switch from the single SITE-level system webhook to one ORG
    `printf %s '<distinct-random-value>' | claude-run secret set forgejo-hmac-<org>` for each org that sends
    webhooks (e.g. `acme`, `globex`).
 2. In Forgejo, on each org's Settings -> Webhooks, add a **Forgejo** webhook with URL
-   `https://<daemon-host>/webhooks/forgejo/<source>`, Secret set to that org's stored value, and **only** the Action Run
-   Failure event selected. Selecting only the Failure event keeps `success` / `recover` deliveries off the wire
-   entirely; any that do arrive are acked and dropped.
+   `https://<daemon-host>/webhooks/forgejo/<source>`, Secret set to that org's stored value, and the Action Run Failure
+   event selected. If any `youtrack` action in this org has `automerge.enabled: true`, also select Action Run Success
+   and Action Run Recover (CLAUDE-278: that is what triggers the merge once CI goes green - see "Event-driven automerge"
+   below); otherwise leave them unselected so `success` / `recover` deliveries stay off the wire entirely (any that do
+   arrive are acked and dropped, same as before).
 3. Replace the old `[webhook]` block in `config.toml` with the sources shape above and restart the daemon. It refuses to
    start while any old key is present, naming it.
 4. Delete the SITE-level system webhook (and any old per-repo pilot webhook).
