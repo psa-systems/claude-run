@@ -598,11 +598,13 @@ pub struct WorkdirGcConfig {
     /// from the directory's last-modified time. Conservative default of 14 days
     /// (revise if operational data shows otherwise, per the issue).
     pub retention_days: u64,
-    /// Longer age, in days, past which even a workdir that still holds unpushed
-    /// commits is deleted. Between `retention_days` and this cap an unpushed
-    /// workdir is kept; beyond it the disk cost wins. Assumed 60 days; revise if
-    /// validation shows otherwise. Must exceed `retention_days` to have any
-    /// effect (a smaller value just deletes unpushed dirs at the normal window).
+    /// Longer age, in days, past which even a workdir that still holds
+    /// local-only work (unpushed commits, a dirty tree, or a stash -
+    /// CLAUDE-284) is deleted. Between `retention_days` and this cap such a
+    /// workdir is kept; beyond it the disk cost wins. Assumed 60 days; revise
+    /// if validation shows otherwise. Must exceed `retention_days` to have
+    /// any effect (a smaller value just deletes such dirs at the normal
+    /// window).
     pub unpushed_hard_cap_days: u64,
 }
 

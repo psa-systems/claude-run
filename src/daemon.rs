@@ -1633,7 +1633,7 @@ async fn gc_loop(paths: Paths, cfg: Arc<tokio::sync::RwLock<crate::config::Workd
                 &base,
                 &snapshot,
                 std::time::SystemTime::now(),
-                crate::native::youtrack::has_unpushed_commits,
+                crate::native::youtrack::has_local_only_work,
             )
         })
         .await;
