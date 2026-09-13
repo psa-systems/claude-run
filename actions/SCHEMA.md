@@ -233,6 +233,31 @@ prompt is sent to the agent; an unknown placeholder (or an unterminated `{{`) is
 | `{{skip_attempt_marker}}`| The `.claude-run-skip-attempt` marker filename.                               |
 | `{{no_code_marker}}`     | The `.claude-run-no-code-change` marker filename (CLAUDE-214).                |
 | `{{write_projects}}`     | Comma-separated `youtrack.write_projects`, or the triggering issue's own project when that list is empty (CLAUDE-214). |
+| `{{existing_pr_url}}`    | Empty on a fresh pickup. On a re-queue with an open recorded PR (CLAUDE-275), the URL of that PR. |
+| `{{existing_branch}}`    | Empty on a fresh pickup. On a re-queue with an open recorded PR (CLAUDE-275), that PR's head branch, already checked out in `{{workdir}}`. |
+
+##### Resuming an open PR on re-queue (CLAUDE-275)
+
+Every PR the `youtrack` action opens is recorded in the `agent_pull_requests` store (action, issue key, host, repo, PR
+number, head branch), keyed unique on `(host, repo, pr_number)`. Before `pre` runs, `process_job` looks up the
+triggering issue's most recently recorded PR:
+
+- **No record, or a record already `merged` / `closed`:** unchanged behavior - clone the repo's default branch and
+  open a fresh PR.
+- **A record still marked `open`:** confirmed live against `Forge::list_open_prs`. Still open: `{{existing_branch}}`
+  is cloned instead of the default branch, and `{{existing_pr_url}}` / `{{existing_branch}}` are rendered into the
+  prompt so the agent fixes the SAME branch (reading the issue's newest comments for what to fix) instead of opening a
+  second PR. No longer in the open list: the record is marked `closed` (a closed-vs-merged distinction is not
+  derivable from an open-PR listing alone) and pickup falls back to the default branch.
+- **The `agit` PR strategy:** always skipped, logged at `info`. AGit pushes to `refs/for/<base>` and produces no
+  server branch, so there is nothing to resume; a re-queue always opens a fresh PR under this strategy.
+
+A successful `create_pr` on a NON-resumed run (fresh PR) records one new `agent_pull_requests` row; a resumed run's
+`create_pr` call adopts the same PR number again (the branch-strategy idempotency reconcile below), so it is never
+re-recorded (the store's `UNIQUE(host, repo, pr_number)` would reject a duplicate insert). A failed record write is
+logged at `error`, surfaced as a `run_events` row (the same channel a degraded open-PR lookup uses), and named in a
+follow-up issue comment; the PR itself still exists and the issue still advances to Code Review, since the record is
+bookkeeping for the NEXT re-queue, not a condition of this one succeeding.
 
 ##### The no-code completion path (CLAUDE-214)
 

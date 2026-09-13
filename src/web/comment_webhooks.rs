@@ -1023,11 +1023,7 @@ async fn run_instruction(
         }
     }
     finish_comment_run(&ctx.pool, run_id, key, &outcome, &stream_log, &spend).await;
-    if workdir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&workdir) {
-            warn!(workdir = %workdir.display(), error = %e, "comment workdir cleanup failed (continuing)");
-        }
-    }
+    crate::workdir::cleanup_or_preserve(&workdir, WEBHOOK_COMMENT_ACTION, key);
 }
 
 /// The recorded result of one served instruction, on either route.

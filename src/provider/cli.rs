@@ -496,6 +496,9 @@ impl CliBackend {
         Ok(PullRequest {
             number,
             url: created.html_url,
+            // CLAUDE-275: the caller (branch-backed create, or AGit) fills in
+            // `head_branch` when it has one; AGit has none.
+            head_branch: None,
         })
     }
 
@@ -554,19 +557,22 @@ impl CliBackend {
         match candidates.len() {
             1 => Ok(candidates.pop().unwrap()),
             0 => Err(Error::Other(anyhow::anyhow!(
-                // CLAUDE-193: state the condition, not an outcome the later
-                // `cleanup_or_preserve` decision can contradict.
+                // CLAUDE-193 / CLAUDE-281: state the condition, not an outcome
+                // the later `cleanup_or_preserve` decision can contradict: it
+                // is the one that checks the workdir and decides whether
+                // anything is preserved.
                 "no feature branch with commits ahead of `{base_ref}`; the agent \
                  produced no branch or no commits (base `{base_branch}`). Any \
-                 unpushed work in the workdir `{}` is preserved; branches already \
-                 pushed remain on the remote.",
+                 unpushed work in the workdir `{}` is preserved only if the \
+                 cleanup check finds it there; branches already pushed remain on \
+                 the remote regardless.",
                 workdir.display()
             ))),
             _ => Err(Error::Other(anyhow::anyhow!(
                 "multiple candidate feature branches ahead of `{base_ref}`: {}; \
                  refusing to guess which to open a PR for. Any unpushed work in \
-                 the workdir `{}` is preserved; branches already pushed remain on \
-                 the remote.",
+                 the workdir `{}` is preserved only if the cleanup check finds it \
+                 there; branches already pushed remain on the remote regardless.",
                 candidates.join(", "),
                 workdir.display()
             ))),
@@ -593,9 +599,11 @@ impl CliBackend {
     /// caller ([`Forge::create_pr`]) so both strategies share the ahead check.
     ///
     /// CLAUDE-170: idempotent against a pre-existing `origin/<branch>`. The
-    /// feature-branch name is deterministic per issue key, so a re-run, a
-    /// concurrent duplicate run, or a manual pre-push of the same branch is a
-    /// DETERMINISTIC collision, not a transient one. Before pushing, the remote
+    /// feature-branch name is chosen by the agent and not deterministic per issue
+    /// key; a pre-existing remote branch of the same name is legitimate, not just
+    /// a collision, because CLAUDE-275's resume path clones a re-queued issue's
+    /// recorded PR branch by name and continues committing on it. Before pushing,
+    /// the remote
     /// state of the branch is read (`git ls-remote`) and reconciled WITHOUT force:
     /// absent -> push + create; local fast-forwards or equals remote -> (fast-
     /// forward) push then find-or-create the PR; diverged (or remote-ahead) ->
@@ -603,10 +611,11 @@ impl CliBackend {
     /// fail loudly naming both SHAs and the workdir. No `--force` /
     /// `--force-with-lease` is ever issued.
     ///
-    /// CLAUDE-193: the error text states the retention CONDITION ("any unpushed
-    /// work in the workdir is preserved; branches already pushed remain on the
-    /// remote"), never a flat outcome, because `cleanup_or_preserve` makes the
-    /// keep-or-delete decision later and can legitimately delete the directory.
+    /// CLAUDE-193 / CLAUDE-281: the error text states the retention CONDITION
+    /// ("preserved only if the cleanup check finds it there"), never a flat
+    /// outcome, because `cleanup_or_preserve` makes the keep-or-delete
+    /// decision later, from its own check of the workdir, and can legitimately
+    /// delete the directory.
     fn create_pr_branch(&self, workdir: &Path, host: &str, branch: &str) -> Result<PullRequest> {
         // Repo path (`owner/repo`) for the open-PR lookup, derived from the
         // workdir's `origin` remote (the form `list_open_prs` expects).
@@ -649,8 +658,8 @@ impl CliBackend {
                             "remote branch `{branch}` has diverged from the local work \
                              (local {local_sha}, remote {remote_sha}) and no open PR exists \
                              for it; refusing to force-push over it. Any unpushed work in the \
-                             workdir `{}` is preserved; branches already pushed remain on the \
-                             remote.",
+                             workdir `{}` is preserved only if the cleanup check finds it \
+                             there; branches already pushed remain on the remote regardless.",
                             workdir.display()
                         ))),
                         Err(e) => Err(Error::Other(anyhow::anyhow!(
@@ -658,7 +667,8 @@ impl CliBackend {
                              (local {local_sha}, remote {remote_sha}) and the open-PR lookup \
                              failed ({e}), so whether an open PR exists for it is UNKNOWN; \
                              refusing to force-push over it. Any unpushed work in the workdir \
-                             `{}` is preserved; branches already pushed remain on the remote.",
+                             `{}` is preserved only if the cleanup check finds it there; \
+                             branches already pushed remain on the remote regardless.",
                             workdir.display()
                         ))),
                     }
@@ -750,6 +760,7 @@ impl CliBackend {
             .map(|p| PullRequest {
                 number: Some(p.number),
                 url: p.html_url,
+                head_branch: Some(branch.to_string()),
             }))
     }
 
@@ -813,6 +824,10 @@ impl CliBackend {
             .run_in_env(Some(workdir), &self.fj, &create_args, &self.fj_envs())
             .and_then(|out| Self::checked(&self.fj, out, &create_args));
         let _ = std::fs::remove_file(workdir.join(BODY_FILE));
+        // CLAUDE-275: the branch-backed create just pushed this exact server
+        // branch (`self.push_branch` / the fast-forward arm above), so it is
+        // always the resulting PR's head, whatever `fj pr create --json` itself
+        // reports.
         let stdout = match res {
             Ok(stdout) => stdout,
             // CLAUDE-206: the forge says a PR for this head already exists (a
@@ -842,7 +857,10 @@ impl CliBackend {
                 ));
             }
         };
-        self.created_pr(&stdout)
+        self.created_pr(&stdout).map(|mut pr| {
+            pr.head_branch = Some(branch.to_string());
+            pr
+        })
     }
 
     /// CLAUDE-206: record a lookup failure that was degraded to a create, in the
@@ -1349,6 +1367,10 @@ impl Forge for CliBackend {
 
     fn take_notices(&self) -> Vec<String> {
         std::mem::take(&mut *self.notices.lock().unwrap())
+    }
+
+    fn note(&self, message: String) {
+        self.notices.lock().unwrap().push(message);
     }
 
     /// CLAUDE-194 / CLAUDE-207: two probes, one per scope category the PR path
