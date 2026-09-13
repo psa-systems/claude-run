@@ -169,10 +169,6 @@ async fn login_required_accept_and_drop(st: &WebhookState, source: &str, deliver
 /// dashboard / action-detail surfaces show webhook activity like any action.
 pub const WEBHOOK_TRIGGERED_BY: &str = "webhook";
 
-/// Wall-clock cap for one triage classification (`claude --print`). The pass is
-/// a single bounded-log JSON reply, so it needs far less than a full code run.
-pub const TRIAGE_TIMEOUT_SECS: u64 = 120;
-
 /// Hex-encoded HMAC-SHA256 of the raw body, keyed by the webhook secret.
 pub const SIGNATURE_HEADER: &str = "X-Forgejo-Signature";
 /// Per-delivery unique id, used for replay protection.
