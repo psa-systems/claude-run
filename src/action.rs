@@ -263,6 +263,9 @@ pub struct Dependencies {
     /// it has any link whose `verb` is listed here and whose target is
     /// unresolved.
     pub block_on: Vec<String>,
+    /// `false` ignores links to issues in other projects (CLAUDE-295): an audit
+    /// Epic must not wait on the product-project findings it filed as subtasks.
+    pub block_cross_project: bool,
 }
 
 impl Default for Dependencies {
@@ -271,6 +274,7 @@ impl Default for Dependencies {
             enabled: true,
             recheck_timeout: default_recheck_timeout(),
             block_on: default_block_on(),
+            block_cross_project: true,
         }
     }
 }
@@ -832,6 +836,7 @@ post:
         assert!(deps.enabled);
         assert_eq!(deps.recheck_timeout, "5m");
         assert_eq!(deps.block_on, vec!["depends on", "parent for"]);
+        assert!(deps.block_cross_project);
     }
 
     /// CLAUDE-161: an untouched `dependencies` block round-trips out of the
@@ -1162,9 +1167,9 @@ native:
         assert_eq!(reloaded.action.kind, action.kind);
     }
 
-    /// The shipped `actions/audit-run.yml` (CLAUDE-214): a second youtrack-kind
-    /// action whose only structural difference is the `AUDIT` query and the
-    /// full-replacement prompt that permits the three audit tracker writes.
+    /// The shipped `actions/audit-run.yml` (CLAUDE-214, CLAUDE-295): a second
+    /// youtrack-kind action with the `AUDIT` query, a full-replacement prompt,
+    /// the product projects its findings file into, and a same-project gate.
     #[test]
     fn shipped_audit_run_action_is_native_and_round_trips() {
         const SHIPPED: &str = include_str!("../actions/audit-run.yml");
@@ -1197,11 +1202,14 @@ native:
         assert!(prompt.contains("{{workdir}}"));
         assert!(prompt.contains("{{needs_review_marker}}"));
         assert!(prompt.contains("{{skip_attempt_marker}}"));
-        // Exactly three tracker writes are permitted; creation stays banned.
-        assert!(prompt.contains("yt issue add-comment"));
-        assert!(prompt.contains("no `yt issue create`"));
-        assert!(prompt.contains("no `yt issue set-field`"));
-        assert!(prompt.contains("no `yt issue set-state`"));
+        assert!(prompt.contains("{{write_projects}}"));
+        // CLAUDE-295: findings file into the product projects, and an Epic must
+        // not wait on the findings it filed there as its subtasks.
+        assert_eq!(
+            cfg.youtrack.write_projects,
+            vec!["ALPHA", "BETA", "GAMMA", "DELTA", "EPSILON", "ZETA", "ETA"]
+        );
+        assert!(!cfg.youtrack.dependencies.block_cross_project);
         // The parent gate is what makes the daily summary run last, so it must
         // not be disabled here.
         assert!(cfg.youtrack.dependencies.enabled);
@@ -1212,41 +1220,6 @@ native:
         let reloaded = validate_str(&reserialized, "<roundtrip>").unwrap();
         assert_eq!(reloaded.action.native, action.native);
         assert_eq!(reloaded.action.kind, action.kind);
-    }
-
-    /// CLAUDE-214 addendum: relaxing the built-in prompt must not widen the
-    /// audit action underneath it. `audit-run.yml` keeps its own override, and
-    /// that override stays the tighter policy: it bans issue creation, which the
-    /// built-in prompt now permits, and it names its three permitted writes.
-    #[test]
-    fn audit_prompt_override_stays_narrower_than_the_builtin() {
-        const SHIPPED: &str = include_str!("../actions/audit-run.yml");
-        let loaded = validate_str(SHIPPED, "actions/audit-run.yml").expect("shipped action valid");
-        let Some(NativeConfig::Youtrack(cfg)) = &loaded.action.native else {
-            panic!("expected youtrack native config");
-        };
-        let audit = cfg
-            .youtrack
-            .prompt
-            .as_deref()
-            .expect("audit action carries a prompt override");
-        let builtin = crate::native::youtrack::default_youtrack_prompt();
-
-        assert_ne!(audit, builtin, "the override must not become the default");
-        // The built-in permits creation; the audit override forbids it.
-        assert!(
-            builtin.contains("Create issues with 'yt issue create'"),
-            "built-in must permit creation: {builtin}"
-        );
-        assert!(
-            audit.contains("no `yt issue create`"),
-            "audit override must still ban creation: {audit}"
-        );
-        // Both keep `AI Agent` and `State` the runner's alone.
-        for p in [audit, builtin.as_str()] {
-            assert!(p.contains("set-field"), "{p}");
-            assert!(p.contains("set-state"), "{p}");
-        }
     }
 
     /// CLAUDE-215: the two youtrack-kind actions partition the queued issues

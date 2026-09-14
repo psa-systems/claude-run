@@ -556,8 +556,9 @@ issue (description, summary, comment, tag, assignee, `State`), any write to an i
 
 The permitted list is a prompt instruction. The enforced boundary is the YouTrack token's own permissions: a create the
 token cannot perform fails loudly and the run parks at Needs Review quoting the rejected command. An action that wants a
-tighter policy than the built-in one overrides `native.youtrack.prompt` wholesale (`actions/audit-run.yml` does exactly
-that, permitting three named writes and banning issue creation).
+different policy from the built-in one overrides `native.youtrack.prompt` wholesale. `actions/audit-run.yml` does
+exactly that: it adds the audit write-back and lets the run set `AI Agent = Queued` on the finding issues it files
+(CLAUDE-295), the one place a prompt permits that field.
 
 **No-code completion path.** A run whose deliverable is tracker output rather than code makes no commits, and the
 CLAUDE-212 ahead check fails such a run (`AI Agent = Failed`, no PR) so a silently-empty engineering run cannot look
@@ -585,18 +586,24 @@ without it the winner is a race. Note the query syntax - YouTrack rejects `-proj
 negation sits on the value (`project: -AUDIT`). Name the project by its short name `AUDIT`: `AUD` is a legacy alias
 YouTrack still resolves after the rename, but it appears in no project listing and must not be used in a query.
 
-`audit-run.yml` carries a full-replacement prompt (CLAUDE-125) rather than the built-in one, to permit exactly three
-tracker writes the default prompt forbids outright: the run-summary comment on the parent issue, a `## Result` block on
-the run's own Epic description, and the standing table on the anchor issue. Everything else stays banned, **including
-issue creation**: an unattended run proposes findings in its report and a human asks for the filing separately. `AI
-Agent` and `State` remain the runner's alone, exactly as for the code-issue action. The procedure itself (audit phases,
-the coverage and carry-forward ledgers, the per-target cap) lives in the audits repo under `prompts/`, not in this
-prompt, so it changes by pull request there.
+`audit-run.yml` carries a full-replacement prompt (CLAUDE-125) rather than the built-in one. It permits the tracker
+writes the default prompt forbids: the run-summary comment on the parent issue, a `## Result` block on the run's own
+Epic description, the standing table on the anchor issue, and filing the run's findings (CLAUDE-295). Findings are
+created only in `native.youtrack.write_projects` (the seven product projects the audits repo maps its targets to), at
+most 20 finding issues per target, and each gets `AI Agent = Queued` as its last write, so the code-issue action works
+it. That is the only `AI Agent` value the run may set, and only on issues it created; `AI Agent` and `State` on the
+audit issue itself remain the runner's alone. The cap is a prompt instruction, not an enforced limit: `AuditedTracker`
+counts the runner's own provider calls, not the `yt` calls an agent makes. The procedure itself (audit phases, the
+coverage and carry-forward ledgers, dedup, grouping, priority, links) lives in the audits repo under `prompts/`, not in
+this prompt, so it changes by pull request there.
 
 The dependency gate (CLAUDE-161) is left enabled, which is what sequences a daily rotation: the workflow files one
 parent plus one Epic per target and queues all of them, and `parent for` keeps the parent blocked until every Epic
-resolves, so the run summary has something to summarize. `concurrency.max_parallel: 1` keeps one audit in flight at a
-time; per-target caps and the coverage ledger, not serialization, are what keep a rotation affordable.
+resolves, so the run summary has something to summarize. Each finding is filed as a subtask of its Epic, which makes the
+Epic `parent for` open issues in the product projects. `dependencies.block_cross_project: false` makes the gate ignore
+those, or an Epic retried after a transient failure would wait until every one of its findings was worked.
+`concurrency.max_parallel: 1` keeps one audit in flight at a time; per-target caps and the coverage ledger, not
+serialization, are what keep a rotation affordable.
 
 ## Global pause and the restart-safety workflow (CLAUDE-223)
 

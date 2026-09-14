@@ -38,15 +38,18 @@ file and the prompt disagree, the prompt wins. In outline you MAY:
 - Update, comment on, and link the issues YOU created during this run.
 - Link one issue you created as a `subtask of` the triggering issue.
 
-Hard bans, no exceptions:
+Hard bans, lifted only where the job prompt explicitly names an exception:
 
-- NEVER set the `AI Agent` field on ANY issue, including ones you created.
-  Setting it queues an agent run, so that field is the runner's alone.
+- NEVER set the `AI Agent` field on any issue unless the job prompt explicitly
+  permits it, and then only the value the prompt names, only on issues you
+  created during this run. Setting it queues an agent run, so outside that
+  exception the field is the runner's alone.
 - No other write to the triggering issue: no description or summary edit, no
   comment, no tag, no assignee change, no `set-state` / `set-field`. The runner
   owns its outcome comment and its fields.
-- No write of any kind to an issue you did not create during this run, and never
-  `yt issue delete` anywhere.
+- No write of any kind to an issue you did not create during this run.
+
+Never run `yt issue delete` anywhere, whatever the prompt says.
 
 If the job's deliverable is tracker output rather than code and you therefore
 finish deliberately with no commits, write your human-facing summary to
