@@ -1833,7 +1833,7 @@ fn validate_native(action: &Action, label: &str) -> Result<()> {
             warn!(
                 action = %action.name,
                 path = %label,
-                "automerge.wait_seconds / automerge.check_interval_seconds are deprecated and ignored: automerge is now triggered by the run-succeeded webhook instead of a polling wait"
+                "automerge.wait_seconds / automerge.check_interval_seconds are deprecated and ignored: automerge is now triggered by the run-succeeded webhook instead of a polling wait. Remove both keys from the action file, or save the action's structured form, which resets them."
             );
         }
     }
