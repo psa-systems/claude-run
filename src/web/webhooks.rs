@@ -726,15 +726,31 @@ async fn process_event(
         // (CLAUDE-92) routes those to a human rather than dropping them.
         let (log_text, log_available, log_artifact, log_unavailable_reason, jobs) = match outcome {
             Ok(Ok(LogOutcome::Fetched(log))) => {
-                info!(
-                    repo = %ev.repo,
-                    run = ev.index_in_repo,
-                    bytes = log.text.len(),
-                    jobs = log.jobs.len(),
-                    artifact = %log.artifact.display(),
-                    "fetched and redacted run log"
-                );
-                (log.text, true, Some(log.artifact), None, log.jobs)
+                if let Some(reason) = crate::forge_log::logs_permanently_missing(&log.jobs) {
+                    warn!(
+                        repo = %ev.repo,
+                        run = ev.index_in_repo,
+                        %reason,
+                        "run log permanently missing (FJ-79)"
+                    );
+                    (
+                        String::new(),
+                        false,
+                        Some(log.artifact),
+                        Some(reason),
+                        log.jobs,
+                    )
+                } else {
+                    info!(
+                        repo = %ev.repo,
+                        run = ev.index_in_repo,
+                        bytes = log.text.len(),
+                        jobs = log.jobs.len(),
+                        artifact = %log.artifact.display(),
+                        "fetched and redacted run log"
+                    );
+                    (log.text, true, Some(log.artifact), None, log.jobs)
+                }
             }
             Ok(Ok(LogOutcome::TransientMiss { reason })) => {
                 warn!(repo = %ev.repo, run = ev.index_in_repo, %reason, "run log not available (transient miss)");
@@ -5688,6 +5704,135 @@ mod tests {
                 .unwrap();
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log unavailable"), "{summary}");
+    }
+
+    /// A `Fetched` outcome whose jobs carry `log_state` in run order (FJ-79).
+    fn jobs_with_log_states(states: &[&str]) -> crate::forge_log::RunLogsOutcome {
+        crate::forge_log::RunLogsOutcome::Fetched(
+            states
+                .iter()
+                .enumerate()
+                .map(|(i, state)| crate::forge_log::JobLog {
+                    name: format!("job-{i}"),
+                    status: "failure".to_string(),
+                    log: if *state == crate::forge_log::LOG_STATE_MISSING {
+                        String::new()
+                    } else {
+                        "cargo build\n".to_string()
+                    },
+                    log_state: (*state).to_string(),
+                    log_reason: if *state == crate::forge_log::LOG_STATE_MISSING {
+                        Some("open logs for task 43177: no such file or directory".to_string())
+                    } else {
+                        None
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_permanently_missing_log_degrades_to_a_no_log_outcome() {
+        // CLAUDE-242: FJ-79's every-job `log_state: "missing"` must be read the
+        // same way an unfetchable log is, so the CLAUDE-92 human-action route
+        // still fires instead of triaging an empty-but-"available" log.
+        let pool = memory_pool().await;
+        let out_dir = tempfile::tempdir().unwrap();
+        let logs = Arc::new(ScriptedLogs::new(jobs_with_log_states(&[
+            crate::forge_log::LOG_STATE_MISSING,
+            crate::forge_log::LOG_STATE_MISSING,
+        ])));
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(event()).await.unwrap();
+        drop(tx);
+
+        consume_events(
+            rx,
+            pool.clone(),
+            logs,
+            out_dir.path().to_path_buf(),
+            None,
+            Arc::new(RwLock::new(WebhookConfig::default())),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+
+        let summary: Option<String> =
+            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let summary = summary.expect("summary recorded");
+        assert!(summary.contains("log unavailable"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn a_partially_readable_log_still_mints_as_available() {
+        // CLAUDE-242 AC: at least one job carrying a readable log must be
+        // unaffected by the FJ-79 predicate, even alongside a missing one.
+        let pool = memory_pool().await;
+        let out_dir = tempfile::tempdir().unwrap();
+        let logs = Arc::new(ScriptedLogs::new(jobs_with_log_states(&[
+            crate::forge_log::LOG_STATE_MISSING,
+            "available",
+        ])));
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(event()).await.unwrap();
+        drop(tx);
+
+        consume_events(
+            rx,
+            pool.clone(),
+            logs,
+            out_dir.path().to_path_buf(),
+            None,
+            Arc::new(RwLock::new(WebhookConfig::default())),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+
+        let summary: Option<String> =
+            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let summary = summary.expect("summary recorded");
+        assert!(summary.contains("log fetched and redacted"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn a_pre_fj79_log_with_no_log_state_still_mints_as_available() {
+        // CLAUDE-242 AC: an `fj` predating FJ-79 emits no `log_state` field at
+        // all, which deserializes to `""` on every job, never `"missing"`; that
+        // absence must never be read as "gone".
+        let pool = memory_pool().await;
+        let out_dir = tempfile::tempdir().unwrap();
+        let logs = Arc::new(ScriptedLogs::new(one_failing_job()));
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(event()).await.unwrap();
+        drop(tx);
+
+        consume_events(
+            rx,
+            pool.clone(),
+            logs,
+            out_dir.path().to_path_buf(),
+            None,
+            Arc::new(RwLock::new(WebhookConfig::default())),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+
+        let summary: Option<String> =
+            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let summary = summary.expect("summary recorded");
+        assert!(summary.contains("log fetched and redacted"), "{summary}");
     }
 
     /// A `Fetched` outcome whose jobs carry `statuses` in run order.
