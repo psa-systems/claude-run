@@ -88,10 +88,6 @@ impl Daemon {
         // behind shared RwLocks so Settings-page saves apply live.
         crate::settings::migrate_config_file(&pool, &self.paths).await?;
         let effective = crate::settings::effective(&pool, &self.on_disk).await?;
-        let webhook_enabled = !effective.webhook.sources.is_empty();
-        // CLAUDE-220: the `/claude` comment listener is enabled by the same rule
-        // (at least one configured source) on its own DB-backed section.
-        let comment_webhook_enabled = !effective.webhook_comment.sources.is_empty();
         let replay_window_secs = effective.webhook.replay_window_secs;
         let settings = Arc::new(crate::settings::LiveSettings::new(
             pool.clone(),
@@ -277,17 +273,7 @@ impl Daemon {
         // TCP router: web UI at root, JSON API under `/api/`. Same handlers
         // as the unix-socket flavor, just nested + sibling-mounted.
         let api_for_tcp = api::router((*api_state).clone());
-        // CLAUDE-61: the web layer injects the synthetic `webhook-forgejo`
-        // action only when the Forgejo webhook is configured. CLAUDE-87: that
-        // is now any configured source (an empty `sources` map disables it).
-        // CLAUDE-101: `webhook_enabled` reflects the effective (DB-resolved)
-        // config at start.
-        let web_router = crate::web::router(
-            api_state.clone(),
-            self.paths.clone(),
-            webhook_enabled,
-            comment_webhook_enabled,
-        );
+        let web_router = crate::web::router(api_state.clone(), self.paths.clone());
 
         // CLAUDE-43: Forgejo webhook listener. Verified `action_run_failure`
         // events are emitted onto a channel drained by `consume_events`, which
