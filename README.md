@@ -1219,20 +1219,14 @@ run `claude` once to log in, or set `ANTHROPIC_API_KEY`. A regular `.credentials
 is left alone rather than replaced by the link, because in a container that file is the login itself. On macOS
 credentials live in the Keychain rather than `.credentials.json`, so the symlink step is Linux-only.
 
-**Image.** `oci-build/Dockerfile` has a `runtime` target built on the CI image (`dev.a8n.run/pandoras-box/rust-builder-musl`).
-It carries `claude-run` plus the pinned runtime toolchain: `nu`, the `claude` CLI, coreutils `timeout`, `git`, `yt` (
-youtrack-cli), `fj` (forgejo-cli), `just`, and `kingfisher`. `yt` and `fj` are the org's own prebuilt static binaries, pulled from the Forgejo
-generic packages `fabrikam/youtrack-cli` and `pandoras-box/forgejo-cli` and verified against the `.sha256` published
-beside each (CLAUDE-247). `just` and `kingfisher` are pulled from the org's Dufs binary mirror
-(`https://files.example.com/public/{os}/{arch}/{name}/{version}/{file}`) and verified against a checksum pinned in the
-Dockerfile itself (CLAUDE-282), so an agent's check suite (`just check`) and secret scan (`kingfisher scan`) run without
-installing either tool into `$HOME` on every fresh container. Versions are build args (`NU_VERSION`, `CLAUDE_CODE_VERSION`, `YT_VERSION`, `FJ_VERSION`,
-`JUST_VERSION`, `KINGFISHER_VERSION`, plus `PKG_BASE` and `BINARIES_BASE` for the two registries); override any one with `--build-arg`. The two CI-failure actions read the forge only through `fj`, so they
-need an `fj` carrying `fj actions logs`, `fj actions runs` (FJ-66), and `fj repo file` (FJ-67); the latter two landed on
-`pandoras-box/forgejo-cli` `main` after the `v0.13.0` tag (merge `b08d8bc`) and are in no released version yet, so
-`FJ_VERSION` must point at a build from that commit or newer for those actions to work. The container runs as the
-non-root user `claudebot` with `$HOME=/home/claudebot`, which holds nothing persistent: everything the operator cares
-about lives on the three flat volumes below.
+**Image.** `oci-build/Dockerfile` has a `runtime` target built on `dev.a8n.run/pandoras-box/opensuse-dev:v1.8.0-leap-16.0`
+(CLAUDE-287), the org's dev image. It already carries the whole runtime toolchain: `nu`, the `claude` CLI, coreutils
+`timeout`, `git`, `yt` (youtrack-cli), `fj` (forgejo-cli), `just`, `kingfisher`, and `docker` (client, Compose, buildx).
+Tool versions come from the base image tag; moving a tool means bumping that tag, not editing a Dockerfile `RUN` block.
+The runtime stage smoke-checks every one of those tools in a single `RUN`, so a base image that loses a tool fails the
+image build instead of the first job. The container runs as the non-root user `claudebot` (uid 100, gid 101, matching
+the ids the earlier Alpine-based image used) with `$HOME=/home/claudebot`, which holds nothing persistent: everything
+the operator cares about lives on the three flat volumes below.
 
 **Published image (CLAUDE-88).** CI publishes the runtime image to the Forgejo OCI registry on every push to main (
 `:latest`) and every release tag (`:vX.Y.Z`), the same tag set as the binary's Generic Package. The image publish runs
@@ -1261,7 +1255,7 @@ agent is never told to push, open PRs, or transition issue state.
 
 **compose.yml.** Consumes the published image (`image: dev.a8n.run/psa-systems/claude-run:latest`; the local `build:` block stays as a commented development alternative). App-prefixed names (service `claude-bot`, network `claude-bot-private`, volumes `claude-bot-config`, `claude-bot-data` and `claude-bot-state`, plus `claude-bot-postgres` which only the `postgres` profile mounts; prefix each with `dev-` for a development stack). Each tool's store is a subdirectory of one of the three roots rather than a volume of its own (CLAUDE-253); see the volume table below.
 
-**Self-contained by design (CLAUDE-247).** The container bind-mounts nothing from the host and reads no host credential. The operator logs Claude, YouTrack, Forgejo and git in INSIDE the container once; each login lands in its own subdirectory of the config or data volume (`claude-agent-home/`, `youtrack-cli/` and `git/` under `/config`, `forgejo-cli/` under `/data`, per the volume table below) and survives restarts and image upgrades. Two reasons: the runner's identity stays separate from the operator's, and the stack deploys on a host where neither `$HOME` nor the invocation directory is available to the compose file. The default stack reads no path relative to this repo at all, including the secrets key, which the daemon generates itself; the only repo-relative paths in the file are the two `secrets/` files the `postgres` profile needs.
+**Self-contained by design (CLAUDE-247, image and isolation superseded by CLAUDE-287).** The container bind-mounts nothing from the host and reads no host credential. The operator logs Claude, YouTrack, Forgejo and git in INSIDE the container once; each login lands in its own subdirectory of the config or data volume (`claude-agent-home/`, `youtrack-cli/` and `git/` under `/config`, `forgejo-cli/` under `/data`, per the volume table below) and survives restarts and image upgrades. Two reasons: the runner's identity stays separate from the operator's, and the stack deploys on a host where neither `$HOME` nor the invocation directory is available to the compose file. The default stack reads no path relative to this repo at all, including the secrets key, which the daemon generates itself; the only repo-relative paths in the file are the two `secrets/` files the `postgres` profile needs. CLAUDE-287 supersedes CLAUDE-247's image decisions (the Alpine base, the per-tool downloads, `su-exec`) and ends the property that the agent has no path to anything privileged (see "Docker access" above); the no-host-mount and in-container-login properties themselves are unchanged.
 
 **Volumes.** Three, flat, named for what they hold:
 
@@ -1278,10 +1272,35 @@ Each tool's store is a subdirectory rather than a mount of its own, because the 
 
 A host install is unaffected by all of this: none of these variables is set there, and every path still resolves through XDG exactly as before.
 
-**Running user.** The image has no `USER` directive. It starts as root so `oci-build/entrypoint.sh` can chown the mounted volumes to `claudebot`, then drops to that user with `su-exec` (pattern 3 in `governance/CONTAINER_UID_GID.md`); the daemon itself runs non-root. Do NOT set `user:` in compose: the entrypoint would lose the privileges the chown needs and a volume owned by another uid could never be repaired from inside. Two consequences for the operator:
+**Running user.** The runtime stage stays on `USER root` (the base image's last `USER` is `dev`) so `oci-build/entrypoint.sh` can chown the mounted volumes to `claudebot`, then drops to that user with `setpriv --reuid=claudebot --regid=claudebot --init-groups` (pattern 3 in `governance/CONTAINER_UID_GID.md`); Leap packages neither `su-exec` nor `gosu`, and `setpriv` (util-linux, already in the base) is the equivalent gosu's own README names. The daemon itself runs non-root. Do NOT set `user:` in compose: the entrypoint would lose the privileges the chown needs and a volume owned by another uid could never be repaired from inside. Two consequences for the operator:
 
 - `docker compose exec` lands as root unless you pass `--user claudebot`. Always pass it for the login commands below, or the credentials are written root-owned and only become usable after the next restart's chown.
 - The chown skips `$CLAUDE_RUN_DATA_DIR/workdirs`, which is a tree of job git clones the runtime user created itself; walking it on every boot would be slow for no gain.
+
+**Docker access (CLAUDE-287).** Agent sessions run against a Docker-in-Docker sidecar, `claude-bot-docker`
+(`docker.io/docker:29.6.2-dind`, the same pin the org's Forgejo runners use), rather than the host's own daemon: a
+mounted host socket resolves bind paths against the host filesystem, where the volume in `/data/workdirs/...` does not
+exist. The sidecar shares `claude-bot`'s network namespace (`network_mode: service:claude-bot`) and listens on
+`tcp://127.0.0.1:2375` with no TLS, since nothing outside that shared namespace can reach it; `claude-bot` sets
+`DOCKER_HOST` to that address, and every `claude` child inherits it (nothing in `src/` calls `env_clear` or
+`env_remove`). A port a job publishes through that daemon answers on `claude-bot`'s own `127.0.0.1`. The sidecar mounts
+the same `claude-bot-data` volume at `/data` that `claude-bot` does, which is what makes a bind like
+`docker run --volume /data/workdirs/<job>:/build ...` from inside a job's workdir resolve to the right files; its own
+Docker state lives on a separate named volume, `claude-bot-docker` at `/var/lib/docker`, so its growth is visible and
+prunable:
+
+```nu
+docker compose exec --env DOCKER_HOST=tcp://127.0.0.1:2375 claude-bot-docker docker system df
+docker compose exec --env DOCKER_HOST=tcp://127.0.0.1:2375 claude-bot-docker docker system prune
+```
+
+The `--env` override is required because `-H` in the sidecar's own `dockerd` command replaces its default unix socket.
+There is no `depends_on` between the two services (the sidecar joins `claude-bot`'s namespace, so the dependency would
+be a cycle); a job that runs `docker` before the sidecar's healthcheck passes simply fails with the CLI's own
+connection error in that job's log. This ends the property CLAUDE-247 established that the agent has no path to
+anything privileged: the agent now drives a privileged Docker daemon, which is root-equivalent on the host if a
+container escapes it. That trade was accepted when CLAUDE-287 was filed; the container still bind-mounts nothing from
+the host, and logins still happen inside the container.
 
 **Actions.** The `./actions` bind is gone with the other host mounts. The image bakes this repo's action YAML at `/usr/share/claude-run/actions`, and the entrypoint copies it into the config volume the first time that volume holds no `*.yml`, so a fresh container starts with the shipped action set. It never overwrites after that: an action edited in the web UI survives an image upgrade, and a changed shipped action reaches an existing deployment through the same editor (`/actions`), not by recreating the container.
 
