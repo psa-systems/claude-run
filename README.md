@@ -1003,7 +1003,8 @@ acked and dropped.
 The failing workflow's run at the merge commit is found by paging `fj actions runs` for the commit (`CommitRunsClient`,
 a second seam over the same JSON `ActionRunsClient::list_runs` reads, needed because `RunEntry` carries no commit sha).
 
-**Operator setup:** each Forgejo webhook pointed at `/webhooks/forgejo/<source>` must also send "Pull Request" events,
+**Operator setup:** each Forgejo webhook pointed at `/webhooks/forgejo/<source>` must also send pull-request events
+(**Pull request events > Modification** in Forgejo's webhook form, which covers opened, closed, reopened and edited),
 alongside the Action-run events it already sends. Until it does, nothing closes on merge, and the run list shows no
 pull-request deliveries.
 
@@ -1127,10 +1128,11 @@ two routes, chosen by whether the comment's thread is a pull request:
 The second route is a ROUTE, not a second listener: the request pipeline, authorization gate, trigger parsing,
 bot-login loop drop, dedupe key, and caps ledger are the same implementations both paths run through.
 
-It is a SEPARATE listener, section, and synthetic action rather than a second event type on `webhook-forgejo`, because
-the credentials differ in kind: comment handling needs a WRITE token (post replies, push a branch) while the CI-failure
-sources need only a read-only log token. Separate sections keep the write token out of the block holding the read-only
-one, and each listener gets its own Pause switch. What the two DO share, by reference rather than by copy: HMAC
+It is a SEPARATE listener, section, and synthetic action rather than a second event type on `webhook-forgejo`,
+because the tokens differ in power: the comment listener's `write_token_ref` pushes branches (`write:repository`
+plus `write:issue`), while a CI-failure source holds a read-only `log_token_ref` and, since CLAUDE-276, a
+`write_token_ref` that only comments on pull requests (`write:issue`). Separate sections keep the push-capable token
+out of the CI-failure source block, and each listener gets its own Pause switch. What the two DO share, by reference rather than by copy: HMAC
 verification, the single replay-store instance (so one `X-Forgejo-Delivery` id fanned out to both endpoints is still
 caught), the per-source rate-limiter type and builder, the `owner/repo` allow-list matcher, and the accept-and-drop
 pause gate (CLAUDE-223), which checks the GLOBAL pause before each listener's own synthetic action.
@@ -1200,8 +1202,15 @@ environment, never a process argument, and never rendered in a settings response
 
 **Forgejo setup.** On the repo or org's Settings -> Webhooks, add a **Forgejo** webhook with URL
 `https://<daemon-host>/webhooks/forgejo-comment/<source>`, the Secret set to that source's stored `secret_ref` value,
-and **only** the Issue Comment event selected (Forgejo delivers pull-request and plain-issue comments through that one
-event; the listener tells them apart from the payload). Store the write PAT first, e.g.
+and exactly two events selected: **Issue events > Comments** (plain-issue comments) and **Pull request events >
+Comments** (pull-request comments). Forgejo sends these as separate event types, `issue_comment` and
+`pull_request_comment` (`services/webhook/notifier.go`, `CreateIssueComment`), each behind its own checkbox, so a hook
+with only the issue box ticked never receives a pull-request comment. Both carry the same payload, and the listener
+tells them apart by `issue.pull_request`. Leave **Reviews** unticked: review comments are a different event the
+listener does not handle. The bot account that owns the write PAT needs the **Admin** role on each allowed
+repository, because Forgejo answers a permission read only for a site admin, a repo admin, or the user being
+queried (`GetRepoPermissions`, `routers/api/v1/repo/collaborators.go`); without it every command replies "could not
+verify permission". Store the write PAT first, e.g.
 `printf %s '<pat>' | claude-run secret set forgejo-write-<org>`, and name it in the source's `write_token_ref`.
 
 ## Containerized deployment
