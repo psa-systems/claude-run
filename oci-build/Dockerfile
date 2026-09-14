@@ -70,97 +70,41 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release --locked
 
-# Runtime stage (CLAUDE-37): the daemon plus its full runtime toolchain in one
-# image. Based on the same musl rust-builder image so cargo/rust and the C
-# toolchain are present if a target-repo check needs them; the runtime tools
-# (nu, claude, yt, fj, just, kingfisher, timeout, git) are added and pinned via
-# build args so the image is reproducible instead of depending on whatever the
-# operator installed.
+# Runtime stage (CLAUDE-37, rebased onto opensuse-dev in CLAUDE-287): the daemon
+# plus its full runtime toolchain in one image. The base carries the whole
+# toolchain already (nu, claude, yt, fj, just, kingfisher, docker, git,
+# coreutils, cargo/rustc), so this stage only creates the runtime user, copies
+# the binary and shipped config, and smoke-checks the tools it did not install.
+# Moving a tool means bumping the base image tag, not editing a RUN block here.
+#
+# CLAUDE-287: the base also carries Docker, so `claude` sessions the daemon
+# spawns can run `docker`, `docker compose` and `docker buildx` against the
+# `claude-bot-docker` sidecar in compose.yml (DOCKER_HOST=tcp://127.0.0.1:2375).
+# That is what makes `just check` (ending in `check-docker`) and
+# `just pre-commit` (docker-mode) work inside this container.
 #
 # CLAUDE-247: the image is self-contained. It mounts nothing from the host, and
 # the operator logs claude / yt / fj / git in INSIDE the container, onto named
 # volumes. See README "Containerized deployment".
-FROM dev.a8n.run/pandoras-box/rust-builder-musl:v1.0.0-rust1.94-alpine AS runtime
+FROM dev.a8n.run/pandoras-box/opensuse-dev:v1.8.0-leap-16.0 AS runtime
 
-# Version pins. Override at build time with --build-arg to move a single tool.
-ARG NU_VERSION=0.112.2
-ARG CLAUDE_CODE_VERSION=latest
-ARG YT_VERSION=v0.13.0
-ARG FJ_VERSION=v0.15.0
-# CLAUDE-247: yt and fj come from this org's own Forgejo generic packages, which
-# publish prebuilt static binaries. Both are anonymous downloads.
-ARG PKG_BASE=https://dev.a8n.run/api/packages/pandoras-box/generic
-# CLAUDE-282: just and kingfisher come from the org's Dufs binary mirror. The
-# checksum is pinned here rather than read from Dufs' own `?hash` at build
-# time, because a hash served by the same host as the file verifies nothing.
-ARG BINARIES_BASE=https://files.example.com/public/linux/x86_64
-ARG JUST_VERSION=1.57.0
-ARG JUST_SHA256=8545d0880e84bbd6c9d6a5dc2681df2a6315455bc2a2f1d7bca52085d6adb8e3
-ARG KINGFISHER_VERSION=1.59.0
-ARG KINGFISHER_SHA256=ae94fdc3fad5ad18b39c7f3c0742a34b98f7359eea9eaa39c22ecc3129577155
+USER root
 
-# Runtime dependencies:
-#   coreutils -> the `timeout(1)` wall-clock wrapper src/claude.rs delegates to
-#   git       -> clone/branch/commit inside each job workdir
-#   nodejs/npm-> the `claude` CLI ships as the @anthropic-ai/claude-code package
-#   su-exec   -> drop root to claudebot in the entrypoint (CLAUDE-247)
-#   curl/tar  -> fetch the pinned nu / yt / fj release binaries
-RUN apk add --no-cache coreutils git nodejs npm su-exec curl tar
-
-# nu: pinned musl release tarball (apk's nushell version drifts from the
-# 0.112.2 the actions are written against).
-RUN curl -fsSL "https://github.com/nushell/nushell/releases/download/${NU_VERSION}/nu-${NU_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-    | tar -xz -C /tmp \
-    && install -m 0755 "/tmp/nu-${NU_VERSION}-x86_64-unknown-linux-musl/nu" /usr/local/bin/nu \
-    && rm -rf /tmp/nu-* \
-    && nu --version
-
-# claude: the Claude Code CLI as a global npm package.
-RUN npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-    && claude --version
-
-# yt: the org's youtrack-cli (pandoras-box/youtrack-cli), a prebuilt static
-# binary from the Forgejo generic package registry. NOT the unrelated PyPI
-# project of the same name, whose command surface the actions are not written
-# against. Verified against the checksum published beside it.
-RUN cd /tmp \
-    && curl -fsSLO "${PKG_BASE}/youtrack-cli/${YT_VERSION}/yt-linux-x86_64" \
-    && curl -fsSLO "${PKG_BASE}/youtrack-cli/${YT_VERSION}/yt-linux-x86_64.sha256" \
-    && sha256sum -c yt-linux-x86_64.sha256 \
-    && install -m 0755 yt-linux-x86_64 /usr/local/bin/yt \
-    && rm -f yt-linux-x86_64 yt-linux-x86_64.sha256 \
-    && yt --version
-
-# fj: forgejo-cli (pandoras-box/forgejo-cli), the musl-static build from the same
-# registry. Replaces a `cargo install` that recompiled the whole crate on every
-# image build. The smoke check is `--help`: fj has no `--version` flag.
-RUN cd /tmp \
-    && curl -fsSLO "${PKG_BASE}/forgejo-cli/${FJ_VERSION}/fj-linux-x86_64-static" \
-    && curl -fsSLO "${PKG_BASE}/forgejo-cli/${FJ_VERSION}/fj-linux-x86_64-static.sha256" \
-    && sha256sum -c fj-linux-x86_64-static.sha256 \
-    && install -m 0755 fj-linux-x86_64-static /usr/local/bin/fj \
-    && rm -f fj-linux-x86_64-static fj-linux-x86_64-static.sha256 \
-    && fj --help >/dev/null
-
-# just: the check-suite runner target repos are built against (src/native/youtrack.rs
-# step 6, "the repo's 'just check'"), from the org's Dufs binary mirror
-# (NiceGuyIT/binaries). Static musl binary, verified against its pinned checksum.
-RUN cd /tmp \
-    && curl -fsSLo just "${BINARIES_BASE}/just/${JUST_VERSION}/just" \
-    && echo "${JUST_SHA256}  just" | sha256sum -c \
-    && install -m 0755 just /usr/local/bin/just \
-    && rm -f just \
-    && just --version
-
-# kingfisher: the secret scanner org repos gate on (a8n-run/docker's
-# check-secrets recipe, another repo's justfile), from the same Dufs mirror.
-# Static musl binary, verified against its pinned checksum.
-RUN cd /tmp \
-    && curl -fsSLo kingfisher "${BINARIES_BASE}/kingfisher/${KINGFISHER_VERSION}/kingfisher" \
-    && echo "${KINGFISHER_SHA256}  kingfisher" | sha256sum -c \
-    && install -m 0755 kingfisher /usr/local/bin/kingfisher \
-    && rm -f kingfisher \
-    && kingfisher --version
+# Smoke-check the toolchain the base image is expected to carry. A base that
+# loses a tool fails the image build here instead of the first job.
+RUN nu --version \
+    && claude --version \
+    && yt --version \
+    && fj version \
+    && just --version \
+    && kingfisher --version \
+    && docker --version \
+    && docker compose version \
+    && docker buildx version \
+    && git --version \
+    && timeout --version \
+    && setpriv --version \
+    && cargo --version
 
 # claude-run itself, from the builder stage above.
 COPY --from=builder /build/target/release/claude-run /usr/local/bin/claude-run
@@ -180,11 +124,12 @@ COPY actions/*.yml /usr/share/claude-run/actions/
 # volume.
 COPY deploy/container-config.toml /usr/share/claude-run/config.toml
 
-# Non-root container user. $HOME is deliberately NOT where anything persists
-# (CLAUDE-253): it is scratch, and every store the operator cares about lives
-# under the three volumes below.
-RUN addgroup -S claudebot \
-    && adduser -S -G claudebot -h /home/claudebot claudebot
+# Non-root container user. Same ids the earlier Alpine image used (uid 100,
+# gid 101), so a volume from before CLAUDE-287 stays owned by this user. $HOME
+# is deliberately NOT where anything persists (CLAUDE-253): it is scratch, and
+# every store the operator cares about lives under the three volumes below.
+RUN groupadd --system --gid 101 claudebot \
+    && useradd --system --uid 100 --gid 101 --create-home --home-dir /home/claudebot claudebot
 COPY deploy/bot-CLAUDE.md /home/claudebot/.claude/CLAUDE.md
 
 # CLAUDE-253: three flat mounts instead of seven XDG paths under a home
@@ -224,7 +169,7 @@ RUN mkdir -p /config/actions /config/claude-agent-home /config/git /config/youtr
     && chown -R claudebot:claudebot /config /data /state /run/claude-run \
     && chown -R claudebot:claudebot /home/claudebot
 
-# HOME is set explicitly because the runtime stage has no USER directive (see the
+# HOME is set explicitly because the runtime stage stays on USER root (see the
 # entrypoint note below): without it a root `docker compose exec` would write to
 # /root. Nothing persists here; it is the scratch home the agent's own tooling
 # uses.
@@ -232,8 +177,9 @@ ENV HOME=/home/claudebot
 WORKDIR /home/claudebot
 
 # CLAUDE-247: the container STARTS as root so the entrypoint can chown the
-# mounted volumes, then drops to claudebot with su-exec. This is a deliberate,
-# recorded exception to BUILD.md's non-root-runtime mandate (pattern 3 in
+# mounted volumes, then drops to claudebot with setpriv (CLAUDE-287; Leap
+# packages neither su-exec nor gosu). This is a deliberate, recorded exception
+# to BUILD.md's non-root-runtime mandate (pattern 3 in
 # governance/CONTAINER_UID_GID.md); the daemon itself runs non-root. An operator
 # `user:` override in compose disables the chown and must not be set.
 COPY oci-build/entrypoint.sh /usr/local/bin/entrypoint.sh
