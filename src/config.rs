@@ -421,9 +421,8 @@ pub struct CommentWebhookSource {
     /// reaches `fj` in a temp single-host `keys.json` carrying that one secret.
     /// Unset means no command can be served (every delivery is refused).
     pub write_token_ref: Option<String>,
-    /// Effective repository permissions that may run a command. Configurable
-    /// because Forgejo's role model keeps growing; adding a role is a settings
-    /// edit, not a code change. Matched case-insensitively.
+    /// Repository permissions that may run a command. A Forgejo access level (read, write,
+    /// admin, owner) also admits every higher level; any other value matches exactly.
     pub allowed_permissions: Vec<String>,
     /// Decision-gate cap: a working-tree diff touching more files than this is
     /// commented on rather than pushed.
