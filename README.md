@@ -1150,7 +1150,9 @@ comment instead.
 **Authorization** is a LIVE read of the commenter's effective repository permission through
 `fj repo collaborator <owner>/<repo> permission <username> --format json` (a new `Forge::repo_permission`; no raw REST
 anywhere on this path). The command runs only when the returned permission is in the source's `allowed_permissions`
-(default `["write", "admin"]`, matched case-insensitively and configurable because Forgejo's role model keeps growing).
+(default `["write", "admin"]`) or outranks an entry in it. Forgejo ranks its access levels `none` < `read` < `write` <
+`admin` < `owner` (`models/perm/access_mode.go`), so the default also admits a repository `owner`. Any other value is
+matched exactly and case-insensitively, so a future Forgejo role can still be allowed by name.
 A permission lookup that ERRORS denies (fail closed) and replies "could not verify permission". A denied commenter gets
 ONE reply stating the required set, then the delivery is acked and dropped; denial replies are throttled per
 `(repo, login)` so a scripted denied commenter cannot flood a PR.
