@@ -609,7 +609,8 @@ The workflow:
 1. **Pause all activity.** The card's button posts to `/api/pause` with an optional free-text reason. From then on
    nothing new starts: the scheduler tick returns immediately, a manual trigger is refused with `409` naming the pause
    (instead of the old "queued trigger" ack for a run that was then silently dropped), an inbound delivery to either
-   webhook listener is accepted with a `2xx` and dropped, and any run still in flight stops picking up its NEXT job.
+   webhook listener is accepted with a `2xx` and dropped (a dropped delivery is not recovered after Resume), and any run
+   still in flight stops picking up its NEXT job.
 2. **Watch the indicator drain.** It polls itself every 2s and reads exactly one of three states: **busy** (each active
    run listed and linked), **idle** ("safe to restart or reboot"), or **unknown**. `unknown` means the activity check
    itself failed; it is never rendered as idle, and the underlying error is logged at `error`. Do not restart on
@@ -772,7 +773,7 @@ minutes while ready, and every 60 seconds while login-required (skipped entirely
 there is nothing to probe yet). A spawn failure, a timeout, or unparseable probe output is logged and changes
 nothing: it is neither evidence of a login nor of its absence. While login-required, exactly like `no_credential`,
 the scheduler dispatches nothing, the trigger endpoint answers `409`, the CI-triage webhook accepts and drops each
-delivery (recording why as a `run_events` row), and the `/claude` comment webhook replies on the thread naming the
+delivery (recording why as a `run_events` row), which is not recovered once signed in again, and the `/claude` comment webhook replies on the thread naming the
 reason instead of running anything; unlike a global pause, no job spends an attempt because of it. A run already in
 flight stops picking up new jobs and closes with `exit::LOGIN_REQUIRED` (8), distinct from `exit::PAUSED`: an operator
 cancel wins over both, and a global pause wins over login-required when both hold. The dashboard-and-every-page banner,
@@ -841,11 +842,12 @@ Auth (and every action `token_ref`) reads from an encrypted secrets store. Two t
 
 ## Webhook (Forgejo)
 
-The daemon turns a Forgejo `action_run_failure` delivery into a triaged YouTrack issue in seconds, instead of waiting
-for the next scheduled poll. The pipeline is `POST /webhooks/forgejo/<source>` (HMAC-verified, replay-protected,
-rate-limited) -> internal-route log fetch + redaction -> hybrid triage -> issue mint, all inside the running daemon. The
-scheduled `youtrack` action remains the backstop and dedupes against webhook-minted issues through the same hidden
-markers, so a poll that races the webhook never files a second issue.
+The daemon turns a Forgejo `action_run_failure` delivery into a triaged YouTrack issue in seconds. The pipeline is
+`POST /webhooks/forgejo/<source>` (HMAC-verified, replay-protected, rate-limited) -> internal-route log fetch +
+redaction -> hybrid triage -> issue mint, all inside the running daemon. The webhook is the only path that turns a CI
+failure into an issue: nothing has polled for CI failures since CLAUDE-279 retired the scheduled CI-failure actions,
+so a delivery the daemon never processes (daemon down, hook misconfigured, or dropped while paused) is not picked up
+later.
 
 **CLAUDE-273: dedupe is a database lookup by failing-test overlap, not a YouTrack search.** Before triage runs, the
 webhook consumer fingerprints the redacted log (`ci_failure::fingerprint`, the same cargo-test-output parser CLAUDE-272
@@ -955,7 +957,7 @@ a `run_events` row naming the source, and the run finishes `ok = false` - it is 
 agent's-own-PR case, before `mint` is ever reached. `config.mint.bot_logins` is unchanged and still used by the
 `/claude` PR-comment listener's own, separate bot-login check.
 
-**CLAUDE-153/CLAUDE-273: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
+**CLAUDE-153/CLAUDE-273: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. A dropped delivery is not recovered after Resume. CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
 
 A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then
 the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the
@@ -1001,7 +1003,8 @@ acked and dropped.
 The failing workflow's run at the merge commit is found by paging `fj actions runs` for the commit (`CommitRunsClient`,
 a second seam over the same JSON `ActionRunsClient::list_runs` reads, needed because `RunEntry` carries no commit sha).
 
-**Operator setup:** each Forgejo webhook pointed at `/webhooks/forgejo/<source>` must also send "Pull Request" events,
+**Operator setup:** each Forgejo webhook pointed at `/webhooks/forgejo/<source>` must also send pull-request events
+(**Pull request events > Modification** in Forgejo's webhook form, which covers opened, closed, reopened and edited),
 alongside the Action-run events it already sends. Until it does, nothing closes on merge, and the run list shows no
 pull-request deliveries.
 
@@ -1125,10 +1128,11 @@ two routes, chosen by whether the comment's thread is a pull request:
 The second route is a ROUTE, not a second listener: the request pipeline, authorization gate, trigger parsing,
 bot-login loop drop, dedupe key, and caps ledger are the same implementations both paths run through.
 
-It is a SEPARATE listener, section, and synthetic action rather than a second event type on `webhook-forgejo`, because
-the credentials differ in kind: comment handling needs a WRITE token (post replies, push a branch) while the CI-failure
-sources need only a read-only log token. Separate sections keep the write token out of the block holding the read-only
-one, and each listener gets its own Pause switch. What the two DO share, by reference rather than by copy: HMAC
+It is a SEPARATE listener, section, and synthetic action rather than a second event type on `webhook-forgejo`,
+because the tokens differ in power: the comment listener's `write_token_ref` pushes branches (`write:repository`
+plus `write:issue`), while a CI-failure source holds a read-only `log_token_ref` and, since CLAUDE-276, a
+`write_token_ref` that only comments on pull requests (`write:issue`). Separate sections keep the push-capable token
+out of the CI-failure source block, and each listener gets its own Pause switch. What the two DO share, by reference rather than by copy: HMAC
 verification, the single replay-store instance (so one `X-Forgejo-Delivery` id fanned out to both endpoints is still
 caught), the per-source rate-limiter type and builder, the `owner/repo` allow-list matcher, and the accept-and-drop
 pause gate (CLAUDE-223), which checks the GLOBAL pause before each listener's own synthetic action.
@@ -1200,8 +1204,15 @@ environment, never a process argument, and never rendered in a settings response
 
 **Forgejo setup.** On the repo or org's Settings -> Webhooks, add a **Forgejo** webhook with URL
 `https://<daemon-host>/webhooks/forgejo-comment/<source>`, the Secret set to that source's stored `secret_ref` value,
-and **only** the Issue Comment event selected (Forgejo delivers pull-request and plain-issue comments through that one
-event; the listener tells them apart from the payload). Store the write PAT first, e.g.
+and exactly two events selected: **Issue events > Comments** (plain-issue comments) and **Pull request events >
+Comments** (pull-request comments). Forgejo sends these as separate event types, `issue_comment` and
+`pull_request_comment` (`services/webhook/notifier.go`, `CreateIssueComment`), each behind its own checkbox, so a hook
+with only the issue box ticked never receives a pull-request comment. Both carry the same payload, and the listener
+tells them apart by `issue.pull_request`. Leave **Reviews** unticked: review comments are a different event the
+listener does not handle. The bot account that owns the write PAT needs the **Admin** role on each allowed
+repository, because Forgejo answers a permission read only for a site admin, a repo admin, or the user being
+queried (`GetRepoPermissions`, `routers/api/v1/repo/collaborators.go`); without it every command replies "could not
+verify permission". Store the write PAT first, e.g.
 `printf %s '<pat>' | claude-run secret set forgejo-write-<org>`, and name it in the source's `write_token_ref`.
 
 ## Containerized deployment
