@@ -606,7 +606,8 @@ The workflow:
 1. **Pause all activity.** The card's button posts to `/api/pause` with an optional free-text reason. From then on
    nothing new starts: the scheduler tick returns immediately, a manual trigger is refused with `409` naming the pause
    (instead of the old "queued trigger" ack for a run that was then silently dropped), an inbound delivery to either
-   webhook listener is accepted with a `2xx` and dropped, and any run still in flight stops picking up its NEXT job.
+   webhook listener is accepted with a `2xx` and dropped (a dropped delivery is not recovered after Resume), and any run
+   still in flight stops picking up its NEXT job.
 2. **Watch the indicator drain.** It polls itself every 2s and reads exactly one of three states: **busy** (each active
    run listed and linked), **idle** ("safe to restart or reboot"), or **unknown**. `unknown` means the activity check
    itself failed; it is never rendered as idle, and the underlying error is logged at `error`. Do not restart on
@@ -769,7 +770,7 @@ minutes while ready, and every 60 seconds while login-required (skipped entirely
 there is nothing to probe yet). A spawn failure, a timeout, or unparseable probe output is logged and changes
 nothing: it is neither evidence of a login nor of its absence. While login-required, exactly like `no_credential`,
 the scheduler dispatches nothing, the trigger endpoint answers `409`, the CI-triage webhook accepts and drops each
-delivery (recording why as a `run_events` row), and the `/claude` comment webhook replies on the thread naming the
+delivery (recording why as a `run_events` row), which is not recovered once signed in again, and the `/claude` comment webhook replies on the thread naming the
 reason instead of running anything; unlike a global pause, no job spends an attempt because of it. A run already in
 flight stops picking up new jobs and closes with `exit::LOGIN_REQUIRED` (8), distinct from `exit::PAUSED`: an operator
 cancel wins over both, and a global pause wins over login-required when both hold. The dashboard-and-every-page banner,
@@ -838,11 +839,12 @@ Auth (and every action `token_ref`) reads from an encrypted secrets store. Two t
 
 ## Webhook (Forgejo)
 
-The daemon turns a Forgejo `action_run_failure` delivery into a triaged YouTrack issue in seconds, instead of waiting
-for the next scheduled poll. The pipeline is `POST /webhooks/forgejo/<source>` (HMAC-verified, replay-protected,
-rate-limited) -> internal-route log fetch + redaction -> hybrid triage -> issue mint, all inside the running daemon. The
-scheduled `youtrack` action remains the backstop and dedupes against webhook-minted issues through the same hidden
-markers, so a poll that races the webhook never files a second issue.
+The daemon turns a Forgejo `action_run_failure` delivery into a triaged YouTrack issue in seconds. The pipeline is
+`POST /webhooks/forgejo/<source>` (HMAC-verified, replay-protected, rate-limited) -> internal-route log fetch +
+redaction -> hybrid triage -> issue mint, all inside the running daemon. The webhook is the only path that turns a CI
+failure into an issue: nothing has polled for CI failures since CLAUDE-279 retired the scheduled CI-failure actions,
+so a delivery the daemon never processes (daemon down, hook misconfigured, or dropped while paused) is not picked up
+later.
 
 **CLAUDE-273: dedupe is a database lookup by failing-test overlap, not a YouTrack search.** Before triage runs, the
 webhook consumer fingerprints the redacted log (`ci_failure::fingerprint`, the same cargo-test-output parser CLAUDE-272
@@ -952,7 +954,7 @@ a `run_events` row naming the source, and the run finishes `ok = false` - it is 
 agent's-own-PR case, before `mint` is ever reached. `config.mint.bot_logins` is unchanged and still used by the
 `/claude` PR-comment listener's own, separate bot-login check.
 
-**CLAUDE-153/CLAUDE-273: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
+**CLAUDE-153/CLAUDE-273: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. A dropped delivery is not recovered after Resume. CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
 
 A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then
 the project whose **enabled VCS integration** claims the failing repo, then `fallback_project`. The VCS lookup is the
