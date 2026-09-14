@@ -1,9 +1,11 @@
 #!/bin/sh
 # CLAUDE-247: pattern 3 from governance/CONTAINER_UID_GID.md. The container
 # starts as root so this script can chown the mounted volumes to the runtime
-# user, then drops to claudebot via su-exec. Starting as root is a deliberate,
-# recorded exception to BUILD.md's non-root-runtime mandate: the workload itself
-# still runs non-root. Do NOT set `user:` in compose, or the chown never happens.
+# user, then drops to claudebot via setpriv (CLAUDE-287; Leap packages neither
+# of the two tools earlier images used for this). Starting as root is a
+# deliberate, recorded exception to BUILD.md's non-root-runtime mandate: the
+# workload itself still runs non-root. Do NOT set `user:` in compose, or the
+# chown never happens.
 #
 # Why chown at all when every mount is a named volume: Docker seeds an EMPTY
 # named volume with the image mountpoint's ownership, but a volume the operator
@@ -60,8 +62,12 @@ if [ -d "${CLAUDE_RUN_DATA_DIR}" ]; then
     fi
 fi
 
-# su-exec sets HOME from the target user's passwd entry. Nothing persistent hangs
-# off $HOME any more (CLAUDE-253): the stores are named by CLAUDE_RUN_*_DIR,
-# XDG_CONFIG_HOME, XDG_DATA_HOME, CLAUDE_CONFIG_DIR and GIT_CONFIG_GLOBAL, all
-# set in the image and all inherited by the dropped process.
-exec su-exec claudebot /usr/local/bin/claude-run "$@"
+# setpriv leaves HOME as inherited rather than setting it from the target
+# user's passwd entry, which is why ENV HOME=/home/claudebot stays in the
+# Dockerfile. The env-clearing flag setpriv also offers is deliberately not
+# passed: that would clear CLAUDE_RUN_*, XDG_*, CLAUDE_CONFIG_DIR and
+# GIT_CONFIG_GLOBAL too. Nothing persistent hangs off $HOME any more
+# (CLAUDE-253): the stores are named by CLAUDE_RUN_*_DIR, XDG_CONFIG_HOME,
+# XDG_DATA_HOME, CLAUDE_CONFIG_DIR and GIT_CONFIG_GLOBAL, all set in the image
+# and all inherited by the dropped process.
+exec setpriv --reuid=claudebot --regid=claudebot --init-groups /usr/local/bin/claude-run "$@"

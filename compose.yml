@@ -1,4 +1,4 @@
-# claude-run daemon, containerized (CLAUDE-37, CLAUDE-247).
+# claude-run daemon, containerized (CLAUDE-37, CLAUDE-247, CLAUDE-287).
 #
 # The whole daemon runs in this container, so every `claude` child it spawns
 # inherits the container's clean $HOME and loads only the slim bot CLAUDE.md
@@ -14,6 +14,13 @@
 #
 # CLAUDE-253: three flat volumes, /config /data /state. Nothing persists under
 # $HOME, and no path here needs to know about XDG.
+#
+# CLAUDE-287: the runtime image is built on `opensuse-dev`, which carries
+# Docker, so the daemon's `claude-bot-docker` sidecar below (Docker-in-Docker,
+# loopback only) gives every `claude` session it spawns a Docker it can use.
+# Still no host bind mount: the sidecar's Docker state lives on its own named
+# volume, and the `/data` it shares with claude-bot is that same named volume,
+# never a host path.
 #
 # Names are app-prefixed per house convention. For a development stack, prefix
 # each name with `dev-` (service dev-claude-bot, network dev-claude-bot-private,
@@ -37,7 +44,7 @@ services:
     networks:
       claude-bot-private:
     # CLAUDE-247: no `user:` here. The image starts as root so its entrypoint can
-    # chown the volumes, then drops to claudebot with su-exec (pattern 3 in
+    # chown the volumes, then drops to claudebot with setpriv (pattern 3 in
     # governance/CONTAINER_UID_GID.md). A `user:` override would leave the
     # entrypoint without the privileges the chown needs.
     environment:
@@ -49,6 +56,11 @@ services:
       # first start. Set CLAUDE_RUN_SECRETS_KEY_FILE only to supply your own,
       # e.g. from a secret store; the value is a PATH, never key material.
       CLAUDE_RUN_LOG: info
+      # CLAUDE-287: the Docker-in-Docker sidecar below shares this service's
+      # network namespace, so its loopback-only daemon is reachable here.
+      # `claude` sessions the daemon spawns inherit this, since nothing in
+      # src/ calls env_clear or env_remove.
+      DOCKER_HOST: tcp://127.0.0.1:2375
       # CLAUDE-250: uncomment together with the `claude-run-database-url` secret
       # below to put the runner state on the `postgres` profile's server instead
       # of the SQLite file on claude-bot-data. Unset means SQLite, which is what
@@ -93,6 +105,47 @@ services:
     tmpfs:
       - /run/claude-run
 
+  # CLAUDE-287: Docker-in-Docker sidecar, so `claude` sessions the daemon spawns
+  # can run `docker`, `docker compose` and `docker buildx` (this repo's own
+  # `just check`/`just pre-commit` need it). Follows the Forgejo runners'
+  # pattern: a
+  # privileged dind daemon sharing its owner's network namespace, listening on
+  # loopback only, with no TLS because nothing outside that namespace can reach
+  # it. The agent drives a privileged daemon, which is root-equivalent on the
+  # host if a container escapes it; that trade was accepted when CLAUDE-287 was
+  # filed. No host bind mount: `/data` is the same named volume claude-bot
+  # mounts at the same path, which is what makes `docker run --volume
+  # $PWD:...` from inside a job workdir resolve (both containers agree on
+  # what `/data/workdirs/...` means); through the host's own socket it would
+  # resolve against the host filesystem instead, where that path does not
+  # exist. `/var/lib/docker` is a separate named volume rather than anonymous,
+  # so its growth is visible and prunable.
+  claude-bot-docker:
+    container_name: claude-bot-docker
+    image: docker.io/docker:29.6.2-dind
+    privileged: true
+    restart: unless-stopped
+    # Deliberately no `depends_on: claude-bot`: this service JOINS claude-bot's
+    # network namespace, so a dependency the other way would be a cycle. A job
+    # that runs `docker` before this sidecar is up simply fails with the CLI's
+    # own connection error in that job's log.
+    network_mode: service:claude-bot
+    command: ["dockerd", "-H", "tcp://127.0.0.1:2375", "--tls=false"]
+    volumes:
+      - type: volume
+        source: claude-bot-data
+        target: /data
+      - type: volume
+        source: claude-bot-docker
+        target: /var/lib/docker
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "2375"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 5s
+      start_interval: 1s
+
   # CLAUDE-250: the optional PostgreSQL state store. Behind a profile, so a plain
   # `docker compose up` starts exactly the service set it started before this
   # existed; `docker compose --profile postgres up` adds the database. The first
@@ -136,6 +189,10 @@ volumes:
     name: claude-bot-data
   claude-bot-state:
     name: claude-bot-state
+  # CLAUDE-287: /var/lib/docker for the Docker-in-Docker sidecar. Named rather
+  # than anonymous so its growth is visible and prunable.
+  claude-bot-docker:
+    name: claude-bot-docker
   # CLAUDE-250: only mounted by the profiled claude-bot-postgres service.
   claude-bot-postgres:
     name: claude-bot-postgres
