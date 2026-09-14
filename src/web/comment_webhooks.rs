@@ -18,12 +18,10 @@
 //! trigger parsing, bot-login loop drop, dedupe key, caps ledger, and run
 //! accounting are the same implementations both paths run through.
 //!
-//! This is a SECOND, independent listener from [`super::webhooks`], not an
-//! extension of it, because the credentials differ in kind: comment handling
-//! needs a WRITE token (post comments, push a branch) while the CI-failure
-//! sources need only a read-only log token. Separate config sections keep the
-//! write token out of the block holding the read-only one, and the two get
-//! independent Pause switches.
+//! This is a SECOND, independent listener from [`super::webhooks`], not an extension
+//! of it: its token pushes branches, while a CI-failure source's tokens only read logs
+//! and comment. Separate config sections keep the push-capable token apart, and the
+//! two get independent Pause switches.
 //!
 //! What IS shared with [`super::webhooks`], deliberately and by reference rather
 //! than by copy: [`super::webhooks::verify_signature`], the single
@@ -576,13 +574,34 @@ impl PermissionVerdict {
     }
 }
 
-/// True when `permission` is in `allowed` (case-insensitive). An empty list
-/// denies everyone; the settings validator rejects one, so this is defence in
-/// depth for a hand-edited DB row.
+/// Forgejo access-mode rank (`models/perm/access_mode.go`): `none` 0, `read` 1,
+/// `write` 2, `admin` 3, `owner` 4, case-insensitive. `None` for anything else.
+fn access_rank(permission: &str) -> Option<u8> {
+    match permission.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(0),
+        "read" => Some(1),
+        "write" => Some(2),
+        "admin" => Some(3),
+        "owner" => Some(4),
+        _ => None,
+    }
+}
+
+/// True when `permission` is in `allowed` (case-insensitive), or outranks a
+/// Forgejo access level listed in it. An empty list denies everyone; the
+/// settings validator rejects one, so this is defence in depth for a
+/// hand-edited DB row.
 pub fn permission_allowed(permission: &str, allowed: &[String]) -> bool {
-    allowed
-        .iter()
-        .any(|a| a.trim().eq_ignore_ascii_case(permission.trim()))
+    let permission_rank = access_rank(permission);
+    allowed.iter().any(|a| {
+        if a.trim().eq_ignore_ascii_case(permission.trim()) {
+            return true;
+        }
+        match (permission_rank, access_rank(a)) {
+            (Some(p), Some(a)) => p >= a,
+            _ => false,
+        }
+    })
 }
 
 /// Read the commenter's effective repository permission LIVE from the forge and
@@ -1584,13 +1603,13 @@ pub fn denied_comment(verdict: &PermissionVerdict, allowed: &[String]) -> String
         PermissionVerdict::LookupFailed(_) => [
             "**Command refused: could not verify your repository permission.**".to_string(),
             String::new(),
-            format!("Running a command needs one of these repository permissions: `{list}`. The permission lookup failed, so the request was refused (fail closed). See the runner journal for the error."),
+            format!("Running a command needs one of these repository permissions, or a higher one: `{list}`. The permission lookup failed, so the request was refused (fail closed). See the runner journal for the error."),
         ]
         .join("\n"),
         PermissionVerdict::Denied(p) => [
             "**Command refused: insufficient repository permission.**".to_string(),
             String::new(),
-            format!("Your effective permission on this repository is `{p}`; running a command needs one of: `{list}`."),
+            format!("Your effective permission on this repository is `{p}`; running a command needs one of `{list}`, or a higher permission."),
         ]
         .join("\n"),
         PermissionVerdict::Allowed(_) => String::new(),
@@ -2069,6 +2088,40 @@ mod tests {
         );
         assert!(body.contains("`read`"), "{body}");
         assert!(body.contains("write") && body.contains("admin"), "{body}");
+    }
+
+    #[test]
+    fn permission_allowed_ranks_forgejo_access_levels() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("owner", &["write", "admin"], true),
+            ("admin", &["write"], true),
+            ("OWNER", &["Write"], true),
+            ("write", &["admin"], false),
+            ("read", &["write", "admin"], false),
+            ("none", &["read"], false),
+            ("maintainer", &["maintainer"], true),
+            ("maintainer", &["write", "admin"], false),
+            ("owner", &["maintainer"], false),
+            ("write", &[], false),
+        ];
+        for (permission, allowed, expected) in cases {
+            let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                permission_allowed(permission, &allowed),
+                *expected,
+                "permission={permission:?} allowed={allowed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_outranks_the_default_allowed_permissions() {
+        let allowed = vec!["write".to_string(), "admin".to_string()];
+        let b = permission_backend(Some(r#"{"username":"alice","permission":"owner"}"#));
+        assert_eq!(
+            check_permission(&b, "dev.a8n.run", REPO, "alice", &allowed),
+            PermissionVerdict::Allowed("owner".to_string())
+        );
     }
 
     #[test]

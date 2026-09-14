@@ -350,9 +350,9 @@ impl Default for WebhookSource {
 }
 
 /// CLAUDE-220: `/claude <instruction>` pull-request comment commands. A SECOND,
-/// independent listener from [`WebhookConfig`]: comment handling needs a WRITE
-/// token (post comments, push a branch) while the CI-failure sources need only a
-/// read-only log token, so the two credential kinds never share a config block.
+/// independent listener from [`WebhookConfig`]: its token pushes branches, while a
+/// CI-failure source's tokens only read logs and comment, so a push-capable token
+/// never shares a config block with them.
 ///
 /// DB-only from day one (settings key `config.webhook_comment`, edited on the web
 /// Settings page / via `PUT /api/settings/webhook_comment`). It is deliberately
@@ -421,9 +421,8 @@ pub struct CommentWebhookSource {
     /// reaches `fj` in a temp single-host `keys.json` carrying that one secret.
     /// Unset means no command can be served (every delivery is refused).
     pub write_token_ref: Option<String>,
-    /// Effective repository permissions that may run a command. Configurable
-    /// because Forgejo's role model keeps growing; adding a role is a settings
-    /// edit, not a code change. Matched case-insensitively.
+    /// Repository permissions that may run a command. A Forgejo access level (read, write,
+    /// admin, owner) also admits every higher level; any other value matches exactly.
     pub allowed_permissions: Vec<String>,
     /// Decision-gate cap: a working-tree diff touching more files than this is
     /// commented on rather than pushed.
