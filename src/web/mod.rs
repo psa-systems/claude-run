@@ -62,29 +62,10 @@ const IDIOMORPH_JS: &[u8] = include_bytes!("../../assets/idiomorph-ext.min.js");
 pub struct WebState {
     pub api: Arc<AppState>,
     pub paths: Paths,
-    /// CLAUDE-61: whether the Forgejo webhook is configured
-    /// (`[webhook].secret_ref` set). When true the web layer injects a synthetic
-    /// read-only `webhook-forgejo` action so its runs are visible; when false
-    /// the entry is absent (historical runs stay queryable on the dashboard).
-    pub webhook_enabled: bool,
-    /// CLAUDE-220: whether the `/claude` comment listener has at least one
-    /// configured source. When true the web layer injects the synthetic
-    /// read-only `webhook-forgejo-comment` action alongside `webhook-forgejo`.
-    pub comment_webhook_enabled: bool,
 }
 
-pub fn router(
-    api: Arc<AppState>,
-    paths: Paths,
-    webhook_enabled: bool,
-    comment_webhook_enabled: bool,
-) -> Router {
-    let st = WebState {
-        api,
-        paths,
-        webhook_enabled,
-        comment_webhook_enabled,
-    };
+pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
+    let st = WebState { api, paths };
     Router::new()
         .route("/", get(dashboard))
         // CLAUDE-211: the new-action page is a kind picker; raw YAML is the
@@ -475,6 +456,30 @@ fn build_duration_chart(series: &[(String, i64)]) -> DurationChart {
     }
 }
 
+/// CLAUDE-289: whether each event-driven listener has at least one configured
+/// source, read live off the shared settings handles rather than a startup
+/// snapshot. Saving the first source (or removing the last one) for either
+/// section is reflected on the next page load with no restart.
+async fn listeners_enabled(s: &WebState) -> (bool, bool) {
+    let webhook_enabled = !s
+        .api
+        .settings
+        .webhook_handle()
+        .read()
+        .await
+        .sources
+        .is_empty();
+    let comment_webhook_enabled = !s
+        .api
+        .settings
+        .webhook_comment_handle()
+        .read()
+        .await
+        .sources
+        .is_empty();
+    (webhook_enabled, comment_webhook_enabled)
+}
+
 async fn enriched_actions(
     pool: &DbPool,
     webhook_enabled: bool,
@@ -572,10 +577,11 @@ pub const SYNTHETIC_ACTIONS: &[&str] = &[
 /// configured this run, so the action-detail / durations pages render it instead
 /// of 404ing. An unconfigured listener keeps its historical runs queryable but
 /// has no live entry.
-fn synthetic_enabled(s: &WebState, name: &str) -> bool {
+async fn synthetic_enabled(s: &WebState, name: &str) -> bool {
+    let (webhook_enabled, comment_webhook_enabled) = listeners_enabled(s).await;
     match name {
-        n if n == webhooks::WEBHOOK_MINT_ACTION => s.webhook_enabled,
-        n if n == comment_webhooks::WEBHOOK_COMMENT_ACTION => s.comment_webhook_enabled,
+        n if n == webhooks::WEBHOOK_MINT_ACTION => webhook_enabled,
+        n if n == comment_webhooks::WEBHOOK_COMMENT_ACTION => comment_webhook_enabled,
         _ => false,
     }
 }
@@ -1387,7 +1393,8 @@ async fn dashboard(
             paused_at: a,
             reason: r,
         });
-    let actions = enriched_actions(pool, s.webhook_enabled, s.comment_webhook_enabled).await?;
+    let (webhook_enabled, comment_webhook_enabled) = listeners_enabled(&s).await;
+    let actions = enriched_actions(pool, webhook_enabled, comment_webhook_enabled).await?;
 
     // CLAUDE-141: whitelist the sort/filter selections before they reach SQL or
     // the page. `sort`/`dir`/`exit`/`outcome` are checked against fixed allow-lists; the
@@ -1565,7 +1572,8 @@ async fn action_detail(
     Query(q): Query<ActionDetailQuery>,
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
-    let actions = enriched_actions(pool, s.webhook_enabled, s.comment_webhook_enabled).await?;
+    let (webhook_enabled, comment_webhook_enabled) = listeners_enabled(&s).await;
+    let actions = enriched_actions(pool, webhook_enabled, comment_webhook_enabled).await?;
     let Some(action) = actions.into_iter().find(|a| a.name == name) else {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
@@ -1631,7 +1639,7 @@ async fn action_durations(
     // 404 unknown actions cleanly; only names the daemon has indexed resolve.
     // CLAUDE-61: the synthetic webhook action is not indexed but charts its
     // recorded runs like any action, so accept it when webhook is configured.
-    let known_synthetic = synthetic_enabled(&s, &name);
+    let known_synthetic = synthetic_enabled(&s, &name).await;
     if !known_synthetic && indexed_action_path(pool, &name).await?.is_none() {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     }
@@ -1985,7 +1993,7 @@ async fn logs(State(s): State<WebState>, Query(q): Query<LogsQuery>) -> Result<R
     // being echoed back into the page.
     if let Some(requested) = q.action.as_deref().filter(|a| !a.is_empty()) {
         if !action_options.iter().any(|a| a == requested)
-            && (synthetic_enabled(&s, requested)
+            && (synthetic_enabled(&s, requested).await
                 || indexed_action_path(pool, requested).await?.is_some())
         {
             action_options.push(requested.to_string());
@@ -3695,7 +3703,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "sources",
                 badge: "live",
-                note: "per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref, write_token_ref (WRITE scope, CLAUDE-276: required to comment on a PR).",
+                note: "a saved source puts webhook-forgejo on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref, write_token_ref (WRITE scope, CLAUDE-276: required to comment on a PR).",
             },
             FieldDoc {
                 name: "auto_fix",
@@ -3732,7 +3740,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "sources",
                 badge: "live",
-                note: "per-source secret_ref, allowed_repos, rate_limit_per_min, write_token_ref (WRITE scope), allowed_permissions, max_files, max_lines.",
+                note: "a saved source puts webhook-forgejo-comment on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, write_token_ref (WRITE scope), allowed_permissions, max_files, max_lines.",
             },
         ],
         LogFilter => vec![FieldDoc {
@@ -6177,13 +6185,13 @@ mod tests {
     // actions directory.
     mod editor {
         use super::super::{
-            action_create, action_delete, action_detail, action_edit_page, action_edit_save,
-            action_events_redirect, action_export, action_to_youtrack_form, auth_claude_banner,
-            auth_login_code, auth_login_start, auth_save_claude, dashboard, logs, settings_page,
-            settings_save, youtrack_create, youtrack_edit_page, youtrack_edit_save,
-            youtrack_form_to_yaml, youtrack_new_page, ActionDetailQuery, ActionForm,
-            AuthClaudeForm, AuthCodeForm, DashboardQuery, EventsView, LogsQuery, SettingsForm,
-            WebState, YoutrackEditForm,
+            action_create, action_delete, action_detail, action_durations, action_edit_page,
+            action_edit_save, action_events_redirect, action_export, action_to_youtrack_form,
+            auth_claude_banner, auth_login_code, auth_login_start, auth_save_claude, dashboard,
+            logs, settings_page, settings_save, youtrack_create, youtrack_edit_page,
+            youtrack_edit_save, youtrack_form_to_yaml, youtrack_new_page, ActionDetailQuery,
+            ActionForm, AuthClaudeForm, AuthCodeForm, DashboardQuery, EventsView, LogsQuery,
+            SettingsForm, WebState, YoutrackEditForm,
         };
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
@@ -6234,12 +6242,7 @@ mod tests {
                 state_dir: tmp.join("state"),
                 runtime_dir: tmp.join("runtime"),
             };
-            WebState {
-                api,
-                paths,
-                webhook_enabled: false,
-                comment_webhook_enabled: false,
-            }
+            WebState { api, paths }
         }
 
         /// CLAUDE-269: [`web_state`] with a real readiness gate attached, so a
@@ -6532,12 +6535,7 @@ mod tests {
 
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
-            let app = super::super::router(
-                s.api.clone(),
-                s.paths.clone(),
-                s.webhook_enabled,
-                s.comment_webhook_enabled,
-            );
+            let app = super::super::router(s.api.clone(), s.paths.clone());
             let resp = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -6561,12 +6559,7 @@ mod tests {
             use tower::ServiceExt;
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
-            let app = super::super::router(
-                s.api.clone(),
-                s.paths.clone(),
-                s.webhook_enabled,
-                s.comment_webhook_enabled,
-            );
+            let app = super::super::router(s.api.clone(), s.paths.clone());
             let resp = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -7921,6 +7914,154 @@ mod tests {
             assert!(entry.schedule_kind.is_none(), "event-driven: no schedule");
         }
 
+        // ---- CLAUDE-289: listener visibility is live, no restart -----------
+
+        #[tokio::test]
+        async fn dashboard_shows_webhook_listener_as_soon_as_a_source_is_saved() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION;
+
+            let before = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                !before.contains(synthetic),
+                "webhook-forgejo listed before any source is configured"
+            );
+
+            s.api
+                .settings
+                .save_section(
+                    crate::settings::Section::Webhook,
+                    r#"{"sources":{"ng":{"allowed_repos":["Contoso/*"],"rate_limit_per_min":120}}}"#,
+                )
+                .await
+                .unwrap();
+
+            let with_source = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                with_source.contains(synthetic),
+                "webhook-forgejo missing from the dashboard immediately after saving a source"
+            );
+
+            s.api
+                .settings
+                .save_section(crate::settings::Section::Webhook, r#"{"sources":{}}"#)
+                .await
+                .unwrap();
+
+            let after_removal = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                !after_removal.contains(synthetic),
+                "webhook-forgejo still listed after removing its only source"
+            );
+        }
+
+        #[tokio::test]
+        async fn dashboard_shows_comment_webhook_listener_as_soon_as_a_source_is_saved() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let synthetic = crate::web::comment_webhooks::WEBHOOK_COMMENT_ACTION;
+
+            let before = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                !before.contains(synthetic),
+                "webhook-forgejo-comment listed before any source is configured"
+            );
+
+            s.api
+                .settings
+                .save_section(
+                    crate::settings::Section::WebhookComment,
+                    r#"{"sources":{"ng":{"secret_ref":"hmac","allowed_repos":["Contoso/*"],
+                       "rate_limit_per_min":120,"write_token_ref":"write-pat"}}}"#,
+                )
+                .await
+                .unwrap();
+
+            let with_source = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                with_source.contains(synthetic),
+                "webhook-forgejo-comment missing from the dashboard immediately after saving a source"
+            );
+
+            s.api
+                .settings
+                .save_section(
+                    crate::settings::Section::WebhookComment,
+                    r#"{"sources":{}}"#,
+                )
+                .await
+                .unwrap();
+
+            let after_removal = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(
+                !after_removal.contains(synthetic),
+                "webhook-forgejo-comment still listed after removing its only source"
+            );
+        }
+
+        #[tokio::test]
+        async fn durations_answers_404_then_200_as_a_webhook_source_is_saved() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION;
+
+            let resp = action_durations(State(s.clone()), AxumPath(synthetic.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+            s.api
+                .settings
+                .save_section(
+                    crate::settings::Section::Webhook,
+                    r#"{"sources":{"ng":{"allowed_repos":["Contoso/*"],"rate_limit_per_min":120}}}"#,
+                )
+                .await
+                .unwrap();
+
+            let resp = action_durations(State(s.clone()), AxumPath(synthetic.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
         #[tokio::test]
         async fn synthetic_action_rejects_mutations() {
             let tmp = tempfile::tempdir().unwrap();
@@ -8532,12 +8673,7 @@ mod tests {
             std::fs::write(&file, "name: youtrack\nkind: youtrack\nnative: {}\n").unwrap();
             index_action(&s.api.pool, "youtrack", file.to_str().unwrap()).await;
 
-            let app = super::super::router(
-                s.api.clone(),
-                s.paths.clone(),
-                s.webhook_enabled,
-                s.comment_webhook_enabled,
-            );
+            let app = super::super::router(s.api.clone(), s.paths.clone());
             let resp = app
                 .oneshot(
                     axum::http::Request::builder()
@@ -9212,12 +9348,7 @@ mod tests {
                 state_dir: tmp.join("state"),
                 runtime_dir: tmp.join("runtime"),
             };
-            WebState {
-                api,
-                paths,
-                webhook_enabled: false,
-                comment_webhook_enabled: false,
-            }
+            WebState { api, paths }
         }
 
         pub(super) async fn body_string(resp: axum::response::Response) -> String {
@@ -9465,8 +9596,6 @@ mod tests {
                     state_dir: "/tmp/x/state".into(),
                     runtime_dir: "/tmp/x/runtime".into(),
                 },
-                webhook_enabled: false,
-                comment_webhook_enabled: false,
             }
         }
 
