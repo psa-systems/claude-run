@@ -194,7 +194,7 @@ native:
 | `youtrack.custom_field` | `AI Agent`                         | Custom field holding the AI Agent state machine.                                                    |
 | `youtrack.assignee`     | none                               | Optional Assignee set on the issue during pickup (CLAUDE-131). A literal `yt` assignee argument: a login, `me`, or `unassigned`. When unset (default), the Assignee is never touched. An assignee write failure aborts pickup before the clone. Editable in the structured web form. |
 | `youtrack.prompt`       | built-in default                   | Full-replacement agent prompt (CLAUDE-125). When unset, the built-in CLAUDE-24 prompt is used. When set, the text fully replaces it (so the operator owns the runner contract: bare `#<KEY>` commit reference, the `.claude-run-needs-review` / `.claude-run-skip-attempt` blocker markers, the `.claude-run-no-code-change` no-code marker, no push / no PR, and whichever tracker writes the operator chooses to permit). Editable in the structured web form. See the placeholders below. |
-| `youtrack.write_projects` | empty                            | Projects the agent may create issues in (CLAUDE-214), rendered into the prompt as `{{write_projects}}`. Empty (the default) resolves to the **triggering issue's own project**, so filing a deferred item satisfies the `No orphan notes` rule with no site-specific configuration and none is baked into the binary. The list is a prompt instruction, not an enforced grant: the hard boundary is the YouTrack token's own permissions. No structured-form UI; a hand-written list is carried forward across form saves. |
+| `youtrack.write_projects` | empty                            | Projects the agent may create issues in for a descoped piece of the triggering issue (CLAUDE-214), and the fallback for an out-of-scope bug when no project or more than one project binds the buggy repo (CLAUDE-297); rendered into the prompt as `{{write_projects}}`. Empty (the default) resolves to the **triggering issue's own project**, so filing a deferred item satisfies the `No orphan notes` rule with no site-specific configuration and none is baked into the binary. The list is a prompt instruction, not an enforced grant: the hard boundary is the YouTrack token's own permissions. No structured-form UI; a hand-written list is carried forward across form saves. |
 | `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value. `done` (AI Agent) and `state_done` (State) are set only when a `success`/`recover` webhook event automerges the PR (CLAUDE-126, event-driven since CLAUDE-278). |
 | `youtrack.states.no_code` | the `done` label                 | AI Agent label set when a successful run deliberately produced no commits and left `.claude-run-no-code-change` (CLAUDE-214). Defaults to whatever `states.done` is, because there is no PR for a human to review. `State` is left untouched, so the issue stays In Progress until a human closes it. No structured-form UI; a hand-written value is carried forward across form saves. |
 | `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge (CLAUDE-126). When `false`, the PR is never merged by the runner (unchanged behavior). When `true`, `finalize` still stops at Code Review immediately; the merge happens later, driven by a `success`/`recover` Action-run webhook event (CLAUDE-278). |
@@ -225,7 +225,7 @@ prompt is sent to the agent; an unknown placeholder (or an unterminated `{{`) is
 | `{{needs_review_marker}}`| The `.claude-run-needs-review` marker filename.                               |
 | `{{skip_attempt_marker}}`| The `.claude-run-skip-attempt` marker filename.                               |
 | `{{no_code_marker}}`     | The `.claude-run-no-code-change` marker filename (CLAUDE-214).                |
-| `{{write_projects}}`     | Comma-separated `youtrack.write_projects`, or the triggering issue's own project when that list is empty (CLAUDE-214). |
+| `{{write_projects}}`     | Comma-separated `youtrack.write_projects`, or the triggering issue's own project when that list is empty (CLAUDE-214). Scopes a descoped piece of the triggering issue, and is the fallback project for an out-of-scope bug whose repo no project or more than one project binds (CLAUDE-297). |
 | `{{existing_pr_url}}`    | Empty on a fresh pickup. On a re-queue with an open recorded PR (CLAUDE-275), the URL of that PR. |
 | `{{existing_branch}}`    | Empty on a fresh pickup. On a re-queue with an open recorded PR (CLAUDE-275), that PR's head branch, already checked out in `{{workdir}}`. |
 
@@ -311,9 +311,12 @@ Without the marker, a zero-commit run keeps the CLAUDE-212 behaviour unchanged (
 is what stops a silently-empty engineering run from looking successful, so the marker is the only thing that relaxes it,
 and never an escape hatch for a code task the agent could not finish (that stays `.claude-run-needs-review`).
 
-The built-in prompt correspondingly permits a bounded set of tracker writes: read across projects; create issues in
-`write_projects`; update, comment on and link the issues the run itself created; and one `subtask of` link onto the
-triggering issue. Setting `AI Agent` on **any** issue stays banned, since setting it queues an agent run.
+The built-in prompt correspondingly permits a bounded set of tracker writes: read across projects; create an issue in
+one of two cases (CLAUDE-297) - a descoped piece of the triggering issue, filed in `write_projects` and linked
+`subtask of` the triggering issue, or a bug found outside the triggering issue's scope, filed in the project whose
+VCS integration binds the buggy repo (falling back to `write_projects`) and linked `relates to` the triggering issue;
+and update, comment on and link only the issues the run itself created. Setting `AI Agent` on **any** issue stays
+banned, since setting it queues an agent run.
 
 ##### Forgejo token scopes (CLAUDE-196)
 
