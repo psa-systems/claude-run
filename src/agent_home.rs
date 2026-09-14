@@ -139,9 +139,10 @@ mod tests {
         assert!(BOT_CLAUDE_MD.contains("You perform NO external mutation"));
         // CLAUDE-214: the bot file must match the relaxed prompt, so it carries
         // the `No orphan notes` obligation and the `AI Agent` ban that keeps a
-        // filing agent from queueing further agent runs.
+        // filing agent from queueing further agent runs (CLAUDE-295: unless the
+        // job prompt names the exception).
         assert!(BOT_CLAUDE_MD.contains("No orphan notes"));
-        assert!(BOT_CLAUDE_MD.contains("NEVER set the `AI Agent` field on ANY issue"));
+        assert!(BOT_CLAUDE_MD.contains("NEVER set the `AI Agent` field on any issue unless"));
         assert!(BOT_CLAUDE_MD.contains(".claude-run-no-code-change"));
     }
 

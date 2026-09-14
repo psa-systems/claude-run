@@ -1423,13 +1423,20 @@ enum GateDecision {
 /// blocks iff its direction-resolved `verb` is listed in `block_on` and its
 /// target is unresolved (`resolved` is `None`). Direction is already baked into
 /// the verb by YT-40 (`depends on` = Depend INWARD, `parent for` = Subtask
-/// OUTWARD, etc.), so matching the verb resolves direction exactly. The result is
-/// sorted and de-duplicated so its signature is order-independent.
-fn unmet_blockers(links: &[provider::IssueLink], block_on: &[String]) -> Vec<Blocker> {
+/// OUTWARD, etc.), so matching the verb resolves direction exactly. With
+/// `own_project` set (`block_cross_project: false`), a target in any other
+/// project never blocks. The result is sorted and de-duplicated so its signature
+/// is order-independent.
+fn unmet_blockers(
+    links: &[provider::IssueLink],
+    block_on: &[String],
+    own_project: Option<&str>,
+) -> Vec<Blocker> {
     let mut out: Vec<Blocker> = links
         .iter()
         .filter(|l| l.resolved.is_none())
         .filter(|l| block_on.iter().any(|v| v == &l.verb))
+        .filter(|l| own_project.is_none_or(|p| project_key(&l.target) == p))
         .map(|l| Blocker {
             id: l.target.clone(),
             verb: l.verb.clone(),
@@ -1526,7 +1533,8 @@ async fn dependency_gate(
 
     // Re-evaluate: read the live links and compute the unmet blocker set.
     let links = backend.issue_links(key)?;
-    let blockers = unmet_blockers(&links, &deps.block_on);
+    let own_project = (!deps.block_cross_project).then(|| project_key(key));
+    let blockers = unmet_blockers(&links, &deps.block_on, own_project.as_deref());
     if blockers.is_empty() {
         // Cleared (or never blocked): drop any persisted gate state, proceed.
         if prev.is_some() {
@@ -4676,7 +4684,7 @@ mod tests {
             link(LinkDirection::Inward, "subtask of", "CLAUDE-2", None), // reverse Subtask
             link(LinkDirection::Inward, "depends on", "CLAUDE-3", Some(123)), // met (resolved)
         ];
-        let blockers = unmet_blockers(&links, &block_on);
+        let blockers = unmet_blockers(&links, &block_on, None);
         let ids: Vec<&str> = blockers.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -4687,6 +4695,57 @@ mod tests {
             blocker_signature(&blockers),
             "CLAUDE-9 (parent for); YT-40 (depends on)"
         );
+    }
+
+    /// CLAUDE-295: scoped to its own project, the gate ignores targets anywhere
+    /// else, so an `AUDIT` Epic does not wait on the `PMS` findings it filed.
+    #[test]
+    fn unmet_blockers_skips_other_projects_when_scoped() {
+        let block_on = crate::action::Dependencies::default().block_on;
+        let links = vec![
+            link(LinkDirection::Outward, "parent for", "PMS-12", None),
+            link(LinkDirection::Outward, "parent for", "AUDIT-7", None),
+            link(LinkDirection::Inward, "depends on", "SF-3", None),
+        ];
+        let ids = |own: Option<&str>| -> Vec<String> {
+            unmet_blockers(&links, &block_on, own)
+                .into_iter()
+                .map(|b| b.id)
+                .collect()
+        };
+        assert_eq!(ids(None), vec!["AUDIT-7", "PMS-12", "SF-3"]);
+        assert_eq!(ids(Some("AUDIT")), vec!["AUDIT-7"]);
+    }
+
+    /// CLAUDE-295: `block_cross_project` reaches the gate. An Epic whose only open
+    /// child is in another project is blocked by default and proceeds when false.
+    #[tokio::test]
+    async fn dependency_gate_scopes_to_own_project_when_configured() {
+        let inspect = r#"{"links":[{"direction":"OUTWARD","verb":"parent for","issues":[{"idReadable":"PMS-12","summary":"x"}]}]}"#;
+        let body = blocked_comment(&[Blocker {
+            id: "PMS-12".into(),
+            verb: "parent for".into(),
+        }]);
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("yt", &["issue", "inspect", "AUDIT-7", "--json"], inspect)
+                .ok("yt", &["issue", "comment", "AUDIT-7", &body], ""),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let mut s = src();
+
+        let pool = mem_pool().await;
+        let d = dependency_gate(&pool, &backend, &s, "act", "AUDIT-7", false)
+            .await
+            .unwrap();
+        assert!(matches!(d, GateDecision::Blocked { .. }), "default blocks");
+
+        s.dependencies.block_cross_project = false;
+        let pool = mem_pool().await;
+        let d = dependency_gate(&pool, &backend, &s, "act", "AUDIT-7", false)
+            .await
+            .unwrap();
+        assert!(matches!(d, GateDecision::Proceed), "scoped gate proceeds");
     }
 
     /// CLAUDE-161: a blocked issue is left Queued, a blocker comment is posted
