@@ -350,9 +350,9 @@ impl Default for WebhookSource {
 }
 
 /// CLAUDE-220: `/claude <instruction>` pull-request comment commands. A SECOND,
-/// independent listener from [`WebhookConfig`]: comment handling needs a WRITE
-/// token (post comments, push a branch) while the CI-failure sources need only a
-/// read-only log token, so the two credential kinds never share a config block.
+/// independent listener from [`WebhookConfig`]: its token pushes branches, while a
+/// CI-failure source's tokens only read logs and comment, so a push-capable token
+/// never shares a config block with them.
 ///
 /// DB-only from day one (settings key `config.webhook_comment`, edited on the web
 /// Settings page / via `PUT /api/settings/webhook_comment`). It is deliberately
