@@ -172,6 +172,9 @@ will want to know about:
   native action's form is at `/actions/<name>/form` (offered from the raw editor, which stays at
   `/actions/<name>/edit`). Every form saves through the same validation and write path as the raw editor, so a form can
   never write a file the raw editor would reject; keys no form covers are preserved untouched on save.
+  The two webhook listeners (`webhook-forgejo`, `webhook-forgejo-comment`) are not action kinds and are not created
+  here: they are configured on the Settings page (Webhook sources, Comment webhook) and appear on the dashboard as
+  soon as their section has a source, with no restart.
 - **Action detail** (`/actions/<name>`) carries an **Input errors / warnings** line (CLAUDE-147 / CLAUDE-235): how many
   input / poll-phase diagnostics (probe failures, no-VCS drops) this action has recorded since the current serve
   started, linking to the Logs screen filtered to it. It is a signal, not a log.
