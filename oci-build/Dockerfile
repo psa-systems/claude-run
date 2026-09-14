@@ -16,7 +16,7 @@
 #                        and the build-binary.yml workflow
 
 # syntax=docker/dockerfile:1.6
-FROM dev.a8n.run/pandoras-box/rust-builder-musl:v1.0.0-rust1.94-alpine AS builder
+FROM dev.a8n.run/pandoras-box/rust-builder-musl:v1.1.0-rust1.98.1-alpine AS builder
 
 WORKDIR /build
 
@@ -86,7 +86,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # CLAUDE-247: the image is self-contained. It mounts nothing from the host, and
 # the operator logs claude / yt / fj / git in INSIDE the container, onto named
 # volumes. See README "Containerized deployment".
-FROM dev.a8n.run/pandoras-box/opensuse-dev:v1.8.0-leap-16.0 AS runtime
+FROM dev.a8n.run/pandoras-box/opensuse-dev:v1.9.0-leap-16.0 AS runtime
 
 USER root
 
