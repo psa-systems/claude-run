@@ -2589,12 +2589,6 @@ struct YoutrackEditForm {
     state_state_done: String,
     /// Present ("on") when the automerge checkbox is checked (CLAUDE-126).
     automerge_enabled: Option<String>,
-    /// Max total seconds to wait for the PR's checks (number-as-text). Blank ->
-    /// the `Automerge` default (1800).
-    automerge_wait_seconds: String,
-    /// Seconds between CI status polls (number-as-text). Blank -> the `Automerge`
-    /// default (30).
-    automerge_check_interval_seconds: String,
     fj_base_url: String,
     fj_token_ref: String,
     /// PR-creation strategy (CLAUDE-103): `"branch"` (default) or `"agit"`.
@@ -2670,8 +2664,6 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
         state_in_progress: c.youtrack.states.in_progress,
         state_done: c.youtrack.states.done,
         state_state_done: c.youtrack.states.state_done,
-        automerge_wait_seconds: c.youtrack.automerge.wait_seconds.to_string(),
-        automerge_check_interval_seconds: c.youtrack.automerge.check_interval_seconds.to_string(),
         concurrency_max_parallel: conc.max_parallel.to_string(),
         concurrency_key: conc.key.join(", "),
         fj_pr_strategy: c.forgejo.pr_strategy.as_str().to_string(),
@@ -2710,8 +2702,6 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         state_done: yt.youtrack.states.done.clone(),
         state_state_done: yt.youtrack.states.state_done.clone(),
         automerge_enabled: yt.youtrack.automerge.enabled.then(|| "on".to_string()),
-        automerge_wait_seconds: yt.youtrack.automerge.wait_seconds.to_string(),
-        automerge_check_interval_seconds: yt.youtrack.automerge.check_interval_seconds.to_string(),
         fj_base_url: s(&yt.forgejo.base_url),
         fj_token_ref: s(&yt.forgejo.token_ref),
         fj_pr_strategy: yt.forgejo.pr_strategy.as_str().to_string(),
@@ -2861,30 +2851,13 @@ fn youtrack_form_to_yaml(
     if let Some(v) = opt(&form.state_state_done) {
         states.state_done = v;
     }
-    // CLAUDE-133: automerge comes from the form. A blank timing falls back to the
-    // `Automerge` default; prune_yaml still drops an all-default block so an
-    // untouched action writes no `automerge`.
-    let am_default = Automerge::default();
-    let pu64 = |label: &str, raw: &str, default: u64| -> Result<u64, String> {
-        match raw.trim() {
-            "" => Ok(default),
-            t => t
-                .parse::<u64>()
-                .map_err(|_| format!("{label} must be a whole number (got `{t}`)")),
-        }
-    };
+    // CLAUDE-293: automerge is now just the checkbox. Saving the form always
+    // resets the (deprecated, ignored) timing fields to their defaults, which
+    // is what clears the load-time deprecation warning for an action that
+    // still carries non-default values from before CLAUDE-278.
     youtrack.automerge = Automerge {
         enabled: form.is_automerge_enabled(),
-        wait_seconds: pu64(
-            "Automerge wait (seconds)",
-            &form.automerge_wait_seconds,
-            am_default.wait_seconds,
-        )?,
-        check_interval_seconds: pu64(
-            "Automerge check interval (seconds)",
-            &form.automerge_check_interval_seconds,
-            am_default.check_interval_seconds,
-        )?,
+        ..Automerge::default()
     };
     // CLAUDE-161: preserve a hand-written `dependencies` block. The structured
     // form has no dependency-gate UI, so read the existing
@@ -7511,29 +7484,51 @@ mod tests {
         }
 
         #[test]
-        fn automerge_round_trips_from_form() {
-            // CLAUDE-133: enabling automerge and tuning the timings serializes to
-            // `native.youtrack.automerge` and reloads into the same form.
-            let mut f = super::super::youtrack_form_defaults();
-            f.name = "yt".to_string();
-            f.automerge_enabled = Some("on".to_string());
-            f.automerge_wait_seconds = "600".to_string();
-            f.automerge_check_interval_seconds = "15".to_string();
-            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
-            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
-            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.as_ref().unwrap()
-            else {
+        fn automerge_form_save_resets_deprecated_timings() {
+            // CLAUDE-293: automerge is event-driven now (CLAUDE-278), so the form
+            // no longer exposes the timing fields at all. Editing an action that
+            // still carries non-default timings (from before CLAUDE-278) through
+            // the form, with automerge ticked, resets both to their defaults.
+            let yaml = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\n      wait_seconds: 600\n      check_interval_seconds: 15\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let mut form = action_to_youtrack_form(&loaded.action).unwrap();
+            form.name = "yt".to_string();
+            assert_eq!(form.automerge_enabled.as_deref(), Some("on"));
+
+            let saved_yaml = youtrack_form_to_yaml(empty_base(), &form).unwrap();
+            let saved = crate::action::validate_str(&saved_yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = saved.action.native.unwrap() else {
                 panic!("expected youtrack native config");
             };
             assert!(yt.youtrack.automerge.enabled);
-            assert_eq!(yt.youtrack.automerge.wait_seconds, 600);
-            assert_eq!(yt.youtrack.automerge.check_interval_seconds, 15);
+            assert_eq!(yt.youtrack.automerge.wait_seconds, 1800);
+            assert_eq!(yt.youtrack.automerge.check_interval_seconds, 30);
+        }
 
-            // And the loaded action prefills the form fields it came from.
-            let form = action_to_youtrack_form(&loaded.action).unwrap();
-            assert_eq!(form.automerge_enabled.as_deref(), Some("on"));
-            assert_eq!(form.automerge_wait_seconds, "600");
-            assert_eq!(form.automerge_check_interval_seconds, "15");
+        #[test]
+        fn automerge_editor_has_no_timing_inputs() {
+            // CLAUDE-293: the structured editor renders only the automerge
+            // checkbox; the timing inputs are gone from the markup entirely.
+            use askama::Template as _;
+            let tpl = super::super::YoutrackEditorTpl {
+                version: "test",
+                heading: "Edit yt".to_string(),
+                post_url: "/actions/yt/form".to_string(),
+                raw_url: "/actions/yt/edit".to_string(),
+                form: super::super::youtrack_form_defaults(),
+                secrets: Vec::new(),
+                error: None,
+                name: Some("yt".to_string()),
+            };
+            let html = tpl.render().unwrap();
+            assert!(
+                !html.contains("name=\"automerge_wait_seconds\""),
+                "automerge_wait_seconds input leaked:\n{html}"
+            );
+            assert!(
+                !html.contains("name=\"automerge_check_interval_seconds\""),
+                "automerge_check_interval_seconds input leaked:\n{html}"
+            );
         }
 
         #[test]
@@ -7545,36 +7540,6 @@ mod tests {
             f.name = "yt".to_string();
             let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
             assert!(!yaml.contains("automerge"), "automerge leaked:\n{yaml}");
-        }
-
-        #[test]
-        fn automerge_blank_timings_fall_back_to_defaults() {
-            // CLAUDE-133: blank timing inputs fall back to the Automerge defaults
-            // (1800 / 30) rather than erroring or blanking.
-            let mut f = super::super::youtrack_form_defaults();
-            f.name = "yt".to_string();
-            f.automerge_enabled = Some("on".to_string());
-            f.automerge_wait_seconds = String::new();
-            f.automerge_check_interval_seconds = "  ".to_string();
-            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
-            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
-            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
-                panic!("expected youtrack native config");
-            };
-            assert!(yt.youtrack.automerge.enabled);
-            assert_eq!(yt.youtrack.automerge.wait_seconds, 1800);
-            assert_eq!(yt.youtrack.automerge.check_interval_seconds, 30);
-        }
-
-        #[test]
-        fn automerge_rejects_non_numeric_timing() {
-            // CLAUDE-133: a non-numeric (non-blank) timing is an inline error,
-            // matching the limits / concurrency fields.
-            let mut f = super::super::youtrack_form_defaults();
-            f.name = "yt".to_string();
-            f.automerge_wait_seconds = "soon".to_string();
-            let err = youtrack_form_to_yaml(empty_base(), &f).unwrap_err();
-            assert!(err.contains("Automerge wait"), "{err}");
         }
 
         #[test]
