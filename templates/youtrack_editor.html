@@ -69,13 +69,9 @@
     <h3>Automerge</h3>
     <label class="fld-inline">
       <input type="checkbox" name="automerge_enabled"{% if form.is_automerge_enabled() %} checked{% endif %}>
-      <span>Enabled (wait for the PR's CI to go green, then merge and advance the issue to Done)</span>
+      <span>Enabled (merge the PR once its CI goes green, then advance the issue to Done)</span>
     </label>
-    <div class="grid2" style="margin-top: 8px;">
-      {% call m::numfield("Wait (seconds)", "automerge_wait_seconds", form.automerge_wait_seconds, "1800", "1") %}
-      {% call m::numfield("Check interval (seconds)", "automerge_check_interval_seconds", form.automerge_check_interval_seconds, "30", "1") %}
-    </div>
-    <p class="hint dim">When enabled, finalize polls the opened PR's combined CI status every <em>check interval</em> seconds, up to <em>wait</em> seconds total. On green (with an up-to-date branch) it merges the PR and sets the AI Agent / State to the Done labels above. Disabled (the default) leaves finalize stopping at Code Review. Blank timings fall back to 1800 / 30.</p>
+    <p class="hint dim">When enabled, a successful run still stops at Code Review. The runner merges the PR later, when a Forgejo Action Run Success or Recover webhook reports its CI green and the branch is mergeable, then sets the AI Agent / State to the Done labels above. The webhook must send those events (see the README "Event-driven automerge" section). Disabled (the default) leaves the PR for a human to merge.</p>
   </div>
 
   <div class="card">
