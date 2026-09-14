@@ -18,12 +18,10 @@
 //! trigger parsing, bot-login loop drop, dedupe key, caps ledger, and run
 //! accounting are the same implementations both paths run through.
 //!
-//! This is a SECOND, independent listener from [`super::webhooks`], not an
-//! extension of it, because the credentials differ in kind: comment handling
-//! needs a WRITE token (post comments, push a branch) while the CI-failure
-//! sources need only a read-only log token. Separate config sections keep the
-//! write token out of the block holding the read-only one, and the two get
-//! independent Pause switches.
+//! This is a SECOND, independent listener from [`super::webhooks`], not an extension
+//! of it: its token pushes branches, while a CI-failure source's tokens only read logs
+//! and comment. Separate config sections keep the push-capable token apart, and the
+//! two get independent Pause switches.
 //!
 //! What IS shared with [`super::webhooks`], deliberately and by reference rather
 //! than by copy: [`super::webhooks::verify_signature`], the single
