@@ -38,10 +38,14 @@
 //! in [`finalize`], after claude exits, gated on the outcome - matching the
 //! merged CLAUDE-24 runner-creates-PR contract. The agent itself does local
 //! engineering work only (no push, no PR) and, since CLAUDE-214, the bounded
-//! tracker writes [`default_youtrack_prompt`] permits: creating issues in the
-//! configured `write_projects`, updating / commenting / linking the issues it
-//! created, and one `subtask of` link onto the triggering issue. `AI Agent` on
-//! any issue, and every other write to the triggering issue, stay the runner's.
+//! tracker writes [`default_youtrack_prompt`] permits: a descoped piece of the
+//! triggering issue goes to the configured `write_projects`, linked `subtask
+//! of` the triggering issue; an out-of-scope bug found elsewhere (CLAUDE-297)
+//! goes to the project whose VCS integration binds the buggy repo (falling
+//! back to `write_projects`), linked `relates to` the triggering issue. Either
+//! way the agent may update / comment / link only the issues it created this
+//! run. `AI Agent` on any issue, and every other write to the triggering
+//! issue, stay the runner's.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1726,8 +1730,13 @@ fn clone_repo(clone_url: &str, workdir: &Path, branch: Option<&str>) -> Result<(
 /// CLAUDE-214 replaced the blanket YouTrack ban with an explicit permission
 /// block, because the `No orphan notes` directive requires a run that discovers
 /// a gap to file it as a tracked, linked issue rather than mention it in prose.
-/// The ban that stays absolute is `AI Agent` on ANY issue: setting it queues
-/// work, so an agent that could set it could spawn runs.
+/// CLAUDE-297 split that permission into two cases: a descoped piece of the
+/// triggering issue is filed in `write_projects` and linked `subtask of`; a
+/// bug found outside the triggering issue's scope is filed in the project
+/// whose VCS integration binds the buggy repo (falling back to
+/// `write_projects`) and linked `relates to`. The ban that stays absolute is
+/// `AI Agent` on ANY issue: setting it queues work, so an agent that could set
+/// it could spawn runs.
 pub(crate) fn default_youtrack_prompt() -> String {
     [
         "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.",
@@ -1740,9 +1749,11 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "",
         "YouTrack writes. You MAY do exactly the following, and nothing else:",
         "- Read anything the token can see, across every project: 'yt list --query=...', 'yt search', 'yt issue inspect <KEY>', 'yt project list' / 'yt project show' / 'yt project vcs list'.",
-        "- Create issues with 'yt issue create', but ONLY in these projects: {{write_projects}}. This is how the CLAUDE.md 'No orphan notes' rule is satisfied: a gap, deferred item, or descoped piece you find mid-task becomes its own tracked issue instead of a sentence in the PR body that nobody owns.",
+        "- Create an issue with 'yt issue create' in exactly two cases:",
+        "  1. A gap, deferred item, or descoped piece of {{key}} itself: create it ONLY in these projects: {{write_projects}}, then link it with 'yt issue link <new-issue> {{key}} --type \"subtask of\"'. This is how the CLAUDE.md 'No orphan notes' rule is satisfied: the piece becomes its own tracked issue instead of a sentence in the PR body that nobody owns.",
+        "  2. A bug you find that is NOT part of {{key}}, in this repo or in any other repo (for example a defect in a server repo you hit while working on the app that calls it). If it blocks {{key}}'s acceptance criteria and lives in this repo, fix it as part of {{key}}'s change and file nothing. Otherwise do NOT fix it in this run; file it. First run 'yt search' for an open issue that already reports it; if one exists, file nothing and name that issue in your final summary. Create it in the project whose VCS integration binds the repo the bug lives in: find that project with 'yt project list' and 'yt project vcs list <PROJECT>', and if no project or more than one project binds that repo, create it in {{write_projects}}. Its description states what you observed, how to reproduce it, and the file:line or command output that shows it. Then link it with 'yt issue link <new-issue> {{key}} --type \"relates to\"'. If the bug blocks {{key}}'s acceptance criteria from another repo, also take the blocker path below and name the new issue in the reason.",
         "- Update, comment on, and link ONLY the issues you created during THIS run: 'yt issue update', 'yt issue comment', 'yt issue link'.",
-        "- On the triggering issue {{key}}, exactly ONE write: 'yt issue link <new-issue> \"subtask of\" {{key}}', hanging an issue you created off the issue that asked for it. Nothing else on {{key}}.",
+        "- On the triggering issue {{key}}, the ONLY writes are the links named in the two cases above, one per issue you created. Nothing else on {{key}}.",
         "",
         "HARD BANS on YouTrack, no exceptions:",
         "- NEVER set the 'AI Agent' field on ANY issue, including issues you created yourself: no 'yt issue set-field ... \"AI Agent\" ...', and no equivalent through 'yt issue update' or 'yt issue apply'. Setting that field queues an agent run, so an agent that can set it can spawn runs. It belongs to the runner alone.",
@@ -2723,12 +2734,12 @@ mod tests {
         // The create scope renders from `{{write_projects}}`, defaulting to the
         // triggering issue's own project.
         assert!(
-            p.contains("ONLY in these projects: MK."),
+            p.contains("create it ONLY in these projects: MK,"),
             "create scope must render the project list: {p}"
         );
         // The single permitted write to the triggering issue.
         assert!(
-            p.contains("yt issue link <new-issue> \"subtask of\" MK-16"),
+            p.contains("yt issue link <new-issue> MK-16 --type \"subtask of\""),
             "{p}"
         );
 

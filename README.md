@@ -532,7 +532,7 @@ and `regather_interval_secs` (default `60`, must be `>= 1`). Both apply on the n
 > `claude-run run <action>` path still takes it as a cross-process guard; running standalone `run` for an action the
 > daemon also schedules is unsupported concurrent use.
 
-## What the agent may write to the tracker (CLAUDE-214)
+## What the agent may write to the tracker (CLAUDE-214, CLAUDE-297)
 
 The agent never publishes code: no `git push`, no pull request. The runner's finalize step opens the PR from the local
 commits and owns every field it sets. What the agent *may* do to YouTrack used to be nothing at all; the built-in
@@ -542,12 +542,16 @@ tracked issue rather than bury it in prose in a PR body.
 Permitted by the built-in prompt (`default_youtrack_prompt`, `src/native/youtrack.rs`):
 
 - Read anything the token can see, across every project.
-- Create issues with `yt issue create`, restricted to `native.youtrack.write_projects`. That list defaults to empty,
-  which resolves to the **triggering issue's own project**, so the common case needs no configuration and no site
-  specifics are baked into the binary.
+- Create an issue with `yt issue create` in exactly two cases. A gap, deferred item, or descoped piece of the
+  triggering issue: restricted to `native.youtrack.write_projects` (defaulting to empty, which resolves to the
+  **triggering issue's own project**, so the common case needs no configuration and no site specifics are baked into
+  the binary), linked `yt issue link <new-issue> <KEY> --type "subtask of"`. A bug found outside the triggering
+  issue's scope, in this repo or another: filed in the project whose VCS integration binds the buggy repo, falling
+  back to `native.youtrack.write_projects` when none or more than one project binds it, linked
+  `yt issue link <new-issue> <KEY> --type "relates to"`; fixed in this run only if it blocks the triggering issue's
+  acceptance criteria and lives in the same repo, otherwise filed and left unfixed.
 - Update, comment on and link **only the issues the run itself created** during that attempt.
-- On the triggering issue, exactly one write: `yt issue link <new-issue> "subtask of" <KEY>`, so a report issue hangs
-  off the issue that asked for it.
+- On the triggering issue, the only writes are the two link commands above, one per issue the run created.
 
 Banned outright, stated as hard rules in the prompt: setting `AI Agent` on **any** issue including ones the run created
 (setting it queues an agent run, so an agent that could set it could spawn runs), every other write to the triggering
