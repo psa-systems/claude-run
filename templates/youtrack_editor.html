@@ -105,6 +105,32 @@
   </div>
 
   <div class="card">
+    <h3>Tracker writes</h3>
+    <div class="grid2">
+      {% call m::textfield("Write projects", "yt_write_projects", form.yt_write_projects, "AUD, DEV (blank = the triggering issue's own project)") %}
+      {% call m::textfield("No-code label", "state_no_code", form.state_no_code, "blank = inherit the Done label above") %}
+    </div>
+    <p class="hint dim">Comma-separated project keys the agent may create issues in when filing a gap, deferred item, or out-of-scope bug. Blank resolves to the triggering issue's own project. The no-code label is the AI Agent value set when a run deliberately produces no commits; blank inherits the Done label above.</p>
+  </div>
+
+  <div class="card">
+    <h3>Dependency gate</h3>
+    <label class="fld-inline">
+      <input type="checkbox" name="deps_enabled"{% if form.is_deps_enabled() %} checked{% endif %}>
+      <span>Enabled (skip a queued issue whose blockers are still open)</span>
+    </label>
+    <div class="grid2">
+      {% call m::textfield("Recheck timeout", "deps_recheck_timeout", form.deps_recheck_timeout, "5m") %}
+      {% call m::textfield("Block on (link verbs)", "deps_block_on", form.deps_block_on, "depends on, parent for") %}
+    </div>
+    <label class="fld-inline">
+      <input type="checkbox" name="deps_block_cross_project"{% if form.is_deps_block_cross_project() %} checked{% endif %}>
+      <span>Block on cross-project links</span>
+    </label>
+    <p class="hint dim">Before the clone, a queued issue with an unresolved link whose verb is listed above leaves it Queued instead of starting a run. Recheck timeout (humantime, e.g. <code>5m</code>) is the backoff before a blocked issue is re-evaluated. Unchecking "Block on cross-project links" ignores links to issues in other projects, so an audit action's own findings (filed as subtasks in another project) never block it.</p>
+  </div>
+
+  <div class="card">
     <h3>GitHub target</h3>
     <div class="grid2">
       {% call m::tokenfield("Token secret", "github_token_ref", form.github_token_ref, secrets) %}

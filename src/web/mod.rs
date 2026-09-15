@@ -2634,6 +2634,25 @@ struct YoutrackEditForm {
     concurrency_key: String,
     /// Present ("on") when the enabled checkbox is checked, absent otherwise.
     enabled: Option<String>,
+    /// CLAUDE-298: comma-separated project keys the agent may create issues in
+    /// (`native.youtrack.write_projects`). Empty resolves to the triggering
+    /// issue's own project.
+    yt_write_projects: String,
+    /// CLAUDE-298: pre-clone dependency gate master switch
+    /// (`dependencies.enabled`). Present ("on") when checked.
+    deps_enabled: Option<String>,
+    /// CLAUDE-298: humantime backoff before a blocked issue is re-evaluated
+    /// (`dependencies.recheck_timeout`). Blank falls back to the default (`5m`).
+    deps_recheck_timeout: String,
+    /// CLAUDE-298: comma-separated link verbs that block pickup
+    /// (`dependencies.block_on`). Blank falls back to the default.
+    deps_block_on: String,
+    /// CLAUDE-298: whether a link to another project blocks pickup
+    /// (`dependencies.block_cross_project`). Present ("on") when checked.
+    deps_block_cross_project: Option<String>,
+    /// CLAUDE-298: AI Agent label for a deliberate zero-commit run
+    /// (`states.no_code`). Blank inherits the `done` label.
+    state_no_code: String,
 }
 
 impl YoutrackEditForm {
@@ -2648,6 +2667,18 @@ impl YoutrackEditForm {
     fn is_automerge_enabled(&self) -> bool {
         self.automerge_enabled.is_some()
     }
+
+    /// Whether the dependency-gate checkbox was ticked (CLAUDE-298). Like
+    /// [`Self::is_enabled`], absence means the box was unchecked.
+    fn is_deps_enabled(&self) -> bool {
+        self.deps_enabled.is_some()
+    }
+
+    /// Whether the cross-project block checkbox was ticked (CLAUDE-298). Like
+    /// [`Self::is_enabled`], absence means the box was unchecked.
+    fn is_deps_block_cross_project(&self) -> bool {
+        self.deps_block_cross_project.is_some()
+    }
 }
 
 /// Field defaults for a brand-new YouTrack action: blank identity, but the
@@ -2656,6 +2687,7 @@ impl YoutrackEditForm {
 fn youtrack_form_defaults() -> YoutrackEditForm {
     let c = YoutrackConfig::default();
     let conc = Concurrency::default();
+    let deps = crate::action::Dependencies::default();
     YoutrackEditForm {
         yt_query: c.youtrack.query,
         yt_custom_field: c.youtrack.custom_field,
@@ -2671,6 +2703,10 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
         concurrency_max_parallel: conc.max_parallel.to_string(),
         concurrency_key: conc.key.join(", "),
         fj_pr_strategy: c.forgejo.pr_strategy.as_str().to_string(),
+        deps_enabled: deps.enabled.then(|| "on".to_string()),
+        deps_recheck_timeout: deps.recheck_timeout,
+        deps_block_on: deps.block_on.join(", "),
+        deps_block_cross_project: deps.block_cross_project.then(|| "on".to_string()),
         ..Default::default()
     }
 }
@@ -2749,6 +2785,16 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         concurrency_max_parallel: a.concurrency.max_parallel.to_string(),
         concurrency_key: a.concurrency.key.join(", "),
         enabled: a.enabled.then(|| "on".to_string()),
+        yt_write_projects: yt.youtrack.write_projects.join(", "),
+        deps_enabled: yt.youtrack.dependencies.enabled.then(|| "on".to_string()),
+        deps_recheck_timeout: yt.youtrack.dependencies.recheck_timeout.clone(),
+        deps_block_on: yt.youtrack.dependencies.block_on.join(", "),
+        deps_block_cross_project: yt
+            .youtrack
+            .dependencies
+            .block_cross_project
+            .then(|| "on".to_string()),
+        state_no_code: s(&yt.youtrack.states.no_code),
     })
 }
 
@@ -2871,38 +2917,53 @@ fn youtrack_form_to_yaml(
         enabled: form.is_automerge_enabled(),
         ..Automerge::default()
     };
-    // CLAUDE-161: preserve a hand-written `dependencies` block. The structured
-    // form has no dependency-gate UI, so read the existing
-    // `native.youtrack.dependencies` sub-block off the parsed on-disk action
-    // (before we overwrite the `native` key below) and carry it forward, so
-    // editing any other field in the form does not silently reset the gate.
-    // Missing / unparsable -> the default (enabled 5m gate); `prune_yaml` still
-    // drops an all-default block so an untouched action writes no `dependencies`.
-    youtrack.dependencies = map
-        .get("native")
-        .and_then(|n| n.get("youtrack"))
-        .and_then(|y| y.get("dependencies"))
-        .cloned()
-        .and_then(|d| serde_yaml::from_value::<crate::action::Dependencies>(d).ok())
-        .unwrap_or_default();
-    // CLAUDE-214: same carry-forward for `write_projects` and `states.no_code`,
-    // neither of which the structured form exposes. Without this, saving any
-    // other field would silently narrow the agent's create scope back to the
-    // triggering issue's project and reset the no-code label.
-    youtrack.write_projects = map
-        .get("native")
-        .and_then(|n| n.get("youtrack"))
-        .and_then(|y| y.get("write_projects"))
-        .cloned()
-        .and_then(|w| serde_yaml::from_value::<Vec<String>>(w).ok())
-        .unwrap_or_default();
-    youtrack.states.no_code = map
-        .get("native")
-        .and_then(|n| n.get("youtrack"))
-        .and_then(|y| y.get("states"))
-        .and_then(|s| s.get("no_code"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    // CLAUDE-298: projects the agent may create issues in. Comma-separated,
+    // trimmed, empties dropped; blank -> no `write_projects` key (resolves to
+    // the triggering issue's own project).
+    youtrack.write_projects = form
+        .yt_write_projects
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    // CLAUDE-298: pre-clone dependency gate. A blank recheck timeout falls back
+    // to the default like the other required fields; a non-empty value that
+    // does not parse as a humantime duration is rejected, matching the
+    // numeric-limit fields, and no file is written.
+    let deps_default = crate::action::Dependencies::default();
+    let recheck_timeout = match form.deps_recheck_timeout.trim() {
+        "" => deps_default.recheck_timeout.clone(),
+        t => {
+            humantime::parse_duration(t).map_err(|_| {
+                format!("Dependency recheck timeout must be a duration (got `{t}`)")
+            })?;
+            t.to_string()
+        }
+    };
+    let block_on: Vec<String> = {
+        let parsed: Vec<String> = form
+            .deps_block_on
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if parsed.is_empty() {
+            deps_default.block_on.clone()
+        } else {
+            parsed
+        }
+    };
+    youtrack.dependencies = crate::action::Dependencies {
+        enabled: form.is_deps_enabled(),
+        recheck_timeout,
+        block_on,
+        block_cross_project: form.is_deps_block_cross_project(),
+    };
+    // CLAUDE-298: AI Agent label for a deliberate zero-commit run. Blank -> no
+    // `no_code` key (resolves to the `done` label).
+    youtrack.states.no_code = opt(&form.state_no_code);
     // CLAUDE-54: preserve a hand-written `github` block. The form exposes only
     // `token_ref`, so read the existing `native.github` sub-block off the parsed
     // on-disk action (before we overwrite the `native` key below) to carry its
@@ -7530,42 +7591,97 @@ mod tests {
         }
 
         #[test]
-        fn dependencies_block_preserved_on_save() {
-            // CLAUDE-161 no-wipe regression: an action whose YAML carries a
-            // hand-written `dependencies` block survives a structured-form save
-            // intact, since the form has no dependency-gate UI to reconstruct it.
-            let base: serde_yaml::Value = serde_yaml::from_str(
-                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    dependencies:\n      enabled: false\n      recheck_timeout: 30s\n      block_on:\n        - depends on\n",
-            )
-            .unwrap();
+        fn dependency_gate_form_round_trips() {
+            // CLAUDE-298: saving the form's dependency-gate inputs writes them,
+            // and the saved file loads back with those exact values.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
-            let yaml = youtrack_form_to_yaml(base, &f).unwrap();
+            f.deps_enabled = None;
+            f.deps_recheck_timeout = "10m".to_string();
+            f.deps_block_on = "depends on".to_string();
+            f.deps_block_cross_project = None;
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
             let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
             let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
                 panic!("expected youtrack native config");
             };
             let deps = &yt.youtrack.dependencies;
-            assert!(!deps.enabled, "hand-written enabled:false must survive");
+            assert!(!deps.enabled, "unchecked enabled must save false");
+            assert_eq!(deps.recheck_timeout, "10m");
+            assert_eq!(deps.block_on, vec!["depends on".to_string()]);
+            assert!(
+                !deps.block_cross_project,
+                "unchecked block_cross_project must save false"
+            );
+        }
+
+        #[test]
+        fn dependency_gate_preserved_on_unrelated_save() {
+            // Editing an action whose YAML carries a non-default `dependencies`
+            // block, without touching the dependency-gate inputs (the form
+            // prefills from the loaded action), round-trips it unchanged.
+            let yaml = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    dependencies:\n      enabled: false\n      recheck_timeout: 30s\n      block_on:\n        - depends on\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let mut f = action_to_youtrack_form(&loaded.action).unwrap();
+            f.name = "yt".to_string();
+            let saved_yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let saved = crate::action::validate_str(&saved_yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = saved.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            let deps = &yt.youtrack.dependencies;
+            assert!(!deps.enabled);
             assert_eq!(deps.recheck_timeout, "30s");
             assert_eq!(deps.block_on, vec!["depends on".to_string()]);
         }
 
         #[test]
-        fn write_projects_and_no_code_label_preserved_on_save() {
-            // CLAUDE-214 no-wipe regression: `write_projects` and
-            // `states.no_code` have no structured-form UI, so a save that edits
-            // any other field must carry them forward rather than silently
-            // narrowing the agent's create scope back to the issue's own project.
-            let base: serde_yaml::Value = serde_yaml::from_str(
-                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    write_projects:\n      - AUD\n      - DEV\n    states:\n      no_code: Reported\n",
-            )
-            .unwrap();
+        fn dependency_gate_bad_recheck_timeout_rejected() {
+            // A non-empty recheck timeout that does not parse as a humantime
+            // duration is rejected with a form error naming the field and the
+            // value, and no file is written.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
-            let yaml = youtrack_form_to_yaml(base, &f).unwrap();
+            f.deps_recheck_timeout = "not-a-duration".to_string();
+            let err = youtrack_form_to_yaml(empty_base(), &f).unwrap_err();
+            assert!(
+                err.contains("Dependency recheck timeout") && err.contains("not-a-duration"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn write_projects_and_no_code_label_form_round_trip() {
+            // CLAUDE-298: saving `write_projects` and the no-code label writes
+            // them, and the saved file loads back with those exact values.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.yt_write_projects = "ALPHA, BETA".to_string();
+            f.state_no_code = "Reported".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
             let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
             let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(
+                yt.youtrack.write_projects,
+                vec!["ALPHA".to_string(), "BETA".to_string()]
+            );
+            assert_eq!(yt.youtrack.states.no_code_label(), "Reported");
+        }
+
+        #[test]
+        fn write_projects_and_no_code_preserved_on_unrelated_save() {
+            // Editing an action whose YAML carries `write_projects` and
+            // `states.no_code`, without touching those inputs (the form
+            // prefills from the loaded action), round-trips them unchanged.
+            let yaml = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    write_projects:\n      - AUD\n      - DEV\n    states:\n      no_code: Reported\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let mut f = action_to_youtrack_form(&loaded.action).unwrap();
+            f.name = "yt".to_string();
+            let saved_yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let saved = crate::action::validate_str(&saved_yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = saved.action.native.unwrap() else {
                 panic!("expected youtrack native config");
             };
             assert_eq!(
@@ -7577,8 +7693,9 @@ mod tests {
 
         #[test]
         fn write_projects_and_no_code_default_omit_keys() {
-            // The untouched defaults write neither key, so existing action YAML
-            // is byte-unchanged by this feature.
+            // The untouched defaults write neither key, and the default
+            // dependency gate also emits no `dependencies` key, so existing
+            // action YAML is byte-unchanged by this feature.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
@@ -7587,6 +7704,10 @@ mod tests {
                 "write_projects leaked:\n{yaml}"
             );
             assert!(!yaml.contains("no_code"), "no_code leaked:\n{yaml}");
+            assert!(
+                !yaml.contains("dependencies"),
+                "dependencies leaked:\n{yaml}"
+            );
         }
 
         #[test]
