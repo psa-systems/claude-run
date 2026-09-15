@@ -57,7 +57,7 @@ use tracing::{error, info, warn};
 
 use super::{HandlerFuture, NativeContext, NativeHandler};
 use crate::access;
-use crate::action::{NativeConfig, YoutrackSource};
+use crate::action::{NativeConfig, PromptPreset, YoutrackSource};
 use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::claude::{raw_event_details, ClaudeInvoker, ClaudeResult};
 use crate::concurrency::Executor;
@@ -1804,17 +1804,32 @@ pub(crate) fn default_youtrack_prompt() -> String {
     .join("\n")
 }
 
-/// Build the agent's instruction text for `job`. Uses the action's full-override
-/// prompt (`native.youtrack.prompt`, CLAUDE-125) when set, otherwise the
-/// built-in [`default_youtrack_prompt`]; either way the `{{...}}` placeholders
-/// are substituted with this job's values.
+/// The built-in prompt template a preset names.
+pub(crate) fn preset_prompt(p: PromptPreset) -> String {
+    match p {
+        PromptPreset::Default => default_youtrack_prompt(),
+        PromptPreset::Audit => super::audit_prompt::default_audit_prompt(),
+    }
+}
+
+/// The unrendered prompt template for an action: the `native.youtrack.prompt`
+/// override (CLAUDE-125) when set, otherwise the `prompt_preset` built-in.
+pub(crate) fn prompt_template(src: &YoutrackSource) -> String {
+    match &src.prompt {
+        Some(p) => p.clone(),
+        None => preset_prompt(src.prompt_preset),
+    }
+}
+
+/// Build the agent's instruction text for `job`: [`prompt_template`] (override, else
+/// preset) with the `{{...}}` placeholders substituted.
 fn build_prompt(
     src: &YoutrackSource,
     job: &YoutrackJob,
     workdir: &Path,
     resume: Option<&PrResume>,
 ) -> String {
-    let template = src.prompt.clone().unwrap_or_else(default_youtrack_prompt);
+    let template = prompt_template(src);
     render_prompt_template(&template, job, workdir, &write_projects(src, job), resume)
 }
 
@@ -2873,6 +2888,113 @@ mod tests {
         let p = build_prompt(&s, &job(), std::path::Path::new("/tmp/wd"), None);
         assert_eq!(p, "Do MK-16: Do the thing in /tmp/wd");
         assert!(!p.contains("You are working a YouTrack issue"));
+    }
+
+    /// Resolution order: a YAML override beats the preset; without one the
+    /// preset's built-in text is the template.
+    #[test]
+    fn build_prompt_override_beats_preset() {
+        let mut s = src();
+        assert_eq!(prompt_template(&s), default_youtrack_prompt());
+
+        s.prompt_preset = PromptPreset::Audit;
+        assert_eq!(
+            prompt_template(&s),
+            super::super::audit_prompt::default_audit_prompt()
+        );
+        assert!(prompt_template(&s).starts_with("You are executing a scheduled AUDIT run"));
+
+        s.prompt = Some("Do {{key}}".to_string());
+        assert_eq!(prompt_template(&s), "Do {{key}}");
+        assert_eq!(
+            build_prompt(&s, &job(), std::path::Path::new("/tmp/wd"), None),
+            "Do MK-16"
+        );
+    }
+
+    #[test]
+    fn preset_prompt_maps_each_preset() {
+        assert_eq!(
+            preset_prompt(PromptPreset::Default),
+            default_youtrack_prompt()
+        );
+        assert!(preset_prompt(PromptPreset::Audit)
+            .starts_with("You are executing a scheduled AUDIT run"));
+    }
+
+    fn audit_src() -> YoutrackSource {
+        YoutrackSource {
+            prompt_preset: PromptPreset::Audit,
+            write_projects: vec!["ALPHA".into(), "GAMMA".into()],
+            ..YoutrackSource::default()
+        }
+    }
+
+    #[test]
+    fn audit_preset_template_carries_the_runner_placeholders() {
+        let t = preset_prompt(PromptPreset::Audit);
+        for placeholder in [
+            "{{key}}",
+            "{{summary}}",
+            "{{clone_url}}",
+            "{{workdir}}",
+            "{{needs_review_marker}}",
+            "{{skip_attempt_marker}}",
+            "{{write_projects}}",
+            "{{existing_branch}}",
+        ] {
+            assert!(t.contains(placeholder), "audit preset lacks {placeholder}");
+        }
+    }
+
+    #[test]
+    fn audit_preset_renders_every_placeholder() {
+        let resume = PrResume {
+            branch: "audit/pms-ui-2026-09-14".into(),
+            pr_url: "https://dev.a8n.run/contoso/audits/pulls/9".into(),
+        };
+        let wd = std::path::Path::new("/tmp/wd");
+        for r in [None, Some(&resume)] {
+            let p = build_prompt(&audit_src(), &job(), wd, r);
+            assert!(!p.contains("{{"), "unresolved placeholder:\n{p}");
+            assert!(p.contains("Issue: MK-16: Do the thing"), "{p}");
+            assert!(
+                p.contains("Repo: https://dev.a8n.run/contoso/claude-run.git"),
+                "{p}"
+            );
+            assert!(p.contains("ONLY in these projects: ALPHA, GAMMA"), "{p}");
+            assert!(p.contains("/tmp/wd/.claude-run-needs-review"), "{p}");
+            assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"), "{p}");
+            assert!(p.contains("#MK-16"), "{p}");
+        }
+        let resumed = build_prompt(&audit_src(), &job(), wd, Some(&resume));
+        assert!(resumed.contains("audit/pms-ui-2026-09-14"), "{resumed}");
+        assert!(
+            resumed.contains("https://dev.a8n.run/contoso/audits/pulls/9"),
+            "{resumed}"
+        );
+    }
+
+    #[test]
+    fn audit_preset_states_its_permits_and_bans() {
+        let p = preset_prompt(PromptPreset::Audit);
+        assert!(p.is_ascii(), "the audit preset must be ASCII only");
+        for needle in [
+            "Tracker writes. You may perform EXACTLY these, and nothing else:",
+            "`Queued` is the only `AI Agent` value you may set",
+            "Every other tracker write is forbidden, in particular:",
+            "No `AI Agent` or `State` change on any issue you did not create during this run",
+            "No `yt issue set-state` anywhere",
+            "No summary edit on any issue.",
+            "No assignee change on any issue.",
+            "No `yt issue delete`, anywhere.",
+            "No pull request URL in any comment, description, or issue body.",
+            "No write to the anchor issue from a per-target run.",
+            "Never run `git checkout main` or `git switch main`",
+            "HARD RULE on long commands: run everything in the FOREGROUND",
+        ] {
+            assert!(p.contains(needle), "audit preset lacks: {needle}");
+        }
     }
 
     #[test]

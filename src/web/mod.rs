@@ -2556,6 +2556,10 @@ struct YoutrackEditorTpl {
     /// Existing action name (`None` in create mode); drives the heading,
     /// breadcrumb, and Cancel link.
     name: Option<String>,
+    /// Prompt provenance of the on-disk action (`override`, `builtin:<preset>`).
+    prompt_source: String,
+    /// Preset the prompt resolves to without an override; named in the hint.
+    prompt_preset: &'static str,
 }
 
 /// Flat form backing the structured editor. Every input posts a string; the
@@ -2630,6 +2634,25 @@ struct YoutrackEditForm {
     concurrency_key: String,
     /// Present ("on") when the enabled checkbox is checked, absent otherwise.
     enabled: Option<String>,
+    /// CLAUDE-298: comma-separated project keys the agent may create issues in
+    /// (`native.youtrack.write_projects`). Empty resolves to the triggering
+    /// issue's own project.
+    yt_write_projects: String,
+    /// CLAUDE-298: pre-clone dependency gate master switch
+    /// (`dependencies.enabled`). Present ("on") when checked.
+    deps_enabled: Option<String>,
+    /// CLAUDE-298: humantime backoff before a blocked issue is re-evaluated
+    /// (`dependencies.recheck_timeout`). Blank falls back to the default (`5m`).
+    deps_recheck_timeout: String,
+    /// CLAUDE-298: comma-separated link verbs that block pickup
+    /// (`dependencies.block_on`). Blank falls back to the default.
+    deps_block_on: String,
+    /// CLAUDE-298: whether a link to another project blocks pickup
+    /// (`dependencies.block_cross_project`). Present ("on") when checked.
+    deps_block_cross_project: Option<String>,
+    /// CLAUDE-298: AI Agent label for a deliberate zero-commit run
+    /// (`states.no_code`). Blank inherits the `done` label.
+    state_no_code: String,
 }
 
 impl YoutrackEditForm {
@@ -2644,6 +2667,18 @@ impl YoutrackEditForm {
     fn is_automerge_enabled(&self) -> bool {
         self.automerge_enabled.is_some()
     }
+
+    /// Whether the dependency-gate checkbox was ticked (CLAUDE-298). Like
+    /// [`Self::is_enabled`], absence means the box was unchecked.
+    fn is_deps_enabled(&self) -> bool {
+        self.deps_enabled.is_some()
+    }
+
+    /// Whether the cross-project block checkbox was ticked (CLAUDE-298). Like
+    /// [`Self::is_enabled`], absence means the box was unchecked.
+    fn is_deps_block_cross_project(&self) -> bool {
+        self.deps_block_cross_project.is_some()
+    }
 }
 
 /// Field defaults for a brand-new YouTrack action: blank identity, but the
@@ -2652,6 +2687,7 @@ impl YoutrackEditForm {
 fn youtrack_form_defaults() -> YoutrackEditForm {
     let c = YoutrackConfig::default();
     let conc = Concurrency::default();
+    let deps = crate::action::Dependencies::default();
     YoutrackEditForm {
         yt_query: c.youtrack.query,
         yt_custom_field: c.youtrack.custom_field,
@@ -2667,6 +2703,10 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
         concurrency_max_parallel: conc.max_parallel.to_string(),
         concurrency_key: conc.key.join(", "),
         fj_pr_strategy: c.forgejo.pr_strategy.as_str().to_string(),
+        deps_enabled: deps.enabled.then(|| "on".to_string()),
+        deps_recheck_timeout: deps.recheck_timeout,
+        deps_block_on: deps.block_on.join(", "),
+        deps_block_cross_project: deps.block_cross_project.then(|| "on".to_string()),
         ..Default::default()
     }
 }
@@ -2692,7 +2732,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
             .youtrack
             .prompt
             .clone()
-            .unwrap_or_else(crate::native::youtrack::default_youtrack_prompt),
+            .unwrap_or_else(|| crate::native::youtrack::preset_prompt(yt.youtrack.prompt_preset)),
         state_queued: yt.youtrack.states.queued.clone(),
         state_working: yt.youtrack.states.working.clone(),
         state_code_review: yt.youtrack.states.code_review.clone(),
@@ -2745,6 +2785,16 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         concurrency_max_parallel: a.concurrency.max_parallel.to_string(),
         concurrency_key: a.concurrency.key.join(", "),
         enabled: a.enabled.then(|| "on".to_string()),
+        yt_write_projects: yt.youtrack.write_projects.join(", "),
+        deps_enabled: yt.youtrack.dependencies.enabled.then(|| "on".to_string()),
+        deps_recheck_timeout: yt.youtrack.dependencies.recheck_timeout.clone(),
+        deps_block_on: yt.youtrack.dependencies.block_on.join(", "),
+        deps_block_cross_project: yt
+            .youtrack
+            .dependencies
+            .block_cross_project
+            .then(|| "on".to_string()),
+        state_no_code: s(&yt.youtrack.states.no_code),
     })
 }
 
@@ -2814,15 +2864,23 @@ fn youtrack_form_to_yaml(
     // CLAUDE-131: blank Assignee box -> no `assignee` key (Assignee untouched);
     // any value is persisted as a literal `yt` assignee argument.
     youtrack.assignee = opt(&form.yt_assignee);
-    // CLAUDE-125: store the prompt only as a real override. Normalize browser
-    // CRLF to LF, trim, and compare to the built-in default: an empty box or one
-    // left equal to the default writes no `prompt` key (stay on the built-in so
-    // future default improvements flow through); anything else is persisted
-    // verbatim as a full-replacement override.
+    // No preset picker in the form: carry `prompt_preset` forward. An invalid value is an
+    // error, since falling back would switch an audit action to the engineering prompt.
+    youtrack.prompt_preset = match map
+        .get("native")
+        .and_then(|n| n.get("youtrack"))
+        .and_then(|y| y.get("prompt_preset"))
+    {
+        Some(v) => serde_yaml::from_value::<crate::action::PromptPreset>(v.clone())
+            .map_err(|e| format!("native.youtrack.prompt_preset is invalid: {e}"))?,
+        None => crate::action::PromptPreset::default(),
+    };
+    // CLAUDE-125: text equal to the action's preset (CRLF-normalized, trimmed) or an empty
+    // box stores no override, so preset improvements still apply.
     let prompt_norm = form.yt_prompt.replace("\r\n", "\n");
     let prompt_trim = prompt_norm.trim();
     youtrack.prompt = (!prompt_trim.is_empty()
-        && prompt_trim != crate::native::youtrack::default_youtrack_prompt().trim())
+        && prompt_trim != crate::native::youtrack::preset_prompt(youtrack.prompt_preset).trim())
     .then(|| prompt_trim.to_string());
     let states = &mut youtrack.states;
     if let Some(v) = opt(&form.state_queued) {
@@ -2859,38 +2917,53 @@ fn youtrack_form_to_yaml(
         enabled: form.is_automerge_enabled(),
         ..Automerge::default()
     };
-    // CLAUDE-161: preserve a hand-written `dependencies` block. The structured
-    // form has no dependency-gate UI, so read the existing
-    // `native.youtrack.dependencies` sub-block off the parsed on-disk action
-    // (before we overwrite the `native` key below) and carry it forward, so
-    // editing any other field in the form does not silently reset the gate.
-    // Missing / unparsable -> the default (enabled 5m gate); `prune_yaml` still
-    // drops an all-default block so an untouched action writes no `dependencies`.
-    youtrack.dependencies = map
-        .get("native")
-        .and_then(|n| n.get("youtrack"))
-        .and_then(|y| y.get("dependencies"))
-        .cloned()
-        .and_then(|d| serde_yaml::from_value::<crate::action::Dependencies>(d).ok())
-        .unwrap_or_default();
-    // CLAUDE-214: same carry-forward for `write_projects` and `states.no_code`,
-    // neither of which the structured form exposes. Without this, saving any
-    // other field would silently narrow the agent's create scope back to the
-    // triggering issue's project and reset the no-code label.
-    youtrack.write_projects = map
-        .get("native")
-        .and_then(|n| n.get("youtrack"))
-        .and_then(|y| y.get("write_projects"))
-        .cloned()
-        .and_then(|w| serde_yaml::from_value::<Vec<String>>(w).ok())
-        .unwrap_or_default();
-    youtrack.states.no_code = map
-        .get("native")
-        .and_then(|n| n.get("youtrack"))
-        .and_then(|y| y.get("states"))
-        .and_then(|s| s.get("no_code"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    // CLAUDE-298: projects the agent may create issues in. Comma-separated,
+    // trimmed, empties dropped; blank -> no `write_projects` key (resolves to
+    // the triggering issue's own project).
+    youtrack.write_projects = form
+        .yt_write_projects
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    // CLAUDE-298: pre-clone dependency gate. A blank recheck timeout falls back
+    // to the default like the other required fields; a non-empty value that
+    // does not parse as a humantime duration is rejected, matching the
+    // numeric-limit fields, and no file is written.
+    let deps_default = crate::action::Dependencies::default();
+    let recheck_timeout = match form.deps_recheck_timeout.trim() {
+        "" => deps_default.recheck_timeout.clone(),
+        t => {
+            humantime::parse_duration(t).map_err(|_| {
+                format!("Dependency recheck timeout must be a duration (got `{t}`)")
+            })?;
+            t.to_string()
+        }
+    };
+    let block_on: Vec<String> = {
+        let parsed: Vec<String> = form
+            .deps_block_on
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if parsed.is_empty() {
+            deps_default.block_on.clone()
+        } else {
+            parsed
+        }
+    };
+    youtrack.dependencies = crate::action::Dependencies {
+        enabled: form.is_deps_enabled(),
+        recheck_timeout,
+        block_on,
+        block_cross_project: form.is_deps_block_cross_project(),
+    };
+    // CLAUDE-298: AI Agent label for a deliberate zero-commit run. Blank -> no
+    // `no_code` key (resolves to the `done` label).
+    youtrack.states.no_code = opt(&form.state_no_code);
     // CLAUDE-54: preserve a hand-written `github` block. The form exposes only
     // `token_ref`, so read the existing `native.github` sub-block off the parsed
     // on-disk action (before we overwrite the `native` key below) to carry its
@@ -3086,6 +3159,50 @@ async fn token_ref_options(s: &WebState, form: &YoutrackEditForm) -> Result<Vec<
     Ok(names)
 }
 
+/// Prompt provenance shown on the structured editor.
+struct PromptProvenance {
+    source: String,
+    preset: &'static str,
+}
+
+impl PromptProvenance {
+    /// A new action has no file yet, so it resolves to the default preset.
+    fn builtin_default() -> Self {
+        let preset = crate::action::PromptPreset::Default;
+        Self {
+            source: crate::action::PromptSource::Builtin(preset).to_string(),
+            preset: preset.as_str(),
+        }
+    }
+
+    /// From a loaded action; `None` unless it is a youtrack action.
+    fn of(a: &Action) -> Option<Self> {
+        let NativeConfig::Youtrack(yt) = a.native.as_ref()? else {
+            return None;
+        };
+        Some(Self {
+            source: yt.youtrack.prompt_source().to_string(),
+            preset: yt.youtrack.prompt_preset.as_str(),
+        })
+    }
+
+    /// From the action file as it is on disk now. A file that does not load
+    /// renders as `unknown` with the reason, never as a guessed preset.
+    fn on_disk(yaml: &str, label: &str) -> Self {
+        let reason = match crate::action::validate_str(yaml, label) {
+            Ok(loaded) => match Self::of(&loaded.action) {
+                Some(p) => return p,
+                None => "the on-disk action is not kind: youtrack".to_string(),
+            },
+            Err(e) => format!("the on-disk action does not validate: {e}"),
+        };
+        Self {
+            source: format!("unknown ({reason})"),
+            preset: "unknown",
+        }
+    }
+}
+
 /// Render the structured editor at `status`, preserving the supplied `form`.
 async fn render_youtrack_editor(
     s: &WebState,
@@ -3093,6 +3210,7 @@ async fn render_youtrack_editor(
     name: Option<String>,
     form: YoutrackEditForm,
     error: Option<String>,
+    prompt: PromptProvenance,
 ) -> Result<Response, WebError> {
     let secrets = token_ref_options(s, &form).await?;
     let (heading, post_url, raw_url) = match &name {
@@ -3116,6 +3234,8 @@ async fn render_youtrack_editor(
         secrets,
         error,
         name,
+        prompt_source: prompt.source,
+        prompt_preset: prompt.preset,
     };
     Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
 }
@@ -3179,7 +3299,15 @@ async fn action_form_save(
 }
 
 async fn youtrack_new_page(State(s): State<WebState>) -> Result<Response, WebError> {
-    render_youtrack_editor(&s, StatusCode::OK, None, youtrack_form_defaults(), None).await
+    render_youtrack_editor(
+        &s,
+        StatusCode::OK,
+        None,
+        youtrack_form_defaults(),
+        None,
+        PromptProvenance::builtin_default(),
+    )
+    .await
 }
 
 async fn youtrack_edit_page(
@@ -3193,13 +3321,15 @@ async fn youtrack_edit_page(
     // A file that no longer parses, or is not a youtrack action, has no
     // structured form; send the user to the raw editor instead.
     let form = match crate::action::validate_str(&yaml, &path) {
-        Ok(loaded) => action_to_youtrack_form(&loaded.action),
+        Ok(loaded) => {
+            action_to_youtrack_form(&loaded.action).zip(PromptProvenance::of(&loaded.action))
+        }
         Err(_) => None,
     };
-    let Some(form) = form else {
+    let Some((form, prompt)) = form else {
         return Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response());
     };
-    render_youtrack_editor(&s, StatusCode::OK, Some(name), form, None).await
+    render_youtrack_editor(&s, StatusCode::OK, Some(name), form, None, prompt).await
 }
 
 async fn youtrack_edit_save(
@@ -3211,8 +3341,27 @@ async fn youtrack_edit_save(
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
     let existing = std::fs::read_to_string(&path).map_err(WebError::from)?;
-    let base: serde_yaml::Value = serde_yaml::from_str(&existing)
-        .unwrap_or_else(|_| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    // Provenance for an error re-render comes from the file as it is on disk.
+    let prompt = PromptProvenance::on_disk(&existing, &path);
+    // An unparsable base must not become an empty mapping: the save would drop
+    // every key the form does not show, `prompt_preset` included.
+    let base: serde_yaml::Value = match serde_yaml::from_str(&existing) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!(
+                "the action file on disk is not valid YAML, so a form save would drop the keys the form does not show; fix it in the raw YAML editor: {e}"
+            );
+            return render_youtrack_editor(
+                &s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some(name),
+                form,
+                Some(msg),
+                prompt,
+            )
+            .await;
+        }
+    };
     let yaml = match youtrack_form_to_yaml(base, &form) {
         Ok(y) => y,
         Err(msg) => {
@@ -3222,6 +3371,7 @@ async fn youtrack_edit_save(
                 Some(name),
                 form,
                 Some(msg),
+                prompt,
             )
             .await
         }
@@ -3235,6 +3385,7 @@ async fn youtrack_edit_save(
                 Some(name),
                 form,
                 Some(e.to_string()),
+                prompt,
             )
             .await
         }
@@ -3264,6 +3415,7 @@ async fn youtrack_create(
                 None,
                 form,
                 Some(msg),
+                PromptProvenance::builtin_default(),
             )
             .await
         }
@@ -3277,6 +3429,7 @@ async fn youtrack_create(
                 None,
                 form,
                 Some(e.to_string()),
+                PromptProvenance::builtin_default(),
             )
             .await
         }
@@ -3286,15 +3439,29 @@ async fn youtrack_create(
             "action name `{}` is not a safe filename (allowed: letters, digits, '-', '_', '.')",
             loaded.action.name
         );
-        return render_youtrack_editor(&s, StatusCode::UNPROCESSABLE_ENTITY, None, form, Some(msg))
-            .await;
+        return render_youtrack_editor(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            form,
+            Some(msg),
+            PromptProvenance::builtin_default(),
+        )
+        .await;
     };
     let actions_dir = s.paths.actions_dir();
     let dest = actions_dir.join(format!("{stem}.yml"));
     if dest.exists() {
         let msg = format!("`{stem}.yml` already exists; edit it instead of creating a duplicate");
-        return render_youtrack_editor(&s, StatusCode::UNPROCESSABLE_ENTITY, None, form, Some(msg))
-            .await;
+        return render_youtrack_editor(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            form,
+            Some(msg),
+            PromptProvenance::builtin_default(),
+        )
+        .await;
     }
     std::fs::create_dir_all(&actions_dir).map_err(WebError::from)?;
     std::fs::write(&dest, yaml.as_bytes()).map_err(WebError::from)?;
@@ -7424,42 +7591,97 @@ mod tests {
         }
 
         #[test]
-        fn dependencies_block_preserved_on_save() {
-            // CLAUDE-161 no-wipe regression: an action whose YAML carries a
-            // hand-written `dependencies` block survives a structured-form save
-            // intact, since the form has no dependency-gate UI to reconstruct it.
-            let base: serde_yaml::Value = serde_yaml::from_str(
-                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    dependencies:\n      enabled: false\n      recheck_timeout: 30s\n      block_on:\n        - depends on\n",
-            )
-            .unwrap();
+        fn dependency_gate_form_round_trips() {
+            // CLAUDE-298: saving the form's dependency-gate inputs writes them,
+            // and the saved file loads back with those exact values.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
-            let yaml = youtrack_form_to_yaml(base, &f).unwrap();
+            f.deps_enabled = None;
+            f.deps_recheck_timeout = "10m".to_string();
+            f.deps_block_on = "depends on".to_string();
+            f.deps_block_cross_project = None;
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
             let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
             let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
                 panic!("expected youtrack native config");
             };
             let deps = &yt.youtrack.dependencies;
-            assert!(!deps.enabled, "hand-written enabled:false must survive");
+            assert!(!deps.enabled, "unchecked enabled must save false");
+            assert_eq!(deps.recheck_timeout, "10m");
+            assert_eq!(deps.block_on, vec!["depends on".to_string()]);
+            assert!(
+                !deps.block_cross_project,
+                "unchecked block_cross_project must save false"
+            );
+        }
+
+        #[test]
+        fn dependency_gate_preserved_on_unrelated_save() {
+            // Editing an action whose YAML carries a non-default `dependencies`
+            // block, without touching the dependency-gate inputs (the form
+            // prefills from the loaded action), round-trips it unchanged.
+            let yaml = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    dependencies:\n      enabled: false\n      recheck_timeout: 30s\n      block_on:\n        - depends on\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let mut f = action_to_youtrack_form(&loaded.action).unwrap();
+            f.name = "yt".to_string();
+            let saved_yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let saved = crate::action::validate_str(&saved_yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = saved.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            let deps = &yt.youtrack.dependencies;
+            assert!(!deps.enabled);
             assert_eq!(deps.recheck_timeout, "30s");
             assert_eq!(deps.block_on, vec!["depends on".to_string()]);
         }
 
         #[test]
-        fn write_projects_and_no_code_label_preserved_on_save() {
-            // CLAUDE-214 no-wipe regression: `write_projects` and
-            // `states.no_code` have no structured-form UI, so a save that edits
-            // any other field must carry them forward rather than silently
-            // narrowing the agent's create scope back to the issue's own project.
-            let base: serde_yaml::Value = serde_yaml::from_str(
-                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    write_projects:\n      - AUD\n      - DEV\n    states:\n      no_code: Reported\n",
-            )
-            .unwrap();
+        fn dependency_gate_bad_recheck_timeout_rejected() {
+            // A non-empty recheck timeout that does not parse as a humantime
+            // duration is rejected with a form error naming the field and the
+            // value, and no file is written.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
-            let yaml = youtrack_form_to_yaml(base, &f).unwrap();
+            f.deps_recheck_timeout = "not-a-duration".to_string();
+            let err = youtrack_form_to_yaml(empty_base(), &f).unwrap_err();
+            assert!(
+                err.contains("Dependency recheck timeout") && err.contains("not-a-duration"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn write_projects_and_no_code_label_form_round_trip() {
+            // CLAUDE-298: saving `write_projects` and the no-code label writes
+            // them, and the saved file loads back with those exact values.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.yt_write_projects = "ALPHA, BETA".to_string();
+            f.state_no_code = "Reported".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
             let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
             let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(
+                yt.youtrack.write_projects,
+                vec!["ALPHA".to_string(), "BETA".to_string()]
+            );
+            assert_eq!(yt.youtrack.states.no_code_label(), "Reported");
+        }
+
+        #[test]
+        fn write_projects_and_no_code_preserved_on_unrelated_save() {
+            // Editing an action whose YAML carries `write_projects` and
+            // `states.no_code`, without touching those inputs (the form
+            // prefills from the loaded action), round-trips them unchanged.
+            let yaml = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    write_projects:\n      - AUD\n      - DEV\n    states:\n      no_code: Reported\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let mut f = action_to_youtrack_form(&loaded.action).unwrap();
+            f.name = "yt".to_string();
+            let saved_yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let saved = crate::action::validate_str(&saved_yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = saved.action.native.unwrap() else {
                 panic!("expected youtrack native config");
             };
             assert_eq!(
@@ -7471,8 +7693,9 @@ mod tests {
 
         #[test]
         fn write_projects_and_no_code_default_omit_keys() {
-            // The untouched defaults write neither key, so existing action YAML
-            // is byte-unchanged by this feature.
+            // The untouched defaults write neither key, and the default
+            // dependency gate also emits no `dependencies` key, so existing
+            // action YAML is byte-unchanged by this feature.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
@@ -7481,6 +7704,10 @@ mod tests {
                 "write_projects leaked:\n{yaml}"
             );
             assert!(!yaml.contains("no_code"), "no_code leaked:\n{yaml}");
+            assert!(
+                !yaml.contains("dependencies"),
+                "dependencies leaked:\n{yaml}"
+            );
         }
 
         #[test]
@@ -7519,6 +7746,8 @@ mod tests {
                 secrets: Vec::new(),
                 error: None,
                 name: Some("yt".to_string()),
+                prompt_source: "builtin:default".to_string(),
+                prompt_preset: "default",
             };
             let html = tpl.render().unwrap();
             assert!(
@@ -7621,6 +7850,110 @@ mod tests {
                 form.yt_prompt,
                 crate::native::youtrack::default_youtrack_prompt()
             );
+        }
+
+        fn audit_base(preset: &str) -> serde_yaml::Value {
+            serde_yaml::from_str(&format!(
+                "name: audit\nkind: youtrack\nnative:\n  youtrack:\n    prompt_preset: {preset}\n"
+            ))
+            .unwrap()
+        }
+
+        fn saved_youtrack(yaml: &str) -> crate::action::YoutrackSource {
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            yt.youtrack
+        }
+
+        #[test]
+        fn prompt_prefills_audit_preset_when_unset() {
+            let yaml =
+                "name: audit\nkind: youtrack\nnative:\n  youtrack:\n    prompt_preset: audit\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            assert_eq!(
+                form.yt_prompt,
+                crate::native::audit_prompt::default_audit_prompt()
+            );
+        }
+
+        #[test]
+        fn prompt_equal_to_audit_preset_writes_no_override_and_keeps_the_preset() {
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "audit".to_string();
+            // A browser posts CRLF line endings.
+            f.yt_prompt = crate::native::audit_prompt::default_audit_prompt().replace('\n', "\r\n");
+            let yaml = youtrack_form_to_yaml(audit_base("audit"), &f).unwrap();
+            assert!(!yaml.contains("prompt:"), "prompt key leaked:\n{yaml}");
+            assert!(yaml.contains("prompt_preset: audit"), "{yaml}");
+            let yt = saved_youtrack(&yaml);
+            assert!(yt.prompt.is_none());
+            assert_eq!(yt.prompt_preset, crate::action::PromptPreset::Audit);
+        }
+
+        #[test]
+        fn prompt_preset_preserved_on_save() {
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "audit".to_string();
+            f.yt_prompt = String::new();
+            let yt = saved_youtrack(&youtrack_form_to_yaml(audit_base("audit"), &f).unwrap());
+            assert_eq!(yt.prompt_preset, crate::action::PromptPreset::Audit);
+            assert_eq!(
+                yt.prompt_source(),
+                crate::action::PromptSource::Builtin(crate::action::PromptPreset::Audit)
+            );
+        }
+
+        #[test]
+        fn youtrack_default_text_on_audit_action_is_saved_as_override() {
+            // The comparison is against the action's own preset, not the engineering default.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "audit".to_string();
+            let yt = saved_youtrack(&youtrack_form_to_yaml(audit_base("audit"), &f).unwrap());
+            assert_eq!(
+                yt.prompt.as_deref(),
+                Some(crate::native::youtrack::default_youtrack_prompt().trim())
+            );
+            assert_eq!(yt.prompt_preset, crate::action::PromptPreset::Audit);
+            assert_eq!(yt.prompt_source(), crate::action::PromptSource::Override);
+        }
+
+        #[test]
+        fn unparsable_prompt_preset_in_base_is_a_form_error() {
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "audit".to_string();
+            let err = youtrack_form_to_yaml(audit_base("audt"), &f).unwrap_err();
+            assert!(err.contains("native.youtrack.prompt_preset"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn youtrack_edit_page_shows_the_builtin_audit_prompt_source() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("audit.yml");
+            std::fs::write(
+                &file,
+                "name: audit\nkind: youtrack\nnative:\n  youtrack:\n    prompt_preset: audit\n",
+            )
+            .unwrap();
+            index_action(&s.api.pool, "audit", file.to_str().unwrap()).await;
+
+            let resp = youtrack_edit_page(State(s.clone()), AxumPath("audit".to_string()))
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            assert!(
+                body.contains("Prompt source: <code>builtin:audit</code>"),
+                "{body}"
+            );
+            assert!(body.contains("the built-in audit preset"), "{body}");
+            assert!(body.contains("Reset to built-in preset"), "{body}");
         }
 
         #[test]

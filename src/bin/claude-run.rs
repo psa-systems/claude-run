@@ -980,6 +980,42 @@ async fn daemonless_status(
     }))
 }
 
+/// `action show` output: the index row plus prompt provenance read from the YAML. Both prompt
+/// fields are null for a kind with no agent prompt, or when the YAML does not parse.
+#[derive(serde::Serialize)]
+struct ActionShow {
+    #[serde(flatten)]
+    row: state::ActionIndexRow,
+    prompt_source: Option<String>,
+    prompt_preset: Option<&'static str>,
+}
+
+impl ActionShow {
+    fn new(row: state::ActionIndexRow, a: &action::Action) -> Self {
+        let preset = match &a.native {
+            Some(action::NativeConfig::Youtrack(yt)) => Some(yt.youtrack.prompt_preset.as_str()),
+            _ => None,
+        };
+        Self {
+            row,
+            prompt_source: a
+                .native
+                .as_ref()
+                .and_then(|n| n.prompt_source())
+                .map(|s| s.to_string()),
+            prompt_preset: preset,
+        }
+    }
+
+    fn without_prompt(row: state::ActionIndexRow) -> Self {
+        Self {
+            row,
+            prompt_source: None,
+            prompt_preset: None,
+        }
+    }
+}
+
 async fn action_cmd(
     cmd: ActionCmd,
     paths: &cfg::Paths,
@@ -1000,11 +1036,24 @@ async fn action_cmd(
         }
         ActionCmd::Show { name } => {
             let rows = state::action_index_list(&pool).await?;
-            match rows.into_iter().find(|r| r.name == name) {
-                Some(r) => jsonfmt::print_json(&r)?,
-                None => {
-                    paint::error(&format!("no action `{name}` in index"));
-                    return Ok(exit::CONFIG_ERROR);
+            let Some(row) = rows.into_iter().find(|r| r.name == name) else {
+                paint::error(&format!("no action `{name}` in index"));
+                return Ok(exit::CONFIG_ERROR);
+            };
+            // Prompt provenance is read from the YAML on disk; the index has no column for it.
+            if row.parse_error.is_some() {
+                jsonfmt::print_json(&ActionShow::without_prompt(row))?;
+            } else {
+                match action::load_from_path(std::path::Path::new(&row.file_path)) {
+                    Ok(loaded) => jsonfmt::print_json(&ActionShow::new(row, &loaded.action))?,
+                    Err(e) => {
+                        let path = row.file_path.clone();
+                        jsonfmt::print_json(&ActionShow::without_prompt(row))?;
+                        paint::error(&format!(
+                            "action `{name}` is indexed but failed to load from {path}: {e}"
+                        ));
+                        return Ok(exit::CONFIG_ERROR);
+                    }
                 }
             }
         }
@@ -1188,6 +1237,53 @@ async fn secret_cmd(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// `action show` adds the prompt provenance read from each shipped action's YAML.
+    #[test]
+    fn action_show_reports_prompt_provenance() {
+        let row = |name: &str| state::ActionIndexRow {
+            name: name.to_string(),
+            file_path: format!("actions/{name}.yml"),
+            yaml_sha256: String::new(),
+            enabled: true,
+            schedule_kind: None,
+            schedule_spec: None,
+            last_seen_at: String::new(),
+            parse_error: None,
+            link_template: None,
+            max_parallel: 1,
+        };
+        for (name, raw, source, preset) in [
+            (
+                "audit-run",
+                include_str!("../../actions/audit-run.yml"),
+                Some("builtin:audit"),
+                Some("audit"),
+            ),
+            (
+                "youtrack",
+                include_str!("../../actions/youtrack.yml"),
+                Some("builtin:default"),
+                Some("default"),
+            ),
+            (
+                "closed-issue-summary",
+                include_str!("../../actions/closed-issue-summary.yml"),
+                None,
+                None,
+            ),
+        ] {
+            let loaded = action::validate_str(raw, name).unwrap();
+            let v = serde_json::to_value(ActionShow::new(row(name), &loaded.action)).unwrap();
+            assert_eq!(v["name"], name, "the index row is flattened in");
+            assert_eq!(v["prompt_source"].as_str(), source, "{name}");
+            assert_eq!(v["prompt_preset"].as_str(), preset, "{name}");
+        }
+
+        let v = serde_json::to_value(ActionShow::without_prompt(row("broken"))).unwrap();
+        assert!(v["prompt_source"].is_null() && v["prompt_preset"].is_null());
+        assert!(v.get("parse_error").is_some());
+    }
 
     #[test]
     fn color_flag_defaults_to_auto() {
