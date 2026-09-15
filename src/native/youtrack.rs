@@ -3915,6 +3915,14 @@ mod tests {
         // CLAUDE-103 default: the branch strategy pushes a real server branch and
         // opens the PR via the API; `-aA` is never invoked.
         let dir = tempfile::tempdir().unwrap();
+        // CLAUDE-305: `find_or_create_pr` resolves the clone's git directory
+        // before writing the PR body scratch file there.
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
         // CLAUDE-166: the branch strategy resolves the feature branch by name
         // (origin/HEAD base, for-each-ref listing, rev-list ahead check) before
         // pushing `<branch>:<branch>` and opening the PR with an explicit --head.
@@ -3967,6 +3975,11 @@ mod tests {
                     "body\n\n#MK-16\n",
                 )
                 .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
                     "fj",
                     &[
                         "--host",
@@ -3975,7 +3988,7 @@ mod tests {
                         "create",
                         "feat: x",
                         "--body-file",
-                        ".claude-run-pr-body.md",
+                        body_path.as_str(),
                         "--head",
                         "feat/x",
                         "--json",
