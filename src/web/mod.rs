@@ -2556,6 +2556,10 @@ struct YoutrackEditorTpl {
     /// Existing action name (`None` in create mode); drives the heading,
     /// breadcrumb, and Cancel link.
     name: Option<String>,
+    /// Prompt provenance of the on-disk action (`override`, `builtin:<preset>`).
+    prompt_source: String,
+    /// Preset the prompt resolves to without an override; named in the hint.
+    prompt_preset: &'static str,
 }
 
 /// Flat form backing the structured editor. Every input posts a string; the
@@ -2728,7 +2732,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
             .youtrack
             .prompt
             .clone()
-            .unwrap_or_else(crate::native::youtrack::default_youtrack_prompt),
+            .unwrap_or_else(|| crate::native::youtrack::preset_prompt(yt.youtrack.prompt_preset)),
         state_queued: yt.youtrack.states.queued.clone(),
         state_working: yt.youtrack.states.working.clone(),
         state_code_review: yt.youtrack.states.code_review.clone(),
@@ -2860,15 +2864,23 @@ fn youtrack_form_to_yaml(
     // CLAUDE-131: blank Assignee box -> no `assignee` key (Assignee untouched);
     // any value is persisted as a literal `yt` assignee argument.
     youtrack.assignee = opt(&form.yt_assignee);
-    // CLAUDE-125: store the prompt only as a real override. Normalize browser
-    // CRLF to LF, trim, and compare to the built-in default: an empty box or one
-    // left equal to the default writes no `prompt` key (stay on the built-in so
-    // future default improvements flow through); anything else is persisted
-    // verbatim as a full-replacement override.
+    // No preset picker in the form: carry `prompt_preset` forward. An invalid value is an
+    // error, since falling back would switch an audit action to the engineering prompt.
+    youtrack.prompt_preset = match map
+        .get("native")
+        .and_then(|n| n.get("youtrack"))
+        .and_then(|y| y.get("prompt_preset"))
+    {
+        Some(v) => serde_yaml::from_value::<crate::action::PromptPreset>(v.clone())
+            .map_err(|e| format!("native.youtrack.prompt_preset is invalid: {e}"))?,
+        None => crate::action::PromptPreset::default(),
+    };
+    // CLAUDE-125: text equal to the action's preset (CRLF-normalized, trimmed) or an empty
+    // box stores no override, so preset improvements still apply.
     let prompt_norm = form.yt_prompt.replace("\r\n", "\n");
     let prompt_trim = prompt_norm.trim();
     youtrack.prompt = (!prompt_trim.is_empty()
-        && prompt_trim != crate::native::youtrack::default_youtrack_prompt().trim())
+        && prompt_trim != crate::native::youtrack::preset_prompt(youtrack.prompt_preset).trim())
     .then(|| prompt_trim.to_string());
     let states = &mut youtrack.states;
     if let Some(v) = opt(&form.state_queued) {
@@ -3147,6 +3159,50 @@ async fn token_ref_options(s: &WebState, form: &YoutrackEditForm) -> Result<Vec<
     Ok(names)
 }
 
+/// Prompt provenance shown on the structured editor.
+struct PromptProvenance {
+    source: String,
+    preset: &'static str,
+}
+
+impl PromptProvenance {
+    /// A new action has no file yet, so it resolves to the default preset.
+    fn builtin_default() -> Self {
+        let preset = crate::action::PromptPreset::Default;
+        Self {
+            source: crate::action::PromptSource::Builtin(preset).to_string(),
+            preset: preset.as_str(),
+        }
+    }
+
+    /// From a loaded action; `None` unless it is a youtrack action.
+    fn of(a: &Action) -> Option<Self> {
+        let NativeConfig::Youtrack(yt) = a.native.as_ref()? else {
+            return None;
+        };
+        Some(Self {
+            source: yt.youtrack.prompt_source().to_string(),
+            preset: yt.youtrack.prompt_preset.as_str(),
+        })
+    }
+
+    /// From the action file as it is on disk now. A file that does not load
+    /// renders as `unknown` with the reason, never as a guessed preset.
+    fn on_disk(yaml: &str, label: &str) -> Self {
+        let reason = match crate::action::validate_str(yaml, label) {
+            Ok(loaded) => match Self::of(&loaded.action) {
+                Some(p) => return p,
+                None => "the on-disk action is not kind: youtrack".to_string(),
+            },
+            Err(e) => format!("the on-disk action does not validate: {e}"),
+        };
+        Self {
+            source: format!("unknown ({reason})"),
+            preset: "unknown",
+        }
+    }
+}
+
 /// Render the structured editor at `status`, preserving the supplied `form`.
 async fn render_youtrack_editor(
     s: &WebState,
@@ -3154,6 +3210,7 @@ async fn render_youtrack_editor(
     name: Option<String>,
     form: YoutrackEditForm,
     error: Option<String>,
+    prompt: PromptProvenance,
 ) -> Result<Response, WebError> {
     let secrets = token_ref_options(s, &form).await?;
     let (heading, post_url, raw_url) = match &name {
@@ -3177,6 +3234,8 @@ async fn render_youtrack_editor(
         secrets,
         error,
         name,
+        prompt_source: prompt.source,
+        prompt_preset: prompt.preset,
     };
     Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
 }
@@ -3240,7 +3299,15 @@ async fn action_form_save(
 }
 
 async fn youtrack_new_page(State(s): State<WebState>) -> Result<Response, WebError> {
-    render_youtrack_editor(&s, StatusCode::OK, None, youtrack_form_defaults(), None).await
+    render_youtrack_editor(
+        &s,
+        StatusCode::OK,
+        None,
+        youtrack_form_defaults(),
+        None,
+        PromptProvenance::builtin_default(),
+    )
+    .await
 }
 
 async fn youtrack_edit_page(
@@ -3254,13 +3321,15 @@ async fn youtrack_edit_page(
     // A file that no longer parses, or is not a youtrack action, has no
     // structured form; send the user to the raw editor instead.
     let form = match crate::action::validate_str(&yaml, &path) {
-        Ok(loaded) => action_to_youtrack_form(&loaded.action),
+        Ok(loaded) => {
+            action_to_youtrack_form(&loaded.action).zip(PromptProvenance::of(&loaded.action))
+        }
         Err(_) => None,
     };
-    let Some(form) = form else {
+    let Some((form, prompt)) = form else {
         return Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response());
     };
-    render_youtrack_editor(&s, StatusCode::OK, Some(name), form, None).await
+    render_youtrack_editor(&s, StatusCode::OK, Some(name), form, None, prompt).await
 }
 
 async fn youtrack_edit_save(
@@ -3272,8 +3341,27 @@ async fn youtrack_edit_save(
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
     let existing = std::fs::read_to_string(&path).map_err(WebError::from)?;
-    let base: serde_yaml::Value = serde_yaml::from_str(&existing)
-        .unwrap_or_else(|_| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    // Provenance for an error re-render comes from the file as it is on disk.
+    let prompt = PromptProvenance::on_disk(&existing, &path);
+    // An unparsable base must not become an empty mapping: the save would drop
+    // every key the form does not show, `prompt_preset` included.
+    let base: serde_yaml::Value = match serde_yaml::from_str(&existing) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!(
+                "the action file on disk is not valid YAML, so a form save would drop the keys the form does not show; fix it in the raw YAML editor: {e}"
+            );
+            return render_youtrack_editor(
+                &s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some(name),
+                form,
+                Some(msg),
+                prompt,
+            )
+            .await;
+        }
+    };
     let yaml = match youtrack_form_to_yaml(base, &form) {
         Ok(y) => y,
         Err(msg) => {
@@ -3283,6 +3371,7 @@ async fn youtrack_edit_save(
                 Some(name),
                 form,
                 Some(msg),
+                prompt,
             )
             .await
         }
@@ -3296,6 +3385,7 @@ async fn youtrack_edit_save(
                 Some(name),
                 form,
                 Some(e.to_string()),
+                prompt,
             )
             .await
         }
@@ -3325,6 +3415,7 @@ async fn youtrack_create(
                 None,
                 form,
                 Some(msg),
+                PromptProvenance::builtin_default(),
             )
             .await
         }
@@ -3338,6 +3429,7 @@ async fn youtrack_create(
                 None,
                 form,
                 Some(e.to_string()),
+                PromptProvenance::builtin_default(),
             )
             .await
         }
@@ -3347,15 +3439,29 @@ async fn youtrack_create(
             "action name `{}` is not a safe filename (allowed: letters, digits, '-', '_', '.')",
             loaded.action.name
         );
-        return render_youtrack_editor(&s, StatusCode::UNPROCESSABLE_ENTITY, None, form, Some(msg))
-            .await;
+        return render_youtrack_editor(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            form,
+            Some(msg),
+            PromptProvenance::builtin_default(),
+        )
+        .await;
     };
     let actions_dir = s.paths.actions_dir();
     let dest = actions_dir.join(format!("{stem}.yml"));
     if dest.exists() {
         let msg = format!("`{stem}.yml` already exists; edit it instead of creating a duplicate");
-        return render_youtrack_editor(&s, StatusCode::UNPROCESSABLE_ENTITY, None, form, Some(msg))
-            .await;
+        return render_youtrack_editor(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            form,
+            Some(msg),
+            PromptProvenance::builtin_default(),
+        )
+        .await;
     }
     std::fs::create_dir_all(&actions_dir).map_err(WebError::from)?;
     std::fs::write(&dest, yaml.as_bytes()).map_err(WebError::from)?;
@@ -7640,6 +7746,8 @@ mod tests {
                 secrets: Vec::new(),
                 error: None,
                 name: Some("yt".to_string()),
+                prompt_source: "builtin:default".to_string(),
+                prompt_preset: "default",
             };
             let html = tpl.render().unwrap();
             assert!(
@@ -7742,6 +7850,110 @@ mod tests {
                 form.yt_prompt,
                 crate::native::youtrack::default_youtrack_prompt()
             );
+        }
+
+        fn audit_base(preset: &str) -> serde_yaml::Value {
+            serde_yaml::from_str(&format!(
+                "name: audit\nkind: youtrack\nnative:\n  youtrack:\n    prompt_preset: {preset}\n"
+            ))
+            .unwrap()
+        }
+
+        fn saved_youtrack(yaml: &str) -> crate::action::YoutrackSource {
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            yt.youtrack
+        }
+
+        #[test]
+        fn prompt_prefills_audit_preset_when_unset() {
+            let yaml =
+                "name: audit\nkind: youtrack\nnative:\n  youtrack:\n    prompt_preset: audit\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let form = action_to_youtrack_form(&loaded.action).unwrap();
+            assert_eq!(
+                form.yt_prompt,
+                crate::native::audit_prompt::default_audit_prompt()
+            );
+        }
+
+        #[test]
+        fn prompt_equal_to_audit_preset_writes_no_override_and_keeps_the_preset() {
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "audit".to_string();
+            // A browser posts CRLF line endings.
+            f.yt_prompt = crate::native::audit_prompt::default_audit_prompt().replace('\n', "\r\n");
+            let yaml = youtrack_form_to_yaml(audit_base("audit"), &f).unwrap();
+            assert!(!yaml.contains("prompt:"), "prompt key leaked:\n{yaml}");
+            assert!(yaml.contains("prompt_preset: audit"), "{yaml}");
+            let yt = saved_youtrack(&yaml);
+            assert!(yt.prompt.is_none());
+            assert_eq!(yt.prompt_preset, crate::action::PromptPreset::Audit);
+        }
+
+        #[test]
+        fn prompt_preset_preserved_on_save() {
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "audit".to_string();
+            f.yt_prompt = String::new();
+            let yt = saved_youtrack(&youtrack_form_to_yaml(audit_base("audit"), &f).unwrap());
+            assert_eq!(yt.prompt_preset, crate::action::PromptPreset::Audit);
+            assert_eq!(
+                yt.prompt_source(),
+                crate::action::PromptSource::Builtin(crate::action::PromptPreset::Audit)
+            );
+        }
+
+        #[test]
+        fn youtrack_default_text_on_audit_action_is_saved_as_override() {
+            // The comparison is against the action's own preset, not the engineering default.
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "audit".to_string();
+            let yt = saved_youtrack(&youtrack_form_to_yaml(audit_base("audit"), &f).unwrap());
+            assert_eq!(
+                yt.prompt.as_deref(),
+                Some(crate::native::youtrack::default_youtrack_prompt().trim())
+            );
+            assert_eq!(yt.prompt_preset, crate::action::PromptPreset::Audit);
+            assert_eq!(yt.prompt_source(), crate::action::PromptSource::Override);
+        }
+
+        #[test]
+        fn unparsable_prompt_preset_in_base_is_a_form_error() {
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "audit".to_string();
+            let err = youtrack_form_to_yaml(audit_base("audt"), &f).unwrap_err();
+            assert!(err.contains("native.youtrack.prompt_preset"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn youtrack_edit_page_shows_the_builtin_audit_prompt_source() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("audit.yml");
+            std::fs::write(
+                &file,
+                "name: audit\nkind: youtrack\nnative:\n  youtrack:\n    prompt_preset: audit\n",
+            )
+            .unwrap();
+            index_action(&s.api.pool, "audit", file.to_str().unwrap()).await;
+
+            let resp = youtrack_edit_page(State(s.clone()), AxumPath("audit".to_string()))
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_string(resp).await;
+            assert!(
+                body.contains("Prompt source: <code>builtin:audit</code>"),
+                "{body}"
+            );
+            assert!(body.contains("the built-in audit preset"), "{body}");
+            assert!(body.contains("Reset to built-in preset"), "{body}");
         }
 
         #[test]
