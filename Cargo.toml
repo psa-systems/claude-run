@@ -1,6 +1,6 @@
 [package]
 name = "claude-run"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
 description = "YAML-driven Claude Code runner. Rust port of scripts/claude-run.nu."
 license = "MIT"
@@ -99,10 +99,6 @@ features = ["derive"]
 version = "0.8"
 features = [
     "runtime-tokio",
-    # CLAUDE-250: one `Any` pool over either backend. `postgres` is pure Rust,
-    # so the musl static build gains no native dependency; rustls matches the
-    # reqwest policy above, and webpki roots keep a minimal container from
-    # needing a host trust store.
     "any",
     "sqlite",
     "postgres",
