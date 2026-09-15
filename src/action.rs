@@ -147,6 +147,15 @@ impl NativeConfig {
             NativeConfig::ClosedIssueSummary(_) => ActionKind::ClosedIssueSummary,
         }
     }
+
+    /// Where the agent prompt comes from; `None` for `closed-issue-summary`,
+    /// which starts no agent session.
+    pub fn prompt_source(&self) -> Option<PromptSource> {
+        match self {
+            NativeConfig::Youtrack(cfg) => Some(cfg.youtrack.prompt_source()),
+            NativeConfig::ClosedIssueSummary(_) => None,
+        }
+    }
 }
 
 /// Config for the native YouTrack handler (CLAUDE-33, Phase 4 of the
@@ -196,13 +205,13 @@ pub struct YoutrackSource {
     pub custom_field: String,
     /// Labels of the AI Agent / State machine the handler drives.
     pub states: YoutrackStates,
-    /// Full-replacement prompt override (CLAUDE-125). `None` uses the built-in
-    /// `DEFAULT_YOUTRACK_PROMPT` from [`crate::native::youtrack`]. When set, the
-    /// text fully replaces the default and is rendered with the documented
-    /// `{{...}}` placeholders (`{{key}}`, `{{summary}}`, `{{clone_url}}`,
-    /// `{{workdir}}`, `{{needs_review_marker}}`, `{{skip_attempt_marker}}`,
-    /// `{{no_code_marker}}`, `{{write_projects}}`).
+    /// Full-replacement prompt override (CLAUDE-125). Resolution order: this text, else the
+    /// `prompt_preset` built-in; both render the `{{...}}` placeholders in `actions/SCHEMA.md`.
     pub prompt: Option<String>,
+    /// Built-in prompt used when `prompt` is unset. Compiled into the binary, so
+    /// an image upgrade updates it; omitted on serialize when `default`.
+    #[serde(skip_serializing_if = "PromptPreset::is_default")]
+    pub prompt_preset: PromptPreset,
     /// Projects the agent may create issues in (CLAUDE-214), rendered into the
     /// prompt as `{{write_projects}}`. Empty (the default) resolves to the
     /// triggering issue's own project, so filing a deferred item needs no
@@ -234,10 +243,71 @@ impl Default for YoutrackSource {
             custom_field: default_custom_field(),
             states: YoutrackStates::default(),
             prompt: None,
+            prompt_preset: PromptPreset::default(),
             write_projects: Vec::new(),
             automerge: Automerge::default(),
             assignee: None,
             dependencies: Dependencies::default(),
+        }
+    }
+}
+
+impl YoutrackSource {
+    /// Where this action's agent prompt comes from: the YAML override when set,
+    /// otherwise the built-in preset.
+    pub fn prompt_source(&self) -> PromptSource {
+        match self.prompt {
+            Some(_) => PromptSource::Override,
+            None => PromptSource::Builtin(self.prompt_preset),
+        }
+    }
+}
+
+/// Built-in agent prompt a `kind: youtrack` action uses when it sets no
+/// `prompt` override. The text lives in the binary, not in the action YAML.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptPreset {
+    /// The engineering prompt ([`crate::native::youtrack::default_youtrack_prompt`]).
+    #[default]
+    Default,
+    /// The scheduled-audit prompt ([`crate::native::audit_prompt::default_audit_prompt`]).
+    Audit,
+}
+
+impl PromptPreset {
+    /// Every preset, in the order error messages list them.
+    pub const ALL: [PromptPreset; 2] = [PromptPreset::Default, PromptPreset::Audit];
+
+    /// Lowercase wire name, matching the serde rename.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromptPreset::Default => "default",
+            PromptPreset::Audit => "audit",
+        }
+    }
+
+    /// True for [`PromptPreset::Default`]; drives `skip_serializing_if`.
+    pub fn is_default(&self) -> bool {
+        *self == PromptPreset::Default
+    }
+}
+
+/// Provenance of an action's agent prompt, shown by `claude-run action show`
+/// and the web editor so an operator can tell a YAML override from a preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptSource {
+    /// `native.youtrack.prompt` is set and fully replaces the preset.
+    Override,
+    /// No override: the named built-in preset is used.
+    Builtin(PromptPreset),
+}
+
+impl std::fmt::Display for PromptSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PromptSource::Override => f.write_str("override"),
+            PromptSource::Builtin(p) => write!(f, "builtin:{}", p.as_str()),
         }
     }
 }
@@ -997,6 +1067,90 @@ native:
         );
     }
 
+    /// An untouched `prompt_preset` stays out of the serialized YAML, so
+    /// existing action files are unchanged by the field.
+    #[test]
+    fn prompt_preset_default_is_omitted_on_serialize() {
+        let cfg = YoutrackConfig::default();
+        assert_eq!(cfg.youtrack.prompt_preset, PromptPreset::Default);
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("prompt_preset"),
+            "default prompt_preset must not serialize: {yaml}"
+        );
+    }
+
+    #[test]
+    fn prompt_preset_audit_round_trips() {
+        let raw = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    prompt_preset: audit\n";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = &loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        assert_eq!(cfg.youtrack.prompt_preset, PromptPreset::Audit);
+
+        let yaml = serde_yaml::to_string(&loaded.action).unwrap();
+        assert!(yaml.contains("prompt_preset: audit"), "{yaml}");
+        let reloaded = validate_str(&yaml, "<roundtrip>").unwrap();
+        assert_eq!(reloaded.action.native, loaded.action.native);
+    }
+
+    /// A typo or a non-string preset is rejected at load naming the field, not
+    /// as the untagged enum's anonymous "did not match any variant".
+    #[test]
+    fn unknown_prompt_preset_is_rejected_naming_the_field() {
+        for (value, shown) in [("audt", "`audt`"), ("[audit]", "Sequence")] {
+            let raw = format!(
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    prompt_preset: {value}\n"
+            );
+            let err = validate_str(&raw, "<candidate>").unwrap_err();
+            let Error::ActionInvalidField {
+                name,
+                field,
+                reason,
+                path,
+            } = &err
+            else {
+                panic!("expected ActionInvalidField for {value}, got {err:?}");
+            };
+            assert_eq!(name, "yt");
+            assert_eq!(field, "native.youtrack.prompt_preset");
+            assert_eq!(path, "<candidate>");
+            assert!(reason.contains(shown), "{reason}");
+            assert!(
+                reason.ends_with("expected one of: default, audit"),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_source_displays_override_or_builtin_preset() {
+        assert_eq!(PromptSource::Override.to_string(), "override");
+        assert_eq!(
+            PromptSource::Builtin(PromptPreset::Default).to_string(),
+            "builtin:default"
+        );
+        assert_eq!(
+            PromptSource::Builtin(PromptPreset::Audit).to_string(),
+            "builtin:audit"
+        );
+
+        let mut src = YoutrackSource {
+            prompt_preset: PromptPreset::Audit,
+            ..YoutrackSource::default()
+        };
+        assert_eq!(
+            src.prompt_source(),
+            PromptSource::Builtin(PromptPreset::Audit)
+        );
+        src.prompt = Some("custom".to_string());
+        assert_eq!(src.prompt_source(), PromptSource::Override);
+
+        let reporter = NativeConfig::ClosedIssueSummary(Box::default());
+        assert_eq!(reporter.prompt_source(), None);
+    }
+
     #[test]
     fn youtrack_automerge_defaults_to_disabled_when_absent() {
         // CLAUDE-126: a youtrack config with no `automerge` block deserializes to
@@ -1148,14 +1302,25 @@ native:
         let Some(NativeConfig::Youtrack(cfg)) = &action.native else {
             panic!("expected youtrack native config");
         };
-        // CLAUDE-215: the shipped query excludes the audit project, which
-        // `audit-run.yml` owns. It therefore differs from `default_query()`,
-        // which stays site-agnostic.
+        // CLAUDE-215: excludes audit runs (`AUDIT` tagged `Audit-*`), which `audit-run.yml` owns,
+        // so it differs from the site-agnostic `default_query()`.
         assert_eq!(
             cfg.youtrack.query,
-            "-Resolved AI Agent: Queued project: -AUDIT"
+            "(project: -AUDIT or tag: -Audit-*) and -Resolved AI Agent: Queued"
         );
         assert_eq!(cfg.youtrack.custom_field, "AI Agent");
+        // The worker runs the built-in engineering prompt, with no YAML override.
+        assert!(cfg.youtrack.prompt.is_none());
+        assert_eq!(cfg.youtrack.prompt_preset, PromptPreset::Default);
+        assert_eq!(
+            action
+                .native
+                .as_ref()
+                .and_then(|n| n.prompt_source())
+                .map(|s| s.to_string())
+                .as_deref(),
+            Some("builtin:default")
+        );
         // Generic blocks stay on the Action, not in the native config.
         assert_eq!(action.workdir_base.as_deref(), Some("~/workspace"));
         assert_eq!(action.limits.max_attempts_per_key, Some(3));
@@ -1167,9 +1332,8 @@ native:
         assert_eq!(reloaded.action.kind, action.kind);
     }
 
-    /// The shipped `actions/audit-run.yml` (CLAUDE-214, CLAUDE-295): a second
-    /// youtrack-kind action with the `AUDIT` query, a full-replacement prompt,
-    /// the product projects its findings file into, and a same-project gate.
+    /// The shipped `actions/audit-run.yml` (CLAUDE-214, CLAUDE-295): audit query, audit prompt
+    /// preset, product write projects, same-project gate, automerge.
     #[test]
     fn shipped_audit_run_action_is_native_and_round_trips() {
         const SHIPPED: &str = include_str!("../actions/audit-run.yml");
@@ -1190,19 +1354,27 @@ native:
         };
         assert_eq!(
             cfg.youtrack.query,
-            "-Resolved AI Agent: Queued project: AUDIT"
+            "-Resolved AI Agent: Queued project: AUDIT tag: Audit-*"
         );
-        // The prompt override is the reason this action exists (CLAUDE-125).
-        let prompt = cfg
-            .youtrack
-            .prompt
-            .as_deref()
-            .expect("audit action carries a prompt override");
-        assert!(prompt.contains("{{key}}"));
-        assert!(prompt.contains("{{workdir}}"));
-        assert!(prompt.contains("{{needs_review_marker}}"));
-        assert!(prompt.contains("{{skip_attempt_marker}}"));
-        assert!(prompt.contains("{{write_projects}}"));
+        // The prompt lives in the binary as a preset, so an image upgrade
+        // updates it; a YAML override here would freeze it.
+        assert!(
+            cfg.youtrack.prompt.is_none(),
+            "audit-run.yml must not carry a prompt override"
+        );
+        assert_eq!(cfg.youtrack.prompt_preset, PromptPreset::Audit);
+        assert_eq!(
+            action
+                .native
+                .as_ref()
+                .and_then(|n| n.prompt_source())
+                .map(|s| s.to_string())
+                .as_deref(),
+            Some("builtin:audit")
+        );
+        // Audit pull requests must merge so the Epic resolves and the gated
+        // daily parent runs.
+        assert!(cfg.youtrack.automerge.enabled);
         // CLAUDE-295: findings file into the product projects, and an Epic must
         // not wait on the findings it filed there as its subtasks.
         assert_eq!(
@@ -1222,15 +1394,8 @@ native:
         assert_eq!(reloaded.action.kind, action.kind);
     }
 
-    /// CLAUDE-215: the two youtrack-kind actions partition the queued issues
-    /// rather than racing for them. Both poll on the same interval, so an issue
-    /// matching both would be cloned by whichever action polled first, and for
-    /// an audit issue that means the wrong repo and a pull request against it.
-    ///
-    /// The queries execute server-side, so this asserts the static half: the
-    /// default action excludes `AUDIT` and the audit action selects only `AUDIT`.
-    /// Note the syntax - YouTrack rejects `-project: AUDIT` as a parse error, so
-    /// the negation has to sit on the value (`project: -AUDIT`).
+    /// CLAUDE-215: the two youtrack-kind actions partition queued issues instead of racing for
+    /// them. Static half only: audit selects `AUDIT` + `Audit-*`, the worker its exact complement.
     #[test]
     fn shipped_youtrack_actions_partition_audit_issues() {
         fn query_of(raw: &str, path: &str) -> String {
@@ -1251,17 +1416,28 @@ native:
         );
 
         assert!(
-            default_query.contains("project: -AUDIT"),
-            "default action must exclude the audit project, got {default_query:?}"
+            audit_query.contains("project: AUDIT") && audit_query.contains("tag: Audit-*"),
+            "audit action must select AUDIT issues tagged Audit-*, got {audit_query:?}"
         );
         assert!(
-            !default_query.contains("-project:"),
-            "`-project:` is a YouTrack parse error; negate the value instead, got {default_query:?}"
+            !audit_query.contains("project: -AUDIT") && !audit_query.contains("tag: -Audit-*"),
+            "audit action must not negate its own selector, got {audit_query:?}"
         );
         assert!(
-            audit_query.contains("project: AUDIT") && !audit_query.contains("project: -AUDIT"),
-            "audit action must select only the audit project, got {audit_query:?}"
+            default_query.starts_with("(project: -AUDIT or tag: -Audit-*) and "),
+            "default action must select the exact complement of the audit selector, got {default_query:?}"
         );
+        for q in [&default_query, &audit_query] {
+            assert!(
+                !q.contains("-project:") && !q.contains("-tag:"),
+                "`-project:` / `-tag:` are YouTrack parse errors; negate the value instead, got {q:?}"
+            );
+            // The complement is only exact within the same queued, unresolved set.
+            assert!(
+                q.contains("-Resolved AI Agent: Queued"),
+                "both actions must pin the same base set, got {q:?}"
+            );
+        }
         assert_ne!(default_query, audit_query);
 
         // Both queries name the project by its real short name. `AUD` is a
@@ -1706,8 +1882,49 @@ fn reject_retired_kind(raw: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Checked on raw YAML before the parse: the untagged `native:` enum would
+/// otherwise report a bad preset as "did not match any variant", naming no field.
+fn reject_unknown_prompt_preset(raw: &str, label: &str) -> Result<()> {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(raw) else {
+        // Not YAML at all: the real parse right after this reports why.
+        return Ok(());
+    };
+    let Some(v) = value
+        .get("native")
+        .and_then(|n| n.get("youtrack"))
+        .and_then(|y| y.get("prompt_preset"))
+    else {
+        return Ok(());
+    };
+    if PromptPreset::ALL
+        .iter()
+        .any(|p| v.as_str() == Some(p.as_str()))
+    {
+        return Ok(());
+    }
+    let shown = match v.as_str() {
+        Some(s) => s.to_string(),
+        None => format!("{v:?}"),
+    };
+    let expected: Vec<&str> = PromptPreset::ALL.iter().map(|p| p.as_str()).collect();
+    Err(Error::ActionInvalidField {
+        name: value
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("(unnamed)")
+            .to_string(),
+        field: "native.youtrack.prompt_preset".to_string(),
+        reason: format!(
+            "unknown preset `{shown}`; expected one of: {}",
+            expected.join(", ")
+        ),
+        path: label.to_string(),
+    })
+}
+
 pub fn validate_str(raw: &str, label: &str) -> Result<LoadedAction> {
     reject_retired_kind(raw, label)?;
+    reject_unknown_prompt_preset(raw, label)?;
     let action: Action = serde_yaml::from_str(raw)?;
 
     // Required-field validation that goes beyond what serde catches with

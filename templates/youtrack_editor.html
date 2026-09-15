@@ -76,14 +76,15 @@
 
   <div class="card">
     <h3>Agent prompt</h3>
+    <p class="dim">Prompt source: <code>{{ prompt_source }}</code></p>
     <label class="fld">
-      <span>Prompt (full replacement of the built-in default)</span>
+      <span>Prompt (full replacement of the built-in {{ prompt_preset }} preset)</span>
       <textarea name="yt_prompt" spellcheck="false" autocapitalize="off">{{ form.yt_prompt }}</textarea>
     </label>
-    <p class="hint dim">The complete instruction text sent to the agent for each issue. Edit any part of it. Placeholders (double-brace) substituted per job: <code>&#123;&#123;key&#125;&#125;</code>, <code>&#123;&#123;summary&#125;&#125;</code>, <code>&#123;&#123;clone_url&#125;&#125;</code>, <code>&#123;&#123;workdir&#125;&#125;</code>, <code>&#123;&#123;needs_review_marker&#125;&#125;</code>, <code>&#123;&#123;skip_attempt_marker&#125;&#125;</code>, <code>&#123;&#123;no_code_marker&#125;&#125;</code>, <code>&#123;&#123;write_projects&#125;&#125;</code>. An unknown placeholder is left literal. Saving text equal to the default (or an empty box) stores no override, so future default improvements still apply.</p>
+    <p class="hint dim">The complete instruction text sent to the agent for each issue. Edit any part of it. Placeholders (double-brace) substituted per job: <code>&#123;&#123;key&#125;&#125;</code>, <code>&#123;&#123;summary&#125;&#125;</code>, <code>&#123;&#123;clone_url&#125;&#125;</code>, <code>&#123;&#123;workdir&#125;&#125;</code>, <code>&#123;&#123;needs_review_marker&#125;&#125;</code>, <code>&#123;&#123;skip_attempt_marker&#125;&#125;</code>, <code>&#123;&#123;no_code_marker&#125;&#125;</code>, <code>&#123;&#123;write_projects&#125;&#125;</code>, <code>&#123;&#123;existing_pr_url&#125;&#125;</code>, <code>&#123;&#123;existing_branch&#125;&#125;</code>. An unknown placeholder is left literal. Saving text equal to the built-in {{ prompt_preset }} preset (or an empty box) stores no override, so future preset improvements still apply.</p>
     <div class="row-actions" style="margin-top: 8px;">
       <button type="button" class="btn"
-              onclick="this.closest('.card').querySelector('textarea').value='';">Reset to default</button>
+              onclick="this.closest('.card').querySelector('textarea').value='';">Reset to built-in preset</button>
     </div>
   </div>
 
