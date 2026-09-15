@@ -530,15 +530,6 @@ async fn write_new(s: &WebState, yaml: &str) -> Result<Saved, WebError> {
     ))
 }
 
-/// The parsed on-disk YAML of an existing action, used as the overlay base so
-/// keys no form covers survive the save. An unparsable file starts from empty.
-fn base_value(path: &str) -> serde_yaml::Value {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_yaml::from_str(&raw).ok())
-        .unwrap_or_else(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()))
-}
-
 // ---- closed-issue-summary handlers ----------------------------------------
 
 async fn render_closed_issue_summary(
@@ -637,7 +628,26 @@ pub(super) async fn closed_issue_summary_edit_save(
         }
     };
     let form = ClosedIssueSummaryForm::from_pairs(&pairs);
-    let outcome = match closed_issue_summary_form_to_yaml(base_value(path), &form) {
+    // CLAUDE-300: an unparsable base must not become an empty mapping, matching
+    // `youtrack_edit_save`: the save would drop every key the form does not show.
+    let raw = std::fs::read_to_string(path).map_err(WebError::from)?;
+    let base: serde_yaml::Value = match serde_yaml::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!(
+                "the action file on disk is not valid YAML, so a form save would drop the keys the form does not show; fix it in the raw YAML editor: {e}"
+            );
+            return render_closed_issue_summary(
+                s,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some(name),
+                form,
+                Some(msg),
+            )
+            .await;
+        }
+    };
+    let outcome = match closed_issue_summary_form_to_yaml(base, &form) {
         Ok(yaml) => write_existing(s, path, &yaml).await?,
         Err(msg) => Saved::Rejected(msg),
     };
@@ -693,19 +703,27 @@ pub(super) async fn edit_save_for_kind(
 /// Resolve an indexed action to its file path and parsed form. A name the
 /// daemon has not indexed, or a file that no longer parses, has no structured
 /// editor.
-pub(super) async fn indexed_action(
-    s: &WebState,
-    name: &str,
-) -> Result<Option<(String, Action)>, WebError> {
+/// Outcome of resolving an indexed action's file to a parsed [`Action`].
+/// CLAUDE-300: a file that fails to read or fails `validate_str` is
+/// [`IndexedAction::Invalid`], carrying the reason, rather than collapsing into
+/// the same "no form" case as an index entry with no path.
+pub(super) enum IndexedAction {
+    NotIndexed,
+    Invalid(String),
+    Loaded(String, Box<Action>),
+}
+
+pub(super) async fn indexed_action(s: &WebState, name: &str) -> Result<IndexedAction, WebError> {
     let Some(path) = indexed_action_path(&s.api.pool, name).await? else {
-        return Ok(None);
+        return Ok(IndexedAction::NotIndexed);
     };
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return Ok(None);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) => return Ok(IndexedAction::Invalid(e.to_string())),
     };
     match crate::action::validate_str(&raw, &path) {
-        Ok(loaded) => Ok(Some((path, loaded.action))),
-        Err(_) => Ok(None),
+        Ok(loaded) => Ok(IndexedAction::Loaded(path, Box::new(loaded.action))),
+        Err(e) => Ok(IndexedAction::Invalid(e.to_string())),
     }
 }
 
