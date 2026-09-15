@@ -53,7 +53,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::db::DbPool;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::{HandlerFuture, NativeContext, NativeHandler};
 use crate::access;
@@ -980,13 +980,26 @@ async fn process_job(
 
     // YouTrack jobs always carry a stable key (idReadable), so the attempt cap
     // always applies.
-    // CLAUDE-232: `warn`, not `info`: the issue keeps its Queued field value, so
-    // it re-enters the candidate set and is skipped again on every poll.
+    // CLAUDE-301: the issue no longer just sits at Queued to be skipped again
+    // on the next poll. It gets one comment naming the cap and moves to
+    // Needs Review, the same label the needs-review marker and the timeout
+    // path use for "parked pending a human decision". A write failure here
+    // must not swallow the cap hit: `report_cap_reached` logs each failure at
+    // `error` and this still returns `CapHit` so the CLAUDE-232 banner keeps
+    // showing the key.
     if attempts >= limits.max_attempts_per_key {
         warn!(
             action = %action.name, key = %key, attempts,
             cap = limits.max_attempts_per_key,
-            "skipping job, attempt cap reached"
+            "attempt cap reached; reporting and moving to Needs Review"
+        );
+        report_cap_reached(
+            backend,
+            src,
+            &action.name,
+            key,
+            attempts,
+            limits.max_attempts_per_key,
         );
         return Ok(ProcessedJob::CapHit { key: key.clone() });
     }
@@ -2095,6 +2108,44 @@ pub(crate) fn automerge_needs_update_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
+/// CLAUDE-301: an issue at the per-key attempt cap leaves the queue instead of
+/// being skipped again on every poll. Comments the cap event (best-effort)
+/// then sets AI Agent to Needs Review, the same label the needs-review marker
+/// and the timeout path use for "parked pending a human". Unlike
+/// [`comment_then_field`], a failed write here must not abort the caller (the
+/// cap was still hit and `ProcessedJob::CapHit` must still be returned so the
+/// CLAUDE-232 banner keeps showing the key), so each write is attempted
+/// independently and a failure of either logs at `error` naming the key and
+/// the cause.
+fn report_cap_reached(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    action: &str,
+    key: &str,
+    attempts: u32,
+    cap: u32,
+) {
+    let body = cap_reached_comment(attempts, cap);
+    if let Err(e) = backend.comment(key, &body) {
+        error!(action = %action, key = %key, error = %e, "attempt-cap comment failed");
+    }
+    if let Err(e) = backend.set_field(key, &src.custom_field, &src.states.needs_review) {
+        error!(action = %action, key = %key, error = %e, "attempt-cap AI Agent write failed");
+    }
+}
+
+fn cap_reached_comment(attempts: u32, cap: u32) -> String {
+    [
+        format!(
+            "This issue has reached its attempt cap ({attempts} of {cap}) without finishing successfully."
+        ),
+        String::new(),
+        "Re-queueing it alone (AI Agent = Queued) will not retry it: the attempt counter is not cleared by re-queueing or by a successful run.".to_string(),
+        "To retry it, raise the action's `limits.max_attempts_per_key`, or reset this key's counter once CLAUDE-238 lands.".to_string(),
+    ]
+    .join("\n")
+}
+
 /// Comment first (best-effort), then set AI Agent last as the authoritative
 /// write. A comment failure is logged and ignored so it cannot prevent the
 /// field from advancing off Working; a set_field failure propagates and marks
@@ -2557,6 +2608,170 @@ mod tests {
         // No `set-field` past `Working` and no comment were registered on the
         // stub, so a call to either would have failed with "no canned
         // response"; reaching this point proves finalize never ran.
+    }
+
+    /// CLAUDE-301 acceptance criterion 1: a queued issue whose key is at the
+    /// cap gets exactly one comment naming the attempt count and the cap, and
+    /// its AI Agent field moves to the configured Needs Review label, through
+    /// the full `process_job` pipeline (the cap check runs before any other
+    /// step, so no workdir or clone is needed).
+    #[tokio::test]
+    async fn process_job_at_cap_comments_and_sets_needs_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = cap_reached_comment(3, 3);
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("yt", &["issue", "comment", "MK-16", &body], "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+
+        let j = job();
+        let s = src();
+        let pool = mem_pool().await;
+        for _ in 0..3 {
+            state::attempts_increment(&pool, "yt", &j.key)
+                .await
+                .unwrap();
+        }
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+        };
+        let claude = ClaudeInvoker::new(None);
+        let cancel = CancellationToken::new();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            &pool,
+            &claude,
+            &backend,
+            &backend,
+            &s,
+            &limits,
+            &cancel,
+            &crate::pause::RunPause::never(),
+            &spend,
+            &j,
+            PrStrategy::Branch,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&outcome, ProcessedJob::CapHit { key } if key == "MK-16"),
+            "{outcome:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("yt issue comment"))
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+    }
+
+    /// CLAUDE-301 acceptance criterion 2: a failed comment or field write at
+    /// the cap still returns `CapHit` (the banner must keep showing the key)
+    /// rather than propagating the write error out of `process_job`.
+    #[tokio::test]
+    async fn process_job_at_cap_still_reports_cap_hit_when_writes_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = cap_reached_comment(3, 3);
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail("yt", &["issue", "comment", "MK-16", &body], 1, "boom")
+                .fail(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    1,
+                    "boom",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+
+        let j = job();
+        let s = src();
+        let pool = mem_pool().await;
+        for _ in 0..3 {
+            state::attempts_increment(&pool, "yt", &j.key)
+                .await
+                .unwrap();
+        }
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+        };
+        let claude = ClaudeInvoker::new(None);
+        let cancel = CancellationToken::new();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            &pool,
+            &claude,
+            &backend,
+            &backend,
+            &s,
+            &limits,
+            &cancel,
+            &crate::pause::RunPause::never(),
+            &spend,
+            &j,
+            PrStrategy::Branch,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&outcome, ProcessedJob::CapHit { key } if key == "MK-16"),
+            "a failed comment/field write must not turn the cap hit into an error, got {outcome:?}"
+        );
     }
 
     fn job() -> YoutrackJob {
