@@ -563,7 +563,11 @@ pub fn shallow_clone(
     depth: u32,
 ) -> Result<()> {
     let mut cmd = std::process::Command::new("git");
-    cmd.arg("clone");
+    // CLAUDE-306: a detached auto-maintenance repack would race the push and the
+    // workdir removal; an ephemeral clone never benefits from it.
+    cmd.arg("clone")
+        .arg("--config")
+        .arg("maintenance.auto=false");
     if let Some(b) = branch {
         cmd.arg("--branch").arg(b);
     }
@@ -747,6 +751,58 @@ mod tests {
             !err.contains("oauth2:"),
             "the userinfo must not survive redaction: {err}"
         );
+    }
+
+    /// CLAUDE-306: the key must land in the clone's own config, so every later
+    /// git command in the workdir (runner and agent) skips auto-maintenance.
+    #[test]
+    fn a_clone_disables_auto_maintenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.example",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let clone = tmp.path().join("clone");
+        let url = format!("file://{}", origin.display());
+        shallow_clone(&url, None, &clone, 50).unwrap();
+
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&clone)
+            .args(["config", "--local", "--get", "maintenance.auto"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "maintenance.auto must be set in the clone: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "false");
     }
 
     /// The userinfo is pulled out of every URL shape the forge can produce, so

@@ -2473,6 +2473,8 @@ mod tests {
             vec!["init", "-q", "-b", "main"],
             vec!["config", "user.name", "tester"],
             vec!["config", "user.email", "tester@example.com"],
+            // CLAUDE-306: git 2.54's detached auto-maintenance repacks mid-test past ~100 loose objects.
+            vec!["config", "maintenance.auto", "false"],
         ] {
             assert!(
                 std::process::Command::new("git")
@@ -2784,7 +2786,11 @@ mod tests {
             .args(["merge", "-q", "--no-ff", "base-branch"])
             .output()
             .unwrap();
-        let _ = merge;
+        assert!(
+            !merge.status.success(),
+            "the merge must stop on the conflict: {}",
+            String::from_utf8_lossy(&merge.stderr)
+        );
         assert!(
             dir.join(".git").join("MERGE_HEAD").exists(),
             "the merge must conflict on the shared line"
