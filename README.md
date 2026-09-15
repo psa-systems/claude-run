@@ -1204,12 +1204,19 @@ A permission lookup that ERRORS denies (fail closed) and replies "could not veri
 ONE reply stating the required set, then the delivery is acked and dropped; denial replies are throttled per
 `(repo, login)` so a scripted denied commenter cannot flood a PR.
 
-**Execution on a pull request** shallow-clones the PR head branch, writes the human's instruction VERBATIM to
+**Execution on a pull request** shallow-clones the PR head branch, records the cloned head commit and appends
+`.claude-run-instruction.md` / `.claude-run-commit-msg` / `.claude-run-pr-comment.md` to `.git/info/exclude` so the
+runner's own scratch files never count as a change or reach a commit, writes the human's instruction VERBATIM to
 `.claude-run-instruction.md` in the checkout (it is never interpolated into a shell command or a command line: the
-agent is told to read the file), runs Claude, then applies the decision gate. A run that made no changes, or whose
-diff exceeds the source's `max_files` / `max_lines`, is reported on the PR and nothing is pushed; within the caps the
-runner commits as the bot identity with the CI skip marker (so the push does not re-trigger this listener) and pushes
-the branch. A PR comment is posted on EVERY outcome path: pushed, push failed, no changes, too big, and agent error.
+agent is told to read the file), runs Claude, then applies the decision gate (CLAUDE-302). The change measurement
+stages the whole working tree (`git add -A`) and diffs the index against the cloned head, so a staged edit, an
+untracked file, and a commit the agent made on top of the clone all count; a run that made no changes this way, or
+whose diff exceeds the source's `max_files` / `max_lines`, is reported on the PR and nothing is pushed. A failure
+while measuring the change (for example an unreadable checkout) is reported as a failure, never as "no changes".
+Within the caps the runner stages the tree again, commits only if the index still differs from `HEAD` or a merge is
+in progress (an agent that already committed everything is not re-committed), as the bot identity with the CI skip
+marker (so the push does not re-trigger this listener), and pushes the branch. A PR comment is posted on EVERY
+outcome path: pushed, push failed, no changes, too big, agent error, and measurement error.
 
 **Execution on a plain issue (CLAUDE-221)** clones nothing, starts no agent session, and pushes nothing. It resolves
 the repo's YouTrack project through the SAME routing the CI-failure mint uses (the `[mint]` `repo_project_map`
