@@ -142,11 +142,16 @@ will want to know about:
 
   The attempt-cap banner is the same signal for the sibling condition: every job whose attempt counter has reached its
   action's `limits.max_attempts_per_key`, with the action, the key, the count against the cap, and the last counted
-  attempt. That skip writes no outcome row, no run event, and no field change, so the issue keeps its Queued value, is
-  skipped again on the next poll, and never moves. The same list is on `/api/status` as `attempt_cap_hits`, with or
-  without the daemon, and the skip itself logs at `warn` with the count and the cap. Unlike a dependency gate, the row
-  does not clear itself: the counter is the durable record of the attempts, so a key stays listed until the counter is
-  gone (today only an action delete purges it, per CLAUDE-238), and the runner cannot retry a capped key until then.
+  attempt. For the `youtrack` native action (CLAUDE-301), reaching the cap is no longer a silent skip: the run posts
+  one comment naming the attempt count and the cap and stating that re-queueing alone will not retry it, then sets
+  `AI Agent` to the configured `needs_review` label - the same label the needs-review marker and a timeout use - so the
+  issue leaves Queued instead of being skipped again on every poll. A failed comment or field write logs at `error`
+  naming the key and the cause, and the cap is still reported as hit either way, so the banner keeps showing the key
+  until a write actually lands. The generic scripted runner has no tracker field to write, so a scripted action's cap
+  hit still just skips the job with a `warn` and no outcome row, exactly as before. The same list is on `/api/status`
+  as `attempt_cap_hits`, with or without the daemon. Unlike a dependency gate, the counter row does not clear itself:
+  it is the durable record of the attempts, so a key stays listed until the counter is gone (today only an action
+  delete purges it, or a per-key reset once CLAUDE-238 lands), and the runner cannot retry a capped key until then.
   Raising the action's cap grants one more attempt. See `actions/SCHEMA.md`, "`limits`".
 
   A third cap bounds what a single run may WRITE rather than how often it fires: `limits.max_issues_per_run`
