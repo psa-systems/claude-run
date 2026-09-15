@@ -120,6 +120,8 @@
     } else if (j.type === 'system') {
       if (j.subtype === 'no-stream-yet') {
         append('ev-system', 'No stream yet - the agent has not started writing.', ts, tsFmt);
+      } else if (j.subtype === 'stream-log-gone') {
+        append('ev-system', 'This attempt has no stream log on disk. The run has finished, so the log was either never written or has been deleted by the stream-log retention sweep (Settings -> Stream log GC).', ts, tsFmt);
       } else if (j.subtype === 'init') {
         append('ev-system', 'session started' + (j.model ? ' (model ' + j.model + ')' : ''), ts, tsFmt);
       } else if (j.error) {

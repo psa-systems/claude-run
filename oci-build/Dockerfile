@@ -16,7 +16,7 @@
 #                        and the build-binary.yml workflow
 
 # syntax=docker/dockerfile:1.6
-FROM dev.a8n.run/pandoras-box/rust-builder-musl:v1.0.0-rust1.94-alpine AS builder
+FROM dev.a8n.run/pandoras-box/rust-builder-musl:v1.1.0-rust1.98.1-alpine AS builder
 
 WORKDIR /build
 
@@ -70,81 +70,129 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release --locked
 
-# Runtime stage (CLAUDE-37): the daemon plus its full runtime toolchain in one
-# image. Based on the same musl rust-builder image so cargo/rust and the C
-# toolchain are present if a target-repo check needs them; the runtime tools
-# (nu, claude, yt, fj, timeout, git) are added and pinned via build args so the
-# image is reproducible instead of depending on whatever the operator installed.
-FROM dev.a8n.run/pandoras-box/rust-builder-musl:v1.0.0-rust1.94-alpine AS runtime
+# Runtime stage (CLAUDE-37, rebased onto opensuse-dev in CLAUDE-287): the daemon
+# plus its full runtime toolchain in one image. The base carries the whole
+# toolchain already (nu, claude, yt, fj, just, kingfisher, docker, git,
+# coreutils, cargo/rustc), so this stage only creates the runtime user, copies
+# the binary and shipped config, and smoke-checks the tools it did not install.
+# Moving a tool means bumping the base image tag, not editing a RUN block here.
+#
+# CLAUDE-287: the base also carries Docker, so `claude` sessions the daemon
+# spawns can run `docker`, `docker compose` and `docker buildx` against the
+# `claude-bot-docker` sidecar in compose.yml (DOCKER_HOST=tcp://127.0.0.1:2375).
+# That is what makes `just check` (ending in `check-docker`) and
+# `just pre-commit` (docker-mode) work inside this container.
+#
+# CLAUDE-247: the image is self-contained. It mounts nothing from the host, and
+# the operator logs claude / yt / fj / git in INSIDE the container, onto named
+# volumes. See README "Containerized deployment".
+FROM dev.a8n.run/pandoras-box/opensuse-dev:v1.9.0-leap-16.0 AS runtime
 
-# Version pins. Override at build time with --build-arg to move a single tool.
-ARG NU_VERSION=0.112.2
-ARG CLAUDE_CODE_VERSION=latest
-ARG YT_VERSION
-ARG FJ_VERSION=0.5.0
+USER root
 
-# Runtime dependencies:
-#   coreutils -> the `timeout(1)` wall-clock wrapper src/claude.rs delegates to
-#   git       -> clone/branch/commit inside each job workdir
-#   nodejs/npm-> the `claude` CLI ships as the @anthropic-ai/claude-code package
-#   python3/pip-> the `yt` (youtrack-cli) CLI ships on PyPI
-#   curl/tar  -> fetch the pinned nu release binary
-RUN apk add --no-cache coreutils git nodejs npm python3 py3-pip curl tar
-
-# nu: pinned musl release tarball (apk's nushell version drifts from the
-# 0.112.2 the actions are written against).
-RUN curl -fsSL "https://github.com/nushell/nushell/releases/download/${NU_VERSION}/nu-${NU_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-    | tar -xz -C /tmp \
-    && install -m 0755 "/tmp/nu-${NU_VERSION}-x86_64-unknown-linux-musl/nu" /usr/local/bin/nu \
-    && rm -rf /tmp/nu-* \
-    && nu --version
-
-# claude: the Claude Code CLI as a global npm package.
-RUN npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-    && claude --version
-
-# yt: youtrack-cli from PyPI. Pin with --build-arg YT_VERSION=x.y.z; unset
-# installs the newest release.
-RUN pip install --no-cache-dir --break-system-packages \
-    "youtrack-cli${YT_VERSION:+==${YT_VERSION}}" \
-    && yt --version
-
-# fj: forgejo-cli, compiled musl-native from crates.io. CLAUDE-88: the
-# original pin (v0.1.0 bare binary) never existed as a release asset, and the
-# codeberg release tarballs are glibc-linked, so they cannot exec on this
-# musl/Alpine base. The runtime stage inherits the Rust toolchain from the
-# builder image, so a pinned `cargo install` is the cheapest correct source.
-# The smoke check is `--help`: fj has no `--version` flag.
-RUN cargo install forgejo-cli --version "${FJ_VERSION}" --locked --root /usr/local \
-    && rm -rf "${CARGO_HOME:-/usr/local/cargo}/registry" \
-    && fj --help >/dev/null
+# Smoke-check the toolchain the base image is expected to carry. A base that
+# loses a tool fails the image build here instead of the first job.
+RUN nu --version \
+    && claude --version \
+    && yt --version \
+    && fj version \
+    && just --version \
+    && kingfisher --version \
+    && docker --version \
+    && docker compose version \
+    && docker buildx version \
+    && git --version \
+    && timeout --version \
+    && setpriv --version \
+    && cargo --version
 
 # claude-run itself, from the builder stage above.
 COPY --from=builder /build/target/release/claude-run /usr/local/bin/claude-run
 
-# Non-root container user with a dedicated, clean $HOME. The agent's user memory
-# is the slim bot CLAUDE.md, never the operator's interactive one.
-RUN addgroup -S claudebot \
-    && adduser -S -G claudebot -h /home/claudebot claudebot
+# CLAUDE-247: the shipped action YAML, baked read-only. The entrypoint seeds it
+# into the config volume the first time that volume has no actions, so a fresh
+# container starts with the actions this repo ships instead of an empty dir (the
+# `./actions` bind that used to supply them is gone with the host mounts). It
+# never overwrites afterwards, so edits made in the web UI survive an image
+# upgrade; a changed shipped action reaches an existing deployment through that
+# same editor.
+COPY actions/*.yml /usr/share/claude-run/actions/
+
+# Bootstrap config seeded the same way, and for the same reason the actions are:
+# the container binds 0.0.0.0 because a loopback bind is reachable from nothing
+# outside the container, and the operator owns the file once it lands on the
+# volume.
+COPY deploy/container-config.toml /usr/share/claude-run/config.toml
+
+# Non-root container user. Same ids the earlier Alpine image used (uid 100,
+# gid 101), so a volume from before CLAUDE-287 stays owned by this user. $HOME
+# is deliberately NOT where anything persists (CLAUDE-253): it is scratch, and
+# every store the operator cares about lives under the three volumes below.
+RUN groupadd --system --gid 101 claudebot \
+    && useradd --system --uid 100 --gid 101 --create-home --home-dir /home/claudebot claudebot
 COPY deploy/bot-CLAUDE.md /home/claudebot/.claude/CLAUDE.md
 
-# Runtime XDG dirs the compose named volumes / tmpfs back. Keep them under the
-# container user's $HOME so the clean-home guarantee holds end to end.
-ENV CLAUDE_RUN_CONFIG_DIR=/home/claudebot/.config/claude-run \
-    CLAUDE_RUN_DATA_DIR=/home/claudebot/.local/share/claude-run \
-    CLAUDE_RUN_STATE_DIR=/home/claudebot/.local/state/claude-run \
-    CLAUDE_RUN_RUNTIME_DIR=/home/claudebot/.runtime/claude-run
-RUN mkdir -p "${CLAUDE_RUN_CONFIG_DIR}/actions" "${CLAUDE_RUN_DATA_DIR}" \
-    "${CLAUDE_RUN_STATE_DIR}" "${CLAUDE_RUN_RUNTIME_DIR}" \
+# CLAUDE-253: three flat mounts instead of seven XDG paths under a home
+# directory. An operator mounting a volume should not have to know that config
+# lives in `.config/claude-run` while credentials split across
+# `.config/youtrack-cli` and `.local/share/forgejo-cli`.
+#
+#   /config  config.toml, actions, secrets.key, the agent config dir, the yt
+#            store, the git identity
+#   /data    state.db, workdirs, the fj key store
+#   /state   logs and per-attempt stream JSONL
+#   /run/claude-run  pidfile (tmpfs; the socket is off, see CMD below)
+#
+# The tool stores follow their own tools rather than being relabelled: `yt`
+# reads XDG_CONFIG_HOME, `fj` reads XDG_DATA_HOME (it has no config-dir variable
+# of its own, and claude-run resolves its key store the same way through
+# `dirs::data_dir()`), `claude` reads CLAUDE_CONFIG_DIR and git reads
+# GIT_CONFIG_GLOBAL. Nothing here changes how paths resolve for a HOST install,
+# where none of these variables is set and XDG defaults still apply.
+#
+# CLAUDE_CONFIG_DIR names the SAME directory the daemon seeds and points its
+# agent children at (`<config dir>/claude-agent-home`, CLAUDE-165), so an
+# operator running `claude auth login` through `docker compose exec` writes the
+# credential exactly where the agent reads it. Two Claude config dirs is the
+# failure this avoids: a login that reports success and leaves the runner still
+# unauthenticated.
+ENV CLAUDE_RUN_CONFIG_DIR=/config \
+    CLAUDE_RUN_DATA_DIR=/data \
+    CLAUDE_RUN_STATE_DIR=/state \
+    CLAUDE_RUN_RUNTIME_DIR=/run/claude-run \
+    XDG_CONFIG_HOME=/config \
+    XDG_DATA_HOME=/data \
+    CLAUDE_CONFIG_DIR=/config/claude-agent-home \
+    GIT_CONFIG_GLOBAL=/config/git/config
+RUN mkdir -p /config/actions /config/claude-agent-home /config/git /config/youtrack-cli \
+    /data/forgejo-cli /state /run/claude-run \
+    && chown -R claudebot:claudebot /config /data /state /run/claude-run \
     && chown -R claudebot:claudebot /home/claudebot
 
-USER claudebot
+# HOME is set explicitly because the runtime stage stays on USER root (see the
+# entrypoint note below): without it a root `docker compose exec` would write to
+# /root. Nothing persists here; it is the scratch home the agent's own tooling
+# uses.
+ENV HOME=/home/claudebot
 WORKDIR /home/claudebot
 
-# Foreground daemon (no --detach): claude-run is PID 1 and owns the socket under
-# CLAUDE_RUN_RUNTIME_DIR exactly as on the host.
-ENTRYPOINT ["claude-run"]
-CMD ["serve"]
+# CLAUDE-247: the container STARTS as root so the entrypoint can chown the
+# mounted volumes, then drops to claudebot with setpriv (CLAUDE-287; Leap
+# packages neither su-exec nor gosu). This is a deliberate, recorded exception
+# to BUILD.md's non-root-runtime mandate (pattern 3 in
+# governance/CONTAINER_UID_GID.md); the daemon itself runs non-root. An operator
+# `user:` override in compose disables the chown and must not be set.
+COPY oci-build/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
+
+# Foreground daemon (no --detach), and no unix-socket API. That socket is the
+# CLI's control plane on a host install; this image has no CLI operator (the web
+# UI and its /api routes are the whole interface), so binding it would only leave
+# an unauthenticated second copy of the control plane inside the container,
+# reachable by the agent the daemon spawns. Override the command to `serve` if a
+# deployment really does want it.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["serve", "--no-socket"]
 
 # Export stage: pull just the binary out, no runtime base.
 FROM scratch AS binary

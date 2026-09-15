@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} - load error - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><a href="/actions/{{ name }}">{{ name }}</a><span class="sep">/</span><span class="current">Form</span>{% endblock %}
+{% block main %}
+
+<h2>Structured editor unavailable</h2>
+
+<div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
+  <strong style="color: var(--bad);">{{ name }} does not load:</strong>
+  <pre style="white-space: pre-wrap; margin: 8px 0 0;">{{ message }}</pre>
+</div>
+
+<div class="row-actions">
+  <a class="btn" href="/actions/{{ name }}/edit">Open in raw editor</a>
+</div>
+
+{% endblock %}

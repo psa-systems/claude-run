@@ -15,24 +15,22 @@
 //! [`crate::job::done_record`], [`crate::job::append_output_record`]) so its
 //! outcome records and JSONL output stay byte-identical to the scripted path.
 
-pub mod ci_failure_analysis;
-pub mod ci_failure_reconcile;
+pub mod audit_prompt;
 pub mod closed_issue_summary;
-pub mod forgejo_ci_fix;
 pub mod youtrack;
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::action::{ActionKind, LoadedAction, LogTokenRef};
+use crate::action::{ActionKind, LoadedAction};
 use crate::cancel::RunRegistry;
 use crate::claude::ClaudeInvoker;
 use crate::concurrency::{KeyGate, Limiter};
 use crate::config::Paths;
+use crate::db::DbPool;
 use crate::error::{Error, Result};
 use crate::snippet::SnippetRunner;
-use sqlx::SqlitePool;
 
 /// Everything a native handler needs, mirroring the arguments
 /// [`crate::daemon::run_action_inner`] receives. Passed by value so a handler
@@ -40,7 +38,7 @@ use sqlx::SqlitePool;
 pub struct NativeContext<'a> {
     pub action: &'a LoadedAction,
     pub paths: &'a Paths,
-    pub pool: &'a SqlitePool,
+    pub pool: &'a DbPool,
     /// `Arc` (not `&`) so the native handler can clone it into the per-job
     /// tasks spawned by the CLAUDE-28 keyed executor.
     pub snippet: Arc<SnippetRunner>,
@@ -57,6 +55,15 @@ pub struct NativeContext<'a> {
     /// at its per-job checkpoints, so a pause taken mid-run stops the next
     /// pickup and the run finishes with `exit::PAUSED`.
     pub pause: crate::pause::PauseGate,
+    /// CLAUDE-228: daemon-wide per-action gather marker. Each handler holds it
+    /// across its gather step (the `yt list` that opens the run) so the
+    /// scheduler does not stack another pickup on a gather still in flight.
+    pub gather: crate::concurrency::GatherGate,
+    /// DEV-705 / DEV-707: this run's spend ledger and frozen ceiling, built by
+    /// [`crate::daemon::run_action_inner`] from the action's limits BEFORE the
+    /// handler starts. A handler bills every `claude` invocation against it,
+    /// checks it before each pickup, and finalizes it with its run's exit code.
+    pub spend: crate::usage::RunSpend,
 }
 
 /// Boxed future returned by a [`NativeHandler`]. Hand-rolled (rather than
@@ -74,13 +81,6 @@ fn handler_for(kind: ActionKind) -> Option<Box<dyn NativeHandler>> {
     match kind {
         ActionKind::Scripted => None,
         ActionKind::Youtrack => Some(Box::new(youtrack::YoutrackHandler)),
-        ActionKind::ForgejoCiFix => Some(Box::new(forgejo_ci_fix::ForgejoCiFixHandler)),
-        ActionKind::CiFailureAnalysis => {
-            Some(Box::new(ci_failure_analysis::CiFailureAnalysisHandler))
-        }
-        ActionKind::CiFailureReconcile => {
-            Some(Box::new(ci_failure_reconcile::CiFailureReconcileHandler))
-        }
         ActionKind::ClosedIssueSummary => {
             Some(Box::new(closed_issue_summary::ClosedIssueSummaryHandler))
         }
@@ -99,28 +99,6 @@ pub async fn dispatch(ctx: NativeContext<'_>) -> Result<()> {
     }
 }
 
-/// CLAUDE-200: the per-repo Forgejo log-token mapping a CI-failure handler runs
-/// with: the action's own mapping when it configures one, else the mapping
-/// derived from `config.webhook.sources`, so a token is rotated in one place. An
-/// unreadable webhook section yields an empty mapping (every repo skipped with a
-/// warning) rather than a wrong token.
-pub(crate) async fn effective_log_tokens(
-    pool: &SqlitePool,
-    paths: &Paths,
-    configured: Option<&LogTokenRef>,
-) -> LogTokenRef {
-    if let Some(tokens) = configured {
-        return tokens.clone();
-    }
-    match crate::settings::effective_webhook(pool, paths).await {
-        Ok(webhook) => LogTokenRef::from_webhook_sources(&webhook),
-        Err(e) => {
-            tracing::warn!(error = %e, "reading the webhook sources for the log-token fallback failed; no repo will resolve a token");
-            LogTokenRef::PerRepo(Vec::new())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,21 +111,6 @@ mod tests {
     #[test]
     fn youtrack_has_a_native_handler() {
         assert!(handler_for(ActionKind::Youtrack).is_some());
-    }
-
-    #[test]
-    fn forgejo_ci_fix_has_a_native_handler() {
-        assert!(handler_for(ActionKind::ForgejoCiFix).is_some());
-    }
-
-    #[test]
-    fn ci_failure_analysis_has_a_native_handler() {
-        assert!(handler_for(ActionKind::CiFailureAnalysis).is_some());
-    }
-
-    #[test]
-    fn ci_failure_reconcile_has_a_native_handler() {
-        assert!(handler_for(ActionKind::CiFailureReconcile).is_some());
     }
 
     #[test]

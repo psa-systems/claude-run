@@ -23,25 +23,88 @@
         so the poll does not wipe text selection / scroll / focus. #}
      hx-swap="morph:outerHTML">
 
-{# CLAUDE-216: poll-time access failures. The preflight leaves the affected
+{# CLAUDE-216: poll-time diagnostics. The access preflight leaves the affected
    issues Queued with no field change, so this banner is the only place the
-   operator is told rather than having to go looking. #}
-{% if !access_failures.is_empty() %}
+   operator is told rather than having to go looking.
+   CLAUDE-235: a count and a link, not the messages. One repeating failure used
+   to fill the first screen with byte-identical rows; the rows are on /logs, and
+   the access subset is named separately because its remedy is the access
+   check. It clears itself when a later poll records the recovery marker. #}
+{# Setup-incomplete / login-required banner moved to the shared, htmx-polled
+   fragment in base.html (CLAUDE-269): it now shows on every page, not just the
+   dashboard, and covers the login-required state alongside the no-credential
+   one. #}
+
+{% if events_24h > 0 %}
   <div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
-    <strong style="color: var(--bad);">Access failures in the last 24h</strong>
-    <div class="dim" style="margin-top: 6px;">Issues for these repos are skipped each poll and
-    left Queued. Run an <a href="/access">access check</a> to see which credential and scope
-    is short.</div>
+    <strong style="color: var(--bad);">{{ events_24h }} errors / warnings in the last 24h.</strong>
+    {% if access_failure_events > 0 %}
+      <span>{{ access_failure_events }} of them are still-open repo-access failures across
+      {{ access_failure_groups }} repo(s): those issues are skipped each poll and left Queued. Run an
+      <a href="/access">access check</a> to see which credential and scope is short.</span>
+    {% endif %}
+    <a href="/logs?since=24h">View logs</a>
+  </div>
+{% endif %}
+
+{# CLAUDE-225: dependency gates that have held an issue past the staleness
+   threshold. The gate leaves the issue Queued with no field change and a poll
+   whose candidates are all blocked writes no run row, so without this banner a
+   gate that stops resuming is invisible until someone notices the issue by
+   hand. Read straight off the gate table, so it clears itself the moment the
+   blockers resolve. #}
+{% if !stale_gates.is_empty() %}
+  <div class="card" style="border-color: var(--warn); margin-bottom: 16px;">
+    <strong style="color: var(--warn);">Dependency gates blocked over an hour</strong>
+    <div class="dim" style="margin-top: 6px;">These issues stay Queued and consume no attempt.
+    "recheck overdue" means the gate's own re-evaluation deadline passed without the issue being
+    re-evaluated, so the blockers may already be resolved.</div>
     <table style="margin-top: 8px;">
-      <thead><tr><th>Action</th><th>Context</th><th>Last seen</th><th>Count</th><th>Message</th></tr></thead>
+      <thead><tr><th>Action</th><th>Issue</th><th>Blocked for</th><th>Blockers</th><th>Last checked</th><th>Recheck</th></tr></thead>
       <tbody>
-        {% for f in access_failures %}
+        {% for g in stale_gates %}
         <tr>
-          <td class="mono">{{ f.action_name }}</td>
-          <td class="mono">{% if let Some(c) = f.context %}{{ c }}{% else %}-{% endif %}</td>
-          <td class="dim">{{ f.last_ts|datetime }}</td>
-          <td class="dim">{{ f.count }}</td>
-          <td>{{ f.message }}</td>
+          <td class="mono"><a href="/actions/{{ g.action_name() }}">{{ g.action_name() }}</a></td>
+          <td class="mono">{{ g.job_key() }}</td>
+          <td class="mono">{{ g.blocked_for() }}</td>
+          <td>{{ g.signature() }}</td>
+          <td class="dim">{{ g.updated_at()|datetime }}</td>
+          <td>
+            {% if g.recheck_overdue() %}
+              <span class="badge bad">overdue {{ g.recheck_overdue_for() }}</span>
+            {% else %}
+              <span class="badge neutral">on schedule</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
+{# CLAUDE-232: jobs parked at their action's per-key attempt cap, the sibling of
+   the stale-gate banner above. The skip writes no outcome row, no run event and
+   no field change, so the issue stays Queued, is skipped again on every poll,
+   and nothing but this banner says so. Read straight off `attempt_counters`. #}
+{% if !attempt_cap_hits.is_empty() %}
+  <div class="card" style="border-color: var(--warn); margin-bottom: 16px;">
+    <strong style="color: var(--warn);">Jobs parked at the attempt cap</strong>
+    <div class="dim" style="margin-top: 6px;">These jobs have used every attempt their action allows
+    (<code>limits.max_attempts_per_key</code>), so each poll skips them and they never move. The runner
+    cannot retry a capped key: the counter is only cleared by deleting the action, which purges its
+    control state. So finish the job by hand and take it out of the action's candidate set (resolve the
+    issue, or change its <code>AI Agent</code> value); raising the action's cap gets one more attempt.
+    A key stays listed until its counter is gone, including one you have already dealt with.</div>
+    <table style="margin-top: 8px;">
+      <thead><tr><th>Action</th><th>Job</th><th>Attempts</th><th>Last attempt</th></tr></thead>
+      <tbody>
+        {% for c in attempt_cap_hits %}
+        <tr>
+          <td class="mono"><a href="/actions/{{ c.action_name }}">{{ c.action_name }}</a></td>
+          <td class="mono">{{ c.job_key }}</td>
+          <td class="mono">{{ c.count }} / {{ c.cap }}</td>
+          <td class="dim">{{ c.last_at|datetime }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -182,8 +245,32 @@
   {% if sr.in_stream %}
     <p class="meta">Searched summaries and the stream logs of {{ sr.files_searched }} failed-job attempt(s){% if sr.capped %}; capped at {{ sr.max_files }} files, older streams were not searched{% endif %}.</p>
   {% endif %}
+  {# CLAUDE-246: logs that opened and then failed to read. The search never
+     established whether these runs match, so they are named here instead of
+     being folded into the no-match set. #}
+  {% if !sr.unreadable.is_empty() %}
+    <div class="card" style="border-color: var(--warn); margin-bottom: 16px;">
+      <strong style="color: var(--warn);">{{ sr.unreadable.len() }} stream log(s) could not be read</strong>
+      <div class="dim" style="margin-top: 6px;">These attempts were skipped mid-read, so this search says nothing
+      about them either way: they may contain "{{ sr.q }}". A log truncated by a full disk reads like this.</div>
+      <table style="margin-top: 8px;">
+        <thead><tr><th>Run</th><th>Job</th><th>Attempt</th><th>Log</th><th>Error</th></tr></thead>
+        <tbody>
+          {% for u in sr.unreadable %}
+          <tr>
+            <td class="mono"><a href="/runs/{{ u.run_id }}">#{{ u.run_id }}</a></td>
+            <td class="mono"><a href="/runs/{{ u.run_id }}/jobs/{{ u.job_key }}/attempt/{{ u.attempt }}">{{ u.job_key }}</a></td>
+            <td class="mono">{{ u.attempt }}</td>
+            <td class="mono dim">{{ u.path }}</td>
+            <td class="mono">{{ u.error }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
   {% if sr.hits.is_empty() %}
-    <div class="card"><span class="dim">No jobs match "{{ sr.q }}".</span></div>
+    <div class="card"><span class="dim">No jobs match "{{ sr.q }}"{% if !sr.unreadable.is_empty() %} among the logs that could be read{% endif %}.</span></div>
   {% else %}
     <table>
       <thead><tr><th>Run</th><th>Action</th><th>Job</th><th>Attempt</th><th>When</th><th>Status</th><th>Match</th><th>Snippet</th></tr></thead>
@@ -263,10 +350,25 @@
             {% endfor %}
           </select>
         </th>
-        <th><a href="#" class="sort-link"
-               hx-get="/?{{ view.sort_query("jobs") }}" hx-include="#search-form"
-               hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
-               >Jobs{{ view.arrow("jobs") }}</a></th>
+        <th>
+          <a href="#" class="sort-link"
+             hx-get="/?{{ view.sort_query("jobs") }}" hx-include="#search-form"
+             hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+             >Jobs{{ view.arrow("jobs") }}</a>
+          {# CLAUDE-230: sort worst-first by the derived failed-job count. #}
+          <a href="#" class="sort-link" style="color: var(--fg-dim);"
+             hx-get="/?{{ view.sort_query("failed") }}" hx-include="#search-form"
+             hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
+             >failed{{ view.arrow("failed") }}</a>
+          {# CLAUDE-230: job-level outcome, independent of the run's Exit code. #}
+          <select name="outcome" hx-trigger="change"
+                  hx-get="/?{{ view.query_without("outcome") }}" hx-include="#search-form"
+                  hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
+            <option value=""{% if view.outcome.is_empty() %} selected{% endif %}>all</option>
+            <option value="failed"{% if view.outcome == "failed" %} selected{% endif %}>failed</option>
+            <option value="timedout"{% if view.outcome == "timedout" %} selected{% endif %}>timed out</option>
+          </select>
+        </th>
         <th>
           <a href="#" class="sort-link"
              hx-get="/?{{ view.sort_query("exit") }}" hx-include="#search-form"

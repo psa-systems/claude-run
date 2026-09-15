@@ -30,10 +30,9 @@
 //! sibling subtasks - log fetch + redaction (CLAUDE-44), the hybrid triage
 //! engine (CLAUDE-45), and the triage-driven issue mint + dedupe + loop safety
 //! (CLAUDE-46) - so a verified failure turns into a minted issue (bucket 1 ->
-//! `AI Agent=Queued` for forgejo-ci-fix, bucket 2 -> a human-assigned issue) or
-//! nothing (bucket 3, transient). The scheduled `youtrack` / `forgejo-ci-fix`
-//! actions stay as the backstop and dedupe against webhook-minted issues through
-//! the same [`crate::mint`] markers.
+//! `AI Agent=Queued`, picked up by the `youtrack` action, bucket 2 -> a
+//! human-assigned issue) or nothing (bucket 3, transient). Nothing polls for
+//! CI failures (CLAUDE-279), so a delivery this module drops is not recovered.
 //!
 //! TLS / reverse proxy and service authentication are out of scope here per the
 //! epic decision (handled by the external proxy / the linked auth issue).
@@ -43,6 +42,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::db::DbPool;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -52,15 +52,15 @@ use axum::Router;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use sqlx::SqlitePool;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::config::{MintConfig, WebhookConfig, WebhookSource};
+use crate::ci_failure::{fingerprint, store as ci_failure_store};
+use crate::config::{MintConfig, Paths, WebhookConfig, WebhookSource};
 use crate::forge_log::LogOutcome;
 use crate::job::RunnerDefaults;
 use crate::mint::{self, MintCaps, MintOutcome, MintRequest, VcsRouteCache};
-use crate::provider::{Backend, ForgePullRequest};
+use crate::provider::{Backend, CliBackend, CommandRunner, ForgePullRequest};
 use crate::secrets::{self, SecretsKey};
 use crate::state;
 use crate::triage::{self, FailureClassifier, TriageInput};
@@ -87,10 +87,9 @@ pub const WEBHOOK_MINT_ACTION: &str = "webhook-forgejo";
 ///   work against a pause we could not read.
 ///
 /// 2xx (not 4xx/5xx) because a retry cannot help: the delivery id is already in
-/// the replay store, so a same-id retry would 409, and the scheduled `youtrack`
-/// / `forgejo-ci-fix` poll is the backstop that re-finds the work after Resume.
+/// the replay store, so a same-id retry would 409. Nothing recovers a dropped delivery.
 pub(crate) async fn paused_accept_and_drop(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
     source: &str,
     delivery: &str,
@@ -108,7 +107,7 @@ pub(crate) async fn paused_accept_and_drop(
         }
         Ok(None) => {}
         Err(e) => {
-            warn!(source = %source, delivery, action, error = %e, "global pause read failed; accepting and dropping the delivery (scheduled poll is the backstop)");
+            error!(source = %source, delivery, action, error = %e, "global pause read failed; delivery accepted and dropped, and will not be recovered");
             return true;
         }
     }
@@ -124,10 +123,41 @@ pub(crate) async fn paused_accept_and_drop(
         }
         Ok(None) => false,
         Err(e) => {
-            warn!(source = %source, delivery, action, error = %e, "pause-status read failed; accepting and dropping the delivery (scheduled poll is the backstop)");
+            error!(source = %source, delivery, action, error = %e, "pause-status read failed; delivery accepted and dropped, and will not be recovered");
             true
         }
     }
+}
+
+/// CLAUDE-269: right after the pause check, accept-and-drop a delivery while
+/// the Claude login needs renewing. 2xx for the same reason as a pause: a
+/// retry cannot help (the delivery id is already in the replay store), and
+/// nothing recovers the delivery once signed in again. Unlike a pause, this ALSO records a
+/// `run_events` row (`state::run_events_record`), because a login-required
+/// drop is unusual enough that "on screen, not only in the log" earns it a
+/// dedicated row rather than riding the pause's log-only treatment.
+async fn login_required_accept_and_drop(st: &WebhookState, source: &str, delivery: &str) -> bool {
+    let Some(gate) = &st.readiness else {
+        return false;
+    };
+    let check = gate.check();
+    if check.kind != Some(crate::readiness::NotReadyKind::LoginRequired) {
+        return false;
+    }
+    let reason = check
+        .reason()
+        .unwrap_or_else(|| "Claude login required".to_string());
+    warn!(source = %source, delivery, "{reason}; delivery accepted and dropped");
+    let now = state::now_iso();
+    let event = state::InputEvent {
+        level: "warn".to_string(),
+        context: Some(source.to_string()),
+        message: format!("{reason}; delivery accepted and dropped"),
+    };
+    if let Err(e) = state::run_events_record(&st.pool, WEBHOOK_MINT_ACTION, &now, &[event]).await {
+        warn!(source = %source, delivery, error = %e, "recording the login-required drop as a run_events row failed (continuing)");
+    }
+    true
 }
 
 /// `runs.triggered_by` value for the event-driven webhook, alongside
@@ -136,14 +166,78 @@ pub(crate) async fn paused_accept_and_drop(
 /// dashboard / action-detail surfaces show webhook activity like any action.
 pub const WEBHOOK_TRIGGERED_BY: &str = "webhook";
 
-/// Wall-clock cap for one triage classification (`claude --print`). The pass is
-/// a single bounded-log JSON reply, so it needs far less than a full code run.
-pub const TRIAGE_TIMEOUT_SECS: u64 = 120;
-
 /// Hex-encoded HMAC-SHA256 of the raw body, keyed by the webhook secret.
 pub const SIGNATURE_HEADER: &str = "X-Forgejo-Signature";
 /// Per-delivery unique id, used for replay protection.
 pub const DELIVERY_HEADER: &str = "X-Forgejo-Delivery";
+/// CLAUDE-277: the delivery's event type, mirroring Gitea's `X-Gitea-Event`
+/// (Forgejo forked Gitea's webhook notifier and kept its header naming,
+/// rebranded to `X-Forgejo-*` the same way it renamed the signature and
+/// delivery headers above). Its value for an Action-run delivery is
+/// `action_run_failure` / `action_run_success` / `action_run_recover`
+/// (`services/webhook/notifier.go` `ActionRunNowDone`, the same notifier
+/// [`VerifiedFailureEvent::status`]'s doc comment cites); for a pull-request
+/// delivery it is [`PULL_REQUEST_EVENT_TYPE`]. Operators must confirm this
+/// against their deployed Forgejo's actual delivery before relying on it (see
+/// the README "Webhook (Forgejo)" operator-setup note): a missing or
+/// unrecognized header still falls back to the pre-existing Action-run parse
+/// path, so an Action-run-only deployment that never sends this header is
+/// unaffected.
+pub const EVENT_HEADER: &str = "X-Forgejo-Event";
+/// [`EVENT_HEADER`] value for a pull-request delivery.
+pub const PULL_REQUEST_EVENT_TYPE: &str = "pull_request";
+/// [`EVENT_HEADER`] value prefix for every Action-run delivery kind.
+const ACTION_RUN_EVENT_PREFIX: &str = "action_run_";
+/// `pull_request.action` value for a PR closed (merged or not) delivery. Every
+/// other action (`opened`, `edited`, `synchronized`, ...) is acked and dropped:
+/// nothing to reconcile until the PR is terminal.
+const PR_ACTION_CLOSED: &str = "closed";
+
+/// CLAUDE-277: the subset of Forgejo's `pull_request` webhook payload the
+/// merge-close path consumes. Extra fields are ignored (no
+/// `deny_unknown_fields`), matching [`ActionPayload`]'s tolerance of a Forgejo
+/// upgrade that adds keys.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequestPayload {
+    /// `opened` | `edited` | `closed` | `synchronized` | ... . Only
+    /// [`PR_ACTION_CLOSED`] is acted on.
+    pub action: String,
+    pub number: i64,
+    pub pull_request: PullRequestInfo,
+    pub repository: Repository,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequestInfo {
+    /// True when the PR was merged rather than closed unmerged. Only
+    /// meaningful when `action == "closed"`.
+    #[serde(default)]
+    pub merged: bool,
+    pub head: PullRequestHead,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequestHead {
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    pub sha: String,
+}
+
+/// The typed event emitted downstream for a verified, allow-listed, terminal
+/// (`closed`) pull-request delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPullRequestEvent {
+    pub repo: String,
+    pub number: i64,
+    pub merged: bool,
+    pub head_sha: String,
+    pub head_ref: String,
+    pub html_url: String,
+    /// CLAUDE-96-style: the webhook source this event arrived through, so the
+    /// consumer can resolve the source's `log_token_ref`.
+    pub source: String,
+}
 
 /// Subset of the Forgejo Action-run webhook payload we consume. Extra fields in
 /// the delivery are ignored (no `deny_unknown_fields`) so a Forgejo upgrade that
@@ -232,6 +326,21 @@ pub struct VerifiedFailureEvent {
     pub source: String,
 }
 
+/// CLAUDE-278: the typed event emitted downstream for a verified, allow-listed
+/// `success` or `recover` Action-run delivery - an agent PR's checks may have
+/// just gone green. Deliberately thin: which PR (if any) this run belongs to,
+/// whether its action has automerge enabled, and its CI/mergeable state are
+/// all resolved downstream in `process_action_success_event`, so a slow forge
+/// call never blocks the HTTP response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedActionSuccessEvent {
+    pub repo: String,
+    pub commit_sha: String,
+    pub html_url: String,
+    /// CLAUDE-96-style: the webhook source this event arrived through.
+    pub source: String,
+}
+
 /// CLAUDE-85: the one `run.status` the pipeline acts on. Forgejo's status enum
 /// (`models/actions/status.go`) is `unknown, success, failure, cancelled,
 /// skipped, waiting, running, blocked`; of the done statuses that reach the
@@ -241,14 +350,14 @@ pub struct VerifiedFailureEvent {
 /// full 60s retry budget); both finish in ~0s with no fetch, triage, or mint.
 pub const RUN_STATUS_FAILURE: &str = "failure";
 
-/// State injected into the webhook handler. Cheap to clone (`SqlitePool` and
+/// State injected into the webhook handler. Cheap to clone (`DbPool` and
 /// `Sender` are `Arc`-shaped; the config and the rate-limiter map are
 /// `Arc`-wrapped). CLAUDE-87: one [`RateLimiter`] per source (built once at
 /// startup, keyed by source name) and a single shared [`SeenDeliveries`] replay
 /// store across all sources.
 #[derive(Clone)]
 pub struct WebhookState {
-    pool: SqlitePool,
+    pool: DbPool,
     /// CLAUDE-101: live webhook config, shared with [`crate::settings::LiveSettings`]
     /// so a Settings save (new/edited source, allow-list, rate limit, secret refs)
     /// is routable on the next request without a restart.
@@ -257,6 +366,22 @@ pub struct WebhookState {
     seen: Arc<Mutex<SeenDeliveries>>,
     /// CLAUDE-101: live per-source limiter map, rebuilt by `LiveSettings` on save.
     rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
+    /// CLAUDE-269: `None` outside the daemon (tests, standalone callers).
+    /// When set, a login-required delivery is accepted and dropped exactly
+    /// like a pause, and the drop is recorded as a `run_events` row.
+    readiness: Option<crate::readiness::ReadinessGate>,
+    /// CLAUDE-277: `None` outside the daemon and in every pre-existing test
+    /// (a separate `with_pr_events` builder, not a constructor parameter, so
+    /// `WebhookState::new`'s call sites - including
+    /// `comment_webhooks`'s cross-listener replay-store test - stay
+    /// source-compatible). A `pull_request` delivery with no sender configured
+    /// is acked and dropped with a log, exactly like a delivery arriving while
+    /// the daemon has no usable provider backend.
+    pr_events: Option<mpsc::Sender<VerifiedPullRequestEvent>>,
+    /// CLAUDE-278: same source-compatibility shape as `pr_events`, for a
+    /// verified `success`/`recover` Action-run delivery. `None` (no daemon
+    /// wiring, every pre-existing test) acks and drops with a log.
+    success_events: Option<mpsc::Sender<VerifiedActionSuccessEvent>>,
 }
 
 /// CLAUDE-87/101: build one fixed-window rate limiter per source, so exhausting
@@ -293,7 +418,7 @@ impl WebhookState {
     /// Standalone constructor (tests, single-source callers): owns fresh shared
     /// handles built from `config`.
     pub fn new(
-        pool: SqlitePool,
+        pool: DbPool,
         config: WebhookConfig,
         events: mpsc::Sender<VerifiedFailureEvent>,
     ) -> Self {
@@ -305,6 +430,9 @@ impl WebhookState {
             events,
             seen: Arc::new(Mutex::new(seen)),
             rate: Arc::new(RwLock::new(rate)),
+            readiness: None,
+            pr_events: None,
+            success_events: None,
         }
     }
 
@@ -312,7 +440,7 @@ impl WebhookState {
     /// so a save swaps the routed config + limiters live. The replay store is
     /// built once here from `replay_window_secs` (restart-only by design).
     pub fn from_shared(
-        pool: SqlitePool,
+        pool: DbPool,
         config: Arc<RwLock<WebhookConfig>>,
         rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
         replay_window_secs: u64,
@@ -325,7 +453,34 @@ impl WebhookState {
             events,
             seen: Arc::new(Mutex::new(seen)),
             rate,
+            readiness: None,
+            pr_events: None,
+            success_events: None,
         }
+    }
+
+    /// CLAUDE-269: attach the daemon's readiness gate, so a login-required
+    /// delivery is accepted and dropped like a pause. A builder so every
+    /// existing constructor call site stays source-compatible.
+    pub fn with_readiness(mut self, gate: crate::readiness::ReadinessGate) -> Self {
+        self.readiness = Some(gate);
+        self
+    }
+
+    /// CLAUDE-277: attach the channel a verified `pull_request` delivery is
+    /// dispatched onto. A builder for the same source-compatibility reason as
+    /// [`Self::with_readiness`].
+    pub fn with_pr_events(mut self, events: mpsc::Sender<VerifiedPullRequestEvent>) -> Self {
+        self.pr_events = Some(events);
+        self
+    }
+
+    /// CLAUDE-278: attach the channel a verified `success`/`recover`
+    /// Action-run delivery is dispatched onto. A builder for the same
+    /// source-compatibility reason as [`Self::with_readiness`].
+    pub fn with_success_events(mut self, events: mpsc::Sender<VerifiedActionSuccessEvent>) -> Self {
+        self.success_events = Some(events);
+        self
     }
 
     /// CLAUDE-220: the SHARED replay store handle. The comment listener records
@@ -351,9 +506,13 @@ pub fn router(state: WebhookState) -> Router {
 /// on-disk mint config, and the shared `claude` invoker behind a
 /// [`FailureClassifier`]. When the daemon cannot build one (no usable `yt`/`fj`
 /// backend) it passes `None` and the consumer falls back to log-only behaviour.
+/// CLAUDE-277: `Clone` so the daemon can hand the same context to both
+/// [`consume_events`] and [`consume_pr_events`] - every field is already
+/// `Arc`-shaped or cheap to clone.
+#[derive(Clone)]
 pub struct MintContext {
     /// State DB, for the reused DEV-335 caps ledger.
-    pub pool: SqlitePool,
+    pub pool: DbPool,
     /// The LLM pass for the residue the deterministic rules cannot label.
     pub classifier: Arc<dyn FailureClassifier>,
     /// Provider backend: the `IssueTracker` the mint writes through and the
@@ -369,6 +528,20 @@ pub struct MintContext {
     /// CLAUDE-86: TTL-cached inverse VCS routing map (repo -> project), built
     /// from YouTrack project VCS integrations and shared across mints.
     pub route_cache: Arc<VcsRouteCache>,
+    /// CLAUDE-276: resolved on-disk locations, so a PR comment's write-scoped
+    /// backend can materialize its temp single-host `keys.json` under the
+    /// daemon's own runtime dir (the same CLAUDE-26 mechanism
+    /// `comment_webhooks::build_env` uses).
+    pub paths: Paths,
+    /// CLAUDE-276: the [`CommandRunner`] the PR-comment backend's `fj` child
+    /// runs through. Real [`ProcessRunner`] in production; injectable so a test
+    /// can exercise a PR-comment routing decision against a canned `fj`
+    /// response with no real subprocess or network call.
+    pub pr_comment_runner: Arc<dyn CommandRunner>,
+    /// CLAUDE-277: seam over `fj actions runs` carrying the commit sha, used by
+    /// the merge-close pull-request path to find the failing workflow's run at
+    /// a merged PR's head commit.
+    pub commit_runs: Arc<dyn crate::forge_log::CommitRunsClient>,
 }
 
 /// Drain emitted events. For each verified failure this fetches the run's logs
@@ -380,18 +553,81 @@ pub struct MintContext {
 /// signal (the rules pass routes an unavailable log to transient).
 pub async fn consume_events(
     mut rx: mpsc::Receiver<VerifiedFailureEvent>,
-    pool: SqlitePool,
+    pool: DbPool,
     logs: Arc<dyn crate::forge_log::ActionLogClient>,
     out_dir: PathBuf,
     mint: Option<MintContext>,
     webhook_cfg: Arc<RwLock<WebhookConfig>>,
+    keygate: crate::concurrency::KeyGate,
 ) {
-    let cfg = crate::forge_log::LogFetchConfig::default();
+    // CLAUDE-274: bound the number of events processed concurrently, so a
+    // burst of failures does not start one 600s analysis session per event at
+    // once (`config.webhook.analysis_concurrency`, default 2). The snapshot is
+    // taken once at start: resizing the pool live is not required by this
+    // issue and the DB-backed setting is otherwise honored per event as
+    // before.
+    let concurrency = webhook_cfg.read().await.analysis_concurrency.max(1);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    // Built once so every spawned event shares one classifier/backend/route
+    // cache, exactly as the old inline loop did.
+    let mint = mint.map(Arc::new);
+    // CLAUDE-274: joined once the channel closes, so a caller awaiting
+    // `consume_events` (every existing test, and the daemon's own shutdown)
+    // observes every spawned event's completed side effects, not just that
+    // they were scheduled.
+    let mut tasks = Vec::new();
     while let Some(ev) = rx.recv().await {
         // CLAUDE-101: snapshot the live webhook config for this event so a
         // Settings save (e.g. a source's `log_token_ref`) is picked up by the
         // next event without a restart.
-        let webhook_cfg = webhook_cfg.read().await.clone();
+        let webhook_cfg_snapshot = webhook_cfg.read().await.clone();
+        // CLAUDE-274: acquire a permit before spawning, so the loop itself
+        // (not the spawned task) is what bounds how many events are ever
+        // in flight; a saturated pool simply leaves later events queued in
+        // the channel until one finishes.
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore is never closed");
+        let pool = pool.clone();
+        let logs = logs.clone();
+        let out_dir = out_dir.clone();
+        let mint = mint.clone();
+        let keygate = keygate.clone();
+        tasks.push(tokio::spawn(async move {
+            process_event(ev, pool, logs, out_dir, mint, webhook_cfg_snapshot, keygate).await;
+            drop(permit);
+        }));
+        // Bound the join set's own growth: a task that already finished is
+        // dropped from the list immediately rather than accumulating for the
+        // whole (potentially unbounded) lifetime of the consumer.
+        tasks.retain(|t| !t.is_finished());
+    }
+    for t in tasks {
+        if let Err(e) = t.await {
+            warn!(error = %e, "a webhook event task panicked");
+        }
+    }
+}
+
+/// One verified failure's whole pipeline (CLAUDE-61/CLAUDE-44/CLAUDE-45/
+/// CLAUDE-46/CLAUDE-273/CLAUDE-274): fetch the run's logs, redact, and (when a
+/// [`MintContext`] is configured) triage and mint. Spawned as its own task by
+/// [`consume_events`]'s worker pool so a slow analysis for one event never
+/// delays another's.
+async fn process_event(
+    ev: VerifiedFailureEvent,
+    pool: DbPool,
+    logs: Arc<dyn crate::forge_log::ActionLogClient>,
+    out_dir: PathBuf,
+    mint: Option<Arc<MintContext>>,
+    webhook_cfg: WebhookConfig,
+    keygate: crate::concurrency::KeyGate,
+) {
+    let cfg = crate::forge_log::LogFetchConfig::default();
+    let mint = mint.as_deref();
+    {
         info!(
             repo = %ev.repo,
             run = ev.index_in_repo,
@@ -430,7 +666,7 @@ pub async fn consume_events(
                 ev.status
             );
             finish_webhook_run(&pool, run_id, &job_key, &summary, true, None).await;
-            continue;
+            return;
         }
 
         // CLAUDE-204: ONE fetch path for public and private repos. `fj actions
@@ -440,6 +676,9 @@ pub async fn consume_events(
         // the no-log triage rule routes it to a human (bucket 2) rather than
         // silently dropping it as transient.
         let token = source_log_token(&pool, &webhook_cfg, &ev.source).await;
+        // CLAUDE-274: kept for the analysis classifier's own workflow-YAML fetch
+        // (it authorizes the log fetch below, then travels via `TriageInput`).
+        let log_token = token.clone();
         let Some(target) =
             crate::forge_log::LogTarget::for_run(&ev.html_url, &ev.repo, ev.index_in_repo, token)
         else {
@@ -453,7 +692,7 @@ pub async fn consume_events(
                 None,
             )
             .await;
-            continue;
+            return;
         };
         if let Some(id) = run_id {
             if let Err(e) = state::run_stage_set(&pool, id, Some(STAGE_FETCHING_LOGS)).await {
@@ -487,15 +726,31 @@ pub async fn consume_events(
         // (CLAUDE-92) routes those to a human rather than dropping them.
         let (log_text, log_available, log_artifact, log_unavailable_reason, jobs) = match outcome {
             Ok(Ok(LogOutcome::Fetched(log))) => {
-                info!(
-                    repo = %ev.repo,
-                    run = ev.index_in_repo,
-                    bytes = log.text.len(),
-                    jobs = log.jobs.len(),
-                    artifact = %log.artifact.display(),
-                    "fetched and redacted run log"
-                );
-                (log.text, true, Some(log.artifact), None, log.jobs)
+                if let Some(reason) = crate::forge_log::logs_permanently_missing(&log.jobs) {
+                    warn!(
+                        repo = %ev.repo,
+                        run = ev.index_in_repo,
+                        %reason,
+                        "run log permanently missing (FJ-79)"
+                    );
+                    (
+                        String::new(),
+                        false,
+                        Some(log.artifact),
+                        Some(reason),
+                        log.jobs,
+                    )
+                } else {
+                    info!(
+                        repo = %ev.repo,
+                        run = ev.index_in_repo,
+                        bytes = log.text.len(),
+                        jobs = log.jobs.len(),
+                        artifact = %log.artifact.display(),
+                        "fetched and redacted run log"
+                    );
+                    (log.text, true, Some(log.artifact), None, log.jobs)
+                }
             }
             Ok(Ok(LogOutcome::TransientMiss { reason })) => {
                 warn!(repo = %ev.repo, run = ev.index_in_repo, %reason, "run log not available (transient miss)");
@@ -588,7 +843,7 @@ pub async fn consume_events(
                     log_artifact.as_deref(),
                 )
                 .await;
-                continue;
+                return;
             }
             info!(
                 repo = %ev.repo,
@@ -598,7 +853,7 @@ pub async fn consume_events(
             );
         }
 
-        let Some(ctx) = mint.as_ref() else {
+        let Some(ctx) = mint else {
             // No mint configured (no usable backend): log-only, as before. The
             // run is still recorded so the operator sees the event landed.
             let summary = if log_available {
@@ -615,7 +870,7 @@ pub async fn consume_events(
                 log_artifact.as_deref(),
             )
             .await;
-            continue;
+            return;
         };
         let artifact = log_artifact.clone();
         // CLAUDE-190/204: the failing job's name comes from the jobs `fj` already
@@ -636,6 +891,9 @@ pub async fn consume_events(
             log_unavailable_reason,
             webhook_cfg.auto_fix,
             job_name,
+            log_token,
+            &keygate,
+            &webhook_cfg,
         )
         .await;
         finish_webhook_run(
@@ -664,7 +922,7 @@ pub const STAGE_MINTING: &str = "minting issue";
 
 /// CLAUDE-96: decrypt the named log token from the secrets store (same age-key
 /// mechanism as the HMAC refs).
-async fn resolve_log_token(pool: &SqlitePool, name: &str) -> crate::error::Result<String> {
+async fn resolve_log_token(pool: &DbPool, name: &str) -> crate::error::Result<String> {
     let key = SecretsKey::load()?;
     // CLAUDE-146: trim the decrypted token. A stored trailing space or CR
     // survives as a valid header character and yields a spurious HTTP 401.
@@ -676,7 +934,7 @@ async fn resolve_log_token(pool: &SqlitePool, name: &str) -> crate::error::Resul
 /// source has no token configured or it cannot be resolved. Authorizes the
 /// `fj actions logs` read; a public repo's run reads without one.
 async fn source_log_token(
-    pool: &SqlitePool,
+    pool: &DbPool,
     webhook_cfg: &WebhookConfig,
     source: &str,
 ) -> Option<String> {
@@ -705,7 +963,7 @@ async fn source_log_token(
 /// CLAUDE-220: `action` is a parameter so the comment listener records its runs
 /// through this same accounting rather than a forked copy.
 pub(crate) async fn begin_webhook_run(
-    pool: &SqlitePool,
+    pool: &DbPool,
     action: &str,
     job_key: &str,
     html_url: &str,
@@ -747,7 +1005,7 @@ pub(crate) async fn begin_webhook_run(
 /// DEV-335 caps ledger is advanced separately inside [`triage_and_mint`] and
 /// must not be double counted here. A no-op when `run_id` is `None`.
 async fn finish_webhook_run(
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: Option<i64>,
     job_key: &str,
     summary: &str,
@@ -767,6 +1025,11 @@ async fn finish_webhook_run(
         job_key,
         attempt: 1,
         ok,
+        // DEV-707: the triage classification this run performed DID spend, and
+        // its tokens / cost land in `logs/usage.jsonl` under this action name.
+        // Carrying that cost onto this row (and into the daily ledger) needs
+        // `FailureClassifier::classify` to return it, which is tracked in
+        // DEV-726.
         claude_ran: false,
         claude_ok: false,
         claude_cost_usd: 0.0,
@@ -806,6 +1069,15 @@ impl WebhookRunSummary {
         }
     }
 
+    /// CLAUDE-273: a decision the `ci_failure` store made without ever calling
+    /// `mint::mint` (an attach, a reopen, or a legacy adoption).
+    fn store_decided(outcome: &StoreOutcome) -> Self {
+        Self {
+            text: store_outcome_summary(outcome),
+            ok: true,
+        }
+    }
+
     fn error(message: String) -> Self {
         Self {
             text: format!("triage/mint error: {message}"),
@@ -814,36 +1086,61 @@ impl WebhookRunSummary {
     }
 }
 
+/// CLAUDE-273: the outcomes the `ci_failure` store drives directly, with no
+/// `mint::mint` call (and, for [`StoreOutcome::Attached`], no `claude` call
+/// either).
+enum StoreOutcome {
+    /// The fingerprint matched an `open` `ci_failures` row: attached, no
+    /// triage, no mint.
+    Attached { key: String },
+    /// The fingerprint matched a `resolved` row: reopened, triaged, and the
+    /// analysis posted as a comment.
+    Reopened { key: String },
+    /// No store row matched, but a legacy YouTrack full-text search (the
+    /// pre-store mechanism) found an issue minted before the store existed.
+    Adopted { key: String },
+}
+
+/// CLAUDE-273: what [`decide_mint`] decided, inside the blocking task, before
+/// any of its async store bookkeeping runs.
+enum DecideOutcome {
+    /// No store row, but the legacy YouTrack marker search adopted an issue
+    /// minted before the store existed.
+    LegacyAdopted { key: String },
+    /// The ordinary triage + mint path ran to a decision.
+    Mint(triage::TriageBucket, MintOutcome),
+}
+
 /// One-line description of a [`MintOutcome`] for the run summary: the minted
 /// issue key on success, or the skip reason otherwise.
 fn mint_summary(outcome: &MintOutcome) -> String {
     match outcome {
         MintOutcome::Created { key, project, .. } => format!("minted {key} in {project}"),
         MintOutcome::SkippedTransient => "no issue (transient)".to_string(),
-        MintOutcome::SkippedBotLoop => "no issue (bot-loop guard)".to_string(),
-        MintOutcome::SkippedOpenPr => "no issue (open PR; left to author)".to_string(),
-        MintOutcome::SkippedAutoFixDisabled => {
-            "no issue (webhook auto-fix off; left on PR)".to_string()
-        }
         MintOutcome::SkippedAttemptCap => "no issue (per-key attempt cap)".to_string(),
         MintOutcome::SkippedDailyCap => "no issue (daily run cap)".to_string(),
-        MintOutcome::SkippedDuplicateOpen { existing } => {
-            format!("no issue (duplicate of open {existing})")
-        }
-        MintOutcome::SkippedResolved { existing } => {
-            format!("no issue (resolved {existing} not reopened)")
-        }
-        MintOutcome::AssociatedWithOpen { existing } => {
-            format!("associated with open {existing}")
-        }
     }
 }
 
-/// Triage a verified failure and mint (or decline to mint) a YouTrack issue.
-/// Reads the reused DEV-335 caps from the DB, resolves the `has_open_pr` signal
-/// from the forge, runs the hybrid triage + mint on a blocking thread (every
-/// step shells out), and advances the caps ledger only when an issue was
-/// actually created. Logs the decision; never propagates an error to the loop.
+/// CLAUDE-273: one-line description of the store-driven outcomes that never
+/// reach [`mint::mint`] at all: an attach onto an already-tracked failure, or a
+/// reopen of a resolved one.
+fn store_outcome_summary(outcome: &StoreOutcome) -> String {
+    match outcome {
+        StoreOutcome::Attached { key } => format!("attached to {key}"),
+        StoreOutcome::Reopened { key } => format!("regression; reopened {key}"),
+        StoreOutcome::Adopted { key } => format!("adopted legacy issue {key}"),
+    }
+}
+
+/// CLAUDE-273: fingerprint the log and look it up in the `ci_failure` store
+/// BEFORE triage. A store read failure fails the run rather than falling
+/// through to a mint, which would recreate the duplicate this issue removes.
+/// `open` attaches with no triage and no `claude` call; `resolved` reopens and
+/// triages for the analysis comment and the `AI Agent` write; `none` and
+/// `pr_only` (the PR-routing issue owns `pr_only`) fall through to the
+/// ordinary classify + mint path, itself preceded by one legacy adoption
+/// lookup for an issue minted before the store existed.
 #[allow(clippy::too_many_arguments)]
 async fn triage_and_mint(
     ctx: &MintContext,
@@ -855,6 +1152,1362 @@ async fn triage_and_mint(
     log_unavailable_reason: Option<String>,
     auto_fix_enabled: bool,
     job_name: String,
+    log_token: Option<String>,
+    keygate: &crate::concurrency::KeyGate,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    // CLAUDE-274: the store lookup, analysis and mint for one event run under a
+    // key gate on (repo, workflow_id, job_name), so two concurrent failures of
+    // the same job never both run an analysis: the second waits here and then
+    // finds the first one's store row, attaching instead of re-analyzing.
+    let key = format!("{}#{}#{}", ev.repo, ev.workflow_id, job_name);
+    let _key_guard = keygate.acquire(&key).await;
+
+    // CLAUDE-190: derive the deterministic failure signature and the branch
+    // from the redacted log up front (pure string work); CLAUDE-273 fingerprint
+    // is the failing-test overlap key the store matches on.
+    let failure_signature = crate::mint::failure_signature(&log_text);
+    let branch = crate::forge_log::resolve_branch(None, &log_text).unwrap_or_default();
+    let infra = crate::infra_failure::detect(&log_text);
+    if let Some(f) = &infra {
+        info!(
+            repo = %ev.repo,
+            run = ev.index_in_repo,
+            kind = %f.kind,
+            problem = %f.problem,
+            "infrastructure failure detected"
+        );
+    }
+    let infra_kind = infra.as_ref().map(|f| f.kind.clone());
+    let test_ids = fingerprint::fingerprint(&log_text);
+
+    let store_match = if log_available {
+        match ci_failure_store::find_match(
+            &ctx.pool,
+            &ev.repo,
+            &ev.workflow_id,
+            &job_name,
+            &test_ids,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store read failed; not minting");
+                return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+            }
+        }
+    } else {
+        None
+    };
+
+    // CLAUDE-276: resolve whether the failing commit itself is on an open PR
+    // BEFORE the store-match dispatch, not as a fallback from it: an agent's
+    // own PR must intercept before the ordinary open/resolved handling runs,
+    // and a human's PR always needs a PR comment, including one that shares a
+    // failing test with an already-`open` failure. A lookup error is never
+    // read as "no PR" (see [`resolve_open_pr`]).
+    let backend = ctx.backend.clone();
+    let event = ev.clone();
+    let pr_result =
+        tokio::task::spawn_blocking(move || resolve_open_pr(backend.as_ref(), &event)).await;
+    let pr = match pr_result {
+        Ok(Ok(pr)) => pr,
+        Ok(Err(e)) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "open-PR lookup failed; not routing");
+            record_run_event(
+                &ctx.pool,
+                run_id,
+                WEBHOOK_MINT_ACTION,
+                "error",
+                format!("open-PR lookup failed: {e}"),
+            )
+            .await;
+            return WebhookRunSummary::error(format!("open-PR lookup failed: {e}"));
+        }
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "open-PR lookup task panicked");
+            return WebhookRunSummary::error(format!("task panicked: {e}"));
+        }
+    };
+
+    let Some(pr) = pr else {
+        // No open PR for this commit: the pre-CLAUDE-276 store dispatch, run
+        // exactly as before this issue.
+        if let Some(m) = store_match {
+            if m.state == "open" {
+                return attach_to_open_failure(ctx, ev, &branch, &test_ids, m).await;
+            }
+            if m.state == "resolved" {
+                return reopen_resolved_failure(
+                    ctx,
+                    run_id,
+                    ev,
+                    log_text,
+                    log_available,
+                    log_unavailable_reason,
+                    auto_fix_enabled,
+                    branch,
+                    test_ids,
+                    log_token,
+                    m,
+                )
+                .await;
+            }
+        }
+        // `None` and `pr_only` both fall through to the ordinary classify +
+        // mint path, as they did before this issue.
+        return classify_and_mint(
+            ctx,
+            run_id,
+            ev,
+            log_text,
+            log_available,
+            log_artifact,
+            log_unavailable_reason,
+            auto_fix_enabled,
+            job_name,
+            branch,
+            failure_signature,
+            infra_kind,
+            test_ids,
+            log_token,
+        )
+        .await;
+    };
+
+    let Some(host) = forge_host_from_url(&ev.html_url) else {
+        // Unreachable in practice: resolve_open_pr above already needed this
+        // same host to find the PR it just returned.
+        error!(repo = %ev.repo, run = ev.index_in_repo, "could not derive forge host after resolving an open PR");
+        return WebhookRunSummary::error("could not derive forge host".to_string());
+    };
+
+    match ci_failure_store::agent_pr(&ctx.pool, &host, &ev.repo, pr.number as i64).await {
+        Ok(Some(record)) if record.state == "open" => {
+            route_agent_pr_failure(
+                ctx,
+                ev,
+                log_text,
+                log_available,
+                log_unavailable_reason,
+                log_token,
+                &job_name,
+                &branch,
+                infra_kind.as_deref(),
+                &test_ids,
+                record,
+                webhook_cfg,
+            )
+            .await
+        }
+        Ok(_) => {
+            route_human_pr_failure(
+                ctx,
+                run_id,
+                ev,
+                log_text,
+                log_available,
+                log_unavailable_reason,
+                auto_fix_enabled,
+                &job_name,
+                &branch,
+                failure_signature.as_deref(),
+                infra_kind.as_deref(),
+                &test_ids,
+                log_token,
+                store_match,
+                &pr,
+                &host,
+                webhook_cfg,
+            )
+            .await
+        }
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store read failed");
+            WebhookRunSummary::error(format!("ci-failure store error: {e}"))
+        }
+    }
+}
+
+/// CLAUDE-273: the comment posted when a failure attaches to an already-open
+/// `ci_failures` row. No triage ran, so this names the run and the
+/// overlapping failing tests rather than an analysis.
+fn attach_comment_body(ev: &VerifiedFailureEvent, branch: &str, test_ids: &[String]) -> String {
+    let short_sha: String = ev.commit_sha.chars().take(8).collect();
+    let tests = if test_ids.is_empty() {
+        "(no test ids parsed)".to_string()
+    } else {
+        test_ids.join(", ")
+    };
+    format!(
+        "`{}` failed again on `{}` (run #{}, {}, branch `{}`).\n- Run: {}\n- Failing tests: {tests}",
+        ev.workflow_id, ev.repo, ev.index_in_repo, short_sha, branch, ev.html_url
+    )
+}
+
+/// CLAUDE-273: attach `ev` to the already-tracked, still-`open` failure `m`
+/// matched. No triage, no mint, no `claude` call: the failure is already
+/// filed and this run is just another sighting of it.
+async fn attach_to_open_failure(
+    ctx: &MintContext,
+    ev: &VerifiedFailureEvent,
+    branch: &str,
+    test_ids: &[String],
+    m: ci_failure_store::FailureMatch,
+) -> WebhookRunSummary {
+    let Some(key) = m.issue_key.clone() else {
+        error!(repo = %ev.repo, run = ev.index_in_repo, failure_id = m.id, "open ci_failures row has no issue_key");
+        return WebhookRunSummary::error("ci-failure store row has no issue_key".to_string());
+    };
+    let now = state::now_iso();
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, m.id, test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        m.id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        None,
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    let backend = ctx.backend.clone();
+    let body = attach_comment_body(ev, branch, test_ids);
+    let key_for_comment = key.clone();
+    let result =
+        tokio::task::spawn_blocking(move || backend.comment(&key_for_comment, &body)).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "commenting on attached issue failed");
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "attach comment task panicked");
+        }
+    }
+    WebhookRunSummary::store_decided(&StoreOutcome::Attached { key })
+}
+
+/// CLAUDE-273: the comment posted immediately on reopening a resolved
+/// `ci_failures` row, before the triage analysis is posted separately.
+fn regression_comment_body(ev: &VerifiedFailureEvent, branch: &str, test_ids: &[String]) -> String {
+    let tests = if test_ids.is_empty() {
+        "(no test ids parsed)".to_string()
+    } else {
+        test_ids.join(", ")
+    };
+    format!(
+        "Regression: run {} on `{branch}` fails {tests} again; reopened.",
+        ev.html_url
+    )
+}
+
+/// CLAUDE-273: reopen the resolved failure `m` matched: `set_state` back to
+/// `target_state`, comment the regression, mark the store row `open` and
+/// attach this run, then triage (for the analysis comment) and set `AI Agent`
+/// exactly as a freshly created issue of that bucket would be.
+#[allow(clippy::too_many_arguments)]
+async fn reopen_resolved_failure(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    auto_fix_enabled: bool,
+    branch: String,
+    test_ids: Vec<String>,
+    log_token: Option<String>,
+    m: ci_failure_store::FailureMatch,
+) -> WebhookRunSummary {
+    let Some(key) = m.issue_key.clone() else {
+        error!(repo = %ev.repo, run = ev.index_in_repo, failure_id = m.id, "resolved ci_failures row has no issue_key");
+        return WebhookRunSummary::error("ci-failure store row has no issue_key".to_string());
+    };
+    let now = state::now_iso();
+    if let Err(e) = ci_failure_store::set_failure_state(&ctx.pool, m.id, "open", &now).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "reopening ci-failure store row failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, m.id, &test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        m.id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        &branch,
+        None,
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    let backend = ctx.backend.clone();
+    let classifier = ctx.classifier.clone();
+    let mint_cfg = ctx.mint_cfg.read().await.clone();
+    let event = ev.clone();
+    let key2 = key.clone();
+    let regression_body = regression_comment_body(ev, &branch, &test_ids);
+    let bucket =
+        tokio::task::spawn_blocking(move || -> crate::error::Result<triage::TriageBucket> {
+            backend.set_state(&key2, &mint_cfg.target_state)?;
+            backend.comment(&key2, &regression_body)?;
+            let has_open_pr = resolve_has_open_pr(backend.as_ref(), &event);
+            let input = TriageInput {
+                repo: event.repo.clone(),
+                workflow_id: event.workflow_id.clone(),
+                commit_sha: event.commit_sha.clone(),
+                html_url: event.html_url.clone(),
+                log: log_text,
+                log_available,
+                log_unavailable_reason,
+                has_open_pr,
+                log_token,
+            };
+            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+            backend.comment(&key2, &verdict.analysis)?;
+            if mint::queues_for_fix(verdict.bucket) && auto_fix_enabled {
+                backend.set_field(&key2, &mint_cfg.ai_agent_field, &mint_cfg.queued_value)?;
+            }
+            Ok(verdict.bucket)
+        })
+        .await;
+
+    let bucket = match bucket {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "reopen triage failed");
+            return WebhookRunSummary::error(e.to_string());
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "reopen triage task panicked");
+            return WebhookRunSummary::error(format!("task panicked: {e}"));
+        }
+    };
+    let _ = run_id;
+    info!(repo = %ev.repo, run = ev.index_in_repo, %key, bucket = %bucket, "regression reopened a resolved ci-failure issue");
+    WebhookRunSummary::store_decided(&StoreOutcome::Reopened { key })
+}
+
+/// CLAUDE-273: record a brand-new `ci_failures` row for `issue_key` (either
+/// freshly minted, or a legacy issue this delivery adopted), and the tests /
+/// run this delivery already carries.
+async fn record_new_store_row(
+    pool: &DbPool,
+    ev: &VerifiedFailureEvent,
+    job_name: &str,
+    infra_kind: Option<&str>,
+    issue_key: &str,
+    branch: &str,
+    test_ids: &[String],
+) -> crate::error::Result<()> {
+    let now = state::now_iso();
+    let id = ci_failure_store::record_failure(
+        pool,
+        &ev.repo,
+        &ev.workflow_id,
+        job_name,
+        infra_kind,
+        Some(issue_key),
+        "open",
+        &now,
+    )
+    .await?;
+    ci_failure_store::add_tests(pool, id, test_ids).await?;
+    ci_failure_store::attach_run(
+        pool,
+        id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        None,
+        &now,
+    )
+    .await?;
+    Ok(())
+}
+
+/// CLAUDE-276: best-effort record a `run_events` row for something that went
+/// wrong outside the ordinary per-job accounting (an open-PR lookup failure, a
+/// missing `write_token_ref`): attaches to the run when one exists, else a
+/// standalone row (never backfilled, but still visible on the action's event
+/// log) like [`login_required_accept_and_drop`] writes.
+async fn record_run_event(
+    pool: &DbPool,
+    run_id: Option<i64>,
+    action: &str,
+    level: &str,
+    message: String,
+) {
+    let event = state::InputEvent {
+        level: level.to_string(),
+        context: Some(action.to_string()),
+        message,
+    };
+    let result = match run_id {
+        Some(id) => state::run_events_record_for_run(pool, id, action, &[event]).await,
+        None => state::run_events_record(pool, action, &state::now_iso(), &[event]).await,
+    };
+    if let Err(e) = result {
+        warn!(error = %e, "recording a run_events row failed (continuing)");
+    }
+}
+
+/// True when some open PR's head commit matches `commit_sha`, and the PR
+/// itself (tolerant of a short / long SHA mismatch, accepting a prefix
+/// relationship in either direction).
+fn pr_matching_commit<'a>(
+    prs: &'a [ForgePullRequest],
+    commit_sha: &str,
+) -> Option<&'a ForgePullRequest> {
+    prs.iter().find(|p| {
+        !p.head_sha.is_empty()
+            && (p.head_sha == commit_sha
+                || commit_sha.starts_with(&p.head_sha)
+                || p.head_sha.starts_with(commit_sha))
+    })
+}
+
+/// CLAUDE-276: find the open PR (if any) whose head matches the failing
+/// commit. Replaces the old CLAUDE-149 `resolve_has_open_pr` for the routing
+/// decision: that helper degraded a forge error or an underivable host to
+/// `false` ("no PR"), which is safe only as advisory context for the triage
+/// classifier. For routing it is not safe - it would send the agent's own
+/// failing PR through the create-a-new-issue path instead of re-queuing it,
+/// and would drop a human's failure with no comment. A lookup error (or an
+/// underivable host) is therefore returned as an error, never folded into
+/// `Ok(None)`.
+fn resolve_open_pr(
+    backend: &dyn Backend,
+    ev: &VerifiedFailureEvent,
+) -> crate::error::Result<Option<ForgePullRequest>> {
+    let Some(host) = forge_host_from_url(&ev.html_url) else {
+        return Err(crate::error::Error::Other(anyhow::anyhow!(
+            "could not derive forge host from html_url `{}`",
+            ev.html_url
+        )));
+    };
+    let prs = backend.list_open_prs(&host, &ev.repo)?;
+    Ok(pr_matching_commit(&prs, &ev.commit_sha).cloned())
+}
+
+/// CLAUDE-276: on-disk root for a PR-comment backend's temp single-host
+/// `keys.json`, alongside `comment_webhooks::creds_root`'s own `comment-creds`
+/// sibling.
+fn pr_creds_root(paths: &Paths) -> PathBuf {
+    paths.runtime_dir.join("webhook-pr-creds")
+}
+
+/// A forge backend scoped to one webhook source's `write_token_ref`. Held
+/// until every `pr_comment` call for this routing decision has run, then
+/// dropped: `_creds`'s `Drop` scrubs its temp `keys.json` directory.
+struct PrCommentEnv {
+    backend: Box<dyn Backend>,
+    _creds: secrets::JobCredentials,
+}
+
+/// CLAUDE-276: where a PR comment's body is staged before posting: a
+/// deterministic path (not the ephemeral, randomly-suffixed credential
+/// directory `PrCommentEnv` holds), so a repeated comment on the same PR
+/// simply overwrites its own scratch file rather than accumulating one per
+/// routing decision.
+fn pr_comment_body_path(paths: &Paths, repo: &str, pr_number: u64) -> PathBuf {
+    paths.state_dir.join(format!(
+        "webhook-pr-comment-{}-{pr_number}.md",
+        repo.replace('/', "_")
+    ))
+}
+
+/// CLAUDE-276: resolve `source`'s `write_token_ref` and build a forge backend
+/// carrying it in a temp single-host `keys.json` (the CLAUDE-26 mechanism
+/// `comment_webhooks::build_env` also uses), so a PR-comment token never
+/// appears in YAML, env, a process argument, or a settings response. A source
+/// with no `write_token_ref` configured is a hard failure: it must never be
+/// silent about being unable to post.
+async fn build_pr_comment_backend(
+    ctx: &MintContext,
+    webhook_cfg: &WebhookConfig,
+    source: &str,
+    host: &str,
+) -> crate::error::Result<PrCommentEnv> {
+    let token_ref = webhook_cfg
+        .sources
+        .get(source)
+        .and_then(|s| s.write_token_ref.as_deref())
+        .ok_or_else(|| {
+            crate::error::Error::Secret(format!(
+                "webhook source `{source}` has no write_token_ref; it cannot comment on pull requests"
+            ))
+        })?;
+    let key = SecretsKey::load()?;
+    let token = secrets::resolve_secret(&ctx.pool, &key, token_ref)
+        .await?
+        .trim()
+        .to_string();
+    let dir = pr_creds_root(&ctx.paths).join(secrets::unique_suffix());
+    let creds = secrets::JobCredentials::materialize(
+        &dir,
+        &secrets::ResolvedCredentials {
+            fj_token: Some(token),
+            ..Default::default()
+        },
+        Some(host),
+    )?;
+    let mut backend =
+        CliBackend::new(ctx.pr_comment_runner.clone()).with_fj_env(creds.fj_env.clone());
+    if let Some(keys) = &creds.fj_keys_path {
+        backend = backend.with_keys_path(keys.clone());
+    }
+    Ok(PrCommentEnv {
+        backend: Box::new(backend),
+        _creds: creds,
+    })
+}
+
+/// CLAUDE-276: [`build_pr_comment_backend`], with the missing-token failure
+/// already logged and recorded as a `run_events` row - the shape every PR-
+/// commenting caller in this module needs.
+async fn require_pr_comment_backend(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> Result<PrCommentEnv, WebhookRunSummary> {
+    match build_pr_comment_backend(ctx, webhook_cfg, &ev.source, host).await {
+        Ok(env) => Ok(env),
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, source = %ev.source, error = %e, "no write-scoped forge backend for this webhook source; cannot comment on the PR");
+            record_run_event(
+                &ctx.pool,
+                run_id,
+                WEBHOOK_MINT_ACTION,
+                "error",
+                format!("PR comment failed: {e}"),
+            )
+            .await;
+            Err(WebhookRunSummary::error(format!(
+                "PR comment backend error: {e}"
+            )))
+        }
+    }
+}
+
+/// Write `body` to `body_file` and post it on PR `pr_number`.
+fn write_and_post_pr_comment(
+    backend: &dyn Backend,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    body_file: &std::path::Path,
+    body: &str,
+) -> crate::error::Result<()> {
+    std::fs::write(body_file, body)?;
+    backend.pr_comment(host, repo, pr_number, body_file)
+}
+
+/// Run triage (for its analysis text) and post that text as a PR comment
+/// through `env`'s write-scoped backend. Returns the analysis text.
+#[allow(clippy::too_many_arguments)]
+async fn analyze_and_comment_pr(
+    ctx: &MintContext,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    log_token: Option<String>,
+    pr_number: u64,
+    host: &str,
+    env: PrCommentEnv,
+) -> crate::error::Result<String> {
+    let classifier = ctx.classifier.clone();
+    let mint_cfg = ctx.mint_cfg.read().await.clone();
+    let event = ev.clone();
+    let host_owned = host.to_string();
+    let body_file = pr_comment_body_path(&ctx.paths, &ev.repo, pr_number);
+    let result = tokio::task::spawn_blocking(move || -> crate::error::Result<String> {
+        let input = TriageInput {
+            repo: event.repo.clone(),
+            workflow_id: event.workflow_id.clone(),
+            commit_sha: event.commit_sha.clone(),
+            html_url: event.html_url.clone(),
+            log: log_text,
+            log_available,
+            log_unavailable_reason,
+            has_open_pr: true,
+            log_token,
+        };
+        let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+        write_and_post_pr_comment(
+            env.backend.as_ref(),
+            &host_owned,
+            &event.repo,
+            pr_number,
+            &body_file,
+            &verdict.analysis,
+        )?;
+        Ok(verdict.analysis)
+    })
+    .await;
+    match result {
+        Ok(inner) => inner,
+        Err(e) => Err(crate::error::Error::Other(anyhow::anyhow!(
+            "PR analysis task panicked: {e}"
+        ))),
+    }
+}
+
+/// `AI Agent` value flagging an issue for a human to look at, mirroring
+/// `youtrack.states.needs_review`'s default (`src/action.rs`); this path has
+/// no dependency on the `youtrack` action's own config, so the value is
+/// spelled directly rather than threaded through another config section.
+const NEEDS_REVIEW_VALUE: &str = "Needs Review";
+
+/// CLAUDE-276: `ev` failed on an open PR the agent itself opened (an `open`
+/// `agent_pull_requests` row). Below `webhook_cfg.agent_pr_fix_attempts`,
+/// comment the recorded issue with the run, the failing tests and the
+/// analysis, bump the attempt counter, and re-queue it (`AI Agent = Queued`);
+/// at the ceiling, flag the issue `Needs Review` instead, listing every
+/// attempt's run. Either way: no PR comment, no new issue - the failure
+/// belongs to an issue that already exists.
+#[allow(clippy::too_many_arguments)]
+async fn route_agent_pr_failure(
+    ctx: &MintContext,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    log_token: Option<String>,
+    job_name: &str,
+    branch: &str,
+    infra_kind: Option<&str>,
+    test_ids: &[String],
+    record: ci_failure_store::AgentPullRequest,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    let now = state::now_iso();
+    let failure_id = match ci_failure_store::failure_for_issue(&ctx.pool, &record.issue_key).await {
+        Ok(Some(f)) => f.id,
+        Ok(None) => {
+            match ci_failure_store::record_failure(
+                &ctx.pool,
+                &ev.repo,
+                &ev.workflow_id,
+                job_name,
+                infra_kind,
+                Some(&record.issue_key),
+                "open",
+                &now,
+            )
+            .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "creating the ci-failure store row for the agent's PR failed");
+                    return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+                }
+            }
+        }
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store read failed");
+            return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+        }
+    };
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, failure_id, test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        failure_id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        Some(record.pr_number),
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    if (record.fix_attempts as u32) < webhook_cfg.agent_pr_fix_attempts {
+        let backend = ctx.backend.clone();
+        let classifier = ctx.classifier.clone();
+        let mint_cfg = ctx.mint_cfg.read().await.clone();
+        let event = ev.clone();
+        let key = record.issue_key.clone();
+        let tests = test_ids.to_vec();
+        let branch_owned = branch.to_string();
+        let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
+            let input = TriageInput {
+                repo: event.repo.clone(),
+                workflow_id: event.workflow_id.clone(),
+                commit_sha: event.commit_sha.clone(),
+                html_url: event.html_url.clone(),
+                log: log_text,
+                log_available,
+                log_unavailable_reason,
+                has_open_pr: true,
+                log_token,
+            };
+            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+            let tests_display = if tests.is_empty() {
+                "(no test ids parsed)".to_string()
+            } else {
+                tests.join(", ")
+            };
+            let body = format!(
+                "CI failed again on this PR (run #{}, branch `{branch_owned}`).\n- Run: {}\n- Failing tests: {tests_display}\n\n{}",
+                event.index_in_repo, event.html_url, verdict.analysis
+            );
+            backend.comment(&key, &body)?;
+            backend.set_field(&key, &mint_cfg.ai_agent_field, &mint_cfg.queued_value)?;
+            Ok(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "re-queuing the agent's own PR failed");
+                return WebhookRunSummary::error(e.to_string());
+            }
+            Err(e) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "re-queue task panicked");
+                return WebhookRunSummary::error(format!("task panicked: {e}"));
+            }
+        }
+        if let Err(e) = ci_failure_store::bump_fix_attempts(&ctx.pool, record.id, &now).await {
+            warn!(error = %e, "bumping the agent PR's fix-attempt counter failed (continuing)");
+        }
+        info!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, "CI failure on the agent's own open PR; re-queued its issue");
+        WebhookRunSummary {
+            text: format!("re-queued {} (agent PR fix attempt)", record.issue_key),
+            ok: true,
+        }
+    } else {
+        let runs =
+            ci_failure_store::run_indexes_for_failure_pr(&ctx.pool, failure_id, record.pr_number)
+                .await
+                .unwrap_or_default();
+        let base = ev.html_url.rsplit_once("/actions/runs/").map(|(b, _)| b);
+        let links = runs
+            .iter()
+            .map(|idx| match base {
+                Some(b) => format!("- {b}/actions/runs/{idx}"),
+                None => format!("- run #{idx}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!(
+            "Fix-attempt ceiling ({}) reached on this PR; flagging Needs Review.\nAttempts:\n{links}",
+            webhook_cfg.agent_pr_fix_attempts
+        );
+        let backend = ctx.backend.clone();
+        let mint_cfg = ctx.mint_cfg.read().await.clone();
+        let key = record.issue_key.clone();
+        let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
+            backend.comment(&key, &body)?;
+            backend.set_field(&key, &mint_cfg.ai_agent_field, NEEDS_REVIEW_VALUE)?;
+            Ok(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "flagging the agent's PR Needs Review failed");
+                return WebhookRunSummary::error(e.to_string());
+            }
+            Err(e) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "flag task panicked");
+                return WebhookRunSummary::error(format!("task panicked: {e}"));
+            }
+        }
+        info!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, "agent PR fix-attempt ceiling reached; flagged Needs Review");
+        WebhookRunSummary {
+            text: format!(
+                "{} flagged Needs Review (agent PR fix ceiling)",
+                record.issue_key
+            ),
+            ok: true,
+        }
+    }
+}
+
+/// CLAUDE-276: `ev` failed on an open PR that is NOT the agent's own. Routes by
+/// whether its failing tests overlap an already-tracked failure.
+#[allow(clippy::too_many_arguments)]
+async fn route_human_pr_failure(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    auto_fix_enabled: bool,
+    job_name: &str,
+    branch: &str,
+    failure_signature: Option<&str>,
+    infra_kind: Option<&str>,
+    test_ids: &[String],
+    log_token: Option<String>,
+    store_match: Option<ci_failure_store::FailureMatch>,
+    pr: &ForgePullRequest,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    match store_match {
+        Some(m) if m.state == "open" => {
+            route_pr_matches_open_failure(
+                ctx,
+                run_id,
+                ev,
+                branch,
+                test_ids,
+                &m,
+                pr,
+                host,
+                webhook_cfg,
+            )
+            .await
+        }
+        // A human PR matching a `resolved` failure is a regression exactly as
+        // it would be off a PR: reopen and triage for the analysis comment on
+        // the issue, unchanged by this issue (it is not one of the three
+        // human-PR cases the issue enumerates).
+        Some(m) if m.state == "resolved" => {
+            reopen_resolved_failure(
+                ctx,
+                run_id,
+                ev,
+                log_text,
+                log_available,
+                log_unavailable_reason,
+                auto_fix_enabled,
+                branch.to_string(),
+                test_ids.to_vec(),
+                log_token,
+                m,
+            )
+            .await
+        }
+        Some(m) if m.state == "pr_only" => {
+            route_pr_matches_pr_only_failure(
+                ctx,
+                run_id,
+                ev,
+                log_text,
+                log_available,
+                log_unavailable_reason,
+                auto_fix_enabled,
+                job_name,
+                branch,
+                failure_signature,
+                infra_kind,
+                test_ids,
+                log_token,
+                &m,
+                pr,
+                host,
+                webhook_cfg,
+            )
+            .await
+        }
+        _ => {
+            route_new_pr_only_failure(
+                ctx,
+                run_id,
+                ev,
+                log_text,
+                log_available,
+                log_unavailable_reason,
+                job_name,
+                branch,
+                infra_kind,
+                test_ids,
+                log_token,
+                pr,
+                host,
+                webhook_cfg,
+            )
+            .await
+        }
+    }
+}
+
+/// CLAUDE-276: `ev`'s failing tests overlap an `open` `ci_failures` row (that
+/// row may or may not itself be on a PR). Attach the run, comment the PR
+/// naming the issue, and run no analysis: the failure is already filed.
+#[allow(clippy::too_many_arguments)]
+async fn route_pr_matches_open_failure(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    branch: &str,
+    test_ids: &[String],
+    m: &ci_failure_store::FailureMatch,
+    pr: &ForgePullRequest,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    let Some(key) = m.issue_key.clone() else {
+        error!(repo = %ev.repo, run = ev.index_in_repo, failure_id = m.id, "open ci_failures row has no issue_key");
+        return WebhookRunSummary::error("ci-failure store row has no issue_key".to_string());
+    };
+    let now = state::now_iso();
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, m.id, test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        m.id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        Some(pr.number as i64),
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    let env = match require_pr_comment_backend(ctx, run_id, ev, host, webhook_cfg).await {
+        Ok(env) => env,
+        Err(summary) => return summary,
+    };
+    let body = format!("This failure is already tracked in {key}; it is not caused by this PR.");
+    let pr_number = pr.number;
+    let repo = ev.repo.clone();
+    let host_owned = host.to_string();
+    let body_file = pr_comment_body_path(&ctx.paths, &ev.repo, pr_number);
+    let result = tokio::task::spawn_blocking(move || {
+        write_and_post_pr_comment(
+            env.backend.as_ref(),
+            &host_owned,
+            &repo,
+            pr_number,
+            &body_file,
+            &body,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "commenting on the human PR failed (continuing)");
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "PR comment task panicked (continuing)");
+        }
+    }
+    WebhookRunSummary::store_decided(&StoreOutcome::Attached { key })
+}
+
+/// CLAUDE-276: `ev`'s failing tests overlap a `pr_only` row: a prior sighting
+/// on some open PR (possibly this same one). If the attach brings the row's
+/// distinct branches to 2 or more, the failure belongs to `main`: mint a real
+/// issue and comment its link onto every PR it was sighted on. Otherwise this
+/// is another sighting of the same still-single-branch failure: analyze again
+/// and comment the PR, same as a fresh sighting.
+#[allow(clippy::too_many_arguments)]
+async fn route_pr_matches_pr_only_failure(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    auto_fix_enabled: bool,
+    job_name: &str,
+    branch: &str,
+    failure_signature: Option<&str>,
+    infra_kind: Option<&str>,
+    test_ids: &[String],
+    log_token: Option<String>,
+    m: &ci_failure_store::FailureMatch,
+    pr: &ForgePullRequest,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    let now = state::now_iso();
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, m.id, test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        m.id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        Some(pr.number as i64),
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    let branches = match ci_failure_store::distinct_branches(&ctx.pool, m.id).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store read failed");
+            return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+        }
+    };
+
+    if branches.len() >= 2 {
+        return mint_for_two_branch_pr_only_failure(
+            ctx,
+            ev,
+            log_text,
+            log_available,
+            log_unavailable_reason,
+            auto_fix_enabled,
+            job_name,
+            branch,
+            failure_signature,
+            infra_kind,
+            log_token,
+            m.id,
+            host,
+            webhook_cfg,
+        )
+        .await;
+    }
+
+    let env = match require_pr_comment_backend(ctx, run_id, ev, host, webhook_cfg).await {
+        Ok(env) => env,
+        Err(summary) => return summary,
+    };
+    match analyze_and_comment_pr(
+        ctx,
+        ev,
+        log_text,
+        log_available,
+        log_unavailable_reason,
+        log_token,
+        pr.number,
+        host,
+        env,
+    )
+    .await
+    {
+        Ok(_) => WebhookRunSummary {
+            text: format!(
+                "commented analysis on PR #{} (pr_only, still one branch)",
+                pr.number
+            ),
+            ok: true,
+        },
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "PR analysis/comment failed");
+            WebhookRunSummary::error(e.to_string())
+        }
+    }
+}
+
+/// CLAUDE-276: a `pr_only` failure's tests just appeared on a second distinct
+/// branch: promote it to a real issue (triage + mint, DEV-335 caps applied and
+/// advanced exactly like a fresh mint), point the existing store row at it
+/// instead of inserting a duplicate, and comment the issue link onto every
+/// open PR the failure was sighted on.
+#[allow(clippy::too_many_arguments)]
+async fn mint_for_two_branch_pr_only_failure(
+    ctx: &MintContext,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    auto_fix_enabled: bool,
+    job_name: &str,
+    branch: &str,
+    failure_signature: Option<&str>,
+    infra_kind: Option<&str>,
+    log_token: Option<String>,
+    failure_id: i64,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
+    let attempts = state::attempts_get(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key)
+        .await
+        .unwrap_or(0);
+    let daily = state::daily_count_get(&ctx.pool, WEBHOOK_MINT_ACTION)
+        .await
+        .unwrap_or(0);
+    let caps = MintCaps {
+        attempts,
+        max_attempts: ctx.defaults.max_attempts_per_key,
+        daily,
+        max_runs_per_day: ctx.defaults.max_runs_per_day,
+    };
+
+    let backend = ctx.backend.clone();
+    let classifier = ctx.classifier.clone();
+    let audit = crate::provider::IssueWriteAudit::new(None, ctx.defaults.max_issues_per_run);
+    let mint_cfg = ctx.mint_cfg.read().await.clone();
+    let route_cache = ctx.route_cache.clone();
+    let event = ev.clone();
+    let job_name_owned = job_name.to_string();
+    let branch_owned = branch.to_string();
+    let sig_owned = failure_signature.map(str::to_string);
+    let infra_owned = infra_kind.map(str::to_string);
+
+    let decision = tokio::task::spawn_blocking(
+        move || -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
+            let tracker = crate::provider::AuditedTracker::new(backend.as_ref(), audit);
+            let input = TriageInput {
+                repo: event.repo.clone(),
+                workflow_id: event.workflow_id.clone(),
+                commit_sha: event.commit_sha.clone(),
+                html_url: event.html_url.clone(),
+                log: log_text,
+                log_available,
+                log_unavailable_reason,
+                has_open_pr: true,
+                log_token,
+            };
+            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+            let req = MintRequest {
+                repo: &event.repo,
+                index_in_repo: event.index_in_repo,
+                commit_sha: &event.commit_sha,
+                workflow_id: &event.workflow_id,
+                branch: &branch_owned,
+                job_name: &job_name_owned,
+                failure_signature: sig_owned.as_deref(),
+                infra_kind: infra_owned.as_deref(),
+                html_url: &event.html_url,
+                trigger_user: &event.trigger_user,
+                triage: &verdict,
+                log_path: None,
+                private: event.private,
+                has_open_pr: true,
+                auto_fix_enabled,
+            };
+            let outcome = mint::mint(&tracker, &mint_cfg, route_cache.as_ref(), &req, &caps)?;
+            Ok((verdict.bucket, outcome))
+        },
+    )
+    .await;
+
+    let (bucket, outcome) = match decision {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "two-branch mint failed");
+            return WebhookRunSummary::error(e.to_string());
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "two-branch mint task panicked");
+            return WebhookRunSummary::error(format!("task panicked: {e}"));
+        }
+    };
+
+    let key = match &outcome {
+        MintOutcome::Created { key, .. } => key.clone(),
+        other => {
+            log_mint_outcome(ev, other);
+            return WebhookRunSummary::decided(bucket, other);
+        }
+    };
+
+    if let Err(e) = state::attempts_increment(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key).await {
+        warn!(error = %e, "advancing webhook attempt counter failed");
+    }
+    if let Err(e) = state::daily_count_increment(&ctx.pool, WEBHOOK_MINT_ACTION).await {
+        warn!(error = %e, "advancing webhook daily ledger failed");
+    }
+
+    let now = state::now_iso();
+    if let Err(e) = ci_failure_store::set_issue(&ctx.pool, failure_id, Some(&key), &now).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::set_failure_state(&ctx.pool, failure_id, "open", &now).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    let pr_numbers = ci_failure_store::pr_numbers_for_failure(&ctx.pool, failure_id)
+        .await
+        .unwrap_or_default();
+    if !pr_numbers.is_empty() {
+        match require_pr_comment_backend(ctx, None, ev, host, webhook_cfg).await {
+            Ok(env) => {
+                let body =
+                    format!("Filed as {key}; the same failure was seen on another branch's PR.");
+                let repo = ev.repo.clone();
+                let host_owned = host.to_string();
+                let backend = env.backend;
+                let paths = ctx.paths.clone();
+                let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
+                    for pr_number in pr_numbers {
+                        let body_file = pr_comment_body_path(&paths, &repo, pr_number as u64);
+                        write_and_post_pr_comment(
+                            backend.as_ref(),
+                            &host_owned,
+                            &repo,
+                            pr_number as u64,
+                            &body_file,
+                            &body,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "commenting the issue link onto a PR failed (continuing)");
+                    }
+                    Err(e) => {
+                        warn!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "commenting the issue link onto every PR task panicked (continuing)");
+                    }
+                }
+            }
+            Err(_) => {
+                // Already logged and recorded by require_pr_comment_backend; the
+                // issue itself is already filed, so this is best-effort only.
+            }
+        }
+    }
+
+    log_mint_outcome(ev, &outcome);
+    WebhookRunSummary::decided(bucket, &outcome)
+}
+
+/// CLAUDE-276: `ev`'s failing tests matched no store row at all, on an open PR
+/// that is not the agent's own: the first sighting of this failure. Run the
+/// analysis, comment it on the PR (always), and record a `pr_only` row - no
+/// issue yet.
+#[allow(clippy::too_many_arguments)]
+async fn route_new_pr_only_failure(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_unavailable_reason: Option<String>,
+    job_name: &str,
+    branch: &str,
+    infra_kind: Option<&str>,
+    test_ids: &[String],
+    log_token: Option<String>,
+    pr: &ForgePullRequest,
+    host: &str,
+    webhook_cfg: &WebhookConfig,
+) -> WebhookRunSummary {
+    let env = match require_pr_comment_backend(ctx, run_id, ev, host, webhook_cfg).await {
+        Ok(env) => env,
+        Err(summary) => return summary,
+    };
+    if let Err(e) = analyze_and_comment_pr(
+        ctx,
+        ev,
+        log_text,
+        log_available,
+        log_unavailable_reason,
+        log_token,
+        pr.number,
+        host,
+        env,
+    )
+    .await
+    {
+        warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "PR analysis/comment failed");
+        return WebhookRunSummary::error(e.to_string());
+    }
+
+    let now = state::now_iso();
+    let id = match ci_failure_store::record_failure(
+        &ctx.pool,
+        &ev.repo,
+        &ev.workflow_id,
+        job_name,
+        infra_kind,
+        None,
+        "pr_only",
+        &now,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
+            return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+        }
+    };
+    if let Err(e) = ci_failure_store::add_tests(&ctx.pool, id, test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    if let Err(e) = ci_failure_store::attach_run(
+        &ctx.pool,
+        id,
+        ev.index_in_repo,
+        &ev.commit_sha,
+        branch,
+        Some(pr.number as i64),
+        &now,
+    )
+    .await
+    {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+
+    WebhookRunSummary {
+        text: format!(
+            "commented analysis on PR #{}; no issue (pr_only, first sighting)",
+            pr.number
+        ),
+        ok: true,
+    }
+}
+
+/// CLAUDE-273: the classify + mint path for a failure the `ci_failure` store
+/// does not yet track (`none`) or that is on an open PR (`pr_only`, treated as
+/// `none` here; the PR-routing issue owns that case). One legacy adoption
+/// lookup runs first (an issue minted before the store existed); on a miss,
+/// this is the pre-existing triage + mint pipeline, and a `Created` outcome
+/// (or a legacy hit) is recorded into the store so the next sighting matches.
+#[allow(clippy::too_many_arguments)]
+async fn classify_and_mint(
+    ctx: &MintContext,
+    run_id: Option<i64>,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_artifact: Option<PathBuf>,
+    log_unavailable_reason: Option<String>,
+    auto_fix_enabled: bool,
+    job_name: String,
+    branch: String,
+    failure_signature: Option<String>,
+    infra_kind: Option<String>,
+    test_ids: Vec<String>,
+    log_token: Option<String>,
 ) -> WebhookRunSummary {
     // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
     // run's (repo, index); the daily ledger is per synthetic action. The
@@ -896,20 +2549,30 @@ async fn triage_and_mint(
 
     let backend = ctx.backend.clone();
     let classifier = ctx.classifier.clone();
+    // CLAUDE-234: this delivery's own issue-write ledger. The backend is
+    // daemon-lifetime and shared by every delivery, so the ledger is built per
+    // run here rather than held on the backend: that is what keeps the ceiling
+    // and the `run_id` on each write line belonging to THIS run.
+    let audit = crate::provider::IssueWriteAudit::new(run_id, ctx.defaults.max_issues_per_run);
     // CLAUDE-101: snapshot the live mint config for this event; the next event
     // re-reads, so a Settings save in between is honored without a restart.
     let mint_cfg = ctx.mint_cfg.read().await.clone();
     let route_cache = ctx.route_cache.clone();
     let event = ev.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let branch_for_blocking = branch.clone();
+    let job_name_for_blocking = job_name.clone();
+    let sig_for_blocking = failure_signature.clone();
+    let infra_for_blocking = infra_kind.clone();
+    let decision = tokio::task::spawn_blocking(move || {
         let report_stage = move |stage: &'static str| {
             let _ = stage_tx.send(stage);
         };
         report_stage(STAGE_TRIAGING);
         let has_open_pr = resolve_has_open_pr(backend.as_ref(), &event);
-        decide_mint(
+        let tracker = crate::provider::AuditedTracker::new(backend.as_ref(), audit);
+        decide_with_legacy_adoption(
             classifier.as_ref(),
-            backend.as_ref(),
+            &tracker,
             &mint_cfg,
             route_cache.as_ref(),
             &caps,
@@ -920,15 +2583,19 @@ async fn triage_and_mint(
             log_unavailable_reason,
             has_open_pr,
             auto_fix_enabled,
-            &job_name,
+            &job_name_for_blocking,
+            &branch_for_blocking,
+            sig_for_blocking.as_deref(),
+            infra_for_blocking.as_deref(),
+            log_token,
             &report_stage,
         )
     })
     .await;
     let _ = stage_drainer.await;
 
-    let (bucket, outcome) = match outcome {
-        Ok(Ok(o)) => o,
+    let decision = match decision {
+        Ok(Ok(d)) => d,
         Ok(Err(e)) => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "triage/mint failed");
             return WebhookRunSummary::error(e.to_string());
@@ -939,27 +2606,128 @@ async fn triage_and_mint(
         }
     };
 
-    // Advance the caps ledger only on a real mint, so repeated failures for the
-    // same key (and a busy day) throttle exactly like the scheduled path. Skips
-    // (transient, dedupe, cap-hit, loop) create no issue and must not count.
-    if matches!(outcome, MintOutcome::Created { .. }) {
-        if let Err(e) = state::attempts_increment(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key).await {
-            warn!(error = %e, "advancing webhook attempt counter failed");
+    match decision {
+        DecideOutcome::LegacyAdopted { key } => {
+            if let Err(e) = record_new_store_row(
+                &ctx.pool,
+                ev,
+                &job_name,
+                infra_kind.as_deref(),
+                &key,
+                &branch,
+                &test_ids,
+            )
+            .await
+            {
+                error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
+                return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+            }
+            WebhookRunSummary::store_decided(&StoreOutcome::Adopted { key })
         }
-        if let Err(e) = state::daily_count_increment(&ctx.pool, WEBHOOK_MINT_ACTION).await {
-            warn!(error = %e, "advancing webhook daily ledger failed");
+        DecideOutcome::Mint(bucket, outcome) => {
+            // Advance the caps ledger only on a real mint, so repeated failures
+            // for the same key (and a busy day) throttle exactly like the
+            // scheduled path. Skips (transient, cap-hit, loop, open-PR) create
+            // no issue and must not count.
+            if matches!(outcome, MintOutcome::Created { .. }) {
+                if let Err(e) =
+                    state::attempts_increment(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key).await
+                {
+                    warn!(error = %e, "advancing webhook attempt counter failed");
+                }
+                if let Err(e) = state::daily_count_increment(&ctx.pool, WEBHOOK_MINT_ACTION).await {
+                    warn!(error = %e, "advancing webhook daily ledger failed");
+                }
+            }
+            if let MintOutcome::Created { key, .. } = &outcome {
+                if let Err(e) = record_new_store_row(
+                    &ctx.pool,
+                    ev,
+                    &job_name,
+                    infra_kind.as_deref(),
+                    key,
+                    &branch,
+                    &test_ids,
+                )
+                .await
+                {
+                    error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "ci-failure store write failed");
+                    return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+                }
+            }
+            log_mint_outcome(ev, &outcome);
+            WebhookRunSummary::decided(bucket, &outcome)
         }
     }
+}
 
-    log_mint_outcome(ev, &outcome);
-    WebhookRunSummary::decided(bucket, &outcome)
+/// CLAUDE-273: one legacy adoption lookup, then the ordinary triage + mint
+/// pipeline. Factored out from [`classify_and_mint`] so the blocking work (the
+/// legacy search, triage, and mint all shell out) stays inside one
+/// `spawn_blocking` task. Returns [`DecideOutcome::LegacyAdopted`] on a legacy
+/// hit (no triage, no mint) or [`DecideOutcome::Mint`] otherwise.
+#[allow(clippy::too_many_arguments)]
+fn decide_with_legacy_adoption(
+    classifier: &dyn FailureClassifier,
+    tracker: &dyn crate::provider::IssueTracker,
+    mint_cfg: &MintConfig,
+    route_cache: &VcsRouteCache,
+    caps: &MintCaps,
+    ev: &VerifiedFailureEvent,
+    log_text: String,
+    log_available: bool,
+    log_artifact: Option<&std::path::Path>,
+    log_unavailable_reason: Option<String>,
+    has_open_pr: bool,
+    auto_fix_enabled: bool,
+    job_name: &str,
+    branch: &str,
+    failure_signature: Option<&str>,
+    infra_kind: Option<&str>,
+    log_token: Option<String>,
+    report_stage: &(dyn Fn(&'static str) + Send + Sync),
+) -> crate::error::Result<DecideOutcome> {
+    // CLAUDE-273: before spending a `claude` classification, check whether this
+    // exact collapse key already has an issue minted before the `ci_failure`
+    // store existed (the caller already established this is a store miss).
+    let collapse = mint::legacy_collapse_key(
+        &ev.repo,
+        branch,
+        &ev.workflow_id,
+        job_name,
+        failure_signature,
+        infra_kind,
+    );
+    if let Some(existing) = mint::find_first(tracker, &format!("{collapse} #Unresolved"))? {
+        return Ok(DecideOutcome::LegacyAdopted { key: existing });
+    }
+    let (bucket, outcome) = decide_mint(
+        classifier,
+        tracker,
+        mint_cfg,
+        route_cache,
+        caps,
+        ev,
+        log_text,
+        log_available,
+        log_artifact,
+        log_unavailable_reason,
+        has_open_pr,
+        auto_fix_enabled,
+        job_name,
+        log_token,
+        report_stage,
+    )?;
+    Ok(DecideOutcome::Mint(bucket, outcome))
 }
 
 /// Pure triage + mint composition over the two traits, with `has_open_pr`
-/// already resolved. Factored out so the bucket routing and dedupe are unit
-/// tested against stub a classifier / tracker with no forge, DB, or process
-/// spawn. Builds the [`TriageInput`], runs the hybrid [`triage::triage`], then
-/// [`mint::mint`] on the result.
+/// already resolved. Factored out so the bucket routing is unit tested against
+/// a stub classifier / tracker with no forge, DB, or process spawn. Builds the
+/// [`TriageInput`], runs the hybrid [`triage::triage`], then [`mint::mint`] on
+/// the result. CLAUDE-273: dedupe by failing-test overlap is decided by the
+/// caller against the `ci_failure` store before this is ever reached, so this
+/// function itself issues no dedupe search.
 #[allow(clippy::too_many_arguments)]
 fn decide_mint(
     classifier: &dyn FailureClassifier,
@@ -975,6 +2743,7 @@ fn decide_mint(
     has_open_pr: bool,
     auto_fix_enabled: bool,
     job_name: &str,
+    log_token: Option<String>,
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
 ) -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
     // CLAUDE-190: derive the deterministic failure signature and the branch from
@@ -984,6 +2753,19 @@ fn decide_mint(
     // (`resolve_branch` keeps the run-detail arm for instances that populate it).
     let failure_signature = crate::mint::failure_signature(&log_text);
     let branch = crate::forge_log::resolve_branch(None, &log_text).unwrap_or_default();
+    // CLAUDE-264: the infrastructure detector reads the SAME full redacted log,
+    // not the bounded copy the classifier prompt gets, because a capacity abort
+    // is post-steps and is exactly what the bound cuts.
+    let infra = crate::infra_failure::detect(&log_text);
+    if let Some(f) = &infra {
+        info!(
+            repo = %ev.repo,
+            run = ev.index_in_repo,
+            kind = %f.kind,
+            problem = %f.problem,
+            "infrastructure failure detected; collapsing on the branch-agnostic dedupe key"
+        );
+    }
     let input = TriageInput {
         repo: ev.repo.clone(),
         workflow_id: ev.workflow_id.clone(),
@@ -993,6 +2775,7 @@ fn decide_mint(
         log_available,
         log_unavailable_reason,
         has_open_pr,
+        log_token,
     };
     // CLAUDE-80: the classify stage only exists when the deterministic rules
     // abstain, so the label is reported from inside the classifier call rather
@@ -1011,6 +2794,7 @@ fn decide_mint(
         branch: &branch,
         job_name,
         failure_signature: failure_signature.as_deref(),
+        infra_kind: infra.as_ref().map(|f| f.kind.as_str()),
         html_url: &ev.html_url,
         trigger_user: &ev.trigger_user,
         triage: &verdict,
@@ -1091,29 +2875,11 @@ fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
         MintOutcome::SkippedTransient => {
             info!(repo = %ev.repo, run = ev.index_in_repo, "transient failure; minted nothing")
         }
-        MintOutcome::SkippedBotLoop => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, trigger_user = %ev.trigger_user, "bot-loop guard; minted nothing")
-        }
-        MintOutcome::SkippedOpenPr => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, "open PR for this run; auto-fix suppressed (CLAUDE-149), minted nothing")
-        }
-        MintOutcome::SkippedAutoFixDisabled => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, "webhook auto-fix toggle off (CLAUDE-153); no fixup queued, failure left on the PR")
-        }
         MintOutcome::SkippedAttemptCap => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, "per-key attempt cap reached; minted nothing")
         }
         MintOutcome::SkippedDailyCap => {
             warn!(repo = %ev.repo, run = ev.index_in_repo, "daily run cap reached; minted nothing")
-        }
-        MintOutcome::SkippedDuplicateOpen { existing } => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, %existing, "open issue already exists; minted nothing")
-        }
-        MintOutcome::SkippedResolved { existing } => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, %existing, "resolved issue exists; not reopening")
-        }
-        MintOutcome::AssociatedWithOpen { existing } => {
-            info!(repo = %ev.repo, run = ev.index_in_repo, %existing, "grouped onto existing open issue; minted nothing")
         }
     }
 }
@@ -1226,6 +2992,31 @@ async fn forgejo_webhook(
     if paused_accept_and_drop(&st.pool, WEBHOOK_MINT_ACTION, &source, delivery).await {
         return StatusCode::OK.into_response();
     }
+    if login_required_accept_and_drop(&st, &source, delivery).await {
+        return StatusCode::OK.into_response();
+    }
+
+    // CLAUDE-277: dispatch on the event-type header before parsing. A
+    // pull-request delivery takes its own path; an empty/missing header or an
+    // Action-run header keeps the pre-existing path below; anything else is an
+    // event type this endpoint does not handle, acked and dropped.
+    let event_type = headers
+        .get(EVENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if event_type == PULL_REQUEST_EVENT_TYPE {
+        return handle_pull_request_delivery(&st, &src_cfg, &source, delivery, &body).await;
+    }
+    if !event_type.is_empty() && !event_type.starts_with(ACTION_RUN_EVENT_PREFIX) {
+        info!(
+            source = %source,
+            delivery,
+            event = %event_type,
+            "forgejo webhook delivery of an unhandled event type acked and dropped"
+        );
+        return StatusCode::OK.into_response();
+    }
 
     // Parse only after the request is authenticated and de-duplicated.
     let payload: ActionPayload = match serde_json::from_slice(&body) {
@@ -1235,6 +3026,13 @@ async fn forgejo_webhook(
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
+
+    // CLAUDE-278: a `success` or `recover` action is routed to the automerge
+    // success-event pipeline instead of `verified_failure_event`, which only
+    // ever keeps `failure`.
+    if payload.action == "success" || payload.action == "recover" {
+        return handle_action_success(&st, &src_cfg, &source, delivery, &payload).await;
+    }
 
     match verified_failure_event(&payload, &src_cfg.allowed_repos, &source) {
         Some(event) => {
@@ -1262,6 +3060,617 @@ async fn forgejo_webhook(
                 "forgejo webhook event dropped"
             );
             StatusCode::OK.into_response()
+        }
+    }
+}
+
+/// CLAUDE-278: parse and route an authenticated, de-duplicated `success` or
+/// `recover` Action-run delivery: an agent PR's checks may have just gone
+/// green. Repo-allow-listed only; which PR (if any) this belongs to, and
+/// whether automerge is even enabled for it, are resolved downstream in
+/// `process_action_success_event` so a slow forge call never blocks the HTTP
+/// response.
+async fn handle_action_success(
+    st: &WebhookState,
+    src_cfg: &WebhookSource,
+    source: &str,
+    delivery: &str,
+    payload: &ActionPayload,
+) -> Response {
+    let repo = &payload.run.repository.full_name;
+    if !repo_allowed(&src_cfg.allowed_repos, repo) {
+        info!(
+            source = %source,
+            delivery,
+            action = %payload.action,
+            repo = %repo,
+            "forgejo webhook event dropped: repo not in allowed_repos"
+        );
+        return StatusCode::OK.into_response();
+    }
+    let event = VerifiedActionSuccessEvent {
+        repo: repo.clone(),
+        commit_sha: payload.run.commit_sha.clone(),
+        html_url: payload.run.html_url.clone(),
+        source: source.to_string(),
+    };
+    let Some(sender) = &st.success_events else {
+        info!(
+            source = %source,
+            delivery,
+            repo = %event.repo,
+            "action-run success event accepted but no success_events channel is configured; dropping"
+        );
+        return StatusCode::OK.into_response();
+    };
+    if sender.send(event).await.is_err() {
+        warn!(source = %source, delivery, "action-run success event channel closed; dropping event");
+    }
+    StatusCode::ACCEPTED.into_response()
+}
+
+/// CLAUDE-277: parse and route an authenticated, de-duplicated `pull_request`
+/// delivery. Only a terminal `closed` action does anything; every other
+/// action (`opened`, `edited`, `synchronized`, ...) and a repo outside the
+/// source's allow-list is acked and dropped, exactly like the Action-run
+/// path's own ack-drop branch.
+async fn handle_pull_request_delivery(
+    st: &WebhookState,
+    src_cfg: &WebhookSource,
+    source: &str,
+    delivery: &str,
+    body: &Bytes,
+) -> Response {
+    let payload: PullRequestPayload = match serde_json::from_slice(body) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(source = %source, delivery, error = %e, "forgejo pull_request payload parse failed");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
+    if payload.action != PR_ACTION_CLOSED {
+        info!(
+            source = %source,
+            delivery,
+            action = %payload.action,
+            repo = %payload.repository.full_name,
+            "pull_request event dropped: non-terminal action"
+        );
+        return StatusCode::OK.into_response();
+    }
+    if !repo_allowed(&src_cfg.allowed_repos, &payload.repository.full_name) {
+        info!(
+            source = %source,
+            delivery,
+            repo = %payload.repository.full_name,
+            "pull_request event dropped: repo not in allowed_repos"
+        );
+        return StatusCode::OK.into_response();
+    }
+
+    let event = VerifiedPullRequestEvent {
+        repo: payload.repository.full_name.clone(),
+        number: payload.number,
+        merged: payload.pull_request.merged,
+        head_sha: payload.pull_request.head.sha.clone(),
+        head_ref: payload.pull_request.head.git_ref.clone(),
+        html_url: payload.pull_request.html_url.clone(),
+        source: source.to_string(),
+    };
+
+    let Some(sender) = &st.pr_events else {
+        warn!(
+            source = %source,
+            delivery,
+            repo = %event.repo,
+            number = event.number,
+            "pull_request event accepted but no pr_events channel is configured; dropping"
+        );
+        return StatusCode::OK.into_response();
+    };
+    if sender.send(event).await.is_err() {
+        warn!(source = %source, delivery, "pull-request event channel closed; dropping event");
+    }
+    StatusCode::ACCEPTED.into_response()
+}
+
+/// CLAUDE-277: drain verified `pull_request` deliveries for the lifetime of
+/// the daemon, mirroring [`consume_events`]'s shape. `mint` carries the
+/// backend + store access every close/left-open/mark-merged decision needs;
+/// `None` (no usable provider backend) drops every event with a log, the same
+/// degrade-to-log-only behaviour the Action-run path takes.
+pub async fn consume_pr_events(
+    mut rx: mpsc::Receiver<VerifiedPullRequestEvent>,
+    pool: DbPool,
+    mint: Option<MintContext>,
+    webhook_cfg: Arc<RwLock<WebhookConfig>>,
+    keygate: crate::concurrency::KeyGate,
+) {
+    let mint = mint.map(Arc::new);
+    let mut tasks = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        let pool = pool.clone();
+        let mint = mint.clone();
+        let webhook_cfg = webhook_cfg.clone();
+        let keygate = keygate.clone();
+        tasks.push(tokio::spawn(async move {
+            process_pr_event(ev, pool, mint, webhook_cfg, keygate).await;
+        }));
+        tasks.retain(|t| !t.is_finished());
+    }
+    for t in tasks {
+        if let Err(e) = t.await {
+            warn!(error = %e, "a pull-request webhook event task panicked");
+        }
+    }
+}
+
+/// CLAUDE-277: one merged-or-closed PR's whole handling: mark its
+/// `agent_pull_requests` row (merged / closed), and on a merge, close or leave
+/// open every open store failure the PR references.
+async fn process_pr_event(
+    ev: VerifiedPullRequestEvent,
+    pool: DbPool,
+    mint: Option<Arc<MintContext>>,
+    webhook_cfg: Arc<RwLock<WebhookConfig>>,
+    keygate: crate::concurrency::KeyGate,
+) {
+    let Some(mint) = mint else {
+        info!(
+            repo = %ev.repo,
+            number = ev.number,
+            "pull-request event dropped: no usable provider backend (mint disabled)"
+        );
+        return;
+    };
+
+    // CLAUDE-274-style: one key per (repo, PR), so two deliveries of the same
+    // PR (a retried delivery, or closed-then-reopened-then-merged in quick
+    // succession) never race each other's store/issue writes.
+    let key = format!("{}#{}", ev.repo, ev.number);
+    let _key_guard = keygate.acquire(&key).await;
+
+    let Some(host) = forge_host_from_url(&ev.html_url) else {
+        warn!(repo = %ev.repo, number = ev.number, html_url = %ev.html_url, "could not derive forge host from pull_request html_url");
+        return;
+    };
+
+    let job_key = format!("pr-{}-{}", ev.repo.replace('/', "_"), ev.number);
+    let run_id = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
+
+    let result = if ev.merged {
+        let webhook_cfg = webhook_cfg.read().await.clone();
+        let token = source_log_token(&pool, &webhook_cfg, &ev.source).await;
+        handle_merged_pr(&mint, &pool, &host, &ev, token).await
+    } else {
+        handle_closed_unmerged_pr(&pool, &host, &ev).await
+    };
+
+    let (ok, summary) = match &result {
+        Ok(s) => (true, s.clone()),
+        Err(e) => {
+            warn!(repo = %ev.repo, number = ev.number, error = %e, "pull-request event handling failed");
+            (false, e.clone())
+        }
+    };
+    finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None).await;
+}
+
+/// CLAUDE-277: a PR closed WITHOUT merging. The only action is marking the
+/// agent's own PR record `closed` when one exists; a human's PR (no record)
+/// changes nothing.
+async fn handle_closed_unmerged_pr(
+    pool: &DbPool,
+    host: &str,
+    ev: &VerifiedPullRequestEvent,
+) -> Result<String, String> {
+    let row = ci_failure_store::agent_pr(pool, host, &ev.repo, ev.number)
+        .await
+        .map_err(|e| format!("agent_pull_requests lookup failed: {e}"))?;
+    let Some(row) = row else {
+        return Ok(format!(
+            "PR #{} closed without merging; no agent_pull_requests row",
+            ev.number
+        ));
+    };
+    let now = state::now_iso();
+    ci_failure_store::set_agent_pr_state(pool, row.id, "closed", &now)
+        .await
+        .map_err(|e| format!("marking agent_pull_requests closed failed: {e}"))?;
+    Ok(format!(
+        "agent PR #{} closed without merging; marked closed",
+        ev.number
+    ))
+}
+
+/// CLAUDE-277: a merged PR. Marks the agent's own PR record `merged` when one
+/// exists, collects every open store failure the PR references (its own
+/// agent-PR issue key, plus [`Forge::pr_referenced_issues`]), and for each,
+/// closes the issue when the failing workflow is green at the PR's head
+/// commit, else leaves it open with an explanatory comment.
+async fn handle_merged_pr(
+    mint: &MintContext,
+    pool: &DbPool,
+    host: &str,
+    ev: &VerifiedPullRequestEvent,
+    log_token: Option<String>,
+) -> Result<String, String> {
+    let now = state::now_iso();
+
+    let agent_row = ci_failure_store::agent_pr(pool, host, &ev.repo, ev.number)
+        .await
+        .map_err(|e| format!("agent_pull_requests lookup failed: {e}"))?;
+    if let Some(row) = &agent_row {
+        ci_failure_store::set_agent_pr_state(pool, row.id, "merged", &now)
+            .await
+            .map_err(|e| format!("marking agent_pull_requests merged failed: {e}"))?;
+    }
+
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(row) = &agent_row {
+        keys.push(row.issue_key.clone());
+    }
+    let backend = mint.backend.clone();
+    let host_owned = host.to_string();
+    let repo = ev.repo.clone();
+    let number = ev.number as u64;
+    let referenced = tokio::task::spawn_blocking(move || {
+        backend.pr_referenced_issues(&host_owned, &repo, number)
+    })
+    .await
+    .map_err(|e| format!("pr_referenced_issues task panicked: {e}"))?
+    .map_err(|e| format!("pr_referenced_issues failed: {e}"))?;
+    for k in referenced {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+
+    if keys.is_empty() {
+        return Ok(format!(
+            "PR #{} merged; no linked issue keys found",
+            ev.number
+        ));
+    }
+
+    let mint_cfg = mint.mint_cfg.read().await.clone();
+    let mut summaries = Vec::new();
+    for key in keys {
+        let failure = match ci_failure_store::failure_for_issue(pool, &key).await {
+            Ok(Some(f)) if f.state == "open" => f,
+            Ok(_) => continue,
+            Err(e) => {
+                summaries.push(format!("{key}: store read failed: {e}"));
+                continue;
+            }
+        };
+        match close_or_leave_open(
+            mint,
+            pool,
+            host,
+            ev,
+            log_token.as_deref(),
+            &mint_cfg,
+            &key,
+            &failure,
+        )
+        .await
+        {
+            Ok(s) => summaries.push(s),
+            Err(e) => summaries.push(format!("{key}: {e}")),
+        }
+    }
+    Ok(summaries.join("; "))
+}
+
+/// CLAUDE-277: paged deep enough to find a run that finished moments ago (this
+/// fires right at merge time, not a scan over deep history), the same shape
+/// the reconciler's own page ceiling uses for the same reason.
+const MERGE_CHECK_MAX_PAGES: u32 = 10;
+
+/// CLAUDE-277: the per-issue decision - find the failing workflow's run at the
+/// merged PR's head commit ("failing workflow green at the head commit" is a
+/// RUN-level status, not a job-level one: the acceptance criterion speaks of
+/// the workflow, not a specific job within it), then close the issue when it
+/// is green, or comment "left open" when it is red or no run was found.
+#[allow(clippy::too_many_arguments)]
+async fn close_or_leave_open(
+    mint: &MintContext,
+    pool: &DbPool,
+    host: &str,
+    ev: &VerifiedPullRequestEvent,
+    log_token: Option<&str>,
+    mint_cfg: &MintConfig,
+    key: &str,
+    failure: &ci_failure_store::Failure,
+) -> Result<String, String> {
+    let runs =
+        match mint
+            .commit_runs
+            .list_commit_runs(host, &ev.repo, MERGE_CHECK_MAX_PAGES, log_token)
+        {
+            crate::forge_log::CommitRunsOutcome::Resolved(r) => r,
+            crate::forge_log::CommitRunsOutcome::NotFound => Vec::new(),
+            crate::forge_log::CommitRunsOutcome::AuthDenied(code) => {
+                return Err(format!("commit-runs list auth denied ({code})"));
+            }
+            crate::forge_log::CommitRunsOutcome::Failed(reason) => {
+                return Err(format!("commit-runs list failed: {reason}"));
+            }
+        };
+    let matched =
+        crate::ci_failure::close::latest_run_at_commit(&runs, &failure.workflow_id, &ev.head_sha)
+            .cloned();
+
+    match matched {
+        Some(run) if crate::ci_failure::close::is_green(&run.status) => {
+            let backend = mint.backend.clone();
+            let key_owned = key.to_string();
+            let state_owned = mint_cfg.resolved_state.clone();
+            let body = format!(
+                "Closed: {} merged and `{}` is green at {}.",
+                ev.html_url, failure.workflow_id, run.html_url
+            );
+            let body_for_task = body.clone();
+            let close_result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
+                backend.set_state(&key_owned, &state_owned)?;
+                backend.comment(&key_owned, &body_for_task)?;
+                Ok(())
+            })
+            .await;
+            match close_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(format!("closing issue failed: {e}")),
+                Err(e) => return Err(format!("close task panicked: {e}")),
+            }
+            let now = state::now_iso();
+            ci_failure_store::set_failure_state(pool, failure.id, "resolved", &now)
+                .await
+                .map_err(|e| format!("store resolve failed: {e}"))?;
+            Ok(format!("closed ({body})"))
+        }
+        other => {
+            let workflow_url = other.map(|r| r.html_url);
+            let body = match workflow_url {
+                Some(url) => format!(
+                    "Merged without a green `{}` run; left open. PR: {}. Run: {url}.",
+                    failure.workflow_id, ev.html_url
+                ),
+                None => format!(
+                    "Merged without a green `{}` run; left open. PR: {}. No run found at the head commit.",
+                    failure.workflow_id, ev.html_url
+                ),
+            };
+            let backend = mint.backend.clone();
+            let key_owned = key.to_string();
+            let body_for_task = body.clone();
+            let comment_result =
+                tokio::task::spawn_blocking(move || backend.comment(&key_owned, &body_for_task))
+                    .await;
+            match comment_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(format!("left-open comment failed: {e}")),
+                Err(e) => return Err(format!("left-open comment task panicked: {e}")),
+            }
+            Ok(format!("left open ({body})"))
+        }
+    }
+}
+
+/// CLAUDE-278: drain verified `success`/`recover` Action-run deliveries for the
+/// lifetime of the daemon, mirroring [`consume_pr_events`]'s shape. `mint`
+/// carries the backend every routing decision needs; `None` (no usable
+/// provider backend) drops every event with a log, the same degrade-to-log-only
+/// behaviour the other two Action-run consumers take.
+pub async fn consume_action_success_events(
+    mut rx: mpsc::Receiver<VerifiedActionSuccessEvent>,
+    pool: DbPool,
+    mint: Option<MintContext>,
+    keygate: crate::concurrency::KeyGate,
+) {
+    let mint = mint.map(Arc::new);
+    let mut tasks = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        let pool = pool.clone();
+        let mint = mint.clone();
+        let keygate = keygate.clone();
+        tasks.push(tokio::spawn(async move {
+            process_action_success_event(ev, pool, mint, keygate).await;
+        }));
+        tasks.retain(|t| !t.is_finished());
+    }
+    for t in tasks {
+        if let Err(e) = t.await {
+            warn!(error = %e, "an action-run success webhook event task panicked");
+        }
+    }
+}
+
+/// CLAUDE-278: one success event's whole handling. Finds the open PR matching
+/// the run's commit, looks it up in `agent_pull_requests`, and (only when it
+/// is a recorded, still-open agent PR whose action has automerge enabled)
+/// reads the PR's CI status and merges it, comments that it needs a branch
+/// update, or does nothing while checks are still pending - `finalize` no
+/// longer polls, so this event is the only thing that ever looks again.
+async fn process_action_success_event(
+    ev: VerifiedActionSuccessEvent,
+    pool: DbPool,
+    mint: Option<Arc<MintContext>>,
+    keygate: crate::concurrency::KeyGate,
+) {
+    let Some(mint) = mint else {
+        info!(
+            repo = %ev.repo,
+            commit = %ev.commit_sha,
+            "action-run success event dropped: no usable provider backend (mint disabled)"
+        );
+        return;
+    };
+
+    let Some(host) = forge_host_from_url(&ev.html_url) else {
+        warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge host from action-run html_url");
+        return;
+    };
+
+    let backend = mint.backend.clone();
+    let host_for_list = host.clone();
+    let repo_for_list = ev.repo.clone();
+    let prs = match tokio::task::spawn_blocking(move || {
+        backend.list_open_prs(&host_for_list, &repo_for_list)
+    })
+    .await
+    {
+        Ok(Ok(prs)) => prs,
+        Ok(Err(e)) => {
+            warn!(repo = %ev.repo, error = %e, "action-run success: list_open_prs failed");
+            return;
+        }
+        Err(e) => {
+            warn!(repo = %ev.repo, error = %e, "action-run success: list_open_prs task panicked");
+            return;
+        }
+    };
+    let Some(pr) = pr_matching_commit(&prs, &ev.commit_sha) else {
+        info!(repo = %ev.repo, commit = %ev.commit_sha, "action-run success: no open PR matches the commit; dropping");
+        return;
+    };
+    let pr_number = pr.number;
+    let pr_url = pr.html_url.clone();
+
+    // CLAUDE-274-style: one key per (repo, PR), so two success deliveries for
+    // the same PR never race each other's merge / comment.
+    let key = format!("{}#{}", ev.repo, pr_number);
+    let _key_guard = keygate.acquire(&key).await;
+
+    let job_key = format!("automerge-{}-{}", ev.repo.replace('/', "_"), pr_number);
+    let run_id = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
+
+    let result =
+        handle_action_success_for_pr(&mint, &pool, &host, &ev.repo, pr_number, &pr_url).await;
+
+    let (ok, summary) = match &result {
+        Ok(s) => (true, s.clone()),
+        Err(e) => (false, e.clone()),
+    };
+    if !ok {
+        warn!(repo = %ev.repo, pr = pr_number, error = %summary, "action-run success handling failed");
+    }
+    finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None).await;
+}
+
+/// CLAUDE-278: the per-PR decision once a success event's PR is known. Looks
+/// up the `agent_pull_requests` row, loads that row's action to check
+/// `automerge.enabled`, and on green+mergeable calls
+/// [`crate::native::youtrack::complete_automerge`] - the same merge + State +
+/// AI-Agent write sequence the old CLAUDE-126 poll loop made.
+async fn handle_action_success_for_pr(
+    mint: &MintContext,
+    pool: &DbPool,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    pr_url: &str,
+) -> Result<String, String> {
+    let row = ci_failure_store::agent_pr(pool, host, repo, pr_number as i64)
+        .await
+        .map_err(|e| format!("agent_pull_requests lookup failed: {e}"))?;
+    let Some(row) = row else {
+        info!(repo = %repo, pr = pr_number, "action-run success: PR is not a recorded agent PR; no action");
+        return Ok("not a recorded agent PR; no action".to_string());
+    };
+    if row.state != "open" {
+        info!(repo = %repo, pr = pr_number, state = %row.state, "action-run success: recorded PR is no longer open; no action");
+        return Ok(format!(
+            "agent PR #{pr_number} already {}; no action",
+            row.state
+        ));
+    }
+
+    let actions_dir = mint.paths.actions_dir();
+    let action_name = row.action_name.clone();
+    let loaded =
+        tokio::task::spawn_blocking(move || crate::action::load(&action_name, &actions_dir))
+            .await
+            .map_err(|e| format!("loading action `{}` task panicked: {e}", row.action_name))?
+            .map_err(|e| format!("loading action `{}` failed: {e}", row.action_name))?;
+    let youtrack_cfg = match loaded.action.native {
+        Some(crate::action::NativeConfig::Youtrack(cfg)) => cfg.youtrack,
+        _ => {
+            info!(repo = %repo, pr = pr_number, action = %row.action_name, "action-run success: recorded action is not a youtrack action; no action");
+            return Ok(format!(
+                "action `{}` is not a youtrack action; no action",
+                row.action_name
+            ));
+        }
+    };
+    if !youtrack_cfg.automerge.enabled {
+        info!(repo = %repo, pr = pr_number, action = %row.action_name, "action-run success: automerge disabled for this action; no action");
+        return Ok("automerge disabled for this action; no action".to_string());
+    }
+
+    let backend = mint.backend.clone();
+    let host_owned = host.to_string();
+    let repo_owned = repo.to_string();
+    let status =
+        tokio::task::spawn_blocking(move || backend.pr_status(&host_owned, &repo_owned, pr_number))
+            .await
+            .map_err(|e| format!("pr_status task panicked: {e}"))?
+            .map_err(|e| format!("pr_status failed: {e}"))?;
+
+    match status.state.trim() {
+        "success" if status.mergeable => {
+            let backend = mint.backend.clone();
+            let host_owned = host.to_string();
+            let repo_owned = repo.to_string();
+            let issue_key = row.issue_key.clone();
+            let pr_url_owned = pr_url.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::native::youtrack::complete_automerge(
+                    backend.as_ref(),
+                    backend.as_ref(),
+                    &youtrack_cfg,
+                    &issue_key,
+                    &host_owned,
+                    &repo_owned,
+                    pr_number,
+                    &pr_url_owned,
+                )
+            })
+            .await
+            .map_err(|e| format!("complete_automerge task panicked: {e}"))?
+            .map_err(|e| format!("complete_automerge failed: {e}"))?;
+            info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: merged PR and advanced issue to Done");
+            Ok(format!(
+                "merged PR #{pr_number}; issue {} advanced to Done",
+                row.issue_key
+            ))
+        }
+        "success" => {
+            let body = crate::native::youtrack::automerge_needs_update_comment(pr_url);
+            let backend = mint.backend.clone();
+            let issue_key = row.issue_key.clone();
+            let comment_result =
+                tokio::task::spawn_blocking(move || backend.comment(&issue_key, &body)).await;
+            match comment_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(repo = %repo, pr = pr_number, error = %e, "action-run success: needs-update comment failed (continuing)");
+                }
+                Err(e) => {
+                    warn!(repo = %repo, pr = pr_number, error = %e, "action-run success: needs-update comment task panicked (continuing)");
+                }
+            }
+            info!(repo = %repo, pr = pr_number, "action-run success: green but not mergeable; commented, left at Code Review");
+            Ok(format!(
+                "PR #{pr_number} green but not mergeable; commented, left at Code Review"
+            ))
+        }
+        other => {
+            info!(repo = %repo, pr = pr_number, state = %other, "action-run success: checks not successful; no action");
+            Ok(format!(
+                "PR #{pr_number} checks not successful ({other}); no action"
+            ))
         }
     }
 }
@@ -1724,6 +4133,856 @@ mod tests {
         }
     }
 
+    // ---- CLAUDE-273: `ci_failure` store dedupe through the full pipeline ---
+
+    /// A [`Backend`] (IssueTracker + Forge) driving `consume_events` end to
+    /// end for the store-dedupe tests: `create_issue` hands out incrementing
+    /// keys, every mutation is recorded, and there is never an open PR (the
+    /// Forge surface the CLAUDE-149 `has_open_pr` signal reads).
+    struct StoreBackend {
+        next_key: StdMutex<u32>,
+        calls: StdMutex<Vec<String>>,
+        /// When set, `list_queued` returns this issue for any query: the
+        /// legacy-adoption lookup's canned hit.
+        legacy_match: StdMutex<Option<String>>,
+        /// CLAUDE-276: canned `list_open_prs` result, so a test can put the
+        /// failing commit on an open PR.
+        open_prs: StdMutex<Vec<ForgePullRequest>>,
+        /// CLAUDE-276: when set, `list_open_prs` fails with this message.
+        open_prs_error: StdMutex<Option<String>>,
+        /// CLAUDE-278: canned `pr_status` result for the automerge success-event
+        /// tests. `None` (the default) errors, matching every pre-existing test
+        /// that never reaches the automerge path.
+        pr_status: StdMutex<Option<crate::provider::PrStatus>>,
+    }
+
+    impl StoreBackend {
+        fn new() -> Self {
+            Self {
+                next_key: StdMutex::new(100),
+                calls: StdMutex::new(Vec::new()),
+                legacy_match: StdMutex::new(None),
+                open_prs: StdMutex::new(Vec::new()),
+                open_prs_error: StdMutex::new(None),
+                pr_status: StdMutex::new(None),
+            }
+        }
+        fn with_legacy_match(self, key: &str) -> Self {
+            *self.legacy_match.lock().unwrap() = Some(key.to_string());
+            self
+        }
+        fn with_open_prs(self, prs: Vec<ForgePullRequest>) -> Self {
+            *self.open_prs.lock().unwrap() = prs;
+            self
+        }
+        fn with_open_prs_error(self, message: &str) -> Self {
+            *self.open_prs_error.lock().unwrap() = Some(message.to_string());
+            self
+        }
+        fn with_pr_status(self, state: &str, mergeable: bool) -> Self {
+            *self.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
+                state: state.to_string(),
+                mergeable,
+            });
+            self
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::provider::IssueTracker for StoreBackend {
+        fn list_queued(&self, query: &str) -> crate::error::Result<Vec<serde_json::Value>> {
+            self.calls.lock().unwrap().push(format!("list {query}"));
+            match self.legacy_match.lock().unwrap().as_ref() {
+                Some(key) => Ok(vec![serde_json::json!({"idReadable": key})]),
+                None => Ok(Vec::new()),
+            }
+        }
+        fn get_field(&self, _key: &str, _field: &str) -> crate::error::Result<String> {
+            unreachable!()
+        }
+        fn set_field(&self, key: &str, field: &str, value: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_field {key} {field} {value}"));
+            Ok(())
+        }
+        fn set_state(&self, key: &str, state: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_state {key} {state}"));
+            Ok(())
+        }
+        fn set_assignee(&self, key: &str, login: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_assignee {key} {login}"));
+            Ok(())
+        }
+        fn comment(&self, key: &str, body: &str) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("comment {key} | {body}"));
+            Ok(())
+        }
+        fn issue_links(&self, _key: &str) -> crate::error::Result<Vec<crate::provider::IssueLink>> {
+            unreachable!()
+        }
+        fn inspect_issue(&self, _key: &str) -> crate::error::Result<crate::provider::IssueInspect> {
+            unreachable!()
+        }
+        fn resolve_vcs(
+            &self,
+            _project_key: &str,
+        ) -> crate::error::Result<crate::provider::VcsRepo> {
+            unreachable!()
+        }
+        fn vcs_repo_map(&self) -> crate::error::Result<Vec<crate::provider::VcsMapEntry>> {
+            Ok(Vec::new())
+        }
+        fn create_issue(
+            &self,
+            project: &str,
+            summary: &str,
+            _description: &str,
+            assignee: Option<&str>,
+        ) -> crate::error::Result<String> {
+            let mut next = self.next_key.lock().unwrap();
+            let key = format!("CLAUDE-{next}");
+            *next += 1;
+            self.calls.lock().unwrap().push(format!(
+                "create {project} {key} | {summary} | assignee={}",
+                assignee.unwrap_or("-")
+            ));
+            Ok(key)
+        }
+        fn attach_file(&self, _key: &str, _file: &Path) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::provider::Forge for StoreBackend {
+        fn create_pr(
+            &self,
+            _workdir: &Path,
+            _host: &str,
+            _strategy: crate::action::PrStrategy,
+        ) -> crate::error::Result<crate::provider::PullRequest> {
+            unreachable!()
+        }
+        fn clone_url(&self, _host: &str, _repo: &str) -> crate::error::Result<String> {
+            unreachable!()
+        }
+        fn repo_access(&self, _host: &str, _repo: &str) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        fn list_open_prs(
+            &self,
+            _host: &str,
+            _repo: &str,
+        ) -> crate::error::Result<Vec<ForgePullRequest>> {
+            if let Some(message) = self.open_prs_error.lock().unwrap().clone() {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(message)));
+            }
+            Ok(self.open_prs.lock().unwrap().clone())
+        }
+        fn pr_ci_state(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _pr_number: u64,
+        ) -> crate::error::Result<String> {
+            unreachable!()
+        }
+        fn pr_comment(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _pr_number: u64,
+            _body_file: &Path,
+        ) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        fn issue_comment(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _issue_number: u64,
+            _body_file: &Path,
+        ) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        fn pr_status(
+            &self,
+            _host: &str,
+            _repo: &str,
+            pr_number: u64,
+        ) -> crate::error::Result<crate::provider::PrStatus> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("pr_status {pr_number}"));
+            self.pr_status
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| crate::error::Error::Other(anyhow::anyhow!("no canned pr_status")))
+        }
+        fn merge_pr(&self, _host: &str, _repo: &str, pr_number: u64) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("merge_pr {pr_number}"));
+            Ok(())
+        }
+    }
+
+    impl Backend for StoreBackend {
+        fn name(&self) -> &'static str {
+            "store-backend-stub"
+        }
+    }
+
+    /// CLAUDE-277: a canned [`crate::forge_log::CommitRunsClient`], returning
+    /// one fixed outcome for every call. Defaults to an empty resolved list (no
+    /// run found), which is what every PRE-EXISTING failure-event test needs
+    /// (they never reach the merge-close path).
+    struct ScriptedCommitRuns {
+        outcome: StdMutex<crate::forge_log::CommitRunsOutcome>,
+    }
+
+    impl ScriptedCommitRuns {
+        fn new(outcome: crate::forge_log::CommitRunsOutcome) -> Self {
+            Self {
+                outcome: StdMutex::new(outcome),
+            }
+        }
+
+        fn empty() -> Self {
+            Self::new(crate::forge_log::CommitRunsOutcome::Resolved(Vec::new()))
+        }
+    }
+
+    impl crate::forge_log::CommitRunsClient for ScriptedCommitRuns {
+        fn list_commit_runs(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _max_pages: u32,
+            _token: Option<&str>,
+        ) -> crate::forge_log::CommitRunsOutcome {
+            self.outcome.lock().unwrap().clone()
+        }
+    }
+
+    /// A [`FailureClassifier`] that always returns `code_fix`, recording how
+    /// many times it ran so a test can assert the store dedupe skipped it.
+    struct CountingClassifier {
+        calls: StdMutex<u32>,
+    }
+
+    impl CountingClassifier {
+        fn new() -> Self {
+            Self {
+                calls: StdMutex::new(0),
+            }
+        }
+        fn call_count(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl FailureClassifier for CountingClassifier {
+        fn classify(&self, _input: &TriageInput) -> crate::error::Result<Triage> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(Triage {
+                bucket: TriageBucket::CodeFix,
+                analysis: "root cause and next step".to_string(),
+                classified_by: ClassifiedBy::Llm,
+                auto_fix: None,
+            })
+        }
+    }
+
+    /// A log carrying `test_id` as its one failing test (cargo-test-shaped, so
+    /// [`fingerprint::fingerprint`] parses it), on `branch`, resolvable to a
+    /// non-transient signature.
+    fn failing_test_log(target: &str, test_id: &str, branch: &str) -> String {
+        format!(
+            "GITHUB_HEAD_REF={branch}\n     Running tests/{target}.rs (target/debug/deps/{target}-abc123)\ntest {test_id} ... FAILED\n"
+        )
+    }
+
+    fn store_mint_cfg() -> MintConfig {
+        MintConfig {
+            repo_project_map: [("acme/widgets".to_string(), "CLAUDE".to_string())]
+                .into_iter()
+                .collect(),
+            ..MintConfig::default()
+        }
+    }
+
+    fn test_paths(dir: &std::path::Path) -> Paths {
+        Paths {
+            config_dir: dir.to_path_buf(),
+            data_dir: dir.to_path_buf(),
+            state_dir: dir.to_path_buf(),
+            runtime_dir: dir.to_path_buf(),
+        }
+    }
+
+    fn store_mint_context(
+        pool: DbPool,
+        backend: Arc<StoreBackend>,
+        classifier: Arc<dyn FailureClassifier>,
+    ) -> MintContext {
+        store_mint_context_in(
+            pool,
+            backend,
+            classifier,
+            std::env::temp_dir().as_path(),
+            Arc::new(crate::provider::cli::testutil::StubRunner::new()),
+        )
+    }
+
+    fn store_mint_context_in(
+        pool: DbPool,
+        backend: Arc<StoreBackend>,
+        classifier: Arc<dyn FailureClassifier>,
+        paths_dir: &std::path::Path,
+        pr_comment_runner: Arc<dyn CommandRunner>,
+    ) -> MintContext {
+        store_mint_context_with_commit_runs(
+            pool,
+            backend,
+            classifier,
+            paths_dir,
+            pr_comment_runner,
+            Arc::new(ScriptedCommitRuns::empty()),
+        )
+    }
+
+    /// CLAUDE-277: like [`store_mint_context_in`], with an injectable
+    /// [`crate::forge_log::CommitRunsClient`] for the merge-close tests.
+    #[allow(clippy::too_many_arguments)]
+    fn store_mint_context_with_commit_runs(
+        pool: DbPool,
+        backend: Arc<StoreBackend>,
+        classifier: Arc<dyn FailureClassifier>,
+        paths_dir: &std::path::Path,
+        pr_comment_runner: Arc<dyn CommandRunner>,
+        commit_runs: Arc<dyn crate::forge_log::CommitRunsClient>,
+    ) -> MintContext {
+        MintContext {
+            pool,
+            classifier,
+            backend,
+            mint_cfg: Arc::new(RwLock::new(store_mint_cfg())),
+            defaults: RunnerDefaults::default(),
+            route_cache: Arc::new(route_cache()),
+            paths: test_paths(paths_dir),
+            pr_comment_runner,
+            commit_runs,
+        }
+    }
+
+    /// One `action_run_failure` event for `acme/widgets`, run `index_in_repo`,
+    /// with a distinct commit per run. The branch itself travels in the job
+    /// log's `GITHUB_HEAD_REF` line, not on the event.
+    fn store_event(index_in_repo: i64) -> VerifiedFailureEvent {
+        VerifiedFailureEvent {
+            repo: "acme/widgets".to_string(),
+            index_in_repo,
+            commit_sha: format!("commit-{index_in_repo}"),
+            workflow_id: "ci.yml".to_string(),
+            private: false,
+            source: "test-source".to_string(),
+            trigger_user: "alice".to_string(),
+            html_url: format!("https://dev.a8n.run/acme/widgets/actions/runs/{index_in_repo}"),
+            status: "failure".to_string(),
+        }
+    }
+
+    /// [`ActionLogClient`] returning one canned failing job's log per repo/run
+    /// number, keyed the way the worked-example test needs it.
+    struct ScriptedFailingLogs {
+        /// `(run_number, job_log)`.
+        logs: HashMap<i64, String>,
+    }
+
+    impl crate::forge_log::ActionLogClient for ScriptedFailingLogs {
+        fn run_logs(
+            &self,
+            _host: &str,
+            _repo: &str,
+            run_number: i64,
+            _token: Option<&str>,
+        ) -> crate::forge_log::RunLogsOutcome {
+            let log = self.logs.get(&run_number).cloned().unwrap_or_default();
+            crate::forge_log::RunLogsOutcome::Fetched(vec![crate::forge_log::JobLog {
+                name: "test".to_string(),
+                status: "failure".to_string(),
+                log,
+                ..Default::default()
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn worked_example_dedupes_by_failing_test_overlap_and_classifies_once() {
+        // CLAUDE-273 acceptance criterion 1: runs 5845, 5850, 5859 and 5871 on
+        // four branches, each failing `invitation_team_id::create_refuses_a_
+        // foreign_tenant_team` plus other tests, produce one `Created` and
+        // three attachments; the classifier runs exactly once (for the first,
+        // creating run only - the three repeats attach with no triage at all).
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new());
+        let counting = Arc::new(CountingClassifier::new());
+        let classifier: Arc<dyn FailureClassifier> = counting.clone();
+
+        let branches = [
+            "fix/GAMMA-1041-invoice-module-gate",
+            "feat/GAMMA-1126-kb-provenance",
+            "chore/GAMMA-1130-cleanup",
+            "fix/GAMMA-1140-retry-logic",
+        ];
+        let runs = [5845, 5850, 5859, 5871];
+        let mut logs = HashMap::new();
+        for (run, branch) in runs.iter().zip(branches.iter()) {
+            let mut log = failing_test_log(
+                "invitation_team_id",
+                "create_refuses_a_foreign_tenant_team",
+                branch,
+            );
+            log.push_str(&format!(
+                "     Running tests/other_{run}.rs (target/debug/deps/other_{run}-abc)\ntest some_other_test ... FAILED\n"
+            ));
+            logs.insert(*run, log);
+        }
+
+        for run in runs.iter() {
+            let (tx, rx) = mpsc::channel(4);
+            tx.send(store_event(*run)).await.unwrap();
+            drop(tx);
+            let out_dir = tempfile::tempdir().unwrap();
+            consume_events(
+                rx,
+                pool.clone(),
+                Arc::new(ScriptedFailingLogs { logs: logs.clone() }),
+                out_dir.path().to_path_buf(),
+                Some(store_mint_context(
+                    pool.clone(),
+                    backend.clone(),
+                    classifier.clone(),
+                )),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+        }
+        let calls = backend.calls();
+        let creates: Vec<_> = calls.iter().filter(|c| c.starts_with("create")).collect();
+        assert_eq!(creates.len(), 1, "exactly one issue created: {calls:?}");
+        let comments: Vec<_> = calls.iter().filter(|c| c.starts_with("comment")).collect();
+        assert_eq!(
+            comments.len(),
+            3,
+            "the three repeats each attach with one comment: {calls:?}"
+        );
+        assert_eq!(counting.call_count(), 1, "the classifier ran exactly once");
+    }
+
+    /// A classifier that sleeps `delay` while classifying, tracking how many
+    /// calls overlap (`peak`) so a test can observe the worker pool's actual
+    /// concurrency rather than inferring it from timing.
+    struct SlowClassifier {
+        delay: Duration,
+        live: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SlowClassifier {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                live: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl FailureClassifier for SlowClassifier {
+        fn classify(&self, _input: &TriageInput) -> crate::error::Result<Triage> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.fetch_add(1, SeqCst);
+            let now = self.live.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            std::thread::sleep(self.delay);
+            self.live.fetch_sub(1, SeqCst);
+            Ok(Triage {
+                bucket: TriageBucket::CodeFix,
+                analysis: "slow analysis".to_string(),
+                classified_by: ClassifiedBy::Llm,
+                auto_fix: None,
+            })
+        }
+    }
+
+    /// Two events for two DIFFERENT jobs (distinct `workflow_id`, so the
+    /// CLAUDE-274 key gate never serializes them against each other), sent
+    /// through one `consume_events` call. Returns the peak observed
+    /// concurrent classification count for the given `analysis_concurrency`.
+    async fn run_two_distinct_jobs_at_concurrency(analysis_concurrency: usize) -> usize {
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new());
+        let slow = Arc::new(SlowClassifier::new(Duration::from_millis(150)));
+        let classifier: Arc<dyn FailureClassifier> = slow.clone();
+
+        let mut logs = HashMap::new();
+        logs.insert(1, failing_test_log("mod_a", "test_one", "main"));
+        logs.insert(2, failing_test_log("mod_b", "test_two", "main"));
+
+        let mut ev1 = store_event(1);
+        ev1.workflow_id = "ci-one.yml".to_string();
+        let mut ev2 = store_event(2);
+        ev2.workflow_id = "ci-two.yml".to_string();
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(ev1).await.unwrap();
+        tx.send(ev2).await.unwrap();
+        drop(tx);
+
+        let cfg = WebhookConfig {
+            analysis_concurrency,
+            ..WebhookConfig::default()
+        };
+        consume_events(
+            rx,
+            pool.clone(),
+            Arc::new(ScriptedFailingLogs { logs }),
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            Some(store_mint_context(pool, backend, classifier)),
+            Arc::new(RwLock::new(cfg)),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+        slow.peak()
+    }
+
+    /// AC 5: with `analysis_concurrency = 2`, a slow stub shows a second event
+    /// starting before the first finishes.
+    #[tokio::test]
+    async fn analysis_concurrency_two_overlaps_two_distinct_jobs() {
+        assert_eq!(
+            run_two_distinct_jobs_at_concurrency(2).await,
+            2,
+            "both distinct-job events analyze concurrently under a pool of 2"
+        );
+    }
+
+    /// AC 5: with `analysis_concurrency = 1`, the second waits for the first.
+    #[tokio::test]
+    async fn analysis_concurrency_one_serializes_distinct_jobs() {
+        assert_eq!(
+            run_two_distinct_jobs_at_concurrency(1).await,
+            1,
+            "a pool of 1 never runs two analyses at once"
+        );
+    }
+
+    /// AC 5 (racing duplicates): two concurrent failures of the SAME job
+    /// (same repo/workflow_id/job_name) with an overlapping failing test,
+    /// submitted together into one `consume_events` call with a slow
+    /// classifier so they would genuinely overlap without the key gate.
+    /// Exactly one analysis runs and exactly one issue is created; the second
+    /// event's store lookup (after it waits its turn on the gate) finds the
+    /// first's row and attaches instead of re-analyzing.
+    #[tokio::test]
+    async fn concurrent_failures_of_the_same_job_produce_one_issue_and_one_analysis() {
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new());
+        let slow = Arc::new(SlowClassifier::new(Duration::from_millis(150)));
+        let classifier: Arc<dyn FailureClassifier> = slow.clone();
+
+        let mut logs = HashMap::new();
+        logs.insert(10, failing_test_log("shared_mod", "shared_test", "fix/a"));
+        logs.insert(11, failing_test_log("shared_mod", "shared_test", "fix/b"));
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(store_event(10)).await.unwrap();
+        tx.send(store_event(11)).await.unwrap();
+        drop(tx);
+
+        let cfg = WebhookConfig {
+            analysis_concurrency: 2,
+            ..WebhookConfig::default()
+        };
+        consume_events(
+            rx,
+            pool.clone(),
+            Arc::new(ScriptedFailingLogs { logs }),
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            Some(store_mint_context(pool, backend.clone(), classifier)),
+            Arc::new(RwLock::new(cfg)),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+
+        assert_eq!(slow.calls(), 1, "exactly one analysis runs");
+        let calls = backend.calls();
+        let creates: Vec<_> = calls.iter().filter(|c| c.starts_with("create")).collect();
+        assert_eq!(creates.len(), 1, "exactly one issue created: {calls:?}");
+        let comments: Vec<_> = calls.iter().filter(|c| c.starts_with("comment")).collect();
+        assert_eq!(comments.len(), 1, "the second attaches: {calls:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failure_sharing_a_test_with_a_resolved_issue_reopens_it() {
+        // CLAUDE-273 acceptance criterion 2: a shared test with a RESOLVED
+        // issue reopens it (a state write plus a comment) and creates none.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        let failure_id = ci_failure_store::record_failure(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            None,
+            Some("CLAUDE-40"),
+            "resolved",
+            now,
+        )
+        .await
+        .unwrap();
+        ci_failure_store::add_tests(
+            &pool,
+            failure_id,
+            &["invitation_team_id::create_refuses_a_foreign_tenant_team".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let backend = Arc::new(StoreBackend::new());
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(6001);
+        let log = failing_test_log(
+            "invitation_team_id",
+            "create_refuses_a_foreign_tenant_team",
+            "main",
+        );
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        assert!(result.text.contains("CLAUDE-40"), "{}", result.text);
+
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create")),
+            "no new issue: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "set_state CLAUDE-40 To do"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("comment CLAUDE-40 | Regression")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-40 AI Agent Queued"),
+            "AI Agent set exactly as a fresh code_fix issue would be: {calls:?}"
+        );
+
+        let failure = ci_failure_store::get_failure(&pool, failure_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.state, "open");
+    }
+
+    #[tokio::test]
+    async fn a_failure_with_no_shared_test_creates_a_second_issue() {
+        // CLAUDE-273 acceptance criterion 3: a failure on the same job with no
+        // shared test creates a second issue.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        let failure_id = ci_failure_store::record_failure(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            None,
+            Some("CLAUDE-50"),
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+        ci_failure_store::add_tests(&pool, failure_id, &["other::already_tracked".to_string()])
+            .await
+            .unwrap();
+
+        let backend = Arc::new(StoreBackend::new());
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(6002);
+        let log = failing_test_log(
+            "invitation_team_id",
+            "create_refuses_a_foreign_tenant_team",
+            "main",
+        );
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("create")),
+            "a distinct failing test mints a second issue: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_issue_found_by_marker_search_is_adopted_not_duplicated() {
+        // CLAUDE-273 acceptance criterion 4: an open legacy issue found by the
+        // marker search, with no store row, is adopted and not duplicated.
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new().with_legacy_match("CLAUDE-70"));
+        let counting = Arc::new(CountingClassifier::new());
+        let classifier: Arc<dyn FailureClassifier> = counting.clone();
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(6003);
+        let log = failing_test_log(
+            "invitation_team_id",
+            "create_refuses_a_foreign_tenant_team",
+            "main",
+        );
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        assert!(result.text.contains("CLAUDE-70"), "{}", result.text);
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create")),
+            "adopted, not duplicated: {calls:?}"
+        );
+        assert_eq!(counting.call_count(), 0, "no triage for a legacy adoption");
+
+        // The adoption is now recorded, so the next sighting of this test
+        // attaches instead of searching YouTrack again.
+        let m = ci_failure_store::find_match(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            &["invitation_team_id::create_refuses_a_foreign_tenant_team".to_string()],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(m.issue_key, Some("CLAUDE-70".to_string()));
+        assert_eq!(m.state, "open");
+    }
+
+    #[tokio::test]
+    async fn a_ci_failure_store_read_error_fails_the_run_and_mints_nothing() {
+        // A store read failure logs at error and fails the run rather than
+        // falling through to a mint, which would recreate a duplicate.
+        let pool = crate::db::test_pool().await;
+        pool.close().await;
+        let backend = Arc::new(StoreBackend::new());
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(9001);
+        let log = failing_test_log(
+            "invitation_team_id",
+            "create_refuses_a_foreign_tenant_team",
+            "main",
+        );
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(!result.ok, "a store read failure must fail the run");
+        assert!(
+            result.text.contains("ci-failure store error"),
+            "{}",
+            result.text
+        );
+        assert!(
+            backend.calls().is_empty(),
+            "nothing minted on a store error: {:?}",
+            backend.calls()
+        );
+    }
+
     fn event() -> VerifiedFailureEvent {
         VerifiedFailureEvent {
             repo: "fabrikam/forgejo-cli".to_string(),
@@ -1783,6 +5042,7 @@ mod tests {
             false,
             true, // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -1824,6 +5084,7 @@ mod tests {
             true,
             true, // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -1835,9 +5096,10 @@ mod tests {
     #[test]
     fn code_fix_classification_mints_and_queues() {
         // A non-transient log + a code_fix verdict with NO open PR -> issue in the
-        // mapped project, queued for the fix bot, no human assignee. (With an open
-        // PR the code_fix route is suppressed per CLAUDE-149; see
-        // `open_pr_code_fix_is_left_to_the_author_and_mints_nothing`.)
+        // mapped project, queued for the fix bot, no human assignee. (CLAUDE-276:
+        // an open PR no longer suppresses this route inside `decide_mint`; see
+        // `decide_mint_applies_no_open_pr_suppression_of_its_own`. Open-PR
+        // routing is decided by the caller before `decide_mint` is reached.)
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let (bucket, out) = decide_mint(
@@ -1854,6 +5116,7 @@ mod tests {
             false, // has_open_pr: no PR, so the code_fix route still queues
             true,  // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -1899,6 +5162,7 @@ mod tests {
             false,
             true, // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -1943,6 +5207,7 @@ mod tests {
             false, // has_open_pr: push to main, no PR
             true,  // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
@@ -1976,11 +5241,12 @@ mod tests {
     }
 
     #[test]
-    fn open_pr_code_fix_is_left_to_the_author_and_mints_nothing() {
-        // CLAUDE-149 end-to-end through decide_mint: a failure WITH an open PR
-        // that the classifier calls code_fix is the author's to fix. The
-        // queue-for-fix route is suppressed, so no issue is minted and the fix
-        // bot is never queued.
+    fn decide_mint_applies_no_open_pr_suppression_of_its_own() {
+        // CLAUDE-276: the open-PR routing decision (agent PR re-queue / human PR
+        // comment) is now made by the caller BEFORE `decide_mint` is ever
+        // reached; `decide_mint` (and `mint::mint` underneath it) no longer
+        // suppresses a code-fix mint for `has_open_pr: true` the way CLAUDE-149's
+        // `SkippedOpenPr` used to.
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let ev = event();
@@ -1995,31 +5261,93 @@ mod tests {
             true,
             None,
             None,
-            true, // has_open_pr: a failing open PR
+            true, // has_open_pr: context only, no longer a suppression signal
             true, // auto_fix_enabled
             "",
+            None,
             &|_| {},
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::CodeFix);
-        assert_eq!(out, MintOutcome::SkippedOpenPr);
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
         let calls = tracker.calls();
+        assert!(calls.iter().any(|c| c.starts_with("create")), "{calls:?}");
         assert!(
-            !calls.iter().any(|c| c.starts_with("create")),
-            "no issue minted for an open-PR failure: {calls:?}"
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-99 AI Agent Queued"),
+            "{calls:?}"
         );
-        assert!(
-            !calls.iter().any(|c| c.contains("AI Agent")),
-            "fix bot never queued: {calls:?}"
+    }
+
+    /// CLAUDE-264/CLAUDE-273: the collapse key the legacy adoption lookup
+    /// searches, i.e. the `#Unresolved` full-text query
+    /// `decide_with_legacy_adoption` issues before falling through to triage.
+    fn collapse_query(log: &str) -> String {
+        let classifier = StubClassifier::new(TriageBucket::HumanAction);
+        let tracker = StubTracker::new();
+        let failure_signature = crate::mint::failure_signature(log);
+        let branch = crate::forge_log::resolve_branch(None, log).unwrap_or_default();
+        let infra_kind = crate::infra_failure::detect(log).map(|f| f.kind);
+        let _ = decide_with_legacy_adoption(
+            &classifier,
+            &tracker,
+            &mint_cfg(),
+            &route_cache(),
+            &caps(),
+            &event(),
+            log.to_string(),
+            true,
+            None,
+            None,
+            false,
+            true,
+            "integration tests",
+            &branch,
+            failure_signature.as_deref(),
+            infra_kind.as_deref(),
+            None,
+            &|_| {},
+        );
+        tracker
+            .calls()
+            .into_iter()
+            .rfind(|c| c.starts_with("list ") && c.ends_with("#Unresolved"))
+            .expect("the legacy lookup issued a collapse search")
+    }
+
+    #[test]
+    fn an_infra_failure_collapses_across_branches_but_a_code_failure_does_not() {
+        // CLAUDE-264/CLAUDE-273: `infra_kind` is resolved from the same full
+        // redacted log as `failure_signature`, and switches the legacy
+        // adoption lookup's collapse search onto the branch-agnostic key. Two
+        // runs of one job on two different PR branches: with a host condition
+        // in the log they search the SAME key, and without one they search
+        // different keys, exactly as before.
+        let a = "GITHUB_HEAD_REF=fix/GAMMA-1041-invoice-module-gate\n";
+        let b = "GITHUB_HEAD_REF=feat/GAMMA-1126-kb-provenance\n";
+        let guard = "Insufficient free space: the suite needs ~25G to link test binaries.\n";
+        assert_eq!(
+            collapse_query(&format!("{a}{guard}")),
+            collapse_query(&format!("{b}{guard}")),
+            "one host condition on one job is one key, whatever the branch"
+        );
+        // The control: the same two branches with an ordinary code failure keep
+        // their per-branch identity (and so their per-branch auto-fix routing).
+        let bug = "error[E0308]: mismatched types\n";
+        assert_ne!(
+            collapse_query(&format!("{a}{bug}")),
+            collapse_query(&format!("{b}{bug}")),
+            "a code failure still keys per branch"
         );
     }
 
     #[test]
-    fn auto_fix_off_code_fix_mints_nothing_and_leaves_it_on_the_pr() {
-        // CLAUDE-153 end-to-end through decide_mint: with the webhook auto-fix
-        // toggle OFF, a code_fix failure (even with no open PR) mints nothing and
-        // queues no fixup PR, so the red check stays reported on the PR
-        // (CLAUDE-152). No `create` and no `AI Agent` write reach the tracker.
+    fn auto_fix_off_code_fix_still_creates_but_leaves_it_on_the_pr() {
+        // CLAUDE-153/CLAUDE-273 end-to-end through decide_mint: with the webhook
+        // auto-fix toggle OFF, a code_fix failure (even with no open PR) still
+        // creates an issue, but queues no fixup PR (no `AI Agent` write), so the
+        // red check stays reported on the PR (CLAUDE-152).
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let (bucket, out) = decide_mint(
@@ -2036,15 +5364,16 @@ mod tests {
             false, // has_open_pr: no PR; the toggle, not open-PR, does the gating
             false, // auto_fix_enabled: OFF
             "",
+            None,
             &|_| {},
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::CodeFix);
-        assert_eq!(out, MintOutcome::SkippedAutoFixDisabled);
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
         let calls = tracker.calls();
         assert!(
-            !calls.iter().any(|c| c.starts_with("create")),
-            "no issue minted when auto-fix is off: {calls:?}"
+            calls.iter().any(|c| c.starts_with("create")),
+            "issue still minted when auto-fix is off: {calls:?}"
         );
         assert!(
             !calls.iter().any(|c| c.contains("AI Agent")),
@@ -2059,6 +5388,7 @@ mod tests {
             title: String::new(),
             head_sha: sha.to_string(),
             head_ref: String::new(),
+            base_ref: String::new(),
             author: String::new(),
             html_url: String::new(),
             updated_at: String::new(),
@@ -2102,18 +5432,13 @@ mod tests {
                 name: "check".to_string(),
                 status: "failure".to_string(),
                 log: "assertion failed: expected 1 got 2".to_string(),
+                ..Default::default()
             }])
         }
     }
 
-    async fn memory_pool() -> SqlitePool {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::db::MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn memory_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     /// CLAUDE-85: a client that fails the test on any call, proving the
@@ -2154,22 +5479,27 @@ mod tests {
                 out_dir.path().to_path_buf(),
                 None,
                 Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
             )
             .await;
 
-            let (jobs, exit): (i64, Option<i64>) =
-                sqlx::query_as("SELECT jobs_processed, exit_code FROM runs")
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let (jobs, exit): (i64, Option<i64>) = sqlx::query_as(&crate::db::q(
+                &pool,
+                "SELECT jobs_processed, exit_code FROM runs",
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             assert_eq!(jobs, 1, "{status}");
             assert_eq!(exit, Some(crate::exit::OK as i64), "{status}");
 
-            let (ok, summary): (bool, Option<String>) =
-                sqlx::query_as("SELECT ok, summary FROM job_outcomes")
+            // `ok` is an integer 0/1 column on both backends (see `crate::db::flag`).
+            let (ok, summary): (i64, Option<String>) =
+                sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
                     .fetch_one(&pool)
                     .await
                     .unwrap();
+            let ok = ok != 0;
             assert!(ok, "{status}");
             let summary = summary.expect("summary recorded");
             assert!(summary.contains(status), "{status}: {summary}");
@@ -2252,13 +5582,14 @@ mod tests {
             name: "check".to_string(),
             status: "failure".to_string(),
             log: "assertion failed: expected 1 got 2\n".to_string(),
+            ..Default::default()
         }])
     }
 
     /// Shared scaffolding for the log-token consume tests: age key file, stored
     /// `log-token` secret, and a webhook config whose `test-source` (the
     /// `event()` fixture's source) carries the `log_token_ref`.
-    async fn log_token_setup(tmp: &std::path::Path) -> (SqlitePool, Arc<RwLock<WebhookConfig>>) {
+    async fn log_token_setup(tmp: &std::path::Path) -> (DbPool, Arc<RwLock<WebhookConfig>>) {
         use age::secrecy::ExposeSecret;
         let key_path = tmp.join("key.txt");
         let identity = age::x25519::Identity::generate();
@@ -2307,6 +5638,7 @@ mod tests {
                 tmp.path().to_path_buf(),
                 None,
                 cfg,
+                crate::concurrency::KeyGate::new(),
             )
             .await;
 
@@ -2323,10 +5655,11 @@ mod tests {
                 "private={private}"
             );
 
-            let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            let summary: Option<String> =
+                sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             let summary = summary.expect("summary recorded");
             assert!(
                 summary.contains("log fetched and redacted"),
@@ -2360,16 +5693,147 @@ mod tests {
             tmp.path().to_path_buf(),
             None,
             cfg,
+            crate::concurrency::KeyGate::new(),
         )
         .await;
 
         assert_eq!(logs.calls.lock().unwrap().len(), 1, "exactly one call");
-        let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let summary: Option<String> =
+            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log unavailable"), "{summary}");
+    }
+
+    /// A `Fetched` outcome whose jobs carry `log_state` in run order (FJ-79).
+    fn jobs_with_log_states(states: &[&str]) -> crate::forge_log::RunLogsOutcome {
+        crate::forge_log::RunLogsOutcome::Fetched(
+            states
+                .iter()
+                .enumerate()
+                .map(|(i, state)| crate::forge_log::JobLog {
+                    name: format!("job-{i}"),
+                    status: "failure".to_string(),
+                    log: if *state == crate::forge_log::LOG_STATE_MISSING {
+                        String::new()
+                    } else {
+                        "cargo build\n".to_string()
+                    },
+                    log_state: (*state).to_string(),
+                    log_reason: if *state == crate::forge_log::LOG_STATE_MISSING {
+                        Some("open logs for task 43177: no such file or directory".to_string())
+                    } else {
+                        None
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_permanently_missing_log_degrades_to_a_no_log_outcome() {
+        // CLAUDE-242: FJ-79's every-job `log_state: "missing"` must be read the
+        // same way an unfetchable log is, so the CLAUDE-92 human-action route
+        // still fires instead of triaging an empty-but-"available" log.
+        let pool = memory_pool().await;
+        let out_dir = tempfile::tempdir().unwrap();
+        let logs = Arc::new(ScriptedLogs::new(jobs_with_log_states(&[
+            crate::forge_log::LOG_STATE_MISSING,
+            crate::forge_log::LOG_STATE_MISSING,
+        ])));
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(event()).await.unwrap();
+        drop(tx);
+
+        consume_events(
+            rx,
+            pool.clone(),
+            logs,
+            out_dir.path().to_path_buf(),
+            None,
+            Arc::new(RwLock::new(WebhookConfig::default())),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+
+        let summary: Option<String> =
+            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let summary = summary.expect("summary recorded");
+        assert!(summary.contains("log unavailable"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn a_partially_readable_log_still_mints_as_available() {
+        // CLAUDE-242 AC: at least one job carrying a readable log must be
+        // unaffected by the FJ-79 predicate, even alongside a missing one.
+        let pool = memory_pool().await;
+        let out_dir = tempfile::tempdir().unwrap();
+        let logs = Arc::new(ScriptedLogs::new(jobs_with_log_states(&[
+            crate::forge_log::LOG_STATE_MISSING,
+            "available",
+        ])));
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(event()).await.unwrap();
+        drop(tx);
+
+        consume_events(
+            rx,
+            pool.clone(),
+            logs,
+            out_dir.path().to_path_buf(),
+            None,
+            Arc::new(RwLock::new(WebhookConfig::default())),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+
+        let summary: Option<String> =
+            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let summary = summary.expect("summary recorded");
+        assert!(summary.contains("log fetched and redacted"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn a_pre_fj79_log_with_no_log_state_still_mints_as_available() {
+        // CLAUDE-242 AC: an `fj` predating FJ-79 emits no `log_state` field at
+        // all, which deserializes to `""` on every job, never `"missing"`; that
+        // absence must never be read as "gone".
+        let pool = memory_pool().await;
+        let out_dir = tempfile::tempdir().unwrap();
+        let logs = Arc::new(ScriptedLogs::new(one_failing_job()));
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(event()).await.unwrap();
+        drop(tx);
+
+        consume_events(
+            rx,
+            pool.clone(),
+            logs,
+            out_dir.path().to_path_buf(),
+            None,
+            Arc::new(RwLock::new(WebhookConfig::default())),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+
+        let summary: Option<String> =
+            sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let summary = summary.expect("summary recorded");
+        assert!(summary.contains("log fetched and redacted"), "{summary}");
     }
 
     /// A `Fetched` outcome whose jobs carry `statuses` in run order.
@@ -2382,6 +5846,7 @@ mod tests {
                     name: format!("job-{i}"),
                     status: (*s).to_string(),
                     log: "cargo build\n".to_string(),
+                    ..Default::default()
                 })
                 .collect(),
         )
@@ -2413,14 +5878,17 @@ mod tests {
                 out_dir.path().to_path_buf(),
                 None,
                 Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
             )
             .await;
 
-            let (ok, summary): (bool, Option<String>) =
-                sqlx::query_as("SELECT ok, summary FROM job_outcomes")
+            // `ok` is an integer 0/1 column on both backends (see `crate::db::flag`).
+            let (ok, summary): (i64, Option<String>) =
+                sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
                     .fetch_one(&pool)
                     .await
                     .unwrap();
+            let ok = ok != 0;
             assert!(ok, "{statuses:?}");
             let summary = summary.expect("summary recorded");
             assert!(summary.contains("no job failed"), "{statuses:?}: {summary}");
@@ -2463,13 +5931,15 @@ mod tests {
                 out_dir.path().to_path_buf(),
                 None,
                 Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
             )
             .await;
 
-            let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM job_outcomes")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            let summary: Option<String> =
+                sqlx::query_scalar(&crate::db::q(&pool, "SELECT summary FROM job_outcomes"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             let summary = summary.expect("summary recorded");
             assert!(summary.contains("log-only"), "{label}: {summary}");
             assert!(!summary.contains("no job failed"), "{label}: {summary}");
@@ -2493,6 +5963,7 @@ mod tests {
             out_dir.path().to_path_buf(),
             None,
             Arc::new(RwLock::new(WebhookConfig::default())),
+            crate::concurrency::KeyGate::new(),
         )
         .await;
 
@@ -2505,9 +5976,10 @@ mod tests {
             i64,
             Option<i64>,
             Option<String>,
-        ) = sqlx::query_as(
+        ) = sqlx::query_as(&crate::db::q(
+            &pool,
             "SELECT action_name, triggered_by, jobs_processed, exit_code, stage FROM runs",
-        )
+        ))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -2516,15 +5988,18 @@ mod tests {
         assert_eq!(jobs, 1);
         assert_eq!(exit, Some(crate::exit::OK as i64));
         assert_eq!(stage, None, "stage cleared on finish");
-        let inflight: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_inflight_jobs")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let inflight: i64 = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT COUNT(*) FROM run_inflight_jobs",
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(inflight, 0, "in-flight marker cleared on finish");
 
         // CLAUDE-93: the event's html_url is recorded as the job's outbound
         // link so the run-detail tables can link the key to the Forgejo run.
-        let run_id: i64 = sqlx::query_scalar("SELECT id FROM runs")
+        let run_id: i64 = sqlx::query_scalar(&crate::db::q(&pool, "SELECT id FROM runs"))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -2537,11 +6012,13 @@ mod tests {
 
         // The outcome carries a summary; with no backend it is the log-only note,
         // and it references the redacted artifact that the ready fetch wrote.
-        let (job_key, summary): (String, Option<String>) =
-            sqlx::query_as("SELECT job_key, summary FROM job_outcomes")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (job_key, summary): (String, Option<String>) = sqlx::query_as(&crate::db::q(
+            &pool,
+            "SELECT job_key, summary FROM job_outcomes",
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(job_key, "fabrikam/forgejo-cli#7");
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log-only"), "{summary}");
@@ -2570,6 +6047,7 @@ mod tests {
             true,
             true, // auto_fix_enabled
             "",
+            None,
             &report,
         )
         .unwrap();
@@ -2601,6 +6079,7 @@ mod tests {
             true,
             true, // auto_fix_enabled
             "",
+            None,
             &report,
         )
         .unwrap();
@@ -2630,6 +6109,1009 @@ mod tests {
         assert!(!WebhookRunSummary::error("boom".to_string()).ok);
     }
 
+    // ---- CLAUDE-276: route a CI failure on an open PR by who opened it ----
+
+    fn pr(number: u64, head_sha: &str) -> ForgePullRequest {
+        ForgePullRequest {
+            number,
+            title: String::new(),
+            head_sha: head_sha.to_string(),
+            head_ref: String::new(),
+            base_ref: String::new(),
+            author: String::new(),
+            html_url: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// Point the process-global key-file env at a fresh (or reused, within one
+    /// test) `age` key and store `value` under `name`, the same setup
+    /// `comment_webhooks::tests::setup_pool` uses for its own write-token test.
+    async fn setup_write_secret(pool: &DbPool, tmp: &std::path::Path, name: &str, value: &str) {
+        use age::secrecy::ExposeSecret;
+        let key_path = tmp.join("key.txt");
+        if !key_path.exists() {
+            let identity = age::x25519::Identity::generate();
+            std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();
+        }
+        std::env::set_var(crate::secrets::KEY_FILE_ENV, &key_path);
+        let key = SecretsKey::load().unwrap();
+        let ciphertext = key.encrypt(value).unwrap();
+        state::secret_create(pool, name, &ciphertext).await.unwrap();
+    }
+
+    /// A [`WebhookConfig`] with one source (`store_event`'s `"test-source"`)
+    /// carrying `write_token_ref`, so a PR-comment routing decision has a
+    /// backend to build.
+    fn webhook_cfg_with_write_token(token_ref: Option<&str>) -> WebhookConfig {
+        let mut cfg = WebhookConfig::default();
+        cfg.sources.insert(
+            "test-source".to_string(),
+            WebhookSource {
+                write_token_ref: token_ref.map(str::to_string),
+                ..WebhookSource::default()
+            },
+        );
+        cfg
+    }
+
+    #[tokio::test]
+    async fn open_pr_lookup_error_fails_the_run_and_mints_nothing() {
+        // CLAUDE-276 acceptance criterion: an open-PR lookup error fails the run
+        // with `ok = false` and an `error` log, and nothing is minted or
+        // commented - never silently read as "no PR".
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new().with_open_prs_error("forge unreachable"));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(7101);
+        let log = failing_test_log("mod_a", "test_one", "feature/x");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(
+            !result.ok,
+            "a lookup error must fail the run: {}",
+            result.text
+        );
+        assert!(
+            result.text.contains("open-PR lookup failed"),
+            "{}",
+            result.text
+        );
+        assert!(
+            !backend.calls().iter().any(|c| c.starts_with("create")),
+            "nothing minted: {:?}",
+            backend.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_pr_under_limit_requeues_its_issue_and_bumps_fix_attempts() {
+        // CLAUDE-276 acceptance criterion: a failure recorded in
+        // `agent_pull_requests` with `fix_attempts` below the ceiling comments
+        // its issue, bumps `fix_attempts`, and sets `AI Agent = Queued` - no PR
+        // comment, no new issue.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        ci_failure_store::record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-40",
+            "dev.a8n.run",
+            "acme/widgets",
+            17,
+            "fix/CLAUDE-40",
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(17, "commit-7102")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(7102);
+        let log = failing_test_log("mod_a", "test_one", "fix/CLAUDE-40");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("create")),
+            "no new issue: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("comment CLAUDE-40")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-40 AI Agent Queued"),
+            "{calls:?}"
+        );
+
+        let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 17)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.fix_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_pr_at_limit_flags_needs_review_listing_every_attempt() {
+        // CLAUDE-276 acceptance criterion: at the fix-attempt ceiling, the next
+        // failure sets `AI Agent = Needs Review` with every attempt's run
+        // listed, instead of re-queuing again.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        let agent_pr_id = ci_failure_store::record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-41",
+            "dev.a8n.run",
+            "acme/widgets",
+            18,
+            "fix/CLAUDE-41",
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            ci_failure_store::bump_fix_attempts(&pool, agent_pr_id, now)
+                .await
+                .unwrap();
+        }
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(18, "commit-7103")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(7103);
+        let log = failing_test_log("mod_a", "test_one", "fix/CLAUDE-41");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        let calls = backend.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-41 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("comment CLAUDE-41") && c.contains("7103")),
+            "the comment names this attempt's run: {calls:?}"
+        );
+
+        let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 18)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.fix_attempts, 3,
+            "a ceiling hit does not itself bump the counter further"
+        );
+    }
+
+    #[tokio::test]
+    async fn human_pr_no_match_comments_the_pr_and_records_a_pr_only_row() {
+        // CLAUDE-276 acceptance criterion: a human PR with no store match gets
+        // one PR comment carrying the analysis, a `pr_only` store row, and no
+        // issue.
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = crate::db::test_pool().await;
+        setup_write_secret(&pool, tmp.path(), "write-ref", "secret-pat").await;
+
+        let paths = test_paths(tmp.path());
+        let body_file = pr_comment_body_path(&paths, "acme/widgets", 17);
+        let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "comment",
+                "acme/widgets#17",
+                "--body-file",
+                body_file.to_str().unwrap(),
+            ],
+            "",
+        ));
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(17, "commit-7104")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context_in(
+            pool.clone(),
+            backend.clone(),
+            classifier,
+            tmp.path(),
+            runner.clone(),
+        );
+        let ev = store_event(7104);
+        let log = failing_test_log("mod_a", "test_one", "human/branch");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg_with_write_token(Some("write-ref")),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        assert!(
+            runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("pr comment acme/widgets#17")),
+            "{:?}",
+            runner.calls.lock().unwrap()
+        );
+        assert!(
+            !backend.calls().iter().any(|c| c.starts_with("create")),
+            "no issue: {:?}",
+            backend.calls()
+        );
+
+        let m = ci_failure_store::find_match(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            &["mod_a::test_one".to_string()],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(m.state, "pr_only");
+        assert_eq!(m.issue_key, None);
+    }
+
+    #[tokio::test]
+    async fn human_pr_sharing_an_open_failure_comments_and_attaches_with_no_analysis() {
+        // CLAUDE-276 acceptance criterion: a human PR sharing a failing test
+        // with an open failure gets a PR comment naming the issue, the run is
+        // attached, and no analysis runs.
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = crate::db::test_pool().await;
+        setup_write_secret(&pool, tmp.path(), "write-ref", "secret-pat").await;
+
+        let now = "2026-09-01T00:00:00Z";
+        let failure_id = ci_failure_store::record_failure(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            None,
+            Some("CLAUDE-42"),
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+        ci_failure_store::add_tests(&pool, failure_id, &["mod_a::test_one".to_string()])
+            .await
+            .unwrap();
+
+        let paths = test_paths(tmp.path());
+        let body_file = pr_comment_body_path(&paths, "acme/widgets", 19);
+        let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "comment",
+                "acme/widgets#19",
+                "--body-file",
+                body_file.to_str().unwrap(),
+            ],
+            "",
+        ));
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(19, "commit-7105")]));
+        let counting = Arc::new(CountingClassifier::new());
+        let classifier: Arc<dyn FailureClassifier> = counting.clone();
+        let ctx = store_mint_context_in(
+            pool.clone(),
+            backend.clone(),
+            classifier,
+            tmp.path(),
+            runner.clone(),
+        );
+        let ev = store_event(7105);
+        let log = failing_test_log("mod_a", "test_one", "human/branch2");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg_with_write_token(Some("write-ref")),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        assert_eq!(
+            counting.call_count(),
+            0,
+            "no analysis runs: {}",
+            result.text
+        );
+        assert!(
+            runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("pr comment acme/widgets#19")),
+            "{:?}",
+            runner.calls.lock().unwrap()
+        );
+        let body = std::fs::read_to_string(&body_file).unwrap();
+        assert!(body.contains("CLAUDE-42"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn human_pr_on_a_second_branch_mints_one_issue_and_comments_both_prs() {
+        // CLAUDE-276 acceptance criterion: the same failing tests on a second
+        // branch's PR create one issue, and both PRs get the issue link.
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = crate::db::test_pool().await;
+        setup_write_secret(&pool, tmp.path(), "write-ref", "secret-pat").await;
+
+        let paths = test_paths(tmp.path());
+        let body_file_a = pr_comment_body_path(&paths, "acme/widgets", 21);
+        let body_file_b = pr_comment_body_path(&paths, "acme/widgets", 22);
+        let runner = Arc::new(
+            crate::provider::cli::testutil::StubRunner::new()
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "acme/widgets#21",
+                        "--body-file",
+                        body_file_a.to_str().unwrap(),
+                    ],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "acme/widgets#22",
+                        "--body-file",
+                        body_file_b.to_str().unwrap(),
+                    ],
+                    "",
+                ),
+        );
+
+        let backend = Arc::new(
+            StoreBackend::new().with_open_prs(vec![pr(21, "commit-7106"), pr(22, "commit-7107")]),
+        );
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context_in(
+            pool.clone(),
+            backend.clone(),
+            classifier,
+            tmp.path(),
+            runner.clone(),
+        );
+        let webhook_cfg = webhook_cfg_with_write_token(Some("write-ref"));
+
+        let ev_a = store_event(7106);
+        let log_a = failing_test_log("mod_a", "test_one", "branch/a");
+        let result_a = triage_and_mint(
+            &ctx,
+            None,
+            &ev_a,
+            log_a,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg,
+        )
+        .await;
+        assert!(result_a.ok, "{}", result_a.text);
+
+        let ev_b = store_event(7107);
+        let log_b = failing_test_log("mod_a", "test_one", "branch/b");
+        let result_b = triage_and_mint(
+            &ctx,
+            None,
+            &ev_b,
+            log_b,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg,
+        )
+        .await;
+        assert!(result_b.ok, "{}", result_b.text);
+
+        let calls = backend.calls();
+        let creates: Vec<_> = calls.iter().filter(|c| c.starts_with("create")).collect();
+        assert_eq!(creates.len(), 1, "exactly one issue created: {calls:?}");
+
+        let runner_calls = runner.calls.lock().unwrap();
+        assert!(
+            runner_calls
+                .iter()
+                .any(|c| c.contains("pr comment acme/widgets#21")),
+            "{runner_calls:?}"
+        );
+        assert!(
+            runner_calls
+                .iter()
+                .any(|c| c.contains("pr comment acme/widgets#22")),
+            "{runner_calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_write_token_ref_fails_the_run_and_records_a_run_event() {
+        // CLAUDE-276 acceptance criterion: a source without `write_token_ref`
+        // logs at `error`, writes a `run_events` row, and fails the run.
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(23, "commit-7108")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(7108);
+        let log = failing_test_log("mod_a", "test_one", "human/branch3");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &webhook_cfg_with_write_token(None),
+        )
+        .await;
+        assert!(!result.ok, "no write_token_ref must fail the run");
+        assert!(result.text.contains("PR comment"), "{}", result.text);
+        let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 10)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|e| e.message.contains("write_token_ref")),
+            "a run_events row names the missing token: {events:?}"
+        );
+    }
+
+    // ---- CLAUDE-277: merge-close - PR merges with the failing workflow green ----
+    mod merge_close {
+        use super::*;
+
+        fn merge_event(repo: &str, number: i64, head_sha: &str) -> VerifiedPullRequestEvent {
+            VerifiedPullRequestEvent {
+                repo: repo.to_string(),
+                number,
+                merged: true,
+                head_sha: head_sha.to_string(),
+                head_ref: "fix-branch".to_string(),
+                html_url: format!("https://dev.a8n.run/{repo}/pulls/{number}"),
+                source: "test-source".to_string(),
+            }
+        }
+
+        fn closed_unmerged_event(repo: &str, number: i64) -> VerifiedPullRequestEvent {
+            VerifiedPullRequestEvent {
+                merged: false,
+                ..merge_event(repo, number, "deadbeef")
+            }
+        }
+
+        fn commit_run(
+            global_id: i64,
+            workflow_id: &str,
+            commit_sha: &str,
+            status: &str,
+        ) -> crate::forge_log::CommitRun {
+            crate::forge_log::CommitRun {
+                global_id,
+                index: global_id,
+                workflow_id: workflow_id.to_string(),
+                commit_sha: commit_sha.to_string(),
+                status: status.to_string(),
+                html_url: format!("https://dev.a8n.run/acme/widgets/actions/runs/{global_id}"),
+            }
+        }
+
+        fn ctx_with_runs(
+            pool: DbPool,
+            backend: Arc<StoreBackend>,
+            outcome: crate::forge_log::CommitRunsOutcome,
+        ) -> MintContext {
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            store_mint_context_with_commit_runs(
+                pool,
+                backend,
+                classifier,
+                std::env::temp_dir().as_path(),
+                Arc::new(crate::provider::cli::testutil::StubRunner::new()),
+                Arc::new(ScriptedCommitRuns::new(outcome)),
+            )
+        }
+
+        #[tokio::test]
+        async fn merged_pr_with_green_workflow_closes_the_issue_and_resolves_the_store_row() {
+            // Acceptance criterion 1: a merged PR referencing an open store
+            // failure, with the failing workflow green at the head commit,
+            // closes the issue (state write plus comment) and marks the store
+            // row `resolved`.
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            let failure_id = ci_failure_store::record_failure(
+                &pool,
+                "acme/widgets",
+                "ci.yml",
+                "test",
+                None,
+                Some("CLAUDE-50"),
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-50",
+                "dev.a8n.run",
+                "acme/widgets",
+                99,
+                "fix/CLAUDE-50",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+
+            let backend = Arc::new(StoreBackend::new());
+            let ctx = ctx_with_runs(
+                pool.clone(),
+                backend.clone(),
+                crate::forge_log::CommitRunsOutcome::Resolved(vec![commit_run(
+                    1,
+                    "ci.yml",
+                    "deadbeefcafefeed",
+                    "success",
+                )]),
+            );
+
+            let ev = merge_event("acme/widgets", 99, "deadbeefcafefeed");
+            process_pr_event(
+                ev,
+                pool.clone(),
+                Some(Arc::new(ctx)),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+
+            let calls = backend.calls();
+            assert!(
+                calls.iter().any(|c| c == "set_state CLAUDE-50 Done"),
+                "{calls:?}"
+            );
+            assert!(
+                calls.iter().any(|c| c.starts_with("comment CLAUDE-50")),
+                "{calls:?}"
+            );
+
+            let row = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 99)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "merged");
+
+            let failure = ci_failure_store::get_failure(&pool, failure_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(failure.state, "resolved");
+        }
+
+        #[tokio::test]
+        async fn merged_pr_with_red_workflow_leaves_the_issue_open() {
+            // Acceptance criterion 2: a merged PR with that workflow red gets
+            // the "left open" comment, and the issue stays open.
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            let failure_id = ci_failure_store::record_failure(
+                &pool,
+                "acme/widgets",
+                "ci.yml",
+                "test",
+                None,
+                Some("CLAUDE-51"),
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-51",
+                "dev.a8n.run",
+                "acme/widgets",
+                100,
+                "fix/CLAUDE-51",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+
+            let backend = Arc::new(StoreBackend::new());
+            let ctx = ctx_with_runs(
+                pool.clone(),
+                backend.clone(),
+                crate::forge_log::CommitRunsOutcome::Resolved(vec![commit_run(
+                    1,
+                    "ci.yml",
+                    "cafefeeddeadbeef",
+                    "failure",
+                )]),
+            );
+
+            let ev = merge_event("acme/widgets", 100, "cafefeeddeadbeef");
+            process_pr_event(
+                ev,
+                pool.clone(),
+                Some(Arc::new(ctx)),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("set_state")),
+                "issue state must not change: {calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with("comment CLAUDE-51") && c.contains("left open")),
+                "{calls:?}"
+            );
+
+            let failure = ci_failure_store::get_failure(&pool, failure_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(failure.state, "open");
+        }
+
+        #[tokio::test]
+        async fn merged_pr_with_no_run_at_the_head_commit_leaves_the_issue_open() {
+            // Same "left open" outcome when no run matches the head commit at
+            // all (the workflow may not have run there, or the runs list is
+            // stale).
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_failure(
+                &pool,
+                "acme/widgets",
+                "ci.yml",
+                "test",
+                None,
+                Some("CLAUDE-52"),
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-52",
+                "dev.a8n.run",
+                "acme/widgets",
+                101,
+                "fix/CLAUDE-52",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+
+            let backend = Arc::new(StoreBackend::new());
+            let ctx = ctx_with_runs(
+                pool.clone(),
+                backend.clone(),
+                crate::forge_log::CommitRunsOutcome::Resolved(Vec::new()),
+            );
+
+            let ev = merge_event("acme/widgets", 101, "no-such-commit");
+            process_pr_event(
+                ev,
+                pool.clone(),
+                Some(Arc::new(ctx)),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("set_state")),
+                "{calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with("comment CLAUDE-52") && c.contains("left open")),
+                "{calls:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn closed_unmerged_agent_pr_is_marked_closed_and_changes_no_issue() {
+            // Acceptance criterion 3: a closed, unmerged agent PR sets
+            // `agent_pull_requests.state = closed` and changes no issue.
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_failure(
+                &pool,
+                "acme/widgets",
+                "ci.yml",
+                "test",
+                None,
+                Some("CLAUDE-53"),
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-53",
+                "dev.a8n.run",
+                "acme/widgets",
+                102,
+                "fix/CLAUDE-53",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+
+            let backend = Arc::new(StoreBackend::new());
+            let ctx = ctx_with_runs(
+                pool.clone(),
+                backend.clone(),
+                crate::forge_log::CommitRunsOutcome::Resolved(Vec::new()),
+            );
+
+            let ev = closed_unmerged_event("acme/widgets", 102);
+            process_pr_event(
+                ev,
+                pool.clone(),
+                Some(Arc::new(ctx)),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+
+            assert!(
+                backend.calls().is_empty(),
+                "no issue write for a closed-unmerged PR: {:?}",
+                backend.calls()
+            );
+            let row = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 102)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "closed");
+        }
+
+        #[tokio::test]
+        async fn no_usable_backend_drops_the_event_with_no_panic() {
+            let pool = crate::db::test_pool().await;
+            let ev = merge_event("acme/widgets", 103, "deadbeef");
+            // `mint: None` is what the daemon passes when no `yt`/`fj` backend is
+            // usable; the event must simply be dropped, not panic.
+            process_pr_event(
+                ev,
+                pool,
+                None,
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_close_then_a_shared_failing_test_reopens_the_issue() {
+            // Acceptance criterion 6, end to end: after this issue's merge-close
+            // sets a store row `resolved`, a later failure sharing one of its
+            // originally-recorded failing tests reopens the issue - exercising
+            // the merge-close write and the pre-existing CLAUDE-273 reopen path
+            // together.
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            let failure_id = ci_failure_store::record_failure(
+                &pool,
+                "acme/widgets",
+                "ci.yml",
+                "test",
+                None,
+                Some("CLAUDE-54"),
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            ci_failure_store::add_tests(&pool, failure_id, &["mod_a::test_one".to_string()])
+                .await
+                .unwrap();
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-54",
+                "dev.a8n.run",
+                "acme/widgets",
+                104,
+                "fix/CLAUDE-54",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+
+            let backend = Arc::new(StoreBackend::new());
+            let close_ctx = ctx_with_runs(
+                pool.clone(),
+                backend.clone(),
+                crate::forge_log::CommitRunsOutcome::Resolved(vec![commit_run(
+                    1,
+                    "ci.yml",
+                    "deadbeefcafefeed",
+                    "success",
+                )]),
+            );
+            let ev = merge_event("acme/widgets", 104, "deadbeefcafefeed");
+            process_pr_event(
+                ev,
+                pool.clone(),
+                Some(Arc::new(close_ctx)),
+                Arc::new(RwLock::new(WebhookConfig::default())),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+            let closed = ci_failure_store::get_failure(&pool, failure_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                closed.state, "resolved",
+                "merge-close must resolve it first"
+            );
+
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            let mint_ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+            let regression_ev = store_event(9001);
+            let log = failing_test_log("mod_a", "test_one", "main");
+            let result = triage_and_mint(
+                &mint_ctx,
+                None,
+                &regression_ev,
+                log,
+                true,
+                None,
+                None,
+                true,
+                "test".to_string(),
+                None,
+                &crate::concurrency::KeyGate::new(),
+                &WebhookConfig::default(),
+            )
+            .await;
+            assert!(result.ok, "{}", result.text);
+
+            let calls = backend.calls();
+            assert!(
+                calls.iter().any(|c| c == "set_state CLAUDE-54 To do"),
+                "the reopen must set the target_state: {calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with("comment CLAUDE-54 | Regression")),
+                "{calls:?}"
+            );
+
+            let reopened = ci_failure_store::get_failure(&pool, failure_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reopened.state, "open");
+        }
+    }
+
     // ---- CLAUDE-64 / CLAUDE-87: every auth-rejection branch is reachable ----
     //
     // Drive `forgejo_webhook` directly so each rejection branch (and the
@@ -2653,7 +7135,7 @@ mod tests {
         /// sources' HMAC secrets, returning the backing pool. The caller holds
         /// [`crate::secrets::key_file_env_lock`] so the env stays stable across
         /// the `resolve_secret` call inside the handler.
-        async fn setup_pool(tmp: &std::path::Path) -> SqlitePool {
+        async fn setup_pool(tmp: &std::path::Path) -> DbPool {
             let key_path = tmp.join("key.txt");
             let identity = age::x25519::Identity::generate();
             std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();
@@ -2681,6 +7163,7 @@ mod tests {
                         allowed_repos: vec!["contoso/claude-run".to_string()],
                         rate_limit_per_min: rate_per_min,
                         log_token_ref: None,
+                        write_token_ref: None,
                     },
                 ),
                 (
@@ -2690,6 +7173,7 @@ mod tests {
                         allowed_repos: vec!["fabrikam/*".to_string()],
                         rate_limit_per_min: rate_per_min,
                         log_token_ref: None,
+                        write_token_ref: None,
                     },
                 ),
             ]
@@ -2699,6 +7183,9 @@ mod tests {
                 replay_window_secs: 300,
                 sources,
                 auto_fix: false,
+                analysis_timeout_secs: 600,
+                analysis_concurrency: 2,
+                agent_pr_fix_attempts: 3,
             }
         }
 
@@ -2811,6 +7298,7 @@ mod tests {
                     allowed_repos: vec!["*".to_string()],
                     rate_limit_per_min: 60,
                     log_token_ref: None,
+                    write_token_ref: None,
                 },
             )]
             .into_iter()
@@ -2819,6 +7307,9 @@ mod tests {
                 replay_window_secs: 300,
                 sources,
                 auto_fix: false,
+                analysis_timeout_secs: 600,
+                analysis_concurrency: 2,
+                agent_pr_fix_attempts: 3,
             };
             let (tx, _rx) = mpsc::channel(8);
             let st = WebhookState::new(pool, config, tx);
@@ -2898,6 +7389,52 @@ mod tests {
             assert!(
                 rx.try_recv().is_err(),
                 "paused action must not emit a mint event"
+            );
+        }
+
+        /// CLAUDE-269: while the Claude login needs renewing, a delivery is
+        /// accepted and dropped exactly like a pause (2xx, no classifier, no
+        /// mint), AND a `run_events` row records why, so the drop is visible
+        /// on the action page and not only in the daemon log.
+        #[tokio::test]
+        async fn login_required_accepts_and_drops_and_records_a_run_event() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut st, mut rx) = state(tmp.path()).await;
+            let readiness = crate::readiness::ReadinessGate::new(
+                tempfile::tempdir().unwrap().path().to_path_buf(),
+                None,
+            );
+            readiness.trip_login_required("OAuth session expired", "invocation");
+            st = st.with_readiness(readiness);
+
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st.clone()),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig), Some("lr-1")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "2xx so Forgejo does not retry"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "a login-required delivery must not emit a mint event"
+            );
+
+            let events = state::run_events_for_action(&st.pool, WEBHOOK_MINT_ACTION, 10)
+                .await
+                .unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.message.contains("Claude login required")),
+                "the drop must be recorded as a run_events row: {events:?}"
             );
         }
 
@@ -3124,6 +7661,473 @@ mod tests {
             // Drop path ("repo not in allowed_repos"): same 200 ack, no event.
             assert_eq!(resp.status(), StatusCode::OK);
             assert!(rx.try_recv().is_err());
+        }
+
+        // CLAUDE-277: the pull-request event-type dispatch and its gates.
+
+        fn headers_with_event(
+            signature: Option<&str>,
+            delivery: Option<&str>,
+            event: Option<&str>,
+        ) -> HeaderMap {
+            let mut h = headers(signature, delivery);
+            if let Some(e) = event {
+                h.insert(EVENT_HEADER, HeaderValue::from_str(e).unwrap());
+            }
+            h
+        }
+
+        fn pull_request_payload(repo: &str, number: i64, action: &str, merged: bool) -> String {
+            format!(
+                r#"{{"action":"{action}","number":{number},"pull_request":{{"merged":{merged},
+                "head":{{"ref":"fix-branch","sha":"deadbeefcafefeed"}},
+                "html_url":"https://dev.a8n.run/{repo}/pulls/{number}"}},
+                "repository":{{"full_name":"{repo}"}}}}"#
+            )
+        }
+
+        /// A [`WebhookState`] over [`two_source_config`], with a `pr_events`
+        /// channel attached so a `pull_request` delivery dispatches instead of
+        /// being acked-and-dropped for lack of a configured sender.
+        async fn state_with_pr_events(
+            tmp: &std::path::Path,
+        ) -> (
+            WebhookState,
+            mpsc::Receiver<VerifiedFailureEvent>,
+            mpsc::Receiver<VerifiedPullRequestEvent>,
+        ) {
+            let pool = setup_pool(tmp).await;
+            let (tx, rx) = mpsc::channel(8);
+            let (pr_tx, pr_rx) = mpsc::channel(8);
+            let st = WebhookState::new(pool, two_source_config(60), tx).with_pr_events(pr_tx);
+            (st, rx, pr_rx)
+        }
+
+        #[tokio::test]
+        async fn unrecognized_event_type_is_acked_and_dropped() {
+            // A header value that is neither an Action-run kind nor
+            // `pull_request` (e.g. "issues") is acked and dropped without being
+            // parsed as either payload shape.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(Some(&sig), Some("u-1"), Some("issues")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn action_run_event_header_still_takes_the_failure_path() {
+            // An explicit `action_run_failure` header (the value the deployed
+            // Forgejo's Action-run notifier sends) keeps the pre-existing path.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(Some(&sig), Some("ar-1"), Some("action_run_failure")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            assert!(rx.try_recv().is_ok());
+        }
+
+        #[tokio::test]
+        async fn pull_request_event_missing_signature_is_401() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, _pr_rx) = state_with_pr_events(tmp.path()).await;
+            let raw = pull_request_payload("contoso/claude-run", 42, "closed", true);
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(None, Some("pr-1"), Some(PULL_REQUEST_EVENT_TYPE)),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn pull_request_event_replay_is_rejected() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, mut pr_rx) = state_with_pr_events(tmp.path()).await;
+            let raw = pull_request_payload("contoso/claude-run", 42, "closed", true);
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let headers1 =
+                headers_with_event(Some(&sig), Some("pr-dup"), Some(PULL_REQUEST_EVENT_TYPE));
+            let r1 = forgejo_webhook(
+                State(st.clone()),
+                Path(SOURCE_A.to_string()),
+                headers1,
+                Bytes::from(raw.clone()),
+            )
+            .await;
+            assert_eq!(r1.status(), StatusCode::ACCEPTED);
+            assert!(pr_rx.try_recv().is_ok());
+
+            let headers2 =
+                headers_with_event(Some(&sig), Some("pr-dup"), Some(PULL_REQUEST_EVENT_TYPE));
+            let r2 = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers2,
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(r2.status(), StatusCode::CONFLICT);
+        }
+
+        #[tokio::test]
+        async fn pull_request_event_paused_action_accepts_and_drops() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, mut pr_rx) = state_with_pr_events(tmp.path()).await;
+            state::action_pause_set(&st.pool, WEBHOOK_MINT_ACTION, Some("maintenance"))
+                .await
+                .unwrap();
+            let raw = pull_request_payload("contoso/claude-run", 42, "closed", true);
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(Some(&sig), Some("pr-pause"), Some(PULL_REQUEST_EVENT_TYPE)),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(pr_rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn pull_request_event_non_terminal_action_is_acked_and_dropped() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, mut pr_rx) = state_with_pr_events(tmp.path()).await;
+            let raw = pull_request_payload("contoso/claude-run", 42, "synchronize", false);
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(Some(&sig), Some("pr-sync"), Some(PULL_REQUEST_EVENT_TYPE)),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(pr_rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn pull_request_event_unlisted_repo_is_acked_and_dropped() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, mut pr_rx) = state_with_pr_events(tmp.path()).await;
+            let raw = pull_request_payload("someone-else/other-repo", 42, "closed", true);
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(
+                    Some(&sig),
+                    Some("pr-unlisted"),
+                    Some(PULL_REQUEST_EVENT_TYPE),
+                ),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(pr_rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn merged_pull_request_event_is_accepted_and_dispatched() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx, mut pr_rx) = state_with_pr_events(tmp.path()).await;
+            let raw = pull_request_payload("contoso/claude-run", 42, "closed", true);
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers_with_event(Some(&sig), Some("pr-merged"), Some(PULL_REQUEST_EVENT_TYPE)),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            let ev = pr_rx.try_recv().unwrap();
+            assert_eq!(ev.repo, "contoso/claude-run");
+            assert_eq!(ev.number, 42);
+            assert!(ev.merged);
+            assert_eq!(ev.head_sha, "deadbeefcafefeed");
+        }
+    }
+
+    // ---- CLAUDE-278: event-driven automerge on a success/recover event -----
+    mod automerge_success {
+        use super::*;
+
+        /// Writes a minimal youtrack action YAML under `dir/actions/<name>.yml`
+        /// (the layout `crate::action::load` resolves against), with automerge
+        /// set to `enabled`.
+        fn write_youtrack_action(dir: &std::path::Path, name: &str, automerge_enabled: bool) {
+            let actions_dir = dir.join("actions");
+            std::fs::create_dir_all(&actions_dir).unwrap();
+            let yaml = format!(
+                "name: {name}\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: {automerge_enabled}\n"
+            );
+            std::fs::write(actions_dir.join(format!("{name}.yml")), yaml).unwrap();
+        }
+
+        fn ctx_for(
+            pool: DbPool,
+            backend: Arc<StoreBackend>,
+            paths_dir: &std::path::Path,
+        ) -> MintContext {
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            store_mint_context_in(
+                pool,
+                backend,
+                classifier,
+                paths_dir,
+                Arc::new(crate::provider::cli::testutil::StubRunner::new()),
+            )
+        }
+
+        #[tokio::test]
+        async fn success_and_mergeable_merges_and_advances_to_done() {
+            // Acceptance criterion 1: a success event on a recorded agent PR,
+            // with automerge enabled and pr_status success+mergeable, merges the
+            // PR and advances the issue to Done.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("merged"), "{result}");
+            let calls = backend.calls();
+            assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
+            assert!(
+                calls.iter().any(|c| c == "set_state MK-16 Done"),
+                "{calls:?}"
+            );
+            assert!(
+                calls.iter().any(|c| c == "set_field MK-16 AI Agent Done"),
+                "{calls:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn pending_does_nothing_then_a_later_success_merges() {
+            // Acceptance criterion 2: a success event while other checks are
+            // pending does nothing, and a later success event (once the forge
+            // reports green + mergeable) merges.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("pending", false));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(
+                result.contains("not action") || result.contains("no action"),
+                "{result}"
+            );
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+            assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
+
+            // A later success event: the forge now reports green + mergeable.
+            *backend.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
+                state: "success".to_string(),
+                mergeable: true,
+            });
+            let result2 = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result2.contains("merged"), "{result2}");
+            let calls = backend.calls();
+            assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
+        }
+
+        #[tokio::test]
+        async fn not_a_recorded_pr_changes_nothing() {
+            // Acceptance criterion 3 (part 1): a success event on a PR that is
+            // not a recorded agent PR changes nothing.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                999,
+                "https://dev.a8n.run/contoso/claude-run/pulls/999",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("not a recorded agent PR"), "{result}");
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+        }
+
+        #[tokio::test]
+        async fn automerge_disabled_action_changes_nothing() {
+            // Acceptance criterion 3 (part 2): a recorded agent PR whose action
+            // has automerge disabled changes nothing.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", false);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("automerge disabled"), "{result}");
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+        }
+
+        #[tokio::test]
+        async fn not_mergeable_comments_and_leaves_code_review() {
+            // Acceptance criterion 4: a success event that is not mergeable
+            // comments and leaves the issue at Code Review (no State / AI Agent
+            // write).
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", false));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("not mergeable"), "{result}");
+            let calls = backend.calls();
+            assert!(
+                calls.iter().any(|c| c.starts_with("comment MK-16")),
+                "{calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+            assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
         }
     }
 }

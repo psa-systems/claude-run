@@ -102,6 +102,7 @@
     <h1><a href="/" style="color: var(--fg);">claude-run</a></h1>
     <nav>
       <a href="/">Dashboard</a>
+      <a href="/logs">Logs</a>
       <a href="/reports">Reports</a>
       <a href="/secrets">Secrets</a>
       <a href="/access">Access</a>
@@ -114,6 +115,13 @@
     <nav class="breadcrumb" aria-label="Breadcrumb">
       {% block breadcrumb %}{% endblock %}
     </nav>
+    {# CLAUDE-269: shared not-ready banner (no Claude credential, or the CLI
+       reported the login expired/revoked), polled on every page so it is
+       visible wherever the operator happens to be, not only the dashboard. #}
+    <div id="claude-readiness-banner"
+         hx-get="/settings/auth/claude/banner"
+         hx-trigger="load, every 30s"
+         hx-swap="innerHTML"></div>
     {# CLAUDE-223: page-level failure banner for every hx-post control. Nearly all
        of them use hx-swap="none", which discards the response body, so before
        this a refused action (a 409 from a trigger on a paused daemon, a 500 from

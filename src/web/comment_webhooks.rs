@@ -18,12 +18,10 @@
 //! trigger parsing, bot-login loop drop, dedupe key, caps ledger, and run
 //! accounting are the same implementations both paths run through.
 //!
-//! This is a SECOND, independent listener from [`super::webhooks`], not an
-//! extension of it, because the credentials differ in kind: comment handling
-//! needs a WRITE token (post comments, push a branch) while the CI-failure
-//! sources need only a read-only log token. Separate config sections keep the
-//! write token out of the block holding the read-only one, and the two get
-//! independent Pause switches.
+//! This is a SECOND, independent listener from [`super::webhooks`], not an extension
+//! of it: its token pushes branches, while a CI-failure source's tokens only read logs
+//! and comment. Separate config sections keep the push-capable token apart, and the
+//! two get independent Pause switches.
 //!
 //! What IS shared with [`super::webhooks`], deliberately and by reference rather
 //! than by copy: [`super::webhooks::verify_signature`], the single
@@ -56,6 +54,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::db::DbPool;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -64,7 +63,6 @@ use axum::routing::post;
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
@@ -73,7 +71,7 @@ use crate::claude::{ClaudeInvoker, ClaudeResult};
 use crate::concurrency::KeyGate;
 use crate::config::{CommentWebhookConfig, CommentWebhookSource, MintConfig, Paths};
 use crate::job::RunnerDefaults;
-use crate::provider::{Backend, CliBackend, Forge, ProcessRunner};
+use crate::provider::{Backend, CliBackend, Forge, IssueTracker, ProcessRunner};
 use crate::secrets::{self, SecretsKey};
 use crate::state;
 
@@ -341,7 +339,7 @@ pub fn verified_comment_command(
 /// [`crate::settings::LiveSettings`] swaps on save.
 #[derive(Clone)]
 pub struct CommentWebhookState {
-    pool: SqlitePool,
+    pool: DbPool,
     config: Arc<RwLock<CommentWebhookConfig>>,
     /// Loop-safety bot logins, reused from the mint config rather than
     /// re-declared, so the bot's own reply can never re-trigger a run.
@@ -357,7 +355,7 @@ impl CommentWebhookState {
     /// the CI-failure listener, so a Settings save routes live and the replay
     /// store is one instance across both endpoints.
     pub fn from_shared(
-        pool: SqlitePool,
+        pool: DbPool,
         config: Arc<RwLock<CommentWebhookConfig>>,
         mint_cfg: Arc<RwLock<MintConfig>>,
         rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
@@ -376,7 +374,7 @@ impl CommentWebhookState {
 
     /// Standalone instance owning fresh handles built from `config` (tests).
     pub fn new(
-        pool: SqlitePool,
+        pool: DbPool,
         config: CommentWebhookConfig,
         commands: mpsc::Sender<VerifiedCommentCommand>,
     ) -> Self {
@@ -548,10 +546,7 @@ async fn forgejo_comment_webhook(
 
 /// Resolve a source's HMAC secret to plaintext. Errors when the source has no
 /// `secret_ref` or the secret cannot be decrypted (both fail closed as 401).
-async fn resolve_secret(
-    pool: &SqlitePool,
-    src: &CommentWebhookSource,
-) -> crate::error::Result<String> {
+async fn resolve_secret(pool: &DbPool, src: &CommentWebhookSource) -> crate::error::Result<String> {
     let name = src.secret_ref.as_deref().ok_or_else(|| {
         crate::error::Error::Secret(
             "comment webhook source secret_ref is not configured".to_string(),
@@ -579,13 +574,34 @@ impl PermissionVerdict {
     }
 }
 
-/// True when `permission` is in `allowed` (case-insensitive). An empty list
-/// denies everyone; the settings validator rejects one, so this is defence in
-/// depth for a hand-edited DB row.
+/// Forgejo access-mode rank (`models/perm/access_mode.go`): `none` 0, `read` 1,
+/// `write` 2, `admin` 3, `owner` 4, case-insensitive. `None` for anything else.
+fn access_rank(permission: &str) -> Option<u8> {
+    match permission.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(0),
+        "read" => Some(1),
+        "write" => Some(2),
+        "admin" => Some(3),
+        "owner" => Some(4),
+        _ => None,
+    }
+}
+
+/// True when `permission` is in `allowed` (case-insensitive), or outranks a
+/// Forgejo access level listed in it. An empty list denies everyone; the
+/// settings validator rejects one, so this is defence in depth for a
+/// hand-edited DB row.
 pub fn permission_allowed(permission: &str, allowed: &[String]) -> bool {
-    allowed
-        .iter()
-        .any(|a| a.trim().eq_ignore_ascii_case(permission.trim()))
+    let permission_rank = access_rank(permission);
+    allowed.iter().any(|a| {
+        if a.trim().eq_ignore_ascii_case(permission.trim()) {
+            return true;
+        }
+        match (permission_rank, access_rank(a)) {
+            (Some(p), Some(a)) => p >= a,
+            _ => false,
+        }
+    })
 }
 
 /// Read the commenter's effective repository permission LIVE from the forge and
@@ -631,7 +647,7 @@ impl DenialReplyLimiter {
 /// Everything [`consume_commands`] needs to serve an accepted command. Built
 /// once at daemon start.
 pub struct CommentContext {
-    pub pool: SqlitePool,
+    pub pool: DbPool,
     pub paths: Paths,
     pub claude: Arc<ClaudeInvoker>,
     /// Live comment config, re-read per command so a Settings save applies
@@ -652,6 +668,10 @@ pub struct CommentContext {
     pub keygate: KeyGate,
     /// Per-(repo, login) denial-reply throttle.
     pub denials: Arc<DenialReplyLimiter>,
+    /// CLAUDE-269: `None` outside the daemon (tests). When set, a command is
+    /// refused with a reply naming the reason instead of invoking `claude`,
+    /// while the Claude login needs renewing.
+    pub readiness: Option<crate::readiness::ReadinessGate>,
 }
 
 /// Drain accepted commands for the daemon's lifetime. Each command is served on
@@ -892,6 +912,23 @@ async fn run_instruction(
     src: &CommentWebhookSource,
     instruction: String,
 ) {
+    // CLAUDE-269: right after the pause check (already taken before this
+    // command was accepted), refuse before admission so no attempt counter is
+    // advanced and no `claude` runs. Unlike the CI-triage webhook's silent
+    // accept-and-drop, this route knows the thread, so it replies naming the
+    // reason instead of leaving the commenter to wonder why nothing happened.
+    if let Some(gate) = &ctx.readiness {
+        let check = gate.check();
+        if check.kind == Some(crate::readiness::NotReadyKind::LoginRequired) {
+            let reason = check
+                .reason()
+                .unwrap_or_else(|| "Claude login required".to_string());
+            info!(repo = %cmd.repo, number = cmd.number, "Claude login required; replying and running nothing");
+            reply(ctx, env, cmd, key, login_required_comment(&reason)).await;
+            return;
+        }
+    }
+
     // Reused DEV-335 caps. The per-key counter also IS the redelivery guard: a
     // comment is a one-shot, so its effective cap is one attempt however high the
     // runner default is, and the counter is advanced BEFORE the work so a
@@ -936,6 +973,17 @@ async fn run_instruction(
     // The route: a pull-request comment runs the CLAUDE-220 clone / Claude /
     // push pipeline; a plain-issue comment mints a Queued YouTrack issue and
     // starts no agent session (CLAUDE-221).
+    // DEV-705: one comment delivery is one run, so its ceiling is resolved from
+    // the runner defaults before the agent starts and cannot be raised while it
+    // works.
+    let spend = crate::usage::RunSpend::new(
+        WEBHOOK_COMMENT_ACTION,
+        crate::usage::RunBudget::new(
+            ctx.defaults.daily_budget_usd,
+            ctx.defaults.budget_warn_fraction,
+        ),
+        Some(ctx.paths.usage_log()),
+    );
     let outcome = if cmd.is_pull_request {
         stage(STAGE_RUNNING).await;
         let claude = ctx.claude.clone();
@@ -945,6 +993,7 @@ async fn run_instruction(
         let src = src.clone();
         let workdir = workdir.clone();
         let stream_log = stream_log.clone();
+        let run_spend = spend.clone();
         tokio::task::block_in_place(move || {
             serve_run(
                 backend.as_ref(),
@@ -955,6 +1004,7 @@ async fn run_instruction(
                 &workdir,
                 &stream_log,
                 timeout,
+                &run_spend,
             )
         })
     } else {
@@ -964,9 +1014,14 @@ async fn run_instruction(
         let route_cache = ctx.route_cache.clone();
         let cmd = cmd.clone();
         let workdir = workdir.clone();
+        // CLAUDE-234: one ledger for this delivery's run, so the mint's writes
+        // are journalled with `run_id` and bounded by the run's ceiling.
+        let audit = crate::provider::IssueWriteAudit::new(run_id, ctx.defaults.max_issues_per_run);
         tokio::task::block_in_place(move || {
+            let tracker = crate::provider::AuditedTracker::new(backend.as_ref(), audit);
             serve_mint(
                 backend.as_ref(),
+                &tracker,
                 &mint_cfg,
                 &route_cache,
                 &cmd,
@@ -986,12 +1041,8 @@ async fn run_instruction(
             warn!(error = %e, "advancing the comment daily ledger failed");
         }
     }
-    finish_comment_run(&ctx.pool, run_id, key, &outcome, &stream_log).await;
-    if workdir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&workdir) {
-            warn!(workdir = %workdir.display(), error = %e, "comment workdir cleanup failed (continuing)");
-        }
-    }
+    finish_comment_run(&ctx.pool, run_id, key, &outcome, &stream_log, &spend).await;
+    crate::workdir::cleanup_or_preserve(&workdir, WEBHOOK_COMMENT_ACTION, key);
 }
 
 /// The recorded result of one served instruction, on either route.
@@ -1041,15 +1092,17 @@ fn serve_run(
     workdir: &FsPath,
     stream_log: &FsPath,
     timeout: Duration,
+    // DEV-705 / DEV-707: this delivery's ledger and frozen ceiling.
+    spend: &crate::usage::RunSpend,
 ) -> RunOutcome {
     let cancel = CancellationToken::new();
 
-    let branch = match head_branch(backend, cmd) {
+    let (branch, base) = match pr_branches(backend, cmd) {
         Ok(b) => b,
         Err(e) => {
-            let body = error_comment(&format!("could not resolve the PR head branch: {e}"));
+            let body = error_comment(&format!("could not resolve the PR's head/base branch: {e}"));
             post_reply(backend, cmd, workdir, body);
-            return RunOutcome::failed(format!("could not resolve the PR head branch: {e}"));
+            return RunOutcome::failed(format!("could not resolve the PR's head/base branch: {e}"));
         }
     };
 
@@ -1061,24 +1114,28 @@ fn serve_run(
     let clone = backend
         .clone_url(&cmd.host, &cmd.repo)
         .map_err(|e| format!("resolve clone url: {e}"))
-        .and_then(|url| {
-            clone_branch(&url, &branch, workdir).map_err(|e| format!("git clone: {e}"))
+        .and_then(|url| clone_branch(&url, &branch, workdir).map_err(|e| format!("git clone: {e}")))
+        .and_then(|()| {
+            prepare_checkout(workdir, &src.bot_author, &src.bot_email)
+                .map_err(|e| format!("preparing the checkout failed: {e}"))
         });
 
     let mut claude_ran = false;
+    let mut cloned_head = None;
     let claude_result = match clone {
         Err(reason) => {
             warn!(repo = %cmd.repo, pr = cmd.number, %reason, "clone failed (the PR reply still runs)");
             ClaudeResult::synthesized("clone failed", reason)
         }
-        Ok(()) => {
+        Ok(head) => {
+            cloned_head = Some(head);
             // The instruction reaches the agent through a FILE, verbatim. It is
             // never interpolated into a shell command or a command line.
             let instruction_path = workdir.join(INSTRUCTION_FILE);
             if let Err(e) = std::fs::write(&instruction_path, instruction) {
                 ClaudeResult::synthesized("writing the instruction file failed", e.to_string())
             } else {
-                let prompt = build_prompt(cmd, &branch);
+                let prompt = build_prompt(cmd, &branch, &base);
                 info!(repo = %cmd.repo, pr = cmd.number, stream_log = %stream_log.display(), "invoking claude for a comment command");
                 match claude.invoke(
                     &prompt,
@@ -1087,9 +1144,13 @@ fn serve_run(
                     workdir,
                     stream_log,
                     &cancel,
+                    // DEV-705: cap the child at this run's remaining ceiling.
+                    Some(spend.remaining_usd()),
                 ) {
                     Ok(r) => {
                         claude_ran = true;
+                        // DEV-707: bill the run with what the session spent.
+                        spend.record(&r);
                         r
                     }
                     Err(e) => ClaudeResult::synthesized("claude invocation failed", e.to_string()),
@@ -1098,23 +1159,33 @@ fn serve_run(
         }
     };
 
-    // ---- decision gate (the `forgejo-ci-fix` shape) ----
+    // ---- decision gate ----
     let decision = if !claude_result.ok {
         Decision::ClaudeFailed
     } else {
-        let (files, lines) = diff_stats(workdir);
-        decide(
-            &claude_result.summary,
-            files,
-            lines,
-            src.max_files,
-            src.max_lines,
-        )
+        // `cloned_head` is always `Some` here: claude only ran after a
+        // successful clone + `prepare_checkout`, and a fault on either path
+        // leaves `claude_result.ok == false` above.
+        let head = cloned_head
+            .as_deref()
+            .expect("claude only runs after a successful clone");
+        match run_decision_gate(workdir, head, cmd, src, &claude_result.summary) {
+            Ok(d) => d,
+            Err(e) => {
+                // A measurement failure is a fault, never "no changes": that
+                // would tell the human nothing changed when git simply could
+                // not be asked.
+                warn!(repo = %cmd.repo, pr = cmd.number, error = %e, "measuring the change failed (the PR reply still runs)");
+                Decision::MeasureFailed {
+                    reason: e.to_string(),
+                }
+            }
+        }
     };
 
     let mut push_err = None;
     if matches!(decision, Decision::Push { .. }) {
-        if let Err(e) = push_fix(backend, src, cmd, &branch, workdir, &claude_result) {
+        if let Err(e) = push_fix(backend, cmd, &branch, workdir) {
             warn!(repo = %cmd.repo, pr = cmd.number, error = %e, "push failed (commenting the failure)");
             push_err = Some(e.to_string());
         }
@@ -1134,7 +1205,9 @@ fn serve_run(
     );
     RunOutcome {
         summary,
-        ok: claude_result.ok && push_err.is_none(),
+        ok: claude_result.ok
+            && push_err.is_none()
+            && !matches!(decision, Decision::MeasureFailed { .. }),
         claude_ran,
         claude_ok: claude_result.ok,
         cost: claude_result.cost,
@@ -1152,6 +1225,7 @@ fn serve_run(
 /// path (minted, create failed, queue failed).
 fn serve_mint(
     backend: &dyn Backend,
+    tracker: &dyn IssueTracker,
     mint_cfg: &MintConfig,
     route_cache: &crate::mint::VcsRouteCache,
     cmd: &VerifiedCommentCommand,
@@ -1162,7 +1236,10 @@ fn serve_mint(
     let summary = mint_summary(cmd);
     let description = mint_description(cmd, instruction);
 
-    let key = match backend.create_issue(&project, &summary, &description, None) {
+    // CLAUDE-234: the tracker writes go through this delivery's ledger (the
+    // backend is per-delivery but the ledger carries the run id and the
+    // ceiling); the forge replies keep using `backend` directly.
+    let key = match tracker.create_issue(&project, &summary, &description, None) {
         Ok(k) => k,
         Err(e) => {
             warn!(repo = %cmd.repo, issue = cmd.number, %project, error = %e, "minting the YouTrack issue failed");
@@ -1181,10 +1258,10 @@ fn serve_mint(
     // State first, then the authoritative `AI Agent` write, the same order the
     // triage mint uses. A failed state write leaves a usable issue, so it is
     // logged and the queueing still runs; a failed queue write is reported.
-    if let Err(e) = backend.set_state(&key, &mint_cfg.target_state) {
+    if let Err(e) = tracker.set_state(&key, &mint_cfg.target_state) {
         warn!(key = %key, error = %e, "setting the minted issue's state failed (continuing to the AI Agent write)");
     }
-    if let Err(e) = backend.set_field(&key, &mint_cfg.ai_agent_field, &mint_cfg.queued_value) {
+    if let Err(e) = tracker.set_field(&key, &mint_cfg.ai_agent_field, &mint_cfg.queued_value) {
         warn!(key = %key, error = %e, "queueing the minted issue failed");
         post_reply(
             backend,
@@ -1256,52 +1333,47 @@ fn mint_description(cmd: &VerifiedCommentCommand, instruction: &str) -> String {
     .join("\n")
 }
 
-/// Resolve the PR's head branch from the forge's open-PR list (the same read the
-/// CI-fix scan uses; no new tooling and no raw REST).
-fn head_branch(
+/// Resolve the PR's head and base branch from the forge's open-PR list (the
+/// same read the CI-fix scan uses; no new tooling and no raw REST). An empty
+/// `base_ref` is an error handled exactly like an empty `head_ref`: the base
+/// branch names what the agent is allowed to merge in to resolve conflicts
+/// (CLAUDE-303), so a PR whose base the forge did not report cannot be served.
+fn pr_branches(
     backend: &dyn Backend,
     cmd: &VerifiedCommentCommand,
-) -> crate::error::Result<String> {
+) -> crate::error::Result<(String, String)> {
     let prs = backend.list_open_prs(&cmd.host, &cmd.repo)?;
-    prs.into_iter()
+    let pr = prs
+        .into_iter()
         .find(|p| p.number == cmd.number)
-        .map(|p| p.head_ref)
-        .filter(|b| !b.is_empty())
         .ok_or_else(|| {
             crate::error::Error::Other(anyhow::anyhow!(
                 "PR #{} is not an open pull request on {}",
                 cmd.number,
                 cmd.repo
             ))
-        })
+        })?;
+    if pr.head_ref.is_empty() || pr.base_ref.is_empty() {
+        return Err(crate::error::Error::Other(anyhow::anyhow!(
+            "PR #{} on {} is missing a head or base branch",
+            cmd.number,
+            cmd.repo
+        )));
+    }
+    Ok((pr.head_ref, pr.base_ref))
 }
 
-/// Shallow-clone `branch` into `workdir`. Errors carry only the exit code, never
-/// the token-bearing URL.
+/// Shallow-clone `branch` into `workdir`. CLAUDE-252: the shared helper reports
+/// git's own reason for a failure with the token-bearing URL's credential
+/// redacted, instead of the bare exit code this used to carry.
 fn clone_branch(clone_url: &str, branch: &str, workdir: &FsPath) -> crate::error::Result<()> {
-    let status = std::process::Command::new("git")
-        .arg("clone")
-        .arg("--branch")
-        .arg(branch)
-        .arg("--depth")
-        .arg("50")
-        .arg(clone_url)
-        .arg(workdir)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(crate::error::Error::Other(anyhow::anyhow!(
-            "git clone exited {}",
-            status.code().unwrap_or(-1)
-        )))
-    }
+    crate::provider::shallow_clone(clone_url, Some(branch), workdir, 50)
 }
 
 /// The agent's instruction text. The human's own words are NOT inlined here:
 /// they live in [`INSTRUCTION_FILE`] beside the checkout and the agent is told to
 /// read that file, so nothing from the comment reaches a command line.
-fn build_prompt(cmd: &VerifiedCommentCommand, branch: &str) -> String {
+fn build_prompt(cmd: &VerifiedCommentCommand, branch: &str, base: &str) -> String {
     [
         "You are working a request left as a comment on a pull request.".to_string(),
         String::new(),
@@ -1313,6 +1385,7 @@ fn build_prompt(cmd: &VerifiedCommentCommand, branch: &str) -> String {
         String::new(),
         format!("PR: #{} in {}", cmd.number, cmd.repo),
         format!("Branch: {branch}"),
+        format!("Base branch: {base}"),
         format!("Requested by: {}", cmd.author),
         String::new(),
         "Your job:".to_string(),
@@ -1322,20 +1395,38 @@ fn build_prompt(cmd: &VerifiedCommentCommand, branch: &str) -> String {
         "  4. If the request is unsafe, out of scope, or ambiguous, explain why and make no changes"
             .to_string(),
         String::new(),
-        "Do ONLY local engineering work. Do NOT commit, push, or open/modify the PR; the runner commits and pushes your changes and replies on the PR after you exit.".to_string(),
+        "Stay on the branch that is checked out. Do NOT create or switch branches.".to_string(),
+        format!("You MAY bring the base branch into this branch when the request needs it (for example, to resolve merge conflicts): run `git fetch --unshallow origin {base}`, then `git merge FETCH_HEAD`, resolve every conflict, run the repo's checks, and `git commit --no-edit`. A merge of the base branch is the ONLY commit you may create."),
+        "Leave every other change uncommitted. Do NOT push, and do NOT open or modify the PR; the runner commits your remaining changes, pushes the branch, and replies on the PR after you exit.".to_string(),
         String::new(),
         "When you are done, summarize what you changed and why in plain text.".to_string(),
     ]
     .join("\n")
 }
 
-/// The decision gate outcome, the `forgejo-ci-fix` shape.
+/// The decision gate outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     ClaudeFailed,
     NoChanges,
-    TooBig { files: u64, lines: u64 },
-    Push { files: u64, lines: u64 },
+    /// Unmerged paths (`git diff --diff-filter=U`) were left behind: nothing
+    /// was staged, committed, or pushed.
+    UnresolvedConflicts {
+        paths: Vec<String>,
+    },
+    /// A git failure while committing the leftovers or measuring the change
+    /// since the cloned head: never read as "no changes".
+    MeasureFailed {
+        reason: String,
+    },
+    TooBig {
+        files: u64,
+        lines: u64,
+    },
+    Push {
+        files: u64,
+        lines: u64,
+    },
 }
 
 impl Decision {
@@ -1343,6 +1434,8 @@ impl Decision {
         match self {
             Decision::ClaudeFailed => "claude_failed",
             Decision::NoChanges => "no_changes",
+            Decision::UnresolvedConflicts { .. } => "unresolved_conflicts",
+            Decision::MeasureFailed { .. } => "measure_failed",
             Decision::TooBig { .. } => "too_big",
             Decision::Push { .. } => "push",
         }
@@ -1350,13 +1443,22 @@ impl Decision {
 }
 
 /// Classify a completed run into a [`Decision`]. Pure, so the gate is unit
-/// tested without a workdir.
-pub fn decide(summary: &str, files: u64, lines: u64, max_files: u64, max_lines: u64) -> Decision {
+/// tested without a workdir. `commits` is the number of commits made since the
+/// cloned head (CLAUDE-303): a clean base merge with no other change is
+/// `commits >= 1, files == 0`, which is still a push.
+pub fn decide(
+    summary: &str,
+    commits: u64,
+    files: u64,
+    lines: u64,
+    max_files: u64,
+    max_lines: u64,
+) -> Decision {
     let s = summary.to_lowercase();
     let says_no = s.contains("no changes")
         || s.contains("making no changes")
         || s.contains("changes made: none");
-    if files == 0 || says_no {
+    if commits == 0 || says_no {
         Decision::NoChanges
     } else if files > max_files || lines > max_lines {
         Decision::TooBig { files, lines }
@@ -1365,31 +1467,143 @@ pub fn decide(summary: &str, files: u64, lines: u64, max_files: u64, max_lines: 
     }
 }
 
-/// Working-tree diff size via `git diff --numstat`. A non-git dir yields `(0,0)`.
-fn diff_stats(workdir: &FsPath) -> (u64, u64) {
-    match std::process::Command::new("git")
+/// Runs right after a successful clone: sets the bot git identity (so an
+/// agent-made merge commit is authored and committed as the bot, CLAUDE-303),
+/// records the cloned head (what the change measurement diffs against), and
+/// appends the runner's own scratch files to `.git/info/exclude` so nothing
+/// later, including `git add -A` in [`run_decision_gate`], ever stages or
+/// counts them. A failure of any part is a clone-stage failure: nothing about
+/// the checkout can yet be trusted.
+fn prepare_checkout(
+    workdir: &FsPath,
+    bot_author: &str,
+    bot_email: &str,
+) -> crate::error::Result<String> {
+    git_in(workdir, &["config", "user.name", bot_author])?;
+    git_in(workdir, &["config", "user.email", bot_email])?;
+
+    let head = git_output(workdir, &["rev-parse", "HEAD"])?;
+
+    let exclude_path = workdir.join(".git").join("info").join("exclude");
+    let mut content = match std::fs::read_to_string(&exclude_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    for name in [INSTRUCTION_FILE, COMMIT_MSG_FILE, PR_COMMENT_FILE] {
+        if !content.lines().any(|line| line == name) {
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(name);
+            content.push('\n');
+        }
+    }
+    std::fs::write(&exclude_path, content)?;
+
+    Ok(head)
+}
+
+/// Run `git` in `workdir` and return trimmed stdout, or git's own failure
+/// reason via [`crate::provider::git_error`].
+fn git_output(workdir: &FsPath, args: &[&str]) -> crate::error::Result<String> {
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
-        .arg("diff")
-        .arg("--numstat")
-        .output()
-    {
-        Ok(out) if out.status.success() => parse_numstat(&String::from_utf8_lossy(&out.stdout)),
-        _ => (0, 0),
+        .args(args)
+        .output()?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(crate::provider::git_error(&args.join(" "), &out, None))
     }
 }
 
-/// Sum `git diff --numstat` into `(files, lines_changed)`.
-fn parse_numstat(stdout: &str) -> (u64, u64) {
-    let mut files = 0u64;
+/// The decision gate, run after a successful Claude session. Order matters:
+/// unmerged paths are checked BEFORE anything is staged, so a conflict left
+/// behind (markers and all) is never `git add`ed into a commit. Then the
+/// runner concludes whatever the agent left uncommitted (including a staged
+/// but uncommitted merge), and measures every commit made since the cloned
+/// head, walking `--first-parent` only: that stays on the branch's own
+/// lineage (the agent's own commits, and the merge commit itself) and never
+/// descends into the base branch's individual commits, which is what makes a
+/// merge commit's `--remerge-diff` the right measurement rather than a
+/// double-count. An ordinary commit is measured by its own `--numstat`, a
+/// merge commit (more than one parent) by `--remerge-diff --numstat`, so a
+/// base-branch merge counts only the conflict resolution, never the lines the
+/// base branch brought in. `files` is the count of DISTINCT paths across
+/// every commit's numstat.
+fn run_decision_gate(
+    workdir: &FsPath,
+    cloned_head: &str,
+    cmd: &VerifiedCommentCommand,
+    src: &CommentWebhookSource,
+    claude_summary: &str,
+) -> crate::error::Result<Decision> {
+    let unmerged = git_output(workdir, &["diff", "--name-only", "--diff-filter=U"])?;
+    let paths: Vec<String> = unmerged
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !paths.is_empty() {
+        return Ok(Decision::UnresolvedConflicts { paths });
+    }
+
+    git_in(workdir, &["add", "-A"])?;
+    if needs_commit(workdir)? {
+        let msg = commit_message(cmd, claude_summary, &src.skip_marker);
+        let msg_file = workdir.join(COMMIT_MSG_FILE);
+        std::fs::write(&msg_file, msg)?;
+        let msg_arg = msg_file.to_string_lossy();
+        git_in(workdir, &["commit", "--file", &msg_arg])?;
+    }
+
+    let range = format!("{cloned_head}..HEAD");
+    let commits: u64 = git_output(workdir, &["rev-list", "--first-parent", "--count", &range])?
+        .parse()
+        .map_err(|e| {
+            crate::error::Error::Other(anyhow::anyhow!("parsing the commit count failed: {e}"))
+        })?;
+
+    let shas = git_output(workdir, &["rev-list", "--first-parent", &range])?;
+    let mut files = std::collections::HashSet::new();
+    let mut lines = 0u64;
+    for sha in shas.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let parents = git_output(workdir, &["show", "-s", "--pretty=%P", sha])?;
+        let numstat = if parents.split_whitespace().count() > 1 {
+            git_output(
+                workdir,
+                &["show", "--remerge-diff", "--numstat", "--format=", sha],
+            )?
+        } else {
+            git_output(workdir, &["show", "--numstat", "--format=", sha])?
+        };
+        lines += numstat_files_and_lines(&numstat, &mut files);
+    }
+
+    Ok(decide(
+        claude_summary,
+        commits,
+        files.len() as u64,
+        lines,
+        src.max_files,
+        src.max_lines,
+    ))
+}
+
+/// Fold one `git show --numstat` (or `--remerge-diff --numstat`) output into
+/// the running set of distinct changed paths, returning the lines added plus
+/// deleted. A binary row (`-\t-\tpath`) counts as a file and 0 lines.
+fn numstat_files_and_lines(stdout: &str, files: &mut std::collections::HashSet<String>) -> u64 {
     let mut lines = 0u64;
     for raw in stdout.lines() {
         let line = raw.trim();
         if line.is_empty() {
             continue;
         }
-        files += 1;
-        let mut cols = line.split('\t');
+        let mut cols = line.splitn(3, '\t');
         let added = cols
             .next()
             .and_then(|c| c.trim().parse::<u64>().ok())
@@ -1398,72 +1612,91 @@ fn parse_numstat(stdout: &str) -> (u64, u64) {
             .next()
             .and_then(|c| c.trim().parse::<u64>().ok())
             .unwrap_or(0);
+        if let Some(file) = cols.next() {
+            let file = file.trim();
+            if !file.is_empty() {
+                files.insert(file.to_string());
+            }
+        }
         lines += added + deleted;
     }
-    (files, lines)
+    lines
 }
 
-/// Commit as the bot identity (with the CI skip marker) and push the PR branch.
+/// Push the PR branch. Push-only (CLAUDE-303): committing the leftovers now
+/// happens in [`run_decision_gate`], before the change is measured.
 fn push_fix(
     backend: &dyn Backend,
-    src: &CommentWebhookSource,
     cmd: &VerifiedCommentCommand,
     branch: &str,
     workdir: &FsPath,
-    claude_result: &ClaudeResult,
 ) -> crate::error::Result<()> {
-    git_in(workdir, &["config", "user.name", &src.bot_author])?;
-    git_in(workdir, &["config", "user.email", &src.bot_email])?;
-    git_in(workdir, &["add", "-A"])?;
-
-    let msg = commit_message(cmd, &claude_result.summary, &src.skip_marker);
-    let msg_file = workdir.join(COMMIT_MSG_FILE);
-    std::fs::write(&msg_file, msg)?;
-    let msg_arg = msg_file.to_string_lossy();
-    git_in(workdir, &["commit", "--file", &msg_arg])?;
-
     let push_url = backend.clone_url(&cmd.host, &cmd.repo)?;
     git_push(workdir, &push_url, branch)
 }
 
+/// Whether [`push_fix`] has anything left to commit: the freshly staged index
+/// (via the `git add -A` above) still differs from `HEAD`, or a merge is in
+/// progress (`MERGE_HEAD` present), which that commit concludes. When the
+/// agent committed everything itself, the index already matches `HEAD` and
+/// there is nothing left for the runner to commit before it pushes.
+fn needs_commit(workdir: &FsPath) -> crate::error::Result<bool> {
+    if workdir.join(".git").join("MERGE_HEAD").exists() {
+        return Ok(true);
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .arg("diff")
+        .arg("--cached")
+        .arg("--quiet")
+        .arg("HEAD")
+        .output()?;
+    match out.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(crate::provider::git_error(
+            "diff --cached --quiet HEAD",
+            &out,
+            None,
+        )),
+    }
+}
+
 fn git_in(workdir: &FsPath, args: &[&str]) -> crate::error::Result<()> {
-    let status = std::process::Command::new("git")
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
         .args(args)
-        .status()?;
-    if status.success() {
+        .output()?;
+    if out.status.success() {
         Ok(())
     } else {
-        Err(crate::error::Error::Other(anyhow::anyhow!(
-            "git {} exited {}",
-            args.join(" "),
-            status.code().unwrap_or(-1)
-        )))
+        Err(crate::provider::git_error(&args.join(" "), &out, None))
     }
 }
 
 /// Kept separate from [`git_in`] so the token-bearing URL never reaches an error.
 fn git_push(workdir: &FsPath, url: &str, branch: &str) -> crate::error::Result<()> {
-    let status = std::process::Command::new("git")
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
         .arg("push")
         .arg(url)
         .arg(branch)
-        .status()?;
-    if status.success() {
+        .output()?;
+    if out.status.success() {
         Ok(())
     } else {
-        Err(crate::error::Error::Other(anyhow::anyhow!(
-            "git push exited {}",
-            status.code().unwrap_or(-1)
-        )))
+        // CLAUDE-252: report git's own reason, with the URL credential masked.
+        Err(crate::provider::git_error("push", &out, Some(url)))
     }
 }
 
-/// The commit message: a subject naming the PR, the agent's summary, and the CI
-/// skip marker so the push does not re-trigger the CI-fix action.
+/// The commit message: a subject naming the PR, the agent's summary, and the
+/// skip marker. Nothing reads the marker today; it is a marker of provenance
+/// for a human reading the log, not a loop guard (the `bot_logins` check is
+/// what stops the bot's own replies from re-triggering this listener).
 pub fn commit_message(cmd: &VerifiedCommentCommand, summary: &str, skip_marker: &str) -> String {
     [
         format!("chore: Claude comment command on PR #{}", cmd.number),
@@ -1563,13 +1796,13 @@ pub fn denied_comment(verdict: &PermissionVerdict, allowed: &[String]) -> String
         PermissionVerdict::LookupFailed(_) => [
             "**Command refused: could not verify your repository permission.**".to_string(),
             String::new(),
-            format!("Running a command needs one of these repository permissions: `{list}`. The permission lookup failed, so the request was refused (fail closed). See the runner journal for the error."),
+            format!("Running a command needs one of these repository permissions, or a higher one: `{list}`. The permission lookup failed, so the request was refused (fail closed). See the runner journal for the error."),
         ]
         .join("\n"),
         PermissionVerdict::Denied(p) => [
             "**Command refused: insufficient repository permission.**".to_string(),
             String::new(),
-            format!("Your effective permission on this repository is `{p}`; running a command needs one of: `{list}`."),
+            format!("Your effective permission on this repository is `{p}`; running a command needs one of `{list}`, or a higher permission."),
         ]
         .join("\n"),
         PermissionVerdict::Allowed(_) => String::new(),
@@ -1593,6 +1826,17 @@ pub fn busy_comment(is_pull_request: bool) -> String {
         format!("**Command dropped: a job is already running on this {thread}.**"),
         String::new(),
         format!("At most one comment command runs per {thread} at a time. Wait for the running job to report back, then comment again."),
+    ]
+    .join("\n")
+}
+
+/// CLAUDE-269: reply when the Claude login needs renewing, so the commenter
+/// is told why nothing ran instead of hearing silence.
+pub fn login_required_comment(reason: &str) -> String {
+    [
+        "**Command dropped: the runner's Claude login needs renewing.**".to_string(),
+        String::new(),
+        format!("{reason} Nothing was run; comment again once the operator has signed in."),
     ]
     .join("\n")
 }
@@ -1647,6 +1891,25 @@ pub fn outcome_comment(
             claude.summary.clone(),
         ]
         .join("\n"),
+        Decision::UnresolvedConflicts { paths } => [
+            "**Claude left unresolved merge conflicts.**".to_string(),
+            String::new(),
+            format!("Conflicted paths: {}", paths.join(", ")),
+            String::new(),
+            "Summary:".to_string(),
+            claude.summary.clone(),
+            String::new(),
+            "Nothing was staged, committed, or pushed; this needs human review.".to_string(),
+        ]
+        .join("\n"),
+        Decision::MeasureFailed { reason } => [
+            "**Measuring the change failed.**".to_string(),
+            String::new(),
+            reason.clone(),
+            String::new(),
+            "Nothing was pushed. See the runner journal for full context.".to_string(),
+        ]
+        .join("\n"),
         Decision::TooBig { files, lines } => [
             "**Claude produced a change too large for an unattended push.**".to_string(),
             String::new(),
@@ -1694,13 +1957,19 @@ fn first_line(s: &str) -> String {
 /// Close a comment run: one `job_outcomes` row carrying the decision summary and
 /// the stream-log link, then finalize the run.
 async fn finish_comment_run(
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: Option<i64>,
     key: &str,
     outcome: &RunOutcome,
     stream_log: &FsPath,
+    spend: &crate::usage::RunSpend,
 ) {
-    let Some(run_id) = run_id else { return };
+    let Some(run_id) = run_id else {
+        // DEV-707: no run row (the begin failed), but the spend was real, so the
+        // usage record still names the action.
+        spend.finish(None, crate::exit::UNEXPECTED);
+        return;
+    };
     let stream = outcome.claude_ran.then(|| stream_log.display().to_string());
     let record = state::JobOutcome {
         run_id,
@@ -1722,14 +1991,17 @@ async fn finish_comment_run(
     if let Err(e) = state::job_outcome_insert(pool, &record).await {
         warn!(error = %e, "recording the comment run outcome failed");
     }
-    let exit_code = if outcome.ok {
+    // DEV-705: an over-budget stop overrides only an otherwise-clean outcome.
+    let exit_code = spend.exit_code(if outcome.ok {
         crate::exit::OK
     } else {
         crate::exit::UNEXPECTED
-    };
+    });
     if let Err(e) = state::run_finish(pool, run_id, exit_code, 1).await {
         warn!(error = %e, "finalizing the comment run failed");
     }
+    // DEV-707: one summary line and one machine-readable record per run.
+    spend.finish(Some(run_id), exit_code);
 }
 
 /// Root the per-command credential dirs live under. One directory per command,
@@ -1742,25 +2014,17 @@ pub fn creds_root(paths: &Paths) -> PathBuf {
 mod tests {
     use super::*;
     use crate::config::WebhookConfig;
-    use crate::db::MIGRATOR;
     use crate::provider::cli::testutil::StubRunner;
     use age::secrecy::ExposeSecret;
     use axum::http::HeaderValue;
     use hmac::{Hmac, Mac};
-    use sqlx::sqlite::SqlitePoolOptions;
 
     const SOURCE: &str = "contoso";
     const SECRET: &str = "hmac-value-for-comments";
     const REPO: &str = "contoso/claude-run";
 
-    async fn memory_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn memory_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     fn sign(secret: &[u8], body: &[u8]) -> String {
@@ -2039,6 +2303,40 @@ mod tests {
     }
 
     #[test]
+    fn permission_allowed_ranks_forgejo_access_levels() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("owner", &["write", "admin"], true),
+            ("admin", &["write"], true),
+            ("OWNER", &["Write"], true),
+            ("write", &["admin"], false),
+            ("read", &["write", "admin"], false),
+            ("none", &["read"], false),
+            ("maintainer", &["maintainer"], true),
+            ("maintainer", &["write", "admin"], false),
+            ("owner", &["maintainer"], false),
+            ("write", &[], false),
+        ];
+        for (permission, allowed, expected) in cases {
+            let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                permission_allowed(permission, &allowed),
+                *expected,
+                "permission={permission:?} allowed={allowed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_outranks_the_default_allowed_permissions() {
+        let allowed = vec!["write".to_string(), "admin".to_string()];
+        let b = permission_backend(Some(r#"{"username":"alice","permission":"owner"}"#));
+        assert_eq!(
+            check_permission(&b, "dev.a8n.run", REPO, "alice", &allowed),
+            PermissionVerdict::Allowed("owner".to_string())
+        );
+    }
+
+    #[test]
     fn permission_lookup_error_denies_fail_closed() {
         let allowed = vec!["write".to_string()];
         let b = permission_backend(None);
@@ -2073,33 +2371,420 @@ mod tests {
 
     #[test]
     fn decision_gate_matches_the_ci_fix_shape() {
-        assert_eq!(decide("did it", 0, 0, 10, 300), Decision::NoChanges);
+        assert_eq!(decide("did it", 0, 0, 0, 10, 300), Decision::NoChanges);
         assert_eq!(
-            decide("Making no changes here.", 2, 4, 10, 300),
+            decide("Making no changes here.", 1, 2, 4, 10, 300),
             Decision::NoChanges
         );
         assert_eq!(
-            decide("big", 11, 5, 10, 300),
+            decide("big", 1, 11, 5, 10, 300),
             Decision::TooBig {
                 files: 11,
                 lines: 5
             }
         );
         assert_eq!(
-            decide("big", 2, 301, 10, 300),
+            decide("big", 1, 2, 301, 10, 300),
             Decision::TooBig {
                 files: 2,
                 lines: 301
             }
         );
         assert_eq!(
-            decide("fixed", 10, 300, 10, 300),
+            decide("fixed", 1, 10, 300, 10, 300),
             Decision::Push {
                 files: 10,
                 lines: 300
             }
         );
-        assert_eq!(parse_numstat("3\t1\ta.rs\n0\t5\tb.rs\n"), (2, 9));
+        // A clean base merge with no conflicts: one commit, no files touched.
+        assert_eq!(
+            decide("merged main", 1, 0, 0, 10, 300),
+            Decision::Push { files: 0, lines: 0 }
+        );
+        let mut files = std::collections::HashSet::new();
+        let lines = numstat_files_and_lines("3\t1\ta.rs\n0\t5\tb.rs\n", &mut files);
+        assert_eq!((files.len() as u64, lines), (2, 9));
+    }
+
+    // ---- CLAUDE-302 / CLAUDE-303: change measurement and the merge gate ---
+
+    /// A minimal git repo with one committed file, ready for a test to mutate
+    /// the working tree and then call [`prepare_checkout`] / [`run_decision_gate`]
+    /// / [`needs_commit`] against it exactly as `serve_run` does.
+    fn repo_with_one_commit(dir: &FsPath) {
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "tester"],
+            vec!["config", "user.email", "tester@example.com"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        }
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+        git_in(dir, &["commit", "-q", "-m", "initial"]).unwrap();
+    }
+
+    fn gate_cmd() -> VerifiedCommentCommand {
+        command_of(&payload_json(
+            "created",
+            REPO,
+            "/claude merge main and resolve the conflicts",
+            "alice",
+            true,
+        ))
+        .unwrap()
+    }
+
+    fn gate_src() -> CommentWebhookSource {
+        CommentWebhookSource::default()
+    }
+
+    #[test]
+    fn prepare_checkout_excludes_the_scratch_files_from_the_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+
+        // The scratch files land in the checkout with no other change.
+        std::fs::write(dir.join(INSTRUCTION_FILE), "do the thing").unwrap();
+        std::fs::write(dir.join(COMMIT_MSG_FILE), "msg").unwrap();
+        std::fs::write(dir.join(PR_COMMENT_FILE), "reply").unwrap();
+
+        let decision =
+            run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did nothing").unwrap();
+        assert_eq!(
+            decision,
+            Decision::NoChanges,
+            "scratch files must not count"
+        );
+
+        // They are excluded from any commit too.
+        git_in(dir, &["add", "-A"]).unwrap();
+        let staged = git_output(dir, &["diff", "--cached", "--name-only"]).unwrap();
+        assert!(
+            staged.is_empty(),
+            "scratch files must never be staged: {staged}"
+        );
+    }
+
+    #[test]
+    fn plain_uncommitted_edits_are_committed_by_the_runner_and_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+
+        let decision = run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did it").unwrap();
+        assert_eq!(decision, Decision::Push { files: 1, lines: 1 });
+        assert!(
+            !needs_commit(dir).unwrap(),
+            "the runner already committed it"
+        );
+    }
+
+    #[test]
+    fn an_untracked_new_file_is_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+
+        std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
+
+        let decision = run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did it").unwrap();
+        assert_eq!(decision, Decision::Push { files: 1, lines: 1 });
+    }
+
+    #[test]
+    fn a_commit_made_on_top_of_the_cloned_head_with_a_clean_tree_is_counted_without_a_second_commit(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+        git_in(dir, &["commit", "-q", "-m", "agent commit"]).unwrap();
+        let agent_commit = git_output(dir, &["rev-parse", "HEAD"]).unwrap();
+
+        let decision = run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did it").unwrap();
+        assert_eq!(decision, Decision::Push { files: 1, lines: 1 });
+        assert_eq!(
+            git_output(dir, &["rev-parse", "HEAD"]).unwrap(),
+            agent_commit,
+            "no second, runner-made commit"
+        );
+    }
+
+    #[test]
+    fn the_three_scratch_files_alone_yield_no_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+        std::fs::write(dir.join(INSTRUCTION_FILE), "do the thing").unwrap();
+        std::fs::write(dir.join(COMMIT_MSG_FILE), "msg").unwrap();
+        std::fs::write(dir.join(PR_COMMENT_FILE), "reply").unwrap();
+
+        let decision =
+            run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did nothing").unwrap();
+        assert_eq!(decision, Decision::NoChanges);
+        let log = git_output(dir, &["log", "--name-only", "--pretty=format:"]).unwrap();
+        for scratch in [INSTRUCTION_FILE, COMMIT_MSG_FILE, PR_COMMENT_FILE] {
+            assert!(!log.contains(scratch), "{scratch} must never be committed");
+        }
+    }
+
+    #[test]
+    fn no_commits_and_a_clean_tree_is_no_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+
+        let decision =
+            run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did nothing").unwrap();
+        assert_eq!(decision, Decision::NoChanges);
+    }
+
+    #[test]
+    fn a_git_failure_while_measuring_is_measure_failed_not_no_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Not a git repository at all: both `prepare_checkout` and
+        // `run_decision_gate` must surface the failure rather than read as
+        // zero changes.
+        assert!(prepare_checkout(dir, "claude-run", "claude-run@a8n.run").is_err());
+        assert!(run_decision_gate(dir, "HEAD", &gate_cmd(), &gate_src(), "x").is_err());
+    }
+
+    /// Two branches that touch the same line so a merge conflicts. Returns the
+    /// working dir with `other` merged into `main` and `MERGE_HEAD` present.
+    fn repo_with_a_conflicting_merge_in_progress(dir: &FsPath) {
+        repo_with_one_commit(dir);
+        prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+        git_in(dir, &["checkout", "-q", "-b", "other"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\nbranch\n").unwrap();
+        git_in(dir, &["commit", "-q", "-am", "branch change"]).unwrap();
+        git_in(dir, &["checkout", "-q", "main"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\nmain\n").unwrap();
+        git_in(dir, &["commit", "-q", "-am", "main change"]).unwrap();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["merge", "-q", "--no-ff", "other"])
+            .output()
+            .unwrap();
+        assert!(
+            dir.join(".git").join("MERGE_HEAD").exists(),
+            "the merge must conflict"
+        );
+    }
+
+    #[test]
+    fn a_conflicted_merge_resolved_and_committed_by_the_agent_is_push_measured_by_remerge_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_a_conflicting_merge_in_progress(dir);
+        // Recompute the cloned head the same way `prepare_checkout` recorded
+        // it: it was captured before the merge started.
+        let cloned_head = git_output(dir, &["merge-base", "HEAD", "other"]).unwrap();
+
+        std::fs::write(dir.join("a.txt"), "one\nresolved\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+        git_in(dir, &["commit", "--no-edit"]).unwrap();
+
+        // Expected totals: walk first-parent history from the cloned head the
+        // same way the gate does, since "main change" (committed directly on
+        // `main` before the merge) is itself in range and must count too.
+        let expected = {
+            let mut files = std::collections::HashSet::new();
+            let mut lines = 0u64;
+            let range = format!("{cloned_head}..HEAD");
+            let shas = git_output(dir, &["rev-list", "--first-parent", &range]).unwrap();
+            for sha in shas.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                let parents = git_output(dir, &["show", "-s", "--pretty=%P", sha]).unwrap();
+                let numstat = if parents.split_whitespace().count() > 1 {
+                    git_output(
+                        dir,
+                        &["show", "--remerge-diff", "--numstat", "--format=", sha],
+                    )
+                    .unwrap()
+                } else {
+                    git_output(dir, &["show", "--numstat", "--format=", sha]).unwrap()
+                };
+                lines += numstat_files_and_lines(&numstat, &mut files);
+            }
+            (files.len() as u64, lines)
+        };
+
+        let decision =
+            run_decision_gate(dir, &cloned_head, &gate_cmd(), &gate_src(), "resolved it").unwrap();
+        match decision {
+            Decision::Push { files, lines } => assert_eq!((files, lines), expected),
+            other => panic!("expected Push, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_base_merge_bringing_in_many_lines_with_a_small_conflict_resolution_is_push_not_too_big() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        // The base brings in far more than `max_lines` (default 300).
+        for n in 0..320 {
+            git_in(
+                dir,
+                &[
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    &format!("base commit {n}"),
+                ],
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.join("base.txt"),
+            (0..320).map(|_| "x\n").collect::<String>(),
+        )
+        .unwrap();
+        git_in(dir, &["add", "base.txt"]).unwrap();
+        git_in(dir, &["commit", "-q", "-m", "base file"]).unwrap();
+        git_in(dir, &["branch", "base-branch"]).unwrap();
+
+        // A feature branch off the ORIGINAL tip, with the same conflicting
+        // line the base also touched, plus its own small extra file.
+        git_in(dir, &["checkout", "-q", "-b", "feat", "main~321"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\nfeat\n").unwrap();
+        git_in(dir, &["commit", "-q", "-am", "feat change"]).unwrap();
+
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+
+        git_in(dir, &["checkout", "-q", "base-branch"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\nmain\n").unwrap();
+        git_in(
+            dir,
+            &["commit", "-q", "-am", "base change on the shared line"],
+        )
+        .unwrap();
+        git_in(dir, &["checkout", "-q", "feat"]).unwrap();
+
+        let merge = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["merge", "-q", "--no-ff", "base-branch"])
+            .output()
+            .unwrap();
+        let _ = merge;
+        assert!(
+            dir.join(".git").join("MERGE_HEAD").exists(),
+            "the merge must conflict on the shared line"
+        );
+        std::fs::write(dir.join("a.txt"), "one\nresolved\n").unwrap();
+        git_in(dir, &["add", "-A"]).unwrap();
+        git_in(dir, &["commit", "--no-edit"]).unwrap();
+
+        let decision =
+            run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "merged and resolved").unwrap();
+        match decision {
+            Decision::Push { files, lines } => {
+                assert!(
+                    files <= 10 && lines <= 300,
+                    "only the conflict resolution should count: files={files} lines={lines}"
+                );
+            }
+            other => panic!("expected Push (remerge-diff bounds the caps), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_conflict_free_merge_with_no_other_change_is_push_with_zero_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        git_in(dir, &["branch", "base-branch"]).unwrap();
+        git_in(dir, &["checkout", "-q", "-b", "feat"]).unwrap();
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+
+        git_in(dir, &["checkout", "-q", "base-branch"]).unwrap();
+        std::fs::write(dir.join("other.txt"), "unrelated\n").unwrap();
+        git_in(dir, &["add", "other.txt"]).unwrap();
+        git_in(dir, &["commit", "-q", "-m", "unrelated base change"]).unwrap();
+        git_in(dir, &["checkout", "-q", "feat"]).unwrap();
+        git_in(dir, &["merge", "-q", "--no-ff", "base-branch"]).unwrap();
+        assert!(
+            !dir.join(".git").join("MERGE_HEAD").exists(),
+            "this merge must succeed cleanly"
+        );
+
+        let decision =
+            run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "merged cleanly").unwrap();
+        assert_eq!(decision, Decision::Push { files: 0, lines: 0 });
+    }
+
+    #[test]
+    fn a_conflicted_merge_resolved_but_left_staged_and_not_committed_is_committed_by_the_runner_as_a_merge_commit(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_a_conflicting_merge_in_progress(dir);
+        let cloned_head = git_output(dir, &["merge-base", "HEAD", "other"]).unwrap();
+
+        // Resolve and stage, exactly as an agent that forgot to commit would.
+        std::fs::write(dir.join("a.txt"), "one\nresolved\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+        assert!(needs_commit(dir).unwrap());
+
+        let decision =
+            run_decision_gate(dir, &cloned_head, &gate_cmd(), &gate_src(), "resolved it").unwrap();
+
+        let parents = git_output(dir, &["log", "-1", "--pretty=%P"]).unwrap();
+        assert_eq!(
+            parents.split_whitespace().count(),
+            2,
+            "the runner's commit must be the merge commit: {parents}"
+        );
+        assert!(matches!(decision, Decision::Push { .. }), "{decision:?}");
+    }
+
+    #[test]
+    fn unmerged_paths_left_behind_are_reported_and_never_committed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_a_conflicting_merge_in_progress(dir);
+        let cloned_head = git_output(dir, &["merge-base", "HEAD", "other"]).unwrap();
+
+        // The conflict markers are left in place: nothing resolved, nothing
+        // staged.
+        let decision =
+            run_decision_gate(dir, &cloned_head, &gate_cmd(), &gate_src(), "gave up").unwrap();
+        match decision {
+            Decision::UnresolvedConflicts { paths } => {
+                assert_eq!(paths, vec!["a.txt".to_string()]);
+            }
+            other => panic!("expected UnresolvedConflicts, got {other:?}"),
+        }
+        // Nothing was committed, and the index still reports the conflict.
+        assert!(dir.join(".git").join("MERGE_HEAD").exists());
+        let unmerged = git_output(dir, &["diff", "--name-only", "--diff-filter=U"]).unwrap();
+        assert_eq!(unmerged, "a.txt");
     }
 
     #[test]
@@ -2108,10 +2793,12 @@ mod tests {
             ok: true,
             summary: "did the thing".into(),
             cost: 0.1,
+            usage: Default::default(),
             raw: serde_json::Value::Null,
             error: String::new(),
             transient: false,
             timed_out: false,
+            login_required: false,
         };
         let pushed = outcome_comment(&Decision::Push { files: 1, lines: 2 }, &ok, None);
         assert!(pushed.contains("Claude pushed a commit."));
@@ -2134,6 +2821,25 @@ mod tests {
         .contains("too large"));
         let failed = ClaudeResult::synthesized("claude exited 1", "tail");
         assert!(outcome_comment(&Decision::ClaudeFailed, &failed, None).contains("FAILED"));
+        let unresolved = outcome_comment(
+            &Decision::UnresolvedConflicts {
+                paths: vec!["a.txt".to_string()],
+            },
+            &ok,
+            None,
+        );
+        assert!(unresolved.contains("unresolved merge conflicts"));
+        assert!(unresolved.contains("a.txt"));
+        assert!(unresolved.contains("Nothing was staged, committed, or pushed"));
+        let measure_failed = outcome_comment(
+            &Decision::MeasureFailed {
+                reason: "git diff exited 1".to_string(),
+            },
+            &ok,
+            None,
+        );
+        assert!(measure_failed.contains("Measuring the change failed"));
+        assert!(measure_failed.contains("git diff exited 1"));
         // Usage and busy replies are distinct and name what happened.
         assert!(help_comment("/claude", true).contains("/claude help"));
         assert!(busy_comment(true).contains("already running"));
@@ -2195,8 +2901,10 @@ mod tests {
             true,
         ))
         .unwrap();
-        let prompt = build_prompt(&cmd, "feat/x");
+        let prompt = build_prompt(&cmd, "feat/x", "main");
         assert!(prompt.contains(INSTRUCTION_FILE));
+        assert!(prompt.contains("Base branch: main"));
+        assert!(!prompt.contains("Do NOT commit, push"));
         // The human's own words never travel in the prompt string.
         assert!(!prompt.contains("pwned"), "{prompt}");
     }
@@ -2291,8 +2999,11 @@ mod tests {
         );
         let backend = CliBackend::new(runner.clone());
         let cache = crate::mint::VcsRouteCache::new(Duration::from_secs(900));
+        let audit = crate::provider::IssueWriteAudit::new(Some(1), 25);
+        let tracker = crate::provider::AuditedTracker::new(&backend, audit);
         let outcome = serve_mint(
             &backend,
+            &tracker,
             &MintConfig::default(),
             &cache,
             &cmd,
@@ -2360,8 +3071,11 @@ mod tests {
         let backend = CliBackend::new(runner.clone());
         let cache = crate::mint::VcsRouteCache::new(Duration::from_secs(900));
         // `yt issue create` has no canned response, so the mint fails.
+        let audit = crate::provider::IssueWriteAudit::new(Some(1), 25);
+        let tracker = crate::provider::AuditedTracker::new(&backend, audit);
         let outcome = serve_mint(
             &backend,
+            &tracker,
             &MintConfig::default(),
             &cache,
             &cmd,
@@ -2545,6 +3259,7 @@ mod tests {
             defaults: RunnerDefaults::default(),
             keygate: KeyGate::new(),
             denials: Arc::new(DenialReplyLimiter::new()),
+            readiness: None,
         };
         let cmd = command_of(&payload_json(
             "created",
@@ -2602,6 +3317,76 @@ mod tests {
         assert!(!dir.exists(), "the temp credential dir is removed on drop");
     }
 
+    /// CLAUDE-269: while the Claude login needs renewing, `run_instruction`
+    /// replies naming the reason, invokes no `claude`, and advances no counter
+    /// (checked before `admit`, so a redelivery still sees zero attempts once
+    /// signed in again).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn login_required_replies_and_runs_nothing() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = setup_pool(tmp.path()).await;
+        let key = SecretsKey::load().unwrap();
+        let ciphertext = key.encrypt("super-secret-write-pat").unwrap();
+        state::secret_create(&pool, "write-pat", &ciphertext)
+            .await
+            .unwrap();
+
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let readiness = crate::readiness::ReadinessGate::new(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            None,
+        );
+        readiness.trip_login_required("OAuth session expired", "invocation");
+        let ctx = CommentContext {
+            pool: pool.clone(),
+            paths: paths.clone(),
+            claude: Arc::new(ClaudeInvoker::new(None)),
+            config: Arc::new(RwLock::new(config())),
+            mint_cfg: Arc::new(RwLock::new(MintConfig::default())),
+            route_cache: Arc::new(crate::mint::VcsRouteCache::new(
+                crate::mint::DEFAULT_VCS_MAP_TTL,
+            )),
+            defaults: RunnerDefaults::default(),
+            keygate: KeyGate::new(),
+            denials: Arc::new(DenialReplyLimiter::new()),
+            readiness: Some(readiness),
+        };
+        let cmd = command_of(&payload_json(
+            "created",
+            REPO,
+            "/claude fix it",
+            "alice",
+            true,
+        ))
+        .unwrap();
+        let key_str = cmd.key();
+        let src = config().sources[SOURCE].clone();
+        let env = build_env(&ctx, &cmd, &src).await.expect("env built");
+
+        run_instruction(&ctx, &env, &cmd, &key_str, &src, "fix it".to_string()).await;
+
+        assert_eq!(
+            state::attempts_get(&pool, WEBHOOK_COMMENT_ACTION, &key_str)
+                .await
+                .unwrap(),
+            0,
+            "a login-required refusal must not advance the attempt counter"
+        );
+        assert_eq!(
+            state::daily_count_get(&pool, WEBHOOK_COMMENT_ACTION)
+                .await
+                .unwrap(),
+            0,
+            "no claude invocation means no daily count either"
+        );
+    }
+
     #[tokio::test]
     async fn a_source_without_a_write_token_cannot_be_served() {
         let _env = crate::secrets::key_file_env_lock().await;
@@ -2625,6 +3410,7 @@ mod tests {
             defaults: RunnerDefaults::default(),
             keygate: KeyGate::new(),
             denials: Arc::new(DenialReplyLimiter::new()),
+            readiness: None,
         };
         let cmd = command_of(&payload_json(
             "created",
@@ -2653,7 +3439,7 @@ mod tests {
     // exercised at the status-code level, mirroring the CI-failure handler's
     // tests. These set the process-global key-file env, so they take the shared
     // lock.
-    async fn setup_pool(tmp: &FsPath) -> SqlitePool {
+    async fn setup_pool(tmp: &FsPath) -> DbPool {
         let key_path = tmp.join("key.txt");
         let identity = age::x25519::Identity::generate();
         std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();

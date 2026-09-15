@@ -9,6 +9,12 @@
 //! | State (logs) | `$XDG_STATE_HOME/claude-run/` | `CLAUDE_RUN_STATE_DIR` |
 //! | Runtime (pid, socket) | `$XDG_RUNTIME_DIR/claude-run/` | `CLAUDE_RUN_RUNTIME_DIR` |
 //!
+//! CLAUDE-250: `state.db` is the DEFAULT state store, not the only one. A
+//! `[database] url` (or `CLAUDE_RUN_DATABASE_URL`, or the file named by
+//! `CLAUDE_RUN_DATABASE_URL_FILE`) points the daemon at PostgreSQL instead, in
+//! which case nothing but `workdirs/` lives under the data dir. See
+//! [`resolve_database`].
+//!
 //! `~`, `$VAR`, and `${VAR}` are expanded in all values (the env override and
 //! the `workdir_base` field on actions both go through `expand_path`).
 
@@ -18,6 +24,11 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+
+/// DEV-707's per-run usage record, directly under `logs/`. Shared with
+/// `crate::gc` so the writer's path and the sweep's target cannot drift apart
+/// (CLAUDE-268).
+pub const USAGE_LOG: &str = "usage.jsonl";
 
 /// Resolved on-disk locations. Computed once at startup.
 #[derive(Debug, Clone)]
@@ -62,6 +73,20 @@ impl Paths {
     pub fn workdirs_dir(&self) -> PathBuf {
         self.data_dir.join("workdirs")
     }
+
+    pub fn snippets_dir(&self) -> PathBuf {
+        self.state_dir.join("snippets")
+    }
+
+    pub fn webhook_logs_dir(&self) -> PathBuf {
+        self.state_dir.join("webhook-logs")
+    }
+
+    /// DEV-707: the newline-delimited per-run usage record, one line per run,
+    /// so runs are comparable over time without a provider console.
+    pub fn usage_log(&self) -> PathBuf {
+        self.logs_dir().join(USAGE_LOG)
+    }
 }
 
 fn resolve_dir(env_var: &str, xdg_default: Option<PathBuf>, subdir: &str) -> Result<PathBuf> {
@@ -98,6 +123,27 @@ pub struct OnDiskConfig {
     /// CLAUDE-55: `version` self-update settings (release/latest train default
     /// and the name of the secret holding the registry token).
     pub update: UpdateConfig,
+    /// CLAUDE-250: which database backend holds the runtime state. Bootstrap,
+    /// not a DB-backed setting: it has to be known before the DB is open.
+    pub database: DatabaseConfig,
+}
+
+/// CLAUDE-250: backend selection for the runtime state store.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DatabaseConfig {
+    /// Connection URL for the state store. Unset (the default) means SQLite at
+    /// [`Paths::state_db`], which is what every install had before this key
+    /// existed. `postgres://` or `postgresql://` selects PostgreSQL;
+    /// `sqlite://` selects SQLite explicitly. Any other scheme is a startup
+    /// error naming the scheme, never a silent fallback.
+    ///
+    /// Precedence, highest first: the contents of the file named by
+    /// `CLAUDE_RUN_DATABASE_URL_FILE`, then `CLAUDE_RUN_DATABASE_URL`, then
+    /// this key. The file form exists because the URL carries the password and
+    /// an environment value is readable through `docker inspect` and `/proc`,
+    /// the same reasoning that puts the age key on a compose secret.
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -160,17 +206,34 @@ pub struct WebhookConfig {
     /// names with other characters are warned about at load. An empty map
     /// disables the listener (no endpoints, fail-closed like an unset secret).
     pub sources: BTreeMap<String, WebhookSource>,
-    /// CLAUDE-153: webhook-scoped auto-fix switch. When `false` (the default,
-    /// opt-in), a failure the webhook triage routes to a queue-for-fix bucket
-    /// (`code_fix` / `auto_fix`) mints nothing and queues no corrective fixup
-    /// PR, so a red PR check stays reported on the original PR for its author to
-    /// fix in place (the CLAUDE-152 behavior). A `human_action` failure still
-    /// mints. This gates only the webhook fixup routing; it is independent of the
-    /// framework-wide `[mint].auto_fix.enabled` detector switch and of the
-    /// CLAUDE-149 open-PR suppression. Being on `WebhookConfig` it is DB-backed
-    /// (`config.webhook`) and edited live on the Settings page / via
-    /// `PUT /api/settings/webhook` with no restart.
+    /// CLAUDE-153/CLAUDE-273: webhook-scoped auto-fix switch. It no longer
+    /// decides whether an issue is minted at all (every code failure is filed,
+    /// so `No orphan notes` holds even with this off): `false` (the default,
+    /// opt-in) still creates a `code_fix` / `auto_fix` issue but leaves it with
+    /// no `AI Agent` write, so no corrective fixup PR is queued and a red PR
+    /// check stays reported on the original PR for its author to fix in place
+    /// (the CLAUDE-152 behavior); `true` sets `AI Agent = Queued` on that issue
+    /// as before. A `human_action` failure is unaffected either way. This gates
+    /// only the webhook fixup queuing; it is independent of the framework-wide
+    /// `[mint].auto_fix.enabled` detector switch and of the CLAUDE-149 open-PR
+    /// suppression. Being on `WebhookConfig` it is DB-backed (`config.webhook`)
+    /// and edited live on the Settings page / via `PUT /api/settings/webhook`
+    /// with no restart.
     pub auto_fix: bool,
+    /// CLAUDE-274: timeout (seconds) for the at-ingest [`crate::triage::AnalysisClassifier`]
+    /// session, which runs `Read,Grep,Bash` over the complete log and the
+    /// failing workflow YAML. Default 600 (the retired scheduled analysis
+    /// action's timeout), well past the old tool-less classifier's 120s.
+    pub analysis_timeout_secs: u64,
+    /// CLAUDE-274: how many events [`crate::web::webhooks::consume_events`]
+    /// analyzes concurrently, each behind its own `analysis_timeout_secs`
+    /// session. Must be at least 1 (validated in `src/settings.rs`); default 2.
+    pub analysis_concurrency: usize,
+    /// CLAUDE-276: how many CI failures on the agent's own open PR are routed
+    /// back to its issue (comment + `AI Agent = Queued`) before the issue is
+    /// flagged `Needs Review` instead. Matched against
+    /// `agent_pull_requests.fix_attempts`. Default 3.
+    pub agent_pr_fix_attempts: u32,
 }
 
 impl Default for WebhookConfig {
@@ -178,7 +241,10 @@ impl Default for WebhookConfig {
         Self {
             replay_window_secs: 300,
             sources: BTreeMap::new(),
+            analysis_timeout_secs: 600,
+            analysis_concurrency: 2,
             auto_fix: false,
+            agent_pr_fix_attempts: 3,
         }
     }
 }
@@ -260,6 +326,15 @@ pub struct WebhookSource {
     /// runs unauthenticated, which serves a public repo; a private failure then
     /// mints a human-action issue with no log attached (the CLAUDE-92 outcome).
     pub log_token_ref: Option<String>,
+    /// CLAUDE-276: name of the secret (in the `secrets` table) holding a
+    /// Forgejo PAT that authorizes commenting on this source's pull requests
+    /// (routing a CI failure on an open PR back to its issue, or onto the
+    /// human author's PR). Reaches `fj` the same way `log_token_ref` does: a
+    /// temp single-host `keys.json` carrying only this one secret. Unset, a
+    /// failure that needs a PR comment logs at `error`, writes a `run_events`
+    /// row naming this source, and fails the run rather than posting nothing
+    /// silently.
+    pub write_token_ref: Option<String>,
 }
 
 impl Default for WebhookSource {
@@ -269,14 +344,15 @@ impl Default for WebhookSource {
             allowed_repos: Vec::new(),
             rate_limit_per_min: 60,
             log_token_ref: None,
+            write_token_ref: None,
         }
     }
 }
 
 /// CLAUDE-220: `/claude <instruction>` pull-request comment commands. A SECOND,
-/// independent listener from [`WebhookConfig`]: comment handling needs a WRITE
-/// token (post comments, push a branch) while the CI-failure sources need only a
-/// read-only log token, so the two credential kinds never share a config block.
+/// independent listener from [`WebhookConfig`]: its token pushes branches, while a
+/// CI-failure source's tokens only read logs and comment, so a push-capable token
+/// never shares a config block with them.
 ///
 /// DB-only from day one (settings key `config.webhook_comment`, edited on the web
 /// Settings page / via `PUT /api/settings/webhook_comment`). It is deliberately
@@ -345,12 +421,11 @@ pub struct CommentWebhookSource {
     /// reaches `fj` in a temp single-host `keys.json` carrying that one secret.
     /// Unset means no command can be served (every delivery is refused).
     pub write_token_ref: Option<String>,
-    /// Effective repository permissions that may run a command. Configurable
-    /// because Forgejo's role model keeps growing; adding a role is a settings
-    /// edit, not a code change. Matched case-insensitively.
+    /// Repository permissions that may run a command. A Forgejo access level (read, write,
+    /// admin, owner) also admits every higher level; any other value matches exactly.
     pub allowed_permissions: Vec<String>,
     /// Decision-gate cap: a working-tree diff touching more files than this is
-    /// commented on rather than pushed (the `forgejo-ci-fix` shape).
+    /// commented on rather than pushed.
     pub max_files: u64,
     /// Decision-gate cap: a working-tree diff changing more lines than this is
     /// commented on rather than pushed.
@@ -408,10 +483,16 @@ pub struct MintConfig {
     pub human_assignee: Option<String>,
     /// `State` value set on a freshly minted issue. Default `To do`.
     pub target_state: String,
+    /// CLAUDE-277: `State` value set on a CI-failure issue when its fix PR
+    /// merges with the failing workflow green at the merge commit. Default
+    /// `Done`. Separate from [`MintConfig::target_state`], which is what a
+    /// fresh mint (or a regression reopen) sets, not what a merge-driven close
+    /// sets.
+    pub resolved_state: String,
     /// `AI Agent` custom-field name driven on the minted issue.
     pub ai_agent_field: String,
-    /// `AI Agent` value set on a bucket-1 (code-fix) issue so the existing
-    /// forgejo-ci-fix pickup logic (CLAUDE-29) opens the fix PR. Default `Queued`.
+    /// `AI Agent` value set on a bucket-1 (code-fix) issue so the `youtrack`
+    /// action's pickup logic opens the fix PR. Default `Queued`.
     pub queued_value: String,
     /// CLAUDE-104: auto-fix framework settings. A nested `[mint]` subsection (so
     /// it rides the existing DB-backed mint section per CLAUDE-101 rather than
@@ -430,6 +511,7 @@ impl Default for MintConfig {
             bot_logins: vec!["claude-run".to_string()],
             human_assignee: None,
             target_state: "To do".to_string(),
+            resolved_state: "Done".to_string(),
             ai_agent_field: "AI Agent".to_string(),
             queued_value: "Queued".to_string(),
             auto_fix: AutoFixConfig::default(),
@@ -515,11 +597,13 @@ pub struct WorkdirGcConfig {
     /// from the directory's last-modified time. Conservative default of 14 days
     /// (revise if operational data shows otherwise, per the issue).
     pub retention_days: u64,
-    /// Longer age, in days, past which even a workdir that still holds unpushed
-    /// commits is deleted. Between `retention_days` and this cap an unpushed
-    /// workdir is kept; beyond it the disk cost wins. Assumed 60 days; revise if
-    /// validation shows otherwise. Must exceed `retention_days` to have any
-    /// effect (a smaller value just deletes unpushed dirs at the normal window).
+    /// Longer age, in days, past which even a workdir that still holds
+    /// local-only work (unpushed commits, a dirty tree, or a stash -
+    /// CLAUDE-284) is deleted. Between `retention_days` and this cap such a
+    /// workdir is kept; beyond it the disk cost wins. Assumed 60 days; revise
+    /// if validation shows otherwise. Must exceed `retention_days` to have
+    /// any effect (a smaller value just deletes such dirs at the normal
+    /// window).
     pub unpushed_hard_cap_days: u64,
 }
 
@@ -529,6 +613,109 @@ impl Default for WorkdirGcConfig {
             enabled: true,
             retention_days: 14,
             unpushed_hard_cap_days: 60,
+        }
+    }
+}
+
+/// Retention and size ceilings for everything the runner writes under
+/// `$CLAUDE_RUN_STATE_DIR/logs/`. A DB-backed runtime setting (settings key
+/// `config.stream_log_gc`, editable on the web Settings page) per the CLAUDE-101
+/// bootstrap-vs-runtime split, so it is NOT a `config.toml` key. The sweeps
+/// ([`crate::gc::sweep_stream_logs`] and [`crate::gc::sweep_oversized_logs`])
+/// run on `serve` start and on a periodic tick.
+///
+/// CLAUDE-245 covered the per-attempt stream logs under
+/// `logs/<action>/streams/`: nothing deleted those before, the directory had
+/// only ever grown, and filling the log partition is what truncated the stream
+/// logs diagnosed in CLAUDE-233. CLAUDE-257 extended the same section to the two
+/// writers under `logs/` it left unbounded, `daemon.log` and the per-action
+/// `output.file`. The settings key keeps its original `stream_log_gc` name (and
+/// the `Stream log GC` card title) rather than being renamed to match the wider
+/// scope: the key is the primary key of the stored document, so renaming it
+/// would silently reset an operator's configured window back to the default.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct StreamLogGcConfig {
+    /// Master enable toggle. When `false`, nothing under `logs/` is swept or
+    /// bounded, so an operator can park the feature without losing the
+    /// configured windows.
+    pub enabled: bool,
+    /// Age, in days, past which a stream log is deleted, measured from its
+    /// last-modified time. Default 30 days: long enough that a failure reported
+    /// weeks after the fact still has its transcript (the CLAUDE-233 incident
+    /// windows were days apart), and at the ~800 MB/month observed on host-a
+    /// it bounds the directory near 1 GB instead of the 2.8 GB it reached. A log
+    /// whose run is still in flight is kept regardless of age.
+    pub retention_days: u64,
+    /// CLAUDE-257: size ceiling, in bytes, for `logs/daemon.log`. An age window
+    /// does not apply to it: `serve --detach` opens ONE file in append mode and
+    /// keeps every tracing line the daemon ever emits in it, so what bounds it
+    /// is size. Past the ceiling the file is rolled to `daemon.log.1` and
+    /// truncated in place back to its newest half (in place because the daemon
+    /// holds the fd open; a rename alone would leave it writing into the
+    /// predecessor). `0` disables the ceiling and leaves the file unbounded.
+    pub daemon_log_max_bytes: u64,
+    /// CLAUDE-257: size ceiling, in bytes, for each `logs/<action>/<output.file>`
+    /// (the opt-in per-job JSONL sink an action's `output.file` field turns on).
+    ///
+    /// Decision: this file is bounded by SIZE and never deleted by age, unlike
+    /// the stream logs beside it. An operator sets `output.file` deliberately to
+    /// produce a data sink, often consumed by something outside the runner, and
+    /// age-sweeping it would silently destroy the whole record. A size ceiling
+    /// keeps the newest records in place, hands the previous generation to
+    /// `<output.file>.1`, and still leaves nothing under the state dir growing
+    /// without bound. `0` disables the ceiling for operators who want the sink
+    /// kept whole and rotate it themselves.
+    pub output_file_max_bytes: u64,
+    /// CLAUDE-268: size ceiling, in bytes, for `logs/usage.jsonl` (DEV-707's
+    /// per-run token and cost record, one line per run).
+    ///
+    /// Bounded by SIZE like the two files above rather than by age: it is one
+    /// append-forever file, not a per-unit-of-work artifact, so there is no
+    /// dated entry an age sweep could expire. The ceiling is smaller than
+    /// theirs because a record is one short JSON object rather than a log
+    /// line, so this still holds far more history than anyone reads back. `0`
+    /// disables the ceiling and leaves the file unbounded.
+    pub usage_log_max_bytes: u64,
+    /// CLAUDE-262: age, in days, past which a `snippets/<action>/<job_key>/`
+    /// directory is deleted, measured from its last-modified time. One per job
+    /// per scripted step (`filter` / `pre` / `prompt` / `post`), holding the
+    /// rendered snippet plus one `binding-<name>.json` per `$`-binding
+    /// (`binding-job.json` carries the whole job payload), so a scripted action
+    /// polling every few minutes writes one indefinitely without this window. A
+    /// directory whose job is still in flight is kept regardless of age, the
+    /// same guard [`crate::gc::sweep_stream_logs`] applies to a live run's
+    /// stream log.
+    pub snippet_retention_days: u64,
+    /// CLAUDE-262: age, in days, past which a file directly under
+    /// `webhook-logs/` (the redacted, concatenated CI job logs
+    /// [`crate::forge_log::fetch_run_log`] writes per triaged run) is deleted,
+    /// measured from its last-modified time. The `webhook-logs/triage/` working
+    /// directory the mint classifier reuses across triages is not a per-run
+    /// artifact and is left alone by this sweep (it walks files directly under
+    /// `webhook-logs/`, not its subdirectories).
+    pub webhook_log_retention_days: u64,
+}
+
+impl Default for StreamLogGcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: 30,
+            // 50 MiB each: large enough that a rotation is rare on a busy
+            // daemon, small enough that both generations of both files stay a
+            // rounding error next to the stream logs' ~1 GB window.
+            daemon_log_max_bytes: 50 * 1024 * 1024,
+            output_file_max_bytes: 50 * 1024 * 1024,
+            // CLAUDE-268: 8 MiB. At the ~300 bytes a usage record runs to that
+            // is on the order of 25,000 runs of history, far past what is read
+            // back, and a fraction of the two 50 MiB ceilings above.
+            usage_log_max_bytes: 8 * 1024 * 1024,
+            // Same 30-day default as the stream logs: both are per-unit-of-work
+            // artifacts with the same "recent failure still has its evidence"
+            // shape, and there is no stated reason yet to diverge the windows.
+            snippet_retention_days: 30,
+            webhook_log_retention_days: 30,
         }
     }
 }
@@ -600,6 +787,44 @@ impl Default for PreferencesConfig {
     }
 }
 
+/// CLAUDE-239: global defaults for the `claude` CLI invocation. A DB-backed
+/// runtime section (settings key `config.claude`, editable on the web Settings
+/// page and via `GET`/`PUT /api/settings/claude`) per the CLAUDE-101
+/// bootstrap-vs-runtime split, so it is NOT a `config.toml` key (a brand-new
+/// section, so there is no file fallback: the DB value or the default).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaudeConfig {
+    /// Instance-wide default model, passed through to `--model` untouched. An
+    /// action's own `claude.model` wins over it; when neither is set no
+    /// `--model` flag is passed and the `claude` CLI's own default applies. The
+    /// runner never validates the value: the CLI is the source of truth for
+    /// which models exist.
+    pub model: Option<String>,
+    /// CLAUDE-259: instance-wide default effort level, passed through to
+    /// `--effort` untouched. An action's own `claude.effort` wins over it; when
+    /// neither is set no `--effort` flag is passed and the `claude` CLI's own
+    /// default applies. A value outside
+    /// [`crate::claude::EFFORT_LEVELS`] is warned about and then passed through:
+    /// the set is advisory, so a level Anthropic adds later works with no runner
+    /// release.
+    pub effort: Option<String>,
+    /// DEV-706: instance-wide default compaction window, passed through to
+    /// `--autocompact` untouched (`auto`, or 100k-1M tokens). An action's own
+    /// `claude.autocompact` wins over it; when neither is set the runner passes
+    /// [`crate::claude::DEFAULT_AUTOCOMPACT`], because the CLI's own `auto`
+    /// scales to the whole context window and so lets a tool-heavy session
+    /// resend every completed operation's payloads on every turn.
+    pub autocompact: Option<String>,
+}
+
+/// CLAUDE-239: live handle to the global [`ClaudeConfig`], shared between
+/// [`crate::settings::LiveSettings`] (which swaps it on save) and
+/// [`crate::claude::ClaudeInvoker`] (which reads it per invocation). A
+/// `std::sync::RwLock` rather than a tokio one because the read happens inside
+/// the synchronous `invoke`, which has no `await`.
+pub type ClaudeConfigHandle = std::sync::Arc<std::sync::RwLock<ClaudeConfig>>;
+
 /// CLAUDE-162: daemon-wide concurrency + continuous-pickup settings. A DB-backed
 /// runtime section (settings key `config.concurrency`, editable on the web
 /// Settings page and via `GET`/`PUT /api/settings/concurrency`) per the
@@ -635,6 +860,40 @@ impl Default for ConcurrencyConfig {
             regather_interval_secs: 60,
         }
     }
+}
+
+/// Names the service-auth secrets are stored under. Fixed rather than
+/// operator-chosen: the Settings page owns these three credentials end to end,
+/// and a stable name keeps a rotation an overwrite instead of an orphan.
+pub const ANTHROPIC_KEY_SECRET: &str = "auth-anthropic-api-key";
+/// See [`ANTHROPIC_KEY_SECRET`].
+pub const YOUTRACK_TOKEN_SECRET: &str = "auth-youtrack-token";
+/// See [`ANTHROPIC_KEY_SECRET`].
+pub const FORGEJO_TOKEN_SECRET: &str = "auth-forgejo-token";
+
+/// The `config.auth` settings section: the daemon's own logins to Claude,
+/// YouTrack and Forgejo, entered on the Settings page.
+///
+/// Only non-secret fields and secret NAMES live here. The tokens themselves go
+/// into the encrypted secrets store under the constants above, and
+/// [`crate::service_auth`] materializes them into the credential files the `yt`
+/// and `fj` CLIs read. An action's own `token_ref` still wins for its runs; this
+/// is the default the daemon's own provider calls use, which before had nothing
+/// but whatever the host operator had logged in.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Set when an Anthropic API key is stored; carries the secret name so the
+    /// document says where the value lives.
+    pub anthropic_key_ref: Option<String>,
+    /// YouTrack base URL, e.g. `https://yt.example.com`.
+    pub youtrack_base_url: Option<String>,
+    /// Secret name holding the YouTrack token.
+    pub youtrack_token_ref: Option<String>,
+    /// Forgejo host, e.g. `dev.example.com` (no scheme).
+    pub forgejo_host: Option<String>,
+    /// Secret name holding the Forgejo token.
+    pub forgejo_token_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -738,6 +997,68 @@ impl OnDiskConfig {
         let cfg: Self =
             toml::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing {}: {}", f.display(), e))?;
         Ok((cfg, ConfigSource::Loaded(f)))
+    }
+}
+
+/// CLAUDE-250: the resolved state-store backend, produced once at startup and
+/// handed to `db::open`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatabaseTarget {
+    /// The SQLite file at [`Paths::state_db`], or at the path a `sqlite://`
+    /// URL named.
+    Sqlite(PathBuf),
+    /// A PostgreSQL server, carrying the URL verbatim (password included, so
+    /// this value is never logged).
+    Postgres(String),
+}
+
+/// The URL configured for the state store, or `None` for the default SQLite
+/// file. Highest precedence first: `CLAUDE_RUN_DATABASE_URL_FILE`, then
+/// `CLAUDE_RUN_DATABASE_URL`, then `[database] url` in `config.toml`.
+pub fn database_url(cfg: &DatabaseConfig) -> Result<Option<String>> {
+    if let Ok(path) = std::env::var("CLAUDE_RUN_DATABASE_URL_FILE") {
+        let path = expand_path(&path);
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("reading CLAUDE_RUN_DATABASE_URL_FILE ({path}): {e}"))?;
+        return Ok(Some(raw.trim().to_string()));
+    }
+    if let Ok(url) = std::env::var("CLAUDE_RUN_DATABASE_URL") {
+        return Ok(Some(url.trim().to_string()));
+    }
+    Ok(cfg.url.as_ref().map(|u| u.trim().to_string()))
+}
+
+/// Resolve [`database_url`] into the backend `db::open` should open. An
+/// unrecognised scheme is an error naming it, so a typo stops the daemon
+/// instead of quietly opening a second, empty SQLite store.
+pub fn resolve_database(paths: &Paths, cfg: &DatabaseConfig) -> Result<DatabaseTarget> {
+    let Some(url) = database_url(cfg)? else {
+        return Ok(DatabaseTarget::Sqlite(paths.state_db()));
+    };
+    if url.is_empty() {
+        return Ok(DatabaseTarget::Sqlite(paths.state_db()));
+    }
+    let scheme = url.split(':').next().unwrap_or_default();
+    match scheme {
+        "sqlite" => {
+            let rest = url
+                .strip_prefix("sqlite://")
+                .or_else(|| url.strip_prefix("sqlite:"))
+                .unwrap_or_default();
+            let file = rest.split('?').next().unwrap_or_default();
+            if file.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "database URL `{url}` names no SQLite file; leave the setting unset to use the default"
+                )
+                .into());
+            }
+            Ok(DatabaseTarget::Sqlite(PathBuf::from(file)))
+        }
+        "postgres" | "postgresql" => Ok(DatabaseTarget::Postgres(url)),
+        other => Err(anyhow::anyhow!(
+            "unsupported database URL scheme `{other}`: expected sqlite, postgres or postgresql"
+        )
+        .into()),
     }
 }
 
@@ -978,6 +1299,79 @@ mod tests {
         assert!(!source_name_is_clean("a b"));
         assert!(!source_name_is_clean("a/b"));
         assert!(!source_name_is_clean(""));
+    }
+
+    // CLAUDE-250: one test rather than four, because the three inputs are
+    // process-wide environment variables and `cargo test` runs in parallel.
+    #[test]
+    fn database_url_precedence_is_file_then_env_then_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        std::env::remove_var("CLAUDE_RUN_DATABASE_URL");
+        std::env::remove_var("CLAUDE_RUN_DATABASE_URL_FILE");
+
+        // Nothing set anywhere: the SQLite file every install had before.
+        let empty = DatabaseConfig::default();
+        assert_eq!(database_url(&empty).unwrap(), None);
+        assert_eq!(
+            resolve_database(&paths, &empty).unwrap(),
+            DatabaseTarget::Sqlite(paths.state_db())
+        );
+
+        // The config key alone.
+        let from_file = DatabaseConfig {
+            url: Some("postgres://cfg/db".to_string()),
+        };
+        assert_eq!(
+            database_url(&from_file).unwrap().as_deref(),
+            Some("postgres://cfg/db")
+        );
+
+        // The env var beats the config key.
+        std::env::set_var("CLAUDE_RUN_DATABASE_URL", "postgres://env/db");
+        assert_eq!(
+            database_url(&from_file).unwrap().as_deref(),
+            Some("postgres://env/db")
+        );
+
+        // The file beats both, and its trailing newline is trimmed.
+        let secret = tmp.path().join("db-url");
+        std::fs::write(&secret, "postgres://secret/db\n").unwrap();
+        std::env::set_var("CLAUDE_RUN_DATABASE_URL_FILE", &secret);
+        assert_eq!(
+            database_url(&from_file).unwrap().as_deref(),
+            Some("postgres://secret/db")
+        );
+        assert_eq!(
+            resolve_database(&paths, &from_file).unwrap(),
+            DatabaseTarget::Postgres("postgres://secret/db".to_string())
+        );
+
+        // An unreadable file named by the variable is an error, never a silent
+        // fall-through to the next input.
+        std::env::set_var("CLAUDE_RUN_DATABASE_URL_FILE", tmp.path().join("absent"));
+        let err = database_url(&from_file).unwrap_err().to_string();
+        assert!(err.contains("CLAUDE_RUN_DATABASE_URL_FILE"), "{err}");
+        std::env::remove_var("CLAUDE_RUN_DATABASE_URL_FILE");
+
+        // An explicit sqlite URL selects the file it names.
+        std::env::set_var("CLAUDE_RUN_DATABASE_URL", "sqlite:///tmp/other.db");
+        assert_eq!(
+            resolve_database(&paths, &empty).unwrap(),
+            DatabaseTarget::Sqlite(PathBuf::from("/tmp/other.db"))
+        );
+
+        // Any other scheme stops startup and names the scheme.
+        std::env::set_var("CLAUDE_RUN_DATABASE_URL", "mysql://host/db");
+        let err = resolve_database(&paths, &empty).unwrap_err().to_string();
+        assert!(err.contains("mysql"), "{err}");
+
+        std::env::remove_var("CLAUDE_RUN_DATABASE_URL");
     }
 
     // CLAUDE-57: `load` reports whether `config.toml` was present so `serve` can

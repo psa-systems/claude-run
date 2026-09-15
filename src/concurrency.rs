@@ -5,7 +5,7 @@
 //! executor that runs distinct-key jobs in parallel while never running two jobs
 //! that share a *concurrency key* (project / repo / workflow) at the same time.
 //!
-//! Two primitives:
+//! The primitives:
 //!
 //! - [`KeyGate`]: a process-wide registry of per-key async mutexes. Acquiring a
 //!   key serializes every other holder of the same key. Held at the daemon level
@@ -18,6 +18,9 @@
 //!   and daemon-lived, so a cap holds across *overlapping* runs of an action, not
 //!   just within one run (the old per-run [`Semaphore`] only bounded a single
 //!   run's snapshot).
+//! - [`GatherGate`] (CLAUDE-228): a per-action "gathering right now" marker. The
+//!   scheduler skips a pickup for an action whose previous gather has not
+//!   finished, so a slow `yt list` no longer stacks one gather per tick.
 //! - [`Executor`]: spawns one task per job, each acquiring, in order, (a) its key
 //!   gate (via a NON-BLOCKING try), then (b) a global permit, then (c) a
 //!   per-action permit, then runs.
@@ -42,7 +45,7 @@
 //! job waits on a permit while another waits on that key, and the pipeline stays
 //! deadlock-free.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -99,6 +102,61 @@ impl KeyGate {
             g.entry(key.to_string()).or_default().clone()
         };
         m.try_lock_owned().ok()
+    }
+}
+
+/// CLAUDE-228: a per-action marker for "this action is gathering right now".
+///
+/// Overlapping RUNS are deliberate (CLAUDE-162); overlapping GATHERS are not. A
+/// gather is one `yt list` over the action's whole query, and under load that
+/// call has been observed taking minutes, longer than the 60s pickup cadence.
+/// Every stacked fire then re-ran the same query, each pinning another thread
+/// and re-reading the same issues, so the pileup grew as long as the slowdown
+/// lasted.
+///
+/// Advisory by design, and only for the scheduler: the tick skips a PICKUP for
+/// an action already gathering ([`GatherGate::is_gathering`]), while a run that
+/// does not win the marker still gathers. A manual trigger is an explicit
+/// operator act and is never dropped.
+#[derive(Clone, Default)]
+pub struct GatherGate {
+    inner: Arc<Mutex<HashSet<String>>>,
+}
+
+impl GatherGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark `action` as gathering. `None` when it already is; the caller keeps
+    /// whatever it gets and gathers either way, so a trigger is never lost.
+    pub fn try_acquire(&self, action: &str) -> Option<GatherGuard> {
+        let mut g = self.inner.lock().unwrap();
+        if !g.insert(action.to_string()) {
+            return None;
+        }
+        Some(GatherGuard {
+            inner: self.inner.clone(),
+            action: action.to_string(),
+        })
+    }
+
+    /// Whether a gather for `action` is in flight. The scheduler's fire check.
+    pub fn is_gathering(&self, action: &str) -> bool {
+        self.inner.lock().unwrap().contains(action)
+    }
+}
+
+/// Clears its action's gathering marker on drop, including on an error return
+/// or an early `?` out of the gather.
+pub struct GatherGuard {
+    inner: Arc<Mutex<HashSet<String>>>,
+    action: String,
+}
+
+impl Drop for GatherGuard {
+    fn drop(&mut self) {
+        self.inner.lock().unwrap().remove(&self.action);
     }
 }
 
@@ -178,9 +236,9 @@ impl Limiter {
 
     /// CLAUDE-162: acquire a global then per-action permit, in that fixed order,
     /// returning both owned permits (release together on drop). For a handler
-    /// that runs a sequential per-job loop rather than the parallel [`Executor`]
-    /// (e.g. `forgejo-ci-fix`), so its jobs are still bounded by the daemon-wide
-    /// caps across overlapping runs. The semaphores are never closed in this
+    /// that runs a sequential per-job loop rather than the parallel [`Executor`],
+    /// so its jobs are still bounded by the daemon-wide caps across overlapping
+    /// runs. The semaphores are never closed in this
     /// crate, so acquisition cannot fail.
     pub async fn acquire(
         &self,
@@ -377,15 +435,7 @@ mod tests {
     /// `exit::PAUSED` rather than `exit::OK` or `exit::CANCELLED`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_global_pause_stops_the_next_job_pickup() {
-        use crate::db::MIGRATOR;
-        use sqlx::sqlite::SqlitePoolOptions;
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::db::test_pool().await;
         crate::state::global_pause_set(&pool, Some("reboot"))
             .await
             .unwrap();
@@ -784,5 +834,52 @@ mod tests {
         // A no-op resize keeps the same size.
         limiter.set_global_max(4);
         assert_eq!(limiter.global_max(), 4);
+    }
+
+    // CLAUDE-228: the gather marker is per action, non-blocking, and released on
+    // drop, including when the gather returns early with an error.
+    #[test]
+    fn gather_gate_marks_one_action_at_a_time() {
+        let gate = GatherGate::new();
+        assert!(!gate.is_gathering("a"));
+
+        let held = gate.try_acquire("a").expect("a free action is acquirable");
+        assert!(gate.is_gathering("a"));
+        assert!(
+            gate.try_acquire("a").is_none(),
+            "a second acquire for the same action is refused"
+        );
+        // A different action is unaffected: one slow gather never defers another
+        // action's pickup.
+        let other = gate
+            .try_acquire("b")
+            .expect("distinct actions are independent");
+        assert!(gate.is_gathering("b"));
+
+        drop(held);
+        assert!(!gate.is_gathering("a"), "released on drop");
+        assert!(gate.is_gathering("b"), "dropping one leaves the other held");
+        assert!(
+            gate.try_acquire("a").is_some(),
+            "the action is acquirable again once released"
+        );
+        drop(other);
+        assert!(!gate.is_gathering("b"));
+    }
+
+    // The guard is dropped by an early `?` out of a gather, not just a clean
+    // return, so a failing gather cannot wedge the action's pickups forever.
+    #[test]
+    fn gather_gate_releases_when_the_gather_errors() {
+        let gate = GatherGate::new();
+        fn gather_that_fails(gate: &GatherGate) -> std::result::Result<(), &'static str> {
+            let _marker = gate.try_acquire("a");
+            Err("gather blew up")
+        }
+        assert!(gather_that_fails(&gate).is_err());
+        assert!(
+            !gate.is_gathering("a"),
+            "an error return still releases the marker"
+        );
     }
 }

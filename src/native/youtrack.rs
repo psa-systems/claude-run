@@ -38,29 +38,36 @@
 //! in [`finalize`], after claude exits, gated on the outcome - matching the
 //! merged CLAUDE-24 runner-creates-PR contract. The agent itself does local
 //! engineering work only (no push, no PR) and, since CLAUDE-214, the bounded
-//! tracker writes [`default_youtrack_prompt`] permits: creating issues in the
-//! configured `write_projects`, updating / commenting / linking the issues it
-//! created, and one `subtask of` link onto the triggering issue. `AI Agent` on
-//! any issue, and every other write to the triggering issue, stay the runner's.
+//! tracker writes [`default_youtrack_prompt`] permits: a descoped piece of the
+//! triggering issue goes to the configured `write_projects`, linked `subtask
+//! of` the triggering issue; an out-of-scope bug found elsewhere (CLAUDE-297)
+//! goes to the project whose VCS integration binds the buggy repo (falling
+//! back to `write_projects`), linked `relates to` the triggering issue. Either
+//! way the agent may update / comment / link only the issues it created this
+//! run. `AI Agent` on any issue, and every other write to the triggering
+//! issue, stay the runner's.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sqlx::SqlitePool;
-use tracing::{info, warn};
+use crate::db::DbPool;
+use tracing::{error, info, warn};
 
 use super::{HandlerFuture, NativeContext, NativeHandler};
 use crate::access;
-use crate::action::{NativeConfig, YoutrackSource};
+use crate::action::{NativeConfig, PromptPreset, YoutrackSource};
 use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::claude::{raw_event_details, ClaudeInvoker, ClaudeResult};
 use crate::concurrency::Executor;
 use crate::config::Paths;
 use crate::error::{Error, Result};
 use crate::job::{self, EffectiveLimits, ProcessedJob, RunnerDefaults};
-use crate::provider::{self, Backend, CliBackend, CommandRunner, Forge, PullRequest};
+use crate::provider::{
+    self, AuditedTracker, CliBackend, CommandRunner, Forge, IssueTracker, IssueWriteAudit,
+    PullRequest,
+};
 use crate::secrets::{self, JobCredentials};
 use crate::state;
 use crate::workdir;
@@ -172,11 +179,26 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     // credential store (the gather backend's is yt-only), so it materializes one
     // per probed repo; `None` when the action references no forge secret.
     let access = forge_access_check(&runner, &creds, &cred_base, gh);
-    let (jobs, input_events) = gather(
+    // CLAUDE-228: hold the gather marker so the scheduler does not stack another
+    // pickup while this one is still gathering.
+    let gather_marker = ctx.gather.try_acquire(&action.name);
+    let Gathered {
+        jobs,
+        events: input_events,
+        candidate_keys,
+    } = gather(
         &gather_backend,
         &src.query,
         access.as_ref().map(|a| a as &dyn RepoAccess),
     )?;
+    // CLAUDE-225: drop dependency-gate rows for issues this query no longer
+    // matches. Only a successful query reaches here, so a `yt` failure never
+    // prunes. Non-fatal: a bookkeeping failure must not abort the poll, but it is
+    // logged, because a prune that stops running silently repopulates the
+    // stale-gate banner with issues nobody is waiting on.
+    if let Err(e) = state::dependency_gate_retain(pool, &action.name, &candidate_keys).await {
+        warn!(action = %action.name, error = %e, "dependency-gate prune failed (non-fatal); the stale-gate banner may list issues that are no longer queued");
+    }
     // CLAUDE-147: persist input-phase diagnostics before `run_begin` so they
     // survive even if no run row is ever created. Non-fatal: a bookkeeping
     // failure must not abort the poll.
@@ -266,7 +288,14 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         return Ok(());
     }
 
+    // CLAUDE-228: the gather marker covers the whole pre-`run_begin` phase (the
+    // work a stacked pickup would redo); released here, so overlapping runs past
+    // this point stay allowed exactly as CLAUDE-162 intends.
+    drop(gather_marker);
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
+    // CLAUDE-228: from here the row MUST be closed on every exit path, including
+    // an early `?` out of the bookkeeping below.
+    let run_guard = state::RunGuard::new(pool, run_id);
     // CLAUDE-147: backfill this poll's input-phase events onto the new run row.
     if !input_events.is_empty() {
         if let Err(e) = state::run_events_attach(pool, run_id, &action.name, &poll_ts).await {
@@ -312,6 +341,11 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         }
     }
 
+    // CLAUDE-234: ONE issue-write ledger for the whole run, shared by every
+    // per-job backend below, so the ceiling is per run rather than per job and
+    // every write this run makes carries `run_id` into the journal.
+    let audit = IssueWriteAudit::new(Some(run_id), limits.max_issues_per_run);
+
     // CLAUDE-28: keyed, bounded-parallel execution. Distinct repos (the
     // concurrency key) run in parallel; jobs against the same repo serialize so
     // they never collide on the clone dir / branch / PR. `max_parallel: 1`
@@ -338,6 +372,8 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         let gh = gh_owned.clone();
         let job_cancel = cancel.clone();
         let job_pause = run_pause.clone();
+        let job_audit = audit.clone();
+        let job_spend = ctx.spend.clone();
         let fut: crate::concurrency::JobFuture = Box::pin(async move {
             let action = &loaded.action;
             // CLAUDE-28: best-effort cap/budget check before launch; bounded
@@ -348,6 +384,12 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
             }
             if state::daily_cost_get(&pool, &action.name).await? >= limits.daily_budget_usd {
                 warn!(action = %action.name, "daily budget reached, skipping job");
+                return Ok(false);
+            }
+            // DEV-705: the run's own ceiling; a run that reached it picks up
+            // nothing further.
+            if job_spend.exceeded() {
+                warn!(action = %action.name, "{}", job_spend.stop_reason());
                 return Ok(false);
             }
             // CLAUDE-26: materialize this job's own credential files (yt config +
@@ -391,17 +433,22 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 Some(f) => f,
                 None => &job_backend,
             };
+            // CLAUDE-234: the job writes through the RUN's ledger, so each
+            // comment / field write is journalled with `run_id` and the issue
+            // key, and any issue this job creates spends the run's ceiling.
+            let tracker = AuditedTracker::new(&job_backend, job_audit);
             let outcome = process_job(
                 loaded.as_ref(),
                 &paths,
                 &pool,
                 claude.as_ref(),
-                &job_backend,
+                &tracker,
                 forge,
                 &src,
                 &limits,
                 &job_cancel,
                 &job_pause,
+                &job_spend,
                 &job,
                 pr_strategy,
                 bypass_backoff,
@@ -460,8 +507,36 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         }
     }
 
-    let exit_code = run_pause.exit_code(cancel.is_cancelled());
-    state::run_finish(pool, run_id, exit_code, processed).await?;
+    // CLAUDE-234: a run stopped by its issue-creation ceiling surfaces on the
+    // action page, not only in the daemon journal. The ledger is the run's, so
+    // the drain is here rather than per job. Non-fatal bookkeeping.
+    let notices = audit.take_notices();
+    if !notices.is_empty() {
+        let events: Vec<state::InputEvent> = notices
+            .into_iter()
+            .map(|message| state::InputEvent {
+                level: "warn".to_string(),
+                context: None,
+                message,
+            })
+            .collect();
+        if let Err(e) = state::run_events_record_for_run(pool, run_id, &action.name, &events).await
+        {
+            warn!(run_id, error = %e, "run_events_record_for_run failed (non-fatal)");
+        }
+    }
+
+    // DEV-705: an over-budget stop is this run's outcome unless a cancel or a
+    // pause already claimed it.
+    let exit_code = ctx
+        .spend
+        .exit_code(run_pause.exit_code(cancel.is_cancelled()));
+    if exit_code == crate::exit::OVER_BUDGET {
+        warn!(action = %action.name, "{}", ctx.spend.stop_reason());
+    }
+    run_guard.finish(exit_code, processed).await?;
+    // DEV-707: one summary line and one machine-readable record per run.
+    ctx.spend.finish(Some(run_id), exit_code);
     if let Some(e) = first_err {
         warn!(action = %action.name, error = %e, "one or more jobs errored during the run");
     }
@@ -629,11 +704,19 @@ fn forge_access_check(
 /// per-project probe failures and no-VCS drops) that the caller persists to
 /// `run_events` so they surface in the web UI rather than only in the journal.
 fn gather(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     query: &str,
     access: Option<&dyn RepoAccess>,
-) -> Result<(Vec<YoutrackJob>, Vec<state::InputEvent>)> {
+) -> Result<Gathered> {
     let issues = backend.list_queued(query)?;
+    // CLAUDE-225: every key the QUERY matched, before the VCS / access filters
+    // below drop any. This is "still a candidate for this action", which is what
+    // decides whether a dependency-gate row is still live.
+    let candidate_keys: Vec<String> = issues
+        .iter()
+        .filter_map(|i| i.get("idReadable").and_then(|v| v.as_str()))
+        .map(String::from)
+        .collect();
     let mut vcs_cache: std::collections::HashMap<String, Option<provider::VcsRepo>> =
         std::collections::HashMap::new();
     // CLAUDE-194: repo -> "the forge token can read it", so N issues in one
@@ -748,7 +831,25 @@ fn gather(
             clone_url: repo.clone_url,
         });
     }
-    Ok((jobs, events))
+    Ok(Gathered {
+        jobs,
+        events,
+        candidate_keys,
+    })
+}
+
+/// One poll's gather result.
+struct Gathered {
+    /// Workable jobs (query matches that survived the VCS / access filters).
+    jobs: Vec<YoutrackJob>,
+    /// CLAUDE-147 input-phase diagnostics the caller persists to `run_events`.
+    events: Vec<state::InputEvent>,
+    /// CLAUDE-225: every key the query matched, filters aside. A dependency-gate
+    /// row for a key absent from this list holds nothing: the issue left the
+    /// action's candidate set (resolved by hand, re-fielded, query changed), so
+    /// the row is dead state that would otherwise sit in the stale-gate banner
+    /// forever and teach the operator to ignore it.
+    candidate_keys: Vec<String>,
 }
 
 /// Project key prefix of an issue id (`MK-16` -> `MK`).
@@ -781,8 +882,8 @@ enum Eligibility {
 /// wins the key: that post-gate re-read is the authoritative cross-run TOCTOU
 /// guard right before the first mutation (`src/concurrency.rs` module docs).
 async fn evaluate_eligibility(
-    pool: &SqlitePool,
-    backend: &dyn Backend,
+    pool: &DbPool,
+    backend: &dyn IssueTracker,
     src: &YoutrackSource,
     action: &str,
     job: &YoutrackJob,
@@ -830,8 +931,8 @@ async fn evaluate_eligibility(
 /// blocked). Runs per candidate, before the executor is built, so ineligible
 /// issues never compete for a project's concurrency key.
 async fn filter_eligible(
-    pool: &SqlitePool,
-    backend: &dyn Backend,
+    pool: &DbPool,
+    backend: &dyn IssueTracker,
     src: &YoutrackSource,
     action: &str,
     jobs: Vec<YoutrackJob>,
@@ -858,14 +959,16 @@ async fn filter_eligible(
 async fn process_job(
     loaded: &crate::action::LoadedAction,
     paths: &Paths,
-    pool: &SqlitePool,
+    pool: &DbPool,
     claude: &ClaudeInvoker,
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     forge: &dyn Forge,
     src: &YoutrackSource,
     limits: &EffectiveLimits,
     cancel: &CancellationToken,
     pause: &crate::pause::RunPause,
+    // DEV-705 / DEV-707: the run's shared ledger and frozen ceiling.
+    spend: &crate::usage::RunSpend,
     job: &YoutrackJob,
     pr_strategy: crate::action::PrStrategy,
     bypass_backoff: bool,
@@ -877,8 +980,27 @@ async fn process_job(
 
     // YouTrack jobs always carry a stable key (idReadable), so the attempt cap
     // always applies.
+    // CLAUDE-301: the issue no longer just sits at Queued to be skipped again
+    // on the next poll. It gets one comment naming the cap and moves to
+    // Needs Review, the same label the needs-review marker and the timeout
+    // path use for "parked pending a human decision". A write failure here
+    // must not swallow the cap hit: `report_cap_reached` logs each failure at
+    // `error` and this still returns `CapHit` so the CLAUDE-232 banner keeps
+    // showing the key.
     if attempts >= limits.max_attempts_per_key {
-        info!(action = %action.name, key = %key, attempts, "skipping job, attempt cap reached");
+        warn!(
+            action = %action.name, key = %key, attempts,
+            cap = limits.max_attempts_per_key,
+            "attempt cap reached; reporting and moving to Needs Review"
+        );
+        report_cap_reached(
+            backend,
+            src,
+            &action.name,
+            key,
+            attempts,
+            limits.max_attempts_per_key,
+        );
         return Ok(ProcessedJob::CapHit { key: key.clone() });
     }
 
@@ -942,13 +1064,30 @@ async fn process_job(
         }
     }
 
+    // ---- CLAUDE-275: resume an existing open PR's branch on a re-queue ----
+    // A DB lookup (async) plus, when a record is found, a live confirmation
+    // against the forge (sync, so wrapped). Any failure here just means a fresh
+    // pickup, exactly as before CLAUDE-275; it never fails the job.
+    let resume = match resolve_pr_resume(pool, forge, job, pr_strategy).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(action = %action.name, key = %key, error = %e, "PR-resume lookup failed; starting from the default branch");
+            None
+        }
+    };
+
     // CLAUDE-102: a preserved workdir from a failed finalize (unpushed commits)
     // must not be clobbered by this attempt's clone; move it aside first.
     preserve_aside(&workdir_path);
     std::fs::create_dir_all(&workdir_path)?;
 
     // ---- pre: mark Working / In Progress, then clone ----
-    let pre_result = run_pre(backend, src, job, &workdir_path);
+    // CLAUDE-228: `yt` field writes plus a full `git clone` of the target repo,
+    // all synchronous; keep them off the async worker thread.
+    let resume_branch = resume.as_ref().map(|r| r.branch.as_str());
+    let pre_result = crate::blocking::in_place(|| {
+        run_pre(backend, forge, src, job, &workdir_path, resume_branch)
+    });
 
     // ---- prompt + claude (skipped on pre failure / cancel / global pause) ----
     // CLAUDE-223: the gate is read once here (not in a match guard, which cannot
@@ -980,7 +1119,7 @@ async fn process_job(
             )
         }
         Ok(()) => {
-            let prompt = build_prompt(src, job, &workdir_path);
+            let prompt = build_prompt(src, job, &workdir_path, resume.as_ref());
             let stream_log =
                 ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1);
             info!(action = %action.name, key = %key, stream_log = %stream_log.display(), "invoking claude");
@@ -991,7 +1130,11 @@ async fn process_job(
                 &workdir_path,
                 &stream_log,
                 cancel,
+                // DEV-705: cap the child at the run's remaining ceiling.
+                Some(spend.remaining_usd()),
             )?;
+            // DEV-707: bill the run before any branch discards `r`.
+            spend.record(&r);
             if cancel.is_cancelled() {
                 // The token tripped mid-run; `invoke` already terminated the
                 // child. Synthesize a cancelled result so finalize runs and no
@@ -1020,7 +1163,10 @@ async fn process_job(
     // Transient claude error: no finalize, no attempt counted, no daily count.
     if claude_result.transient {
         info!(action = %action.name, key = %key, error = %claude_result.error, "transient claude error, not counting attempt");
-        cleanup_or_preserve(&workdir_path, &action.name, key);
+        // CLAUDE-228: the preserve decision runs `git ls-remote` against the
+        // remote (network) and may then run `git clean -fdX`; keep it off the
+        // async worker thread.
+        crate::blocking::in_place(|| cleanup_or_preserve(&workdir_path, &action.name, key));
         return Ok(ProcessedJob::Transient { key: key.clone() });
     }
 
@@ -1028,20 +1174,55 @@ async fn process_job(
         state::daily_cost_add(pool, &action.name, claude_result.cost).await?;
     }
 
+    // CLAUDE-304: computed once, before finalize, so both finalize's
+    // compaction check and the `ProcessedJob::Done` field below read the same
+    // path; `None` when claude never ran, so there is no log to check.
+    let stream_log = claude_ran.then(|| {
+        ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1)
+    });
+
     // ---- finalize (the native "post"): every external mutation lives here ----
-    let finalize_res = finalize(
-        backend,
-        forge,
-        src,
-        job,
-        &workdir_path,
-        &claude_result,
-        pr_strategy,
-        cancel,
-        pause,
-    );
+    // CLAUDE-228: synchronous. CLAUDE-278: finalize no longer polls CI (that
+    // wait is now driven by a webhook event), so it returns promptly.
+    let finalize_res = crate::blocking::in_place(|| {
+        finalize(
+            backend,
+            forge,
+            src,
+            job,
+            &workdir_path,
+            &claude_result,
+            pr_strategy,
+            stream_log.as_deref(),
+        )
+    });
+    // ---- CLAUDE-275: record a newly opened PR against its issue ----
+    // Only for a fresh PR (`resume` is `None`): a resumed job's PR is already
+    // recorded, and re-inserting it would collide with the store's
+    // `UNIQUE(host, repo, pr_number)`. `finalize` cannot make this DB write
+    // itself: it is a synchronous state machine whose own unit tests run with
+    // no tokio runtime, so the write happens here, right after it returns.
+    if resume.is_none() {
+        if let Ok(Finalized::CodeReview {
+            pr_number: Some(pr_number),
+            head_branch: Some(head_branch),
+            ..
+        }) = &finalize_res
+        {
+            record_new_pr(
+                pool,
+                forge,
+                backend,
+                &action.name,
+                job,
+                *pr_number,
+                head_branch,
+            )
+            .await;
+        }
+    }
     let post_failed = match &finalize_res {
-        Ok(Finalized::CodeReview { pr_url }) => {
+        Ok(Finalized::CodeReview { pr_url, .. }) => {
             info!(action = %action.name, key = %key, pr_url = %pr_url, "finalized: Code Review");
             false
         }
@@ -1064,15 +1245,7 @@ async fn process_job(
     }
 
     let ok = claude_result.ok && !post_failed;
-    let stream_log_path = if claude_ran {
-        Some(
-            ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1)
-                .display()
-                .to_string(),
-        )
-    } else {
-        None
-    };
+    let stream_log_path = stream_log.as_deref().map(|p| p.display().to_string());
 
     if !skip_attempt {
         state::attempts_increment(pool, &action.name, key).await?;
@@ -1082,19 +1255,42 @@ async fn process_job(
     }
 
     // CLAUDE-102: a finalize failure can cost a retry, never the work. Only a
-    // successfully opened PR makes deletion unconditional (the AGit push leaves
-    // no remote-tracking ref, so the unpushed check cannot clear it); every
+    // successfully opened PR skips the branch-vs-remote check (the AGit push
+    // leaves no remote-tracking ref, so that check cannot clear it); every
     // other outcome deletes only when no unpushed commits would be lost. A
     // panic anywhere above preserves trivially: deletion only ever happens
     // here, explicitly.
-    match &finalize_res {
-        // A merged PR (CLAUDE-126) is as safe to delete as a Code Review PR: the
-        // work reached the server and, for Merged, was merged into the base.
-        Ok(Finalized::CodeReview { .. }) | Ok(Finalized::Merged { .. }) => {
-            cleanup_workdir(&workdir_path)
+    // CLAUDE-228: same as above, the preserve branch shells out to git.
+    // CLAUDE-281: a Code Review PR still leaves the branch-vs-remote check
+    // skipped, but a dirty tree or stash is work that never made it into the
+    // PR at all, so it is checked and preserved just the same.
+    crate::blocking::in_place(|| match &finalize_res {
+        Ok(Finalized::CodeReview { .. }) => {
+            match crate::workdir::uncommitted_or_stashed(&workdir_path) {
+                Ok(dirty) if dirty.is_empty() => cleanup_workdir(&workdir_path),
+                Ok(dirty) => {
+                    warn!(
+                        action = %action.name,
+                        key = %key,
+                        workdir = %workdir_path.display(),
+                        dirty_paths = dirty.paths.len(),
+                        stashes = dirty.stashes.len(),
+                        "workdir preserved after PR: uncommitted work not in the PR"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        action = %action.name,
+                        key = %key,
+                        workdir = %workdir_path.display(),
+                        error = %e,
+                        "workdir preserved after PR: uncommitted-work check failed"
+                    );
+                }
+            }
         }
         _ => cleanup_or_preserve(&workdir_path, &action.name, key),
-    }
+    });
 
     Ok(ProcessedJob::Done {
         key: key.clone(),
@@ -1109,6 +1305,113 @@ async fn process_job(
         duration_ms: started.elapsed().as_millis() as i64,
         timed_out: claude_result.timed_out,
     })
+}
+
+/// CLAUDE-275: an open recorded PR this job continues rather than reopening.
+struct PrResume {
+    /// The PR's server head branch, cloned instead of the default branch.
+    branch: String,
+    /// Human-facing PR URL, rendered into the `{{existing_pr_url}}` placeholder.
+    pr_url: String,
+}
+
+/// CLAUDE-275: look up whether `job`'s issue already has an open PR recorded
+/// against it and, if so, confirm it is still open before resuming its branch.
+///
+/// Returns `Ok(None)` on every path that should fall back to opening a fresh
+/// PR from the default branch: no record, a record already `merged` /
+/// `closed`, the AGit strategy (no server branch to continue on), or a failed
+/// live confirmation (the record might be stale; a false resume is worse than
+/// a redundant PR, so this errs toward a fresh pickup exactly like the rest of
+/// this pipeline's read-then-degrade checks).
+async fn resolve_pr_resume(
+    pool: &DbPool,
+    forge: &dyn Forge,
+    job: &YoutrackJob,
+    pr_strategy: crate::action::PrStrategy,
+) -> Result<Option<PrResume>> {
+    use crate::ci_failure::store;
+    let Some(rec) = store::agent_pr_for_issue(pool, &job.key).await? else {
+        return Ok(None);
+    };
+    if rec.state != "open" {
+        return Ok(None);
+    }
+    if matches!(pr_strategy, crate::action::PrStrategy::Agit) {
+        info!(key = %job.key, pr = rec.pr_number, "CLAUDE-275: recorded PR uses the AGit strategy, which has no server branch to resume; opening a new PR");
+        return Ok(None);
+    }
+    let host = host_only(&job.repo_host);
+    let repo = job.repo_path.clone();
+    let open = match crate::blocking::in_place(|| forge.list_open_prs(&host, &repo)) {
+        Ok(prs) => prs,
+        Err(e) => {
+            warn!(key = %job.key, pr = rec.pr_number, error = %e, "CLAUDE-275: could not confirm the recorded PR is still open; opening a new PR as before");
+            return Ok(None);
+        }
+    };
+    if open.iter().any(|p| p.number as i64 == rec.pr_number) {
+        info!(key = %job.key, pr = rec.pr_number, branch = %rec.head_branch, "CLAUDE-275: resuming the recorded open PR's branch");
+        return Ok(Some(PrResume {
+            branch: rec.head_branch.clone(),
+            pr_url: format!(
+                "{}/{}/pulls/{}",
+                job.repo_host, job.repo_path, rec.pr_number
+            ),
+        }));
+    }
+    // Confirmed no longer open. Whether it was merged or closed cannot be told
+    // apart from an open-PR listing alone; mark it closed so a stale "open"
+    // record cannot cause another resume attempt.
+    if let Err(e) = store::set_agent_pr_state(pool, rec.id, "closed", &state::now_iso()).await {
+        warn!(key = %job.key, pr = rec.pr_number, error = %e, "CLAUDE-275: failed to mark the recorded PR closed (non-fatal)");
+    }
+    info!(key = %job.key, pr = rec.pr_number, "CLAUDE-275: recorded PR is no longer open; marked closed and starting from the default branch");
+    Ok(None)
+}
+
+/// CLAUDE-275: record a freshly opened PR against its issue in the
+/// `agent_pull_requests` store, so a later re-queue of the same issue can
+/// resume its branch instead of opening a second PR. Best-effort: a write
+/// failure is logged at `error`, surfaced as a `run_events` row via
+/// [`Forge::note`] (drained by the caller exactly like a degraded lookup), and
+/// named in a follow-up issue comment, but never fails the job - the PR
+/// already exists and the issue already sits at Code Review.
+async fn record_new_pr(
+    pool: &DbPool,
+    forge: &dyn Forge,
+    backend: &dyn IssueTracker,
+    action_name: &str,
+    job: &YoutrackJob,
+    pr_number: u64,
+    head_branch: &str,
+) {
+    use crate::ci_failure::store;
+    let host = host_only(&job.repo_host);
+    let now = state::now_iso();
+    if let Err(e) = store::record_agent_pr(
+        pool,
+        action_name,
+        &job.key,
+        &host,
+        &job.repo_path,
+        pr_number as i64,
+        head_branch,
+        "open",
+        &now,
+    )
+    .await
+    {
+        tracing::error!(action = %action_name, key = %job.key, pr = pr_number, error = %e, "CLAUDE-275: failed to record the agent PR in the store");
+        let message = format!(
+            "CLAUDE-275: recording PR #{pr_number} against `{}` in the agent_pull_requests store failed ({e}); a re-queue of this issue will not resume this PR's branch and may open a second one",
+            job.repo_path
+        );
+        forge.note(message.clone());
+        if let Err(e) = backend.comment(&job.key, &message) {
+            warn!(key = %job.key, error = %e, "PR-record-failure comment also failed (continuing)");
+        }
+    }
 }
 
 /// One unmet blocker: the linked issue's id and the direction-resolved verb.
@@ -1137,13 +1440,20 @@ enum GateDecision {
 /// blocks iff its direction-resolved `verb` is listed in `block_on` and its
 /// target is unresolved (`resolved` is `None`). Direction is already baked into
 /// the verb by YT-40 (`depends on` = Depend INWARD, `parent for` = Subtask
-/// OUTWARD, etc.), so matching the verb resolves direction exactly. The result is
-/// sorted and de-duplicated so its signature is order-independent.
-fn unmet_blockers(links: &[provider::IssueLink], block_on: &[String]) -> Vec<Blocker> {
+/// OUTWARD, etc.), so matching the verb resolves direction exactly. With
+/// `own_project` set (`block_cross_project: false`), a target in any other
+/// project never blocks. The result is sorted and de-duplicated so its signature
+/// is order-independent.
+fn unmet_blockers(
+    links: &[provider::IssueLink],
+    block_on: &[String],
+    own_project: Option<&str>,
+) -> Vec<Blocker> {
     let mut out: Vec<Blocker> = links
         .iter()
         .filter(|l| l.resolved.is_none())
         .filter(|l| block_on.iter().any(|v| v == &l.verb))
+        .filter(|l| own_project.is_none_or(|p| project_key(&l.target) == p))
         .map(|l| Blocker {
             id: l.target.clone(),
             verb: l.verb.clone(),
@@ -1201,9 +1511,15 @@ fn blocked_comment(blockers: &[Blocker]) -> String {
 /// pickup passes `false`, keeping CLAUDE-182's throttle. Every other side effect
 /// (signature/`blocked_until` persistence, row clear, changed-set comment) is
 /// unchanged; bypass only skips the window short-circuit.
+///
+/// CLAUDE-225: every blocked return logs how long the issue has been held, at
+/// `warn` once past [`state::STALE_GATE_AFTER_MS`]. A gate that stops resuming is
+/// otherwise silent at every layer: the issue stays Queued with no field change,
+/// a poll whose candidates are all blocked returns before `run_begin` so no run
+/// row is written, and the journal said nothing above `info`.
 async fn dependency_gate(
-    pool: &SqlitePool,
-    backend: &dyn Backend,
+    pool: &DbPool,
+    backend: &dyn IssueTracker,
     src: &YoutrackSource,
     action: &str,
     key: &str,
@@ -1227,13 +1543,15 @@ async fn dependency_gate(
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect();
+            log_held(action, key, &p.signature, p.blocked_since_ms, now_ms);
             return Ok(GateDecision::Blocked { blockers });
         }
     }
 
     // Re-evaluate: read the live links and compute the unmet blocker set.
     let links = backend.issue_links(key)?;
-    let blockers = unmet_blockers(&links, &deps.block_on);
+    let own_project = (!deps.block_cross_project).then(|| project_key(key));
+    let blockers = unmet_blockers(&links, &deps.block_on, own_project.as_deref());
     if blockers.is_empty() {
         // Cleared (or never blocked): drop any persisted gate state, proceed.
         if prev.is_some() {
@@ -1263,19 +1581,48 @@ async fn dependency_gate(
     let blocked_until = now_ms + recheck.as_millis() as i64;
     state::dependency_gate_upsert(pool, action, key, blocked_until, &signature).await?;
 
+    // CLAUDE-225: an unchanged row keeps its original stamp, so this measures the
+    // whole block, not this evaluation.
+    let blocked_since = prev.map(|p| p.blocked_since_ms).unwrap_or(now_ms);
+    log_held(action, key, &signature, blocked_since, now_ms);
+
     Ok(GateDecision::Blocked {
         blockers: blockers.iter().map(Blocker::display).collect(),
     })
+}
+
+/// CLAUDE-225: log how long the gate has held this issue, escalating to `warn`
+/// past [`state::STALE_GATE_AFTER_MS`]. The gate's own comment promises automatic
+/// re-evaluation, so a block that outlives the threshold is either a dependency
+/// nobody is working or a re-evaluation that stopped happening; both are worth an
+/// operator's attention and neither announces itself anywhere else.
+fn log_held(action: &str, key: &str, signature: &str, blocked_since_ms: i64, now_ms: i64) {
+    let held_ms = (now_ms - blocked_since_ms).max(0);
+    if held_ms >= state::STALE_GATE_AFTER_MS {
+        warn!(
+            action = %action,
+            key = %key,
+            blockers = %signature,
+            held_secs = held_ms / 1000,
+            "dependency gate has held this issue past the staleness threshold; it stays Queued and is not being worked"
+        );
+    } else {
+        info!(action = %action, key = %key, blockers = %signature, held_secs = held_ms / 1000, "dependency gate holding issue");
+    }
 }
 
 /// Pre steps: mark the issue Working + In Progress, then clone the repo into
 /// `workdir`. Returns the failure reason on any step error so the caller can
 /// synthesize a failed claude result and still finalize.
 fn run_pre(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
+    forge: &dyn Forge,
     src: &YoutrackSource,
     job: &YoutrackJob,
     workdir: &Path,
+    // CLAUDE-275: the recorded PR's head branch to resume, or `None` for the
+    // default-branch clone this always used to be.
+    resume_branch: Option<&str>,
 ) -> std::result::Result<(), String> {
     backend
         .set_field(&job.key, &src.custom_field, &src.states.working)
@@ -1291,7 +1638,8 @@ fn run_pre(
             .set_assignee(&job.key, login)
             .map_err(|e| format!("set Assignee={login}: {e}"))?;
     }
-    clone_repo(&job.clone_url, workdir).map_err(|e| format!("git clone: {e}"))?;
+    clone_repo(&clone_url_for(forge, job), workdir, resume_branch)
+        .map_err(|e| format!("git clone: {e}"))?;
     install_hooks(workdir);
     Ok(())
 }
@@ -1342,24 +1690,47 @@ fn install_hooks(workdir: &Path) {
     }
 }
 
-/// Shallow-clone `clone_url` into `workdir` (already created, empty). Host git
-/// identity handles auth.
-fn clone_repo(clone_url: &str, workdir: &Path) -> Result<()> {
-    let status = Command::new("git")
-        .arg("clone")
-        .arg("--depth")
-        .arg("50")
-        .arg(clone_url)
-        .arg(workdir)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::Other(anyhow::anyhow!(
-            "git clone exited {}",
-            status.code().unwrap_or(-1)
-        )))
+/// The URL to clone this job's repo from.
+///
+/// CLAUDE-252: prefer the token-bearing URL the forge builds from its own key
+/// store, the same one the comment webhook already uses.
+/// `job.clone_url` comes from the YouTrack VCS integration and carries no
+/// credential, so on a host with no git credential of its own (the container,
+/// deliberately) every clone failed with `could not read Username`.
+///
+/// Falls back to the plain URL when the forge cannot resolve one, because a host
+/// install authenticating through a credential helper or `~/.netrc` must keep
+/// working exactly as before. The failure is logged once, naming the host.
+fn clone_url_for(forge: &dyn Forge, job: &YoutrackJob) -> String {
+    // `Forge::clone_url` looks the host up in the key store and formats the URL
+    // itself, so it wants a bare host; `repo_host` carries the scheme.
+    let host = job
+        .repo_host
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    match forge.clone_url(host, &job.repo_path) {
+        Ok(url) => url,
+        Err(e) => {
+            warn!(
+                host = %host,
+                repo = %job.repo_path,
+                error = %e,
+                "no forge credential for this host; cloning with the unauthenticated URL and \
+                 whatever git credentials the environment provides"
+            );
+            job.clone_url.clone()
+        }
     }
+}
+
+/// Shallow-clone `clone_url` into `workdir` (already created, empty).
+///
+/// The URL may carry a token, so the shared helper captures and redacts git's
+/// output rather than letting it inherit the daemon's stderr; the reason string
+/// this produces reaches the action page and can reach a YouTrack comment.
+fn clone_repo(clone_url: &str, workdir: &Path, branch: Option<&str>) -> Result<()> {
+    provider::shallow_clone(clone_url, branch, workdir, 50)
 }
 
 /// The built-in YouTrack agent prompt as a placeholder template (CLAUDE-125).
@@ -1372,8 +1743,13 @@ fn clone_repo(clone_url: &str, workdir: &Path) -> Result<()> {
 /// CLAUDE-214 replaced the blanket YouTrack ban with an explicit permission
 /// block, because the `No orphan notes` directive requires a run that discovers
 /// a gap to file it as a tracked, linked issue rather than mention it in prose.
-/// The ban that stays absolute is `AI Agent` on ANY issue: setting it queues
-/// work, so an agent that could set it could spawn runs.
+/// CLAUDE-297 split that permission into two cases: a descoped piece of the
+/// triggering issue is filed in `write_projects` and linked `subtask of`; a
+/// bug found outside the triggering issue's scope is filed in the project
+/// whose VCS integration binds the buggy repo (falling back to
+/// `write_projects`) and linked `relates to`. The ban that stays absolute is
+/// `AI Agent` on ANY issue: setting it queues work, so an agent that could set
+/// it could spawn runs.
 pub(crate) fn default_youtrack_prompt() -> String {
     [
         "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md.",
@@ -1386,9 +1762,11 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "",
         "YouTrack writes. You MAY do exactly the following, and nothing else:",
         "- Read anything the token can see, across every project: 'yt list --query=...', 'yt search', 'yt issue inspect <KEY>', 'yt project list' / 'yt project show' / 'yt project vcs list'.",
-        "- Create issues with 'yt issue create', but ONLY in these projects: {{write_projects}}. This is how the CLAUDE.md 'No orphan notes' rule is satisfied: a gap, deferred item, or descoped piece you find mid-task becomes its own tracked issue instead of a sentence in the PR body that nobody owns.",
+        "- Create an issue with 'yt issue create' in exactly two cases:",
+        "  1. A gap, deferred item, or descoped piece of {{key}} itself: create it ONLY in these projects: {{write_projects}}, then link it with 'yt issue link <new-issue> {{key}} --type \"subtask of\"'. This is how the CLAUDE.md 'No orphan notes' rule is satisfied: the piece becomes its own tracked issue instead of a sentence in the PR body that nobody owns.",
+        "  2. A bug you find that is NOT part of {{key}}, in this repo or in any other repo (for example a defect in a server repo you hit while working on the app that calls it). If it blocks {{key}}'s acceptance criteria and lives in this repo, fix it as part of {{key}}'s change and file nothing. Otherwise do NOT fix it in this run; file it. First run 'yt search' for an open issue that already reports it; if one exists, file nothing and name that issue in your final summary. Create it in the project whose VCS integration binds the repo the bug lives in: find that project with 'yt project list' and 'yt project vcs list <PROJECT>', and if no project or more than one project binds that repo, create it in {{write_projects}}. Its description states what you observed, how to reproduce it, and the file:line or command output that shows it. Then link it with 'yt issue link <new-issue> {{key}} --type \"relates to\"'. If the bug blocks {{key}}'s acceptance criteria from another repo, also take the blocker path below and name the new issue in the reason.",
         "- Update, comment on, and link ONLY the issues you created during THIS run: 'yt issue update', 'yt issue comment', 'yt issue link'.",
-        "- On the triggering issue {{key}}, exactly ONE write: 'yt issue link <new-issue> \"subtask of\" {{key}}', hanging an issue you created off the issue that asked for it. Nothing else on {{key}}.",
+        "- On the triggering issue {{key}}, the ONLY writes are the links named in the two cases above, one per issue you created. Nothing else on {{key}}.",
         "",
         "HARD BANS on YouTrack, no exceptions:",
         "- NEVER set the 'AI Agent' field on ANY issue, including issues you created yourself: no 'yt issue set-field ... \"AI Agent\" ...', and no equivalent through 'yt issue update' or 'yt issue apply'. Setting that field queues an agent run, so an agent that can set it can spawn runs. It belongs to the runner alone.",
@@ -1399,10 +1777,10 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "Steps:",
         "1. Run 'yt issue inspect {{key}}' to read the full description and acceptance criteria.",
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
-        "3. Create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). Do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
+        "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
         "4. Make the minimum change required to satisfy the acceptance criteria.",
         "5. Commit with a message that references the issue on its own line as '#{{key}}' (a bare reference, with NO 'State ...' command after it). This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
-        "6. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop.",
+        "6. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success.",
         "7. Verify completion against the acceptance criteria before stopping. Re-read each criterion and state the concrete evidence that it is met: the file:line you changed, the command and its output, or the test that now passes. For any criterion that REMOVES or DELETES something, prove absence with a search (grep for the symbol or file) and confirm zero hits - never assert a removal you have not grep-verified - and add or extend a test or CI guard that fails if it reappears, so the removal is enforced mechanically. A green check suite is necessary but NOT sufficient: green checks do not prove the acceptance criteria are met. If you cannot produce objective evidence for EVERY criterion, you have NOT completed the issue - take the blocker path below instead of stopping as done.",
         "8. Stop. Do not push and do not open a PR; beyond the YouTrack writes permitted above, do not touch the tracker. The runner opens the PR from your commits and transitions the issue.",
         "",
@@ -1426,13 +1804,33 @@ pub(crate) fn default_youtrack_prompt() -> String {
     .join("\n")
 }
 
-/// Build the agent's instruction text for `job`. Uses the action's full-override
-/// prompt (`native.youtrack.prompt`, CLAUDE-125) when set, otherwise the
-/// built-in [`default_youtrack_prompt`]; either way the `{{...}}` placeholders
-/// are substituted with this job's values.
-fn build_prompt(src: &YoutrackSource, job: &YoutrackJob, workdir: &Path) -> String {
-    let template = src.prompt.clone().unwrap_or_else(default_youtrack_prompt);
-    render_prompt_template(&template, job, workdir, &write_projects(src, job))
+/// The built-in prompt template a preset names.
+pub(crate) fn preset_prompt(p: PromptPreset) -> String {
+    match p {
+        PromptPreset::Default => default_youtrack_prompt(),
+        PromptPreset::Audit => super::audit_prompt::default_audit_prompt(),
+    }
+}
+
+/// The unrendered prompt template for an action: the `native.youtrack.prompt`
+/// override (CLAUDE-125) when set, otherwise the `prompt_preset` built-in.
+pub(crate) fn prompt_template(src: &YoutrackSource) -> String {
+    match &src.prompt {
+        Some(p) => p.clone(),
+        None => preset_prompt(src.prompt_preset),
+    }
+}
+
+/// Build the agent's instruction text for `job`: [`prompt_template`] (override, else
+/// preset) with the `{{...}}` placeholders substituted.
+fn build_prompt(
+    src: &YoutrackSource,
+    job: &YoutrackJob,
+    workdir: &Path,
+    resume: Option<&PrResume>,
+) -> String {
+    let template = prompt_template(src);
+    render_prompt_template(&template, job, workdir, &write_projects(src, job), resume)
 }
 
 /// The project list `{{write_projects}}` renders to (CLAUDE-214): the configured
@@ -1450,14 +1848,21 @@ fn write_projects(src: &YoutrackSource, job: &YoutrackJob) -> String {
 /// Substitute the documented `{{...}}` placeholders in `template` with this
 /// job's values. An unknown `{{name}}` is left literal and logged at warn
 /// (forgiving per CLAUDE-125), as is an unterminated `{{`.
+///
+/// CLAUDE-275: `existing_pr_url` / `existing_branch` render empty when `resume`
+/// is `None` (a fresh pickup); when it is `Some`, they carry the recorded PR's
+/// URL and head branch, which is already checked out in `workdir`.
 fn render_prompt_template(
     template: &str,
     job: &YoutrackJob,
     workdir: &Path,
     write_projects: &str,
+    resume: Option<&PrResume>,
 ) -> String {
     let workdir = workdir.display().to_string();
-    let vars: [(&str, &str); 8] = [
+    let existing_pr_url = resume.map(|r| r.pr_url.as_str()).unwrap_or("");
+    let existing_branch = resume.map(|r| r.branch.as_str()).unwrap_or("");
+    let vars: [(&str, &str); 10] = [
         ("key", job.key.as_str()),
         ("summary", job.summary.as_str()),
         ("clone_url", job.clone_url.as_str()),
@@ -1466,6 +1871,8 @@ fn render_prompt_template(
         ("skip_attempt_marker", SKIP_ATTEMPT_MARKER),
         ("no_code_marker", NO_CODE_MARKER),
         ("write_projects", write_projects),
+        ("existing_pr_url", existing_pr_url),
+        ("existing_branch", existing_branch),
     ];
 
     let mut out = String::with_capacity(template.len());
@@ -1508,10 +1915,17 @@ enum Finalized {
     /// State untouched.
     NoCodeChange,
     /// Success: PR opened; AI Agent=Code Review.
-    CodeReview { pr_url: String },
-    /// CLAUDE-126: automerge succeeded - the PR's checks went green, the branch
-    /// was up to date, and the runner merged it; State=Done, AI Agent=Done.
-    Merged { pr_url: String },
+    CodeReview {
+        pr_url: String,
+        /// CLAUDE-275: the PR's identity, so the caller (`process_job`, which
+        /// alone has the pool and can await) records it in the
+        /// `agent_pull_requests` store once this synchronous state machine
+        /// returns; `finalize`'s own unit tests run with no tokio runtime, so
+        /// the store write cannot happen in here. `None` when the strategy or
+        /// backend did not report it (e.g. AGit has no server branch).
+        pr_number: Option<u64>,
+        head_branch: Option<String>,
+    },
     /// Hard failure (claude error, pre failure, or PR-create failure);
     /// AI Agent=Failed, no PR (or a failed PR).
     Failed,
@@ -1529,7 +1943,6 @@ impl Finalized {
             Finalized::NeedsReview => "Needs Review",
             Finalized::NoCodeChange => "No Code Change",
             Finalized::CodeReview { .. } => "Code Review",
-            Finalized::Merged { .. } => "Merged",
             Finalized::Failed => "Failed",
             Finalized::TimedOut => "Timed Out",
         }
@@ -1540,22 +1953,20 @@ impl Finalized {
 /// the single finalize `post` step in `actions/youtrack.yml`: the comment is
 /// best-effort (a comment failure cannot strand the AI Agent field on Working),
 /// and the AI Agent write is the authoritative, last operation. State stays In
-/// Progress until a human merges the PR, except when CLAUDE-126 automerge is
-/// enabled and the runner merges the PR itself (then State / AI Agent go Done).
+/// Progress until a human merges the PR. CLAUDE-278: finalize itself never
+/// merges or waits for CI any more, even with automerge enabled; that happens
+/// later, driven by a `success`/`recover` Action-run webhook event calling
+/// [`complete_automerge`] on this PR.
 #[allow(clippy::too_many_arguments)]
 fn finalize(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     forge: &dyn Forge,
     src: &YoutrackSource,
     job: &YoutrackJob,
     workdir: &Path,
     claude_result: &ClaudeResult,
     pr_strategy: crate::action::PrStrategy,
-    cancel: &CancellationToken,
-    // CLAUDE-223: the run's global-pause gate, forwarded to the automerge CI
-    // wait so a pause stops the wait instead of holding the reboot window open
-    // for the whole `automerge.wait_seconds` budget.
-    pause: &crate::pause::RunPause,
+    stream_log: Option<&Path>,
 ) -> Result<Finalized> {
     let needs_review = workdir.join(NEEDS_REVIEW_MARKER);
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
@@ -1568,6 +1979,7 @@ fn finalize(
             std::fs::write(&skip_marker, b"")?;
         }
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
+        let reason = append_compaction_note(&reason, stream_log, &job.key);
         comment_then_field(backend, src, &job.key, &reason, &src.states.needs_review)?;
         Ok(Finalized::NeedsReview)
     } else if claude_result.ok && no_code.exists() {
@@ -1594,35 +2006,18 @@ fn finalize(
             Ok(pr) => {
                 let url = pr_url(job, &pr);
                 let body = success_comment(claude_result, &url);
+                let body = append_compaction_note(&body, stream_log, &job.key);
                 comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
-                // CLAUDE-126: optional, CI-gated automerge. Off by default, so
-                // the issue stays at Code Review exactly as before. When enabled
-                // and the PR number is known, poll the checks and merge on green.
-                if src.automerge.enabled {
-                    match pr.number {
-                        Some(pr_number) => {
-                            match automerge(
-                                backend, forge, src, job, workdir, &url, pr_number, cancel, pause,
-                            ) {
-                                Ok(Some(merged)) => return Ok(merged),
-                                // Failure / timeout / cancel: the PR is left open
-                                // at Code Review and the reason was already
-                                // commented inside `automerge`.
-                                Ok(None) => {}
-                                // A forge error during the merge attempt must not
-                                // strand the issue: it already sits at Code Review
-                                // for a human, so log and leave it there.
-                                Err(e) => {
-                                    warn!(key = %job.key, error = %e, "automerge failed; leaving PR at Code Review");
-                                }
-                            }
-                        }
-                        None => {
-                            warn!(key = %job.key, "automerge enabled but PR number is unknown; leaving at Code Review");
-                        }
-                    }
-                }
-                Ok(Finalized::CodeReview { pr_url: url })
+                // CLAUDE-278: finalize no longer waits for CI itself. When
+                // `automerge.enabled`, the merge happens later, driven by a
+                // `success`/`recover` Action-run webhook event on this PR (see
+                // `crate::web::webhooks`), not by a poll here. The issue simply
+                // stays at Code Review until that event (or a human) advances it.
+                Ok(Finalized::CodeReview {
+                    pr_url: url,
+                    pr_number: pr.number,
+                    head_branch: pr.head_branch,
+                })
             }
             Err(e) => {
                 // CLAUDE-102: the error reaches the journal here (the run loop
@@ -1663,129 +2058,56 @@ fn finalize(
     }
 }
 
-/// CLAUDE-126: the automerge poll loop. Runs only when `automerge.enabled` and
-/// a PR number is known. Polls the PR's combined CI status every
-/// `check_interval_seconds` up to a total budget of `wait_seconds`, honoring the
-/// run's cancel token. Returns:
-///
-/// - `Ok(Some(Finalized::Merged))` on green + up-to-date: the PR is merged as a
-///   merge-commit, State=Done and AI Agent=Done are set, and a "runner merged"
-///   comment is posted.
-/// - `Ok(None)` when the PR is left open at Code Review (checks failed, the
-///   budget was exhausted while still pending, the branch could not be brought
-///   up to date, or the run was cancelled); the reason is commented (except on
-///   cancel, where the run is being torn down).
-/// - `Err` only on a forge/tracker call error, which the caller logs while
-///   leaving the issue at Code Review.
-///
-/// Before merging, a green-but-unmergeable PR (its branch behind the base) is
-/// brought up to date once via [`Forge::update_branch`] (retriggering CI), and
-/// the subsequent checks are awaited within the same budget; a branch that
-/// stays unmergeable after one update is left for a human.
-#[allow(clippy::too_many_arguments)]
-fn automerge(
-    backend: &dyn Backend,
-    forge: &dyn Forge,
-    src: &YoutrackSource,
-    job: &YoutrackJob,
-    workdir: &Path,
-    pr_url: &str,
-    pr_number: u64,
-    cancel: &CancellationToken,
-    pause: &crate::pause::RunPause,
-) -> Result<Option<Finalized>> {
-    let host = host_only(&job.repo_host);
-    let repo = job.repo_path.as_str();
-    let cfg = &src.automerge;
-    let budget = Duration::from_secs(cfg.wait_seconds);
-    let start = Instant::now();
-    // Bound the "behind base" recovery to a single Update Branch so a branch
-    // that stays unmergeable (e.g. a merge conflict) cannot spin until the
-    // deadline.
-    let mut updated = false;
-
-    info!(key = %job.key, pr = pr_number, wait_seconds = cfg.wait_seconds, "automerge: waiting for CI checks");
-    loop {
-        if cancel.is_cancelled() {
-            info!(key = %job.key, "automerge: run cancelled; leaving PR at Code Review");
-            return Ok(None);
+/// CLAUDE-304: a run whose context was compacted mid-run may have rebuilt
+/// finding write-ups (or other filed content) from the compacted summary
+/// instead of re-reading it, which is what let an earlier audit run file nine issues
+/// with citations that did not exist. Appended only to the success and
+/// needs-review comments, since those are the two outcomes that can carry a
+/// tracker write worth double-checking. A stream-log read failure logs at
+/// `error` and leaves `body` unchanged, since the outcome comment must still
+/// post; `stream_log` is `None` whenever claude never ran, which also leaves
+/// `body` unchanged.
+fn append_compaction_note(body: &str, stream_log: Option<&Path>, key: &str) -> String {
+    let Some(path) = stream_log else {
+        return body.to_string();
+    };
+    match crate::claude::count_compact_boundaries(path) {
+        Ok(0) => body.to_string(),
+        Ok(n) => {
+            warn!(key = %key, count = n, "context was compacted during this run");
+            format!(
+                "{body}\n\nContext was compacted {n} time(s) during this run; check the issues it created."
+            )
         }
-        // CLAUDE-223: a global pause stops the wait. `stop_cached` reads the
-        // gate's last known value (this loop is blocking and cannot `await`);
-        // the scheduler tick refreshes it every cycle, so it is at most one tick
-        // stale. The PR is left open at Code Review exactly as on cancel.
-        if pause.stop_cached() {
-            info!(key = %job.key, "automerge: globally paused; leaving PR at Code Review");
-            return Ok(None);
+        Err(e) => {
+            error!(key = %key, error = %e, "stream log read failed while checking for compaction");
+            body.to_string()
         }
-        let status = forge.pr_status(&host, repo, pr_number)?;
-        match status.state.trim() {
-            "failure" | "error" => {
-                let body = automerge_failure_comment(pr_url);
-                if let Err(e) = backend.comment(&job.key, &body) {
-                    warn!(key = %job.key, error = %e, "automerge failure comment failed (continuing)");
-                }
-                info!(key = %job.key, pr = pr_number, "automerge: checks failed; leaving PR at Code Review");
-                return Ok(None);
-            }
-            "success" if status.mergeable => {
-                // Green and up to date: merge as a merge-commit, then advance the
-                // issue. State=Done first, then comment + AI Agent=Done as the
-                // authoritative last write (mirrors comment_then_field).
-                forge.merge_pr(&host, repo, pr_number)?;
-                backend.set_state(&job.key, &src.states.state_done)?;
-                let body = merged_comment(pr_url);
-                comment_then_field(backend, src, &job.key, &body, &src.states.done)?;
-                info!(key = %job.key, pr = pr_number, "automerge: merged PR and advanced issue to Done");
-                return Ok(Some(Finalized::Merged {
-                    pr_url: pr_url.to_string(),
-                }));
-            }
-            "success" => {
-                // Green but not mergeable: the branch is behind its base. Update
-                // it once (which retriggers CI) and keep polling; if it is still
-                // not mergeable after that, leave it for a human.
-                if updated {
-                    let body = automerge_not_mergeable_comment(pr_url);
-                    if let Err(e) = backend.comment(&job.key, &body) {
-                        warn!(key = %job.key, error = %e, "automerge not-mergeable comment failed (continuing)");
-                    }
-                    info!(key = %job.key, pr = pr_number, "automerge: still not mergeable after Update Branch; leaving PR at Code Review");
-                    return Ok(None);
-                }
-                info!(key = %job.key, pr = pr_number, "automerge: branch behind base; running Update Branch");
-                forge.update_branch(workdir)?;
-                updated = true;
-            }
-            // "pending" (or any other transient state): keep waiting.
-            _ => {}
-        }
-
-        if start.elapsed() >= budget {
-            let body = automerge_timeout_comment(pr_url, cfg.wait_seconds);
-            if let Err(e) = backend.comment(&job.key, &body) {
-                warn!(key = %job.key, error = %e, "automerge timeout comment failed (continuing)");
-            }
-            info!(key = %job.key, pr = pr_number, "automerge: timed out waiting for green checks; leaving PR at Code Review");
-            return Ok(None);
-        }
-        sleep_with_cancel(cfg.check_interval_seconds, cancel, pause);
     }
 }
 
-/// Sleep up to `secs` seconds, waking early (in <=500ms) if the run is
-/// cancelled so a `claude-run stop` never hangs on a long `check_interval`.
-/// CLAUDE-223: a global pause wakes it the same way, so the operator's restart
-/// window is not held open by an automerge poll interval.
-fn sleep_with_cancel(secs: u64, cancel: &CancellationToken, pause: &crate::pause::RunPause) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    while Instant::now() < deadline {
-        if cancel.is_cancelled() || pause.stop_cached() {
-            return;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        std::thread::sleep(remaining.min(Duration::from_millis(500)));
-    }
+/// CLAUDE-278: complete automerge on a PR whose checks a `success`/`recover`
+/// Action-run webhook event has already confirmed are green and mergeable.
+/// Called from `crate::web::webhooks`'s success-event handler, not from
+/// `finalize` (which no longer waits for CI itself). Merges as a merge-commit,
+/// then makes the same writes the old CLAUDE-126 poll loop made on green:
+/// State=Done first, then a comment + AI Agent=Done as the authoritative last
+/// write (mirrors [`comment_then_field`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn complete_automerge(
+    backend: &dyn IssueTracker,
+    forge: &dyn Forge,
+    src: &YoutrackSource,
+    issue_key: &str,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    pr_url: &str,
+) -> Result<()> {
+    forge.merge_pr(host, repo, pr_number)?;
+    backend.set_state(issue_key, &src.states.state_done)?;
+    let body = merged_comment(pr_url);
+    comment_then_field(backend, src, issue_key, &body, &src.states.done)
 }
 
 fn merged_comment(pr_url: &str) -> String {
@@ -1799,40 +2121,59 @@ fn merged_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
-fn automerge_failure_comment(pr_url: &str) -> String {
+/// CLAUDE-278: the PR's checks went green but the branch is behind its base,
+/// so it is not mergeable. The webhook success handler has no workdir to run
+/// `Forge::update_branch` from (unlike the old poll loop, which could), so it
+/// only comments and leaves the issue at Code Review for a human to update and
+/// re-merge (or push a new commit, which retriggers CI and a later success
+/// event).
+pub(crate) fn automerge_needs_update_comment(pr_url: &str) -> String {
     [
-        "Automerge did NOT merge this PR: its CI checks reported a failure.".to_string(),
+        "This PR's checks passed, but its branch is behind its base so it cannot be automerged."
+            .to_string(),
         String::new(),
         format!("PR: {pr_url}"),
         String::new(),
-        "The PR is left open for a human to resolve; AI Agent stays at Code Review.".to_string(),
+        "Update the branch (or push a new commit) and it will be automerged on the next green run; AI Agent stays at Code Review."
+            .to_string(),
     ]
     .join("\n")
 }
 
-fn automerge_timeout_comment(pr_url: &str, wait_seconds: u64) -> String {
+/// CLAUDE-301: an issue at the per-key attempt cap leaves the queue instead of
+/// being skipped again on every poll. Comments the cap event (best-effort)
+/// then sets AI Agent to Needs Review, the same label the needs-review marker
+/// and the timeout path use for "parked pending a human". Unlike
+/// [`comment_then_field`], a failed write here must not abort the caller (the
+/// cap was still hit and `ProcessedJob::CapHit` must still be returned so the
+/// CLAUDE-232 banner keeps showing the key), so each write is attempted
+/// independently and a failure of either logs at `error` naming the key and
+/// the cause.
+fn report_cap_reached(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    action: &str,
+    key: &str,
+    attempts: u32,
+    cap: u32,
+) {
+    let body = cap_reached_comment(attempts, cap);
+    if let Err(e) = backend.comment(key, &body) {
+        error!(action = %action, key = %key, error = %e, "attempt-cap comment failed");
+    }
+    if let Err(e) = backend.set_field(key, &src.custom_field, &src.states.needs_review) {
+        error!(action = %action, key = %key, error = %e, "attempt-cap AI Agent write failed");
+    }
+}
+
+fn cap_reached_comment(attempts: u32, cap: u32) -> String {
     [
         format!(
-            "Automerge timed out after {wait_seconds}s waiting for the PR's CI checks to pass."
+            "This issue has reached its attempt cap ({attempts} of {cap}) without finishing successfully."
         ),
         String::new(),
-        format!("PR: {pr_url}"),
-        String::new(),
-        "The PR is left open for a human to review and merge; AI Agent stays at Code Review."
-            .to_string(),
-    ]
-    .join("\n")
-}
-
-fn automerge_not_mergeable_comment(pr_url: &str) -> String {
-    [
-        "Automerge could not bring the PR branch up to date with its base, so it was not merged."
-            .to_string(),
-        String::new(),
-        format!("PR: {pr_url}"),
-        String::new(),
-        "The PR is left open for a human to update and merge; AI Agent stays at Code Review."
-            .to_string(),
+        "Re-queueing it alone (AI Agent = Queued) will not retry it: the attempt counter is not cleared by re-queueing or by a successful run.".to_string(),
+        "To retry it, raise the action's `limits.max_attempts_per_key`, or reset this key's counter once CLAUDE-238 lands.".to_string(),
     ]
     .join("\n")
 }
@@ -1842,7 +2183,7 @@ fn automerge_not_mergeable_comment(pr_url: &str) -> String {
 /// field from advancing off Working; a set_field failure propagates and marks
 /// the job's finalize as failed.
 fn comment_then_field(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     src: &YoutrackSource,
     key: &str,
     body: &str,
@@ -1902,8 +2243,13 @@ fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> Str
             "The committed branch is PRESERVED on the daemon host at: `{}` (push it manually or re-run after the PR path is fixed).",
             p.display()
         ),
+        WorkLocation::UncommittedChanges { workdir, paths } => format!(
+            "The work was never committed and is PRESERVED on the daemon host at: `{}` ({} changed path(s), uncommitted). It is not on the remote under any branch; commit and push it manually, or re-run after the PR path is fixed.",
+            workdir.display(),
+            paths.len()
+        ),
         WorkLocation::RemoteBranch { branch, sha } => format!(
-            "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before the PR call failed, so nothing was lost. Re-queue this issue (set AI Agent = Queued) once the PR path is fixed; the runner reconciles the existing remote branch and opens the PR without re-pushing. The workdir on the daemon host is not kept, because the forge holds the same commits."
+            "The work is SAFE on the remote: branch `{branch}` at `{sha}` was pushed before the PR call failed, so nothing was lost. No PR was ever opened here, so nothing was recorded for this issue (CLAUDE-275): re-queuing it (set AI Agent = Queued) clones the default branch again and opens a fresh PR, it does NOT resume this branch by name. Push the same branch again from a fresh clone, or open the PR for it by hand, if this exact work should not be redone. The workdir on the daemon host is not kept, because the forge holds the same commits."
         ),
         WorkLocation::None => "No local commits were found to preserve.".to_string(),
     };
@@ -1964,7 +2310,7 @@ fn failure_comment(r: &ClaudeResult) -> String {
 async fn record_outcome(
     loaded: &crate::action::LoadedAction,
     paths: &Paths,
-    pool: &SqlitePool,
+    pool: &DbPool,
     run_id: i64,
     outcome: &ProcessedJob,
 ) -> Result<()> {
@@ -2010,142 +2356,61 @@ async fn record_outcome(
 }
 
 fn cleanup_workdir(workdir: &Path) {
-    if workdir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(workdir) {
-            warn!(workdir = %workdir.display(), error = %e, "workdir cleanup failed (continuing)");
-        }
+    crate::workdir::force_remove(workdir);
+}
+
+/// CLAUDE-105 / CLAUDE-281 / CLAUDE-284: true when [`crate::workdir::local_only_work`]
+/// finds anything a delete would destroy: a local branch tip the remote does
+/// not have under its own name, a dirty tracked/untracked tree, or a stash.
+/// Any git or network failure errs toward `true`: preserving costs disk, a
+/// wrong delete costs the run. Used by both `cleanup_or_preserve`'s per-job
+/// callers and `crate::gc`'s age-based sweep, so the two decisions agree.
+pub(crate) fn has_local_only_work(workdir: &Path) -> bool {
+    match crate::workdir::local_only_work(workdir) {
+        Ok(w) => !w.is_clean(),
+        Err(_) => true,
     }
 }
 
-/// CLAUDE-193: one local branch and whether its tip is on the live remote.
-struct BranchTip {
-    branch: String,
-    sha: String,
-    on_remote: bool,
-}
-
-/// CLAUDE-193: every local branch tip classified against the live remote, plus
-/// the remote's default branch (its `HEAD` symref) when advertised.
-struct RepoTips {
-    tips: Vec<BranchTip>,
-    default_branch: Option<String>,
-}
-
-/// CLAUDE-193: the single `git ls-remote origin` code path, shared by
-/// [`has_unpushed_commits`] (preserve-or-delete) and [`work_location`] (what the
-/// PR-failure comment tells a human). `None` means a git or network failure, on
-/// which both callers err toward preserving.
-fn branch_tips(workdir: &Path) -> Option<RepoTips> {
-    fn git(workdir: &Path, args: &[&str]) -> Option<String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(workdir)
-            .args(args)
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
-    // Local branch tips. No branches means nothing local to lose, and no remote
-    // query is needed.
-    let branches = git(
-        workdir,
-        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
-    )?;
-    let branches: Vec<&str> = branches
-        .lines()
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .collect();
-    if branches.is_empty() {
-        return Some(RepoTips {
-            tips: Vec::new(),
-            default_branch: None,
-        });
-    }
-
-    // The live remote's advertised SHAs, plus the `ref: refs/heads/<x>\tHEAD`
-    // symref line that names the default branch.
-    let remote = git(workdir, &["ls-remote", "--symref", "origin"])?;
-    let mut remote_shas: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut default_branch = None;
-    for line in remote.lines() {
-        let mut fields = line.split_whitespace();
-        match (fields.next(), fields.next(), fields.next()) {
-            (Some("ref:"), Some(target), Some("HEAD")) => {
-                default_branch = target.strip_prefix("refs/heads/").map(str::to_string);
-            }
-            (Some(sha), Some(_), None) => {
-                remote_shas.insert(sha);
-            }
-            _ => {}
-        }
-    }
-
-    let mut tips = Vec::new();
-    for branch in branches {
-        let sha = git(workdir, &["rev-parse", branch])?.trim().to_string();
-        let on_remote = remote_shas.contains(sha.as_str());
-        tips.push(BranchTip {
-            branch: branch.to_string(),
-            sha,
-            on_remote,
-        });
-    }
-    Some(RepoTips {
-        tips,
-        default_branch,
-    })
-}
-
-/// CLAUDE-105: true when any local branch tip in `workdir` is absent from the
-/// live remote as reported by `git ls-remote origin` - exactly the work
-/// deleting the directory would destroy. This asks the source of truth rather
-/// than trusting remote-tracking refs: a `--depth` clone is `--single-branch`,
-/// so its only tracking ref is `origin/main` and the old `--not --remotes`
-/// heuristic false-positived on every non-`main` branch (CLAUDE-102's intent
-/// was to save unpushed work, not preserve every feature-branch run). Any git
-/// or network failure errs toward `true`: preserving costs disk, a wrong delete
-/// costs the run.
-pub(crate) fn has_unpushed_commits(workdir: &Path) -> bool {
-    match branch_tips(workdir) {
-        Some(r) => r.tips.iter().any(|t| !t.on_remote),
-        None => true,
-    }
-}
-
-/// CLAUDE-193: where a failed-PR run's work actually is, for the comment a human
-/// reads. Computed from the same [`branch_tips`] query that decides
-/// preserve-or-delete, so the comment can never contradict
-/// [`cleanup_or_preserve`].
+/// CLAUDE-193 / CLAUDE-281: where a failed-PR run's work actually is, for the
+/// comment a human reads. Computed from the same
+/// [`crate::workdir::local_only_work`] query that decides preserve-or-delete,
+/// so the comment can never contradict [`cleanup_or_preserve`].
 enum WorkLocation {
-    /// Unpushed commits exist, so the workdir is kept on the daemon host.
+    /// Unpushed commits or a stash exist, so the workdir is kept on the
+    /// daemon host.
     PreservedWorkdir(PathBuf),
-    /// Every local tip is on the remote: the push landed and only the PR call
-    /// failed, so the work is safe on the forge under this branch.
+    /// A dirty working tree (tracked or untracked changes) with no local
+    /// commits ahead: still only on the daemon host, but never pushed as a
+    /// branch.
+    UncommittedChanges {
+        workdir: PathBuf,
+        paths: Vec<String>,
+    },
+    /// Every local tip is on the remote under its own name: the push landed
+    /// and only the PR call failed, so the work is safe on the forge under
+    /// this branch.
     RemoteBranch { branch: String, sha: String },
-    /// Nothing local beyond the remote's default branch.
+    /// Nothing local beyond the remote's default branch, clean working tree.
     None,
 }
 
 fn work_location(workdir: &Path) -> WorkLocation {
-    // A failed query errs toward preserve, matching `has_unpushed_commits`.
-    let Some(RepoTips {
-        tips,
-        default_branch,
-    }) = branch_tips(workdir)
-    else {
-        return WorkLocation::PreservedWorkdir(workdir.to_path_buf());
+    // A failed query errs toward preserve, matching `has_local_only_work`.
+    let work = match crate::workdir::local_only_work(workdir) {
+        Ok(w) => w,
+        Err(_) => return WorkLocation::PreservedWorkdir(workdir.to_path_buf()),
     };
-    if tips.iter().any(|t| !t.on_remote) {
+    if !work.unpushed_branches.is_empty() || !work.dirty.stashes.is_empty() {
         return WorkLocation::PreservedWorkdir(workdir.to_path_buf());
     }
-    match tips
-        .into_iter()
-        .find(|t| default_branch.as_deref() != Some(t.branch.as_str()))
-    {
+    if !work.dirty.paths.is_empty() {
+        return WorkLocation::UncommittedChanges {
+            workdir: workdir.to_path_buf(),
+            paths: work.dirty.paths,
+        };
+    }
+    match work.remote_branch {
         Some(t) => WorkLocation::RemoteBranch {
             branch: t.branch,
             sha: t.sha,
@@ -2154,53 +2419,15 @@ fn work_location(workdir: &Path) -> WorkLocation {
     }
 }
 
-/// CLAUDE-105: remove gitignored build artifacts from a workdir about to be
-/// preserved. `git clean -fdX` deletes only ignored files and directories; a
-/// failure is logged and tolerated (the directory is still preserved).
-fn prune_ignored_artifacts(workdir: &Path) {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(workdir)
-        .args(["clean", "-fdX"])
-        .output();
-    match out {
-        Err(e) => {
-            warn!(workdir = %workdir.display(), error = %e, "pruning gitignored artifacts failed (preserving anyway)");
-        }
-        Ok(o) if !o.status.success() => {
-            warn!(
-                workdir = %workdir.display(),
-                stderr = %String::from_utf8_lossy(&o.stderr),
-                "git clean -fdX failed (preserving anyway)"
-            );
-        }
-        Ok(_) => {}
-    }
-}
-
-/// CLAUDE-102: delete the workdir unless it holds unpushed commits. The
-/// preserve branch is the data-loss guard from the CLAUDE-101 incident, where
-/// a failed `create_pr` plus an unconditional cleanup destroyed the run's only
-/// copy of the committed work.
+/// CLAUDE-102 / CLAUDE-281: delete the workdir unless
+/// [`crate::workdir::local_only_work`] finds unpushed commits, a dirty tree,
+/// or a stash. The preserve branch is the data-loss guard from the CLAUDE-101
+/// incident, where a failed `create_pr` plus an unconditional cleanup
+/// destroyed the run's only copy of the committed work; CLAUDE-281 extended it
+/// past committed-but-unpushed branches to the uncommitted and stashed work
+/// the old branch-only check never looked at.
 fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
-    if !workdir.exists() {
-        return;
-    }
-    if has_unpushed_commits(workdir) {
-        // CLAUDE-105: the guard only protects committed work in `.git`, so drop
-        // regenerable gitignored output (`target/`, `node_modules/`, ...) before
-        // keeping the directory. `-X` touches only ignored files, leaving source,
-        // `.git`, unpushed commits, and uncommitted tracked changes intact.
-        prune_ignored_artifacts(workdir);
-        warn!(
-            action = %action,
-            key = %key,
-            workdir = %workdir.display(),
-            "workdir preserved: it holds unpushed commits and no PR was opened"
-        );
-    } else {
-        cleanup_workdir(workdir);
-    }
+    crate::workdir::cleanup_or_preserve(workdir, action, key);
 }
 
 /// CLAUDE-102: move a leftover (preserved) workdir out of the way of a fresh
@@ -2240,12 +2467,344 @@ fn preserve_aside(workdir: &Path) {
 mod tests {
     use super::*;
     use crate::action::PrStrategy;
-    use crate::db::MIGRATOR;
     use crate::provider::cli::testutil::StubRunner;
     use crate::provider::{CliBackend, IssueLink, LinkDirection};
     use serde_json::Value;
-    use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
+
+    /// CLAUDE-252: the pre step clones the URL the FORGE resolves from its key
+    /// store, not the unauthenticated one the YouTrack VCS integration reports.
+    /// A container has no git credential of its own, so the plain URL failed
+    /// every job with `could not read Username`.
+    #[test]
+    fn the_clone_url_comes_from_the_forge_key_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys.json");
+        std::fs::write(
+            &keys,
+            r#"{"hosts":{"dev.a8n.run":{"name":"bot","token":"tok-123","type":"Application"}}}"#,
+        )
+        .unwrap();
+        let backend = CliBackend::new(Arc::new(StubRunner::new())).with_keys_path(&keys);
+
+        let url = clone_url_for(&backend, &job());
+        assert_eq!(
+            url, "https://oauth2:tok-123@dev.a8n.run/contoso/claude-run.git",
+            "the scheme must be stripped from repo_host before the key lookup"
+        );
+    }
+
+    /// A host the key store does not know falls back to the plain URL, so a host
+    /// install authenticating through a credential helper keeps working.
+    #[test]
+    fn an_unknown_host_falls_back_to_the_unauthenticated_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
+        let backend = CliBackend::new(Arc::new(StubRunner::new())).with_keys_path(&keys);
+
+        let j = job();
+        assert_eq!(clone_url_for(&backend, &j), j.clone_url);
+    }
+
+    /// The token must never reach the agent: `{{clone_url}}` renders the job's
+    /// own unauthenticated URL, which the authenticated one does not replace.
+    #[test]
+    fn the_prompt_never_renders_an_authenticated_url() {
+        let j = job();
+        let rendered = render_prompt_template("Repo: {{clone_url}}", &j, Path::new("/w"), "", None);
+        assert!(rendered.contains("https://dev.a8n.run/contoso/claude-run.git"));
+        assert!(!rendered.contains("oauth2:"), "{rendered}");
+    }
+
+    /// CLAUDE-269 acceptance criterion 3: a job whose invocation hits the
+    /// authentication failure spends no attempt against
+    /// `max_attempts_per_key` and runs no finalize, through the native
+    /// YouTrack `process_job` pipeline (not merely the generic scripted one in
+    /// `job.rs`). The pre steps (field/state writes, clone) run for real
+    /// against a stub `yt` and a local git repo, so the transient outcome is
+    /// reached exactly as production does, then claude's stub reports the
+    /// structured auth failure.
+    #[tokio::test]
+    async fn process_job_hitting_auth_failure_is_transient_and_skips_finalize() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A real local repo to clone, so `run_pre`'s git clone succeeds with no
+        // network. `clone_url_for` falls back to the job's own (unauthenticated)
+        // URL because the stub CliBackend has no forge key store configured.
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t.example"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(Command::new("git")
+                .args(&args)
+                .current_dir(&origin)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(&origin)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(&origin)
+            .status()
+            .unwrap()
+            .success());
+
+        let stub = tmp.path().join("claude-stub.sh");
+        crate::testutil::write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"assistant\",\"error\":\"authentication_failed\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"OAuth session expired\"}]}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":true,\"error\":\"authentication_failed\"}'\n\
+             exit 1\n",
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("yt", &["issue", "get-field", "MK-16", "AI Agent"], "Queued")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    "",
+                )
+                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], ""),
+        );
+        let backend = CliBackend::new(runner.clone());
+
+        let mut j = job();
+        j.clone_url = format!("file://{}", origin.display());
+        let mut s = src();
+        s.dependencies.enabled = false;
+
+        let pool = mem_pool().await;
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+        };
+        let cancel = CancellationToken::new();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            &pool,
+            &claude,
+            &backend,
+            &backend,
+            &s,
+            &limits,
+            &cancel,
+            &crate::pause::RunPause::never(),
+            &spend,
+            &j,
+            PrStrategy::Branch,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, ProcessedJob::Transient { .. }),
+            "an authentication failure must finalize as transient, got {outcome:?}"
+        );
+        assert_eq!(
+            state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
+            0,
+            "no attempt is spent on a transient auth failure"
+        );
+        // No `set-field` past `Working` and no comment were registered on the
+        // stub, so a call to either would have failed with "no canned
+        // response"; reaching this point proves finalize never ran.
+    }
+
+    /// CLAUDE-301 acceptance criterion 1: a queued issue whose key is at the
+    /// cap gets exactly one comment naming the attempt count and the cap, and
+    /// its AI Agent field moves to the configured Needs Review label, through
+    /// the full `process_job` pipeline (the cap check runs before any other
+    /// step, so no workdir or clone is needed).
+    #[tokio::test]
+    async fn process_job_at_cap_comments_and_sets_needs_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = cap_reached_comment(3, 3);
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("yt", &["issue", "comment", "MK-16", &body], "")
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+
+        let j = job();
+        let s = src();
+        let pool = mem_pool().await;
+        for _ in 0..3 {
+            state::attempts_increment(&pool, "yt", &j.key)
+                .await
+                .unwrap();
+        }
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+        };
+        let claude = ClaudeInvoker::new(None);
+        let cancel = CancellationToken::new();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            &pool,
+            &claude,
+            &backend,
+            &backend,
+            &s,
+            &limits,
+            &cancel,
+            &crate::pause::RunPause::never(),
+            &spend,
+            &j,
+            PrStrategy::Branch,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&outcome, ProcessedJob::CapHit { key } if key == "MK-16"),
+            "{outcome:?}"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("yt issue comment"))
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+    }
+
+    /// CLAUDE-301 acceptance criterion 2: a failed comment or field write at
+    /// the cap still returns `CapHit` (the banner must keep showing the key)
+    /// rather than propagating the write error out of `process_job`.
+    #[tokio::test]
+    async fn process_job_at_cap_still_reports_cap_hit_when_writes_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = cap_reached_comment(3, 3);
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail("yt", &["issue", "comment", "MK-16", &body], 1, "boom")
+                .fail(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    1,
+                    "boom",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+
+        let j = job();
+        let s = src();
+        let pool = mem_pool().await;
+        for _ in 0..3 {
+            state::attempts_increment(&pool, "yt", &j.key)
+                .await
+                .unwrap();
+        }
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+        };
+        let claude = ClaudeInvoker::new(None);
+        let cancel = CancellationToken::new();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            &pool,
+            &claude,
+            &backend,
+            &backend,
+            &s,
+            &limits,
+            &cancel,
+            &crate::pause::RunPause::never(),
+            &spend,
+            &j,
+            PrStrategy::Branch,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(&outcome, ProcessedJob::CapHit { key } if key == "MK-16"),
+            "a failed comment/field write must not turn the cap hit into an error, got {outcome:?}"
+        );
+    }
 
     fn job() -> YoutrackJob {
         YoutrackJob {
@@ -2266,10 +2825,12 @@ mod tests {
             ok: true,
             summary: "did the work".into(),
             cost: 0.5,
+            usage: Default::default(),
             raw: Value::Null,
             error: String::new(),
             transient: false,
             timed_out: false,
+            login_required: false,
         }
     }
 
@@ -2278,10 +2839,12 @@ mod tests {
             ok: false,
             summary: "partial work before kill".into(),
             cost: 0.3,
+            usage: Default::default(),
             raw: Value::Null,
             error: "claude exited 124, see stream.jsonl".into(),
             transient: false,
             timed_out: true,
+            login_required: false,
         }
     }
 
@@ -2294,10 +2857,12 @@ mod tests {
             ok: false,
             summary: "API Error: 529 Overloaded.".into(),
             cost: 0.01,
+            usage: Default::default(),
             raw: serde_json::json!({"type":"result","is_error":true,"api_error_status":"529"}),
             error: "claude exited 1, see stream.jsonl".into(),
             transient: true,
             timed_out: false,
+            login_required: false,
         };
         let body = failure_comment(&r);
         assert!(body.starts_with("Claude AI agent run FAILED (claude exited 1, see stream.jsonl):"));
@@ -2318,12 +2883,60 @@ mod tests {
         assert!(!body.contains("<details>"));
     }
 
+    /// CLAUDE-304: a run with no `compact_boundary` event in its stream log
+    /// leaves the outcome comment untouched.
+    #[test]
+    fn append_compaction_note_leaves_body_unchanged_without_a_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(&log, "{\"type\":\"system\",\"subtype\":\"init\"}\n").unwrap();
+        let body = append_compaction_note("The PR is ready.", Some(&log), "MK-16");
+        assert_eq!(body, "The PR is ready.");
+    }
+
+    /// CLAUDE-304: an earlier audit run's shape - a `compact_boundary` event in the run's
+    /// stream log - appends the one-line warning to whatever outcome comment
+    /// (success or needs-review) it is given.
+    #[test]
+    fn append_compaction_note_appends_the_line_when_a_boundary_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n",
+        )
+        .unwrap();
+        let body = append_compaction_note("The PR is ready.", Some(&log), "MK-16");
+        assert_eq!(
+            body,
+            "The PR is ready.\n\nContext was compacted 1 time(s) during this run; check the issues it created."
+        );
+    }
+
+    /// CLAUDE-304: a `None` stream log (claude never ran) leaves the comment
+    /// unchanged rather than erroring.
+    #[test]
+    fn append_compaction_note_leaves_body_unchanged_with_no_stream_log() {
+        let body = append_compaction_note("Parked for review.", None, "MK-16");
+        assert_eq!(body, "Parked for review.");
+    }
+
+    /// CLAUDE-304: an unreadable stream log must not stop the outcome comment
+    /// from posting; it just posts without the compaction line.
+    #[test]
+    fn append_compaction_note_leaves_body_unchanged_on_a_read_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.jsonl");
+        let body = append_compaction_note("The PR is ready.", Some(&missing), "MK-16");
+        assert_eq!(body, "The PR is ready.");
+    }
+
     #[test]
     fn build_prompt_default_substitutes_job_fields() {
         // CLAUDE-125 regression: the built-in default renders every placeholder
         // and leaves no `{{...}}` behind, preserving the CLAUDE-24 contract lines.
         let wd = std::path::Path::new("/tmp/wd");
-        let p = build_prompt(&src(), &job(), wd);
+        let p = build_prompt(&src(), &job(), wd, None);
         assert!(p.starts_with(
             "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md."
         ));
@@ -2352,18 +2965,141 @@ mod tests {
         // placeholders substituted.
         let mut s = src();
         s.prompt = Some("Do {{key}}: {{summary}} in {{workdir}}".to_string());
-        let p = build_prompt(&s, &job(), std::path::Path::new("/tmp/wd"));
+        let p = build_prompt(&s, &job(), std::path::Path::new("/tmp/wd"), None);
         assert_eq!(p, "Do MK-16: Do the thing in /tmp/wd");
         assert!(!p.contains("You are working a YouTrack issue"));
     }
 
+    /// Resolution order: a YAML override beats the preset; without one the
+    /// preset's built-in text is the template.
+    #[test]
+    fn build_prompt_override_beats_preset() {
+        let mut s = src();
+        assert_eq!(prompt_template(&s), default_youtrack_prompt());
+
+        s.prompt_preset = PromptPreset::Audit;
+        assert_eq!(
+            prompt_template(&s),
+            super::super::audit_prompt::default_audit_prompt()
+        );
+        assert!(prompt_template(&s).starts_with("You are executing a scheduled AUDIT run"));
+
+        s.prompt = Some("Do {{key}}".to_string());
+        assert_eq!(prompt_template(&s), "Do {{key}}");
+        assert_eq!(
+            build_prompt(&s, &job(), std::path::Path::new("/tmp/wd"), None),
+            "Do MK-16"
+        );
+    }
+
+    #[test]
+    fn preset_prompt_maps_each_preset() {
+        assert_eq!(
+            preset_prompt(PromptPreset::Default),
+            default_youtrack_prompt()
+        );
+        assert!(preset_prompt(PromptPreset::Audit)
+            .starts_with("You are executing a scheduled AUDIT run"));
+    }
+
+    fn audit_src() -> YoutrackSource {
+        YoutrackSource {
+            prompt_preset: PromptPreset::Audit,
+            write_projects: vec!["ALPHA".into(), "GAMMA".into()],
+            ..YoutrackSource::default()
+        }
+    }
+
+    #[test]
+    fn audit_preset_template_carries_the_runner_placeholders() {
+        let t = preset_prompt(PromptPreset::Audit);
+        for placeholder in [
+            "{{key}}",
+            "{{summary}}",
+            "{{clone_url}}",
+            "{{workdir}}",
+            "{{needs_review_marker}}",
+            "{{skip_attempt_marker}}",
+            "{{write_projects}}",
+            "{{existing_branch}}",
+        ] {
+            assert!(t.contains(placeholder), "audit preset lacks {placeholder}");
+        }
+    }
+
+    #[test]
+    fn audit_preset_renders_every_placeholder() {
+        let resume = PrResume {
+            branch: "audit/pms-ui-2026-09-14".into(),
+            pr_url: "https://dev.a8n.run/contoso/audits/pulls/9".into(),
+        };
+        let wd = std::path::Path::new("/tmp/wd");
+        for r in [None, Some(&resume)] {
+            let p = build_prompt(&audit_src(), &job(), wd, r);
+            assert!(!p.contains("{{"), "unresolved placeholder:\n{p}");
+            assert!(p.contains("Issue: MK-16: Do the thing"), "{p}");
+            assert!(
+                p.contains("Repo: https://dev.a8n.run/contoso/claude-run.git"),
+                "{p}"
+            );
+            assert!(p.contains("ONLY in these projects: ALPHA, GAMMA"), "{p}");
+            assert!(p.contains("/tmp/wd/.claude-run-needs-review"), "{p}");
+            assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"), "{p}");
+            assert!(p.contains("#MK-16"), "{p}");
+        }
+        let resumed = build_prompt(&audit_src(), &job(), wd, Some(&resume));
+        assert!(resumed.contains("audit/pms-ui-2026-09-14"), "{resumed}");
+        assert!(
+            resumed.contains("https://dev.a8n.run/contoso/audits/pulls/9"),
+            "{resumed}"
+        );
+    }
+
+    #[test]
+    fn audit_preset_states_its_permits_and_bans() {
+        let p = preset_prompt(PromptPreset::Audit);
+        assert!(p.is_ascii(), "the audit preset must be ASCII only");
+        for needle in [
+            "Tracker writes. You may perform EXACTLY these, and nothing else:",
+            "`Queued` and `Needs Review` are the only two `AI Agent` values you may set",
+            "Every other tracker write is forbidden, in particular:",
+            "No `AI Agent` or `State` change on any issue you did not create during this run",
+            "No `yt issue set-state` anywhere",
+            "No summary edit on any issue.",
+            "No assignee change on any issue.",
+            "No `yt issue delete`, anywhere.",
+            "No pull request URL in any comment, description, or issue body.",
+            "No write to the anchor issue from a per-target run.",
+            "Never run `git checkout main` or `git switch main`",
+            "HARD RULE on long commands: run everything in the FOREGROUND",
+        ] {
+            assert!(p.contains(needle), "audit preset lacks: {needle}");
+        }
+    }
+
     #[test]
     fn render_substitutes_all_documented_placeholders() {
-        let t = "{{key}}|{{summary}}|{{clone_url}}|{{workdir}}|{{needs_review_marker}}|{{skip_attempt_marker}}|{{no_code_marker}}|{{write_projects}}";
-        let p = render_prompt_template(t, &job(), std::path::Path::new("/wd"), "MK");
+        let t = "{{key}}|{{summary}}|{{clone_url}}|{{workdir}}|{{needs_review_marker}}|{{skip_attempt_marker}}|{{no_code_marker}}|{{write_projects}}|{{existing_pr_url}}|{{existing_branch}}";
+        let p = render_prompt_template(t, &job(), std::path::Path::new("/wd"), "MK", None);
         assert_eq!(
             p,
-            "MK-16|Do the thing|https://dev.a8n.run/contoso/claude-run.git|/wd|.claude-run-needs-review|.claude-run-skip-attempt|.claude-run-no-code-change|MK"
+            "MK-16|Do the thing|https://dev.a8n.run/contoso/claude-run.git|/wd|.claude-run-needs-review|.claude-run-skip-attempt|.claude-run-no-code-change|MK||"
+        );
+    }
+
+    #[test]
+    fn render_substitutes_resume_placeholders_when_set() {
+        // CLAUDE-275: a resumed job's placeholders carry the recorded PR's URL
+        // and branch instead of rendering empty.
+        let t = "{{existing_pr_url}}|{{existing_branch}}";
+        let resume = PrResume {
+            branch: "fix/CLAUDE-275".into(),
+            pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+        };
+        let p = render_prompt_template(t, &job(), std::path::Path::new("/wd"), "MK", Some(&resume));
+        assert_eq!(
+            p,
+            "https://dev.a8n.run/contoso/claude-run/pulls/7|fix/CLAUDE-275"
         );
     }
 
@@ -2376,6 +3112,7 @@ mod tests {
             &job(),
             std::path::Path::new("/wd"),
             "MK",
+            None,
         );
         assert_eq!(p, "MK-16 {{bogus}} {{oops");
     }
@@ -2400,7 +3137,7 @@ mod tests {
     #[test]
     fn build_prompt_default_permits_bounded_tracker_writes() {
         let wd = std::path::Path::new("/tmp/wd");
-        let p = build_prompt(&src(), &job(), wd);
+        let p = build_prompt(&src(), &job(), wd, None);
 
         // Permitted: read across projects, create, then update/comment/link what
         // this run created.
@@ -2414,12 +3151,12 @@ mod tests {
         // The create scope renders from `{{write_projects}}`, defaulting to the
         // triggering issue's own project.
         assert!(
-            p.contains("ONLY in these projects: MK."),
+            p.contains("create it ONLY in these projects: MK,"),
             "create scope must render the project list: {p}"
         );
         // The single permitted write to the triggering issue.
         assert!(
-            p.contains("yt issue link <new-issue> \"subtask of\" MK-16"),
+            p.contains("yt issue link <new-issue> MK-16 --type \"subtask of\""),
             "{p}"
         );
 
@@ -2448,7 +3185,7 @@ mod tests {
     /// path rendered, and is fenced off from the blocker path.
     #[test]
     fn build_prompt_default_documents_the_no_code_path() {
-        let p = build_prompt(&src(), &job(), std::path::Path::new("/tmp/wd"));
+        let p = build_prompt(&src(), &job(), std::path::Path::new("/tmp/wd"), None);
         assert!(p.contains("/tmp/wd/.claude-run-no-code-change"), "{p}");
         assert!(
             p.contains("NEVER an escape hatch for a code task you could not finish"),
@@ -2477,6 +3214,7 @@ mod tests {
         let with_num = PullRequest {
             number: Some(7),
             url: "raw line".into(),
+            head_branch: Some("fix/x".into()),
         };
         assert_eq!(
             pr_url(&j, &with_num),
@@ -2485,6 +3223,7 @@ mod tests {
         let no_num = PullRequest {
             number: None,
             url: "fallback line".into(),
+            head_branch: None,
         };
         assert_eq!(pr_url(&j, &no_num), "fallback line");
         // CLAUDE-50: a real HTTP URL (the GitHub backend's html_url) is used
@@ -2492,6 +3231,7 @@ mod tests {
         let gh = PullRequest {
             number: Some(11),
             url: "https://github.com/octo/widget/pull/11".into(),
+            head_branch: Some("fix/x".into()),
         };
         assert_eq!(pr_url(&j, &gh), "https://github.com/octo/widget/pull/11");
     }
@@ -2518,7 +3258,7 @@ mod tests {
                 "[]",
             );
         let backend = CliBackend::new(Arc::new(runner));
-        let (jobs, events) = gather(&backend, &src().query, None).unwrap();
+        let Gathered { jobs, events, .. } = gather(&backend, &src().query, None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, "MK-16");
         assert_eq!(jobs[0].summary, "a");
@@ -2560,7 +3300,11 @@ mod tests {
                 "unrecognized subcommand",
             );
         let backend = CliBackend::new(Arc::new(runner));
-        let (jobs, events) = gather(&backend, &src().query, None).unwrap();
+        let Gathered {
+            jobs,
+            events,
+            candidate_keys,
+        } = gather(&backend, &src().query, None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, "MK-16");
         // CLAUDE-147: the probe failure is recorded as a warn event (not the
@@ -2569,6 +3313,13 @@ mod tests {
         assert_eq!(events[0].level, "warn");
         assert_eq!(events[0].context.as_deref(), Some("ZZ"));
         assert!(events[0].message.contains("VCS probe failed"));
+        // CLAUDE-225: the candidate set is what the QUERY matched, so a project
+        // skipped this poll keeps its dependency-gate row instead of having it
+        // pruned (and re-commented) every time a probe or a grant is flaky.
+        assert_eq!(
+            candidate_keys,
+            vec!["MK-16".to_string(), "ZZ-1".to_string()]
+        );
     }
 
     /// CLAUDE-194: a [`RepoAccess`] double that records every probe and either
@@ -2627,7 +3378,7 @@ mod tests {
         // per repo per poll, not once per issue.
         let backend = CliBackend::new(Arc::new(access_runner()));
         let access = StubAccess::allow();
-        let (jobs, events) = gather(&backend, &src().query, Some(&access)).unwrap();
+        let Gathered { jobs, events, .. } = gather(&backend, &src().query, Some(&access)).unwrap();
         assert_eq!(jobs.len(), 2);
         // CLAUDE-216: a pass emits only the recovery marker, once per repo. It is
         // dropped before recording unless it clears an open failure
@@ -2654,7 +3405,7 @@ mod tests {
         let runner = Arc::new(access_runner());
         let backend = CliBackend::new(runner.clone());
         let denied = StubAccess::deny("forge token cannot read it (404)");
-        let (jobs, events) = gather(&backend, &src().query, Some(&denied)).unwrap();
+        let Gathered { jobs, events, .. } = gather(&backend, &src().query, Some(&denied)).unwrap();
         assert!(jobs.is_empty(), "{jobs:?}");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, "warn");
@@ -2689,7 +3440,7 @@ mod tests {
         // The permission grant lands; the very next poll gathers the same issues
         // with no field change in between.
         let granted = StubAccess::allow();
-        let (jobs, events) = gather(&backend, &src().query, Some(&granted)).unwrap();
+        let Gathered { jobs, events, .. } = gather(&backend, &src().query, Some(&granted)).unwrap();
         assert_eq!(jobs.len(), 2);
         // CLAUDE-216: and the poll that recovers records the marker that clears
         // the dashboard's access banner for this repo.
@@ -2866,13 +3617,17 @@ mod tests {
                     "",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        // An empty key store: `clone_url` must resolve nothing here rather than
+        // read the developer's real forgejo-cli credentials.
+        let keys = dir.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
+        let backend = CliBackend::new(runner.clone()).with_keys_path(&keys);
         let mut s = src();
         s.assignee = Some("octocat".into());
         let mut j = job();
         // Bogus local path: `git clone` fails immediately with no network.
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let _ = run_pre(&backend, &s, &j, &wd);
+        let _ = run_pre(&backend, &backend, &s, &j, &wd, None);
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls
@@ -2897,12 +3652,16 @@ mod tests {
                 )
                 .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], ""),
         );
-        let backend = CliBackend::new(runner.clone());
+        // An empty key store: `clone_url` must resolve nothing here rather than
+        // read the developer's real forgejo-cli credentials.
+        let keys = dir.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
+        let backend = CliBackend::new(runner.clone()).with_keys_path(&keys);
         let s = src(); // assignee defaults to None
         assert!(s.assignee.is_none());
         let mut j = job();
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let _ = run_pre(&backend, &s, &j, &wd);
+        let _ = run_pre(&backend, &backend, &s, &j, &wd, None);
         let calls = runner.calls.lock().unwrap();
         assert!(!calls.iter().any(|c| c.contains("--assignee")), "{calls:?}");
     }
@@ -2928,15 +3687,64 @@ mod tests {
                     "no such user",
                 ),
         );
-        let backend = CliBackend::new(runner.clone());
+        // An empty key store: `clone_url` must resolve nothing here rather than
+        // read the developer's real forgejo-cli credentials.
+        let keys = dir.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
+        let backend = CliBackend::new(runner.clone()).with_keys_path(&keys);
         let mut s = src();
         s.assignee = Some("octocat".into());
         let mut j = job();
         j.clone_url = "/nonexistent/claude-run-131.git".into();
-        let err = run_pre(&backend, &s, &j, &wd).unwrap_err();
+        let err = run_pre(&backend, &backend, &s, &j, &wd, None).unwrap_err();
         assert!(err.starts_with("set Assignee=octocat:"), "{err}");
         // The clone is never attempted: the workdir stays absent.
         assert!(!wd.exists(), "clone must not run after an assignee failure");
+    }
+
+    /// CLAUDE-275: with a resume branch set, `run_pre` clones THAT branch rather
+    /// than the repo's default, so the agent lands on the recorded PR's work.
+    #[test]
+    fn run_pre_clones_the_resume_branch_when_set() {
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init"]);
+        set_identity(&origin);
+        std::fs::write(origin.join("f.txt"), "main").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-m", "feat: base"]);
+        git_in(&origin, &["checkout", "-b", "fix/existing"]);
+        std::fs::write(origin.join("f.txt"), "fix").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-m", "fix: existing work"]);
+
+        let wd = base.path().join("clone");
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
+                    "",
+                )
+                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], ""),
+        );
+        let keys = base.path().join("keys.json");
+        std::fs::write(&keys, r#"{"hosts":{}}"#).unwrap();
+        let backend = CliBackend::new(runner.clone()).with_keys_path(&keys);
+        let mut j = job();
+        j.clone_url = origin.to_str().unwrap().to_string();
+
+        run_pre(&backend, &backend, &src(), &j, &wd, Some("fix/existing")).unwrap();
+
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&wd)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "fix/existing");
+        assert_eq!(std::fs::read_to_string(wd.join("f.txt")).unwrap(), "fix");
     }
 
     #[test]
@@ -2958,8 +3766,7 @@ mod tests {
             wd,
             &ClaudeResult::synthesized("e", "s"),
             PrStrategy::Branch,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -3000,8 +3807,7 @@ mod tests {
             wd,
             &ok_result(),
             PrStrategy::Branch,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -3062,8 +3868,7 @@ mod tests {
             wd,
             &ok_result(),
             PrStrategy::Branch,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -3099,8 +3904,7 @@ mod tests {
             wd,
             &ok_result(),
             PrStrategy::Branch,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -3193,14 +3997,15 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Branch,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(
             res,
             Finalized::CodeReview {
-                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into()
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -3248,14 +4053,16 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(
             res,
             Finalized::CodeReview {
-                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into()
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                // AGit is branchless: no server branch to record.
+                head_branch: None,
             }
         );
         let calls = runner.calls.lock().unwrap();
@@ -3334,7 +4141,7 @@ mod tests {
     fn workdir_with_unpushed_commits_is_preserved() {
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
-        assert!(has_unpushed_commits(dir.path()));
+        assert!(has_local_only_work(dir.path()));
         cleanup_or_preserve(dir.path(), "YouTrack", "MK-16");
         assert!(dir.path().exists(), "unpushed commits must survive cleanup");
     }
@@ -3352,12 +4159,64 @@ mod tests {
             base.path(),
             &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
         );
-        assert!(!has_unpushed_commits(&clone));
+        assert!(!has_local_only_work(&clone));
         cleanup_or_preserve(&clone, "YouTrack", "MK-16");
         assert!(
             !clone.exists(),
             "a workdir with no unpushed work is removed"
         );
+    }
+
+    #[test]
+    fn dirty_tree_with_no_unpushed_branch_counts_as_local_only_work() {
+        // CLAUDE-284: a workdir on a branch fully pushed under its own name
+        // (so no unpushed commit exists) but with an uncommitted change must
+        // still be reported as local-only work, since `crate::gc`'s age-based
+        // sweep uses exactly this predicate to decide whether a workdir past
+        // its retention window may be deleted.
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        repo_with_commit(&origin);
+        let clone = base.path().join("clone");
+        git_in(
+            base.path(),
+            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        set_identity(&clone);
+        std::fs::write(clone.join("f.txt"), "changed").unwrap();
+
+        assert!(
+            has_local_only_work(&clone),
+            "a dirty tree with no unpushed branch must still count as local-only work"
+        );
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        assert!(clone.exists(), "a dirty tree must survive cleanup");
+    }
+
+    #[test]
+    fn stash_with_no_unpushed_branch_counts_as_local_only_work() {
+        // CLAUDE-284: same shape as the dirty-tree case above, but for a
+        // stash with no corresponding unpushed branch.
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        repo_with_commit(&origin);
+        let clone = base.path().join("clone");
+        git_in(
+            base.path(),
+            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        set_identity(&clone);
+        std::fs::write(clone.join("f.txt"), "changed").unwrap();
+        git_in(&clone, &["stash"]);
+
+        assert!(
+            has_local_only_work(&clone),
+            "a stash with no unpushed branch must still count as local-only work"
+        );
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        assert!(clone.exists(), "a stash must survive cleanup");
     }
 
     // ---- CLAUDE-120: post-clone pre-commit hook install -----------------
@@ -3465,7 +4324,7 @@ mod tests {
         let clone = origin_and_single_branch_clone(base.path());
         git_in(&clone, &["checkout", "-b", "feat/x"]);
         git_in(&clone, &["push", "origin", "feat/x"]);
-        assert!(!has_unpushed_commits(&clone));
+        assert!(!has_local_only_work(&clone));
         cleanup_or_preserve(&clone, "YouTrack", "MK-16");
         assert!(!clone.exists(), "tip present on remote must be deleted");
     }
@@ -3479,7 +4338,7 @@ mod tests {
         std::fs::write(clone.join("new.txt"), "work").unwrap();
         git_in(&clone, &["add", "."]);
         git_in(&clone, &["commit", "-m", "feat: y"]);
-        assert!(has_unpushed_commits(&clone));
+        assert!(has_local_only_work(&clone));
         cleanup_or_preserve(&clone, "YouTrack", "MK-16");
         assert!(clone.exists(), "an unpushed commit must survive cleanup");
     }
@@ -3563,6 +4422,42 @@ mod tests {
     }
 
     #[test]
+    fn pr_failure_comment_names_uncommitted_changes_not_safe_on_remote() {
+        // Run 10822 shape (CLAUDE-281): a brand-new branch left at `main`'s tip
+        // (no commits of its own) with a dirty working tree. The old SHA-
+        // membership check called this branch "on the remote" and the comment
+        // claimed the work was SAFE there; it must now be reported as
+        // uncommitted and preserved, never "safe on the remote".
+        let base = tempfile::tempdir().unwrap();
+        let clone = origin_and_single_branch_clone(base.path());
+        git_in(
+            &clone,
+            &["checkout", "-b", "feat/CLAUDE-269-login-required-gate"],
+        );
+        std::fs::write(clone.join("f.txt"), "edited but never committed").unwrap();
+
+        let loc = work_location(&clone);
+        assert!(
+            matches!(loc, WorkLocation::UncommittedChanges { .. }),
+            "expected UncommittedChanges"
+        );
+
+        let body = pr_failure_comment(&ok_result(), &pr_error(), &loc);
+        assert!(
+            !body.contains("SAFE on the remote"),
+            "an unpushed branch must never read as safe on the remote: {body}"
+        );
+        assert!(
+            body.contains("PRESERVED on the daemon host"),
+            "uncommitted work must point at the preserved workdir: {body}"
+        );
+        assert!(body.contains(&clone.display().to_string()));
+
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        assert!(clone.exists(), "the dirty tree must survive cleanup");
+    }
+
+    #[test]
     fn ls_remote_failure_errs_toward_preserve() {
         // A reachable local branch but an unreachable remote: the live-remote
         // query fails and the guard preserves rather than risk a wrong delete.
@@ -3572,7 +4467,7 @@ mod tests {
             dir.path(),
             &["remote", "add", "origin", "/nonexistent/repo.git"],
         );
-        assert!(has_unpushed_commits(dir.path()));
+        assert!(has_local_only_work(dir.path()));
     }
 
     #[test]
@@ -3670,8 +4565,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Branch,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -3740,8 +4634,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -3843,14 +4736,15 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Branch,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(
             res,
             Finalized::CodeReview {
-                pr_url: "https://github.com/octo/widget/pull/11".into()
+                pr_url: "https://github.com/octo/widget/pull/11".into(),
+                pr_number: Some(11),
+                head_branch: Some("feat/gh".into()),
             }
         );
         let calls = tracker_runner.calls.lock().unwrap();
@@ -3905,8 +4799,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
@@ -3946,8 +4839,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -3979,8 +4871,7 @@ mod tests {
             dir.path(),
             &claude,
             PrStrategy::Branch,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -4021,8 +4912,7 @@ mod tests {
             dir.path(),
             &timed_out_result(),
             PrStrategy::Branch,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::TimedOut);
@@ -4063,8 +4953,7 @@ mod tests {
             dir.path(),
             &timed_out_result(),
             PrStrategy::Branch,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::TimedOut);
@@ -4080,26 +4969,25 @@ mod tests {
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 
-    // ---- CLAUDE-126: automerge finalize branches ------------------------
+    // ---- CLAUDE-278: automerge no longer polls from finalize -------------
 
-    /// A YoutrackSource with automerge enabled and a zero inter-poll interval so
-    /// the tests never sleep.
-    fn src_automerge(wait_seconds: u64) -> YoutrackSource {
+    /// A YoutrackSource with automerge enabled.
+    fn src_automerge() -> YoutrackSource {
         YoutrackSource {
             automerge: crate::action::Automerge {
                 enabled: true,
-                wait_seconds,
-                check_interval_seconds: 0,
+                ..crate::action::Automerge::default()
             },
             ..YoutrackSource::default()
         }
     }
 
     #[test]
-    fn finalize_automerge_merges_on_green_and_sets_done() {
-        // CLAUDE-126: with automerge enabled, a PR whose checks are green and
-        // whose branch is up to date is merged as a merge-commit; the issue is
-        // advanced to State=Done + AI Agent=Done and the outcome is Merged.
+    fn finalize_never_polls_or_merges_even_with_automerge_enabled() {
+        // CLAUDE-278: finalize stops at Code Review exactly as when automerge is
+        // disabled; the CI wait + merge is now driven entirely by the
+        // run-succeeded webhook (see `complete_automerge` and
+        // `crate::web::webhooks`), never by finalize itself.
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(with_one_branch_ahead(
             StubRunner::new()
@@ -4112,19 +5000,48 @@ mod tests {
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
                     "",
-                )
-                .ok(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "status",
-                        "contoso/claude-run#7",
-                        "--json",
-                    ],
-                    r#"{"pr":7,"state":"success","mergeable":true,"merged":false}"#,
-                )
+                ),
+        ));
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src_automerge(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Agit,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                head_branch: None,
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr status")),
+            "finalize must never poll: {calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("pr merge")), "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c.contains("AI Agent Done")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn complete_automerge_merges_and_advances_to_done() {
+        // CLAUDE-278: the shared merge sequence the webhook success handler
+        // calls once it has confirmed a recorded agent PR's checks are green and
+        // mergeable: merge as a merge-commit, State=Done, then comment + AI
+        // Agent=Done as the authoritative last write.
+        let runner = Arc::new(
+            StubRunner::new()
                 .ok(
                     "fj",
                     &[
@@ -4145,26 +5062,19 @@ mod tests {
                     &["issue", "set-field", "MK-16", "AI Agent", "Done"],
                     "",
                 ),
-        ));
+        );
         let backend = CliBackend::new(runner.clone());
-        let res = finalize(
+        complete_automerge(
             &backend,
             &backend,
-            &src_automerge(600),
-            &job(),
-            dir.path(),
-            &ok_result(),
-            PrStrategy::Agit,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
+            &src(),
+            "MK-16",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            7,
+            "https://dev.a8n.run/contoso/claude-run/pulls/7",
         )
         .unwrap();
-        assert_eq!(
-            res,
-            Finalized::Merged {
-                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into()
-            }
-        );
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls.iter().any(|c| c
@@ -4183,168 +5093,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_automerge_leaves_code_review_on_check_failure() {
-        // CLAUDE-126: a CI failure means no merge; the PR stays open and the
-        // issue stays at Code Review (the create-time state).
-        let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(with_one_branch_ahead(
-            StubRunner::new()
-                .ok(
-                    "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
-                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
-                )
-                .ok(
-                    "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
-                    "",
-                )
-                .ok(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "status",
-                        "contoso/claude-run#7",
-                        "--json",
-                    ],
-                    r#"{"pr":7,"state":"failure","mergeable":false,"merged":false}"#,
-                ),
-        ));
-        let backend = CliBackend::new(runner.clone());
-        let res = finalize(
-            &backend,
-            &backend,
-            &src_automerge(600),
-            &job(),
-            dir.path(),
-            &ok_result(),
-            PrStrategy::Agit,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
-        )
-        .unwrap();
-        assert_eq!(
-            res,
-            Finalized::CodeReview {
-                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into()
-            }
-        );
-        let calls = runner.calls.lock().unwrap();
-        // No merge, and the issue was never advanced to Done.
-        assert!(!calls.iter().any(|c| c.contains("pr merge")), "{calls:?}");
-        assert!(
-            !calls.iter().any(|c| c.contains("AI Agent Done")),
-            "{calls:?}"
-        );
-    }
-
-    #[test]
-    fn finalize_automerge_leaves_code_review_on_timeout() {
-        // CLAUDE-126: checks still pending when the budget is exhausted means no
-        // merge; the PR stays open at Code Review. `wait_seconds: 0` exhausts the
-        // budget after the first (pending) poll.
-        let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(with_one_branch_ahead(
-            StubRunner::new()
-                .ok(
-                    "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
-                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
-                )
-                .ok(
-                    "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
-                    "",
-                )
-                .ok(
-                    "fj",
-                    &[
-                        "--host",
-                        "dev.a8n.run",
-                        "pr",
-                        "status",
-                        "contoso/claude-run#7",
-                        "--json",
-                    ],
-                    r#"{"pr":7,"state":"pending","mergeable":false,"merged":false}"#,
-                ),
-        ));
-        let backend = CliBackend::new(runner.clone());
-        let res = finalize(
-            &backend,
-            &backend,
-            &src_automerge(0),
-            &job(),
-            dir.path(),
-            &ok_result(),
-            PrStrategy::Agit,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
-        )
-        .unwrap();
-        assert_eq!(
-            res,
-            Finalized::CodeReview {
-                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into()
-            }
-        );
-        let calls = runner.calls.lock().unwrap();
-        assert!(!calls.iter().any(|c| c.contains("pr merge")), "{calls:?}");
-    }
-
-    #[test]
-    fn finalize_automerge_disabled_leaves_code_review() {
-        // CLAUDE-126: the default (disabled) automerge never polls or merges; the
-        // success path is exactly the pre-CLAUDE-126 Code Review behavior.
-        let dir = tempfile::tempdir().unwrap();
-        let runner = Arc::new(with_one_branch_ahead(
-            StubRunner::new()
-                .ok(
-                    "fj",
-                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
-                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
-                )
-                .ok(
-                    "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
-                    "",
-                ),
-        ));
-        let backend = CliBackend::new(runner.clone());
-        let res = finalize(
-            &backend,
-            &backend,
-            &src(),
-            &job(),
-            dir.path(),
-            &ok_result(),
-            PrStrategy::Agit,
-            &CancellationToken::new(),
-            &crate::pause::RunPause::never(),
-        )
-        .unwrap();
-        assert!(matches!(res, Finalized::CodeReview { .. }));
-        let calls = runner.calls.lock().unwrap();
-        assert!(
-            !calls.iter().any(|c| c.contains("pr status")),
-            "disabled automerge must not poll: {calls:?}"
-        );
-        assert!(!calls.iter().any(|c| c.contains("pr merge")), "{calls:?}");
-    }
-
     // ---- CLAUDE-161 pre-clone dependency gate ----
 
-    async fn mem_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn mem_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     fn link(
@@ -4375,7 +5127,7 @@ mod tests {
             link(LinkDirection::Inward, "subtask of", "CLAUDE-2", None), // reverse Subtask
             link(LinkDirection::Inward, "depends on", "CLAUDE-3", Some(123)), // met (resolved)
         ];
-        let blockers = unmet_blockers(&links, &block_on);
+        let blockers = unmet_blockers(&links, &block_on, None);
         let ids: Vec<&str> = blockers.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -4386,6 +5138,57 @@ mod tests {
             blocker_signature(&blockers),
             "CLAUDE-9 (parent for); YT-40 (depends on)"
         );
+    }
+
+    /// CLAUDE-295: scoped to its own project, the gate ignores targets anywhere
+    /// else, so an `AUDIT` Epic does not wait on the `GAMMA` findings it filed.
+    #[test]
+    fn unmet_blockers_skips_other_projects_when_scoped() {
+        let block_on = crate::action::Dependencies::default().block_on;
+        let links = vec![
+            link(LinkDirection::Outward, "parent for", "GAMMA-12", None),
+            link(LinkDirection::Outward, "parent for", "AUDIT-7", None),
+            link(LinkDirection::Inward, "depends on", "EPSILON-3", None),
+        ];
+        let ids = |own: Option<&str>| -> Vec<String> {
+            unmet_blockers(&links, &block_on, own)
+                .into_iter()
+                .map(|b| b.id)
+                .collect()
+        };
+        assert_eq!(ids(None), vec!["AUDIT-7", "GAMMA-12", "EPSILON-3"]);
+        assert_eq!(ids(Some("AUDIT")), vec!["AUDIT-7"]);
+    }
+
+    /// CLAUDE-295: `block_cross_project` reaches the gate. An Epic whose only open
+    /// child is in another project is blocked by default and proceeds when false.
+    #[tokio::test]
+    async fn dependency_gate_scopes_to_own_project_when_configured() {
+        let inspect = r#"{"links":[{"direction":"OUTWARD","verb":"parent for","issues":[{"idReadable":"GAMMA-12","summary":"x"}]}]}"#;
+        let body = blocked_comment(&[Blocker {
+            id: "GAMMA-12".into(),
+            verb: "parent for".into(),
+        }]);
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("yt", &["issue", "inspect", "AUDIT-7", "--json"], inspect)
+                .ok("yt", &["issue", "comment", "AUDIT-7", &body], ""),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let mut s = src();
+
+        let pool = mem_pool().await;
+        let d = dependency_gate(&pool, &backend, &s, "act", "AUDIT-7", false)
+            .await
+            .unwrap();
+        assert!(matches!(d, GateDecision::Blocked { .. }), "default blocks");
+
+        s.dependencies.block_cross_project = false;
+        let pool = mem_pool().await;
+        let d = dependency_gate(&pool, &backend, &s, "act", "AUDIT-7", false)
+            .await
+            .unwrap();
+        assert!(matches!(d, GateDecision::Proceed), "scoped gate proceeds");
     }
 
     /// CLAUDE-161: a blocked issue is left Queued, a blocker comment is posted
@@ -4463,6 +5266,70 @@ mod tests {
         assert!(matches!(d3, GateDecision::Blocked { .. }));
         assert_eq!(inspects(), 2, "expired backoff re-reads");
         assert_eq!(comments(), 1, "unchanged blocker set must not re-comment");
+    }
+
+    /// CLAUDE-225: a re-evaluation that finds the blocker still open re-arms the
+    /// window but keeps the original first-blocked stamp, so the age reported to
+    /// the operator is the age of the whole block and not of the last poll. This
+    /// is what makes a long-held gate surface at all: the gate re-evaluates every
+    /// `recheck_timeout`, so an age reset per evaluation would never cross the
+    /// threshold.
+    #[tokio::test]
+    async fn dependency_gate_keeps_the_block_age_across_re_evaluations() {
+        let pool = mem_pool().await;
+        let inspect = r#"{"links":[{"direction":"INWARD","verb":"depends on","issues":[{"idReadable":"AUD-32","summary":"x"}]}]}"#;
+        let body = blocked_comment(&[Blocker {
+            id: "AUD-32".into(),
+            verb: "depends on".into(),
+        }]);
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("yt", &["issue", "inspect", "AUD-31", "--json"], inspect)
+                .ok("yt", &["issue", "comment", "AUD-31", &body], ""),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let s = src();
+
+        // First block, then age it by three hours with an already-expired window.
+        let d = dependency_gate(&pool, &backend, &s, "act", "AUD-31", false)
+            .await
+            .unwrap();
+        assert!(matches!(d, GateDecision::Blocked { .. }));
+        let aged = state::now_epoch_ms() - 3 * 3_600_000;
+        sqlx::query(&crate::db::q(&pool,
+            "UPDATE dependency_gate SET blocked_since = ?, blocked_until = ? WHERE job_key = 'AUD-31'",
+        ))
+        .bind(aged)
+        .bind(state::now_epoch_ms() - 1000)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Re-evaluate: still blocked, window re-armed, stamp untouched.
+        let d2 = dependency_gate(&pool, &backend, &s, "act", "AUD-31", false)
+            .await
+            .unwrap();
+        assert!(matches!(d2, GateDecision::Blocked { .. }));
+        let st = state::dependency_gate_get(&pool, "act", "AUD-31")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(st.blocked_since_ms, aged, "re-arm must not reset the age");
+        assert!(st.blocked_until_ms > state::now_epoch_ms());
+
+        // ...so the operator-facing read surfaces it.
+        let stale = state::dependency_gates_stale(
+            &pool,
+            state::now_epoch_ms(),
+            state::STALE_GATE_AFTER_MS,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stale.len(), 1, "{stale:?}");
+        assert_eq!(stale[0].job_key, "AUD-31");
+        assert_eq!(stale[0].signature, "AUD-32 (depends on)");
+        assert!(stale[0].blocked_for_ms >= 3 * 3_600_000);
     }
 
     /// CLAUDE-161: `enabled: false` makes the gate a no-op: it proceeds without
@@ -4800,6 +5667,191 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c == "yt issue inspect TOOL-34 --json"),
             "filtered issue must not reach the dependency read: {calls:?}"
+        );
+    }
+
+    // ---- CLAUDE-275: resume a recorded open PR's branch on re-queue ----
+
+    fn open_pr(number: u64, head_ref: &str) -> provider::ForgePullRequest {
+        provider::ForgePullRequest {
+            number,
+            title: String::new(),
+            head_sha: String::new(),
+            head_ref: head_ref.to_string(),
+            base_ref: String::new(),
+            author: String::new(),
+            html_url: format!("https://dev.a8n.run/contoso/claude-run/pulls/{number}"),
+            updated_at: String::new(),
+        }
+    }
+
+    /// CLAUDE-275: a recorded, still-open PR resolves to a resume target
+    /// carrying its branch and URL, so `run_pre` clones that branch and the
+    /// prompt's `existing_*` placeholders are populated.
+    #[tokio::test]
+    async fn resolve_pr_resume_returns_branch_when_recorded_pr_still_open() {
+        let pool = mem_pool().await;
+        crate::ci_failure::store::record_agent_pr(
+            &pool,
+            "act",
+            "MK-16",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            7,
+            "fix/MK-16",
+            "open",
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let runner = Arc::new(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "search",
+                "--repo",
+                "contoso/claude-run",
+                "--state",
+                "open",
+                "--json",
+            ],
+            &serde_json::to_string(&[open_pr(7, "fix/MK-16")]).unwrap(),
+        ));
+        let forge = CliBackend::new(runner);
+
+        let resume = resolve_pr_resume(&pool, &forge, &job(), PrStrategy::Branch)
+            .await
+            .unwrap()
+            .expect("an open recorded PR resolves to a resume target");
+        assert_eq!(resume.branch, "fix/MK-16");
+        assert_eq!(
+            resume.pr_url,
+            "https://dev.a8n.run/contoso/claude-run/pulls/7"
+        );
+    }
+
+    /// CLAUDE-275: a recorded PR that no longer shows up in the open-PR list is
+    /// marked `closed` and the caller starts from the default branch.
+    #[tokio::test]
+    async fn resolve_pr_resume_marks_closed_when_absent_from_open_list() {
+        let pool = mem_pool().await;
+        crate::ci_failure::store::record_agent_pr(
+            &pool,
+            "act",
+            "MK-16",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            7,
+            "fix/MK-16",
+            "open",
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let runner = Arc::new(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "search",
+                "--repo",
+                "contoso/claude-run",
+                "--state",
+                "open",
+                "--json",
+            ],
+            "[]",
+        ));
+        let forge = CliBackend::new(runner);
+
+        let resume = resolve_pr_resume(&pool, &forge, &job(), PrStrategy::Branch)
+            .await
+            .unwrap();
+        assert!(resume.is_none());
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.state, "closed");
+    }
+
+    /// CLAUDE-275: the AGit strategy has no server branch to continue on, so an
+    /// open recorded PR is never resumed for it - a new PR is opened as before.
+    /// Asserting on a `StubRunner` with no registered `fj` call proves the
+    /// open-PR lookup is never even attempted.
+    #[tokio::test]
+    async fn resolve_pr_resume_skips_agit_strategy() {
+        let pool = mem_pool().await;
+        crate::ci_failure::store::record_agent_pr(
+            &pool,
+            "act",
+            "MK-16",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            7,
+            "fix/MK-16",
+            "open",
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let runner = Arc::new(StubRunner::new());
+        let forge = CliBackend::new(runner.clone());
+
+        let resume = resolve_pr_resume(&pool, &forge, &job(), PrStrategy::Agit)
+            .await
+            .unwrap();
+        assert!(resume.is_none());
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "AGit must never probe the open-PR list"
+        );
+    }
+
+    /// CLAUDE-275: a fresh (non-resumed) success records the PR in the store.
+    #[tokio::test]
+    async fn record_new_pr_writes_one_agent_pull_requests_row() {
+        let pool = mem_pool().await;
+        let runner = Arc::new(StubRunner::new());
+        let forge = CliBackend::new(runner);
+        let backend = CliBackend::new(Arc::new(StubRunner::new()));
+
+        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x").await;
+
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+            .await
+            .unwrap()
+            .expect("record_new_pr inserts a row");
+        assert_eq!(rec.pr_number, 9);
+        assert_eq!(rec.head_branch, "feat/x");
+        assert_eq!(rec.state, "open");
+    }
+
+    /// CLAUDE-275: a resumed job's PR is already recorded, so `record_new_pr`
+    /// must never run for it - proven end-to-end here by attempting the exact
+    /// second insert `process_job` would skip and observing the store's
+    /// `UNIQUE(host, repo, pr_number)` reject it, which is why the resume branch
+    /// in `process_job` is gated on `resume.is_none()`.
+    #[tokio::test]
+    async fn record_new_pr_twice_for_the_same_pr_conflicts() {
+        let pool = mem_pool().await;
+        let runner = Arc::new(StubRunner::new());
+        let forge = CliBackend::new(runner);
+        let backend = CliBackend::new(Arc::new(StubRunner::new()));
+
+        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x").await;
+        // A second record for the SAME PR number is exactly what would happen if
+        // `process_job` recorded on a resumed run too; `record_new_pr` reports
+        // the conflict as a `note` + comment rather than panicking.
+        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x").await;
+
+        assert_eq!(
+            forge.take_notices().len(),
+            1,
+            "the second, colliding record surfaces as an operator-visible notice"
         );
     }
 }

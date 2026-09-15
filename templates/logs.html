@@ -1,9 +1,53 @@
 {% extends "base.html" %}
-{% block title %}{{ action_name }} error log - claude-run{% endblock %}
-{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><a href="/actions/{{ action_name }}">{{ action_name }}</a><span class="sep">/</span><span class="current">Error log</span>{% endblock %}
+{% block title %}Logs - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><span class="current">Logs</span>{% endblock %}
 {% block main %}
 
-<h2>Input error log</h2>
+<h2>Logs</h2>
+
+{# CLAUDE-235: the way in to a filter, not a second log. Both cards count the
+   last 24h at warn/error regardless of the table's current filter, so the
+   dashboard banner's count and these agree, and each row is a link that applies
+   its own filter over the same window. A NULL/empty context has no filter that
+   can express it, so it is counted but not linked. #}
+{% if !by_context.is_empty() || !by_action.is_empty() %}
+<div class="card" style="display: flex; gap: 32px; flex-wrap: wrap; margin-bottom: 16px;">
+  <div style="flex: 1 1 240px;">
+    <strong>Last 24h by context</strong>
+    <table style="margin-top: 8px;">
+      <thead><tr><th>Context</th><th>Errors / warnings</th></tr></thead>
+      <tbody>
+        {% for c in by_context %}
+        <tr>
+          <td class="mono">
+            {% if c.value.is_empty() %}
+              <span class="dim">-</span>
+            {% else %}
+              <a href="/logs?since=24h&amp;context={{ c.value }}">{{ c.value }}</a>
+            {% endif %}
+          </td>
+          <td>{{ c.count }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div style="flex: 1 1 240px;">
+    <strong>Last 24h by action</strong>
+    <table style="margin-top: 8px;">
+      <thead><tr><th>Action</th><th>Errors / warnings</th></tr></thead>
+      <tbody>
+        {% for a in by_action %}
+        <tr>
+          <td class="mono"><a href="/logs?since=24h&amp;action={{ a.value }}">{{ a.value }}</a></td>
+          <td>{{ a.count }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
 
 {# CLAUDE-171: every filter control re-requests this region with its selection
    encoded in the URL and morph-swaps the result in place, exactly as on the
@@ -24,7 +68,7 @@
   <label style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-dim);">
     Level
     <select name="level" hx-trigger="change"
-            hx-get="/actions/{{ action_name }}/events?{{ view.query_without("level") }}" hx-include="#event-filters"
+            hx-get="/logs?{{ view.query_without("level") }}" hx-include="#event-filters"
             hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
             style="margin-left: 6px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; padding: 3px 5px;">
       <option value=""{% if view.level.is_empty() %} selected{% endif %}>all</option>
@@ -36,7 +80,7 @@
   <label style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-dim);">
     Action
     <select name="action" hx-trigger="change"
-            hx-get="/actions/{{ action_name }}/events?{{ view.query_without("action") }}" hx-include="#event-filters"
+            hx-get="/logs?{{ view.query_without("action") }}" hx-include="#event-filters"
             hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
             style="margin-left: 6px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; padding: 3px 5px;">
       <option value=""{% if view.action.is_empty() %} selected{% endif %}>all</option>
@@ -48,7 +92,7 @@
   <label style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-dim);">
     Context
     <select name="context" hx-trigger="change"
-            hx-get="/actions/{{ action_name }}/events?{{ view.query_without("context") }}" hx-include="#event-filters"
+            hx-get="/logs?{{ view.query_without("context") }}" hx-include="#event-filters"
             hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
             style="margin-left: 6px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; padding: 3px 5px;">
       <option value=""{% if view.context.is_empty() %} selected{% endif %}>all</option>
@@ -60,15 +104,16 @@
   <label style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-dim);">
     Since
     <select name="since" hx-trigger="change"
-            hx-get="/actions/{{ action_name }}/events?{{ view.query_without("since") }}" hx-include="#event-filters"
+            hx-get="/logs?{{ view.query_without("since") }}" hx-include="#event-filters"
             hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
             style="margin-left: 6px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; padding: 3px 5px;">
-      <option value=""{% if !view.all_time() %} selected{% endif %}>current serve</option>
+      <option value=""{% if !view.all_time() && !view.last_24h() %} selected{% endif %}>current serve</option>
+      <option value="24h"{% if view.last_24h() %} selected{% endif %}>last 24h</option>
       <option value="all"{% if view.all_time() %} selected{% endif %}>all time</option>
     </select>
   </label>
   <form id="event-filters"
-        hx-get="/actions/{{ action_name }}/events?{{ view.filter_query() }}"
+        hx-get="/logs?{{ view.filter_query() }}"
         hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
         hx-trigger="submit"
         style="display: flex; gap: 8px; align-items: center; flex: 1 1 240px;">
@@ -77,11 +122,13 @@
            style="flex: 1 1 180px; min-width: 140px;">
     <button class="btn" type="submit">Search</button>
   </form>
-  <a class="btn" href="/actions/{{ action_name }}/events">Reset</a>
+  <a class="btn" href="/logs">Reset</a>
 </div>
 
 <p class="meta">
-  {% if let Some(st) = started_at %}
+  {% if view.last_24h() %}
+    Showing events from the last 24 hours.
+  {% else if let Some(st) = started_at %}
     {% if view.all_time() %}
       Showing events from all time. This serve started {{ st|datetime }}.
     {% else %}
@@ -90,7 +137,7 @@
   {% else %}
     Showing events from all time (no serve start is recorded in this database).
   {% endif %}
-  Every matching event is listed; unlike the action page's summary, repeats are not collapsed.
+  Every matching event is listed; unlike the counts above and on the action page, repeats are not collapsed.
 </p>
 
 {% if events.is_empty() %}
@@ -99,7 +146,7 @@
   <table>
     <thead><tr>
       <th><a href="#" class="sort-link"
-             hx-get="/actions/{{ action_name }}/events?{{ view.sort_query() }}" hx-include="#event-filters"
+             hx-get="/logs?{{ view.sort_query() }}" hx-include="#event-filters"
              hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML"
              >When{{ view.arrow_when() }}</a></th>
       <th>Level</th>
@@ -129,7 +176,7 @@
   </table>
   <div class="pagination" style="display: flex; gap: 12px; align-items: center; margin: 12px 0; font-size: 12px;">
     {% if page.has_prev %}
-      <a class="btn" hx-get="/actions/{{ action_name }}/events?{{ view.filter_query() }}" hx-include="#event-filters"
+      <a class="btn" hx-get="/logs?{{ view.filter_query() }}" hx-include="#event-filters"
          hx-vals='{"page": {{ page.page - 1 }}}'
          hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML">Prev</a>
     {% else %}
@@ -137,7 +184,7 @@
     {% endif %}
     <span class="meta">{{ page.start }}-{{ page.end }} of {{ page.total }} (page {{ page.page }} of {{ page.total_pages }})</span>
     {% if page.has_next %}
-      <a class="btn" hx-get="/actions/{{ action_name }}/events?{{ view.filter_query() }}" hx-include="#event-filters"
+      <a class="btn" hx-get="/logs?{{ view.filter_query() }}" hx-include="#event-filters"
          hx-vals='{"page": {{ page.page + 1 }}}'
          hx-target="#events-region" hx-select="#events-region" hx-swap="morph:outerHTML">Next</a>
     {% else %}

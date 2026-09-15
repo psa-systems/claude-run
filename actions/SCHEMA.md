@@ -15,7 +15,7 @@ attempt caps, timeouts, and a cost-based usage check. The action YAML supplies e
 
 ```yaml
 name: <kebab-id>            # required
-kind: scripted              # optional: scripted (default) | youtrack | forgejo-ci-fix | ci-failure-analysis | ci-failure-reconcile | closed-issue-summary
+kind: scripted              # optional: scripted (default) | youtrack | closed-issue-summary
 enabled: true               # optional, default true; false skips the action in the scheduler
 workdir_base: /path/to/dir  # optional, overrides $CLAUDE_RUN_WORKDIR_BASE for this action
 link_template: https://youtrack/issue/{key}  # optional; {key} -> job key, builds a per-job link (render_link)
@@ -35,16 +35,22 @@ claude: # optional, all keys optional
   cwd: ...
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
   permission_mode: acceptEdits
+  model: opus
+  effort: high
+  autocompact: 200000       # compaction window: auto, or 100000-1000000 tokens
 post: # optional, ordered list of nu snippets
   - |
     ...
 output:
   file: <name>.log          # optional, appended JSONL of per-job outcomes
-limits: # optional per-action overrides of env defaults
+limits: # optional per-action overrides of the built-in defaults
   max_attempts_per_key: 3
   max_runs_per_day: 20
   claude_timeout_seconds: 600
   daily_budget_usd: 5.00
+  run_budget_usd: 5.00      # spend ceiling for ONE run; unset = daily_budget_usd
+  budget_warn_fraction: 0.8 # warn once at this fraction of run_budget_usd
+  max_issues_per_run: 25
 concurrency: # optional; default is strictly sequential
   max_parallel: 1           # distinct-key jobs in flight at once, daemon-wide (default 1)
   key: [ project, repo, workflow ]   # job fields composing the concurrency key
@@ -87,14 +93,14 @@ pre:
 
 ### `name` (string, required)
 
-Identifier used for the lock file, state file, log directory, and PAUSED flag. Should be kebab-case and unique across
-all actions on the host.
+Identifier used for the lock file, the log directory, and every per-action row in the state store (index, pause,
+attempt counters, daily ledger). Should be kebab-case and unique across all actions on the host.
 
 The action index is keyed by this exact string, so two files whose `name:` differ only by case (`youtrack` vs
 `YouTrack`) are indexed as two independent, separately-scheduled actions. At scan time the daemon flags (but does not
 merge or disable) two kinds of redundant configuration among enabled actions (CLAUDE-164): (1) names equal ignoring
 case, and (2) two native actions of the same `kind` polling the same source (for `kind: youtrack`, the same
-`native.youtrack.query` and `base_url`; for `kind: forgejo-ci-fix`, the same `host` and `repos`). Either condition
+`native.youtrack.query` and `base_url`). Either condition
 means both actions gather the same jobs and silently compete on the shared daemon-wide concurrency caps. The daemon
 emits a WARN log and a persisted notice on each colliding action (visible on the action page); no action is
 auto-disabled - rename, consolidate, or disable one yourself.
@@ -109,15 +115,6 @@ The dispatch discriminator (CLAUDE-30). Selects how the runner executes the acti
 - `youtrack`: a built-in Rust handler for YouTrack. The script-bearing fields (`input.command`, `prompt`, `filter`,
   `pre`, `post`) are not used; the action instead supplies a typed [`native`](#native-record-required-for-native-kinds)
   block.
-- `forgejo-ci-fix`: a built-in Rust handler that fixes failing CI on Forgejo PRs (CLAUDE-29, supersedes DEV-330). Like
-  `youtrack` it is config only and supplies a typed [`native`](#native-record-required-for-native-kinds) block.
-- `ci-failure-analysis`: a built-in Rust handler that enriches each open "CI failure" / "Auto-fix" issue with a deep,
-  log-grounded root-cause comment (CLAUDE-189). Config only, supplying a typed
-  [`native`](#native-record-required-for-native-kinds) block.
-- `ci-failure-reconcile`: a built-in Rust handler that auto-closes each open "CI failure" / "Auto-fix" issue once the
-  failing `(repo, branch, workflow, job)` it tracks is green again on its latest run (CLAUDE-191), and collapses
-  duplicate issues that share a root-cause key (CLAUDE-198). Config only, supplying a typed
-  [`native`](#native-record-required-for-native-kinds) block.
 - `closed-issue-summary`: a built-in Rust handler that counts and lists every issue closed in a rolling window across a
   configured project list, files that report as a new issue, and hangs it off a nominated parent as a subtask
   (CLAUDE-218). The automation used as a reporting tool rather than as an issue worker: it clones no repository, starts
@@ -155,7 +152,8 @@ native:
     query: "-Resolved AI Agent: Queued"   # issues to pick up
     custom_field: "AI Agent"              # field holding the state machine
     assignee: octocat                     # optional; assign the issue on pickup (login, me, or unassigned)
-    prompt: |                             # optional; full replacement of the built-in agent prompt
+    prompt_preset: default                # optional; built-in prompt used when `prompt` is unset: default | audit
+    prompt: |                             # optional; full-replacement override, wins over prompt_preset
       Work issue {{key}}: {{summary}}
       Repo cloned at {{workdir}} ({{clone_url}}).
     states: # AI Agent / State labels the handler drives
@@ -168,15 +166,16 @@ native:
       in_progress: In Progress            # the standard State field value set in pre
       state_done: Done                    # the standard State value set when automerge merges the PR
     automerge:                            # optional; CI-gated automerge of the opened PR (CLAUDE-126)
-      enabled: false                      # off by default; finalize stops at Code Review
-      wait_seconds: 1800                  # max total seconds to wait for checks to go green
-      check_interval_seconds: 30          # seconds between CI status polls
+      enabled: false                      # off by default; finalize stops at Code Review either way.
+                                           # when true, a later success/recover webhook event merges
+                                           # once checks are green (CLAUDE-278; finalize never polls)
     dependencies:                         # optional; pre-clone dependency gate (CLAUDE-161)
       enabled: true                       # on by default; false makes the gate a no-op
       recheck_timeout: 5m                 # backoff before a blocked issue is re-evaluated
       block_on:                           # direction-resolved link verbs that block
         - depends on                      # Depend INWARD: an open blocker gates this issue
         - parent for                      # Subtask OUTWARD: an open child gates this parent
+      block_cross_project: true           # false: a link to an issue in another project never blocks
   forgejo:
     base_url: https://forge.example       # optional; default derives host per issue VCS
     token_ref: fj-prod                    # optional; name of an encrypted secret
@@ -192,19 +191,21 @@ native:
 |-------------------------|------------------------------------|-----------------------------------------------------------------------------------------------------|
 | `youtrack.base_url`     | host-configured `yt`               | YouTrack base URL. Required when `token_ref` is set (the injected `yt` config needs a `url`).       |
 | `youtrack.token_ref`    | none                               | Name of an encrypted secret holding the YouTrack API token (CLAUDE-26). `None` uses host `yt` auth. |
-| `youtrack.query`        | `-Resolved AI Agent: Queued`       | Issue query selecting the jobs this action picks up. Two youtrack actions must never both match one issue: they poll on the same interval, so the winner is a race and the loser's repo is the wrong one. The shipped pair partitions on project (`project: -AUD` versus `project: AUD`, CLAUDE-215); note that YouTrack rejects `-project: AUD` as a parse error, so the negation goes on the value. |
+| `youtrack.query`        | `-Resolved AI Agent: Queued`       | Issue query selecting the jobs this action picks up. Two youtrack actions must never both match one issue: they poll on the same interval, so the winner is a race and the loser's repo or prompt is the wrong one. The shipped pair partitions on project plus tag (CLAUDE-215): `audit-run.yml` selects `-Resolved AI Agent: Queued project: AUDIT tag: Audit-*` (the YouTrack workflow tags the daily audit parent and every per-target Epic `Audit-<Type>`), and `youtrack.yml` selects the exact complement, `(project: -AUDIT or tag: -Audit-*) and -Resolved AI Agent: Queued`. Two syntax rules: YouTrack rejects `-project: AUDIT` as a parse error, so the negation goes on the value, and a parenthesized group must be followed by an explicit `and` (`#Unresolved (a or b)` is rejected). |
 | `youtrack.custom_field` | `AI Agent`                         | Custom field holding the AI Agent state machine.                                                    |
 | `youtrack.assignee`     | none                               | Optional Assignee set on the issue during pickup (CLAUDE-131). A literal `yt` assignee argument: a login, `me`, or `unassigned`. When unset (default), the Assignee is never touched. An assignee write failure aborts pickup before the clone. Editable in the structured web form. |
-| `youtrack.prompt`       | built-in default                   | Full-replacement agent prompt (CLAUDE-125). When unset, the built-in CLAUDE-24 prompt is used. When set, the text fully replaces it (so the operator owns the runner contract: bare `#<KEY>` commit reference, the `.claude-run-needs-review` / `.claude-run-skip-attempt` blocker markers, the `.claude-run-no-code-change` no-code marker, no push / no PR, and whichever tracker writes the operator chooses to permit). Editable in the structured web form. See the placeholders below. |
-| `youtrack.write_projects` | empty                            | Projects the agent may create issues in (CLAUDE-214), rendered into the prompt as `{{write_projects}}`. Empty (the default) resolves to the **triggering issue's own project**, so filing a deferred item satisfies the `No orphan notes` rule with no site-specific configuration and none is baked into the binary. The list is a prompt instruction, not an enforced grant: the hard boundary is the YouTrack token's own permissions. No structured-form UI; a hand-written list is carried forward across form saves. |
-| `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value. `done` (AI Agent) and `state_done` (State) are set only when automerge merges the PR (CLAUDE-126). |
-| `youtrack.states.no_code` | the `done` label                 | AI Agent label set when a successful run deliberately produced no commits and left `.claude-run-no-code-change` (CLAUDE-214). Defaults to whatever `states.done` is, because there is no PR for a human to review. `State` is left untouched, so the issue stays In Progress until a human closes it. No structured-form UI; a hand-written value is carried forward across form saves. |
-| `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge (CLAUDE-126). When `false`, finalize stops at Code Review with no CI wait and no merge (unchanged behavior). |
-| `youtrack.automerge.wait_seconds` | `1800`                   | Maximum total seconds to wait for the PR's checks to go green (and the branch to be up to date) before giving up and leaving the PR open. |
-| `youtrack.automerge.check_interval_seconds` | `30`           | Seconds between combined-CI-status polls.                                                            |
-| `youtrack.dependencies.enabled` | `true`                    | Master switch for the pre-clone dependency gate (CLAUDE-161). When `true`, a queued issue with any unmet dependency is left Queued (not cloned, no claude spend) and re-evaluated after `recheck_timeout`. When `false`, the gate is a no-op and pickup proceeds exactly as before. See [Pre-clone dependency gate](#pre-clone-dependency-gate-claude-161). |
-| `youtrack.dependencies.recheck_timeout` | `5m`              | Humantime backoff before a blocked issue is re-evaluated. While the window is open the issue stays Queued with no `yt` read and no comment (no per-poll spam). Validated at action load. |
-| `youtrack.dependencies.block_on` | `["depends on", "parent for"]` | Direction-resolved link verbs (YT-40) that block. A queued issue is blocked when it has any link whose `verb` is listed here and whose target is unresolved. The defaults block `depends on` (Depend INWARD, an open blocker) and `parent for` (Subtask OUTWARD, an open child); the reverse verbs `is required for` and `subtask of` never block. |
+| `youtrack.prompt`       | none                               | Full-replacement agent prompt override (CLAUDE-125). Resolution order: this text when set, otherwise the built-in preset named by `prompt_preset`. When set, the text fully replaces the preset (so the operator owns the runner contract: bare `#<KEY>` commit reference, the `.claude-run-needs-review` / `.claude-run-skip-attempt` blocker markers, the `.claude-run-no-code-change` no-code marker, no push / no PR, and whichever tracker writes the operator chooses to permit), and it no longer changes when the binary's preset improves. Editable in the structured web form, which shows the prompt source (`override` or `builtin:<preset>`) and stores no override when the text equals the action's preset. See the placeholders below. |
+| `youtrack.prompt_preset` | `default`                         | Built-in prompt used when `prompt` is unset. `default` is the engineering prompt (`default_youtrack_prompt`, `src/native/youtrack.rs`); `audit` is the scheduled-audit prompt (`default_audit_prompt`, `src/native/audit_prompt.rs`), selected by `actions/audit-run.yml`. Preset text is compiled into the binary, so an upgrade updates it. Omitted on serialize when `default`. Any other value is rejected at load, naming `native.youtrack.prompt_preset`. No structured-form UI; the value is carried forward across form saves. `claude-run action show <name>` prints `prompt_source` (`override`, `builtin:default`, `builtin:audit`) and `prompt_preset` read from the YAML. |
+| `youtrack.write_projects` | empty                            | Projects the agent may create issues in for a descoped piece of the triggering issue (CLAUDE-214), and the fallback for an out-of-scope bug when no project or more than one project binds the buggy repo (CLAUDE-297); rendered into the prompt as `{{write_projects}}`. Empty (the default) resolves to the **triggering issue's own project**, so filing a deferred item satisfies the `No orphan notes` rule with no site-specific configuration and none is baked into the binary. The list is a prompt instruction, not an enforced grant: the hard boundary is the YouTrack token's own permissions. Exposed in the structured editor as a comma-separated "Write projects" field (CLAUDE-298). |
+| `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value. `done` (AI Agent) and `state_done` (State) are set only when a `success`/`recover` webhook event automerges the PR (CLAUDE-126, event-driven since CLAUDE-278). |
+| `youtrack.states.no_code` | the `done` label                 | AI Agent label set when a successful run deliberately produced no commits and left `.claude-run-no-code-change` (CLAUDE-214). Defaults to whatever `states.done` is, because there is no PR for a human to review. `State` is left untouched, so the issue stays In Progress until a human closes it. Exposed in the structured editor as the "No-code label" field, blank meaning inherit the Done label (CLAUDE-298). |
+| `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge (CLAUDE-126). When `false`, the PR is never merged by the runner (unchanged behavior). When `true`, `finalize` still stops at Code Review immediately; the merge happens later, driven by a `success`/`recover` Action-run webhook event (CLAUDE-278). |
+| `youtrack.automerge.wait_seconds` | `1800`                   | **Deprecated (CLAUDE-278):** the runner no longer polls, so this is parsed (an action file setting it still loads) but otherwise ignored; setting it away from its default logs one deprecation warning at load. Saving the action's structured form resets it to the default. |
+| `youtrack.automerge.check_interval_seconds` | `30`           | **Deprecated (CLAUDE-278):** same as `wait_seconds`.                                                  |
+| `youtrack.dependencies.enabled` | `true`                    | Master switch for the pre-clone dependency gate (CLAUDE-161). When `true`, a queued issue with any unmet dependency is left Queued (not cloned, no claude spend) and re-evaluated after `recheck_timeout`. When `false`, the gate is a no-op and pickup proceeds exactly as before. See [Pre-clone dependency gate](#pre-clone-dependency-gate-claude-161). Editable in the structured web form (CLAUDE-298). |
+| `youtrack.dependencies.recheck_timeout` | `5m`              | Humantime backoff before a blocked issue is re-evaluated. While the window is open the issue stays Queued with no `yt` read and no comment (no per-poll spam). Validated at action load, and by the structured web form on save (CLAUDE-298). |
+| `youtrack.dependencies.block_on` | `["depends on", "parent for"]` | Direction-resolved link verbs (YT-40) that block. A queued issue is blocked when it has any link whose `verb` is listed here and whose target is unresolved. The defaults block `depends on` (Depend INWARD, an open blocker) and `parent for` (Subtask OUTWARD, an open child); the reverse verbs `is required for` and `subtask of` never block. Editable in the structured web form as a comma-separated list (CLAUDE-298). |
+| `youtrack.dependencies.block_cross_project` | `true`        | When `false`, a link to an issue in a different project (compared by key prefix: `GAMMA` in `GAMMA-12`) never blocks, whatever its verb. `actions/audit-run.yml` sets it (CLAUDE-295): an audit Epic in `AUDIT` is `parent for` the findings it filed into the product projects, and must not wait on them. Editable in the structured web form (CLAUDE-298). |
 | `forgejo.base_url`      | per-issue VCS host                 | Forgejo base URL.                                                                                   |
 | `forgejo.token_ref`     | none                               | Name of an encrypted secret holding the Forgejo API token (CLAUDE-26). `None` uses host `fj` auth. The token must carry the **`write:repository`** and **`write:issue`** scopes (see [Forgejo token scopes](#forgejo-token-scopes-claude-196)). |
 | `forgejo.pr_strategy`   | `branch`                           | PR-creation strategy (CLAUDE-103). `branch`: resolve the feature branch by name (independent of the current `HEAD`; CLAUDE-166), push it as `git push --set-upstream origin <branch>:<branch>`, and open the PR over the API with an explicit `--head`, so the PR stays mergeable and updatable. `agit`: `fj pr create -aA`, a branchless PR whose head lives only at `refs/pull/<N>/head` and loses its merge button if it falls behind an up-to-date base. The selected strategy is authoritative (no silent cross-strategy fallback). Both strategies are gated by the same pre-dispatch ahead check (CLAUDE-212): PR creation is attempted only when exactly one local branch has commits ahead of the base, so a run that produced no commits fails loudly instead of opening an empty PR. |
@@ -214,8 +215,9 @@ native:
 
 ##### Prompt placeholders (CLAUDE-125)
 
-`youtrack.prompt` is a template. These `{{...}}` placeholders are substituted with each job's values before the
-prompt is sent to the agent; an unknown placeholder (or an unterminated `{{`) is left literal and logged at warn:
+The prompt is a template, whether it comes from a `youtrack.prompt` override or from any built-in `prompt_preset`. These
+`{{...}}` placeholders are substituted with each job's values before the prompt is sent to the agent; an unknown
+placeholder (or an unterminated `{{`) is left literal and logged at warn:
 
 | Placeholder              | Substituted with                                                              |
 |--------------------------|-------------------------------------------------------------------------------|
@@ -226,7 +228,104 @@ prompt is sent to the agent; an unknown placeholder (or an unterminated `{{`) is
 | `{{needs_review_marker}}`| The `.claude-run-needs-review` marker filename.                               |
 | `{{skip_attempt_marker}}`| The `.claude-run-skip-attempt` marker filename.                               |
 | `{{no_code_marker}}`     | The `.claude-run-no-code-change` marker filename (CLAUDE-214).                |
-| `{{write_projects}}`     | Comma-separated `youtrack.write_projects`, or the triggering issue's own project when that list is empty (CLAUDE-214). |
+| `{{write_projects}}`     | Comma-separated `youtrack.write_projects`, or the triggering issue's own project when that list is empty (CLAUDE-214). Scopes a descoped piece of the triggering issue, and is the fallback project for an out-of-scope bug whose repo no project or more than one project binds (CLAUDE-297). |
+| `{{existing_pr_url}}`    | Empty on a fresh pickup. On a re-queue with an open recorded PR (CLAUDE-275), the URL of that PR. |
+| `{{existing_branch}}`    | Empty on a fresh pickup. On a re-queue with an open recorded PR (CLAUDE-275), that PR's head branch, already checked out in `{{workdir}}`. |
+
+##### Audit prompt: filing from disk, not from a compacted context (CLAUDE-304)
+
+On 2026-09-15 an `audit-run` job compacted mid-run (`claude.autocompact`'s default 200000-token window) and, after the
+boundary, rebuilt 14 of its 20 finding write-ups from the compacted summary instead of re-reading them, filing nine
+issues whose `file:line` citations did not exist. The audit prompt (`default_audit_prompt`,
+`src/native/audit_prompt.rs`) now orders its per-target steps so that never has to happen:
+
+- **P4 writes the dated report, with every finding block, before P5 files anything.** The report is the on-disk record
+  a compacted run re-reads instead of reconstructing a finding from memory.
+- **P5 files each finding from that report, never from conversation memory:** it re-reads the finding's block from the
+  report on disk and re-opens its first cited `file:line` in the clone before building the issue body and calling
+  `yt issue create`. Immediately after each create, it appends `<finding id><TAB><issue key>` to a filing log outside
+  `{{workdir}}`, at `/tmp/audit-filing-{{key}}.tsv`. If the run notices its earlier conversation was replaced by a
+  compaction summary, or it cannot account for a finding's text from its own prior turns, it re-reads the report and
+  the filing log from disk before any further tracker write, and never files a finding id the log already lists.
+- **`AI Agent = Needs Review` is now permitted on a self-created issue**, in addition to `Queued`: an issue the run
+  created and filed this run, that it later finds wrong (a citation that does not exist, a duplicate, anything the
+  filing log or a re-read of the report contradicts), gets `Needs Review` instead, taking it out of the `youtrack`
+  action's queue for a person. Delete stays banned either way. The run records the key and its reason in the
+  `## Result` block and in its final checklist.
+
+Separately, `finalize` (`src/native/youtrack.rs`) reads its own run's stream log after every job and counts
+`compact_boundary` events (`crate::claude::count_compact_boundaries`). A non-zero count appends one line to the
+success or needs-review outcome comment, `Context was compacted <n> time(s) during this run; check the issues it
+created.`, and logs a `warn` naming the key and the count; a run with none gets neither. A stream-log read failure
+logs at `error` and the outcome comment still posts, without that line - the same "the comment is best-effort, the
+field write is authoritative" posture `finalize` already takes everywhere else.
+
+##### Resuming an open PR on re-queue (CLAUDE-275)
+
+Every PR the `youtrack` action opens is recorded in the `agent_pull_requests` store (action, issue key, host, repo, PR
+number, head branch), keyed unique on `(host, repo, pr_number)`. Before `pre` runs, `process_job` looks up the
+triggering issue's most recently recorded PR:
+
+- **No record, or a record already `merged` / `closed`:** unchanged behavior - clone the repo's default branch and
+  open a fresh PR.
+- **A record still marked `open`:** confirmed live against `Forge::list_open_prs`. Still open: `{{existing_branch}}`
+  is cloned instead of the default branch, and `{{existing_pr_url}}` / `{{existing_branch}}` are rendered into the
+  prompt so the agent fixes the SAME branch (reading the issue's newest comments for what to fix) instead of opening a
+  second PR. No longer in the open list: the record is marked `closed` (a closed-vs-merged distinction is not
+  derivable from an open-PR listing alone) and pickup falls back to the default branch.
+- **The `agit` PR strategy:** always skipped, logged at `info`. AGit pushes to `refs/for/<base>` and produces no
+  server branch, so there is nothing to resume; a re-queue always opens a fresh PR under this strategy.
+
+A successful `create_pr` on a NON-resumed run (fresh PR) records one new `agent_pull_requests` row; a resumed run's
+`create_pr` call adopts the same PR number again (the branch-strategy idempotency reconcile below), so it is never
+re-recorded (the store's `UNIQUE(host, repo, pr_number)` would reject a duplicate insert). A failed record write is
+logged at `error`, surfaced as a `run_events` row (the same channel a degraded open-PR lookup uses), and named in a
+follow-up issue comment; the PR itself still exists and the issue still advances to Code Review, since the record is
+bookkeeping for the NEXT re-queue, not a condition of this one succeeding.
+
+##### Routing a CI failure on an open PR (CLAUDE-276)
+
+The `agent_pull_requests` store this section built is what the CI-failure webhook (`webhook-forgejo`) reads to decide
+whether a failing run's open PR is this action's own. Before triage, the webhook consumer resolves the open PR (if
+any) whose head matches the failing commit, then looks that PR up in `agent_pull_requests` by `(host, repo,
+pr_number)`:
+
+- **An `open` row (the agent's own PR):** below `config.webhook.agent_pr_fix_attempts` (default 3), the failure
+  comments the recorded issue (run link, failing tests, analysis), bumps `fix_attempts`, and sets `AI Agent = Queued`
+  - the exact write that re-queues the `youtrack` action's own pickup above, so the SAME branch gets fixed instead of
+  a second issue being filed. At the ceiling, `AI Agent = Needs Review` instead, with a comment listing every fix
+  attempt's run.
+- **No row, or one not `open` (a human's PR):** the failure is never the agent's to fix. It always gets the analysis
+  as a PR comment, one way or another; see "Webhook (Forgejo)" in `README.md` for the three cases (shares an `open`
+  failure / shares a `pr_only` failure across two branches / no match at all).
+
+This replaces matching `trigger_user` against `config.mint.bot_logins` for loop safety: that comparison is
+case-sensitive, and the runner's own Forgejo login (`Claude-Run`) never matched the lowercase-only default
+`bot_logins` entry (`claude-run`), which is what silently dropped a real agent-PR failure before this issue.
+`config.mint.bot_logins` is unchanged and still used by the separate `/claude` PR-comment listener's own bot-login
+check.
+
+##### Closing a CI-failure issue on merge (CLAUDE-277)
+
+Closing a CI-failure issue by finding its failing job green needs a run on `default_branch`, which a PR-only workflow
+never satisfies (it has no run on `main` at all). The CI-failure webhook (`webhook-forgejo`) closes
+that gap with a second delivery kind on the same endpoint: `POST /webhooks/forgejo/<source>` now also accepts Forgejo
+`pull_request` deliveries, dispatched by the delivery's `X-Forgejo-Event` header before parsing (a value the deployed
+Forgejo's Action-run notifier does not send; an operator adding this must confirm the header against their own
+instance's actual delivery). A `pull_request` delivery runs through the same signature / replay / rate-limit / pause /
+allow-list gates the Action-run path does; only a terminal `action: "closed"` delivery does anything.
+
+- **Merged, with the failing workflow green at the PR's head commit:** every open `ci_failures` row the PR
+  references (its own `agent_pull_requests` issue, plus every key `Forge::pr_referenced_issues` finds) is closed -
+  `State` set to `config.mint.resolved_state` (default `Done`, distinct from `mint.target_state`) plus a comment
+  linking the PR and the run - and the store row marked `resolved`.
+- **Merged, with that workflow red or no run found at the head commit:** the issue is left open with a comment
+  saying so.
+- **Closed without merging:** the PR's own `agent_pull_requests` row (if any) is marked `closed`; a human's PR, with
+  no such row, is unaffected.
+
+Finding the failing workflow's run at the head commit reads `fj actions runs` again, through the same `log_token_ref`
+this listener already resolves for the Action-run path - no new credential.
 
 ##### The no-code completion path (CLAUDE-214)
 
@@ -243,9 +342,12 @@ Without the marker, a zero-commit run keeps the CLAUDE-212 behaviour unchanged (
 is what stops a silently-empty engineering run from looking successful, so the marker is the only thing that relaxes it,
 and never an escape hatch for a code task the agent could not finish (that stays `.claude-run-needs-review`).
 
-The built-in prompt correspondingly permits a bounded set of tracker writes: read across projects; create issues in
-`write_projects`; update, comment on and link the issues the run itself created; and one `subtask of` link onto the
-triggering issue. Setting `AI Agent` on **any** issue stays banned, since setting it queues an agent run.
+The built-in prompt correspondingly permits a bounded set of tracker writes: read across projects; create an issue in
+one of two cases (CLAUDE-297) - a descoped piece of the triggering issue, filed in `write_projects` and linked
+`subtask of` the triggering issue, or a bug found outside the triggering issue's scope, filed in the project whose
+VCS integration binds the buggy repo (falling back to `write_projects`) and linked `relates to` the triggering issue;
+and update, comment on and link only the issues the run itself created. Setting `AI Agent` on **any** issue stays
+banned, since setting it queues an agent run.
 
 ##### Forgejo token scopes (CLAUDE-196)
 
@@ -267,18 +369,21 @@ Every `fj` command the runner issues, the fj-source call it makes, and the categ
 
 | `fj` command (`src/provider/cli.rs`)             | fj source call                                             | Forgejo endpoint                                     | Scope category    |
 |--------------------------------------------------|-------------------------------------------------------------|--------------------------------------------------------|--------------------|
-| `repo view <repo> --json` (`:1284`)              | `fj_core::repo::get` -> `repo_get`                          | `GET /repos/{o}/{r}`                                   | repository (read)  |
-| `pr create <title> --body-file .. --head <b> --json` (`:771`) | `fj_core::prs::create` -> `repo_create_pull_request` | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
-| `pr create -aA --json` (AGit, `:843`)            | same as above                                                | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
-| `pr search --repo <r> --state open --json` (`:1316`) | `fj_core::issues::list_page` -> `issue_list_issues` (`type=pulls`), then one `prs::get` per hit | `GET /repos/{o}/{r}/issues?type=pulls`, `GET /repos/{o}/{r}/pulls/{i}` | **issue (read)** + repository (read) |
-| `pr status <id> --json` (`:1335`)                | `prs::get` + `prs::get_commit_statuses`                      | `GET /repos/{o}/{r}/pulls/{i}`, `GET /repos/{o}/{r}/commits/{sha}/status` | repository (read)  |
-| `pr merge <id> --method merge --delete` (`:1365`) | `repo::get` + `prs::get` + `prs::merge` -> `repo_merge_pull_request` | `POST /repos/{o}/{r}/pulls/{i}/merge`          | repository (write) |
-| `pr comment <id> --body-file <f>` (`:1407`)      | `fj_core::issues::create_comment` -> `issue_create_comment`  | `POST /repos/{o}/{r}/issues/{i}/comments`              | **issue (write)**  |
-| `pr edit <id> labels --add <label>` (`:1427`)    | `fj_core::issues::edit_labels` -> `issue_list_labels` + `issue_add_label` | `GET /repos/{o}/{r}/labels`, `POST /repos/{o}/{r}/issues/{i}/labels` | **issue (write)**  |
-| `pr view <id> --json` (`:1443`)                  | `prs::get` + `prs::list_files` + `repo::get`                 | `GET /repos/{o}/{r}/pulls/{i}`, `.../files`            | repository (read)  |
-| `repo collaborator <repo> permission <user> --format json` (CLAUDE-220) | `fj_core::repo::collaborator_permission` | `GET /repos/{o}/{r}/collaborators/{user}/permission` | repository (read, admin-or-self) |
+| `repo view <repo> --json` (`repo_access`)        | `fj_core::repo::get` -> `repo_get`                          | `GET /repos/{o}/{r}`                                   | repository (read)  |
+| `pr create <title> --body-file .. --head <b> --json` (`create_pr_branch`) | `fj_core::prs::create` -> `repo_create_pull_request` | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
+| `pr create -aA --json` (AGit, `create_pr_agit`)  | same as above                                                | `POST /repos/{o}/{r}/pulls`                            | repository (write) |
+| `pr search --repo <r> --state open --json` (`list_open_prs`) | `fj_core::issues::list_page` -> `issue_list_issues` (`type=pulls`), then one `prs::get` per hit | `GET /repos/{o}/{r}/issues?type=pulls`, `GET /repos/{o}/{r}/pulls/{i}` | **issue (read)** + repository (read) |
+| `pr status <id> --json` (`pr_status`)            | `prs::get` + `prs::get_commit_statuses`                      | `GET /repos/{o}/{r}/pulls/{i}`, `GET /repos/{o}/{r}/commits/{sha}/status` | repository (read)  |
+| `pr merge <id> --method merge --delete` (`merge_pr`) | `repo::get` + `prs::get` + `prs::merge` -> `repo_merge_pull_request` | `POST /repos/{o}/{r}/pulls/{i}/merge`          | repository (write) |
+| `pr comment <id> --body-file <f>` (`pr_comment`) | `fj_core::issues::create_comment` -> `issue_create_comment`  | `POST /repos/{o}/{r}/issues/{i}/comments`              | **issue (write)**  |
+| `issue comment <repo>#<n> --body-file <f>` (`issue_comment`) | `fj_core::issues::create_comment` -> `issue_create_comment` | `POST /repos/{o}/{r}/issues/{i}/comments` | **issue (write)** |
+| `pr edit <id> labels --add <label>` (`pr_add_labels`) | `fj_core::issues::edit_labels` -> `issue_list_labels` + `issue_add_label` | `GET /repos/{o}/{r}/labels`, `POST /repos/{o}/{r}/issues/{i}/labels` | **issue (write)**  |
+| `pr view <id> --json` (`pr_referenced_issues`)   | `prs::get` + `prs::list_files` + `repo::get`                 | `GET /repos/{o}/{r}/pulls/{i}`, `.../files`            | repository (read)  |
+| `repo collaborator <repo> permission <user> --format json` (`repo_permission`) | `fj_core::repo::collaborator_permission` | `GET /repos/{o}/{r}/collaborators/{user}/permission` | repository (read); caller must be a site admin, a repo admin, or the queried user |
 
-The comment-command listener (CLAUDE-220) uses a THIRD credential, the `write_token_ref` on a `webhook_comment` source, distinct from `forgejo.token_ref` and from the read-only `log_token_ref`. It issues `repo collaborator ... permission` (the authorization read), `pr search` (resolving the PR's head branch), and `pr comment` (every reply), and it authenticates the branch push, so it needs `write:repository` plus `write:issue` by the same table above. Because the permission read is an admin-category call on some Forgejo builds, a token that cannot read collaborator permissions makes every command fail closed with a "could not verify permission" reply rather than running unauthorized work.
+The comment-command listener (CLAUDE-220) uses a THIRD credential, the `write_token_ref` on a `webhook_comment` source, distinct from `forgejo.token_ref` and from the read-only `log_token_ref`. It issues `repo collaborator ... permission` (the authorization read), `pr search` (resolving the PR's head branch), `pr comment` (every PR reply), and `issue comment` (every plain-issue reply), and it authenticates the branch push, so it needs `write:repository` plus `write:issue` by the same table above. Forgejo answers the permission read only for a site admin, a repo admin, or the user being queried (`GetRepoPermissions`, `routers/api/v1/repo/collaborators.go`), so the bot account that owns this token needs the **Admin** role on every allowed repository; without it every command fails closed with a "could not verify permission" reply rather than running unauthorized work.
+
+The CI-failure webhook (`webhook-forgejo`) uses a FOURTH credential (CLAUDE-276): `write_token_ref` on a `[webhook.sources.<source>]` block, distinct from that same source's own `log_token_ref` and from the comment listener's `write_token_ref` above. It issues only `pr comment` (routing a CI failure on an open PR: the analysis on a human's PR, a re-queue comment on the agent's own PR, or the "already tracked" note), so it needs only **`write:issue`** - never `write:repository`, since this listener never pushes a branch or opens a PR. A source with none configured fails the run the moment a PR comment is needed (logged at `error`, recorded as a `run_events` row naming the source), rather than silently posting nothing.
 
 Two things the token does **not** have to cover: the `git push` in front of `pr create` authenticates with the daemon
 host's own git credentials, not this token (CLAUDE-194); and the org-label lookup inside `pr edit labels`
@@ -300,27 +405,33 @@ equivalent, so the backend pushes the working branch before opening the PR. The 
 must carry the **`repo`** and **`pull_request`** scopes (used for the authenticated push, the MCP call, and `gh`). The
 gather-time preflight probes one capability per scope, so a PAT short of either is rejected before the run (CLAUDE-207).
 
-##### CI-gated automerge (CLAUDE-126)
+##### CI-gated automerge (CLAUDE-126, event-driven since CLAUDE-278)
 
 By default a successful run opens the PR, sets AI Agent to `code_review`, and stops; the issue stays In Progress until a
 human merges. Setting `youtrack.automerge.enabled: true` opts each successful run into merging the PR itself once its CI
-checks pass. After the PR is opened, finalize polls the PR's combined CI status (`fj pr status`) every
-`check_interval_seconds` up to a total budget of `wait_seconds`, honoring the run's cancel token so a `claude-run stop`
-never hangs on a long wait. The outcomes:
+checks pass. `finalize` itself never waits for CI: once the PR is opened it stops at Code Review exactly as when automerge
+is disabled. The merge instead happens later, driven by a Forgejo webhook `success` or `recover` Action-run event on that
+PR's head commit (`POST /webhooks/forgejo/<source>`, the same endpoint the CI-failure listener uses) - so the wait holds
+no job slot no matter how long the suite takes, and there is nothing to time out. On each such event, once the daemon has
+resolved which recorded agent PR it belongs to and confirmed that PR's action still has automerge enabled, it reads the
+PR's combined CI status (`fj pr status`):
 
 - **Green and up to date:** the PR is merged as a **merge-commit** (never squash/rebase, so the single commit's bare
   `#<KEY>` reference survives in history), State is set to `state_done` and AI Agent to `done`, and a "runner merged"
-  comment is posted. The run's outcome is `Merged`.
-- **Branch behind base:** if the checks are green but the forge reports the PR as not mergeable (its branch is behind a
-  base that requires an up-to-date branch), the runner performs the Forgejo "Update Branch" step once (it merges the base
-  into the head with the git CLI and pushes, retriggering CI) and keeps polling within the same budget. `fj` exposes no
-  `pr update-branch` subcommand, so this is done with git rather than the REST API. A branch that stays unmergeable after
-  one update is left open for a human.
-- **CI failure:** no merge; the PR is left open at Code Review and a failure comment is posted.
-- **Budget exhausted while still pending:** no merge; the PR is left open at Code Review and a timeout comment is posted.
+  comment is posted.
+- **Green but not mergeable** (the branch is behind its base): the webhook handler has no workdir to run the Forgejo
+  "Update Branch" step from, so it only comments that the branch needs updating and leaves the issue at Code Review;
+  updating the branch (or pushing a new commit) retriggers CI, and the next `success` event tries again.
+- **Anything else** (other checks still pending, or a failure): no action. A later `success` event on the same PR is what
+  retries; a real CI failure is handled by the existing CI-failure webhook routing, not by this path.
 
-Automerge is currently implemented for the Forgejo (`fj`) backend only; a GitHub-hosted job with automerge enabled logs
-the unsupported merge and leaves the PR at Code Review (GitHub automerge is a follow-up).
+Operators must point their Forgejo webhook at "Action Run" success **and** recover events, in addition to failure, for
+this to fire (see the README "Webhook (Forgejo)" operator-setup note). `automerge.wait_seconds` and
+`automerge.check_interval_seconds` are deprecated: the runner no longer polls, so an action file still setting them keeps
+loading (with one deprecation warning at load) but the values are otherwise ignored.
+
+Automerge is currently implemented for the Forgejo (`fj`) backend only; a GitHub-hosted job with automerge enabled has no
+merge event to react to (GitHub automerge is a follow-up).
 
 ##### Pre-clone dependency gate (CLAUDE-161)
 
@@ -328,7 +439,7 @@ When issues are mass-assigned to the runner (AI Agent = Queued), an issue whose 
 
 CLAUDE-182: the gate (and the live AI-Agent re-read) run at **gather time**, before the daemon-wide concurrency KeyGate is acquired, so a blocked or no-longer-Queued issue is dropped from the candidate set and never competes for its project's single per-poll work slot. Before CLAUDE-182 the gate ran only after an issue won the KeyGate, so a blocked issue could win the shared project key each poll, hit the gate, and consume the slot that a genuinely-workable same-project sibling needed, starving the sibling indefinitely. The gate is re-run once more after the winning issue takes the key (the authoritative pre-clone re-check for the cross-run TOCTOU); its `blocked_until` backoff and idempotent side effects make the second read cheap.
 
-A link blocks when its direction-resolved `verb` is listed in `dependencies.block_on` and its target is unresolved (`resolved` is null/absent). The defaults are `depends on` (Depend INWARD: an open blocker gates this issue) and `parent for` (Subtask OUTWARD: an open child gates this parent). The reverse verbs never block: `is required for` (Depend OUTWARD, issues this one blocks) and `subtask of` (Subtask INWARD, this issue's parent). A blocker or child counts as **met** iff its `resolved` timestamp is non-null.
+A link blocks when its direction-resolved `verb` is listed in `dependencies.block_on` and its target is unresolved (`resolved` is null/absent). The defaults are `depends on` (Depend INWARD: an open blocker gates this issue) and `parent for` (Subtask OUTWARD: an open child gates this parent). The reverse verbs never block: `is required for` (Depend OUTWARD, issues this one blocks) and `subtask of` (Subtask INWARD, this issue's parent). A blocker or child counts as **met** iff its `resolved` timestamp is non-null. With `block_cross_project: false`, a link whose target sits in another project (by key prefix) never blocks, whatever its verb (CLAUDE-295).
 
 When blocked:
 
@@ -339,6 +450,10 @@ When blocked:
 - CLAUDE-195: a **human-initiated** run always ignores an open backoff window and re-reads the links live. "Manual" is any origin other than the scheduler's periodic pickup: `claude-run trigger <action>` (dispatch origin `trigger`) and a direct `claude-run run` (origin `cli`). An operator who just resolved a blocker and triggers expects an evaluation against the live tracker, not a replay of the cached signature, so the manual trigger picks the issue up in the same run instead of waiting out `recheck_timeout`. Only the periodic `scheduler` origin keeps the throttle. The bypass changes only whether an open window suppresses the read; every persistence and comment side effect (fresh signature / `blocked_until` when still blocked, row clear when unblocked, re-comment only on a changed blocker set) is unchanged.
 
 When dependencies are met, the issue has none, or `enabled: false`, the gate is a no-op and pickup proceeds exactly as before (Working, clone, claude). No "unblocked" comment is posted; the normal Working transition and eventual PR are the signal. If the link read itself fails, the gate does not strand the issue: it falls back to normal pickup (the agent self-parks if it truly cannot proceed), since the gate is an optimization over that correct baseline.
+
+CLAUDE-225: a block that lasts is **announced**, because everything about the blocked path is otherwise silent. The issue keeps its Queued field value, its comment says it "will be re-evaluated automatically", and a poll whose every candidate is blocked returns before `run_begin`, so no run row is written either. The gate row therefore carries `blocked_since` (migration `0019_dependency_gate_blocked_since.sql`), stamped when the block starts and preserved across every re-arm, so the age measured is the age of the whole block rather than of the last evaluation; the row is deleted when the blockers clear, so the signal clears itself with no acknowledgement. Once a block passes `STALE_GATE_AFTER_MS` (one hour, `src/state.rs`) it surfaces in three places: a `warn` line in the daemon journal on each evaluation, a Dashboard banner listing the action, issue, age, blocker set, and last evaluation, and a `stale_gates` block on `/api/status` (so `claude-run status` reports it with or without the daemon). The banner separately flags a **recheck overdue** gate, whose `blocked_until` deadline passed more than the threshold ago: that means the promised re-evaluation is not running at all, so the blockers may already be resolved, which is a different fault from a dependency that is simply still open.
+
+For that signal to stay trustworthy, each poll also prunes the gate rows whose issue the action's query no longer matches (resolved by hand, re-fielded, or dropped by a query change). A pruned row held nothing, and left in place it would sit in the banner permanently. The prune runs only after a **successful** query, and it keys off what the query matched rather than what survived the VCS / access filters, so a project skipped for one poll keeps its row (and is not re-commented when it comes back).
 
 ##### Forge repo-access preflight (CLAUDE-194, CLAUDE-207)
 
@@ -382,225 +497,6 @@ injected as the `gh` child's `GH_TOKEN`, the MCP bearer, and the authenticated p
 env-var / URL component it leaves no on-disk plaintext to scrub and is dropped with the job. The gather step and the forge preflight materialize their own short-lived stores; every such directory carries a process-wide unique suffix, so two overlapping polls of one action never share a path and one poll finishing can never scrub another's live credential files (CLAUDE-209). When no block sets
 `token_ref`, the CLIs fall back to host-configured credentials (`gh` host auth / `GH_TOKEN` for GitHub) exactly as the
 scripted action did.
-
-#### `kind: forgejo-ci-fix`
-
-A single flat config record (no sub-records). The handler scans `repos` on `host` for open PRs whose head-commit
-combined CI state is `failure` and that were updated within `window_minutes`, keeps ONLY PRs authored by `bot_author`
-(the bot's own PRs), clones the PR branch, runs Claude to fix the failing CI, applies a diff-size decision gate, commits
-as the bot identity with `skip_marker` and pushes on `push`, and posts a PR comment on every outcome path. The dedup /
-attempt key is the PR head SHA (a per-commit attempt cap). The generic blocks (`workdir_base`, `claude`, `limits`,
-`schedule`, `output`) stay at the top level of the action, not inside `native`.
-
-**CLAUDE-149: only the bot's own PRs, iterate then flag Needs Review.** The author filter is inverted from the old
-anti-feedback-loop skip: a human's failing PR is left to its author (the bot never pushes onto someone else's branch),
-and only PRs authored by `bot_author` (the PRs the bot opened working a queued issue) are worked. The bot keeps pushing
-corrective commits to its own PR until CI passes; because the per-commit cap resets on every new head SHA, a separate
-per-PR counter bounds the iteration. After `max_pr_attempts` distinct fix pushes on one PR the handler stops and flags it
-Needs Review: it posts a PR comment, adds the `needs_review_label` Forgejo label (`fj pr edit <repo>#<n> labels --add`),
-and, when the PR body references a `#<KEY>-N` issue, best-effort sets that source issue's State to `needs_review_state`
-and assigns `review_assignee` (when set). `enabled` defaults to `true` and is a master kill switch. The complementary
-webhook-side change suppresses the mint's queued auto-fix route for any failure that already has an open PR (a
-`human_action` failure on an open PR still mints).
-
-```yaml
-kind: forgejo-ci-fix
-native:
-  enabled: true                       # CLAUDE-149 master kill switch (default on)
-  host: dev.a8n.run                   # forge host passed to `fj --host`
-  repos: # allow-list of owner/name repos to scan
-    - contoso/claude-fix-sandbox
-  window_minutes: 45                  # only PRs updated this recently
-  max_files: 10                       # decision gate: too_big over this many files
-  max_lines: 300                      # decision gate: too_big over this many lines
-  bot_author: claude-run              # ONLY this author's PRs are fixed + git commit author name
-  bot_email: claude-run@a8n.run       # git commit author email
-  skip_marker: "[skip claude]"        # appended to the fix commit message
-  max_pr_attempts: 3                  # per-PR fix-push ceiling, then Needs Review
-  needs_review_label: needs-review    # label added at the ceiling
-  needs_review_state: "Needs Review"  # source-issue State set at the ceiling (best-effort)
-  review_assignee: nate               # optional source-issue assignee at the ceiling
-  token: <token>                      # optional; inline plaintext (CLAUDE-26 encrypts)
-```
-
-| Key                  | Default              | Meaning                                                              |
-|----------------------|----------------------|----------------------------------------------------------------------|
-| `enabled`            | `true`               | CLAUDE-149 master kill switch. While false the handler no-ops.       |
-| `host`               | `dev.a8n.run`        | Forgejo host (bare, no scheme) passed to `fj --host`.                |
-| `repos`              | `[]`                 | Allow-list of `owner/name` repos to scan. Empty means scan none.     |
-| `window_minutes`     | `45`                 | Only consider PRs updated within this many minutes of the run.       |
-| `max_files`          | `10`                 | Decision gate: a diff touching more files is `too_big`.              |
-| `max_lines`          | `300`                | Decision gate: a diff changing more lines is `too_big`.              |
-| `bot_author`         | `claude-run`         | ONLY this author's PRs are auto-fixed (CLAUDE-149) + git commit author. |
-| `bot_email`          | `claude-run@a8n.run` | Git commit author email.                                             |
-| `skip_marker`        | `[skip claude]`      | Appended to the fix commit so the bot's push does not re-trigger.    |
-| `max_pr_attempts`    | `3`                  | Per-PR fix-push ceiling before the PR is flagged Needs Review.       |
-| `needs_review_label` | `needs-review`       | Forgejo label added to the PR at the ceiling.                        |
-| `needs_review_state` | `Needs Review`       | YouTrack State set on the PR's source issue at the ceiling (best-effort). |
-| `review_assignee`    | none                 | Optional YouTrack login assigned to the source issue at the ceiling. |
-| `token`              | none                 | API token, inline plaintext for now (CLAUDE-26 encrypts).            |
-
-All Forgejo reads (open PRs, head-commit CI status, the PR body for the source-issue link) and the comment / label writes
-go through the `fj` CLI (no raw REST); clone / push auth comes from `fj`'s own credential store. **Deployment
-prerequisite:** the runner's `fj` must be a build that exposes `--json` on `pr search` (FJ-1), `pr status` (FJ-2), and
-`pr view`, plus `pr edit <PR> labels --add`. An older `fj` without these cannot drive the gather reads or the Needs
-Review flag.
-
-#### `kind: ci-failure-analysis`
-
-A single flat config record (no sub-records). The handler scans the tracker for open, unresolved issues whose summary
-starts with one of `summary_prefixes` and that are not yet marked analyzed, then for each: parses the run coordinates from
-the issue's `## Failure` block, fetches the complete redacted run log through `fj actions logs <run_number>` (the
-per-repo run number the block already carries; PAT from `log_token_ref`) plus the failing workflow YAML into the workdir,
-runs one agentic `claude` session
-(tools `Read,Grep,Bash`) over both files, and posts a deep root-cause comment before marking the issue analyzed (a hidden
-comment marker) so it is never analyzed twice. The dedup / attempt key is the issue id. The generic blocks
-(`workdir_base`, `claude`, `limits`, `schedule`, `output`) stay at the top level of the action, not inside `native`.
-
-**Selection is by summary prefix + analyzed-marker ONLY; it NEVER selects by `AI Agent: Queued`.** That field belongs to
-the code-fix runner in `actions/youtrack.yml`; analysis is read-only enrichment and must not collide with it, so `query`
-must not filter on `AI Agent`. A log miss (`AuthDenied` / `TransientMiss` / `Failed`) posts a short "unavailable" note
-once and leaves the issue un-marked so a later run retries; it never crashes or marks analyzed on a miss. Redaction is
-preserved end to end via `forge_log::redact`. Log reads shell out to `fj actions logs` and the workflow-YAML read to
-`fj repo file` (CLAUDE-205). Both go through `forge_log` (Rust), never a raw REST call and never one from a nu snippet
-(tooling-gap rule).
-
-```yaml
-kind: ci-failure-analysis
-native:
-  enabled: true                       # master toggle (default true)
-  query: "#Unresolved"                # candidate query; MUST NOT filter by AI Agent
-  summary_prefixes: # summary prefixes an issue must start with
-    - "CI failure:"
-    - "Auto-fix:"
-  log_token_ref:                      # per-repo Forgejo PAT; omit to inherit config.webhook.sources
-    - repos: ["contoso/*"]          # exact owner/repo, owner/*, or *; first match wins
-      token_ref: forgejo-logs-contoso
-    - repos: ["initech/*", "globex/*"]
-      token_ref: forgejo-logs-initech
-  max_analysis_bytes: 24576           # cap on the posted analysis comment
-```
-
-| Key                  | Default                        | Meaning                                                              |
-|----------------------|--------------------------------|----------------------------------------------------------------------|
-| `enabled`            | `true`                         | Master toggle. While false the handler no-ops.                       |
-| `query`              | `#Unresolved`                  | YouTrack candidate query. MUST NOT filter by `AI Agent` (see above). |
-| `summary_prefixes`   | `["CI failure:", "Auto-fix:"]` | Summary prefixes an issue must start with to be analyzed.            |
-| `log_token_ref`      | the webhook sources            | Forgejo PAT with the **`read:repository`** scope, used to fetch the log and read the workflow YAML. Either one encrypted-secret name (CLAUDE-26) for every repo or a per-repo mapping (CLAUDE-200, see **Per-repo log tokens**). Reaches `fj` through a temp single-host `keys.json` carrying that one secret and nothing else (CLAUDE-204/CLAUDE-205), never a process argument. Read-only and repository-category only: every endpoint `fj` touches on its behalf (the three `fj actions logs` calls `/repos/{o}/{r}/actions/runs`, `.../runs/{id}/jobs`, `.../jobs/{id}/logs`, plus `/repos/{o}/{r}/raw/{path}` behind `fj repo file`) is in Forgejo's repository group behind `reqRepoReader(unit.TypeActions)`, so unlike `forgejo.token_ref` this one needs no issue scope (CLAUDE-196). Omitted, the mapping is derived from `config.webhook.sources`. |
-| `max_analysis_bytes` | `24576`                        | Cap (bytes) on the posted analysis comment.                          |
-
-**Deployment prerequisite:** a host `fj` on `PATH` carrying both `fj actions logs` and `fj repo file` (FJ-67), and a
-Forgejo exposing the Actions read endpoints it calls. `fj repo file` landed on `pandoras-box/forgejo-cli` `main` after
-the `v0.13.0` tag (merge `b08d8bc`), so no released version ships it yet: build from that commit or newer. Where they
-are absent the fetch reports a miss and the handler posts an "unavailable" note rather than crashing.
-
-##### Per-repo log tokens (CLAUDE-200)
-
-Both CI-failure actions select issues across a global `#Unresolved` query, so their candidate set spans every org and no
-single PAT can serve it. `log_token_ref` therefore takes either form:
-
-```yaml
-log_token_ref: forgejo-logs-contoso   # one secret for every repo
-```
-
-```yaml
-log_token_ref:                          # per-repo; the first matching entry wins
-  - repos: ["contoso/*"]              # exact owner/repo, per-owner owner/*, or the global *
-    token_ref: forgejo-logs-contoso
-  - repos: ["initech/*", "globex/*"]
-    token_ref: forgejo-logs-initech
-```
-
-The scalar form is exactly a single `*` entry, so a pre-CLAUDE-200 config keeps working. Patterns use the same three
-literal forms as the webhook allow-list (`crate::config::repo_matches`); ordering, not specificity, decides, so put the
-exact entries first.
-
-**Omitting the key** derives the mapping from `config.webhook.sources`: each source contributes its `allowed_repos` and
-its own `log_token_ref` (a source carrying no log token contributes nothing), in source-name order. That keeps one place
-to rotate a token and lets ONE deployed copy of each action cover every org.
-
-Both shapes are editable in each CI-failure kind's structured web form (CLAUDE-211): a source selector picks derive
-(writes no key), one secret for every repo, or repeatable `{repos, token_ref}` rows.
-
-A repo that matches no entry is **skipped with a warning**: `ci-failure-analysis` leaves the issue untouched and posts no
-"log unavailable" note (that note is reserved for a real log miss on a repo the deployment does hold a token for), and
-`ci-failure-reconcile` skips the repo before any Forgejo read rather than spending a request that would 401.
-
-#### `kind: ci-failure-reconcile`
-
-A single flat config record (no sub-records). The mint path only ever observes CI failures, so a stale open "CI failure"
-/ "Auto-fix" issue is closed by hand today; this handler closes it automatically once its failing job is green again. On
-each run it scans the tracker for open issues whose summary starts with one of `summary_prefixes`, inspects each and reads
-the hidden `Branch:` / `Job:` markers the CLAUDE-190 rekey embeds (plus the `## Failure` block's `- Repo:` / `- Workflow:`
-/ `- Run:`); a pre-rekey issue whose branch/job are not parseable is skipped and left for manual close. Then for each
-allow-listed repo it pages the Forgejo runs list, reduces it to the LATEST run per `(branch, workflow_id)` (resolving a
-a branch the runs list does not carry as a plain name from the run's log environment dump, bounded by
-`max_branch_resolves`), and reads each latest run's
-per-job status from the jobs endpoint. Every open issue whose `(repo, branch, workflow, job)` exactly matches a now-green
-job (job status `success`) is closed: State set to `resolved_state` and a run-linked comment posted. The dedup key is the
-issue id.
-
-**Duplicate collapse (CLAUDE-198).** Mint's cross-run collapse is a tracker full-text search on the hidden
-`Root-Cause-Key:` marker, so a lagging tracker index lets two failures of the same job mint two issues. Before any
-Forgejo read, the handler groups the gathered issues by `(repo, root_cause_key)` and closes every issue of a group but
-the OLDEST (lowest issue number, the one mint's association comments already append to): State set to `resolved_state`
-and the `duplicate_comment` posted, carrying the same hidden auto-closed marker. Only the survivor goes on to the
-now-green check. Grouping is on the repo as well as the key, so a marker collision across repos closes nothing, and an
-issue with no `Root-Cause-Key:` marker (pre-rekey) is never grouped and never closed as a duplicate. Set
-`close_duplicates: false` to leave duplicates open.
-
-**Only the LATEST run decides.** A newer failure after an older green run leaves the job red and the issue open. Matching
-is exact on all four of `(repo, branch, workflow, job)`, so a green sibling branch or job never closes a still-broken
-issue. The close is idempotent: an already-closed issue (its resolved State drops it from `#Unresolved`, and a hidden
-auto-closed comment marker) is never re-closed or re-commented. **Selection is by summary prefix + markers ONLY; it NEVER
-selects by `AI Agent`** (reconcile is independent of the code-fix runner), so `query` must not filter on `AI Agent`. The
-reconciler performs no git/PR actions and does not depend on the CLAUDE-189 analysis having run. Log and per-job status
-reads shell out to `fj actions logs` and the runs list to `fj actions runs` (CLAUDE-205). Both go through `forge_log`
-(Rust), never a raw REST call and never one from a nu snippet (tooling-gap rule).
-
-```yaml
-kind: ci-failure-reconcile
-native:
-  enabled: true                       # master toggle (default true)
-  query: "#Unresolved"                # candidate query; MUST NOT filter by AI Agent
-  summary_prefixes: # summary prefixes an issue must start with
-    - "CI failure:"
-    - "Auto-fix:"
-  repos: # allow-list: exact owner/repo, owner/*, or *
-    - contoso/claude-run
-  log_token_ref:                      # per-repo Forgejo PAT; omit to inherit config.webhook.sources
-    - repos: ["contoso/*"]          # exact owner/repo, owner/*, or *; first match wins
-      token_ref: forgejo-logs-contoso
-    - repos: ["initech/*", "globex/*"]
-      token_ref: forgejo-logs-initech
-  resolved_state: Done                # State set on a closed issue
-  close_comment: "Auto-closed: run #{run_index} on `{branch}` succeeded ({run_url}); the failing `{job}` is green, root cause resolved."
-  max_branch_resolves: 40             # cap on per-repo branch-from-log resolutions
-  close_duplicates: true              # collapse issues sharing a Root-Cause-Key onto the oldest
-  duplicate_comment: "Auto-closed as a duplicate of {canonical}: both issues track the same failing job (root-cause key `{root_cause_key}`). Follow {canonical} for the fix."
-```
-
-| Key                   | Default                        | Meaning                                                                                 |
-|-----------------------|--------------------------------|-----------------------------------------------------------------------------------------|
-| `enabled`             | `true`                         | Master toggle. While false the handler no-ops.                                          |
-| `query`               | `#Unresolved`                  | YouTrack candidate query. MUST NOT filter by `AI Agent`.                                 |
-| `summary_prefixes`    | `["CI failure:", "Auto-fix:"]` | Summary prefixes an issue must start with to be reconciled.                              |
-| `repos`               | `[]`                           | Allow-list of `owner/repo` full names to scan: exact `owner/repo`, `owner/*`, or `*`. Empty scans nothing. |
-| `log_token_ref`       | the webhook sources            | Forgejo PAT with the **`read:repository`** scope, used to page the runs list and to read each latest run's per-job status and log (which also resolves a null-branch run's branch). Either one encrypted-secret name (CLAUDE-26) for every repo or a per-repo mapping (CLAUDE-200, see **Per-repo log tokens**). Reaches `fj` through a temp single-host `keys.json` (CLAUDE-204). Repository-category only, same as the `ci-failure-analysis` log token (CLAUDE-196). Omitted, the mapping is derived from `config.webhook.sources`. |
-| `resolved_state`      | `Done`                         | State set on a closed issue (the CLAUDE project's only resolved State).                  |
-| `close_comment`       | (the auto-closed sentence)     | Run-linked close-comment template; `{run_index}` / `{branch}` / `{run_url}` / `{job}` are substituted, and a hidden auto-closed marker is appended. |
-| `max_branch_resolves` | `40`                           | Cap on per-repo branch-from-log resolutions for runs whose branch the runs list does not carry as a plain name (`fj`'s `head_branch` is Forgejo's `prettyref`: `#<pr-number>` on a PR run, the bare sha on a ref-deleted push). Reaching it is logged, never silent. |
-| `close_duplicates`    | `true`                         | Collapse open issues sharing a `(repo, Root-Cause-Key:)` onto the oldest and close the rest as duplicates, before any Forgejo read (CLAUDE-198). |
-| `duplicate_comment`   | (the duplicate sentence)       | Duplicate close-comment template; `{canonical}` (the surviving issue id) and `{root_cause_key}` are substituted, and the same hidden auto-closed marker is appended. |
-
-`repos` and `resolved_state` are the distinctive keys that disambiguate this variant from the other native configs under
-the untagged `native:` block, so a shipped action must set at least one of them (the shipped `ci-failure-reconcile.yml`
-sets both). The generic blocks (`schedule`, `output`, `limits`) stay at the top level of the action.
-
-**Deployment prerequisite:** a host `fj` on `PATH` carrying both `fj actions logs` and `fj actions runs` (FJ-66), and a
-Forgejo exposing the Actions read endpoints they call. `fj actions runs` landed on `pandoras-box/forgejo-cli` `main`
-after the `v0.13.0` tag (merge `b08d8bc`), so no released version ships it yet: build from that commit or newer. On a
-deployment lacking either, a repo scan is skipped with a warning rather than crashing.
 
 #### `kind: closed-issue-summary`
 
@@ -747,22 +643,59 @@ Tuning for the `claude` CLI call. All keys are optional.
 | `cwd`             | per-job `$workdir`               | Working directory for the claude process. Plain string. |
 | `allowed_tools`   | `Read,Edit,Write,Bash,Glob,Grep` | Passed as `--allowed-tools`.                            |
 | `permission_mode` | `acceptEdits`                    | Passed as `--permission-mode`.                          |
+| `model`           | `config.claude.model`, else the `claude` CLI's own default | Passed as `--model`, verbatim (CLAUDE-239). |
+| `effort`          | `config.claude.effort`, else the `claude` CLI's own default | Passed as `--effort`, verbatim: `low`, `medium`, `high`, `xhigh`, `max` (CLAUDE-259). |
+| `autocompact`     | `config.claude.autocompact`, else `200000`                  | Passed as `--autocompact`, verbatim: `auto`, or a window of 100000-1000000 tokens (DEV-706). |
+
+**Model selection (CLAUDE-239).** The effective model is resolved per invocation in this order: this action's `model`, else the global default in the `Claude invocation` settings section (DB key `config.claude`, field `model`, edited on `/settings` or via `GET` / `PUT /api/settings/claude`), else nothing at all - no `--model` flag is passed and the `claude` CLI applies its own default. The runner never validates the value at any layer: it is handed to `--model` untouched, and the CLI is the source of truth for which models exist, so new aliases and dated ids (`sonnet`, `opus`, `claude-sonnet-4-5-20250929`, ...) work without a runner change. Like every DB-backed section, `config.claude` is DB-only from birth (never a `config.toml` key) and applies to the next invocation, with no daemon restart.
+
+**Effort selection (CLAUDE-259).** The effective effort level resolves on exactly the same three-step precedence: this action's `effort`, else `config.claude.effort` (same settings section, same API path), else nothing at all - no `--effort` flag is passed and the `claude` CLI applies its own default. No layer rejects a value and no layer substitutes one, so a level Anthropic adds after this release works without a runner change. What the runner does add is one `warn` per invocation when the resolved value is outside the documented set (`low`, `medium`, `high`, `xhigh`, `max`), naming the value, whether it came from the action or the global default, and the known set. That warn exists because the CLI does NOT fail on an unknown level: it prints `Warning: Unknown --effort value '<x>' - ignoring it and using the default effort` on stderr and carries on at its default, which inside a run lands unstamped in the stream log where nothing notices it. Without the runner's own warn, a typo would silently downgrade effort for every run of that action.
+
+**Compaction window (DEV-706).** The effective `--autocompact` window resolves on the same three-step precedence: this action's `autocompact`, else `config.claude.autocompact`, else the runner's own `200000` (`crate::claude::DEFAULT_AUTOCOMPACT`). Unlike `model` and `effort`, the last step is a VALUE rather than nothing: the CLI's own `auto` scales the window to the model's whole context, so on a 1M-context model a long tool-heavy session never compacts and resends every completed operation's tool payloads on every turn. That is what made cumulative spend grow with the square of the number of tool calls rather than linearly, with tool output rather than reasoning dominating the bill. A bounded window keeps full results for the operation in flight and a short carry-forward summary for the ones already finished. Set `autocompact: auto` on an action to opt back into the CLI's behavior. Values are passed through untouched; the CLI validates them.
 
 The runner always passes `--print --verbose --output-format stream-json`. It wraps the call in `timeout
 $claude_timeout_seconds`. Stdout+stderr are redirected to a per-job NDJSON stream log:
 
+**Background work is disallowed, unconditionally (CLAUDE-280).** No action setting turns this off. Every `claude`
+child runs with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` in its environment and `--disallowedTools=Monitor,ScheduleWakeup`
+on its command line, because a session run under `--print` is over the instant its turn ends: a turn that ends
+"waiting" on a backgrounded `Bash` command, a `Monitor` call, or a `ScheduleWakeup` call never gets to resume, and the
+work it left running is not part of the outcome the runner reads. As a backstop, if a stream log's terminal `result`
+event is followed by a `system`/`task_updated` event reporting `patch.status: killed` (the shape produced when the
+runner terminates a leftover background task that outlived the result), the run finalizes as a non-transient failure
+naming the task id rather than the success the `result` event reported.
+
 ```
-$CLAUDE_RUN_LOG_DIR/<name>/streams/<key>-attempt-<n>.jsonl
+$CLAUDE_RUN_STATE_DIR/logs/<name>/streams/<key>-attempt-<n>.jsonl
 ```
 
 `tail -f` that file from another terminal to watch Claude work in real time. The final `result` event on the last line
 is parsed for cost (`total_cost_usd`) and outcome (`result`, `is_error`) once claude exits.
 
+A relay thread inside the runner is that file's only writer, so if writing to it fails (a full log partition is the
+usual cause) every later event is lost, including the terminal `result`. CLAUDE-233: that is reported as what it is - a
+runner-side I/O failure naming the underlying error and the log path - rather than as claude failing to produce a
+result, and it is classified `transient`, so it costs the job no attempt and the job is retried on the next poll. When
+the `result` event was already captured before the write failed, the run is still finalized from it and the truncation
+is logged at `warn`.
+
+**Retention (CLAUDE-245).** Stream logs are bounded, not permanent. A daemon sweep runs at `serve` start and hourly
+thereafter, deleting every `logs/<name>/streams/<key>-attempt-<n>.jsonl` whose last-modified time is older than the
+configured window; every pass logs its `deleted` / `kept` / `bytes_reclaimed` tally at `info`. A log whose job is still
+in flight is kept no matter how old it is: the sweep reads the in-flight job set from the same database the daemon
+records its runs in, so age is never the only evidence a run has finished. The window is the `Stream log GC` settings
+section (DB key `config.stream_log_gc`, fields `enabled` (default `true`) and `retention_days` (default `30`)), edited
+on `/settings` or via `GET` / `PUT /api/settings/stream_log_gc`. Like every DB-backed section it is DB-only from birth
+(never a `config.toml` key) and applies on the next sweep. Set `enabled: false` to park the sweep without losing the
+window, but note that nothing then bounds the directory: an unbounded `logs/` filling its partition is exactly what
+truncated the stream logs described above.
+
 ### `post` (list of nu snippets, optional)
 
 Ordered steps that run after every code path that reached the workdir: Claude success, Claude non-transient failure,
 prompt-snippet failure, empty-prompt, and pre-step failure all run post. The single exception is transient Claude errors
-(rate limit, auth) - those skip post and return early so the job can be retried cleanly on the next firing.
+(rate limit, auth, and the stream-log write failure above) - those skip post and return early so the job can be retried
+cleanly on the next firing.
 
 When a run is canceled while this job is in flight, its claude child is terminated and post still runs, with a
 synthesized cancelled `$claude_result` (`ok: false`, `error: "run cancelled by operator"`, `cost: 0`), so end-of-job
@@ -842,21 +775,45 @@ plain convention between an action's prompt and its post step; the runner itself
 
 ### `output.file` (string, optional)
 
-If set, the runner appends one JSON line per job to `$CLAUDE_RUN_LOG_DIR/<name>/<output.file>` summarizing the outcome
+If set, the runner appends one JSON line per job to `$CLAUDE_RUN_STATE_DIR/logs/<name>/<output.file>` summarizing the outcome
 (job key, attempt number, claude cost, push/comment results from post steps, etc.).
 
-If omitted, per-job outcomes are only visible in the daily JSONL log.
+If omitted, no JSONL file is written; per-job outcomes are still recorded in the `job_outcomes` table and rendered on the
+run detail page. The file is bounded by size, never by age: see [State + lock layout](#state--lock-layout).
 
 ### `limits` (record, optional)
 
 Per-action overrides for the runner-wide defaults. Any subset of:
 
-| Key                      | Env default                              |
-|--------------------------|------------------------------------------|
-| `max_attempts_per_key`   | `$env.CLAUDE_RUN_MAX_ATTEMPTS_PER_KEY`   |
-| `max_runs_per_day`       | `$env.CLAUDE_RUN_MAX_RUNS_PER_DAY`       |
-| `claude_timeout_seconds` | `$env.CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS` |
-| `daily_budget_usd`       | `$env.CLAUDE_RUN_DAILY_BUDGET_USD`       |
+| Key                      | Default |
+|--------------------------|---------|
+| `max_attempts_per_key`   | `3`     |
+| `max_runs_per_day`       | `20`    |
+| `claude_timeout_seconds` | `600`   |
+| `daily_budget_usd`       | `5.00`  |
+| `run_budget_usd`         | the effective `daily_budget_usd` |
+| `budget_warn_fraction`   | `0.80`  |
+| `max_issues_per_run`     | `25`    |
+
+The defaults are the built-in `RunnerDefaults::default()` (`src/job.rs`); the Rust runner reads no `CLAUDE_RUN_MAX_*` environment variable for them, so an action's YAML is the only override.
+
+CLAUDE-232: reaching `max_attempts_per_key` is **announced**, for the same reason a lasting dependency gate is (see "Pre-clone dependency gate"). It surfaces in three places: a `warn` line naming the count and the cap at each cap-check site, a Dashboard banner listing the action, key, count against the cap, and last counted attempt, and an `attempt_cap_hits` block on `/api/status` (so `claude-run status` reports it with or without the daemon). The read is the live `attempt_counters` table compared against each action's OWN effective cap, so lowering the cap parks a key immediately and raising it releases the key and grants one more attempt.
+
+CLAUDE-301: for the `youtrack` native action (`src/native/youtrack.rs`), the cap check no longer just skips the job silently. It posts one comment naming the attempt count and the cap and stating that re-queueing alone will not retry it, then sets `AI Agent` to the configured `needs_review` label as the last write - the same label the needs-review marker and a timeout use for "parked pending a human". This is why the issue no longer stays Queued forever: it leaves the candidate set the moment the cap is reported, and the comment is posted exactly once, on the poll that reports it. A failed comment or field write is logged at `error` naming the key and the cause; the cap is still reported as hit either way, so the Dashboard banner keeps showing the key until a write actually lands. The generic scripted runner (`src/job.rs`) has no tracker field to write - a scripted action's cap hit still just skips the job with a `warn`, since there is nothing in the action's own model to move.
+
+Unlike a gate row, the counter row is not deleted when the trouble clears: it is the durable record of the attempts, and nothing (not even a successful run) resets it. So the runner cannot retry a capped key by itself; retrying needs `limits.max_attempts_per_key` raised, or a per-key reset once CLAUDE-238 lands. The only other reset today is deleting the action, which purges its whole control state.
+
+CLAUDE-234: `max_issues_per_run` bounds a different axis from the other caps. `max_runs_per_day` bounds how often an action FIRES; this bounds how many issues ONE firing may create in the tracker, so a misfiring filing run opens a handful of issues rather than a hundred. It is enforced at the provider boundary (`src/provider/audit.rs`, `AuditedTracker` wrapping the `yt` backend for the duration of a run), never in a prompt: a prompt is guidance, and the ceiling exists for the case where the guidance is ignored. Reaching it refuses the create BEFORE `yt issue create` runs, logs at `warn`, and records a `run_events` row on the run, so a truncated filing run does not read as a clean one. `0` means "create nothing" rather than "unlimited". The same wrapper writes one `youtrack issue write` line per create AND per update, carrying the originating `run_id` and the issue key, so an unexpected issue resolves to a run in one journal query.
+
+The ceiling covers the writes the RUNNER itself makes through the provider (the mint, the closed-issue-summary filing, every field / state / comment write the native actions perform). It does not reach the `yt` calls an agent session makes inside its own workdir: those are a separate process with its own credentials, bounded by the agent prompt rather than by this cap (tracked separately).
+
+Deletes are denied on this surface by omission: `IssueTracker` exposes no delete, the CLI backend invokes no `yt issue delete`, and `no_delete_on_the_tracker_surface` (`src/provider/audit.rs`) fails if either reappears.
+
+DEV-705: `run_budget_usd` bounds a third axis. `max_runs_per_day` bounds how often an action fires and `daily_budget_usd` bounds a whole day across runs; `run_budget_usd` bounds what ONE firing may spend, so a single runaway run cannot eat the day. It is read from this file BEFORE the run starts, snapshotted into the run's `EffectiveLimits` (which is `Copy` and is moved into each per-job task by value), and never re-read, so it cannot be raised while the run works: raising it means editing the action and starting a new run, which makes the decision deliberate and auditable. Nothing offers to raise it, and there is no interactive path that could. Unset, it falls back to the effective `daily_budget_usd`, so adding the ceiling loosens nothing and changes no shipped action.
+
+Enforcement is two-layered. The runner accumulates each invocation's `total_cost_usd` into one per-run ledger (`crate::usage::RunSpend`, shared by every job of the run) and checks it before every job pickup; a run that has reached the ceiling starts no further job, closes its `runs` row with exit code 6, and logs a reason naming the budget and the spend. Between those checks a single session could still overshoot, so the runner also passes the run's REMAINING dollars to the child as `--max-budget-usd`, which stops the session itself. `budget_warn_fraction` (default `0.80`) emits one `warn` per run when the spend first passes that fraction of the ceiling. A cancel or a global pause keeps its own exit code; the over-budget code only overrides a run that would otherwise have finished cleanly.
+
+DEV-707: every run also reports what it spent. The runner replays each invocation's stream log for input / output / cache-read / cache-write tokens per turn, tool call counts, and per-tool attribution (a turn is attributed to the tool whose result most recently entered its context, so a dominant tool is identifiable), and emits one `run usage` summary line plus one newline-delimited JSON record per run at `$CLAUDE_RUN_STATE_DIR/logs/usage.jsonl`. The record carries the run id, action, exit code, wall-clock duration, invocation count, cost against the budget, tokens by category, turns, tool calls, `peak_context_tokens`, `cumulative_context_tokens`, `context_per_tool_call`, and the per-tool breakdown. `context_per_tool_call` is the DEV-706 measurement: flat as the number of tool calls grows is the linear signature, rising with it is the quadratic one.
 
 ### `concurrency` (record, optional)
 
@@ -998,47 +955,61 @@ Intervals shorter than 5s are not meaningful, and cron seconds-precision is hono
 
 ## Runner environment variables
 
-| Variable                            | Default                      | Purpose                                                                                              |
-|-------------------------------------|------------------------------|------------------------------------------------------------------------------------------------------|
-| `CLAUDE_RUN_STATE_DIR`              | `~/.local/share/claude-run`  | State, locks, PAUSED flags, cost ledger.                                                             |
-| `CLAUDE_RUN_LOG_DIR`                | `$CLAUDE_RUN_STATE_DIR/logs` | Daily JSONL logs and per-action output files.                                                        |
-| `CLAUDE_RUN_ACTIONS_DIR`            | `./actions`                  | Resolves bare action names to YAML files.                                                            |
-| `CLAUDE_RUN_WORKDIR_BASE`           | `/tmp/claude-run`            | Per-job workdir root. Final path = `<base>/<name>/<key>`. Overridable per action via `workdir_base`. |
-| `CLAUDE_RUN_MAX_RUNS_PER_DAY`       | `20`                         | Hard cap on Claude invocations per action per day.                                                   |
-| `CLAUDE_RUN_MAX_ATTEMPTS_PER_KEY`   | `3`                          | Per-job attempt cap when `dedup_key` is set.                                                         |
-| `CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS` | `600`                        | `timeout` wrapper around the `claude` CLI call.                                                      |
-| `CLAUDE_RUN_DAILY_BUDGET_USD`       | `5.00`                       | Skip run when today's cost ledger meets/exceeds this.                                                |
+These are the variables an ACTION author meets. Each one below is read by the Rust binary; verify with
+`grep -rn CLAUDE_RUN_ src/`. The daemon-level variables (`CLAUDE_RUN_DATABASE_URL`, `CLAUDE_RUN_DATABASE_URL_FILE`,
+`CLAUDE_RUN_SECRETS_KEY_FILE`, `CLAUDE_RUN_LOG`) are the operator's and are documented in the README, not repeated here.
+
+| Variable                  | Default                          | Purpose                                                                                          |
+|---------------------------|----------------------------------|--------------------------------------------------------------------------------------------------|
+| `CLAUDE_RUN_CONFIG_DIR`   | `$XDG_CONFIG_HOME/claude-run`    | `config.toml` and `actions/*.yml`.                                                               |
+| `CLAUDE_RUN_DATA_DIR`     | `$XDG_DATA_HOME/claude-run`      | `state.db` (SQLite backend only) and `workdirs/`.                                                |
+| `CLAUDE_RUN_STATE_DIR`    | `$XDG_STATE_HOME/claude-run`     | `logs/`: `daemon.log`, per-action `output.file`, and the per-attempt stream logs. Also `snippets/` and `webhook-logs/`. |
+| `CLAUDE_RUN_RUNTIME_DIR`  | `$XDG_RUNTIME_DIR/claude-run`    | `daemon.pid`, `daemon.sock`, and `locks/<name>.lock`.                                            |
+| `CLAUDE_RUN_ACTIONS_DIR`  | `$CLAUDE_RUN_CONFIG_DIR/actions` | Resolves bare action names to YAML files (same as `--actions-dir`).                              |
+| `CLAUDE_RUN_WORKDIR_BASE` | `$CLAUDE_RUN_DATA_DIR/workdirs`  | Per-job workdir root. Final path = `<base>/<name>/<key>`. The action's `workdir_base` field wins. |
+
+There is no environment variable for any `limits` key. CLAUDE-244: the table above used to carry
+`CLAUDE_RUN_MAX_RUNS_PER_DAY`, `CLAUDE_RUN_MAX_ATTEMPTS_PER_KEY`, `CLAUDE_RUN_CLAUDE_TIMEOUT_SECONDS`,
+`CLAUDE_RUN_DAILY_BUDGET_USD`, and `CLAUDE_RUN_LOG_DIR`, all inherited from the removed `scripts/claude-run.nu` runner
+and read by nothing in the Rust binary, so an operator setting one changed no behaviour and got no warning. The limit
+defaults come from `RunnerDefaults::default()` (`src/job.rs`) and an action's YAML `limits` block is the only override;
+logs live under the state dir as shown above.
 
 ## State + lock layout
 
 ```
 $CLAUDE_RUN_STATE_DIR/
-  PAUSED                       # global pause, applies to all actions
-  <name>.PAUSED                # per-action pause
-  locks/<name>.lock            # PID lock keyed on action name
-  state/<name>.json            # {attempts, daily_count, daily_cost_usd}
-  logs/<name>/YYYY-MM-DD.log   # JSONL runner log
-  logs/<name>/<output.file>    # JSONL per-job outcomes if output.file set
+  logs/daemon.log                              # serve --detach stdout + stderr
+  logs/daemon.log.1                            # its one rolled-over predecessor
+  logs/<name>/<output.file>                    # JSONL per-job outcomes if output.file set
+  logs/<name>/<output.file>.1                  # its one rolled-over predecessor
   logs/<name>/streams/<key>-attempt-<n>.jsonl  # claude stream-json output per attempt
+  logs/usage.jsonl                             # DEV-707: one per-run token / cost record per line
+  snippets/<name>/<key>/                       # rendered snippet scripts + one binding-<name>.json per $-binding
+  webhook-logs/                                # redacted CI job logs the Forgejo webhook triage fetched
 ```
 
-`state/<name>.json` shape:
+What bounds each path:
 
-```json
-{
-  "attempts": {
-    "<dedup_key value>": {
-      "count": 2,
-      "last_at": "2026-05-23T12:34:56-0400"
-    }
-  },
-  "daily_count": {
-    "2026-05-23": 7
-  },
-  "daily_cost_usd": {
-    "2026-05-23": 1.23
-  }
-}
+- `logs/daemon.log`: size, `config.stream_log_gc.daemon_log_max_bytes` (default 50 MiB). Past the ceiling the daemon's log GC pass copies the file to `daemon.log.1` and truncates it in place back to its newest half, so the daemon's open append handle keeps writing to the live file.
+- `logs/<name>/<output.file>`: size, `config.stream_log_gc.output_file_max_bytes` (default 50 MiB), same rollover. It is bounded by size and never deleted by age: `output.file` is an operator-configured data sink, so the sweep keeps the newest records in place instead of destroying the record.
+- `logs/<name>/streams/*.jsonl`: age, `config.stream_log_gc.retention_days` (default 30). A log whose job is still in flight is kept at any age.
+- `snippets/<name>/<key>/`: age, `config.stream_log_gc.snippet_retention_days` (default 30). A directory whose job is still in flight is kept at any age, the same guard the stream logs use.
+- `webhook-logs/`: age, `config.stream_log_gc.webhook_log_retention_days` (default 30), applied to files directly under it. `webhook-logs/analysis/<owner>_<repo>-run<N>/` (CLAUDE-274, replacing the old `webhook-logs/triage/`) is a PER-EVENT working directory the [`crate::triage::AnalysisClassifier`] creates and removes itself once the classification returns, so it needs no sweep of its own; only files directly under `webhook-logs/` (the redacted log artifacts) are swept.
+- `logs/usage.jsonl`: size, `config.stream_log_gc.usage_log_max_bytes` (default 8 MiB), same rollover to `usage.jsonl.1`. The truncation cuts at a line boundary, so what survives is still parseable newline-delimited JSON rather than a part-record (CLAUDE-268).
+
+Pause state and per-key accounting are NOT files here. Global pause is the `global_pause` flag and per-action pause the
+`paused_actions` table (`src/pause.rs`); attempt counters, daily counts, and daily cost are the `attempt_counters` and
+`daily_ledger` tables. All of them live in the state store (`state.db`, or PostgreSQL). The legacy nu runner's
+`state/<name>.json` files are read once by `claude-run migrate` and are never written.
+
+The per-action lock is a file, but it lives in the runtime dir, not here:
+
+```
+$CLAUDE_RUN_RUNTIME_DIR/
+  daemon.pid                   # daemon pidfile lock
+  daemon.sock                  # CLI control socket (absent under serve --no-socket)
+  locks/<name>.lock            # flock keyed on action name, held for one run
 ```
 
 ## Synthetic webhook action (`webhook-forgejo`)
@@ -1046,29 +1017,32 @@ $CLAUDE_RUN_STATE_DIR/
 The inbound Forgejo webhook (`POST /webhooks/forgejo/<source>`) surfaces on the dashboard as a synthetic action named `webhook-forgejo` (renamed from `webhook-fast-path` in CLAUDE-153). It is not a YAML file under `actions/`: it is Rust-defined, injected by the web layer only when at least one webhook source is configured, and reserved (an on-disk YAML claiming the name `webhook-forgejo` is refused at scan). Its per-key attempt counter and daily run ledger are recorded under this name like any other action, so its run history, durations chart, and last-run recency render on the dashboard. A one-time startup migration (SQL migration `0013` plus a log-directory rename) carries any pre-rename history across.
 
 - **Read-only:** edit, export, and delete are rejected (HTTP 403); there is no backing YAML to operate on, and a manual trigger is rejected (HTTP 400) because it is event-driven, not scheduled.
-- **Pausable (CLAUDE-153):** it participates in the same per-action Pause as every other action. Pause/Resume controls and a Paused badge appear on the dashboard, and `POST /api/actions/webhook-forgejo/pause` / `/resume` write and clear its `paused_actions` row. While paused, an inbound delivery is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, then dropped without minting or queuing, so Forgejo does not treat it as a failed delivery and retry. CLAUDE-223: the GLOBAL pause is checked first and gets the identical accept-and-drop treatment.
-- **Auto-fix toggle (CLAUDE-153):** the `Webhook` settings section carries an `auto_fix` boolean, default `false` (opt-in). When off, a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) mints nothing and queues no corrective fixup PR: the failure stays reported on the original PR for its author. A `human_action` failure still mints. When on, the corrective-fixup behavior applies (subject to the CLAUDE-149 open-PR suppression). This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. It is DB-backed (`config.webhook`) and edited live on the Settings page or via `PUT /api/settings/webhook`.
-- **Dedupe (root-cause keying, CLAUDE-190):** the cross-run collapse key is `hash(repo, branch, workflow_id, job_name, failure_signature)`, not the commit SHA, so N commits that each fail the same job on the same branch with the same failure collapse onto ONE open issue (the second and later runs append a run-association comment instead of minting a sibling), while a different failure signature on the same job stays a separate issue. The `failure_signature` is a deterministic, pure-string signature of the first diagnostic line in the redacted log (lowercased, path prefixes dropped, digit runs masked to `#`, whitespace collapsed): no LLM, no I/O. When no signature is derivable (truncated / diagnostic-free / logless failure) the key falls back to `hash(repo, branch, workflow_id, job_name)`, which still collapses a "branch is broken" storm onto one issue (a logless failure cannot distinguish two root causes on the same job, so it intentionally groups them; the CLAUDE-189 analysis can later split a mis-grouped issue). `branch` is resolved from the run's log environment dump (`GITHUB_HEAD_REF` on a PR run, else the `refs/heads/` short name, in either the `setupEnv => map[...]` or the `KEY=value` form; run detail returns `head_branch: null` on the deployed Forgejo), `job_name` from the jobs `fj actions logs` returns with the log, both in Rust (never a raw REST call from a nu snippet). The issue body carries hidden `Dedupe-Key:`, `Root-Cause-Key:`, `Branch:`, and `Job:` markers; a per-run key is retained only for webhook-redelivery idempotency, and a resolved issue is never reopened.
+- **Pausable (CLAUDE-153):** it participates in the same per-action Pause as every other action. Pause/Resume controls and a Paused badge appear on the dashboard, and `POST /api/actions/webhook-forgejo/pause` / `/resume` write and clear its `paused_actions` row. While paused, an inbound delivery is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, then dropped without minting or queuing, so Forgejo does not treat it as a failed delivery and retry. A dropped delivery is not recovered after Resume. CLAUDE-223: the GLOBAL pause is checked first and gets the identical accept-and-drop treatment.
+- **Auto-fix toggle (CLAUDE-153/CLAUDE-273):** the `Webhook` settings section carries an `auto_fix` boolean, default `false` (opt-in), that decides queuing ONLY. When off, a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) still creates an issue but with no `AI Agent` write, so no corrective fixup PR is queued: the failure stays reported on the original PR for its author. A `human_action` failure is unaffected either way. When on, the corrective-fixup behavior applies. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. It is DB-backed (`config.webhook`) and edited live on the Settings page or via `PUT /api/settings/webhook`.
+- **Open-PR routing by who opened the PR (CLAUDE-276):** before triage, the consumer resolves whether the failing commit is the head of some open PR (`resolve_open_pr`, listing the repo's open PRs); a lookup failure fails the run (`ok = false`, an `error` log) rather than being read as "no PR". No PR at all runs the dedupe-then-mint pipeline below unchanged. An open PR routes by whether `agent_pull_requests` has an `open` row for it: the agent's own PR re-queues its issue (comment + bump `fix_attempts` + `AI Agent = Queued`, or `Needs Review` at `config.webhook.agent_pr_fix_attempts`, default 3) with no PR comment and no new issue; anyone else's PR always gets the analysis as a PR comment (sharing an already-`open` failure gets a "this is already tracked" comment and an attach instead of a fresh analysis; the same failure appearing on a SECOND branch's PR mints one issue and comments both PRs). PR comments need the source's own `write_token_ref` (`write:issue` only); a source without one fails the run the moment a comment is needed rather than posting nothing silently. See "Routing a CI failure on an open PR (CLAUDE-276)" above and "Webhook (Forgejo)" in `README.md`.
+- **One tool-using analysis at ingest, no separate scheduled pass (CLAUDE-274):** a failure the store does not already track gets ONE `claude` session (`Read,Grep,Bash`, timeout `config.webhook.analysis_timeout_secs`, default 600s) over the COMPLETE redacted log and the failing workflow YAML, in its own `webhook-logs/analysis/<owner>_<repo>-run<N>/` working directory (removed once the session returns). The session ends with a fenced JSON verdict (`code_defect` | `needs_human` | `flaky` | `infra`) that routes the failure exactly as the old two-value classifier did (`code_defect` -> code-fix, `needs_human` -> human-assigned, `flaky` / `infra` -> transient, no issue), and the session's own Markdown report becomes the issue's `## Triage` analysis text (capped at 24 KiB), so the issue carries the deep, log-grounded analysis from the moment it is filed. `consume_events` processes events through a worker pool bounded by `config.webhook.analysis_concurrency` (default 2, at least 1): each event is a spawned task acquiring a semaphore permit, so a burst of failures runs at most that many analyses at once instead of one 600s session blocking every later event or an unbounded burst starting them all at once. The store lookup, the analysis, and the mint for one event additionally run under a `concurrency::KeyGate` on `(repo, workflow_id, job_name)`, so two concurrent failures of the same job never both analyze: the second waits, then finds the first's store row and attaches instead.
+- **Dedupe by failing-test overlap (CLAUDE-273, store-backed):** before triage runs, the consumer fingerprints the redacted log into `<target>::<test>` ids (`ci_failure::fingerprint`) and looks them up in the `ci_failures` store by `(repo, workflow_id, job_name)` overlap. A hit on an `open` row attaches this run (no triage, no `claude` call); a hit on a `resolved` row reopens it (`set_state`, a regression comment, then triage for the analysis comment and the `AI Agent` write); no hit falls through to one legacy YouTrack `#Unresolved` search on the pre-store collapse marker (adopting an issue minted before the store existed), then the ordinary mint. A store read or write failure fails the run rather than falling through to a mint. `mint::mint` itself no longer searches YouTrack or declines for a duplicate or a resolved issue. The issue body still carries a hidden `Dedupe-Key:` marker (the pre-store cross-run collapse key `hash(repo, branch, workflow_id, job_name, failure_signature)`, falling back to `hash(repo, branch, workflow_id, job_name)` with no derivable signature), because the legacy-adoption lookup above still reads it.
+- **Dedupe (infrastructure keying, CLAUDE-264):** the key above contains `branch`, so a failure caused by the RUNNER rather than the commit never collapsed: a full disk is identical on every branch and fixable on none of them, and with one PR branch per tracker issue every run minted a fresh issue. When `src/infra_failure.rs`'s `detect` recognizes such a condition, the cross-run collapse key becomes `hash(repo, workflow_id, job_name, infra_kind)` instead: no `branch` and no commit, and the stable kind id rather than the matched line, so the same condition keys identically however the message is worded or however many bytes free it reports. N branches hitting one host condition on one `(repo, workflow, job)` collapse onto ONE open issue; two different kinds on the same job stay two issues. The detector is pure string work over the FULL redacted log (no LLM, no I/O), reading the same text `failure_signature` does rather than the 48 KB copy the classifier prompt gets, because a capacity abort is post-steps and is exactly what that bound cuts. Three deliberately conservative kinds ship, each requiring an unambiguous phrase: `disk-full` (`no space left on device`, `enospc`, a capacity guard naming insufficient free space), `out-of-memory` (`out of memory`, `oom-kill`, `cannot allocate memory`, `killed (signal 9)`), and `runner-unavailable` (`could not resolve host`, or a reset connection on a line naming a package or container registry). An over-broad pattern would merge unrelated code failures across branches, so an undetected condition is the preferred failure mode. Triage buckets, routing, and the auto-fix path are unchanged (reclaiming disk is a human action). With no infra kind detected, every key and every decision is exactly as it was.
 
 ## Synthetic comment-webhook action (`webhook-forgejo-comment`)
 
 The inbound `/claude <instruction>` comment listener (`POST /webhooks/forgejo-comment/<source>`, CLAUDE-220 for pull requests, CLAUDE-221 for plain issues) surfaces on the dashboard as a SECOND synthetic action named `webhook-forgejo-comment`, alongside `webhook-forgejo`. Same shape as its sibling above: no YAML file under `actions/`, Rust-defined, injected by the web layer only when at least one comment source is configured, and reserved (an on-disk `webhook-forgejo-comment.yml` is refused at scan with a logged reason). Both reserved names come from ONE shared predicate (`crate::web::SYNTHETIC_ACTIONS`), read by the daemon's scan guard, the API's trigger / delete rejections, and the web layer's edit / export / delete rejections, so a new event-driven listener is reserved everywhere by adding one entry.
 
-It is a separate action from `webhook-forgejo`, not a second event type on it, because the credentials differ in kind: comment handling needs a WRITE token (post replies, push a branch) while the CI-failure sources need only a read-only log token. Separate actions also mean separate Pause switches.
+It is a separate action from `webhook-forgejo`, not a second event type on it, because the tokens differ in power: this listener's `write_token_ref` pushes branches (`write:repository` plus `write:issue`), while a CI-failure source's tokens only read logs (`log_token_ref`) and comment on pull requests (`write_token_ref`, `write:issue`). Separate actions also mean separate Pause switches.
 
 - **Read-only:** edit, export, and delete are rejected (HTTP 403); a manual trigger is rejected (HTTP 400) because it is event-driven, not scheduled.
-- **Pausable:** it participates in the same per-action Pause as every other action, and in the GLOBAL pause (CLAUDE-223), which is checked first. While either is set, an inbound delivery is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, then dropped without running anything, so Forgejo does not retry.
+- **Pausable:** it participates in the same per-action Pause as every other action, and in the GLOBAL pause (CLAUDE-223), which is checked first. While either is set, an inbound delivery is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, then dropped without running anything, so Forgejo does not retry. A dropped delivery is not recovered after Resume.
 - **Two routes, one action (CLAUDE-221):** the route is chosen by whether the comment's thread is a pull request. A PR comment clones the head branch, runs Claude, and pushes within the decision-gate caps. A PLAIN ISSUE comment has no branch to clone or push, so it clones nothing and starts no agent session: it mints a YouTrack issue in the project the repo routes to (the same `[mint]` override / VCS-integration / fallback order the CI-failure mint uses), carrying the instruction verbatim plus a link back to the Forgejo issue, sets `State` to `[mint].target_state`, and sets `[mint].ai_agent_field` to `[mint].queued_value` (`AI Agent = Queued`) LAST, so the `youtrack` action picks it up only once the issue is fully formed. Replies on that route go through `fj issue comment <owner>/<repo>#<n> --body-file <path>` (`Forge::issue_comment`), and every outcome replies: minted, created-but-not-queued (naming the key and the field to set by hand), and create-failed. It is a ROUTE, not a second listener: the authorization gate, trigger parsing, bot-login loop drop, dedupe key, and caps are the same implementations both paths run through.
 - **Accounting:** runs are recorded under this name with the same per-key attempt counter and daily run ledger as every other action. The attempt key is `hash(repo, number, comment_id)` on both routes (a Forgejo comment id is unique across a repo's issues and pull requests); because a comment is a one-shot request its effective per-key cap is one attempt, so a redelivery of the same comment never runs the work twice and never mints a second YouTrack issue. The daily run ledger advances for a mint as well as for a Claude run. `runs.triggered_by` stays `webhook` (the action name distinguishes the two listeners).
 - **Concurrency:** at most one comment job per thread, through the daemon-wide key gate. The gate key carries the thread kind, so a plain issue can never block the like-numbered pull request. A second command while one is running gets a reply saying so and is dropped.
-- **Authorization:** the commenter's effective repository permission is read LIVE per command via `fj repo collaborator <owner>/<repo> permission <username> --format json` (`Forge::repo_permission`); no raw REST on this path. Only a permission in the source's `allowed_permissions` (default `["write", "admin"]`) may run a command, and a lookup that errors denies (fail closed). Denial replies are throttled per `(repo, login)`.
+- **Authorization:** the commenter's effective repository permission is read LIVE per command via `fj repo collaborator <owner>/<repo> permission <username> --format json` (`Forge::repo_permission`); no raw REST on this path. Only a permission in the source's `allowed_permissions` (default `["write", "admin"]`), or one that outranks an entry in it (`none` < `read` < `write` < `admin` < `owner`), may run a command, and a lookup that errors denies (fail closed). Denial replies are throttled per `(repo, login)`.
 - **Config:** the `Comment webhook` settings section, DB key `config.webhook_comment`, edited on `/settings` or via `GET` / `PUT /api/settings/webhook_comment`. The plain-issue route adds no settings of its own; it reads the existing `Mint` section (`config.mint`) for project routing, target state, and the `AI Agent` field / queued value. It is DB-only from day one: it is absent from `OnDiskConfig`, so a `config.toml` declaring `[webhook_comment]` fails to parse as an unknown key, and there is no file-to-DB import path. Source and rate-limiter edits apply live. See the README section "Comment commands on a pull request" for the full field list and the Forgejo webhook setup.
 
 ## Deleting an action
 
 An action can be deleted from all three surfaces: the CLI (`claude-run action delete <name>`), the web UI (the Delete button on an action's detail page), and the JSON API (`POST /actions/<name>/delete`).
 
-Delete is a config-and-control purge, not a history wipe. It removes the on-disk YAML file, the `actions` index row, the `paused_actions` row, and the `attempt_counters` / `daily_ledger` rows for that action. It KEEPS the action's run history: the `runs` and `job_outcomes` rows and the on-disk stream logs under `logs/<name>/` survive. Re-creating an action with the same name re-associates that retained history, which is the intended audit behavior.
+Delete is a config-and-control purge, not a history wipe. It removes the on-disk YAML file, the `actions` index row, the `paused_actions` row, and the `attempt_counters` / `daily_ledger` rows for that action. It KEEPS the action's run history: the `runs` and `job_outcomes` rows and the on-disk stream logs under `logs/<name>/` survive, each for as long as its own retention window allows (`config.db_retention` for the rows, `config.stream_log_gc` for the stream logs). Re-creating an action with the same name re-associates that retained history, which is the intended audit behavior.
 
 Delete is refused while a run for the action is in flight, so removing a config can never orphan a running job. The CLI returns exit code 7 (conflict) and the API / web UI return HTTP 409; cancel the run (`claude-run cancel <run-id>`) or wait for it to finish, then retry. An unknown action returns exit code 3 from the CLI and HTTP 404 from the API / web UI.
 
@@ -1084,14 +1058,21 @@ The index is self-healing: `scan_actions` prunes any `actions` row whose backing
 | 3    | Config error (action YAML missing, malformed, or missing required field). |
 | 4    | Daily cap reached (`max_runs_per_day`).                                   |
 | 5    | Unexpected error (see logs).                                              |
-| 6    | Over daily budget (`daily_budget_usd`).                                   |
+| 6    | Over budget: the daily budget (`daily_budget_usd`) was already spent when the run started, or the run reached its own ceiling (`run_budget_usd`) while working (DEV-705). |
 | 7    | Conflict: a mutating command was refused (e.g. `action delete` while a run for that action is in flight). |
+| 8    | Login required: the run stopped picking up new jobs because the Claude login needs renewing (CLAUDE-269). |
 | 130  | Run cancelled in flight (operator cancel via the API / web UI / CLI).     |
 
 Exit code 130 is recorded on the `runs` row, not returned by the `run` subcommand; the web UI and CLI render it as a
 distinct "canceled" badge. CLAUDE-223: exit code 1 is likewise recorded on the `runs` row of a run that stopped picking
 up new jobs because the operator paused globally mid-run, and badges as "paused"; it is excluded from the run list's
 "failed" filter, because the run did not fail.
+
+CLAUDE-269: exit code 8 is recorded the same way, on a run that stopped picking up new jobs because the CLI itself
+reported an authentication failure (a structured `authentication_failed`, on an invocation or the periodic `claude
+auth status --json` probe), distinct from a pause (an operator decision) and badged "login required" rather than
+"paused" or "failed". An operator cancel wins over both; a global pause wins over login-required when both apply to
+the same run.
 
 ## Snippet execution model
 
@@ -1116,8 +1097,10 @@ error). Plain `rm -r` is used, not `rm -rf`, so permission or read-only issues s
 silently force-deleted.
 
 To inspect what happened in a failed run, look at the per-attempt stream log
-(`$CLAUDE_RUN_LOG_DIR/<name>/streams/<key>-attempt-<n>.jsonl`); it survives across runs since it lives outside
-`$workdir`.
+(`$CLAUDE_RUN_STATE_DIR/logs/<name>/streams/<key>-attempt-<n>.jsonl`); it survives across runs since it lives outside
+`$workdir`, up to the `config.stream_log_gc` retention window (default 30 days) past which the daemon sweep deletes it.
 
-For `filter` and `pre`/`post`, exit code 0 = continue, non-zero = step failure (skip job, count attempt). The snippet's
-stdout is captured into the daily log; stderr passes through.
+For `filter` and `pre`/`post`, exit code 0 = continue, non-zero = step failure (skip job, count attempt). The runner
+captures each snippet's stdout: `input.command`'s is parsed as the job array and `prompt`'s becomes the prompt text,
+while a `filter` / `pre` / `post` step's is read only for its exit code. A failing step's stderr is logged with the
+failure.

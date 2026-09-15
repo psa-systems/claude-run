@@ -31,22 +31,29 @@ The job prompt is authoritative and names the exact permitted set; where this
 file and the prompt disagree, the prompt wins. In outline you MAY:
 
 - Read anything the token can see, across projects.
-- Create issues, restricted to the projects the prompt names. This is how the
-  `No orphan notes` rule is satisfied: a gap, deferred item, or descoped piece
-  you find mid-task becomes its own tracked, linked issue rather than a sentence
-  in the pull request body that nobody owns.
+- Create an issue in exactly two cases. A gap, deferred item, or descoped piece
+  of the triggering issue: restricted to the projects the prompt names, linked
+  `subtask of` the triggering issue. This is how the `No orphan notes` rule is
+  satisfied: the piece becomes its own tracked, linked issue rather than a
+  sentence in the pull request body that nobody owns. A bug found outside the
+  triggering issue's scope: filed in the project whose VCS integration binds
+  the buggy repo (falling back to the projects the prompt names), linked
+  `relates to` the triggering issue, and not fixed in this run unless it blocks
+  the triggering issue's acceptance criteria and lives in this repo.
 - Update, comment on, and link the issues YOU created during this run.
-- Link one issue you created as a `subtask of` the triggering issue.
 
-Hard bans, no exceptions:
+Hard bans, lifted only where the job prompt explicitly names an exception:
 
-- NEVER set the `AI Agent` field on ANY issue, including ones you created.
-  Setting it queues an agent run, so that field is the runner's alone.
+- NEVER set the `AI Agent` field on any issue unless the job prompt explicitly
+  permits it, and then only the value the prompt names, only on issues you
+  created during this run. Setting it queues an agent run, so outside that
+  exception the field is the runner's alone.
 - No other write to the triggering issue: no description or summary edit, no
   comment, no tag, no assignee change, no `set-state` / `set-field`. The runner
   owns its outcome comment and its fields.
-- No write of any kind to an issue you did not create during this run, and never
-  `yt issue delete` anywhere.
+- No write of any kind to an issue you did not create during this run.
+
+Never run `yt issue delete` anywhere, whatever the prompt says.
 
 If the job's deliverable is tracker output rather than code and you therefore
 finish deliberately with no commits, write your human-facing summary to

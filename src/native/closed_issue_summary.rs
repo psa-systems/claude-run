@@ -5,7 +5,7 @@
 //! the summary, and file it as a new issue hanging off a nominated parent
 //! (typically the milestone being reported against).
 //!
-//! Pipeline (typed Rust, mirroring [`crate::native::ci_failure_reconcile`]):
+//! Pipeline (typed Rust, mirroring [`crate::native::youtrack`]):
 //!
 //! - targets -> the union of `parents` (nominated by id) and the issues
 //!   `query` selects (skipped entirely when `query` is empty).
@@ -37,7 +37,7 @@ use super::{HandlerFuture, NativeContext, NativeHandler};
 use crate::action::{ClosedIssueSummaryConfig, NativeConfig};
 use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::error::{Error, Result};
-use crate::provider::{self, Backend};
+use crate::provider::{self, AuditedTracker, IssueTracker, IssueWriteAudit};
 use crate::state;
 
 /// Hidden HTML comment fencing the machine-read block of a report body and of
@@ -146,7 +146,12 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
     let backend = provider::resolve(provider::DEFAULT_PRIORITY)?;
 
     // Resolve targets BEFORE run_begin so a gather failure is a no-op run.
-    let (targets, from_query) = match resolve_targets(backend.as_ref(), &cfg) {
+    // CLAUDE-228: hold the gather marker so the scheduler does not stack another
+    // pickup while this one is still resolving targets.
+    let gather_guard = ctx.gather.try_acquire(&action.name);
+    let (targets, from_query) = match crate::blocking::in_place(|| {
+        resolve_targets(backend.as_ref(), &cfg)
+    }) {
         Ok(t) => t,
         Err(e) => {
             warn!(action = %action.name, error = %e, "selecting report parents failed; skipping run");
@@ -160,7 +165,14 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
 
     let window = Window::ending(Local::now().date_naive(), cfg.window_days);
 
+    // CLAUDE-228: the gather marker covers the whole pre-`run_begin` phase (the
+    // work a stacked pickup would redo); released here, so overlapping runs past
+    // this point stay allowed exactly as CLAUDE-162 intends.
+    drop(gather_guard);
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
+    // CLAUDE-228: from here the row MUST be closed on every exit path, including
+    // an early `?` out of the bookkeeping below.
+    let run_guard = state::RunGuard::new(pool, run_id);
     let cancel = match ctx.registry {
         Some(r) => r.register(run_id),
         None => CancellationToken::new(),
@@ -173,6 +185,14 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
         warn!(run_id, error = %e, "recording planned keys failed (continuing)");
     }
 
+    // CLAUDE-234: every write from here on goes through the run's ledger, which
+    // stamps it with `run_id` and refuses a create past the run's ceiling. This
+    // action is the bulk filer (one report per parent), so the ceiling is what
+    // bounds a misfiring run.
+    let limits = crate::job::effective_limits(&crate::job::RunnerDefaults::default(), ctx.action);
+    let audit = IssueWriteAudit::new(Some(run_id), limits.max_issues_per_run);
+    let tracker = AuditedTracker::new(backend.as_ref(), audit.clone());
+
     // CLAUDE-223: run-scoped global-pause gate, checked alongside cancel at the
     // per-parent pickup so a mid-run pause stops the next report.
     let run_pause = ctx.pause.for_action_run(&action.name);
@@ -184,30 +204,43 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
         if run_pause.stop().await {
             break;
         }
-        match file_report(backend.as_ref(), &cfg, parent, window) {
+        match file_report(&tracker, &cfg, parent, window) {
             Ok(Filing::Filed(key)) => {
                 info!(action = %action.name, parent, report = %key, "filed the closed-issue summary");
                 filed += 1;
-                advance(backend.as_ref(), &cfg, &from_query, parent, &cfg.done_label);
+                advance(&tracker, &cfg, &from_query, parent, &cfg.done_label);
             }
             Ok(Filing::AlreadyFiled) => {
                 info!(action = %action.name, parent, window = %window.marker(), "a report for this window is already filed; skipping");
             }
             Err(e) => {
                 warn!(action = %action.name, parent, error = %e, "filing the closed-issue summary failed (continuing)");
-                advance(
-                    backend.as_ref(),
-                    &cfg,
-                    &from_query,
-                    parent,
-                    &cfg.failed_label,
-                );
+                advance(&tracker, &cfg, &from_query, parent, &cfg.failed_label);
             }
         }
     }
 
+    // CLAUDE-234: a run stopped by its issue-creation ceiling must not read as a
+    // clean one, so the refusal lands on the action page as a run event, not
+    // only in the daemon journal. Non-fatal bookkeeping.
+    let notices = audit.take_notices();
+    if !notices.is_empty() {
+        let events: Vec<state::InputEvent> = notices
+            .into_iter()
+            .map(|message| state::InputEvent {
+                level: "warn".to_string(),
+                context: None,
+                message,
+            })
+            .collect();
+        if let Err(e) = state::run_events_record_for_run(pool, run_id, &action.name, &events).await
+        {
+            warn!(run_id, error = %e, "run_events_record_for_run failed (non-fatal)");
+        }
+    }
+
     let exit_code = run_pause.exit_code(cancel.is_cancelled());
-    state::run_finish(pool, run_id, exit_code, filed).await?;
+    run_guard.finish(exit_code, filed).await?;
     Ok(())
 }
 
@@ -216,7 +249,7 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
 /// Only that subset is ever field-written; a parent nominated by id is left
 /// alone entirely.
 fn resolve_targets(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     cfg: &ClosedIssueSummaryConfig,
 ) -> Result<(Vec<String>, HashSet<String>)> {
     let mut targets: Vec<String> = Vec::new();
@@ -245,7 +278,7 @@ fn resolve_targets(
 /// nominated by id never reaches the write: it has no reporting state machine,
 /// and its idempotency comes from the window marker instead.
 fn advance(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     cfg: &ClosedIssueSummaryConfig,
     from_query: &HashSet<String>,
     parent: &str,
@@ -265,7 +298,7 @@ fn advance(
 /// window unmarked and the next run retries rather than recording a report that
 /// was never linked.
 fn file_report(
-    backend: &dyn Backend,
+    backend: &dyn IssueTracker,
     cfg: &ClosedIssueSummaryConfig,
     parent: &str,
     window: Window,
@@ -299,7 +332,7 @@ fn file_report(
 /// True when the parent's description or any of its comments already carries
 /// this window's marker. An unreadable parent errs toward filing: a duplicate
 /// report is visible and fixable, a silently skipped window is not.
-fn already_filed(backend: &dyn Backend, parent: &str, window: Window) -> bool {
+fn already_filed(backend: &dyn IssueTracker, parent: &str, window: Window) -> bool {
     let marker = window.marker();
     match backend.inspect_issue(parent) {
         Ok(i) => i.description.contains(&marker) || i.comments.iter().any(|c| c.contains(&marker)),
@@ -313,7 +346,11 @@ fn already_filed(backend: &dyn Backend, parent: &str, window: Window) -> bool {
 /// Every issue in `project` resolved inside `window`. The query is the tracker's
 /// own `resolved date:` range, so the window is applied server-side and the row
 /// set is exact rather than filtered from a truncated page.
-fn gather_closed(backend: &dyn Backend, project: &str, window: Window) -> Result<Vec<ClosedIssue>> {
+fn gather_closed(
+    backend: &dyn IssueTracker,
+    project: &str,
+    window: Window,
+) -> Result<Vec<ClosedIssue>> {
     let query = format!(
         "project: {} resolved date: {} .. {}",
         project.trim(),

@@ -118,13 +118,34 @@
 </div>
 {% endmacro %}
 
-{% macro claude_block(cwd, allowed_tools, permission_mode) %}
+{% macro claude_block(cwd, allowed_tools, permission_mode, model, effort, autocompact) %}
 <div class="card">
   <h3>Claude</h3>
   <div class="grid2">
     {% call textfield("CWD", "claude_cwd", cwd, "working directory override") %}
     {% call textfield("Allowed tools", "claude_allowed_tools", allowed_tools, "e.g. Read,Grep,Bash") %}
     {% call textfield("Permission mode", "claude_permission_mode", permission_mode, "e.g. acceptEdits") %}
+    {% call textfield("Model", "claude_model", model, "blank = the config.claude default") %}
+    <label class="fld">
+      <span>Effort</span>
+      {# CLAUDE-259: a stored value outside the documented set (hand-written YAML
+         or the API) renders as its own selected option, so saving this form can
+         never drop or rewrite it. #}
+      <select name="claude_effort">
+        <option value=""{% if effort.is_empty() %} selected{% endif %}>(the config.claude default)</option>
+        <option value="low"{% if effort.as_str() == "low" %} selected{% endif %}>low</option>
+        <option value="medium"{% if effort.as_str() == "medium" %} selected{% endif %}>medium</option>
+        <option value="high"{% if effort.as_str() == "high" %} selected{% endif %}>high</option>
+        <option value="xhigh"{% if effort.as_str() == "xhigh" %} selected{% endif %}>xhigh</option>
+        <option value="max"{% if effort.as_str() == "max" %} selected{% endif %}>max</option>
+        {% if !effort.is_empty() && effort.as_str() != "low" && effort.as_str() != "medium" && effort.as_str() != "high" && effort.as_str() != "xhigh" && effort.as_str() != "max" %}
+        <option value="{{ effort }}" selected>{{ effort }} (not a documented level)</option>
+        {% endif %}
+      </select>
+    </label>
+    {# DEV-706: free text, not a select: the CLI accepts `auto` or any window
+       between 100k and 1M tokens, and the runner passes the value through. #}
+    {% call textfield("Autocompact window", "claude_autocompact", autocompact, "auto, or 100000-1000000 (blank = the runner default)") %}
   </div>
 </div>
 {% endmacro %}
@@ -133,12 +154,12 @@
 <div class="card">
   <h3>Output</h3>
   <div class="grid2">
-    {% call textfield("Result file", "output_file", file, "e.g. ci-failure-analysis.jsonl (blank = no file)") %}
+    {% call textfield("Result file", "output_file", file, "e.g. results.jsonl (blank = no file)") %}
   </div>
 </div>
 {% endmacro %}
 
-{% macro limits_block(max_attempts_per_key, max_runs_per_day, claude_timeout_seconds, daily_budget_usd) %}
+{% macro limits_block(max_attempts_per_key, max_runs_per_day, claude_timeout_seconds, daily_budget_usd, run_budget_usd, budget_warn_fraction, max_issues_per_run) %}
 <div class="card">
   <h3>Limits</h3>
   <div class="grid2">
@@ -146,6 +167,11 @@
     {% call numfield("Max runs per day", "limit_max_runs_per_day", max_runs_per_day, "unset = no cap", "1") %}
     {% call numfield("Claude timeout (seconds)", "limit_claude_timeout_seconds", claude_timeout_seconds, "unset = no timeout", "1") %}
     {% call numfield("Daily budget (USD)", "limit_daily_budget_usd", daily_budget_usd, "unset = no budget", "0.01") %}
+    {# DEV-705: the per-run ceiling. Read before the run starts; a run that
+       reaches it stops and exits non-zero, and is never offered a raise. #}
+    {% call numfield("Per-run budget (USD)", "limit_run_budget_usd", run_budget_usd, "unset = the daily budget", "0.01") %}
+    {% call numfield("Budget warning fraction", "limit_budget_warn_fraction", budget_warn_fraction, "unset = 0.8", "0.05") %}
+    {% call numfield("Max issues per run", "limit_max_issues_per_run", max_issues_per_run, "unset = 25; 0 = create none", "1") %}
   </div>
 </div>
 {% endmacro %}

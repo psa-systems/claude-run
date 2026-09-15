@@ -3,26 +3,44 @@
 # https://github.com/harrydowning/vscode-yaml-embedded-languages
 # https://marketplace.visualstudio.com/items?itemName=harrydowning.yaml-embedded-languages
 
-# Scheduled read-only repository audits (CLAUDE-214).
+# Scheduled repository audits that file their findings (CLAUDE-214, CLAUDE-295).
 #
-# Same native handler as `youtrack.yml` (`kind: youtrack`, `src/native/youtrack.rs`); this file differs only in which
-# issues it picks up and which prompt the agent gets. Audit issues live in the `AUD` project, whose VCS processor is
-# `https://dev.a8n.run` / `contoso/audits`, so the handler clones the AUDITS repo into the job workdir and finalize
-# opens the pull request there. The repository being audited is cloned read-only by the agent, outside the workdir, and
-# is never written to. That split is the whole point: the deliverable belongs in a different repo from the code read.
+# Same native handler as `youtrack.yml` (`kind: youtrack`, `src/native/youtrack.rs`); this file differs in which issues
+# it picks up, which built-in prompt the agent gets, which projects it may create issues in, one dependency-gate setting,
+# and automerge. Audit issues live in the `AUDIT` project, whose VCS processor points at the audits
+# repo (e.g. `owner/audits`), so the handler clones the AUDITS repo into the job workdir and finalize opens the pull request
+# there. The repository being audited is cloned read-only by the agent, outside the workdir, and is never written to.
 #
-# The prompt override (CLAUDE-125 full replacement) exists to permit three tracker writes the built-in prompt forbids
-# outright: the run-summary comment on the parent, the run's own Epic `## Result` description block, and the standing
-# table on anchor issue AUD-1. `prompts/_filing.md` in the audits repo routes those three into the report file "until
-# CLAUDE-214 lands", which is this action. Every other tracker write stays banned, including issue creation: an
-# unattended run PROPOSES findings in its report and a human asks for the filing separately (`prompts/_filing.md`,
-# steps 1 to 3 versus 4 to 8).
+# Prompt source: `prompt_preset: audit` selects the audit prompt compiled into the binary (`src/native/audit_prompt.rs`),
+# so an image upgrade updates it. This file deliberately sets no `prompt:` key: a YAML `prompt` is a full-replacement
+# override that wins over any preset and freezes the text at whatever the file says. `claude-run action show audit-run`
+# prints `"prompt_source": "builtin:audit"` while the preset is in effect.
 #
-# `AI Agent` / `State` remain the runner's alone. The agent never sets them, exactly as in `youtrack.yml`, so the state
-# machine in that file's header applies here unchanged.
+# The audit preset permits the tracker writes an audit needs and the engineering prompt forbids: filing the findings
+# into the product projects in `write_projects` (CLAUDE-295), the `## Result` block on the run's own issue, one summary
+# comment per target on the parent, and (daily parent run only) the standing table on anchor issue AUDIT-1. Every
+# finding issue the run files gets `AI Agent = Queued` as its last write, so the `youtrack` action works it; that value,
+# on issues the run created, is the only `AI Agent` write the agent may make. The 20-issue per-target cap is a prompt
+# instruction: `AuditedTracker` bounds the runner's own provider calls, not the `yt` calls an agent makes. The filing
+# procedure itself (dedup, grouping, priority, tags, links) lives in the audits repo, `prompts/_filing.md`.
+#
+# `AI Agent` and `State` on the triggering issue remain the runner's alone, so the state machine in `youtrack.yml`'s
+# header applies here unchanged.
+#
+# Tag routing: the YouTrack workflow that files a day's audit tags the daily parent and every per-target Epic
+# `Audit-<Type>`, and that tag is what routes them here. This query selects `project: AUDIT tag: Audit-*`;
+# `youtrack.yml` selects the exact complement, `(project: -AUDIT or tag: -Audit-*)`, so exactly one action matches any
+# queued issue (CLAUDE-215). An `AUDIT` issue with no `Audit-*` tag is ordinary engineering work on the audits repo and
+# goes to `youtrack.yml`.
 #
 # The dependency gate (CLAUDE-161) is left on, which is what makes the daily parent wait: the workflow files one parent
 # plus one Epic per target and queues all of them, and `parent for` blocks the parent until every Epic resolves.
+# `block_cross_project: false` stops an Epic from waiting on its own findings: they are its subtasks but live in the
+# product projects, so a retried Epic would otherwise stay blocked until every finding was worked.
+#
+# Automerge is on: an audit pull request only adds dated files to the audits repo, and it has to merge for its Epic to
+# resolve, which is what releases the gated daily parent (whose run reads the per-target reports on the default branch).
+# The merge is event-driven (CLAUDE-278), so the webhook backing this action must send Action Run Success and Recover.
 
 name: audit-run
 
@@ -54,58 +72,28 @@ concurrency:
 
 native:
   youtrack:
-    # Only the `AUD` project, whose VCS processor points at the audits repo. `project: -AUD` in youtrack.yml is the
-    # matching exclusion, so exactly one action matches any issue (CLAUDE-215). Note the syntax: YouTrack rejects
-    # `-project: AUD` with a parse error, the negation goes on the value.
-    query: "-Resolved AI Agent: Queued project: AUD"
+    # Audit runs only: the `AUDIT` project AND an `Audit-<Type>` tag (see the header). YouTrack rejects `-project: AUDIT`
+    # with a parse error, so wherever a clause is negated (in youtrack.yml) the negation goes on the value.
+    query: "-Resolved AI Agent: Queued project: AUDIT tag: Audit-*"
     custom_field: "AI Agent"
-    # dependencies: defaults (enabled, `depends on` + `parent for`) keep the daily parent blocked until its per-target
-    # Epics resolve, which is how the run summary ends up with something to summarize.
-    prompt: |
-      You are executing a scheduled, read-only AUDIT. This is not the normal issue-working workflow: you change no code, you fix nothing, and you open no pull request against the repository you audit.
-
-      Issue: {{key}}: {{summary}}
-      Repo: {{clone_url}}
-      Working directory: {{workdir}} - this is a checkout of the AUDITS repo at the Repo URL above, already cloned here, and you are inside it. It is where the report and the ledgers are written.
-
-      The audits repo is the procedure, not just the destination. Read these before doing anything else, and follow them exactly; where they disagree with this prompt about audit content, they win:
-      1. `prompts/README.md`, to pick the prompt file for this audit's type (the issue summary names it, e.g. a UI audit uses `prompts/tue-ui.md`).
-      2. That audit-type prompt, start to finish. Its phases are the run.
-      3. `prompts/_filing.md`, which owns the coverage and carry-forward ledgers, the per-target cap, and what a run may and may not file.
-      4. `prompts/_yt-cookbook.md`, before any `yt` command.
-
-      Steps:
-      1. Run `yt issue inspect {{key}}` to read the description: the target repository, the report path, the date, and the cap live there.
-      2. Confirm the working directory really is the audits checkout (`prompts/` is present and `git remote --verbose` names Contoso/audits). If it is not, take the blocker path below rather than writing the report somewhere else.
-      3. Clone the target repository READ-ONLY to a path OUTSIDE {{workdir}} (for example `git clone <target-clone-url> /tmp/<repo>`) and treat it as read-only for the whole run: no edits, no builds, no test runs, no package installs, no commits, no push. Never clone either repo inside the other's working tree.
-      4. Read `<target>/_coverage.md` and `<target>/_deferred.md` in the audits checkout FIRST, per `prompts/_filing.md` step 0, and carry forward what is owed before anything found this run.
-      5. Execute the audit-type prompt's phases, including its verification phase. Drop what you cannot substantiate and state the dropped count.
-      6. Write exactly the files that prompt names: the dated report, plus the `_coverage.md` and `_deferred.md` updates for this target. Create nothing else.
-      7. Create a feature branch off the default branch (e.g. `audit/<code>-<type>-<YYYY-MM-DD>`), commit the report and both ledgers to it, and leave that branch checked out as HEAD when you stop. Never run `git checkout main` / `git switch main`: the runner opens the pull request from whatever branch is checked out, so switching back strands the work and produces an empty pull request.
-      8. Reference the issue in the commit message on its own line as a BARE `#{{key}}`, with no command text after it, so the pull request links to the issue without transitioning it.
-      9. Finish this Epic completely, ledger writes and description rewrite included, before you stop. A run that dies halfway should leave one clean boundary, not a half-done target.
-
-      Tracker writes. You may perform EXACTLY these three, and only against the issues named:
-      - `yt issue add-comment` posting the run summary on the parent issue that {{key}} is a subtask of (or on {{key}} itself when it has no parent).
-      - `yt issue update` rewriting the description of {{key}}, your own Epic, to carry a `## Result` block.
-      - `yt issue update` updating the standing table on the anchor issue named in the issue description (AUD-1).
-      Every other tracker write is forbidden: no `yt issue create` (an unattended run PROPOSES findings in the report; a human asks for the filing separately, per `prompts/_filing.md`), no `yt issue set-field`, no `yt issue set-state`, no assignee, tag, or link changes. `AI Agent` and `State` belong to the runner, which sets them after you exit. Read-only `yt` commands (`inspect`, `list`, `search`, `project show`, `version check`) are unrestricted and the dedup step needs them, so use them freely.
-
-      Also out of reach, by design: pushing, opening the pull request (the runner does both from the branch you leave checked out), and writing anything at all into the target repository.
-
-      HARD RULE on long commands: run everything in the FOREGROUND and wait for it inline. Leave NO background job running when you stop; a lingering process keeps the run's process group alive and gets the whole run timeout-killed even after the work is done.
-
-      If you CANNOT safely complete the audit - the working directory is not the audits checkout, the target clone fails, the audit-type prompt is missing, or a permitted tracker write is rejected for lack of permission:
-        a. Do NOT write the report somewhere else and do NOT change any code.
-        b. Write the human-facing explanation of exactly what failed, quoting the command and its error, to this file (its contents are posted verbatim as the issue comment by the runner):
-             {{workdir}}/{{needs_review_marker}}
-        c. Touch this marker so the attempt is not counted against the per-key cap (the job is parked pending human input, not failed):
-             {{workdir}}/{{skip_attempt_marker}}
-        d. Do NOT set any YouTrack field yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.
-
-      When you finish, summarize the run as a checklist: report path, findings proposed against the cap, deferred entries added or drained, and which of the three tracker writes you performed. Do not include a pull request URL; the runner creates it.
+    # The built-in audit prompt (`src/native/audit_prompt.rs`). Do not add a `prompt:` key: it would override this.
+    prompt_preset: audit
+    # The product projects findings file into: the project mapping in the audits repo's `prompts/_filing.md`.
+    write_projects:
+      - ALPHA
+      - BETA
+      - GAMMA
+      - DELTA
+      - EPSILON
+      - ZETA
+      - ETA
+    dependencies:
+      block_cross_project: false
+    # Merge the audit pull request once its CI is green, so the Epic resolves and the gated daily parent can run.
+    automerge:
+      enabled: true
   forgejo: {}
-    # base_url / token_ref omitted, as in youtrack.yml: host `fj` credentials, forge host derived from the AUD
+    # base_url / token_ref omitted, as in youtrack.yml: host `fj` credentials, forge host derived from the AUDIT
     # project's VCS integration.
 
 link_template: "https://example.myjetbrains.com/issue/{key}"

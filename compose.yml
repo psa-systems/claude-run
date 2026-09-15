@@ -1,25 +1,37 @@
-# claude-run daemon, containerized (CLAUDE-37).
+# claude-run daemon, containerized (CLAUDE-37, CLAUDE-247, CLAUDE-287).
 #
 # The whole daemon runs in this container, so every `claude` child it spawns
 # inherits the container's clean $HOME and loads only the slim bot CLAUDE.md
 # baked into the image (deploy/bot-CLAUDE.md), never the operator's interactive
 # ~/.claude/CLAUDE.md.
 #
-# Host tool auth reaches the container through read-only bind mounts. The
-# operator's ~/.claude is NOT mounted wholesale: only ~/.claude/.credentials.json
-# is bound, so the baked slim CLAUDE.md is never shadowed. (To use an API key
-# instead, drop that bind and set ANTHROPIC_API_KEY in the environment block.)
+# CLAUDE-247: the container is self-contained. It bind-mounts NOTHING from the
+# host and reads no host credential. The operator creates the web administrator
+# at /setup and logs Claude, YouTrack, Forgejo and git in from the Settings ->
+# Auth page (see README "Containerized deployment"). That keeps the runner's
+# identity separate from the operator's and lets the stack deploy on a host
+# where neither $HOME nor the invocation directory is available.
+#
+# CLAUDE-253: three flat volumes, /config /data /state. Nothing persists under
+# $HOME, and no path here needs to know about XDG.
+#
+# CLAUDE-287: the runtime image is built on `opensuse-dev`, which carries
+# Docker, so the daemon's `claude-bot-docker` sidecar below (Docker-in-Docker,
+# loopback only) gives every `claude` session it spawns a Docker it can use.
+# Still no host bind mount: the sidecar's Docker state lives on its own named
+# volume, and the `/data` it shares with claude-bot is that same named volume,
+# never a host path.
 #
 # Names are app-prefixed per house convention. For a development stack, prefix
 # each name with `dev-` (service dev-claude-bot, network dev-claude-bot-private,
-# volumes dev-claude-bot-{config,data,state}).
+# volumes dev-claude-bot-*).
 
 name: claude-bot
 
 services:
   claude-bot:
     container_name: claude-bot
-    # CLAUDE-88: published by .forgejo/workflows/build-binary.yml on every main
+    # CLAUDE-88: published by .forgejo/workflows/build-image.yml on every main
     # push (`latest`) and release tag (`vX.Y.Z`). Pin a version tag in
     # production. For local development, comment `image:` and uncomment
     # the build block to build from the working tree instead.
@@ -31,58 +43,140 @@ services:
     restart: unless-stopped
     networks:
       claude-bot-private:
+    # CLAUDE-247: no `user:` here. The image starts as root so its entrypoint can
+    # chown the volumes, then drops to claudebot with setpriv (pattern 3 in
+    # governance/CONTAINER_UID_GID.md). A `user:` override would leave the
+    # entrypoint without the privileges the chown needs.
     environment:
-      CLAUDE_RUN_CONFIG_DIR: /home/claudebot/.config/claude-run
-      CLAUDE_RUN_DATA_DIR: /home/claudebot/.local/share/claude-run
-      CLAUDE_RUN_STATE_DIR: /home/claudebot/.local/state/claude-run
-      CLAUDE_RUN_RUNTIME_DIR: /home/claudebot/.runtime/claude-run
-      # CLAUDE-88: the env var carries the PATH to the secrets-store age key;
-      # the key material itself travels as a compose secret (file mount), never
-      # as an environment value (`docker inspect` / /proc leak surface).
-      CLAUDE_RUN_SECRETS_KEY_FILE: /run/secrets/claude-run-age-key
-    secrets:
-      - claude-run-age-key
+      # CLAUDE-253: the image already sets every path (three flat roots plus the
+      # tool stores under them), so nothing here has to restate them. Override
+      # one only to move a store somewhere unusual.
+      #
+      # CLAUDE-249: the secrets key lives at /config/secrets.key, generated on
+      # first start. Set CLAUDE_RUN_SECRETS_KEY_FILE only to supply your own,
+      # e.g. from a secret store; the value is a PATH, never key material.
+      CLAUDE_RUN_LOG: info
+      # CLAUDE-287: the Docker-in-Docker sidecar below shares this service's
+      # network namespace, so its loopback-only daemon is reachable here.
+      # `claude` sessions the daemon spawns inherit this, since nothing in
+      # src/ calls env_clear or env_remove.
+      DOCKER_HOST: tcp://127.0.0.1:2375
+      # CLAUDE-250: uncomment together with the `claude-run-database-url` secret
+      # below to put the runner state on the `postgres` profile's server instead
+      # of the SQLite file on claude-bot-data. Unset means SQLite, which is what
+      # this file does by default. The URL travels as a file, not as an
+      # environment value, because it carries the password.
+      # CLAUDE_RUN_DATABASE_URL_FILE: /run/secrets/claude-run-database-url
+    # CLAUDE-250: uncomment with the variable above; the daemon reads the URL
+    # from the file this mounts.
+    # secrets:
+    #   - claude-run-database-url
+    # CLAUDE-250: `required: false` so this stays a no-op without
+    # `--profile postgres`: the plain stack is SQLite-only and must not wait on
+    # a service that was never started.
+    depends_on:
+      claude-bot-postgres:
+        condition: service_healthy
+        required: false
     volumes:
-      # Runner state, backed by named volumes.
+      # CLAUDE-253: three mounts, not seven. Each tool's store is a
+      # subdirectory of one of these rather than a mount point of its own,
+      # because the image points every tool at them by environment variable.
+      #
+      # config.toml, actions/, secrets.key, claude-agent-home/ (the agent's
+      # Claude login), youtrack-cli/ (yt), git/ (the commit identity).
       - type: volume
         source: claude-bot-config
-        target: /home/claudebot/.config/claude-run
+        target: /config
+      # state.db (runs, outcomes, the encrypted secrets store), per-job
+      # workdirs, and forgejo-cli/ (fj's key store, which fj reads from the XDG
+      # data dir; claude-run resolves it the same way).
       - type: volume
         source: claude-bot-data
-        target: /home/claudebot/.local/share/claude-run
+        target: /data
+      # Logs and per-attempt stream JSONL. Separate from /data because it is the
+      # volume you would drop: different retention, different growth, no
+      # irreplaceable state.
       - type: volume
         source: claude-bot-state
-        target: /home/claudebot/.local/state/claude-run
-      # Actions YAML, supplied read-only into the config dir.
-      - type: bind
-        source: ./actions
-        target: /home/claudebot/.config/claude-run/actions
-        read_only: true
-      # Claude auth: ONLY the credentials file, never the whole ~/.claude (which
-      # would shadow the baked slim CLAUDE.md).
-      - type: bind
-        source: ${HOME}/.claude/.credentials.json
-        target: /home/claudebot/.claude/.credentials.json
-        read_only: true
-      # yt (youtrack-cli) config.
-      - type: bind
-        source: ${HOME}/.config/youtrack-cli
-        target: /home/claudebot/.config/youtrack-cli
-        read_only: true
-      # fj (forgejo-cli) keys. Token needs write:repository + write:issue (CLAUDE-196).
-      - type: bind
-        source: ${HOME}/.local/share/forgejo-cli/keys.json
-        target: /home/claudebot/.local/share/forgejo-cli/keys.json
-        read_only: true
-      # git identity.
-      - type: bind
-        source: ${HOME}/.gitconfig
-        target: /home/claudebot/.gitconfig
-        read_only: true
-    # The daemon's unix socket lives here; ephemeral per container so a stale
-    # socket never survives a restart.
+        target: /state
+    # Runtime dir (the pidfile; the image runs `serve --no-socket`, so there is
+    # no socket). Ephemeral per container so nothing stale survives a restart.
     tmpfs:
-      - /home/claudebot/.runtime/claude-run
+      - /run/claude-run
+
+  # CLAUDE-287: Docker-in-Docker sidecar, so `claude` sessions the daemon spawns
+  # can run `docker`, `docker compose` and `docker buildx` (this repo's own
+  # `just check`/`just pre-commit` need it). Follows the Forgejo runners'
+  # pattern: a
+  # privileged dind daemon sharing its owner's network namespace, listening on
+  # loopback only, with no TLS because nothing outside that namespace can reach
+  # it. The agent drives a privileged daemon, which is root-equivalent on the
+  # host if a container escapes it; that trade was accepted when CLAUDE-287 was
+  # filed. No host bind mount: `/data` is the same named volume claude-bot
+  # mounts at the same path, which is what makes `docker run --volume
+  # $PWD:...` from inside a job workdir resolve (both containers agree on
+  # what `/data/workdirs/...` means); through the host's own socket it would
+  # resolve against the host filesystem instead, where that path does not
+  # exist. `/var/lib/docker` is a separate named volume rather than anonymous,
+  # so its growth is visible and prunable.
+  claude-bot-docker:
+    container_name: claude-bot-docker
+    image: docker.io/docker:29.6.2-dind
+    privileged: true
+    restart: unless-stopped
+    # Deliberately no `depends_on: claude-bot`: this service JOINS claude-bot's
+    # network namespace, so a dependency the other way would be a cycle. A job
+    # that runs `docker` before this sidecar is up simply fails with the CLI's
+    # own connection error in that job's log.
+    network_mode: service:claude-bot
+    command: ["dockerd", "-H", "tcp://127.0.0.1:2375", "--tls=false"]
+    volumes:
+      - type: volume
+        source: claude-bot-data
+        target: /data
+      - type: volume
+        source: claude-bot-docker
+        target: /var/lib/docker
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "2375"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 5s
+      start_interval: 1s
+
+  # CLAUDE-250: the optional PostgreSQL state store. Behind a profile, so a plain
+  # `docker compose up` starts exactly the service set it started before this
+  # existed; `docker compose --profile postgres up` adds the database. The first
+  # start on this backend is a fresh instance: carry an existing state.db over
+  # with `claude-run import` (CLAUDE-251) before starting the daemon on it.
+  claude-bot-postgres:
+    container_name: claude-bot-postgres
+    image: docker.io/postgres:18.4-alpine3.23
+    profiles:
+      - postgres
+    restart: unless-stopped
+    networks:
+      claude-bot-private:
+    environment:
+      POSTGRES_DB: claude_run
+      POSTGRES_USER: claude_run
+      # A file mount rather than POSTGRES_PASSWORD, which `docker inspect` and
+      # /proc/<pid>/environ would expose.
+      POSTGRES_PASSWORD_FILE: /run/secrets/claude-run-postgres-password
+    secrets:
+      - claude-run-postgres-password
+    volumes:
+      - type: volume
+        source: claude-bot-postgres
+        target: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=claude_run --dbname=claude_run"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
 networks:
   claude-bot-private:
@@ -95,11 +189,23 @@ volumes:
     name: claude-bot-data
   claude-bot-state:
     name: claude-bot-state
+  # CLAUDE-287: /var/lib/docker for the Docker-in-Docker sidecar. Named rather
+  # than anonymous so its growth is visible and prunable.
+  claude-bot-docker:
+    name: claude-bot-docker
+  # CLAUDE-250: only mounted by the profiled claude-bot-postgres service.
+  claude-bot-postgres:
+    name: claude-bot-postgres
 
-# CLAUDE-88: the age identity that decrypts the secrets store (web auth token,
-# webhook HMACs, registry token refs). Create it once before `compose up`:
+# CLAUDE-250: the two files the `postgres` profile needs. Create them before
+# `docker compose --profile postgres up`:
 #   mkdir secrets; chmod 700 secrets
-#   age-keygen | save secrets/age-key.txt
+#   openssl rand -base64 32 | save secrets/postgres-password.txt
+#   $"postgres://claude_run:($password)@claude-bot-postgres:5432/claude_run" | save secrets/database-url.txt
+# The daemon reads the URL only when CLAUDE_RUN_DATABASE_URL_FILE above is
+# uncommented; without it the stack stays on SQLite even with the profile on.
 secrets:
-  claude-run-age-key:
-    file: ./secrets/age-key.txt
+  claude-run-postgres-password:
+    file: ./secrets/postgres-password.txt
+  claude-run-database-url:
+    file: ./secrets/database-url.txt

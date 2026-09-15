@@ -238,7 +238,10 @@ impl ProcessRunner {
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        let output = match cmd.output() {
+        // CLAUDE-228: every `yt` / `fj` call in the runner lands here, most of
+        // them from an async job future. `yt list` has been observed taking
+        // minutes under load, so the worker's core goes back to the runtime.
+        let output = match crate::blocking::in_place(|| cmd.output()) {
             Ok(o) => o,
             // A missing binary surfaces as NotFound from the spawn; map it to
             // the typed CliNotFound so the factory can fall through.
@@ -353,10 +356,9 @@ struct InspectLinks {
     links: Vec<RawLink>,
 }
 
-/// CLAUDE-189: the `issue` + `comments` of `yt issue inspect --json`, for the
-/// ci-failure-analysis action. Only the description and each comment's text are
-/// consumed; `links` and the rest are ignored here (parsed separately by
-/// [`InspectLinks`]).
+/// CLAUDE-189: the `issue` + `comments` of `yt issue inspect --json`. Only the
+/// description and each comment's text are consumed; `links` and the rest are
+/// ignored here (parsed separately by [`InspectLinks`]).
 #[derive(Debug, Deserialize)]
 struct InspectBody {
     #[serde(default)]
@@ -493,6 +495,9 @@ impl CliBackend {
         Ok(PullRequest {
             number,
             url: created.html_url,
+            // CLAUDE-275: the caller (branch-backed create, or AGit) fills in
+            // `head_branch` when it has one; AGit has none.
+            head_branch: None,
         })
     }
 
@@ -551,19 +556,22 @@ impl CliBackend {
         match candidates.len() {
             1 => Ok(candidates.pop().unwrap()),
             0 => Err(Error::Other(anyhow::anyhow!(
-                // CLAUDE-193: state the condition, not an outcome the later
-                // `cleanup_or_preserve` decision can contradict.
+                // CLAUDE-193 / CLAUDE-281: state the condition, not an outcome
+                // the later `cleanup_or_preserve` decision can contradict: it
+                // is the one that checks the workdir and decides whether
+                // anything is preserved.
                 "no feature branch with commits ahead of `{base_ref}`; the agent \
                  produced no branch or no commits (base `{base_branch}`). Any \
-                 unpushed work in the workdir `{}` is preserved; branches already \
-                 pushed remain on the remote.",
+                 unpushed work in the workdir `{}` is preserved only if the \
+                 cleanup check finds it there; branches already pushed remain on \
+                 the remote regardless.",
                 workdir.display()
             ))),
             _ => Err(Error::Other(anyhow::anyhow!(
                 "multiple candidate feature branches ahead of `{base_ref}`: {}; \
                  refusing to guess which to open a PR for. Any unpushed work in \
-                 the workdir `{}` is preserved; branches already pushed remain on \
-                 the remote.",
+                 the workdir `{}` is preserved only if the cleanup check finds it \
+                 there; branches already pushed remain on the remote regardless.",
                 candidates.join(", "),
                 workdir.display()
             ))),
@@ -590,9 +598,11 @@ impl CliBackend {
     /// caller ([`Forge::create_pr`]) so both strategies share the ahead check.
     ///
     /// CLAUDE-170: idempotent against a pre-existing `origin/<branch>`. The
-    /// feature-branch name is deterministic per issue key, so a re-run, a
-    /// concurrent duplicate run, or a manual pre-push of the same branch is a
-    /// DETERMINISTIC collision, not a transient one. Before pushing, the remote
+    /// feature-branch name is chosen by the agent and not deterministic per issue
+    /// key; a pre-existing remote branch of the same name is legitimate, not just
+    /// a collision, because CLAUDE-275's resume path clones a re-queued issue's
+    /// recorded PR branch by name and continues committing on it. Before pushing,
+    /// the remote
     /// state of the branch is read (`git ls-remote`) and reconciled WITHOUT force:
     /// absent -> push + create; local fast-forwards or equals remote -> (fast-
     /// forward) push then find-or-create the PR; diverged (or remote-ahead) ->
@@ -600,10 +610,11 @@ impl CliBackend {
     /// fail loudly naming both SHAs and the workdir. No `--force` /
     /// `--force-with-lease` is ever issued.
     ///
-    /// CLAUDE-193: the error text states the retention CONDITION ("any unpushed
-    /// work in the workdir is preserved; branches already pushed remain on the
-    /// remote"), never a flat outcome, because `cleanup_or_preserve` makes the
-    /// keep-or-delete decision later and can legitimately delete the directory.
+    /// CLAUDE-193 / CLAUDE-281: the error text states the retention CONDITION
+    /// ("preserved only if the cleanup check finds it there"), never a flat
+    /// outcome, because `cleanup_or_preserve` makes the keep-or-delete
+    /// decision later, from its own check of the workdir, and can legitimately
+    /// delete the directory.
     fn create_pr_branch(&self, workdir: &Path, host: &str, branch: &str) -> Result<PullRequest> {
         // Repo path (`owner/repo`) for the open-PR lookup, derived from the
         // workdir's `origin` remote (the form `list_open_prs` expects).
@@ -646,8 +657,8 @@ impl CliBackend {
                             "remote branch `{branch}` has diverged from the local work \
                              (local {local_sha}, remote {remote_sha}) and no open PR exists \
                              for it; refusing to force-push over it. Any unpushed work in the \
-                             workdir `{}` is preserved; branches already pushed remain on the \
-                             remote.",
+                             workdir `{}` is preserved only if the cleanup check finds it \
+                             there; branches already pushed remain on the remote regardless.",
                             workdir.display()
                         ))),
                         Err(e) => Err(Error::Other(anyhow::anyhow!(
@@ -655,7 +666,8 @@ impl CliBackend {
                              (local {local_sha}, remote {remote_sha}) and the open-PR lookup \
                              failed ({e}), so whether an open PR exists for it is UNKNOWN; \
                              refusing to force-push over it. Any unpushed work in the workdir \
-                             `{}` is preserved; branches already pushed remain on the remote.",
+                             `{}` is preserved only if the cleanup check finds it there; \
+                             branches already pushed remain on the remote regardless.",
                             workdir.display()
                         ))),
                     }
@@ -747,6 +759,7 @@ impl CliBackend {
             .map(|p| PullRequest {
                 number: Some(p.number),
                 url: p.html_url,
+                head_branch: Some(branch.to_string()),
             }))
     }
 
@@ -810,6 +823,10 @@ impl CliBackend {
             .run_in_env(Some(workdir), &self.fj, &create_args, &self.fj_envs())
             .and_then(|out| Self::checked(&self.fj, out, &create_args));
         let _ = std::fs::remove_file(workdir.join(BODY_FILE));
+        // CLAUDE-275: the branch-backed create just pushed this exact server
+        // branch (`self.push_branch` / the fast-forward arm above), so it is
+        // always the resulting PR's head, whatever `fj pr create --json` itself
+        // reports.
         let stdout = match res {
             Ok(stdout) => stdout,
             // CLAUDE-206: the forge says a PR for this head already exists (a
@@ -839,7 +856,10 @@ impl CliBackend {
                 ));
             }
         };
-        self.created_pr(&stdout)
+        self.created_pr(&stdout).map(|mut pr| {
+            pr.head_branch = Some(branch.to_string());
+            pr
+        })
     }
 
     /// CLAUDE-206: record a lookup failure that was degraded to a create, in the
@@ -898,11 +918,22 @@ impl CliBackend {
     /// CLAUDE-148: the value of the injected `YOUTRACK_CLI_CONFIG`, if any. The
     /// PATH only is returned, never the file contents (which hold the token).
     /// `None` means host-auth fallback (no injected config).
-    fn yt_config_path(&self) -> Option<&str> {
-        self.yt_env
+    fn yt_config_path(&self) -> Option<String> {
+        if let Some((_, v)) = self
+            .yt_env
             .iter()
-            .find(|(k, _)| k == "YOUTRACK_CLI_CONFIG")
-            .map(|(_, v)| v.as_str())
+            .find(|(k, _)| k == crate::service_auth::YT_CONFIG_ENV)
+        {
+            return Some(v.clone());
+        }
+        // No per-job credential: the child still inherits the daemon's own
+        // `YOUTRACK_CLI_CONFIG` (Settings -> Auth). Reading it here keeps the
+        // failure diagnostics honest; before, a run using the daemon credential
+        // logged `youtrack_cli_config_present: false` and `<host-auth or
+        // unknown>`, which pointed at the wrong cause.
+        std::env::var(crate::service_auth::YT_CONFIG_ENV)
+            .ok()
+            .filter(|v| !v.is_empty())
     }
 
     /// CLAUDE-148: the YouTrack base URL the injected config targets, read from
@@ -914,7 +945,7 @@ impl CliBackend {
     /// in a diagnostic without ever exposing the secret.
     fn yt_base_url(&self) -> Option<String> {
         let path = self.yt_config_path()?;
-        let contents = std::fs::read_to_string(path).ok()?;
+        let contents = std::fs::read_to_string(&path).ok()?;
         contents
             .lines()
             .find_map(|l| l.trim().strip_prefix("url:"))
@@ -944,13 +975,22 @@ impl CliBackend {
             .runner
             .run_in_env(None, &self.yt, args, &self.yt_envs())?;
         if !out.ok {
+            // Name the likeliest cause when the configured credential file is
+            // simply absent: that is an unconfigured instance, not a broken
+            // token, and the fix is one page away.
+            let hint = match self.yt_config_path() {
+                Some(p) if !std::path::Path::new(&p).exists() => {
+                    " (no YouTrack credential yet: Settings -> Auth)"
+                }
+                _ => "",
+            };
             warn!(
                 binary = %self.yt,
                 args = %args.join(" "),
                 exit_code = out.exit_code,
                 youtrack_cli_config_present = config_present,
                 base_url = %self.yt_base_url().as_deref().unwrap_or("<host-auth or unknown>"),
-                "yt invocation failed"
+                "yt invocation failed{hint}"
             );
         }
         Self::checked(&self.yt, out, args)
@@ -1326,6 +1366,10 @@ impl Forge for CliBackend {
 
     fn take_notices(&self) -> Vec<String> {
         std::mem::take(&mut *self.notices.lock().unwrap())
+    }
+
+    fn note(&self, message: String) {
+        self.notices.lock().unwrap().push(message);
     }
 
     /// CLAUDE-194 / CLAUDE-207: two probes, one per scope category the PR path
@@ -1855,6 +1899,118 @@ impl crate::forge_log::ActionRunsClient for FjForgeReads {
         }
         RunsListOutcome::Resolved(all)
     }
+
+    fn run_timing(
+        &self,
+        host: &str,
+        repo: &str,
+        run_number: i64,
+        token: Option<&str>,
+    ) -> std::result::Result<crate::forge_log::RunTiming, String> {
+        let creds = FjCreds::create(host, token)?;
+        // `--run-number` returns the ONE run, so this never pages.
+        let run = run_number.to_string();
+        let args = [
+            "--host",
+            host,
+            "actions",
+            "runs",
+            "--repo",
+            repo,
+            "--json",
+            "--run-number",
+            &run,
+        ];
+        match self.runner.run_in_env(None, &self.fj, &args, &creds.envs()) {
+            Ok(out) if out.ok => crate::forge_log::parse_run_timing(&out.stdout, run_number),
+            Ok(out) => Err(format!(
+                "fj actions runs exited {}: {}",
+                out.exit_code,
+                out.stderr
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("no stderr")
+            )),
+            Err(e) => Err(format!("running {} actions runs: {e}", self.fj)),
+        }
+    }
+}
+
+impl crate::forge_log::CommitRunsClient for FjForgeReads {
+    /// CLAUDE-277: same paging shape as `ActionRunsClient::list_runs` above,
+    /// duplicated rather than shared because the two parse into different
+    /// types ([`crate::forge_log::RunEntry`] vs [`crate::forge_log::CommitRun`])
+    /// and `RunEntry` cannot gain a `commit_sha` field without also editing the
+    /// reconciler's test literals, outside this issue's file scope.
+    fn list_commit_runs(
+        &self,
+        host: &str,
+        repo: &str,
+        max_pages: u32,
+        token: Option<&str>,
+    ) -> crate::forge_log::CommitRunsOutcome {
+        use crate::forge_log::CommitRunsOutcome;
+        let creds = match FjCreds::create(host, token) {
+            Ok(c) => c,
+            Err(e) => return CommitRunsOutcome::Failed(e),
+        };
+        let envs = creds.envs();
+        let limit = RUNS_PAGE_LIMIT.to_string();
+
+        let mut all = Vec::new();
+        for page in 1..=max_pages {
+            let page = page.to_string();
+            let args = [
+                "--host", host, "actions", "runs", "--repo", repo, "--json", "--page", &page,
+                "--limit", &limit,
+            ];
+            let out = match self.runner.run_in_env(None, &self.fj, &args, &envs) {
+                Ok(out) => out,
+                Err(e) => {
+                    if !all.is_empty() {
+                        break;
+                    }
+                    return CommitRunsOutcome::Failed(format!(
+                        "running {} actions runs: {e}",
+                        self.fj
+                    ));
+                }
+            };
+            if !out.ok {
+                if !all.is_empty() {
+                    break;
+                }
+                return match classify_fj_runs_error(&out.stderr, out.exit_code) {
+                    crate::forge_log::RunsListOutcome::AuthDenied(c) => {
+                        CommitRunsOutcome::AuthDenied(c)
+                    }
+                    crate::forge_log::RunsListOutcome::NotFound => CommitRunsOutcome::NotFound,
+                    crate::forge_log::RunsListOutcome::Failed(r) => CommitRunsOutcome::Failed(r),
+                    crate::forge_log::RunsListOutcome::Resolved(_) => unreachable!(
+                        "classify_fj_runs_error never returns Resolved on a non-ok command"
+                    ),
+                };
+            }
+            let entries = match crate::forge_log::parse_runs_list_commits(&out.stdout) {
+                Ok(e) => e,
+                Err(e) => {
+                    if !all.is_empty() {
+                        break;
+                    }
+                    return CommitRunsOutcome::Failed(format!(
+                        "parsing fj actions runs --json: {e}"
+                    ));
+                }
+            };
+            let short = entries.len() < RUNS_PAGE_LIMIT as usize;
+            all.extend(entries);
+            if short {
+                break;
+            }
+        }
+        CommitRunsOutcome::Resolved(all)
+    }
 }
 
 impl crate::forge_log::RepoFileClient for FjForgeReads {
@@ -2297,11 +2453,25 @@ mod tests {
             cfg.to_string_lossy().into_owned(),
         )]);
         assert_eq!(b.yt_base_url().as_deref(), Some("https://yt.example.com"));
-        assert_eq!(b.yt_config_path(), Some(cfg.to_string_lossy().as_ref()));
-        // Host-auth fallback (no injected config) yields no base URL.
+        assert_eq!(
+            b.yt_config_path().as_deref(),
+            Some(cfg.to_string_lossy().as_ref())
+        );
+        // Host-auth fallback (no injected config) yields no base URL. This
+        // reads the AMBIENT `YOUTRACK_CLI_CONFIG` env var (see
+        // `yt_config_path`), which a host or container running the daemon's
+        // own service login (`service_auth::export_yt_config_env`) may have
+        // set for the whole test process (CLAUDE-283), so save and restore it
+        // around the assertion rather than trusting the ambient env is clean.
+        let prior = std::env::var(crate::service_auth::YT_CONFIG_ENV).ok();
+        std::env::remove_var(crate::service_auth::YT_CONFIG_ENV);
         let host_auth = CliBackend::new(Arc::new(StubRunner::new()));
         assert_eq!(host_auth.yt_base_url(), None);
         assert_eq!(host_auth.yt_config_path(), None);
+        match prior {
+            Some(v) => std::env::set_var(crate::service_auth::YT_CONFIG_ENV, v),
+            None => std::env::remove_var(crate::service_auth::YT_CONFIG_ENV),
+        }
     }
 
     #[test]
@@ -3404,6 +3574,7 @@ mod tests {
         assert_eq!(prs[0].number, 52);
         assert_eq!(prs[0].head_sha, "abc");
         assert_eq!(prs[0].head_ref, "feat/x");
+        assert_eq!(prs[0].base_ref, "main");
         assert_eq!(prs[0].author, "David");
         assert_eq!(prs[0].updated_at, "2026-05-29T11:10:28Z");
     }
@@ -4390,6 +4561,112 @@ mod tests {
         let envs = runner.envs.lock().unwrap();
         let (_, env) = envs.iter().find(|(b, _)| b == "fj").expect("fj child ran");
         assert!(env.is_empty(), "no env injected without a token: {env:?}");
+    }
+
+    // ---- CLAUDE-277: `list_commit_runs`, the commit-carrying runs-list read ----
+
+    #[test]
+    fn commit_runs_list_pages_until_a_short_page() {
+        use crate::forge_log::{CommitRunsClient, CommitRunsOutcome};
+        let runner = with_runs_page(StubRunner::new(), "1", &runs_page(50, 90000, "main"));
+        let runner = with_runs_page(runner, "2", &runs_page(1, 21077, "feature"));
+        let runner = Arc::new(runner);
+        let out = FjForgeReads::new(runner.clone()).list_commit_runs(
+            "dev.a8n.run",
+            RUNS_REPO,
+            RUNS_MAX_PAGES,
+            Some("test-pat"),
+        );
+        let CommitRunsOutcome::Resolved(entries) = out else {
+            panic!("expected Resolved, got {out:?}");
+        };
+        assert_eq!(entries.len(), 51);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "stopped at the short page: {calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("test-pat")), "{calls:?}");
+    }
+
+    #[test]
+    fn commit_runs_list_auth_denied_on_the_first_page_is_terminal() {
+        use crate::forge_log::{CommitRunsClient, CommitRunsOutcome};
+        let args = runs_args("1");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let runner = Arc::new(StubRunner::new().fail(
+            "fj",
+            &args,
+            1,
+            "Error: unexpected status code 401 Unauthorized\n",
+        ));
+        let out = FjForgeReads::new(runner.clone()).list_commit_runs(
+            "dev.a8n.run",
+            RUNS_REPO,
+            RUNS_MAX_PAGES,
+            Some("test-pat"),
+        );
+        assert_eq!(out, CommitRunsOutcome::AuthDenied(401));
+    }
+
+    #[test]
+    fn commit_runs_list_error_after_the_first_page_returns_what_was_collected() {
+        use crate::forge_log::{CommitRunsClient, CommitRunsOutcome};
+        let runner = with_runs_page(StubRunner::new(), "1", &runs_page(50, 90000, "main"));
+        let args = runs_args("2");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let runner = Arc::new(runner.fail("fj", &args, 1, "Error: connection refused\n"));
+        let out = FjForgeReads::new(runner).list_commit_runs(
+            "dev.a8n.run",
+            RUNS_REPO,
+            RUNS_MAX_PAGES,
+            Some("test-pat"),
+        );
+        let CommitRunsOutcome::Resolved(entries) = out else {
+            panic!("expected Resolved with the collected page-1 entries, got {out:?}");
+        };
+        assert_eq!(entries.len(), 50);
+    }
+
+    // ---- CLAUDE-236: `fj actions runs --run-number` (one run's timing) ----
+
+    /// The argv for the single-run timing read, as the client builds it.
+    const TIMING_ARGS: &[&str] = &[
+        "--host",
+        "dev.a8n.run",
+        "actions",
+        "runs",
+        "--repo",
+        RUNS_REPO,
+        "--json",
+        "--run-number",
+        "4034",
+    ];
+
+    #[test]
+    fn run_timing_reads_one_run_and_never_pages() {
+        let body = r#"{"total_count":1,"runs":[{"id":21077,"index_in_repo":4034,"started":"2026-08-20T20:03:13+02:00","stopped":"2026-08-20T20:27:31+02:00","status":"failure"}]}"#;
+        let runner = Arc::new(StubRunner::new().ok("fj", TIMING_ARGS, body));
+        let t = FjForgeReads::new(runner.clone())
+            .run_timing("dev.a8n.run", RUNS_REPO, 4034, Some("test-pat"))
+            .expect("timing read");
+        assert_eq!(t.started, "2026-08-20T20:03:13+02:00");
+        assert_eq!(t.stopped, "2026-08-20T20:27:31+02:00");
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one call, no paging: {calls:?}");
+        // The token is never a process argument.
+        assert!(!calls.iter().any(|c| c.contains("test-pat")), "{calls:?}");
+    }
+
+    #[test]
+    fn run_timing_reports_a_failed_call_as_an_err_with_the_reason() {
+        let runner = Arc::new(StubRunner::new().fail(
+            "fj",
+            TIMING_ARGS,
+            1,
+            "Error: unexpected status code 404 Not Found\n",
+        ));
+        let e = FjForgeReads::new(runner)
+            .run_timing("dev.a8n.run", RUNS_REPO, 4034, Some("test-pat"))
+            .unwrap_err();
+        assert!(e.contains("404"), "the reason names the failure: {e}");
     }
 
     // ---- CLAUDE-205: `fj repo file` (FJ-67) -------------------------------
