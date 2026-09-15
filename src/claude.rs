@@ -992,6 +992,24 @@ fn killed_tasks_after_result(stream_log: &Path) -> std::io::Result<Vec<String>> 
         .collect())
 }
 
+/// CLAUDE-304: the number of `compact_boundary` events in a run's stream log,
+/// each marking a point where the CLI replaced earlier conversation with a
+/// summary (`claude.autocompact`, default [`DEFAULT_AUTOCOMPACT`]). A non-zero
+/// count is what let an earlier audit run rebuild finding write-ups from a summary
+/// instead of re-reading them, so callers that file tracker content use this
+/// to warn on the outcome they report.
+pub(crate) fn count_compact_boundaries(stream_log: &Path) -> std::io::Result<usize> {
+    let raw = std::fs::read_to_string(stream_log)?;
+    Ok(raw
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|event| {
+            event.get("type").and_then(|t| t.as_str()) == Some("system")
+                && event.get("subtype").and_then(|t| t.as_str()) == Some("compact_boundary")
+        })
+        .count())
+}
+
 fn read_tail(p: &Path, max: usize) -> std::io::Result<String> {
     let raw = std::fs::read_to_string(p)?;
     if raw.len() <= max {
@@ -2585,6 +2603,58 @@ exit "$code"
             parse_final_result(&no_result).unwrap().is_none(),
             "a readable log with no result event is still Ok(None)"
         );
+    }
+
+    /// CLAUDE-304: a stream log with no `compact_boundary` event counts zero.
+    #[test]
+    fn count_compact_boundaries_none_in_clean_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            format!("{{\"type\":\"system\",\"subtype\":\"init\"}}\n{RESULT_LINE}\n"),
+        )
+        .unwrap();
+        assert_eq!(count_compact_boundaries(&log).unwrap(), 0);
+    }
+
+    /// CLAUDE-304: the shape of an earlier audit run - one `compact_boundary` event partway
+    /// through the run - counts as one, whether it appears before or after the
+    /// terminal `result` (unlike `killed_tasks_after_result`, compaction can
+    /// happen mid-run and still matter, so no result-relative filtering here).
+    #[test]
+    fn count_compact_boundaries_counts_each_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            format!(
+                "{{\"type\":\"system\",\"subtype\":\"init\"}}\n\
+                 {{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compact_metadata\":{{\"pre_tokens\":174289,\"post_tokens\":14835}}}}\n\
+                 {RESULT_LINE}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(count_compact_boundaries(&log).unwrap(), 1);
+
+        let two = dir.path().join("two.jsonl");
+        std::fs::write(
+            &two,
+            "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n\
+             {\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n",
+        )
+        .unwrap();
+        assert_eq!(count_compact_boundaries(&two).unwrap(), 2);
+    }
+
+    /// CLAUDE-304: an unreadable stream log is an `Err`, mirroring
+    /// `parse_final_result`'s CLAUDE-256 read-failure contract, so a caller can
+    /// tell "could not check" apart from "checked, found none".
+    #[test]
+    fn count_compact_boundaries_reports_a_read_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.jsonl");
+        assert!(count_compact_boundaries(&missing).is_err());
     }
 
     /// CLAUDE-256: the end-to-end outcome. A run whose stream log cannot be read

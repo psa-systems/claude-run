@@ -1174,6 +1174,13 @@ async fn process_job(
         state::daily_cost_add(pool, &action.name, claude_result.cost).await?;
     }
 
+    // CLAUDE-304: computed once, before finalize, so both finalize's
+    // compaction check and the `ProcessedJob::Done` field below read the same
+    // path; `None` when claude never ran, so there is no log to check.
+    let stream_log = claude_ran.then(|| {
+        ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1)
+    });
+
     // ---- finalize (the native "post"): every external mutation lives here ----
     // CLAUDE-228: synchronous. CLAUDE-278: finalize no longer polls CI (that
     // wait is now driven by a webhook event), so it returns promptly.
@@ -1186,6 +1193,7 @@ async fn process_job(
             &workdir_path,
             &claude_result,
             pr_strategy,
+            stream_log.as_deref(),
         )
     });
     // ---- CLAUDE-275: record a newly opened PR against its issue ----
@@ -1237,15 +1245,7 @@ async fn process_job(
     }
 
     let ok = claude_result.ok && !post_failed;
-    let stream_log_path = if claude_ran {
-        Some(
-            ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1)
-                .display()
-                .to_string(),
-        )
-    } else {
-        None
-    };
+    let stream_log_path = stream_log.as_deref().map(|p| p.display().to_string());
 
     if !skip_attempt {
         state::attempts_increment(pool, &action.name, key).await?;
@@ -1957,6 +1957,7 @@ impl Finalized {
 /// merges or waits for CI any more, even with automerge enabled; that happens
 /// later, driven by a `success`/`recover` Action-run webhook event calling
 /// [`complete_automerge`] on this PR.
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     backend: &dyn IssueTracker,
     forge: &dyn Forge,
@@ -1965,6 +1966,7 @@ fn finalize(
     workdir: &Path,
     claude_result: &ClaudeResult,
     pr_strategy: crate::action::PrStrategy,
+    stream_log: Option<&Path>,
 ) -> Result<Finalized> {
     let needs_review = workdir.join(NEEDS_REVIEW_MARKER);
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
@@ -1977,6 +1979,7 @@ fn finalize(
             std::fs::write(&skip_marker, b"")?;
         }
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
+        let reason = append_compaction_note(&reason, stream_log, &job.key);
         comment_then_field(backend, src, &job.key, &reason, &src.states.needs_review)?;
         Ok(Finalized::NeedsReview)
     } else if claude_result.ok && no_code.exists() {
@@ -2003,6 +2006,7 @@ fn finalize(
             Ok(pr) => {
                 let url = pr_url(job, &pr);
                 let body = success_comment(claude_result, &url);
+                let body = append_compaction_note(&body, stream_log, &job.key);
                 comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
                 // CLAUDE-278: finalize no longer waits for CI itself. When
                 // `automerge.enabled`, the merge happens later, driven by a
@@ -2051,6 +2055,34 @@ fn finalize(
         let body = failure_comment(claude_result);
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
         Ok(Finalized::Failed)
+    }
+}
+
+/// CLAUDE-304: a run whose context was compacted mid-run may have rebuilt
+/// finding write-ups (or other filed content) from the compacted summary
+/// instead of re-reading it, which is what let an earlier audit run file nine issues
+/// with citations that did not exist. Appended only to the success and
+/// needs-review comments, since those are the two outcomes that can carry a
+/// tracker write worth double-checking. A stream-log read failure logs at
+/// `error` and leaves `body` unchanged, since the outcome comment must still
+/// post; `stream_log` is `None` whenever claude never ran, which also leaves
+/// `body` unchanged.
+fn append_compaction_note(body: &str, stream_log: Option<&Path>, key: &str) -> String {
+    let Some(path) = stream_log else {
+        return body.to_string();
+    };
+    match crate::claude::count_compact_boundaries(path) {
+        Ok(0) => body.to_string(),
+        Ok(n) => {
+            warn!(key = %key, count = n, "context was compacted during this run");
+            format!(
+                "{body}\n\nContext was compacted {n} time(s) during this run; check the issues it created."
+            )
+        }
+        Err(e) => {
+            error!(key = %key, error = %e, "stream log read failed while checking for compaction");
+            body.to_string()
+        }
     }
 }
 
@@ -2851,6 +2883,54 @@ mod tests {
         assert!(!body.contains("<details>"));
     }
 
+    /// CLAUDE-304: a run with no `compact_boundary` event in its stream log
+    /// leaves the outcome comment untouched.
+    #[test]
+    fn append_compaction_note_leaves_body_unchanged_without_a_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(&log, "{\"type\":\"system\",\"subtype\":\"init\"}\n").unwrap();
+        let body = append_compaction_note("The PR is ready.", Some(&log), "MK-16");
+        assert_eq!(body, "The PR is ready.");
+    }
+
+    /// CLAUDE-304: an earlier audit run's shape - a `compact_boundary` event in the run's
+    /// stream log - appends the one-line warning to whatever outcome comment
+    /// (success or needs-review) it is given.
+    #[test]
+    fn append_compaction_note_appends_the_line_when_a_boundary_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n",
+        )
+        .unwrap();
+        let body = append_compaction_note("The PR is ready.", Some(&log), "MK-16");
+        assert_eq!(
+            body,
+            "The PR is ready.\n\nContext was compacted 1 time(s) during this run; check the issues it created."
+        );
+    }
+
+    /// CLAUDE-304: a `None` stream log (claude never ran) leaves the comment
+    /// unchanged rather than erroring.
+    #[test]
+    fn append_compaction_note_leaves_body_unchanged_with_no_stream_log() {
+        let body = append_compaction_note("Parked for review.", None, "MK-16");
+        assert_eq!(body, "Parked for review.");
+    }
+
+    /// CLAUDE-304: an unreadable stream log must not stop the outcome comment
+    /// from posting; it just posts without the compaction line.
+    #[test]
+    fn append_compaction_note_leaves_body_unchanged_on_a_read_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.jsonl");
+        let body = append_compaction_note("The PR is ready.", Some(&missing), "MK-16");
+        assert_eq!(body, "The PR is ready.");
+    }
+
     #[test]
     fn build_prompt_default_substitutes_job_fields() {
         // CLAUDE-125 regression: the built-in default renders every placeholder
@@ -2981,7 +3061,7 @@ mod tests {
         assert!(p.is_ascii(), "the audit preset must be ASCII only");
         for needle in [
             "Tracker writes. You may perform EXACTLY these, and nothing else:",
-            "`Queued` is the only `AI Agent` value you may set",
+            "`Queued` and `Needs Review` are the only two `AI Agent` values you may set",
             "Every other tracker write is forbidden, in particular:",
             "No `AI Agent` or `State` change on any issue you did not create during this run",
             "No `yt issue set-state` anywhere",
@@ -3686,6 +3766,7 @@ mod tests {
             wd,
             &ClaudeResult::synthesized("e", "s"),
             PrStrategy::Branch,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -3726,6 +3807,7 @@ mod tests {
             wd,
             &ok_result(),
             PrStrategy::Branch,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -3786,6 +3868,7 @@ mod tests {
             wd,
             &ok_result(),
             PrStrategy::Branch,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -3821,6 +3904,7 @@ mod tests {
             wd,
             &ok_result(),
             PrStrategy::Branch,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -3913,6 +3997,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Branch,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -3968,6 +4053,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4479,6 +4565,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Branch,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -4547,6 +4634,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -4648,6 +4736,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Branch,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4710,6 +4799,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
+            None,
         )
         .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
@@ -4749,6 +4839,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -4780,6 +4871,7 @@ mod tests {
             dir.path(),
             &claude,
             PrStrategy::Branch,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -4820,6 +4912,7 @@ mod tests {
             dir.path(),
             &timed_out_result(),
             PrStrategy::Branch,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::TimedOut);
@@ -4860,6 +4953,7 @@ mod tests {
             dir.path(),
             &timed_out_result(),
             PrStrategy::Branch,
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::TimedOut);
@@ -4917,6 +5011,7 @@ mod tests {
             dir.path(),
             &ok_result(),
             PrStrategy::Agit,
+            None,
         )
         .unwrap();
         assert_eq!(

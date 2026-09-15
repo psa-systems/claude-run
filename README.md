@@ -610,11 +610,24 @@ description, the standing table on the anchor issue (daily parent run only), and
 (CLAUDE-295). Findings are
 created only in `native.youtrack.write_projects` (the seven product projects the audits repo maps its targets to), at
 most 20 finding issues per target, and each gets `AI Agent = Queued` as its last write, so the code-issue action works
-it. That is the only `AI Agent` value the run may set, and only on issues it created; `AI Agent` and `State` on the
-audit issue itself remain the runner's alone. The cap is a prompt instruction, not an enforced limit: `AuditedTracker`
+it. `AI Agent = Needs Review` is the one other value the run may set, and only on an issue it created this run whose
+content it later finds wrong (CLAUDE-304); `AI Agent` and `State` on the audit issue itself remain the runner's
+alone, and delete stays banned regardless. The cap is a prompt instruction, not an enforced limit: `AuditedTracker`
 counts the runner's own provider calls, not the `yt` calls an agent makes. The procedure itself (audit phases, the
 coverage and carry-forward ledgers, dedup, grouping, priority, links) lives in the audits repo under `prompts/`, not in
 this prompt, so it changes by pull request there.
+
+**Filing from disk, not from a compacted context (CLAUDE-304).** A context compaction mid-run (`claude.autocompact`,
+default 200000 tokens) replaces earlier conversation with a summary; an earlier audit run hit this and refiled nine findings
+whose citations did not exist because the run rebuilt them from that summary instead of re-reading them. The audit
+prompt now writes the dated report, with every finding's full block, before it files a single issue, then files each
+one by re-reading its block from that on-disk report and re-opening its first cited `file:line` in the clone,
+appending `<finding id><TAB><issue key>` to a filing log at `/tmp/audit-filing-{{key}}.tsv` right after each create so
+a resumed or compacted run can tell what it already filed and never refile it. Independently, `finalize` counts
+`compact_boundary` events in the run's own stream log and, when non-zero, appends `Context was compacted <n>
+time(s) during this run; check the issues it created.` to the success or needs-review outcome comment (and logs a
+`warn` naming the key and the count), so a compacted run is visible on the triggering issue even when everything it
+filed turned out fine.
 
 The dependency gate (CLAUDE-161) is left enabled, which is what sequences a daily rotation: the workflow files one
 parent plus one Epic per target and queues all of them, and `parent for` keeps the parent blocked until every Epic
