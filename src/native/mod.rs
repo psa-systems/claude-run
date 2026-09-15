@@ -15,6 +15,7 @@
 //! [`crate::job::done_record`], [`crate::job::append_output_record`]) so its
 //! outcome records and JSONL output stay byte-identical to the scripted path.
 
+pub mod audit_prompt;
 pub mod closed_issue_summary;
 pub mod youtrack;
 
