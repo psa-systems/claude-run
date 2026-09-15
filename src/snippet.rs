@@ -109,13 +109,17 @@ impl SnippetRunner {
         };
         std::fs::write(&script_path, script)?;
 
-        let output = Command::new(interpreter)
-            .arg(&script_path)
-            .envs(env_bindings)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?;
+        // CLAUDE-228: a scripted action's nu snippet is arbitrary operator code
+        // with no time bound; keep it off the async worker thread.
+        let output = crate::blocking::in_place(|| {
+            Command::new(interpreter)
+                .arg(&script_path)
+                .envs(env_bindings)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+        })?;
 
         Ok(SnippetOutcome {
             ok: output.status.success(),
@@ -128,6 +132,14 @@ impl SnippetRunner {
 
 /// Compute the per-job snippet directory:
 /// `<state_dir>/snippets/<action_name>/<job_key>/`.
+///
+/// CLAUDE-262 decided this directory is bounded by a periodic AGE sweep
+/// ([`crate::gc::sweep_snippets`]), not deleted at the end of `process_job`
+/// beside the workdir: unlike the workdir, a snippet directory is small (one
+/// rendered script plus a JSON binding file per step) and is the only place a
+/// failed `filter` / `pre` / `prompt` / `post` step's rendered nu source and
+/// inputs survive for debugging after the job ends, so deleting it immediately
+/// would remove diagnostic value the age window instead preserves for a while.
 pub fn snippet_dir_for(state_dir: &Path, action_name: &str, job_key: &str) -> PathBuf {
     state_dir.join("snippets").join(action_name).join(job_key)
 }

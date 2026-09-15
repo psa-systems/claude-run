@@ -22,8 +22,8 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::db::DbPool;
 use serde_json::Value;
-use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use crate::action::LoadedAction;
@@ -41,6 +41,10 @@ pub struct RunnerDefaults {
     pub max_runs_per_day: u32,
     pub claude_timeout_seconds: u32,
     pub daily_budget_usd: f64,
+    /// DEV-705: fraction of the per-run budget at which a run warns once.
+    pub budget_warn_fraction: f64,
+    /// CLAUDE-234: issues one run may create when the action sets no override.
+    pub max_issues_per_run: u32,
 }
 
 impl Default for RunnerDefaults {
@@ -50,6 +54,8 @@ impl Default for RunnerDefaults {
             max_runs_per_day: 20,
             claude_timeout_seconds: 600,
             daily_budget_usd: 5.00,
+            budget_warn_fraction: crate::usage::DEFAULT_WARN_FRACTION,
+            max_issues_per_run: crate::provider::DEFAULT_MAX_ISSUES_PER_RUN,
         }
     }
 }
@@ -60,10 +66,26 @@ pub struct EffectiveLimits {
     pub max_runs_per_day: u32,
     pub claude_timeout: Duration,
     pub daily_budget_usd: f64,
+    /// DEV-705: this run's spend ceiling, resolved BEFORE the run starts.
+    /// `EffectiveLimits` is `Copy` and is moved into each per-job task by value,
+    /// so no job can raise the ceiling it runs under.
+    pub run_budget_usd: f64,
+    pub budget_warn_fraction: f64,
+    /// CLAUDE-234: this run's issue-creation ceiling, enforced at the provider
+    /// boundary by [`crate::provider::AuditedTracker`].
+    pub max_issues_per_run: u32,
+}
+
+impl EffectiveLimits {
+    /// DEV-705: the frozen ceiling this run bills against.
+    pub fn run_budget(&self) -> crate::usage::RunBudget {
+        crate::usage::RunBudget::new(self.run_budget_usd, self.budget_warn_fraction)
+    }
 }
 
 pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> EffectiveLimits {
     let l = &action.action.limits;
+    let daily_budget_usd = l.daily_budget_usd.unwrap_or(defaults.daily_budget_usd);
     EffectiveLimits {
         max_attempts_per_key: l
             .max_attempts_per_key
@@ -73,8 +95,50 @@ pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> Eff
             l.claude_timeout_seconds
                 .unwrap_or(defaults.claude_timeout_seconds) as u64,
         ),
-        daily_budget_usd: l.daily_budget_usd.unwrap_or(defaults.daily_budget_usd),
+        daily_budget_usd,
+        // DEV-705: an action that sets no per-run ceiling gets its own daily
+        // budget as one, so a single run can never spend more than the day
+        // allows and no shipped action changes behavior.
+        run_budget_usd: l.run_budget_usd.unwrap_or(daily_budget_usd),
+        budget_warn_fraction: l
+            .budget_warn_fraction
+            .unwrap_or(defaults.budget_warn_fraction),
+        max_issues_per_run: l.max_issues_per_run.unwrap_or(defaults.max_issues_per_run),
     }
+}
+
+/// CLAUDE-232: the effective `max_attempts_per_key` per indexed action, for the
+/// operator surfaces that report which keys are parked at their cap. The index
+/// does not cache this limit, so each action's YAML is re-read; an action whose
+/// YAML already failed to parse is left out and reads as the default, since its
+/// parse error is surfaced on its own (the index row's `parse_error`).
+///
+/// Actions with no YAML at all (the synthetic webhook listeners) are absent by
+/// construction; they mint against `defaults`, which is what the caller passes
+/// as the fallback.
+pub fn attempt_caps(
+    rows: &[state::ActionIndexRow],
+    defaults: &RunnerDefaults,
+) -> std::collections::BTreeMap<String, u32> {
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows.iter().filter(|r| r.parse_error.is_none()) {
+        match crate::action::load_from_path(Path::new(&row.file_path)) {
+            Ok(loaded) => {
+                out.insert(
+                    row.name.clone(),
+                    effective_limits(defaults, &loaded).max_attempts_per_key,
+                );
+            }
+            // Read/parse failed for a row the index says parses: the file moved
+            // or changed under us. The default cap is the honest fallback, and
+            // the next scan re-indexes the row with its own `parse_error`.
+            Err(e) => warn!(
+                action = %row.name, path = %row.file_path, error = %e,
+                "cannot read action YAML for its attempt cap; assuming the default"
+            ),
+        }
+    }
+    out
 }
 
 pub struct JobContext<'a> {
@@ -83,7 +147,7 @@ pub struct JobContext<'a> {
     pub paths: &'a Paths,
     pub snippet: &'a SnippetRunner,
     pub claude: &'a ClaudeInvoker,
-    pub pool: &'a SqlitePool,
+    pub pool: &'a DbPool,
     pub run_id: i64,
     /// CLAUDE-9: tripped when an operator cancels this run. The claude
     /// invocation watches it to terminate the child; this pipeline watches it
@@ -95,6 +159,9 @@ pub struct JobContext<'a> {
     /// still stops it before it spends a `claude --print` call. The job's
     /// attempt is not counted, exactly as on the cancel path.
     pub pause: crate::pause::RunPause,
+    /// DEV-705 / DEV-707: the run's shared spend ledger. The invocation below
+    /// is capped at what the run has left, and its usage is billed here.
+    pub spend: crate::usage::RunSpend,
 }
 
 /// Compute the job key for a job. If `dedup_key` is set on the action, look
@@ -197,8 +264,14 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     let key = job_key(ctx.action, job, idx);
     let attempts = state::attempts_get(ctx.pool, &action.name, &key).await?;
 
+    // CLAUDE-232: `warn`, not `info`: the job is parked for good (no outcome row,
+    // no run event, the source still lists it), so every poll skips it again.
     if attempts >= ctx.limits.max_attempts_per_key && action.dedup_key.is_some() {
-        info!(action = %action.name, key = %key, attempts, "skipping job, attempt cap reached");
+        warn!(
+            action = %action.name, key = %key, attempts,
+            cap = ctx.limits.max_attempts_per_key,
+            "skipping job, attempt cap reached"
+        );
         return Ok(ProcessedJob::CapHit { key });
     }
 
@@ -307,15 +380,23 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                 // it reached claude. Don't spend an API call; synthesize a
                 // result so post still runs, and leave the attempt uncounted so
                 // the job is retried after Resume.
+                // CLAUDE-269: the same checkpoint also stops a run when the
+                // Claude login needs renewing (`RunPause` checks both), so the
+                // synthesized reason names whichever actually tripped it.
                 paused_before_claude = true;
-                warn!(action = %action.name, key = %key, "globally paused before claude started (post still runs)");
-                (
-                    ClaudeResult::synthesized(
+                let (reason, summary) = if ctx.pause.login_tripped() {
+                    (
+                        "run stopped: Claude login required",
+                        "Claude login required before claude started",
+                    )
+                } else {
+                    (
                         "run stopped by global pause",
                         "globally paused before claude started",
-                    ),
-                    false,
-                )
+                    )
+                };
+                warn!(action = %action.name, key = %key, "{summary} (post still runs)");
+                (ClaudeResult::synthesized(reason, summary), false)
             } else {
                 let stream_log = ClaudeInvoker::stream_log_path(
                     &ctx.paths.logs_dir(),
@@ -331,7 +412,13 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                     &workdir_path,
                     &stream_log,
                     &ctx.cancel,
+                    // DEV-705: cap the child at what the run has left, so one
+                    // session cannot overshoot the ceiling between checks.
+                    Some(ctx.spend.remaining_usd()),
                 )?;
+                // DEV-707: bill the run before any branch discards `r`, so a
+                // cancelled invocation still reports what it spent.
+                ctx.spend.record(&r);
                 if ctx.cancel.is_cancelled() {
                     // The token tripped mid-run; `invoke` already terminated the
                     // claude child. Synthesize a cancelled result so post runs
@@ -361,7 +448,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     // Transient claude error: no post, no attempt counted, no daily count++.
     if claude_result.transient {
         info!(action = %action.name, key = %key, error = %claude_result.error, "transient claude error, not counting attempt");
-        cleanup_workdir(&workdir_path);
+        workdir::cleanup_or_preserve(&workdir_path, &action.name, &key);
         return Ok(ProcessedJob::Transient { key });
     }
 
@@ -419,7 +506,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
         state::daily_count_increment(ctx.pool, &action.name).await?;
     }
 
-    cleanup_workdir(&workdir_path);
+    workdir::cleanup_or_preserve(&workdir_path, &action.name, &key);
 
     Ok(ProcessedJob::Done {
         key,
@@ -434,14 +521,6 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
         duration_ms: started.elapsed().as_millis() as i64,
         timed_out: claude_result.timed_out,
     })
-}
-
-fn cleanup_workdir(workdir: &Path) {
-    if workdir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(workdir) {
-            warn!(workdir = %workdir.display(), error = %e, "workdir cleanup failed (continuing)");
-        }
-    }
 }
 
 /// Outcome of `process_job`, kept simple enough to fold into both the JSONL
@@ -496,6 +575,12 @@ impl ProcessedJob {
 
 /// Append a job-outcome record to the action's per-action JSONL log (the
 /// `output.file` field on the action). Best-effort; logs but does not fail.
+///
+/// CLAUDE-257: this file is append-only and lives for the life of the install,
+/// so the daemon bounds it by SIZE (`config.stream_log_gc.output_file_max_bytes`,
+/// applied by [`crate::gc::sweep_oversized_logs`]). It is never deleted by age
+/// the way a stream log is: an operator turns `output.file` on to produce a data
+/// sink, and age-sweeping it would destroy the record it exists to keep.
 pub fn append_output_record(paths: &Paths, action: &LoadedAction, record: &Value) {
     let Some(rel) = action.action.output.file.as_deref() else {
         return;
@@ -573,6 +658,112 @@ mod tests {
         let action = mk_action(None);
         let r = job_key(&action, &json!({"foo": "bar"}), 7);
         assert_eq!(r, "job-7");
+    }
+
+    /// CLAUDE-234: the per-run issue-creation ceiling resolves like every other
+    /// limit: the action's own value wins, and an unset one falls back to the
+    /// default of 25. `0` is a real value (create nothing), not "unset".
+    #[test]
+    fn max_issues_per_run_defaults_to_25_and_the_action_overrides_it() {
+        let defaults = RunnerDefaults::default();
+        assert_eq!(defaults.max_issues_per_run, 25);
+
+        let mut action = mk_action(None);
+        assert_eq!(
+            effective_limits(&defaults, &action).max_issues_per_run,
+            25,
+            "an action with no `limits.max_issues_per_run` takes the default"
+        );
+
+        action.action.limits.max_issues_per_run = Some(3);
+        assert_eq!(effective_limits(&defaults, &action).max_issues_per_run, 3);
+
+        action.action.limits.max_issues_per_run = Some(0);
+        assert_eq!(effective_limits(&defaults, &action).max_issues_per_run, 0);
+    }
+
+    /// CLAUDE-232: the cap the operator surfaces compare against is each
+    /// action's own `limits.max_attempts_per_key`, falling back to the runner
+    /// default. An action the index already flags as unparseable is skipped
+    /// (its parse error is its own signal) rather than reported with a guess.
+    #[test]
+    fn attempt_caps_resolve_per_action_over_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.path().join(format!("{name}.yml"));
+            std::fs::write(&p, body).unwrap();
+            p.display().to_string()
+        };
+        let capped = write(
+            "audit",
+            "name: audit\ninput:\n  command: 'x'\nprompt: 'y'\nlimits:\n  max_attempts_per_key: 2\n",
+        );
+        let plain = write(
+            "youtrack",
+            "name: youtrack\ninput:\n  command: 'x'\nprompt: 'y'\n",
+        );
+        let row = |name: &str, file_path: &str, parse_error: Option<&str>| state::ActionIndexRow {
+            name: name.to_string(),
+            file_path: file_path.to_string(),
+            yaml_sha256: String::new(),
+            enabled: true,
+            schedule_kind: None,
+            schedule_spec: None,
+            last_seen_at: String::new(),
+            parse_error: parse_error.map(str::to_string),
+            link_template: None,
+            max_parallel: 1,
+        };
+
+        let caps = attempt_caps(
+            &[
+                row("audit", &capped, None),
+                row("youtrack", &plain, None),
+                row("broken", "/nonexistent/broken.yml", Some("bad yaml")),
+            ],
+            &RunnerDefaults::default(),
+        );
+        assert_eq!(caps.get("audit").copied(), Some(2), "the YAML override");
+        assert_eq!(
+            caps.get("youtrack").copied(),
+            Some(3),
+            "no override, so the runner default"
+        );
+        assert_eq!(
+            caps.get("broken"),
+            None,
+            "an unparseable action is left to the caller's default: {caps:?}"
+        );
+    }
+
+    /// DEV-705: the per-run ceiling defaults to the action's OWN daily budget,
+    /// so adding it loosens nothing and breaks no shipped action; an explicit
+    /// value wins, and the warn fraction defaults to 80 percent.
+    #[test]
+    fn run_budget_defaults_to_the_effective_daily_budget() {
+        let load = |body: &str| crate::action::validate_str(body, "<test>").unwrap();
+        let defaults = RunnerDefaults::default();
+
+        let inherits = load(
+            "name: a\ninput:\n  command: 'x'\nprompt: 'y'\nlimits:\n  daily_budget_usd: 150.0\n",
+        );
+        let l = effective_limits(&defaults, &inherits);
+        assert_eq!(l.daily_budget_usd, 150.0);
+        assert_eq!(l.run_budget_usd, 150.0, "unset inherits the daily budget");
+        assert_eq!(l.budget_warn_fraction, crate::usage::DEFAULT_WARN_FRACTION);
+
+        let pinned = load("name: a\ninput:\n  command: 'x'\nprompt: 'y'\nlimits:\n  daily_budget_usd: 150.0\n  run_budget_usd: 8.5\n  budget_warn_fraction: 0.5\n");
+        let l = effective_limits(&defaults, &pinned);
+        assert_eq!(l.run_budget_usd, 8.5, "the action's own ceiling wins");
+        assert_eq!(l.budget_warn_fraction, 0.5);
+        let budget = l.run_budget();
+        assert_eq!(budget.budget_usd, 8.5);
+        assert_eq!(budget.warn_at_usd(), 4.25);
+
+        // Neither set: the runner defaults, and the two budgets agree.
+        let bare = load("name: a\ninput:\n  command: 'x'\nprompt: 'y'\n");
+        let l = effective_limits(&defaults, &bare);
+        assert_eq!(l.run_budget_usd, defaults.daily_budget_usd);
     }
 
     fn mk_action(dedup_key: Option<String>) -> LoadedAction {

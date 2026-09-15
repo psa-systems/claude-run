@@ -28,6 +28,16 @@
 </div>
 
 <div class="card">
+  <h3>Webhook listeners</h3>
+  <span class="dim">The two event-driven listeners are not created here. <code>webhook-forgejo</code>
+  (CI failures, pull-request merges, automerge) is configured under
+  <a href="/settings#section-webhook">Settings &gt; Webhook sources</a>, and
+  <code>webhook-forgejo-comment</code> (<code>/claude</code> comment commands) under
+  <a href="/settings#section-webhook_comment">Settings &gt; Comment webhook</a>. Each appears on the
+  dashboard as soon as its section has at least one source.</span>
+</div>
+
+<div class="card">
   <h3>Advanced</h3>
   <span class="dim">Already have an action's YAML? <a href="/actions/new/raw">Paste it into the raw
   editor</a>. Raw YAML is also the escape hatch for fields no form covers; every form saves through

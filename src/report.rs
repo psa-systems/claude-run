@@ -20,9 +20,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::db::DbPool;
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Utc};
 use serde::Serialize;
-use sqlx::SqlitePool;
 
 use crate::error::Result;
 
@@ -163,14 +163,11 @@ pub struct HourBucket {
 // ---- aggregations ---------------------------------------------------------
 
 /// Daily spend + run-count series from `daily_ledger`, oldest to newest.
-pub async fn daily(
-    pool: &SqlitePool,
-    range: Range,
-    action: Option<&str>,
-) -> Result<Vec<DailyPoint>> {
+pub async fn daily(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Vec<DailyPoint>> {
     let cutoff = date_cutoff(range);
     let mut sql = String::from(
-        "SELECT date, IFNULL(SUM(cost_usd), 0.0), IFNULL(SUM(run_count), 0) FROM daily_ledger WHERE 1 = 1",
+        "SELECT date, COALESCE(SUM(cost_usd), 0.0), CAST(COALESCE(SUM(run_count), 0) AS BIGINT) \
+         FROM daily_ledger WHERE 1 = 1",
     );
     if cutoff.is_some() {
         sql.push_str(" AND date >= ?");
@@ -180,6 +177,7 @@ pub async fn daily(
     }
     sql.push_str(" GROUP BY date ORDER BY date");
 
+    let sql = crate::db::q(pool, &sql).into_owned();
     let mut q = sqlx::query_as::<_, (String, f64, i64)>(&sql);
     if let Some(c) = &cutoff {
         q = q.bind(c);
@@ -200,11 +198,7 @@ pub async fn daily(
 
 /// Weekly (ISO-week) rollup of the daily series. Aggregated in Rust off
 /// [`daily`] rather than via SQLite date functions, which lack ISO-week support.
-pub async fn weekly(
-    pool: &SqlitePool,
-    range: Range,
-    action: Option<&str>,
-) -> Result<Vec<WeeklyPoint>> {
+pub async fn weekly(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Vec<WeeklyPoint>> {
     let daily = daily(pool, range, action).await?;
     let mut weeks: BTreeMap<String, (f64, i64)> = BTreeMap::new();
     for d in daily {
@@ -229,7 +223,7 @@ pub async fn weekly(
 /// Spend (from `job_outcomes.ts`) and `(ts, claude_cost_usd)` rows over the
 /// window, optionally filtered to one action.
 async fn outcome_cost_rows(
-    pool: &SqlitePool,
+    pool: &DbPool,
     range: Range,
     action: Option<&str>,
 ) -> Result<Vec<(String, f64)>> {
@@ -241,6 +235,7 @@ async fn outcome_cost_rows(
     if action.is_some() {
         sql.push_str(" AND action_name = ?");
     }
+    let sql = crate::db::q(pool, &sql).into_owned();
     let mut q = sqlx::query_as::<_, (String, f64)>(&sql);
     if let Some(c) = &cutoff {
         q = q.bind(c);
@@ -254,7 +249,7 @@ async fn outcome_cost_rows(
 /// `(started_at, ended_at)` rows over the window, optionally filtered to one
 /// action. `ended_at` is `None` for in-flight / orphaned runs.
 async fn run_span_rows(
-    pool: &SqlitePool,
+    pool: &DbPool,
     range: Range,
     action: Option<&str>,
 ) -> Result<Vec<(String, Option<String>)>> {
@@ -266,6 +261,7 @@ async fn run_span_rows(
     if action.is_some() {
         sql.push_str(" AND action_name = ?");
     }
+    let sql = crate::db::q(pool, &sql).into_owned();
     let mut q = sqlx::query_as::<_, (String, Option<String>)>(&sql);
     if let Some(c) = &cutoff {
         q = q.bind(c);
@@ -280,7 +276,7 @@ async fn run_span_rows(
 /// from `job_outcomes`, run count + run minutes from `runs`, all bucketed by
 /// local weekday. Always returns 7 buckets, Sunday first, even when empty.
 pub async fn by_weekday(
-    pool: &SqlitePool,
+    pool: &DbPool,
     range: Range,
     action: Option<&str>,
 ) -> Result<Vec<WeekdayBucket>> {
@@ -318,11 +314,7 @@ pub async fn by_weekday(
 /// Time-of-day aggregation: spend + job activity from `job_outcomes` and run
 /// starts from `runs`, bucketed by local hour. Always returns 24 buckets,
 /// `0..=23`, even when empty.
-pub async fn by_hour(
-    pool: &SqlitePool,
-    range: Range,
-    action: Option<&str>,
-) -> Result<Vec<HourBucket>> {
+pub async fn by_hour(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Vec<HourBucket>> {
     let mut cost = [0.0_f64; 24];
     let mut jobs = [0_i64; 24];
     let mut starts = [0_i64; 24];
@@ -351,10 +343,11 @@ pub async fn by_hour(
 
 /// Top-line totals: spend + run count from `daily_ledger`, run minutes from
 /// `runs` (the only source with both endpoints; NULL `ended_at` excluded).
-pub async fn summary(pool: &SqlitePool, range: Range, action: Option<&str>) -> Result<Summary> {
+pub async fn summary(pool: &DbPool, range: Range, action: Option<&str>) -> Result<Summary> {
     let cutoff_date = date_cutoff(range);
     let mut sql = String::from(
-        "SELECT IFNULL(SUM(cost_usd), 0.0), IFNULL(SUM(run_count), 0) FROM daily_ledger WHERE 1 = 1",
+        "SELECT COALESCE(SUM(cost_usd), 0.0), CAST(COALESCE(SUM(run_count), 0) AS BIGINT) \
+         FROM daily_ledger WHERE 1 = 1",
     );
     if cutoff_date.is_some() {
         sql.push_str(" AND date >= ?");
@@ -362,6 +355,7 @@ pub async fn summary(pool: &SqlitePool, range: Range, action: Option<&str>) -> R
     if action.is_some() {
         sql.push_str(" AND action_name = ?");
     }
+    let sql = crate::db::q(pool, &sql).into_owned();
     let mut q = sqlx::query_as::<_, (f64, i64)>(&sql);
     if let Some(c) = &cutoff_date {
         q = q.bind(c);
@@ -389,19 +383,11 @@ pub async fn summary(pool: &SqlitePool, range: Range, action: Option<&str>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::MIGRATOR;
     use crate::state::{self, JobOutcome};
     use chrono::FixedOffset;
-    use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn mem_pool() -> SqlitePool {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn mem_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     /// CLAUDE-117: the core AC. A timestamp at 02:30 UTC on a Sunday lands on
@@ -469,7 +455,7 @@ mod tests {
         state::daily_count_increment(&pool, "beta").await.unwrap();
 
         // A finished run (10 min) and an in-flight run (NULL ended_at) for alpha.
-        sqlx::query("INSERT INTO runs (action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by) VALUES (?, ?, ?, 0, 1, 'cli')")
+        sqlx::query(&crate::db::q(&pool, "INSERT INTO runs (action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by) VALUES (?, ?, ?, 0, 1, 'cli')"))
             .bind("alpha")
             .bind("2026-06-14T10:00:00Z")
             .bind("2026-06-14T10:10:00Z")

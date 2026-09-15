@@ -39,9 +39,7 @@ pub fn resolve_config_dir(paths: &Paths, configured: Option<&str>) -> PathBuf {
 
 /// Ensure the agent config dir exists and is seeded. Writes `<dir>/CLAUDE.md`
 /// from [`BOT_CLAUDE_MD`] (overwritten each start) and, on Linux, links
-/// `<dir>/.credentials.json` to the host login. Errors (loudly) if the host
-/// credential file is missing so the daemon does not start an agent that cannot
-/// authenticate.
+/// `<dir>/.credentials.json` to the host login when the host has one.
 pub fn ensure(dir: &Path) -> Result<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -62,30 +60,70 @@ fn ensure_seeded(dir: &Path, home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Symlink `<dir>/.credentials.json` to `$HOME/.claude/.credentials.json` so the
+/// Link `<dir>/.credentials.json` to `$HOME/.claude/.credentials.json` so the
 /// child and the host share one credential file (a token refresh written by the
-/// child persists to the host login; a copy would silently diverge). The link is
-/// recreated each start so it always points at the current host file. A missing
-/// host credential file is a hard error naming the path and the login step.
+/// child persists to the host login; a copy would silently diverge).
+///
+/// CLAUDE-247: the container has no host login to share. The operator runs
+/// `claude auth login` inside it, and that file IS the agent's credential, so
+/// three cases never touch it: no host file at all, a real (non-symlink) file
+/// already in the agent dir, and an agent dir that resolves to `$HOME/.claude`
+/// itself (where source and link are one path and replacing it would leave a
+/// symlink pointing at itself). None of the three is an error: the daemon must
+/// come up so there is a container to log into, and `claude` fails loudly at
+/// invocation if no credential ever arrives. The first two log a `warn`; the
+/// third is an ordinary `claude_config_dir` setting with nothing to report.
 #[cfg(target_os = "linux")]
 fn link_credentials(dir: &Path, home: &Path) -> Result<()> {
     let src = home.join(".claude").join(".credentials.json");
-    if !src.exists() {
-        return Err(anyhow::anyhow!(
-            "host claude credentials not found at {}; run `claude` once to log in before starting claude-run \
-             (the agent authenticates with the shared host login)",
-            src.display()
-        )
-        .into());
-    }
     let link = dir.join(".credentials.json");
+
+    if !src.exists() {
+        tracing::warn!(
+            host_credentials = %src.display(),
+            agent_home = %dir.display(),
+            "no host claude login; the agent uses its own credentials in the agent config dir \
+             (`claude auth login` inside the container) or ANTHROPIC_API_KEY"
+        );
+        return Ok(());
+    }
+
+    if is_same_dir(dir, &src)? {
+        // The agent config dir IS $HOME/.claude, so the host login already is
+        // the agent's credential file. Nothing to link.
+        return Ok(());
+    }
+
     match std::fs::symlink_metadata(&link) {
+        Ok(meta) if !meta.file_type().is_symlink() => {
+            tracing::warn!(
+                agent_credentials = %link.display(),
+                host_credentials = %src.display(),
+                "agent config dir carries its own credentials file; leaving it in place and \
+                 not linking the host login"
+            );
+            return Ok(());
+        }
         Ok(_) => std::fs::remove_file(&link)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
     std::os::unix::fs::symlink(&src, &link)?;
     Ok(())
+}
+
+/// Whether `dir` and the directory holding `src` are the same directory, compared
+/// after resolving symlinks so `/home/bot/.claude` and a link to it match.
+#[cfg(target_os = "linux")]
+fn is_same_dir(dir: &Path, src: &Path) -> Result<bool> {
+    let Some(src_dir) = src.parent() else {
+        return Ok(false);
+    };
+    let canonical = |p: &Path| {
+        std::fs::canonicalize(p)
+            .map_err(|e| anyhow::anyhow!("resolving {} for the credential link: {e}", p.display()))
+    };
+    Ok(canonical(dir)? == canonical(src_dir)?)
 }
 
 #[cfg(test)]
@@ -101,9 +139,10 @@ mod tests {
         assert!(BOT_CLAUDE_MD.contains("You perform NO external mutation"));
         // CLAUDE-214: the bot file must match the relaxed prompt, so it carries
         // the `No orphan notes` obligation and the `AI Agent` ban that keeps a
-        // filing agent from queueing further agent runs.
+        // filing agent from queueing further agent runs (CLAUDE-295: unless the
+        // job prompt names the exception).
         assert!(BOT_CLAUDE_MD.contains("No orphan notes"));
-        assert!(BOT_CLAUDE_MD.contains("NEVER set the `AI Agent` field on ANY issue"));
+        assert!(BOT_CLAUDE_MD.contains("NEVER set the `AI Agent` field on any issue unless"));
         assert!(BOT_CLAUDE_MD.contains(".claude-run-no-code-change"));
     }
 
@@ -178,17 +217,91 @@ mod tests {
         assert_eq!(std::fs::read_link(&link).unwrap(), host_cred);
     }
 
+    // CLAUDE-247: the container carries no host login, so seeding must come up
+    // clean and must never destroy a credential written inside the container.
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn seeding_errors_when_host_credentials_absent() {
+    fn seeding_succeeds_when_host_credentials_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap(); // no ~/.claude/.credentials.json
         let dir = tmp.path().join("claude-agent-home");
-        let err = ensure_seeded(&dir, home.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains(".credentials.json") && msg.contains("log in"),
-            "error must name the missing credential path and the login step: {msg}"
+
+        ensure_seeded(&dir, home.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap(),
+            BOT_CLAUDE_MD
         );
+        assert!(
+            std::fs::symlink_metadata(dir.join(".credentials.json")).is_err(),
+            "no host login means no credential entry is invented"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seeding_preserves_an_in_container_credentials_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap(); // no host login
+        let dir = tmp.path().join("claude-agent-home");
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent_cred = dir.join(".credentials.json");
+        std::fs::write(&agent_cred, "{\"in-container\":true}").unwrap();
+
+        ensure_seeded(&dir, home.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&agent_cred).unwrap(),
+            "{\"in-container\":true}",
+            "an in-container login must survive serve start"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seeding_keeps_the_agent_file_when_the_host_also_has_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let cred_dir = home.path().join(".claude");
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        std::fs::write(cred_dir.join(".credentials.json"), "{\"host\":true}").unwrap();
+
+        let dir = tmp.path().join("claude-agent-home");
+        std::fs::create_dir_all(&dir).unwrap();
+        let agent_cred = dir.join(".credentials.json");
+        std::fs::write(&agent_cred, "{\"agent\":true}").unwrap();
+
+        ensure_seeded(&dir, home.path()).unwrap();
+
+        assert!(
+            !std::fs::symlink_metadata(&agent_cred)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a real credentials file is never replaced by a link to the host login"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&agent_cred).unwrap(),
+            "{\"agent\":true}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seeding_leaves_the_file_alone_when_the_agent_dir_is_the_host_claude_dir() {
+        // `[daemon].claude_config_dir = "$HOME/.claude"`: source and link are one
+        // path, so the old unlink-then-symlink left a self-referential link.
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred = dir.join(".credentials.json");
+        std::fs::write(&cred, "{\"only\":true}").unwrap();
+
+        ensure_seeded(&dir, home.path()).unwrap();
+
+        let meta = std::fs::symlink_metadata(&cred).unwrap();
+        assert!(!meta.file_type().is_symlink(), "must not self-symlink");
+        assert_eq!(std::fs::read_to_string(&cred).unwrap(), "{\"only\":true}");
     }
 }

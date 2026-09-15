@@ -14,11 +14,12 @@
 //! exactly as before.
 
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use sqlx::SqlitePool;
+use crate::db::DbPool;
+use age::secrecy::ExposeSecret;
 
 use crate::action::{ForgejoTarget, GithubTarget, YoutrackSource};
 use crate::error::{Error, Result};
@@ -52,22 +53,21 @@ impl SecretsKey {
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| Error::Secret(format!("reading key file {}: {e}", path.display())))?;
-        let line = raw
-            .lines()
-            .map(str::trim)
-            .find(|l| l.starts_with("AGE-SECRET-KEY-"))
-            .ok_or_else(|| {
-                Error::Secret(format!(
-                    "no AGE-SECRET-KEY- line in key file {}",
-                    path.display()
-                ))
-            })?;
-        let identity = age::x25519::Identity::from_str(line)
+        let line = extract_key(&raw).ok_or_else(|| {
+            Error::Secret(format!(
+                "no AGE-SECRET-KEY- value in key file {}",
+                path.display()
+            ))
+        })?;
+        warn_if_readable_by_others(path);
+        let identity = age::x25519::Identity::from_str(&line)
             .map_err(|e| Error::Secret(format!("parsing key file {}: {e}", path.display())))?;
         Ok(Self { identity })
     }
 
-    /// Load the key from the path named by `CLAUDE_RUN_SECRETS_KEY_FILE`.
+    /// Read the key at [`key_file_path`]. One behaviour: the file is there or
+    /// this fails. Creating it is [`ensure_key`]'s job, which runs at serve
+    /// start and before the CLI stores anything.
     pub fn load() -> Result<Self> {
         Self::load_from_file(&key_file_path()?)
     }
@@ -107,15 +107,193 @@ impl SecretsKey {
 }
 
 /// Resolve the key file path from the environment, fail-closed when unset.
+/// File name of the age key inside the config dir.
+pub const DEFAULT_KEY_FILE: &str = "secrets.key";
+
+/// The path of the age key file: `CLAUDE_RUN_SECRETS_KEY_FILE` when set, else
+/// `<CLAUDE_RUN_CONFIG_DIR>/secrets.key`.
+///
+/// The key is CONFIG, not data. Two reasons, and the first is the one that
+/// matters: the ciphertext it decrypts lives in `state.db` under the data dir,
+/// and a key stored beside its ciphertext buys nothing. Encrypting the store is
+/// worth doing precisely so the database can be copied, snapshotted and backed
+/// up without carrying the tokens with it, and that property only exists while
+/// the key sits somewhere else. Second, this is the instance's identity: an
+/// operator may want to supply it, rotate it, or restore it from their own
+/// secret store, which is what the config dir is for. The data dir holds what
+/// the runner generates and can rebuild (workdirs are literally garbage
+/// collected); the key is neither.
 pub fn key_file_path() -> Result<PathBuf> {
-    std::env::var(KEY_FILE_ENV)
-        .map(|v| PathBuf::from(crate::config::expand_path(&v)))
-        .map_err(|_| Error::Secret(format!("{KEY_FILE_ENV} is not set")))
+    if let Ok(v) = std::env::var(KEY_FILE_ENV) {
+        return Ok(PathBuf::from(crate::config::expand_path(&v)));
+    }
+    let paths = crate::config::Paths::resolve()?;
+    Ok(paths.config_dir.join(DEFAULT_KEY_FILE))
+}
+
+/// Where the key used to live: beside `state.db` under the data dir.
+/// [`ensure_key`] moves it to [`key_file_path`] on first start after the change,
+/// so an existing deployment keeps decrypting what it already stored.
+fn legacy_key_file_path() -> Result<PathBuf> {
+    Ok(crate::config::Paths::resolve()?
+        .data_dir
+        .join(DEFAULT_KEY_FILE))
+}
+
+/// Make sure a key exists, generating one when the instance has nothing to lose.
+///
+/// The runner owns its key: an operator should never have to run `age-keygen`
+/// before the web UI will store a token. But generating one is only safe while
+/// the store is empty. A missing key file next to EXISTING ciphertext means the
+/// key was lost, and quietly minting a replacement would turn every stored
+/// secret into permanently undecryptable bytes while the UI kept reporting them
+/// as present. That case is a hard error naming the path.
+///
+/// Called once at serve start and by the CLI before it stores a secret, so
+/// [`SecretsKey::load`] elsewhere is a plain read with one behaviour.
+pub async fn ensure_key(pool: &DbPool) -> Result<PathBuf> {
+    let path = key_file_path()?;
+    if path.exists() {
+        return Ok(path);
+    }
+
+    // Move a pre-existing key from the old data-dir location rather than
+    // generating a new one, or the upgrade would orphan every stored secret.
+    let legacy = legacy_key_file_path()?;
+    if legacy.exists() && legacy != path {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&legacy, &path).map_err(|e| {
+            Error::Secret(format!(
+                "moving the secrets key from {} to {}: {e}",
+                legacy.display(),
+                path.display()
+            ))
+        })?;
+        tracing::info!(
+            from = %legacy.display(),
+            to = %path.display(),
+            "moved the secrets key out of the data dir; it is configuration, not data, and must \
+             not sit beside the ciphertext it decrypts"
+        );
+        return Ok(path);
+    }
+
+    let stored = state::secret_list(pool).await?;
+    if !stored.is_empty() {
+        let names: Vec<&str> = stored.iter().map(|s| s.name.as_str()).collect();
+        return Err(Error::Secret(format!(
+            "the secrets key {} is missing but {} secret(s) are stored under it ({}). Restore that \
+             file from your backup; generating a new key here would leave every one of them \
+             permanently undecryptable",
+            path.display(),
+            stored.len(),
+            names.join(", ")
+        )));
+    }
+
+    generate_key_file(&path)?;
+    tracing::info!(
+        path = %path.display(),
+        "generated a new secrets key; BACK IT UP. Every stored secret is encrypted under it and \
+         is unrecoverable without it"
+    );
+    Ok(path)
+}
+
+/// Pull the age secret key out of `raw`, wherever on its line it sits.
+///
+/// An `age-keygen` file has the key alone on a line, but a key delivered by an
+/// operator's own tooling usually arrives inside a document: a SOPS-decrypted
+/// `data: AGE-SECRET-KEY-...`, or an env-style `CLAUDE_RUN_AGE_KEY=AGE-...`.
+/// Requiring the line to START with the key rejected all of those for no reason,
+/// so the token is found anywhere and read to the first whitespace or quote.
+fn extract_key(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(start) = line.find("AGE-SECRET-KEY-") else {
+            continue;
+        };
+        let rest = &line[start..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+            .unwrap_or(rest.len());
+        return Some(rest[..end].to_string());
+    }
+    None
+}
+
+/// Warn when the key file is readable by group or other. Not an error: an
+/// operator's own delivery mechanism may hand it over `0644` deliberately (the
+/// docker repo's `app config update` does), and refusing to start would be worse
+/// than saying so. But every process in the container can then read the key that
+/// decrypts every stored token, including the agent, so it must not pass in
+/// silence.
+fn warn_if_readable_by_others(path: &Path) {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let mode = meta.permissions().mode() & 0o077;
+            if mode != 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{:o}", meta.permissions().mode() & 0o777),
+                    "the secrets key is readable beyond its owner; every process that can read it \
+                     can decrypt every stored token"
+                );
+            }
+        }
+        // Unreadable metadata on a file we just read is odd but not fatal here;
+        // the read itself already succeeded.
+        Err(e) => tracing::warn!(path = %path.display(), error = %e, "cannot stat the secrets key"),
+    }
+}
+
+/// Create a new age identity at `path` with `0600` permissions, creating the
+/// parent directory. Fails rather than overwrites when the file already exists,
+/// so a race between two callers cannot destroy a key mid-flight.
+fn generate_key_file(path: &Path) -> Result<()> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            Error::Secret(format!(
+                "creating the secrets key directory {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    let identity = age::x25519::Identity::generate();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| {
+            Error::Secret(format!(
+                "creating the secrets key file {}: {e}",
+                path.display()
+            ))
+        })?;
+    writeln!(
+        f,
+        "# created by claude-run. Back this up: every stored secret is encrypted\n         # under this key and is unrecoverable without it."
+    )
+    .and_then(|()| writeln!(f, "{}", identity.to_string().expose_secret()))
+    .map_err(|e| {
+        Error::Secret(format!(
+            "writing the secrets key file {}: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(())
 }
 
 /// Decrypt the secret named `name`, bumping its `last_used_at`. Errors when the
 /// name is unknown or the ciphertext does not decrypt under the loaded key.
-pub async fn resolve_secret(pool: &SqlitePool, key: &SecretsKey, name: &str) -> Result<String> {
+pub async fn resolve_secret(pool: &DbPool, key: &SecretsKey, name: &str) -> Result<String> {
     let ciphertext = state::secret_get_ciphertext(pool, name)
         .await?
         .ok_or_else(|| Error::Secret(format!("no secret named `{name}`")))?;
@@ -151,7 +329,7 @@ impl ResolvedCredentials {
 /// decrypted credentials. The key file is loaded only when at least one block
 /// references a secret, so the host-auth path needs no key configured.
 pub async fn resolve_youtrack_credentials(
-    pool: &SqlitePool,
+    pool: &DbPool,
     youtrack: &YoutrackSource,
     forgejo: &ForgejoTarget,
     github: &GithubTarget,
@@ -326,7 +504,7 @@ impl Drop for TempFjKeys {
 }
 
 /// Write `bytes` to `path`, creating/truncating it mode `0600`.
-fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -409,6 +587,213 @@ mod tests {
         let path = dir.join("key.txt");
         std::fs::write(&path, identity.to_string().expose_secret()).unwrap();
         path
+    }
+
+    /// The key is found wherever it sits on its line, so a SOPS-decrypted
+    /// document or an env-style file works as a key file, not just the bare
+    /// `age-keygen` output.
+    #[test]
+    fn the_key_is_extracted_from_whatever_shape_delivers_it() {
+        let bare = "AGE-SECRET-KEY-1QQQQQQQQQQ";
+        for (label, body) in [
+            ("age-keygen", format!("# created by age-keygen\n{bare}\n")),
+            ("sops yaml", format!("data: {bare}\n")),
+            ("env style", format!("CLAUDE_RUN_AGE_KEY={bare}\n")),
+            ("quoted yaml", format!("key: \"{bare}\"\n")),
+            ("indented", format!("services:\n  env:\n    K: {bare}\n")),
+        ] {
+            assert_eq!(
+                extract_key(&body).as_deref(),
+                Some(bare),
+                "{label} should yield the key"
+            );
+        }
+        assert_eq!(extract_key("# AGE-SECRET-KEY-1COMMENTED\n"), None);
+        assert_eq!(extract_key("nothing here\n"), None);
+    }
+
+    /// A key file delivered `0644` by an operator's own tooling still loads, but
+    /// does not pass in silence.
+    #[test]
+    fn a_group_readable_key_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("delivered.yml");
+        let identity = age::x25519::Identity::generate();
+        std::fs::write(
+            &path,
+            format!("data: {}\n", identity.to_string().expose_secret()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let key = SecretsKey::load_from_file(&path).unwrap();
+        let ct = key.encrypt("token").unwrap();
+        assert_eq!(key.decrypt(&ct).unwrap(), "token");
+    }
+
+    /// The auto-generated key is a usable identity, owner-only, and carries the
+    /// back-it-up notice a human will meet in the file.
+    #[test]
+    fn generated_key_file_is_usable_and_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested").join("secrets.key");
+        generate_key_file(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the key must not be group- or world-readable");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("Back this up"), "{body}");
+
+        // It round-trips as a real key, comments and all.
+        let key = SecretsKey::load_from_file(&path).unwrap();
+        let ct = key.encrypt("hello").unwrap();
+        assert_eq!(key.decrypt(&ct).unwrap(), "hello");
+    }
+
+    /// Generating never clobbers: a second call fails rather than replacing a key
+    /// that existing ciphertext depends on.
+    #[test]
+    fn generating_refuses_to_overwrite_an_existing_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secrets.key");
+        generate_key_file(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = generate_key_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("creating the secrets key file"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the original key must survive a second generate attempt"
+        );
+    }
+
+    /// Fixture: point the process at throwaway config/data dirs and clear any
+    /// explicit key path, so `key_file_path` resolves to the tested default.
+    fn use_temp_dirs(tmp: &Path) {
+        std::env::remove_var(KEY_FILE_ENV);
+        std::env::set_var("CLAUDE_RUN_CONFIG_DIR", tmp.join("config"));
+        std::env::set_var("CLAUDE_RUN_DATA_DIR", tmp.join("data"));
+        std::env::set_var("CLAUDE_RUN_STATE_DIR", tmp.join("state"));
+        std::env::set_var("CLAUDE_RUN_RUNTIME_DIR", tmp.join("run"));
+    }
+
+    fn clear_temp_dirs() {
+        for v in [
+            "CLAUDE_RUN_CONFIG_DIR",
+            "CLAUDE_RUN_DATA_DIR",
+            "CLAUDE_RUN_STATE_DIR",
+            "CLAUDE_RUN_RUNTIME_DIR",
+        ] {
+            std::env::remove_var(v);
+        }
+    }
+
+    /// The key is configuration: it belongs beside `config.toml`, not beside the
+    /// `state.db` ciphertext it decrypts.
+    #[tokio::test]
+    async fn a_fresh_instance_gets_a_key_in_the_config_dir() {
+        let _guard = key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        use_temp_dirs(tmp.path());
+        let pool = mem_pool().await;
+
+        let path = ensure_key(&pool).await.unwrap();
+        assert_eq!(path, tmp.path().join("config").join(DEFAULT_KEY_FILE));
+        assert!(path.exists());
+        assert!(
+            !tmp.path().join("data").join(DEFAULT_KEY_FILE).exists(),
+            "nothing may be left in the data dir"
+        );
+        // Idempotent: a second call reuses the same key rather than replacing it.
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(ensure_key(&pool).await.unwrap(), path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        clear_temp_dirs();
+    }
+
+    /// An existing deployment keeps its key: the data-dir file is moved, not
+    /// replaced, or every secret already stored would become unreadable.
+    #[tokio::test]
+    async fn an_existing_key_is_moved_out_of_the_data_dir() {
+        let _guard = key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        use_temp_dirs(tmp.path());
+        let pool = mem_pool().await;
+
+        let legacy = tmp.path().join("data").join(DEFAULT_KEY_FILE);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        generate_key_file(&legacy).unwrap();
+        let original = std::fs::read_to_string(&legacy).unwrap();
+
+        let path = ensure_key(&pool).await.unwrap();
+        assert_eq!(path, tmp.path().join("config").join(DEFAULT_KEY_FILE));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the same identity must survive the move"
+        );
+        assert!(!legacy.exists(), "the old copy is not left behind");
+        clear_temp_dirs();
+    }
+
+    /// A lost key with ciphertext still in the database is a hard error. Minting
+    /// a replacement would leave every stored secret permanently undecryptable
+    /// while the UI kept listing them as present.
+    #[tokio::test]
+    async fn a_lost_key_with_stored_secrets_refuses_to_generate() {
+        let _guard = key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        use_temp_dirs(tmp.path());
+        let pool = mem_pool().await;
+
+        // Store something, then lose the key.
+        let path = ensure_key(&pool).await.unwrap();
+        let key = SecretsKey::load_from_file(&path).unwrap();
+        state::secret_create(
+            &pool,
+            "auth-youtrack-token",
+            &key.encrypt("perm:x").unwrap(),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let err = ensure_key(&pool).await.unwrap_err().to_string();
+        assert!(
+            err.contains("auth-youtrack-token"),
+            "names what is at risk: {err}"
+        );
+        assert!(err.contains("undecryptable"), "{err}");
+        assert!(!path.exists(), "no replacement key may be written");
+        clear_temp_dirs();
+    }
+
+    /// An operator-named key path is never auto-created: naming it says a
+    /// specific key is meant, and inventing a different one would leave every
+    /// stored secret undecryptable.
+    #[tokio::test]
+    async fn an_explicit_missing_key_path_errors_instead_of_generating() {
+        let _guard = key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nowhere").join("key.txt");
+        std::env::set_var(KEY_FILE_ENV, &missing);
+        let err = match SecretsKey::load() {
+            Ok(_) => panic!("an explicit missing key path must not load"),
+            Err(e) => e,
+        };
+        std::env::remove_var(KEY_FILE_ENV);
+        assert!(
+            err.to_string().contains("reading key file"),
+            "expected a read failure naming the path, got: {err}"
+        );
+        assert!(
+            !missing.exists(),
+            "nothing may be created at an explicit path"
+        );
     }
 
     #[test]
@@ -608,15 +993,8 @@ mod tests {
         assert!(!dir.join("forgejo-cli").exists());
     }
 
-    async fn mem_pool() -> SqlitePool {
-        use sqlx::sqlite::SqlitePoolOptions;
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::db::MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn mem_pool() -> DbPool {
+        crate::db::test_pool().await
     }
 
     #[tokio::test]

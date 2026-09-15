@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 
+use crate::db::DbPool;
 use axum::{
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
@@ -35,7 +36,6 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 
 use crate::cancel::RunRegistry;
@@ -51,11 +51,11 @@ use crate::state;
 pub type InFlight = Arc<tokio::sync::Mutex<std::collections::HashMap<String, usize>>>;
 
 /// Shared state injected into every handler. `Clone` is trivial because the
-/// fields are already cheap-clone (`SqlitePool` is `Arc`-shaped, `Sender`
+/// fields are already cheap-clone (`DbPool` is `Arc`-shaped, `Sender`
 /// is `Clone`, version is `&'static`).
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: SqlitePool,
+    pub pool: DbPool,
     /// One-shot trigger channel: dropping a name into here asks the scheduler
     /// to queue an out-of-cycle run for that action.
     pub trigger_tx: mpsc::Sender<String>,
@@ -72,6 +72,26 @@ pub struct AppState {
     /// CLAUDE-216: resolved on-disk locations, so the access check can write its
     /// throwaway credential files under the runtime dir the daemon already owns.
     pub paths: crate::config::Paths,
+    /// Live Anthropic API key from the Settings Auth card, shared with the
+    /// `claude` invoker so a save applies to the next invocation. `None` in
+    /// contexts that spawn no agent (tests, the CLI-direct paths).
+    pub anthropic_key: Option<crate::service_auth::ApiKeyHandle>,
+    /// Whether an agent can be spawned at all. `None` where nothing dispatches
+    /// (tests, CLI-direct paths).
+    pub readiness: Option<crate::readiness::ReadinessGate>,
+    /// Where `fj` reads `keys.json`. Held here rather than resolved at the call
+    /// site so a test can point it at a temp dir; the daemon passes
+    /// `service_auth::default_fj_data_home()`.
+    pub fj_data_home: std::path::PathBuf,
+    /// Broker for an interactive `claude auth login` driven from the Settings
+    /// Auth card. `None` outside the daemon.
+    pub claude_login: Option<Arc<crate::claude_login::LoginBroker>>,
+    /// The `claude` binary the login broker spawns (mirrors the daemon's own
+    /// `[daemon].claude_binary` override).
+    pub claude_binary: String,
+    /// Where an interactive sign-in writes its credential: the agent's
+    /// `CLAUDE_CONFIG_DIR`, so the agent picks the login up directly.
+    pub agent_config_dir: Option<std::path::PathBuf>,
 }
 
 /// JSON API router. Phase 2 mounted it at root over the unix socket;
@@ -117,6 +137,28 @@ struct StatusResponse {
     /// CLAUDE-223: live-work snapshot, so an operator scripting a reboot polls
     /// `/status` instead of scraping the About page.
     activity: Activity,
+    /// Whether the daemon can run anything at all. `false` means setup is
+    /// unfinished (no Claude credential) and the scheduler is idle by design,
+    /// which otherwise looks identical to a daemon that has no work.
+    ready: bool,
+    /// Why not, when `ready` is false. Owned rather than `&'static str`
+    /// because CLAUDE-269's login-required reason carries the CLI's own
+    /// message and a detection timestamp.
+    not_ready_reason: Option<String>,
+    /// CLAUDE-269: which not-ready axis, if any: `no_credential` |
+    /// `login_required` | `null` (ready).
+    not_ready_kind: Option<&'static str>,
+    /// CLAUDE-269: when the login-required state was first observed, RFC 3339,
+    /// or `null` when not in that state.
+    login_required_since: Option<String>,
+    /// CLAUDE-225: dependency gates holding an issue past the staleness
+    /// threshold, so an operator without the web UI sees the same signal the
+    /// dashboard banner shows.
+    stale_gates: Vec<state::StaleGate>,
+    /// CLAUDE-232: keys parked at their action's per-key attempt cap. They are
+    /// skipped on every poll with no outcome and no event row, so this is the
+    /// only machine-readable report of a queue that has stopped moving.
+    attempt_cap_hits: Vec<state::CappedKey>,
     actions: Vec<ActionStatus>,
 }
 
@@ -141,7 +183,7 @@ pub struct Activity {
 /// than degrading to an empty list: reporting "idle, safe to restart" because
 /// the query failed is exactly the mistake this indicator exists to prevent.
 pub async fn activity(
-    pool: &SqlitePool,
+    pool: &DbPool,
     in_flight: &InFlight,
 ) -> Result<Activity, crate::error::Error> {
     let active_runs = state::active_runs(pool).await?;
@@ -187,6 +229,17 @@ async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusRespons
             reason: r,
         });
     let actions = state::action_index_list(&s.pool).await?;
+    // CLAUDE-232: resolve each action's cap before the rows are consumed below.
+    // Reading the YAML touches disk, hence `in_place`.
+    let defaults = crate::job::RunnerDefaults::default();
+    let caps = crate::blocking::in_place(|| crate::job::attempt_caps(&actions, &defaults));
+    let attempt_cap_hits = state::attempt_cap_hits(
+        &s.pool,
+        &caps,
+        defaults.max_attempts_per_key,
+        state::ATTEMPT_CAP_HITS_LIMIT,
+    )
+    .await?;
     let mut out = Vec::with_capacity(actions.len());
     for a in actions {
         let paused = state::action_pause_status(&s.pool, &a.name)
@@ -210,6 +263,30 @@ async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusRespons
         version: s.version.to_string(),
         global_paused: global,
         activity: activity(&s.pool, &s.in_flight).await?,
+        ready: s
+            .readiness
+            .as_ref()
+            .map(|g| g.check().ready)
+            .unwrap_or(true),
+        not_ready_reason: s.readiness.as_ref().and_then(|g| g.check().reason()),
+        not_ready_kind: s
+            .readiness
+            .as_ref()
+            .and_then(|g| g.check().kind)
+            .map(|k| k.as_str()),
+        login_required_since: s
+            .readiness
+            .as_ref()
+            .and_then(|g| g.check().login_required_since)
+            .map(|t| t.to_rfc3339()),
+        stale_gates: state::dependency_gates_stale(
+            &s.pool,
+            state::now_epoch_ms(),
+            state::STALE_GATE_AFTER_MS,
+            20,
+        )
+        .await?,
+        attempt_cap_hits,
         actions: out,
     }))
 }
@@ -264,6 +341,16 @@ async fn trigger_action(
                 "globally paused since {paused_at}{because}; resume before triggering `{name}`"
             ),
         });
+    }
+    // Same reasoning for an unconfigured instance: `Dispatcher::execute` drops
+    // the run, so acking it as queued would be a lie.
+    if let Some(gate) = &s.readiness {
+        if let Some(reason) = gate.check().reason() {
+            return Err(AppError {
+                status: StatusCode::CONFLICT,
+                message: format!("{reason}; cannot trigger `{name}` yet"),
+            });
+        }
     }
     s.trigger_tx
         .send(name.clone())
@@ -353,10 +440,7 @@ async fn delete_action(
 /// Returns `false` when `name` is not in the index (unknown action). Shared by
 /// the API, web, and CLI-direct delete paths; the in-flight guard is each
 /// caller's responsibility (the API additionally consults its in-flight set).
-pub async fn delete_indexed_action(
-    pool: &SqlitePool,
-    name: &str,
-) -> Result<bool, crate::error::Error> {
+pub async fn delete_indexed_action(pool: &DbPool, name: &str) -> Result<bool, crate::error::Error> {
     let rows = state::action_index_list(pool).await?;
     let Some(row) = rows.into_iter().find(|r| r.name == name) else {
         return Ok(false);
@@ -625,8 +709,6 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::MIGRATOR;
-    use sqlx::sqlite::SqlitePoolOptions;
 
     async fn app_state() -> Arc<AppState> {
         app_state_with_triggers().await.0
@@ -636,12 +718,7 @@ mod tests {
     /// must hold the receiver: dropping it closes the channel and every send
     /// fails with a 503 that has nothing to do with what is under test.
     async fn app_state_with_triggers() -> (Arc<AppState>, mpsc::Receiver<String>) {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
+        let pool = crate::db::test_pool().await;
         let (trigger_tx, rx) = mpsc::channel(8);
         let state = Arc::new(AppState {
             pool: pool.clone(),
@@ -649,6 +726,12 @@ mod tests {
             version: "test",
             runs: Arc::new(RunRegistry::new()),
             in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            anthropic_key: None,
+            readiness: None,
+            claude_login: None,
+            fj_data_home: std::path::PathBuf::from("/nonexistent/test-fj-data"),
+            claude_binary: "claude".to_string(),
+            agent_config_dir: None,
             settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
             paths: crate::config::Paths::resolve().unwrap(),
         });
@@ -816,6 +899,61 @@ mod tests {
         assert!(ack.ok);
     }
 
+    /// CLAUDE-269: while login-required, the trigger endpoint answers 409
+    /// naming the reason, exactly like a global pause, and never lies with a
+    /// "queued trigger" ack for work that would just be dropped.
+    #[tokio::test]
+    async fn trigger_is_refused_while_login_required() {
+        let (mut s, _rx) = app_state_with_triggers().await;
+        state::action_index_upsert(
+            &s.pool,
+            &state::ActionIndexRow {
+                name: "act".into(),
+                file_path: "/dev/null".into(),
+                yaml_sha256: String::new(),
+                enabled: true,
+                schedule_kind: Some("manual".into()),
+                schedule_spec: None,
+                last_seen_at: state::now_iso(),
+                parse_error: None,
+                link_template: None,
+                max_parallel: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".credentials.json"), "{}").unwrap();
+        let gate = crate::readiness::ReadinessGate::new(tmp.path().to_path_buf(), None);
+        s = Arc::new(AppState {
+            readiness: Some(gate.clone()),
+            ..(*s).clone()
+        });
+
+        let Json(ack) = trigger_action(State(s.clone()), AxumPath("act".into()))
+            .await
+            .expect("ready and unpaused: the trigger is accepted");
+        assert!(ack.ok);
+
+        gate.trip_login_required("OAuth session expired", "invocation");
+        let err = trigger_action(State(s.clone()), AxumPath("act".into()))
+            .await
+            .expect_err("a login-required trigger must be refused");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(
+            err.message.contains("Claude login required"),
+            "{}",
+            err.message
+        );
+
+        gate.clear_login_required();
+        let Json(ack) = trigger_action(State(s.clone()), AxumPath("act".into()))
+            .await
+            .expect("a fresh sign-in restores the trigger");
+        assert!(ack.ok);
+    }
+
     /// CLAUDE-223: quiet needs BOTH signals clear. An open `runs` row makes it
     /// false, and so does a non-empty in-flight map with no row yet written.
     #[tokio::test]
@@ -856,6 +994,109 @@ mod tests {
         let Json(status) = get_status(State(s.clone())).await.unwrap();
         assert!(!status.activity.quiet);
         assert_eq!(status.activity.active_runs[0].id, run);
+    }
+
+    /// CLAUDE-269: `/status` carries `not_ready_kind` and `login_required_since`,
+    /// null while ready, `no_credential` with no gate reason, and
+    /// `login_required` plus an RFC 3339 timestamp once tripped.
+    #[tokio::test]
+    async fn status_reports_not_ready_kind_and_login_required_since() {
+        let mut s = app_state().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".credentials.json"), "{}").unwrap();
+        let gate = crate::readiness::ReadinessGate::new(tmp.path().to_path_buf(), None);
+        s = Arc::new(AppState {
+            readiness: Some(gate.clone()),
+            ..(*s).clone()
+        });
+
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert!(status.ready);
+        assert_eq!(status.not_ready_kind, None);
+        assert_eq!(status.login_required_since, None);
+
+        gate.trip_login_required("OAuth session expired", "invocation");
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert!(!status.ready);
+        assert_eq!(status.not_ready_kind, Some("login_required"));
+        assert!(
+            status.login_required_since.is_some(),
+            "must carry a detection timestamp"
+        );
+        assert!(status
+            .not_ready_reason
+            .unwrap()
+            .contains("OAuth session expired"));
+    }
+
+    /// CLAUDE-225: `/status` carries the stale-gate block, so an operator with no
+    /// browser sees a gate that stopped resuming instead of an empty poll history.
+    #[tokio::test]
+    async fn status_reports_stale_dependency_gates() {
+        let s = app_state().await;
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert!(status.stale_gates.is_empty());
+
+        state::dependency_gate_upsert(
+            &s.pool,
+            "youtrack",
+            "AUD-31",
+            state::now_epoch_ms() - 5_400_000,
+            "AUD-32 (depends on)",
+        )
+        .await
+        .unwrap();
+        // A fresh block is not a signal; age this one past the threshold.
+        sqlx::query(&crate::db::q(
+            &s.pool,
+            "UPDATE dependency_gate SET blocked_since = ? WHERE job_key = 'AUD-31'",
+        ))
+        .bind(state::now_epoch_ms() - 7_200_000)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert_eq!(status.stale_gates.len(), 1, "{:?}", status.stale_gates);
+        assert_eq!(status.stale_gates[0].job_key, "AUD-31");
+        assert!(status.stale_gates[0].recheck_overdue_ms > 0);
+    }
+
+    /// CLAUDE-232: `/status` carries the parked-at-cap block. The skip writes no
+    /// outcome and no event row, so without this an operator scripting against
+    /// the API cannot tell a stalled queue from an idle one.
+    #[tokio::test]
+    async fn status_reports_keys_parked_at_the_attempt_cap() {
+        let s = app_state().await;
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert!(status.attempt_cap_hits.is_empty());
+
+        // The action has no index row here, so the default cap (3) applies.
+        for _ in 0..3 {
+            state::attempts_increment(&s.pool, "youtrack", "CLAUDE-9")
+                .await
+                .unwrap();
+        }
+        state::attempts_increment(&s.pool, "youtrack", "CLAUDE-8")
+            .await
+            .unwrap();
+
+        let Json(status) = get_status(State(s.clone())).await.unwrap();
+        assert_eq!(
+            status.attempt_cap_hits.len(),
+            1,
+            "{:?}",
+            status.attempt_cap_hits
+        );
+        assert_eq!(status.attempt_cap_hits[0].job_key, "CLAUDE-9");
+        assert_eq!(status.attempt_cap_hits[0].action_name, "youtrack");
+        assert_eq!(
+            (
+                status.attempt_cap_hits[0].count,
+                status.attempt_cap_hits[0].cap
+            ),
+            (3, 3)
+        );
     }
 
     /// CLAUDE-61 / CLAUDE-220: no synthetic action can be deleted (none has a

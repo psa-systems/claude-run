@@ -1,0 +1,19 @@
+# Bootstrap config seeded into the config volume on a container's first start
+# (oci-build/entrypoint.sh copies it in only when none exists, so operator edits
+# and image upgrades never fight).
+#
+# Only bootstrap keys belong here: everything runtime-tunable is DB-backed and
+# edited on the web Settings page. See README "Configuration".
+
+[web]
+# 0.0.0.0, not the 127.0.0.1 default: a loopback bind inside a container is
+# reachable only from that container, so neither a published port nor a reverse
+# proxy on the compose network can get to the web UI.
+bind = "0.0.0.0"
+port = 7321
+
+# No auth_token_ref / auth_username here on purpose. A non-loopback bind requires
+# auth, and the credential is created from the browser on first start: the daemon
+# serves its /setup page until an administrator exists. Set auth_token_ref later
+# (Settings -> secrets, then this file) only if API clients need a bearer token
+# as well.

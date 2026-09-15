@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::db::DbPool;
 use serde::Deserialize;
-use sqlx::SqlitePool;
 use tracing::info;
 
 use crate::error::Result;
@@ -30,7 +30,7 @@ struct LegacyAttempt {
     last_at: String,
 }
 
-pub async fn import_legacy_state(pool: &SqlitePool, legacy_dir: &Path) -> Result<MigrationReport> {
+pub async fn import_legacy_state(pool: &DbPool, legacy_dir: &Path) -> Result<MigrationReport> {
     let mut report = MigrationReport::default();
     if !legacy_dir.is_dir() {
         return Ok(report);
@@ -61,7 +61,8 @@ pub async fn import_legacy_state(pool: &SqlitePool, legacy_dir: &Path) -> Result
         );
 
         for (job_key, att) in &parsed.attempts {
-            sqlx::query(
+            sqlx::query(&crate::db::q(
+                pool,
                 r#"
                 INSERT INTO attempt_counters (action_name, job_key, count, last_at)
                 VALUES (?, ?, ?, ?)
@@ -69,7 +70,7 @@ pub async fn import_legacy_state(pool: &SqlitePool, legacy_dir: &Path) -> Result
                     count = excluded.count,
                     last_at = excluded.last_at
                 "#,
-            )
+            ))
             .bind(&action_name)
             .bind(job_key)
             .bind(att.count)
@@ -87,7 +88,8 @@ pub async fn import_legacy_state(pool: &SqlitePool, legacy_dir: &Path) -> Result
         for date in dates {
             let count = parsed.daily_count.get(date).copied().unwrap_or(0);
             let cost = parsed.daily_cost_usd.get(date).copied().unwrap_or(0.0);
-            sqlx::query(
+            sqlx::query(&crate::db::q(
+                pool,
                 r#"
                 INSERT INTO daily_ledger (action_name, date, run_count, cost_usd)
                 VALUES (?, ?, ?, ?)
@@ -95,7 +97,7 @@ pub async fn import_legacy_state(pool: &SqlitePool, legacy_dir: &Path) -> Result
                     run_count = excluded.run_count,
                     cost_usd = excluded.cost_usd
                 "#,
-            )
+            ))
             .bind(&action_name)
             .bind(date)
             .bind(count)

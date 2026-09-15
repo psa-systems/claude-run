@@ -25,6 +25,7 @@
 //! [`crate::snippet`]). The async native handler (CLAUDE-32) wraps a backend
 //! call in `tokio::task::spawn_blocking`.
 
+pub mod audit;
 pub mod cli;
 pub mod github;
 
@@ -34,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+pub use audit::{AuditedTracker, IssueWriteAudit, DEFAULT_MAX_ISSUES_PER_RUN};
 pub use cli::{CliBackend, CmdOutput, CommandRunner, FjForgeReads, ProcessRunner};
 pub use github::{is_github_host, GithubForge, HttpMcpTransport, McpTransport};
 
@@ -78,6 +80,11 @@ pub struct ForgePullRequest {
     /// Head branch name, cloned by the handler.
     #[serde(default)]
     pub head_ref: String,
+    /// Base branch name (the branch the PR merges into), used by the comment
+    /// webhook's PR route to let an agent bring the base branch in to resolve
+    /// merge conflicts (CLAUDE-303).
+    #[serde(default)]
+    pub base_ref: String,
     /// Author login, matched against the bot-author skip.
     #[serde(default)]
     pub author: String,
@@ -109,6 +116,13 @@ pub struct PullRequest {
     /// PR web URL as the forge CLI reported it (the `html_url` field of
     /// `fj pr create --json`).
     pub url: String,
+    /// CLAUDE-275: the server-side head branch this PR was opened from, when the
+    /// strategy produced one (the Forgejo branch strategy, and GitHub, which is
+    /// always branch-backed). `None` for the AGit strategy, which pushes to
+    /// `refs/for/<base>` and never creates a server branch, so a re-queued issue
+    /// has nothing to resume there.
+    #[serde(default)]
+    pub head_branch: Option<String>,
 }
 
 /// Direction of an issue link, mirroring the YouTrack REST `IssueLink.direction`
@@ -154,9 +168,7 @@ pub struct IssueLink {
 }
 
 /// CLAUDE-189: an issue's body plus its comment texts, from
-/// `yt issue inspect --json`. Backs the ci-failure-analysis action, which parses
-/// the `## Failure` block out of `description` and detects its own hidden
-/// analyzed-marker (to stay idempotent) across `description` + `comments`.
+/// `yt issue inspect --json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IssueInspect {
     /// The issue's Markdown description / body.
@@ -197,8 +209,7 @@ pub trait IssueTracker: Send + Sync {
     fn issue_links(&self, key: &str) -> Result<Vec<IssueLink>>;
 
     /// CLAUDE-189: read an issue's description and comment texts via
-    /// `yt issue inspect --json`. Backs the ci-failure-analysis action's
-    /// coordinate parsing and idempotent analyzed-marker detection.
+    /// `yt issue inspect --json`.
     fn inspect_issue(&self, key: &str) -> Result<IssueInspect>;
 
     /// Resolve a project's enabled VCS integration to a clonable repo. Errors
@@ -216,6 +227,11 @@ pub trait IssueTracker: Send + Sync {
     /// and a Markdown `description`, optionally pre-assigning `assignee` (a login).
     /// Returns the new issue's `idReadable` (e.g. `CLAUDE-47`). Backs the
     /// triage-driven issue mint (CLAUDE-46).
+    ///
+    /// CLAUDE-234: a run reaches this through [`AuditedTracker`], which spends
+    /// one slot of the run's issue-creation ceiling per call and refuses once
+    /// the ceiling is reached. Implementations do NOT count; the ledger is
+    /// per-run, and a backend can outlive many runs.
     fn create_issue(
         &self,
         project: &str,
@@ -347,6 +363,14 @@ pub trait Forge: Send + Sync {
     fn take_notices(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// CLAUDE-275: record an operator-visible notice from OUTSIDE this backend
+    /// (the native handler, which knows about the `agent_pull_requests` store
+    /// this trait has no knowledge of), so a DB-write failure after a successful
+    /// `create_pr` surfaces through the same [`Self::take_notices`] /
+    /// `run_events` path as a lookup degradation rather than only the daemon
+    /// journal. The default is a no-op, matching a backend with no notice queue.
+    fn note(&self, _message: String) {}
 
     /// Resolve an authenticated clone URL for `repo` on `host` using the forge
     /// CLI's stored credentials (no token in YAML or env). `repo` is the
@@ -519,6 +543,104 @@ pub const GITHUB_PRIORITY: &[BackendKind] = &[BackendKind::Mcp, BackendKind::Gh]
 /// Default priority: CLI-first, and CLI-only for this phase.
 pub const DEFAULT_PRIORITY: &[BackendKind] = &[BackendKind::Cli];
 
+/// Shallow-clone `url` into `workdir`, pinning `branch` when given.
+///
+/// CLAUDE-252: captures git's output instead of letting it inherit the daemon's
+/// stderr, so a failure reports WHY. Before this every clone site reported only
+/// `git clone exited 128`, which in a container is indistinguishable between a
+/// missing credential, an unknown host and a deleted branch, and diagnosing the
+/// real one needed a hand-run `git clone` inside the container.
+///
+/// The URL is token-bearing (see [`Forge::clone_url`]), and git echoes it in its
+/// own messages, so the captured text goes through [`crate::forge_log::redact`]
+/// with the URL's userinfo passed as a known secret. The URL itself never enters
+/// the error: the reason string is persisted to `run_events` and can reach a
+/// YouTrack comment.
+pub fn shallow_clone(
+    url: &str,
+    branch: Option<&str>,
+    workdir: &std::path::Path,
+    depth: u32,
+) -> Result<()> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("clone");
+    if let Some(b) = branch {
+        cmd.arg("--branch").arg(b);
+    }
+    let out = cmd
+        .arg("--depth")
+        .arg(depth.to_string())
+        .arg(url)
+        .arg(workdir)
+        .output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(git_error("clone", &out, Some(url)))
+}
+
+/// The error for a failed git subprocess: the exit code plus the tail of git's
+/// own stderr, redacted.
+///
+/// CLAUDE-252: every git call site used to report only an exit code, so `git
+/// clone exited 128` and `git push exited 1` were the whole diagnosis for a
+/// missing credential, an unknown host, a deleted branch, a rejected
+/// non-fast-forward and a protected branch alike. `url` is the token-bearing URL
+/// when the command had one, so its credential is masked verbatim on top of the
+/// shape-based redaction; the URL itself is never included, because this string
+/// is persisted to `run_events` and can reach a YouTrack comment.
+pub fn git_error(context: &str, out: &std::process::Output, url: Option<&str>) -> Error {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let secrets = url.map(url_secrets).unwrap_or_default();
+    let detail = clone_error_tail(&crate::forge_log::redact(stderr.trim(), &secrets));
+    Error::Other(anyhow::anyhow!(
+        "git {context} exited {}{}",
+        out.status.code().unwrap_or(-1),
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    ))
+}
+
+/// The credential inside a clone URL's userinfo (`https://user:TOKEN@host/...`),
+/// so it can be masked verbatim wherever git echoed it. Both halves are returned:
+/// the password is the secret, and the whole `user:pass` pair is masked too in
+/// case git printed it unsplit.
+fn url_secrets(url: &str) -> Vec<String> {
+    let Some(rest) = url.split_once("//").map(|(_, r)| r) else {
+        return Vec::new();
+    };
+    let Some((userinfo, _)) = rest.split_once('@') else {
+        return Vec::new();
+    };
+    let mut out = vec![userinfo.to_string()];
+    if let Some((_, pass)) = userinfo.split_once(':') {
+        out.push(pass.to_string());
+    }
+    out
+}
+
+/// Keep the last few lines of git's stderr: the cause is at the end, and the
+/// banner above it ("Cloning into ...") is noise in a failure reason that lands
+/// on an action page.
+fn clone_error_tail(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        // "Cloning into '<path>'..." is git's progress banner, not a cause, and
+        // it carries the workdir path into a message an operator reads.
+        .filter(|l| !l.is_empty() && !l.starts_with("Cloning into"))
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Resolve a usable [`Backend`] from `priority`, walking the list in order and
 /// returning the first backend that probes successfully. Errors
 /// [`Error::NoBackend`] (listing every attempt) when none is usable, e.g. when
@@ -587,6 +709,72 @@ pub fn resolve_runner_with(
 mod tests {
     use super::*;
     use cli::testutil::StubRunner;
+
+    /// CLAUDE-252: a failed clone must say WHY. `git clone exited 128` alone is
+    /// the same message for a missing credential, an unknown host and a deleted
+    /// branch, and diagnosing the real one cost a hand-run clone in the
+    /// container.
+    #[test]
+    fn a_failed_clone_reports_gits_own_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = shallow_clone("/nonexistent/repo.git", None, &tmp.path().join("out"), 50)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("git clone exited"), "{err}");
+        assert!(
+            err.to_lowercase().contains("repository")
+                || err.to_lowercase().contains("does not exist"),
+            "the reason git printed must survive into the error: {err}"
+        );
+    }
+
+    /// The clone URL carries a token, git echoes it, and the reason string is
+    /// persisted to `run_events` and can reach a YouTrack comment. Neither the
+    /// token nor the URL may appear.
+    #[test]
+    fn a_failed_clone_never_leaks_the_url_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token = "abcdef0123456789abcdef0123456789";
+        let url = format!("https://oauth2:{token}@127.0.0.1:1/owner/repo.git");
+        let err = shallow_clone(&url, None, &tmp.path().join("out"), 50)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains(token),
+            "the token must not survive redaction: {err}"
+        );
+        assert!(
+            !err.contains("oauth2:"),
+            "the userinfo must not survive redaction: {err}"
+        );
+    }
+
+    /// The userinfo is pulled out of every URL shape the forge can produce, so
+    /// redaction has the verbatim secret to mask and does not rely on shape
+    /// heuristics alone.
+    #[test]
+    fn url_secrets_extracts_the_credential() {
+        assert_eq!(
+            url_secrets("https://oauth2:tok@host/owner/repo.git"),
+            vec!["oauth2:tok".to_string(), "tok".to_string()]
+        );
+        assert_eq!(
+            url_secrets("https://tok@host/owner/repo.git"),
+            vec!["tok".to_string()]
+        );
+        assert!(url_secrets("https://host/owner/repo.git").is_empty());
+        assert!(url_secrets("/local/path.git").is_empty());
+    }
+
+    /// The tail keeps the cause and drops git's banner, which is what makes the
+    /// reason readable on an action page.
+    #[test]
+    fn the_error_tail_keeps_the_cause_not_the_banner() {
+        let stderr = "Cloning into '/tmp/x'...\n\nfatal: could not read Username for 'https://h': terminal prompts disabled\n";
+        let tail = clone_error_tail(stderr);
+        assert!(tail.contains("could not read Username"), "{tail}");
+        assert!(!tail.contains("Cloning into"), "{tail}");
+    }
 
     #[test]
     fn resolve_returns_cli_when_binaries_present() {

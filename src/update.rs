@@ -624,14 +624,14 @@ pub async fn apply_core(
 /// file even when `token_ref` is set, and `--use-fj-token` can escalate without
 /// touching the age store at all.
 pub struct ConfiguredToken {
-    pool: sqlx::SqlitePool,
+    pool: crate::db::DbPool,
     name: String,
 }
 
 impl ConfiguredToken {
     /// Build a lazy resolver for the secret named `name` (from
     /// `[update].token_ref`) against `pool`. Nothing is decrypted here.
-    pub fn new(pool: sqlx::SqlitePool, name: String) -> Self {
+    pub fn new(pool: crate::db::DbPool, name: String) -> Self {
         Self { pool, name }
     }
 
@@ -1158,15 +1158,8 @@ mod tests {
 
     // ---- lazy configured-token resolution (CLAUDE-158) ---------------------
 
-    async fn mem_pool() -> sqlx::SqlitePool {
-        use sqlx::sqlite::SqlitePoolOptions;
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::db::MIGRATOR.run(&pool).await.unwrap();
-        pool
+    async fn mem_pool() -> crate::db::DbPool {
+        crate::db::test_pool().await
     }
 
     fn write_test_key(dir: &Path) -> PathBuf {

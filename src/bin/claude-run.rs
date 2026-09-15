@@ -17,7 +17,7 @@ use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
 use claude_run::{
     access, action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db,
-    exit, jsonfmt, lock, migrate, paint, secrets, settings, snippet, state, update,
+    exit, import, jsonfmt, lock, migrate, paint, secrets, settings, snippet, state, update,
 };
 
 /// `--color` choices. Maps to both `anstream` (our own output) and clap's
@@ -74,11 +74,19 @@ enum Cmd {
         /// Action name (resolved against the actions dir) or path to a YAML file.
         action: String,
     },
-    /// Start the daemon. Owns the scheduler and the unix-socket API.
+    /// Start the daemon. Owns the scheduler and, unless `--no-socket`, the
+    /// unix-socket API.
     Serve {
         /// Detach (fork twice, write pidfile, redirect stdio to daemon.log).
         #[arg(long)]
         detach: bool,
+        /// Do not bind the unix-socket control API. The CLI subcommands that
+        /// need a daemon (`trigger`, `cancel`) then fail, and the TCP web UI
+        /// and its `/api` routes are the only control plane. Intended for the
+        /// container image, where no CLI operator exists and the socket would
+        /// only be an unauthenticated second copy of that control plane.
+        #[arg(long)]
+        no_socket: bool,
     },
     /// Stop a running daemon (SIGTERM, graceful). Idempotent: a no-op exit 0
     /// when no daemon is running. Never force-kills; if the daemon does not
@@ -86,6 +94,9 @@ enum Cmd {
     Stop,
     /// Restart the daemon: stop the running one, then `serve` again.
     Restart {
+        /// Restart without the unix-socket API (mirrors `serve --no-socket`).
+        #[arg(long)]
+        no_socket: bool,
         /// Detach the restarted daemon (mirrors `serve --detach`).
         #[arg(long)]
         detach: bool,
@@ -122,6 +133,22 @@ enum Cmd {
     Migrate {
         #[arg(long)]
         from: Option<String>,
+    },
+    /// Copy an existing SQLite state store into the configured database
+    /// (CLAUDE-251). The target is whatever `[database] url` /
+    /// `CLAUDE_RUN_DATABASE_URL` resolves to, so the import and the daemon
+    /// cannot disagree about where the rows went; the source is opened
+    /// read-only and is never modified.
+    Import {
+        /// SQLite file to read. Defaults to `<CLAUDE_RUN_DATA_DIR>/state.db`,
+        /// the store this install uses with no database URL set.
+        #[arg(long)]
+        from: Option<String>,
+        /// Copy into a target that already holds rows. Off by default: the
+        /// expected move is into a fresh database, and a second import into a
+        /// populated one duplicates history.
+        #[arg(long)]
+        allow_nonempty: bool,
     },
     /// Show the running version, check the registry for a newer build, or
     /// self-update in place. With no subcommand, behaves like `show`.
@@ -236,7 +263,7 @@ fn main() -> ExitCode {
     // the runtime is constructed produces a child with corrupt scheduler
     // state. Resolve paths and do the fork in this sync context, then build
     // the runtime in the child.
-    let maybe_detach = matches!(&cli.cmd, Cmd::Serve { detach: true });
+    let maybe_detach = matches!(&cli.cmd, Cmd::Serve { detach: true, .. });
     if maybe_detach {
         if let Err(e) = detach_now() {
             paint::error(&format!("detach failed: {e}"));
@@ -319,6 +346,11 @@ fn clap_choice(color: ColorWhen) -> clap::ColorChoice {
     }
 }
 
+/// Fork into the background with `logs/daemon.log` as the daemon's stdout and
+/// stderr. CLAUDE-257: nothing rotates that file here; the daemon's own log GC
+/// pass (`crate::gc::sweep_oversized_logs`, first tick at serve start) keeps it
+/// under `config.stream_log_gc.daemon_log_max_bytes` by truncating it in place,
+/// which the `O_APPEND` handle opened below follows to the new end of file.
 fn detach_now() -> claude_run::error::Result<()> {
     let paths = cfg::Paths::resolve()?;
     let log = paths.state_dir.join("logs").join("daemon.log");
@@ -398,6 +430,9 @@ async fn real_main(
     let paths = cfg::Paths::resolve()?;
     let (on_disk, config_source) = cfg::OnDiskConfig::load(&paths)?;
     apply_config_log_filter(&log_reload, on_disk.daemon.log_filter.as_deref());
+    // CLAUDE-250: which state store to open, resolved once so every subcommand
+    // and the daemon agree on the backend.
+    let db_target = cfg::resolve_database(&paths, &on_disk.database)?;
 
     let actions_dir = cli
         .actions_dir
@@ -406,20 +441,34 @@ async fn real_main(
         .unwrap_or_else(|| paths.actions_dir());
 
     match cli.cmd {
-        Cmd::Run { action } => run_action(&action, &actions_dir, &paths, &on_disk).await,
-        Cmd::Serve { detach } => serve(detach, paths, on_disk, config_source, log_reload).await,
+        Cmd::Run { action } => {
+            run_action(&action, &actions_dir, &paths, &on_disk, &db_target).await
+        }
+        Cmd::Serve { detach, no_socket } => {
+            serve(
+                detach,
+                !no_socket,
+                paths,
+                on_disk,
+                config_source,
+                log_reload,
+            )
+            .await
+        }
         Cmd::Stop => stop(&paths).await,
-        Cmd::Restart { detach } => restart(detach, cli.actions_dir.as_deref(), &paths).await,
+        Cmd::Restart { detach, no_socket } => {
+            restart(detach, no_socket, cli.actions_dir.as_deref(), &paths).await
+        }
         Cmd::Trigger { action } => trigger(&action, &paths).await,
         Cmd::Cancel { run_id } => cancel_run(run_id, &paths).await,
-        Cmd::Pause { action, reason } => pause(action, reason, &paths).await,
-        Cmd::Resume { action } => resume(action, &paths).await,
-        Cmd::Status => status(&paths).await,
-        Cmd::Action(c) => action_cmd(c, &paths, &actions_dir).await,
-        Cmd::Access(c) => access_cmd(c, &paths).await,
-        Cmd::Secret(c) => secret_cmd(c, &paths).await,
+        Cmd::Pause { action, reason } => pause(action, reason, &paths, &db_target).await,
+        Cmd::Resume { action } => resume(action, &paths, &db_target).await,
+        Cmd::Status => status(&paths, &db_target).await,
+        Cmd::Action(c) => action_cmd(c, &paths, &actions_dir, &db_target).await,
+        Cmd::Access(c) => access_cmd(c, &paths, &db_target).await,
+        Cmd::Secret(c) => secret_cmd(c, &db_target).await,
         Cmd::Migrate { from } => {
-            let pool = db::open(&paths.state_db()).await?;
+            let pool = db::open(&db_target).await?;
             let legacy = from.map(PathBuf::from).unwrap_or_else(|| {
                 dirs::home_dir()
                     .unwrap()
@@ -434,14 +483,35 @@ async fn real_main(
             );
             Ok(exit::OK)
         }
-        Cmd::Version { cmd } => version_cmd(cmd, &paths, &on_disk).await,
+        Cmd::Import {
+            from,
+            allow_nonempty,
+        } => {
+            let source = from
+                .map(|f| PathBuf::from(cfg::expand_path(&f)))
+                .unwrap_or_else(|| paths.state_db());
+            import::refuse_same_target(&source, &db_target)?;
+            let target = db::open(&db_target).await?;
+            let report =
+                import::import_sqlite(&source, &target, import::ImportOptions { allow_nonempty })
+                    .await?;
+            print!("{}", report.render());
+            tracing::info!(
+                source = %source.display(),
+                tables = report.tables.len(),
+                rows = report.total_copied(),
+                "sqlite state store imported"
+            );
+            Ok(exit::OK)
+        }
+        Cmd::Version { cmd } => version_cmd(cmd, &on_disk, &db_target).await,
     }
 }
 
 async fn version_cmd(
     cmd: Option<VersionCmd>,
-    paths: &cfg::Paths,
     on_disk: &cfg::OnDiskConfig,
+    db_target: &cfg::DatabaseTarget,
 ) -> claude_run::error::Result<i32> {
     match cmd.unwrap_or(VersionCmd::Show) {
         VersionCmd::Show => {
@@ -454,7 +524,7 @@ async fn version_cmd(
         } => {
             // CLAUDE-101: the update config is DB-backed; read the effective value
             // (DB wins, file is the fallback before any serve migrated it).
-            let pool = db::open(&paths.state_db()).await?;
+            let pool = db::open(db_target).await?;
             let update_cfg = settings::effective_update(&pool, on_disk).await?;
             let train = resolve_train(train, &update_cfg.train)?;
             let configured = configured_update_token(&pool, &update_cfg);
@@ -466,7 +536,7 @@ async fn version_cmd(
             use_fj_token,
             yes,
         } => {
-            let pool = db::open(&paths.state_db()).await?;
+            let pool = db::open(db_target).await?;
             let update_cfg = settings::effective_update(&pool, on_disk).await?;
             let train = resolve_train(train, &update_cfg.train)?;
             let configured = configured_update_token(&pool, &update_cfg);
@@ -493,7 +563,7 @@ fn resolve_train(
 /// the configured-token branch is taken, so a configured `token_ref` no longer
 /// forces `CLAUDE_RUN_SECRETS_KEY_FILE` to be present up front.
 fn configured_update_token(
-    pool: &sqlx::SqlitePool,
+    pool: &crate::db::DbPool,
     update_cfg: &cfg::UpdateConfig,
 ) -> Option<update::ConfiguredToken> {
     update_cfg
@@ -507,11 +577,12 @@ async fn run_action(
     actions_dir: &std::path::Path,
     paths: &cfg::Paths,
     on_disk: &cfg::OnDiskConfig,
+    db_target: &cfg::DatabaseTarget,
 ) -> claude_run::error::Result<i32> {
     let loaded = action::load(arg, actions_dir)?;
     tracing::info!(action = %loaded.action.name, path = %loaded.path.display(), "starting run");
 
-    let pool = db::open(&paths.state_db()).await?;
+    let pool = db::open(db_target).await?;
 
     // Pause checks (Phase 2 contract)
     if state::global_pause_status(&pool).await?.is_some() {
@@ -547,9 +618,22 @@ async fn run_action(
         on_disk.daemon.claude_config_dir.as_deref(),
     );
     claude_run::agent_home::ensure(&agent_config_dir)?;
+    // CLAUDE-239: no daemon here, so there is no `LiveSettings` to share a
+    // handle with; read the stored global `config.claude` once and hand the
+    // invoker a handle over that snapshot.
+    let claude_defaults = Arc::new(std::sync::RwLock::new(
+        settings::effective_claude(&pool).await?,
+    ));
+    // CLAUDE-269: a fresh, run-scoped gate. It has nothing to persist across
+    // invocations of the CLI (there is no daemon), but it still stops a LATER
+    // job in the SAME multi-job run once an earlier invocation trips it, via
+    // the same `PauseGate`/`RunPause` wiring the daemon uses.
+    let readiness = claude_run::readiness::ReadinessGate::new(agent_config_dir.clone(), None);
     let claude = Arc::new(
         claude_mod::ClaudeInvoker::new(on_disk.daemon.claude_binary.as_deref())
-            .with_config_dir(Some(agent_config_dir)),
+            .with_config_dir(Some(agent_config_dir))
+            .with_default_claude(claude_defaults)
+            .with_readiness(readiness.clone()),
     );
     // CLAUDE-28: a standalone `run` is a single process with no daemon, so it
     // gets its own ephemeral key gate; the per-action lock already prevents it
@@ -564,16 +648,21 @@ async fn run_action(
     // CLAUDE-223: the standalone path takes the same live global-pause gate as
     // the daemon, so a pause taken while it works stops it picking up new jobs
     // (the up-front check above only covers the moment the run started).
-    let pause = claude_run::pause::PauseGate::new(pool.clone());
+    let pause = claude_run::pause::PauseGate::new(pool.clone()).with_readiness(readiness);
+    // CLAUDE-228: the standalone path has no scheduler to defer, so its gather
+    // marker is a fresh one nothing else reads.
+    let gather = claude_run::concurrency::GatherGate::new();
+    // DEV-705: the run's own exit code, so a standalone run that hit its spend
+    // ceiling exits `exit::OVER_BUDGET` rather than reporting success.
     daemon::run_action_inner(
-        &loaded, paths, &pool, snippet, claude, "cli", None, &keygate, &limiter, &pause,
+        &loaded, paths, &pool, snippet, claude, "cli", None, &keygate, &limiter, &pause, &gather,
     )
-    .await?;
-    Ok(exit::OK)
+    .await
 }
 
 async fn serve(
     _detach: bool, // already actioned in main() before the tokio runtime started
+    unix_socket: bool,
     paths: cfg::Paths,
     on_disk: cfg::OnDiskConfig,
     config_source: cfg::ConfigSource,
@@ -604,6 +693,7 @@ async fn serve(
         paths,
         on_disk,
         log_apply,
+        unix_socket,
     };
     d.run().await?;
     Ok(exit::OK)
@@ -683,6 +773,7 @@ async fn stop(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
 
 async fn restart(
     detach: bool,
+    no_socket: bool,
     actions_dir_arg: Option<&str>,
     paths: &cfg::Paths,
 ) -> claude_run::error::Result<i32> {
@@ -710,18 +801,45 @@ async fn restart(
     if detach {
         cmd.arg("--detach");
     }
+    if no_socket {
+        cmd.arg("--no-socket");
+    }
     let err = cmd.exec();
     Err(anyhow::anyhow!("failed to exec `serve` on restart: {err}").into())
+}
+
+/// The error for "the daemon socket is not answering", told apart from "no
+/// daemon is running". With `serve --no-socket` the daemon is healthy and the
+/// socket is absent by design, and reporting that as "not running" sends the
+/// operator to restart a daemon that is working fine.
+fn daemon_unreachable(
+    paths: &cfg::Paths,
+    sock: &std::path::Path,
+    consequence: &str,
+) -> claude_run::error::Error {
+    match daemon::read_pidfile(paths) {
+        Some(pid) if daemon::process_alive(pid) => anyhow::anyhow!(
+            "daemon (pid {pid}) is running with its unix-socket API disabled (`serve --no-socket`), \
+             so {consequence}. Use the web UI or its `/api` routes over TCP, or restart the daemon \
+             without --no-socket."
+        )
+        .into(),
+        _ => anyhow::anyhow!(
+            "daemon not reachable at {}; start it with `claude-run serve --detach`",
+            sock.display()
+        )
+        .into(),
+    }
 }
 
 async fn trigger(action: &str, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     if !DaemonClient::is_reachable(&sock) {
-        return Err(anyhow::anyhow!(
-            "daemon not reachable at {}; start it with `claude-run serve --detach`",
-            sock.display()
-        )
-        .into());
+        return Err(daemon_unreachable(
+            paths,
+            &sock,
+            "a trigger cannot reach its scheduler",
+        ));
     }
     let c = DaemonClient::new(&sock);
     let v: serde_json::Value = c
@@ -734,12 +852,11 @@ async fn trigger(action: &str, paths: &cfg::Paths) -> claude_run::error::Result<
 async fn cancel_run(run_id: i64, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     if !DaemonClient::is_reachable(&sock) {
-        return Err(anyhow::anyhow!(
-            "daemon not reachable at {}; an in-flight run only exists inside the daemon, \
-             so cancellation requires it to be running",
-            sock.display()
-        )
-        .into());
+        return Err(daemon_unreachable(
+            paths,
+            &sock,
+            "an in-flight run exists only inside it and cannot be cancelled from here",
+        ));
     }
     let c = DaemonClient::new(&sock);
     let v: serde_json::Value = c.post(&format!("/runs/{}/cancel", run_id), None).await?;
@@ -751,6 +868,7 @@ async fn pause(
     action: Option<String>,
     reason: Option<String>,
     paths: &cfg::Paths,
+    db_target: &cfg::DatabaseTarget,
 ) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     let body = reason.as_ref().map(|r| json!({"reason": r}));
@@ -764,7 +882,7 @@ async fn pause(
         let v: serde_json::Value = c.post(&path, body.as_ref()).await?;
         jsonfmt::print_json(&v)?;
     } else {
-        let pool = db::open(&paths.state_db()).await?;
+        let pool = db::open(db_target).await?;
         match action {
             Some(name) => state::action_pause_set(&pool, &name, reason.as_deref()).await?,
             None => state::global_pause_set(&pool, reason.as_deref()).await?,
@@ -774,7 +892,11 @@ async fn pause(
     Ok(exit::OK)
 }
 
-async fn resume(action: Option<String>, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+async fn resume(
+    action: Option<String>,
+    paths: &cfg::Paths,
+    db_target: &cfg::DatabaseTarget,
+) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     if DaemonClient::is_reachable(&sock) {
         let c = DaemonClient::new(&sock);
@@ -785,7 +907,7 @@ async fn resume(action: Option<String>, paths: &cfg::Paths) -> claude_run::error
         let v: serde_json::Value = c.post(&path, None).await?;
         jsonfmt::print_json(&v)?;
     } else {
-        let pool = db::open(&paths.state_db()).await?;
+        let pool = db::open(db_target).await?;
         match action {
             Some(name) => state::action_pause_clear(&pool, &name).await?,
             None => state::global_pause_clear(&pool).await?,
@@ -795,7 +917,10 @@ async fn resume(action: Option<String>, paths: &cfg::Paths) -> claude_run::error
     Ok(exit::OK)
 }
 
-async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+async fn status(
+    paths: &cfg::Paths,
+    db_target: &cfg::DatabaseTarget,
+) -> claude_run::error::Result<i32> {
     let sock = daemon::daemon_socket_path(paths);
     if DaemonClient::is_reachable(&sock) {
         let c = DaemonClient::new(&sock);
@@ -803,14 +928,44 @@ async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
         jsonfmt::print_json(&v)?;
         return Ok(exit::OK);
     }
-    let pool = db::open(&paths.state_db()).await?;
-    let global = state::global_pause_status(&pool).await?;
-    let actions = state::action_index_list(&pool).await?;
+    let pool = db::open(db_target).await?;
+    jsonfmt::print_json(&daemonless_status(&pool, &sock).await?)?;
+    Ok(exit::OK)
+}
+
+/// The report `status` prints with no daemon running. Split out of [`status`]
+/// (CLAUDE-232) so the blocks it must carry are testable without a live daemon
+/// or captured stdout.
+async fn daemonless_status(
+    pool: &crate::db::DbPool,
+    sock: &std::path::Path,
+) -> claude_run::error::Result<serde_json::Value> {
+    let global = state::global_pause_status(pool).await?;
+    let actions = state::action_index_list(pool).await?;
     // CLAUDE-223: the same activity block `/status` carries, so a reboot script
     // reads `quiet` whether or not the daemon is up. With no daemon there is no
     // in-flight map to consult, so the open `runs` rows are the whole signal.
-    let active_runs = state::active_runs(&pool).await?;
-    let report = json!({
+    let active_runs = state::active_runs(pool).await?;
+    // CLAUDE-225: the same stale-gate block `/status` carries. The gate table is
+    // the daemon's, but it is plain DB state, so a daemonless status reports a
+    // stuck gate rather than the misleading silence of omitting it.
+    let stale_gates =
+        state::dependency_gates_stale(pool, state::now_epoch_ms(), state::STALE_GATE_AFTER_MS, 20)
+            .await?;
+    // CLAUDE-232: likewise for the keys parked at their action's attempt cap.
+    // Both counters and action YAML are plain on-disk state, so the daemonless
+    // path reports the same block rather than omitting it and reading as clear.
+    let defaults = claude_run::job::RunnerDefaults::default();
+    let caps =
+        claude_run::blocking::in_place(|| claude_run::job::attempt_caps(&actions, &defaults));
+    let attempt_cap_hits = state::attempt_cap_hits(
+        pool,
+        &caps,
+        defaults.max_attempts_per_key,
+        state::ATTEMPT_CAP_HITS_LIMIT,
+    )
+    .await?;
+    Ok(json!({
         "daemon": "not running",
         "socket_expected_at": sock.display().to_string(),
         "global_paused": global.map(|(a, r)| json!({"paused_at": a, "reason": r})),
@@ -819,18 +974,55 @@ async fn status(paths: &cfg::Paths) -> claude_run::error::Result<i32> {
             "active_runs": active_runs,
             "dispatched_actions": Vec::<String>::new(),
         },
+        "stale_gates": stale_gates,
+        "attempt_cap_hits": attempt_cap_hits,
         "actions": actions,
-    });
-    jsonfmt::print_json(&report)?;
-    Ok(exit::OK)
+    }))
+}
+
+/// `action show` output: the index row plus prompt provenance read from the YAML. Both prompt
+/// fields are null for a kind with no agent prompt, or when the YAML does not parse.
+#[derive(serde::Serialize)]
+struct ActionShow {
+    #[serde(flatten)]
+    row: state::ActionIndexRow,
+    prompt_source: Option<String>,
+    prompt_preset: Option<&'static str>,
+}
+
+impl ActionShow {
+    fn new(row: state::ActionIndexRow, a: &action::Action) -> Self {
+        let preset = match &a.native {
+            Some(action::NativeConfig::Youtrack(yt)) => Some(yt.youtrack.prompt_preset.as_str()),
+            _ => None,
+        };
+        Self {
+            row,
+            prompt_source: a
+                .native
+                .as_ref()
+                .and_then(|n| n.prompt_source())
+                .map(|s| s.to_string()),
+            prompt_preset: preset,
+        }
+    }
+
+    fn without_prompt(row: state::ActionIndexRow) -> Self {
+        Self {
+            row,
+            prompt_source: None,
+            prompt_preset: None,
+        }
+    }
 }
 
 async fn action_cmd(
     cmd: ActionCmd,
     paths: &cfg::Paths,
     actions_dir: &std::path::Path,
+    db_target: &cfg::DatabaseTarget,
 ) -> claude_run::error::Result<i32> {
-    let pool = db::open(&paths.state_db()).await?;
+    let pool = db::open(db_target).await?;
     let sock = daemon::daemon_socket_path(paths);
     let reachable = DaemonClient::is_reachable(&sock);
     if !reachable {
@@ -844,11 +1036,24 @@ async fn action_cmd(
         }
         ActionCmd::Show { name } => {
             let rows = state::action_index_list(&pool).await?;
-            match rows.into_iter().find(|r| r.name == name) {
-                Some(r) => jsonfmt::print_json(&r)?,
-                None => {
-                    paint::error(&format!("no action `{name}` in index"));
-                    return Ok(exit::CONFIG_ERROR);
+            let Some(row) = rows.into_iter().find(|r| r.name == name) else {
+                paint::error(&format!("no action `{name}` in index"));
+                return Ok(exit::CONFIG_ERROR);
+            };
+            // Prompt provenance is read from the YAML on disk; the index has no column for it.
+            if row.parse_error.is_some() {
+                jsonfmt::print_json(&ActionShow::without_prompt(row))?;
+            } else {
+                match action::load_from_path(std::path::Path::new(&row.file_path)) {
+                    Ok(loaded) => jsonfmt::print_json(&ActionShow::new(row, &loaded.action))?,
+                    Err(e) => {
+                        let path = row.file_path.clone();
+                        jsonfmt::print_json(&ActionShow::without_prompt(row))?;
+                        paint::error(&format!(
+                            "action `{name}` is indexed but failed to load from {path}: {e}"
+                        ));
+                        return Ok(exit::CONFIG_ERROR);
+                    }
                 }
             }
         }
@@ -903,7 +1108,11 @@ async fn action_cmd(
 /// PATH and env) and runs the same service directly against the DB when it is
 /// not. Prints the typed report as JSON either way, and exits `CONFIG_ERROR`
 /// when any probe failed so it is usable as a deployment smoke test.
-async fn access_cmd(cmd: AccessCmd, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
+async fn access_cmd(
+    cmd: AccessCmd,
+    paths: &cfg::Paths,
+    db_target: &cfg::DatabaseTarget,
+) -> claude_run::error::Result<i32> {
     let AccessCmd::Check {
         repo,
         host,
@@ -924,7 +1133,7 @@ async fn access_cmd(cmd: AccessCmd, paths: &cfg::Paths) -> claude_run::error::Re
         c.post("/access/check", Some(&serde_json::to_value(&req)?))
             .await?
     } else {
-        let pool = db::open(&paths.state_db()).await?;
+        let pool = db::open(db_target).await?;
         match access::check(&pool, &api::access_cred_base(paths), &req).await {
             Ok(r) => r,
             Err(e) => access::AccessReport::from_error(&e),
@@ -940,8 +1149,11 @@ async fn access_cmd(cmd: AccessCmd, paths: &cfg::Paths) -> claude_run::error::Re
     }
 }
 
-async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Result<i32> {
-    let pool = db::open(&paths.state_db()).await?;
+async fn secret_cmd(
+    cmd: SecretCmd,
+    db_target: &cfg::DatabaseTarget,
+) -> claude_run::error::Result<i32> {
+    let pool = db::open(db_target).await?;
     match cmd {
         SecretCmd::Set { name } => {
             // The value never appears in argv (shell history, `ps`). Interactive
@@ -982,8 +1194,11 @@ async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Re
                 paint::error(&format!("refusing to store an empty secret `{name}`"));
                 return Ok(exit::CONFIG_ERROR);
             }
-            // Encrypt under the age key (CLAUDE_RUN_SECRETS_KEY_FILE). A missing
-            // key file surfaces the same clear error the daemon emits.
+            // Encrypt under the age key. `ensure_key` generates one on a fresh
+            // install so `secret set` works with nothing provisioned, and refuses
+            // to mint a replacement when secrets are already stored under a key
+            // that has gone missing.
+            secrets::ensure_key(&pool).await?;
             let key = secrets::SecretsKey::load()?;
             let ciphertext = key.encrypt(value)?;
             if state::secret_exists(&pool, &name).await? {
@@ -1022,6 +1237,53 @@ async fn secret_cmd(cmd: SecretCmd, paths: &cfg::Paths) -> claude_run::error::Re
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// `action show` adds the prompt provenance read from each shipped action's YAML.
+    #[test]
+    fn action_show_reports_prompt_provenance() {
+        let row = |name: &str| state::ActionIndexRow {
+            name: name.to_string(),
+            file_path: format!("actions/{name}.yml"),
+            yaml_sha256: String::new(),
+            enabled: true,
+            schedule_kind: None,
+            schedule_spec: None,
+            last_seen_at: String::new(),
+            parse_error: None,
+            link_template: None,
+            max_parallel: 1,
+        };
+        for (name, raw, source, preset) in [
+            (
+                "audit-run",
+                include_str!("../../actions/audit-run.yml"),
+                Some("builtin:audit"),
+                Some("audit"),
+            ),
+            (
+                "youtrack",
+                include_str!("../../actions/youtrack.yml"),
+                Some("builtin:default"),
+                Some("default"),
+            ),
+            (
+                "closed-issue-summary",
+                include_str!("../../actions/closed-issue-summary.yml"),
+                None,
+                None,
+            ),
+        ] {
+            let loaded = action::validate_str(raw, name).unwrap();
+            let v = serde_json::to_value(ActionShow::new(row(name), &loaded.action)).unwrap();
+            assert_eq!(v["name"], name, "the index row is flattened in");
+            assert_eq!(v["prompt_source"].as_str(), source, "{name}");
+            assert_eq!(v["prompt_preset"].as_str(), preset, "{name}");
+        }
+
+        let v = serde_json::to_value(ActionShow::without_prompt(row("broken"))).unwrap();
+        assert!(v["prompt_source"].is_null() && v["prompt_preset"].is_null());
+        assert!(v.get("parse_error").is_some());
+    }
 
     #[test]
     fn color_flag_defaults_to_auto() {
@@ -1077,6 +1339,92 @@ mod tests {
         assert!(Cli::try_parse_from(["claude-run", "access", "check"]).is_ok());
     }
 
+    /// CLAUDE-251: `import` takes its source from `--from` (defaulting to the
+    /// install's own `state.db`) and copies into a populated target only when
+    /// told to.
+    #[test]
+    fn import_parses_its_source_and_defaults_to_refusing_a_populated_target() {
+        let cli = Cli::try_parse_from(["claude-run", "import"]).unwrap();
+        assert!(
+            matches!(
+                cli.cmd,
+                Cmd::Import {
+                    from: None,
+                    allow_nonempty: false
+                }
+            ),
+            "no source means <CLAUDE_RUN_DATA_DIR>/state.db, and an empty target"
+        );
+
+        let cli = Cli::try_parse_from([
+            "claude-run",
+            "import",
+            "--from",
+            "/srv/old/state.db",
+            "--allow-nonempty",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Import {
+                from,
+                allow_nonempty,
+            } => {
+                assert_eq!(from.as_deref(), Some("/srv/old/state.db"));
+                assert!(allow_nonempty);
+            }
+            _ => panic!("expected import"),
+        }
+    }
+
+    /// The container image runs `serve --no-socket`, so the flag must parse on
+    /// both `serve` and `restart`, default to off, and not disturb the
+    /// detach pre-scan that decides whether to fork before the tokio runtime.
+    #[test]
+    fn no_socket_flag_parses_on_serve_and_restart() {
+        let cli = Cli::try_parse_from(["claude-run", "serve"]).unwrap();
+        assert!(
+            matches!(
+                cli.cmd,
+                Cmd::Serve {
+                    detach: false,
+                    no_socket: false
+                }
+            ),
+            "the socket stays on by default, so a host install is unchanged"
+        );
+
+        let cli = Cli::try_parse_from(["claude-run", "serve", "--no-socket"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Serve {
+                detach: false,
+                no_socket: true
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["claude-run", "serve", "--detach", "--no-socket"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Serve {
+                detach: true,
+                no_socket: true
+            }
+        ));
+        assert!(
+            matches!(&cli.cmd, Cmd::Serve { detach: true, .. }),
+            "the detach pre-scan must still fire when --no-socket follows it"
+        );
+
+        let cli = Cli::try_parse_from(["claude-run", "restart", "--no-socket"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Restart {
+                detach: false,
+                no_socket: true
+            }
+        ));
+    }
+
     #[test]
     fn color_flag_rejects_unknown_value() {
         assert!(Cli::try_parse_from(["claude-run", "--color", "rainbow", "status"]).is_err());
@@ -1100,5 +1448,33 @@ mod tests {
             let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             assert_eq!(resolve_color_choice(&owned), expected, "{args:?}");
         }
+    }
+
+    /// CLAUDE-232: `claude-run status` with no daemon carries the parked-at-cap
+    /// block, like the CLAUDE-225 stale-gate block beside it. The counters are
+    /// plain DB state, so omitting them here would read as "nothing is stuck"
+    /// exactly when the daemon is down and nobody can check the web UI.
+    #[tokio::test]
+    async fn daemonless_status_reports_keys_parked_at_the_attempt_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open_sqlite(&dir.path().join("state.db")).await.unwrap();
+        let sock = dir.path().join("daemon.sock");
+
+        let report = daemonless_status(&pool, &sock).await.unwrap();
+        assert_eq!(report["attempt_cap_hits"].as_array().unwrap().len(), 0);
+
+        // No action index row, so the key is measured against the default cap.
+        for _ in 0..3 {
+            state::attempts_increment(&pool, "youtrack", "CLAUDE-9")
+                .await
+                .unwrap();
+        }
+        let report = daemonless_status(&pool, &sock).await.unwrap();
+        let hits = report["attempt_cap_hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{report:#}");
+        assert_eq!(hits[0]["job_key"], "CLAUDE-9");
+        assert_eq!(hits[0]["action_name"], "youtrack");
+        assert_eq!(hits[0]["count"], 3);
+        assert_eq!(hits[0]["cap"], 3);
     }
 }
