@@ -1204,19 +1204,27 @@ A permission lookup that ERRORS denies (fail closed) and replies "could not veri
 ONE reply stating the required set, then the delivery is acked and dropped; denial replies are throttled per
 `(repo, login)` so a scripted denied commenter cannot flood a PR.
 
-**Execution on a pull request** shallow-clones the PR head branch, records the cloned head commit and appends
-`.claude-run-instruction.md` / `.claude-run-commit-msg` / `.claude-run-pr-comment.md` to `.git/info/exclude` so the
-runner's own scratch files never count as a change or reach a commit, writes the human's instruction VERBATIM to
-`.claude-run-instruction.md` in the checkout (it is never interpolated into a shell command or a command line: the
-agent is told to read the file), runs Claude, then applies the decision gate (CLAUDE-302). The change measurement
-stages the whole working tree (`git add -A`) and diffs the index against the cloned head, so a staged edit, an
-untracked file, and a commit the agent made on top of the clone all count; a run that made no changes this way, or
-whose diff exceeds the source's `max_files` / `max_lines`, is reported on the PR and nothing is pushed. A failure
-while measuring the change (for example an unreadable checkout) is reported as a failure, never as "no changes".
-Within the caps the runner stages the tree again, commits only if the index still differs from `HEAD` or a merge is
-in progress (an agent that already committed everything is not re-committed), as the bot identity with the CI skip
-marker (so the push does not re-trigger this listener), and pushes the branch. A PR comment is posted on EVERY
-outcome path: pushed, push failed, no changes, too big, agent error, and measurement error.
+**Execution on a pull request** shallow-clones the PR head branch, sets the bot git identity in the clone (so any
+commit the agent itself makes, such as a merge of the base branch, is authored and committed as the bot), records the
+cloned head commit and appends `.claude-run-instruction.md` / `.claude-run-commit-msg` / `.claude-run-pr-comment.md`
+to `.git/info/exclude` so the runner's own scratch files never count as a change or reach a commit, writes the
+human's instruction VERBATIM to `.claude-run-instruction.md` in the checkout (it is never interpolated into a shell
+command or a command line: the agent is told to read the file), runs Claude, then applies the decision gate
+(CLAUDE-302, CLAUDE-303). The prompt names the PR's base branch and allows exactly one kind of commit: a merge of
+that base branch, made with `git fetch --unshallow origin <base>` then `git merge FETCH_HEAD`, which is how a
+`/claude merge main and resolve the conflicts` request resolves a real conflict; every other change is left
+uncommitted for the runner. The gate first checks for unmerged paths (`git diff --diff-filter=U`) BEFORE staging
+anything: a conflict left behind, markers and all, is reported as unresolved and nothing is staged, committed, or
+pushed. Otherwise the runner stages the tree (`git add -A`) and commits only if the index still differs from `HEAD`
+or a merge is in progress (an agent that already committed everything is not re-committed), concluding a merge the
+agent staged but did not commit. The change is then measured over every commit made since the cloned head: an
+ordinary commit by its own `--numstat`, a merge commit (more than one parent) by `--remerge-diff --numstat`, so a
+base-branch merge counts only the conflict resolution the agent actually wrote, never the lines the base branch
+brought in; `files` is the count of distinct paths touched across every commit. A run with no commits since the
+clone, or whose measured diff exceeds the source's `max_files` / `max_lines`, is reported on the PR and nothing is
+pushed. A failure anywhere in the gate (for example an unreadable checkout) is reported as a failure, never as "no
+changes". Within the caps the runner pushes the branch. A PR comment is posted on EVERY outcome path: pushed, push
+failed, no changes, unresolved conflicts, too big, agent error, and measurement error.
 
 **Execution on a plain issue (CLAUDE-221)** clones nothing, starts no agent session, and pushes nothing. It resolves
 the repo's YouTrack project through the SAME routing the CI-failure mint uses (the `[mint]` `repo_project_map`
