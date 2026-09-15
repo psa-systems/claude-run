@@ -80,6 +80,11 @@ pub struct ForgePullRequest {
     /// Head branch name, cloned by the handler.
     #[serde(default)]
     pub head_ref: String,
+    /// Base branch name (the branch the PR merges into), used by the comment
+    /// webhook's PR route to let an agent bring the base branch in to resolve
+    /// merge conflicts (CLAUDE-303).
+    #[serde(default)]
+    pub base_ref: String,
     /// Author login, matched against the bot-author skip.
     #[serde(default)]
     pub author: String,

@@ -3574,6 +3574,7 @@ mod tests {
         assert_eq!(prs[0].number, 52);
         assert_eq!(prs[0].head_sha, "abc");
         assert_eq!(prs[0].head_ref, "feat/x");
+        assert_eq!(prs[0].base_ref, "main");
         assert_eq!(prs[0].author, "David");
         assert_eq!(prs[0].updated_at, "2026-05-29T11:10:28Z");
     }
