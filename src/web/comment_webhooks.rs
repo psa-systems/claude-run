@@ -1114,17 +1114,20 @@ fn serve_run(
     let clone = backend
         .clone_url(&cmd.host, &cmd.repo)
         .map_err(|e| format!("resolve clone url: {e}"))
-        .and_then(|url| {
-            clone_branch(&url, &branch, workdir).map_err(|e| format!("git clone: {e}"))
+        .and_then(|url| clone_branch(&url, &branch, workdir).map_err(|e| format!("git clone: {e}")))
+        .and_then(|()| {
+            prepare_checkout(workdir).map_err(|e| format!("preparing the checkout failed: {e}"))
         });
 
     let mut claude_ran = false;
+    let mut cloned_head = None;
     let claude_result = match clone {
         Err(reason) => {
             warn!(repo = %cmd.repo, pr = cmd.number, %reason, "clone failed (the PR reply still runs)");
             ClaudeResult::synthesized("clone failed", reason)
         }
-        Ok(()) => {
+        Ok(head) => {
+            cloned_head = Some(head);
             // The instruction reaches the agent through a FILE, verbatim. It is
             // never interpolated into a shell command or a command line.
             let instruction_path = workdir.join(INSTRUCTION_FILE);
@@ -1159,14 +1162,38 @@ fn serve_run(
     let decision = if !claude_result.ok {
         Decision::ClaudeFailed
     } else {
-        let (files, lines) = diff_stats(workdir);
-        decide(
-            &claude_result.summary,
-            files,
-            lines,
-            src.max_files,
-            src.max_lines,
-        )
+        // `cloned_head` is always `Some` here: claude only ran after a
+        // successful clone + `prepare_checkout`, and a fault on either path
+        // leaves `claude_result.ok == false` above.
+        let head = cloned_head
+            .as_deref()
+            .expect("claude only runs after a successful clone");
+        match change_stats(workdir, head) {
+            Ok((files, lines)) => decide(
+                &claude_result.summary,
+                files,
+                lines,
+                src.max_files,
+                src.max_lines,
+            ),
+            Err(e) => {
+                // A measurement failure is a fault, never "no changes": that
+                // would tell the human nothing changed when git simply could
+                // not be asked.
+                warn!(repo = %cmd.repo, pr = cmd.number, error = %e, "measuring the change failed (the PR reply still runs)");
+                let body = error_comment(&format!("measuring the change failed: {e}"));
+                post_reply(backend, cmd, workdir, body);
+                return RunOutcome {
+                    summary: format!("measuring the change failed: {e}"),
+                    ok: false,
+                    claude_ran,
+                    claude_ok: claude_result.ok,
+                    cost: claude_result.cost,
+                    timed_out: claude_result.timed_out,
+                    counts_run: claude_ran,
+                };
+            }
+        }
     };
 
     let mut push_err = None;
@@ -1411,17 +1438,72 @@ pub fn decide(summary: &str, files: u64, lines: u64, max_files: u64, max_lines: 
     }
 }
 
-/// Working-tree diff size via `git diff --numstat`. A non-git dir yields `(0,0)`.
-fn diff_stats(workdir: &FsPath) -> (u64, u64) {
-    match std::process::Command::new("git")
+/// Runs right after a successful clone: records the cloned head (what the
+/// change measurement diffs against) and appends the runner's own scratch
+/// files to `.git/info/exclude` so nothing later, including `git add -A` in
+/// [`change_stats`] and [`push_fix`], ever stages or counts them. A failure of
+/// either half is a clone-stage failure: nothing about the checkout can yet be
+/// trusted.
+fn prepare_checkout(workdir: &FsPath) -> crate::error::Result<String> {
+    let head = git_output(workdir, &["rev-parse", "HEAD"])?;
+
+    let exclude_path = workdir.join(".git").join("info").join("exclude");
+    let mut content = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    for name in [INSTRUCTION_FILE, COMMIT_MSG_FILE, PR_COMMENT_FILE] {
+        if !content.lines().any(|line| line == name) {
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(name);
+            content.push('\n');
+        }
+    }
+    std::fs::write(&exclude_path, content)?;
+
+    Ok(head)
+}
+
+/// Run `git` in `workdir` and return trimmed stdout, or git's own failure
+/// reason via [`crate::provider::git_error`].
+fn git_output(workdir: &FsPath, args: &[&str]) -> crate::error::Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(args)
+        .output()?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(crate::provider::git_error(&args.join(" "), &out, None))
+    }
+}
+
+/// The full size of the change against the commit that was cloned: `git add
+/// -A` stages everything in the working tree (unstaged edits, untracked
+/// files, and anything the agent already staged), and the `--cached` diff
+/// against `cloned_head` then sees that staged snapshot PLUS any commits the
+/// agent made on top of it. Unlike the old `git diff --numstat` (working tree
+/// vs. index only), none of staged changes, untracked files, or agent commits
+/// can read as zero. A git failure is surfaced rather than folded into `(0,
+/// 0)`, which used to read as "no changes" to the human.
+fn change_stats(workdir: &FsPath, cloned_head: &str) -> crate::error::Result<(u64, u64)> {
+    git_in(workdir, &["add", "-A"])?;
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(workdir)
         .arg("diff")
+        .arg("--cached")
         .arg("--numstat")
-        .output()
-    {
-        Ok(out) if out.status.success() => parse_numstat(&String::from_utf8_lossy(&out.stdout)),
-        _ => (0, 0),
+        .arg(cloned_head)
+        .output()?;
+    if out.status.success() {
+        Ok(parse_numstat(&String::from_utf8_lossy(&out.stdout)))
+    } else {
+        Err(crate::provider::git_error(
+            "diff --cached --numstat",
+            &out,
+            None,
+        ))
     }
 }
 
@@ -1462,14 +1544,44 @@ fn push_fix(
     git_in(workdir, &["config", "user.email", &src.bot_email])?;
     git_in(workdir, &["add", "-A"])?;
 
-    let msg = commit_message(cmd, &claude_result.summary, &src.skip_marker);
-    let msg_file = workdir.join(COMMIT_MSG_FILE);
-    std::fs::write(&msg_file, msg)?;
-    let msg_arg = msg_file.to_string_lossy();
-    git_in(workdir, &["commit", "--file", &msg_arg])?;
+    if needs_commit(workdir)? {
+        let msg = commit_message(cmd, &claude_result.summary, &src.skip_marker);
+        let msg_file = workdir.join(COMMIT_MSG_FILE);
+        std::fs::write(&msg_file, msg)?;
+        let msg_arg = msg_file.to_string_lossy();
+        git_in(workdir, &["commit", "--file", &msg_arg])?;
+    }
 
     let push_url = backend.clone_url(&cmd.host, &cmd.repo)?;
     git_push(workdir, &push_url, branch)
+}
+
+/// Whether [`push_fix`] has anything left to commit: the freshly staged index
+/// (via the `git add -A` above) still differs from `HEAD`, or a merge is in
+/// progress (`MERGE_HEAD` present), which that commit concludes. When the
+/// agent committed everything itself, the index already matches `HEAD` and
+/// there is nothing left for the runner to commit before it pushes.
+fn needs_commit(workdir: &FsPath) -> crate::error::Result<bool> {
+    if workdir.join(".git").join("MERGE_HEAD").exists() {
+        return Ok(true);
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .arg("diff")
+        .arg("--cached")
+        .arg("--quiet")
+        .arg("HEAD")
+        .output()?;
+    match out.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(crate::provider::git_error(
+            "diff --cached --quiet HEAD",
+            &out,
+            None,
+        )),
+    }
 }
 
 fn git_in(workdir: &FsPath, args: &[&str]) -> crate::error::Result<()> {
@@ -2186,6 +2298,167 @@ mod tests {
             }
         );
         assert_eq!(parse_numstat("3\t1\ta.rs\n0\t5\tb.rs\n"), (2, 9));
+    }
+
+    // ---- CLAUDE-302: staged / untracked / committed change measurement ----
+
+    /// A minimal git repo with one committed file, ready for a test to mutate
+    /// the working tree and then call [`prepare_checkout`] / [`change_stats`]
+    /// / [`needs_commit`] against it exactly as `serve_run` / `push_fix` do.
+    fn repo_with_one_commit(dir: &FsPath) {
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "tester"],
+            vec!["config", "user.email", "tester@example.com"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        }
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+        git_in(dir, &["commit", "-q", "-m", "initial"]).unwrap();
+    }
+
+    #[test]
+    fn prepare_checkout_excludes_the_scratch_files_from_the_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let head = prepare_checkout(dir).unwrap();
+
+        // The scratch files land in the checkout with no other change.
+        std::fs::write(dir.join(INSTRUCTION_FILE), "do the thing").unwrap();
+        std::fs::write(dir.join(COMMIT_MSG_FILE), "msg").unwrap();
+        std::fs::write(dir.join(PR_COMMENT_FILE), "reply").unwrap();
+
+        let (files, lines) = change_stats(dir, &head).unwrap();
+        assert_eq!((files, lines), (0, 0), "scratch files must not count");
+
+        // They are excluded from a commit too.
+        assert!(!needs_commit(dir).unwrap());
+        git_in(dir, &["add", "-A"]).unwrap();
+        let staged = git_output(dir, &["diff", "--cached", "--name-only"]).unwrap();
+        assert!(
+            staged.is_empty(),
+            "scratch files must never be staged: {staged}"
+        );
+    }
+
+    #[test]
+    fn change_stats_counts_a_staged_but_uncommitted_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let head = prepare_checkout(dir).unwrap();
+
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+
+        let (files, lines) = change_stats(dir, &head).unwrap();
+        assert_eq!(files, 1);
+        assert!(lines > 0);
+        assert_eq!(
+            decide("did it", files, lines, 10, 300),
+            Decision::Push { files, lines }
+        );
+    }
+
+    #[test]
+    fn change_stats_counts_an_untracked_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let head = prepare_checkout(dir).unwrap();
+
+        std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
+
+        let (files, _lines) = change_stats(dir, &head).unwrap();
+        assert_eq!(files, 1);
+    }
+
+    #[test]
+    fn change_stats_counts_a_commit_made_on_top_of_the_cloned_head_with_a_clean_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let head = prepare_checkout(dir).unwrap();
+
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+        git_in(dir, &["commit", "-q", "-m", "agent commit"]).unwrap();
+
+        let (files, lines) = change_stats(dir, &head).unwrap();
+        assert_eq!(files, 1);
+        assert!(lines > 0);
+
+        // The working tree (and index) are clean relative to the new HEAD, so
+        // `push_fix` has nothing left to commit before it pushes.
+        assert!(!needs_commit(dir).unwrap());
+    }
+
+    #[test]
+    fn needs_commit_is_true_while_a_merge_is_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        prepare_checkout(dir).unwrap();
+
+        // Two branches that touch the same line so the merge conflicts, then
+        // resolve and stage it exactly as an agent would (without committing).
+        git_in(dir, &["checkout", "-q", "-b", "other"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\nbranch\n").unwrap();
+        git_in(dir, &["commit", "-q", "-am", "branch change"]).unwrap();
+        git_in(dir, &["checkout", "-q", "main"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\nmain\n").unwrap();
+        git_in(dir, &["commit", "-q", "-am", "main change"]).unwrap();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["merge", "-q", "--no-ff", "other"])
+            .output()
+            .unwrap();
+        assert!(
+            dir.join(".git").join("MERGE_HEAD").exists(),
+            "the merge must conflict"
+        );
+        std::fs::write(dir.join("a.txt"), "one\nresolved\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+
+        assert!(needs_commit(dir).unwrap());
+        git_in(
+            dir,
+            &["commit", "-q", "--file", &{
+                let f = dir.join(COMMIT_MSG_FILE);
+                std::fs::write(&f, "resolve merge").unwrap();
+                f.to_string_lossy().to_string()
+            }],
+        )
+        .unwrap();
+        let parents = git_output(dir, &["log", "-1", "--pretty=%P"]).unwrap();
+        assert_eq!(
+            parents.split_whitespace().count(),
+            2,
+            "the runner's commit must be the merge commit: {parents}"
+        );
+        assert!(!needs_commit(dir).unwrap());
+    }
+
+    #[test]
+    fn change_stats_reports_a_git_failure_instead_of_no_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Not a git repository at all: `prepare_checkout` and `change_stats`
+        // must both surface the failure rather than read as zero changes.
+        assert!(prepare_checkout(dir).is_err());
+        assert!(change_stats(dir, "HEAD").is_err());
     }
 
     #[test]
