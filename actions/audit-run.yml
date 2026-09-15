@@ -6,26 +6,41 @@
 # Scheduled repository audits that file their findings (CLAUDE-214, CLAUDE-295).
 #
 # Same native handler as `youtrack.yml` (`kind: youtrack`, `src/native/youtrack.rs`); this file differs in which issues
-# it picks up, which prompt the agent gets, which projects it may create issues in, and one dependency-gate setting.
-# Audit issues live in the `AUDIT` project, whose VCS processor is `https://dev.a8n.run` / `contoso/audits`, so the
-# handler clones the AUDITS repo into the job workdir and finalize opens the pull request there. The repository being
-# audited is cloned read-only by the agent, outside the workdir, and is never written to.
+# it picks up, which built-in prompt the agent gets, which projects it may create issues in, one dependency-gate setting,
+# and automerge. Audit issues live in the `AUDIT` project, whose VCS processor points at the audits
+# repo (e.g. `owner/audits`), so the handler clones the AUDITS repo into the job workdir and finalize opens the pull request
+# there. The repository being audited is cloned read-only by the agent, outside the workdir, and is never written to.
 #
-# The prompt override (CLAUDE-125 full replacement) permits the tracker writes an audit needs and the built-in prompt
-# forbids: the run-summary comment on the parent, the run's own Epic `## Result` block, the standing table on anchor
-# issue AUDIT-1, and filing the findings into the product projects in `write_projects` (CLAUDE-295). Every finding issue
-# the run files gets `AI Agent = Queued` as its last write, so the `youtrack` action works it; that value, on issues the
-# run created, is the only `AI Agent` write the agent may make. The 20-issue per-target cap is a prompt instruction:
-# `AuditedTracker` bounds the runner's own provider calls, not the `yt` calls an agent makes. The filing procedure itself
-# (dedup, grouping, priority, tags, links) lives in the audits repo, `prompts/_filing.md`.
+# Prompt source: `prompt_preset: audit` selects the audit prompt compiled into the binary (`src/native/audit_prompt.rs`),
+# so an image upgrade updates it. This file deliberately sets no `prompt:` key: a YAML `prompt` is a full-replacement
+# override that wins over any preset and freezes the text at whatever the file says. `claude-run action show audit-run`
+# prints `"prompt_source": "builtin:audit"` while the preset is in effect.
 #
-# `AI Agent` and `State` on the triggering Epic remain the runner's alone, so the state machine in `youtrack.yml`'s
+# The audit preset permits the tracker writes an audit needs and the engineering prompt forbids: filing the findings
+# into the product projects in `write_projects` (CLAUDE-295), the `## Result` block on the run's own issue, one summary
+# comment per target on the parent, and (daily parent run only) the standing table on anchor issue AUDIT-1. Every
+# finding issue the run files gets `AI Agent = Queued` as its last write, so the `youtrack` action works it; that value,
+# on issues the run created, is the only `AI Agent` write the agent may make. The 20-issue per-target cap is a prompt
+# instruction: `AuditedTracker` bounds the runner's own provider calls, not the `yt` calls an agent makes. The filing
+# procedure itself (dedup, grouping, priority, tags, links) lives in the audits repo, `prompts/_filing.md`.
+#
+# `AI Agent` and `State` on the triggering issue remain the runner's alone, so the state machine in `youtrack.yml`'s
 # header applies here unchanged.
+#
+# Tag routing: the YouTrack workflow that files a day's audit tags the daily parent and every per-target Epic
+# `Audit-<Type>`, and that tag is what routes them here. This query selects `project: AUDIT tag: Audit-*`;
+# `youtrack.yml` selects the exact complement, `(project: -AUDIT or tag: -Audit-*)`, so exactly one action matches any
+# queued issue (CLAUDE-215). An `AUDIT` issue with no `Audit-*` tag is ordinary engineering work on the audits repo and
+# goes to `youtrack.yml`.
 #
 # The dependency gate (CLAUDE-161) is left on, which is what makes the daily parent wait: the workflow files one parent
 # plus one Epic per target and queues all of them, and `parent for` blocks the parent until every Epic resolves.
 # `block_cross_project: false` stops an Epic from waiting on its own findings: they are its subtasks but live in the
 # product projects, so a retried Epic would otherwise stay blocked until every finding was worked.
+#
+# Automerge is on: an audit pull request only adds dated files to the audits repo, and it has to merge for its Epic to
+# resolve, which is what releases the gated daily parent (whose run reads the per-target reports on the default branch).
+# The merge is event-driven (CLAUDE-278), so the webhook backing this action must send Action Run Success and Recover.
 
 name: audit-run
 
@@ -57,11 +72,12 @@ concurrency:
 
 native:
   youtrack:
-    # Only the `AUDIT` project, whose VCS processor points at the audits repo. `project: -AUDIT` in youtrack.yml is the
-    # matching exclusion, so exactly one action matches any issue (CLAUDE-215). Note the syntax: YouTrack rejects
-    # `-project: AUDIT` with a parse error, the negation goes on the value.
-    query: "-Resolved AI Agent: Queued project: AUDIT"
+    # Audit runs only: the `AUDIT` project AND an `Audit-<Type>` tag (see the header). YouTrack rejects `-project: AUDIT`
+    # with a parse error, so wherever a clause is negated (in youtrack.yml) the negation goes on the value.
+    query: "-Resolved AI Agent: Queued project: AUDIT tag: Audit-*"
     custom_field: "AI Agent"
+    # The built-in audit prompt (`src/native/audit_prompt.rs`). Do not add a `prompt:` key: it would override this.
+    prompt_preset: audit
     # The product projects findings file into: the project mapping in the audits repo's `prompts/_filing.md`.
     write_projects:
       - BUNYIP
@@ -73,55 +89,9 @@ native:
       - AB
     dependencies:
       block_cross_project: false
-    prompt: |
-      You are executing a scheduled AUDIT. It is read-only against the repository you audit: you change no code there, you fix nothing, and you open no pull request against it. Its deliverables are a dated report in the audits repo and the findings filed as YouTrack issues, each queued for the agent that works it.
-
-      Issue: {{key}}: {{summary}}
-      Repo: {{clone_url}}
-      Working directory: {{workdir}} - this is a checkout of the AUDITS repo at the Repo URL above, already cloned here, and you are inside it. It is where the report and the ledgers are written.
-
-      The audits repo is the procedure, not just the destination. Read these before doing anything else, and follow them exactly; where they disagree with this prompt about audit content, they win:
-      1. `prompts/README.md`, to pick the prompt file for this audit's type (the issue summary names it, e.g. a UI audit uses `prompts/tue-ui.md`).
-      2. That audit-type prompt, start to finish. Its phases are the run.
-      3. `prompts/_filing.md`, which owns the coverage and carry-forward ledgers, dedup, grouping, the per-target cap, priority, tagging, and linking.
-      4. `prompts/_yt-cookbook.md`, before any `yt` command.
-
-      This run IS the explicit request to file. Wherever a file in the audits repo says findings are only proposed, or are filed only when someone asks, treat this paragraph as that request and perform `prompts/_filing.md` steps 0 to 7 in full. The tracker-write limits below still bind.
-
-      Steps:
-      1. Run `yt issue inspect {{key}}` to read the description: the target repository, the product project, the report path, the date, and the cap live there.
-      2. Confirm the working directory really is the audits checkout (`prompts/` is present and `git remote --verbose` names Contoso/audits). If it is not, take the blocker path below rather than writing the report somewhere else.
-      3. Clone the target repository READ-ONLY to a path OUTSIDE {{workdir}} (for example `git clone <target-clone-url> /tmp/<repo>`) and treat it as read-only for the whole run: no edits, no builds, no test runs, no package installs, no commits, no push. Never clone either repo inside the other's working tree.
-      4. Read `<target>/_coverage.md` and `<target>/_deferred.md` in the audits checkout FIRST, per `prompts/_filing.md` step 0, and carry forward what is owed before anything found this run.
-      5. Execute the audit-type prompt's phases, including its verification phase. Drop what you cannot substantiate and state the dropped count.
-      6. File the findings per `prompts/_filing.md`: dedup, group, select at most 20 finding issues for this target, and write everything over the cap to the target's `_deferred.md`. For each finding issue, in this order: create it, set its Priority, tag it, link it, and set `AI Agent` to `Queued` LAST, so the agent never picks up a half-filed issue. Then confirm with one batch query (`yt list --query "issue ID: <KEY>, <KEY>" --json --top <N>`) that every issue you filed shows its Priority and `AI Agent = Queued`, and fix any that do not.
-      7. Write exactly the files that prompt names: the dated report with its `## Filed` table, plus the `_coverage.md` and `_deferred.md` updates for this target. Create nothing else.
-      8. Create a feature branch off the default branch (e.g. `audit/<code>-<type>-<YYYY-MM-DD>`), commit the report and both ledgers to it, and leave that branch checked out as HEAD when you stop. Never run `git checkout main` / `git switch main`: the runner opens the pull request from whatever branch is checked out, so switching back strands the work and produces an empty pull request.
-      9. Reference the issue in the commit message on its own line as a BARE `#{{key}}`, with no command text after it, so the pull request links to the issue without transitioning it.
-      10. Finish this Epic completely, filing, ledger writes, and description rewrite included, before you stop. A run that dies halfway should leave one clean boundary, not a half-done target.
-
-      Tracker writes. You may perform EXACTLY these, and nothing else:
-      - `yt issue comment` posting the run summary on the parent issue that {{key}} is a subtask of (or on {{key}} itself when it has no parent).
-      - `yt issue update` rewriting the description of {{key}}, your own Epic, to carry a `## Result` block.
-      - `yt issue update` updating the standing table in the description of the anchor issue named in the issue description (AUDIT-1). Description only.
-      - `yt issue create`, ONLY in these projects: {{write_projects}}, and at most 20 finding issues for this target.
-      - On issues you created during THIS run, and only those: `yt issue update <KEY> --priority`, `yt issue tag add`, `yt issue link` (`--type "subtask of" {{key}}`, `relates`, `depends on`), and `yt issue set-field <KEY> "AI Agent" Queued`. `Queued` is the only `AI Agent` value you may set; you set it on every finding issue you file, and it is the last write on each one.
-      - On an existing OPEN issue that the dedup step matched to a finding: one `yt issue comment` carrying the new evidence. Nothing else on that issue.
-      Every other tracker write is forbidden: no `AI Agent` or `State` change on any issue you did not create ({{key}}, its parent, the anchor, and every dedup match included), no `yt issue set-state` anywhere, no summary edit anywhere, no assignee change, no `yt issue delete`, and no other write to an issue you did not create. `AI Agent` and `State` on {{key}} belong to the runner, which sets them after you exit. Closing an Epic that ended with no findings is a `State` write on {{key}}: leave it to the runner and a person, and say in the `## Result` block that the Epic ended empty. Read-only `yt` commands (`inspect`, `list`, `search`, `project show`, `version check`) are unrestricted and the dedup step needs them, so use them freely.
-
-      Also out of reach, by design: pushing, opening the pull request (the runner does both from the branch you leave checked out), and writing anything at all into the target repository.
-
-      HARD RULE on long commands: run everything in the FOREGROUND and wait for it inline. Leave NO background job running when you stop; a lingering process keeps the run's process group alive and gets the whole run timeout-killed even after the work is done.
-
-      If you CANNOT safely complete the audit - the working directory is not the audits checkout, the target clone fails, the audit-type prompt is missing, or a permitted tracker write is rejected for lack of permission:
-        a. Do NOT write the report somewhere else and do NOT change any code.
-        b. Write the human-facing explanation of exactly what failed, quoting the command and its error, and naming every issue this run already created and whether each reached `AI Agent = Queued`, to this file (its contents are posted verbatim as the issue comment by the runner):
-             {{workdir}}/{{needs_review_marker}}
-        c. Touch this marker so the attempt is not counted against the per-key cap (the job is parked pending human input, not failed):
-             {{workdir}}/{{skip_attempt_marker}}
-        d. Do NOT set any field on {{key}} yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.
-
-      When you finish, summarize the run as a checklist: report path, finding issues filed (key, priority, and confirmed `AI Agent = Queued` for each), existing issues commented on instead of filed, deferred entries added or drained, and which write-back writes you performed. Do not include a pull request URL; the runner creates it.
+    # Merge the audit pull request once its CI is green, so the Epic resolves and the gated daily parent can run.
+    automerge:
+      enabled: true
   forgejo: {}
     # base_url / token_ref omitted, as in youtrack.yml: host `fj` credentials, forge host derived from the AUDIT
     # project's VCS integration.

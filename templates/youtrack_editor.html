@@ -76,14 +76,15 @@
 
   <div class="card">
     <h3>Agent prompt</h3>
+    <p class="dim">Prompt source: <code>{{ prompt_source }}</code></p>
     <label class="fld">
-      <span>Prompt (full replacement of the built-in default)</span>
+      <span>Prompt (full replacement of the built-in {{ prompt_preset }} preset)</span>
       <textarea name="yt_prompt" spellcheck="false" autocapitalize="off">{{ form.yt_prompt }}</textarea>
     </label>
-    <p class="hint dim">The complete instruction text sent to the agent for each issue. Edit any part of it. Placeholders (double-brace) substituted per job: <code>&#123;&#123;key&#125;&#125;</code>, <code>&#123;&#123;summary&#125;&#125;</code>, <code>&#123;&#123;clone_url&#125;&#125;</code>, <code>&#123;&#123;workdir&#125;&#125;</code>, <code>&#123;&#123;needs_review_marker&#125;&#125;</code>, <code>&#123;&#123;skip_attempt_marker&#125;&#125;</code>, <code>&#123;&#123;no_code_marker&#125;&#125;</code>, <code>&#123;&#123;write_projects&#125;&#125;</code>. An unknown placeholder is left literal. Saving text equal to the default (or an empty box) stores no override, so future default improvements still apply.</p>
+    <p class="hint dim">The complete instruction text sent to the agent for each issue. Edit any part of it. Placeholders (double-brace) substituted per job: <code>&#123;&#123;key&#125;&#125;</code>, <code>&#123;&#123;summary&#125;&#125;</code>, <code>&#123;&#123;clone_url&#125;&#125;</code>, <code>&#123;&#123;workdir&#125;&#125;</code>, <code>&#123;&#123;needs_review_marker&#125;&#125;</code>, <code>&#123;&#123;skip_attempt_marker&#125;&#125;</code>, <code>&#123;&#123;no_code_marker&#125;&#125;</code>, <code>&#123;&#123;write_projects&#125;&#125;</code>, <code>&#123;&#123;existing_pr_url&#125;&#125;</code>, <code>&#123;&#123;existing_branch&#125;&#125;</code>. An unknown placeholder is left literal. Saving text equal to the built-in {{ prompt_preset }} preset (or an empty box) stores no override, so future preset improvements still apply.</p>
     <div class="row-actions" style="margin-top: 8px;">
       <button type="button" class="btn"
-              onclick="this.closest('.card').querySelector('textarea').value='';">Reset to default</button>
+              onclick="this.closest('.card').querySelector('textarea').value='';">Reset to built-in preset</button>
     </div>
   </div>
 
@@ -101,6 +102,32 @@
       </label>
     </div>
     <p class="hint dim">Branch-backed pushes a real server branch and opens the PR via the API, so Forgejo can always offer "Update Branch" and the PR stays mergeable. AGit creates PRs with no server branch: if such a PR falls behind a base that requires an up-to-date branch, Forgejo cannot offer "Update Branch" and the merge button disappears. Prefer branch-backed.</p>
+  </div>
+
+  <div class="card">
+    <h3>Tracker writes</h3>
+    <div class="grid2">
+      {% call m::textfield("Write projects", "yt_write_projects", form.yt_write_projects, "AUD, DEV (blank = the triggering issue's own project)") %}
+      {% call m::textfield("No-code label", "state_no_code", form.state_no_code, "blank = inherit the Done label above") %}
+    </div>
+    <p class="hint dim">Comma-separated project keys the agent may create issues in when filing a gap, deferred item, or out-of-scope bug. Blank resolves to the triggering issue's own project. The no-code label is the AI Agent value set when a run deliberately produces no commits; blank inherits the Done label above.</p>
+  </div>
+
+  <div class="card">
+    <h3>Dependency gate</h3>
+    <label class="fld-inline">
+      <input type="checkbox" name="deps_enabled"{% if form.is_deps_enabled() %} checked{% endif %}>
+      <span>Enabled (skip a queued issue whose blockers are still open)</span>
+    </label>
+    <div class="grid2">
+      {% call m::textfield("Recheck timeout", "deps_recheck_timeout", form.deps_recheck_timeout, "5m") %}
+      {% call m::textfield("Block on (link verbs)", "deps_block_on", form.deps_block_on, "depends on, parent for") %}
+    </div>
+    <label class="fld-inline">
+      <input type="checkbox" name="deps_block_cross_project"{% if form.is_deps_block_cross_project() %} checked{% endif %}>
+      <span>Block on cross-project links</span>
+    </label>
+    <p class="hint dim">Before the clone, a queued issue with an unresolved link whose verb is listed above leaves it Queued instead of starting a run. Recheck timeout (humantime, e.g. <code>5m</code>) is the backoff before a blocked issue is re-evaluated. Unchecking "Block on cross-project links" ignores links to issues in other projects, so an audit action's own findings (filed as subtasks in another project) never block it.</p>
   </div>
 
   <div class="card">
