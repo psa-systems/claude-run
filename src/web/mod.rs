@@ -2968,14 +2968,15 @@ fn youtrack_form_to_yaml(
     // `token_ref`, so read the existing `native.github` sub-block off the parsed
     // on-disk action (before we overwrite the `native` key below) to carry its
     // `hosts` / `mcp_endpoint` forward, then overlay `token_ref` from the form.
-    // Missing or unparsable block -> defaults; `prune_yaml` still drops an
-    // all-default github block so Forgejo-only actions write no `github`.
-    let mut github = map
-        .get("native")
-        .and_then(|n| n.get("github"))
-        .cloned()
-        .and_then(|g| serde_yaml::from_value::<GithubTarget>(g).ok())
-        .unwrap_or_default();
+    // Missing block -> defaults; `prune_yaml` still drops an all-default github
+    // block so Forgejo-only actions write no `github`. CLAUDE-300: an unparsable
+    // block is a form error, matching the numeric-limit fields below, rather
+    // than a silent reset that drops `hosts` / `mcp_endpoint`.
+    let mut github = match map.get("native").and_then(|n| n.get("github")).cloned() {
+        Some(g) => serde_yaml::from_value::<GithubTarget>(g)
+            .map_err(|e| format!("native.github is invalid: {e}"))?,
+        None => GithubTarget::default(),
+    };
     github.token_ref = opt(&form.github_token_ref);
     let native = YoutrackConfig {
         youtrack,
@@ -3254,8 +3255,14 @@ async fn action_form_page(
     if indexed_action_path(&s.api.pool, &name).await?.is_none() {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     }
-    let Some((_, action)) = native_forms::indexed_action(&s, &name).await? else {
-        return Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response());
+    let action = match native_forms::indexed_action(&s, &name).await? {
+        native_forms::IndexedAction::NotIndexed => {
+            return Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response())
+        }
+        native_forms::IndexedAction::Invalid(msg) => {
+            return action_load_error_response(&s, &name, &msg).await
+        }
+        native_forms::IndexedAction::Loaded(_, action) => action,
     };
     match action.native {
         Some(NativeConfig::Youtrack(_)) => youtrack_edit_page(State(s), AxumPath(name)).await,
@@ -3277,8 +3284,14 @@ async fn action_form_save(
     if indexed_action_path(&s.api.pool, &name).await?.is_none() {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     }
-    let Some((path, action)) = native_forms::indexed_action(&s, &name).await? else {
-        return Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response());
+    let (path, action) = match native_forms::indexed_action(&s, &name).await? {
+        native_forms::IndexedAction::NotIndexed => {
+            return Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response())
+        }
+        native_forms::IndexedAction::Invalid(msg) => {
+            return action_load_error_response(&s, &name, &msg).await
+        }
+        native_forms::IndexedAction::Loaded(path, action) => (path, action),
     };
     match action.native {
         Some(NativeConfig::Youtrack(_)) => {
@@ -3318,18 +3331,48 @@ async fn youtrack_edit_page(
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
     let yaml = std::fs::read_to_string(&path).map_err(WebError::from)?;
-    // A file that no longer parses, or is not a youtrack action, has no
-    // structured form; send the user to the raw editor instead.
-    let form = match crate::action::validate_str(&yaml, &path) {
-        Ok(loaded) => {
-            action_to_youtrack_form(&loaded.action).zip(PromptProvenance::of(&loaded.action))
-        }
-        Err(_) => None,
+    // CLAUDE-300: a file that no longer parses names why and links to the raw
+    // editor (422) instead of redirecting there with no explanation. A file
+    // that validates but is not a youtrack action still redirects: it simply
+    // has no structured form.
+    let loaded = match crate::action::validate_str(&yaml, &path) {
+        Ok(loaded) => loaded,
+        Err(e) => return action_load_error_response(&s, &name, &e.to_string()).await,
     };
-    let Some((form, prompt)) = form else {
+    let Some((form, prompt)) =
+        action_to_youtrack_form(&loaded.action).zip(PromptProvenance::of(&loaded.action))
+    else {
         return Ok(Redirect::to(&format!("/actions/{name}/edit")).into_response());
     };
     render_youtrack_editor(&s, StatusCode::OK, Some(name), form, None, prompt).await
+}
+
+/// CLAUDE-300: shared 422 response for a structured-editor route that could not
+/// load the action file at all (read failure or a `validate_str` rejection),
+/// naming the reason instead of silently falling back to the raw editor.
+async fn action_load_error_response(
+    s: &WebState,
+    name: &str,
+    message: &str,
+) -> Result<Response, WebError> {
+    let tpl = ActionLoadErrorTpl {
+        version: s.api.version,
+        name: name.to_string(),
+        message: message.to_string(),
+    };
+    Ok((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Html(tpl.render().map_err(WebError::from)?),
+    )
+        .into_response())
+}
+
+#[derive(Template)]
+#[template(path = "action_load_error.html")]
+struct ActionLoadErrorTpl {
+    version: &'static str,
+    name: String,
+    message: String,
 }
 
 async fn youtrack_edit_save(
@@ -7591,6 +7634,25 @@ mod tests {
         }
 
         #[test]
+        fn github_block_unparsable_is_a_form_error_not_a_silent_reset() {
+            // CLAUDE-300: an unparsable native.github block must not be replaced
+            // with defaults on save (which would silently drop hosts /
+            // mcp_endpoint); it is a form error naming native.github, matching
+            // the numeric-limit fields' error shape.
+            let base: serde_yaml::Value = serde_yaml::from_str(
+                "name: yt\nkind: youtrack\nnative:\n  github:\n    hosts: not-a-list\n",
+            )
+            .unwrap();
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            let err = youtrack_form_to_yaml(base, &f).unwrap_err();
+            assert!(
+                err.contains("native.github"),
+                "error should name native.github: {err}"
+            );
+        }
+
+        #[test]
         fn dependency_gate_form_round_trips() {
             // CLAUDE-298: saving the form's dependency-gate inputs writes them,
             // and the saved file loads back with those exact values.
@@ -7991,6 +8053,35 @@ mod tests {
             assert!(written.contains("-Resolved AI Agent: Ready"));
         }
 
+        /// CLAUDE-300: saving over an action whose `native.github` block does not
+        /// parse is refused (422, naming `native.github`) and the file on disk is
+        /// left exactly as it was, not silently rewritten with defaults.
+        #[tokio::test]
+        async fn youtrack_edit_save_rejects_unparsable_github_block() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("yt.yml");
+            let original = "name: yt\nkind: youtrack\nnative:\n  github:\n    hosts: not-a-list\n";
+            std::fs::write(&file, original).unwrap();
+            index_action(&s.api.pool, "yt", file.to_str().unwrap()).await;
+
+            let resp = youtrack_edit_save(
+                State(s.clone()),
+                AxumPath("yt".to_string()),
+                Form(filled_form()),
+            )
+            .await
+            .unwrap()
+            .into_response();
+
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = body_string(resp).await;
+            assert!(body.contains("native.github"), "{body}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        }
+
         #[tokio::test]
         async fn youtrack_edit_save_redirects_to_renamed_action() {
             let tmp = tempfile::tempdir().unwrap();
@@ -8180,6 +8271,52 @@ mod tests {
                 resp.headers().get("location").unwrap(),
                 "/actions/scripted/edit"
             );
+        }
+
+        /// CLAUDE-300: a file that fails `validate_str` names why and links to
+        /// the raw editor (422), instead of a bare redirect that hides the reason.
+        #[tokio::test]
+        async fn youtrack_edit_page_shows_422_for_a_file_that_fails_to_validate() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("broken.yml");
+            // `input` given as a scalar, not the required mapping: fails serde
+            // deserialization inside `validate_str`.
+            std::fs::write(&file, "name: broken\ninput: not-a-mapping\nprompt: hi\n").unwrap();
+            index_action(&s.api.pool, "broken", file.to_str().unwrap()).await;
+
+            let resp = youtrack_edit_page(State(s.clone()), AxumPath("broken".to_string()))
+                .await
+                .unwrap()
+                .into_response();
+
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = body_string(resp).await;
+            assert!(body.contains("/actions/broken/edit"));
+        }
+
+        /// CLAUDE-300: the same treatment via the real `/actions/:name/form`
+        /// route, which is where the browser actually lands.
+        #[tokio::test]
+        async fn action_form_page_shows_422_for_a_file_that_fails_to_validate() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let actions = s.paths.actions_dir();
+            std::fs::create_dir_all(&actions).unwrap();
+            let file = actions.join("broken.yml");
+            std::fs::write(&file, "name: broken\ninput: not-a-mapping\nprompt: hi\n").unwrap();
+            index_action(&s.api.pool, "broken", file.to_str().unwrap()).await;
+
+            let resp = action_form_page(State(s.clone()), AxumPath("broken".to_string()))
+                .await
+                .unwrap()
+                .into_response();
+
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = body_string(resp).await;
+            assert!(body.contains("/actions/broken/edit"));
         }
 
         // ---- synthetic webhook action (CLAUDE-61) -------------------------
@@ -9244,6 +9381,35 @@ mod tests {
                 panic!("expected a closed-issue-summary config");
             };
             assert_eq!(cfg.custom_field, "Reporter");
+        }
+
+        /// CLAUDE-300: same shape as `youtrack_edit_save`'s own base-parse guard.
+        /// An unparsable on-disk file must not be treated as an empty base: that
+        /// would silently drop every key the closed-issue-summary form does not
+        /// show. Calls the handler directly (`action_form_save` already refuses
+        /// an unparsable file earlier via `indexed_action`) to exercise the
+        /// deeper guard on its own.
+        #[tokio::test]
+        async fn closed_issue_summary_edit_save_rejects_unparsable_base() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let original = "not: [valid, yaml,\n";
+            let file = seed_action(&s, "report", original).await;
+
+            let resp = native_forms::closed_issue_summary_edit_save(
+                &s,
+                "report".to_string(),
+                file.to_str().unwrap(),
+                b"name=report&enabled=on&native_enabled=on&window_days=7&projects=CLAUDE",
+            )
+            .await
+            .unwrap()
+            .into_response();
+
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = body_string(resp).await;
+            assert!(body.contains("not valid YAML"), "{body}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
         }
 
         #[tokio::test]
