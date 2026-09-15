@@ -1219,11 +1219,14 @@ ONE reply stating the required set, then the delivery is acked and dropped; deni
 
 **Execution on a pull request** shallow-clones the PR head branch, sets the bot git identity in the clone (so any
 commit the agent itself makes, such as a merge of the base branch, is authored and committed as the bot), records the
-cloned head commit and appends `.claude-run-instruction.md` / `.claude-run-commit-msg` / `.claude-run-pr-comment.md`
-to `.git/info/exclude` so the runner's own scratch files never count as a change or reach a commit, writes the
-human's instruction VERBATIM to `.claude-run-instruction.md` in the checkout (it is never interpolated into a shell
-command or a command line: the agent is told to read the file), runs Claude, then applies the decision gate
-(CLAUDE-302, CLAUDE-303). The prompt names the PR's base branch and allows exactly one kind of commit: a merge of
+cloned head commit, and writes every runner scratch file (`.claude-run-instruction.md`, `.claude-run-commit-msg`,
+`.claude-run-pr-comment.md`, and the `fj pr create` body file) into the clone's own git directory (`git rev-parse
+--absolute-git-dir`, joined with a `claude-run` subdirectory) rather than its work tree (CLAUDE-305), so a scratch
+file can never be tracked, staged, or committed, whatever the repository already tracks at the same name in the work
+tree; the instruction file is removed as soon as Claude's session returns and the commit-message file as soon as the
+commit runs. The human's instruction is written VERBATIM to that file (it is never interpolated into a shell
+command or a command line: the agent is told to read the file by its full path). The runner then runs Claude and
+applies the decision gate (CLAUDE-302, CLAUDE-303). The prompt names the PR's base branch and allows exactly one kind of commit: a merge of
 that base branch, made with `git fetch --unshallow origin <base>` then `git merge FETCH_HEAD`, which is how a
 `/claude merge main and resolve the conflicts` request resolves a real conflict; every other change is left
 uncommitted for the runner. The gate first checks for unmerged paths (`git diff --diff-filter=U`) BEFORE staging
