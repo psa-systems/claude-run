@@ -1097,12 +1097,12 @@ fn serve_run(
 ) -> RunOutcome {
     let cancel = CancellationToken::new();
 
-    let branch = match head_branch(backend, cmd) {
+    let (branch, base) = match pr_branches(backend, cmd) {
         Ok(b) => b,
         Err(e) => {
-            let body = error_comment(&format!("could not resolve the PR head branch: {e}"));
+            let body = error_comment(&format!("could not resolve the PR's head/base branch: {e}"));
             post_reply(backend, cmd, workdir, body);
-            return RunOutcome::failed(format!("could not resolve the PR head branch: {e}"));
+            return RunOutcome::failed(format!("could not resolve the PR's head/base branch: {e}"));
         }
     };
 
@@ -1116,7 +1116,8 @@ fn serve_run(
         .map_err(|e| format!("resolve clone url: {e}"))
         .and_then(|url| clone_branch(&url, &branch, workdir).map_err(|e| format!("git clone: {e}")))
         .and_then(|()| {
-            prepare_checkout(workdir).map_err(|e| format!("preparing the checkout failed: {e}"))
+            prepare_checkout(workdir, &src.bot_author, &src.bot_email)
+                .map_err(|e| format!("preparing the checkout failed: {e}"))
         });
 
     let mut claude_ran = false;
@@ -1134,7 +1135,7 @@ fn serve_run(
             if let Err(e) = std::fs::write(&instruction_path, instruction) {
                 ClaudeResult::synthesized("writing the instruction file failed", e.to_string())
             } else {
-                let prompt = build_prompt(cmd, &branch);
+                let prompt = build_prompt(cmd, &branch, &base);
                 info!(repo = %cmd.repo, pr = cmd.number, stream_log = %stream_log.display(), "invoking claude for a comment command");
                 match claude.invoke(
                     &prompt,
@@ -1168,37 +1169,23 @@ fn serve_run(
         let head = cloned_head
             .as_deref()
             .expect("claude only runs after a successful clone");
-        match change_stats(workdir, head) {
-            Ok((files, lines)) => decide(
-                &claude_result.summary,
-                files,
-                lines,
-                src.max_files,
-                src.max_lines,
-            ),
+        match run_decision_gate(workdir, head, cmd, src, &claude_result.summary) {
+            Ok(d) => d,
             Err(e) => {
                 // A measurement failure is a fault, never "no changes": that
                 // would tell the human nothing changed when git simply could
                 // not be asked.
                 warn!(repo = %cmd.repo, pr = cmd.number, error = %e, "measuring the change failed (the PR reply still runs)");
-                let body = error_comment(&format!("measuring the change failed: {e}"));
-                post_reply(backend, cmd, workdir, body);
-                return RunOutcome {
-                    summary: format!("measuring the change failed: {e}"),
-                    ok: false,
-                    claude_ran,
-                    claude_ok: claude_result.ok,
-                    cost: claude_result.cost,
-                    timed_out: claude_result.timed_out,
-                    counts_run: claude_ran,
-                };
+                Decision::MeasureFailed {
+                    reason: e.to_string(),
+                }
             }
         }
     };
 
     let mut push_err = None;
     if matches!(decision, Decision::Push { .. }) {
-        if let Err(e) = push_fix(backend, src, cmd, &branch, workdir, &claude_result) {
+        if let Err(e) = push_fix(backend, cmd, &branch, workdir) {
             warn!(repo = %cmd.repo, pr = cmd.number, error = %e, "push failed (commenting the failure)");
             push_err = Some(e.to_string());
         }
@@ -1218,7 +1205,9 @@ fn serve_run(
     );
     RunOutcome {
         summary,
-        ok: claude_result.ok && push_err.is_none(),
+        ok: claude_result.ok
+            && push_err.is_none()
+            && !matches!(decision, Decision::MeasureFailed { .. }),
         claude_ran,
         claude_ok: claude_result.ok,
         cost: claude_result.cost,
@@ -1344,24 +1333,34 @@ fn mint_description(cmd: &VerifiedCommentCommand, instruction: &str) -> String {
     .join("\n")
 }
 
-/// Resolve the PR's head branch from the forge's open-PR list (the same read the
-/// CI-fix scan uses; no new tooling and no raw REST).
-fn head_branch(
+/// Resolve the PR's head and base branch from the forge's open-PR list (the
+/// same read the CI-fix scan uses; no new tooling and no raw REST). An empty
+/// `base_ref` is an error handled exactly like an empty `head_ref`: the base
+/// branch names what the agent is allowed to merge in to resolve conflicts
+/// (CLAUDE-303), so a PR whose base the forge did not report cannot be served.
+fn pr_branches(
     backend: &dyn Backend,
     cmd: &VerifiedCommentCommand,
-) -> crate::error::Result<String> {
+) -> crate::error::Result<(String, String)> {
     let prs = backend.list_open_prs(&cmd.host, &cmd.repo)?;
-    prs.into_iter()
+    let pr = prs
+        .into_iter()
         .find(|p| p.number == cmd.number)
-        .map(|p| p.head_ref)
-        .filter(|b| !b.is_empty())
         .ok_or_else(|| {
             crate::error::Error::Other(anyhow::anyhow!(
                 "PR #{} is not an open pull request on {}",
                 cmd.number,
                 cmd.repo
             ))
-        })
+        })?;
+    if pr.head_ref.is_empty() || pr.base_ref.is_empty() {
+        return Err(crate::error::Error::Other(anyhow::anyhow!(
+            "PR #{} on {} is missing a head or base branch",
+            cmd.number,
+            cmd.repo
+        )));
+    }
+    Ok((pr.head_ref, pr.base_ref))
 }
 
 /// Shallow-clone `branch` into `workdir`. CLAUDE-252: the shared helper reports
@@ -1374,7 +1373,7 @@ fn clone_branch(clone_url: &str, branch: &str, workdir: &FsPath) -> crate::error
 /// The agent's instruction text. The human's own words are NOT inlined here:
 /// they live in [`INSTRUCTION_FILE`] beside the checkout and the agent is told to
 /// read that file, so nothing from the comment reaches a command line.
-fn build_prompt(cmd: &VerifiedCommentCommand, branch: &str) -> String {
+fn build_prompt(cmd: &VerifiedCommentCommand, branch: &str, base: &str) -> String {
     [
         "You are working a request left as a comment on a pull request.".to_string(),
         String::new(),
@@ -1386,6 +1385,7 @@ fn build_prompt(cmd: &VerifiedCommentCommand, branch: &str) -> String {
         String::new(),
         format!("PR: #{} in {}", cmd.number, cmd.repo),
         format!("Branch: {branch}"),
+        format!("Base branch: {base}"),
         format!("Requested by: {}", cmd.author),
         String::new(),
         "Your job:".to_string(),
@@ -1395,7 +1395,9 @@ fn build_prompt(cmd: &VerifiedCommentCommand, branch: &str) -> String {
         "  4. If the request is unsafe, out of scope, or ambiguous, explain why and make no changes"
             .to_string(),
         String::new(),
-        "Do ONLY local engineering work. Do NOT commit, push, or open/modify the PR; the runner commits and pushes your changes and replies on the PR after you exit.".to_string(),
+        "Stay on the branch that is checked out. Do NOT create or switch branches.".to_string(),
+        format!("You MAY bring the base branch into this branch when the request needs it (for example, to resolve merge conflicts): run `git fetch --unshallow origin {base}`, then `git merge FETCH_HEAD`, resolve every conflict, run the repo's checks, and `git commit --no-edit`. A merge of the base branch is the ONLY commit you may create."),
+        "Leave every other change uncommitted. Do NOT push, and do NOT open or modify the PR; the runner commits your remaining changes, pushes the branch, and replies on the PR after you exit.".to_string(),
         String::new(),
         "When you are done, summarize what you changed and why in plain text.".to_string(),
     ]
@@ -1407,8 +1409,24 @@ fn build_prompt(cmd: &VerifiedCommentCommand, branch: &str) -> String {
 pub enum Decision {
     ClaudeFailed,
     NoChanges,
-    TooBig { files: u64, lines: u64 },
-    Push { files: u64, lines: u64 },
+    /// Unmerged paths (`git diff --diff-filter=U`) were left behind: nothing
+    /// was staged, committed, or pushed.
+    UnresolvedConflicts {
+        paths: Vec<String>,
+    },
+    /// A git failure while committing the leftovers or measuring the change
+    /// since the cloned head: never read as "no changes".
+    MeasureFailed {
+        reason: String,
+    },
+    TooBig {
+        files: u64,
+        lines: u64,
+    },
+    Push {
+        files: u64,
+        lines: u64,
+    },
 }
 
 impl Decision {
@@ -1416,6 +1434,8 @@ impl Decision {
         match self {
             Decision::ClaudeFailed => "claude_failed",
             Decision::NoChanges => "no_changes",
+            Decision::UnresolvedConflicts { .. } => "unresolved_conflicts",
+            Decision::MeasureFailed { .. } => "measure_failed",
             Decision::TooBig { .. } => "too_big",
             Decision::Push { .. } => "push",
         }
@@ -1423,13 +1443,22 @@ impl Decision {
 }
 
 /// Classify a completed run into a [`Decision`]. Pure, so the gate is unit
-/// tested without a workdir.
-pub fn decide(summary: &str, files: u64, lines: u64, max_files: u64, max_lines: u64) -> Decision {
+/// tested without a workdir. `commits` is the number of commits made since the
+/// cloned head (CLAUDE-303): a clean base merge with no other change is
+/// `commits >= 1, files == 0`, which is still a push.
+pub fn decide(
+    summary: &str,
+    commits: u64,
+    files: u64,
+    lines: u64,
+    max_files: u64,
+    max_lines: u64,
+) -> Decision {
     let s = summary.to_lowercase();
     let says_no = s.contains("no changes")
         || s.contains("making no changes")
         || s.contains("changes made: none");
-    if files == 0 || says_no {
+    if commits == 0 || says_no {
         Decision::NoChanges
     } else if files > max_files || lines > max_lines {
         Decision::TooBig { files, lines }
@@ -1438,17 +1467,29 @@ pub fn decide(summary: &str, files: u64, lines: u64, max_files: u64, max_lines: 
     }
 }
 
-/// Runs right after a successful clone: records the cloned head (what the
-/// change measurement diffs against) and appends the runner's own scratch
-/// files to `.git/info/exclude` so nothing later, including `git add -A` in
-/// [`change_stats`] and [`push_fix`], ever stages or counts them. A failure of
-/// either half is a clone-stage failure: nothing about the checkout can yet be
-/// trusted.
-fn prepare_checkout(workdir: &FsPath) -> crate::error::Result<String> {
+/// Runs right after a successful clone: sets the bot git identity (so an
+/// agent-made merge commit is authored and committed as the bot, CLAUDE-303),
+/// records the cloned head (what the change measurement diffs against), and
+/// appends the runner's own scratch files to `.git/info/exclude` so nothing
+/// later, including `git add -A` in [`run_decision_gate`], ever stages or
+/// counts them. A failure of any part is a clone-stage failure: nothing about
+/// the checkout can yet be trusted.
+fn prepare_checkout(
+    workdir: &FsPath,
+    bot_author: &str,
+    bot_email: &str,
+) -> crate::error::Result<String> {
+    git_in(workdir, &["config", "user.name", bot_author])?;
+    git_in(workdir, &["config", "user.email", bot_email])?;
+
     let head = git_output(workdir, &["rev-parse", "HEAD"])?;
 
     let exclude_path = workdir.join(".git").join("info").join("exclude");
-    let mut content = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    let mut content = match std::fs::read_to_string(&exclude_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
     for name in [INSTRUCTION_FILE, COMMIT_MSG_FILE, PR_COMMENT_FILE] {
         if !content.lines().any(|line| line == name) {
             if !content.is_empty() && !content.ends_with('\n') {
@@ -1478,46 +1519,91 @@ fn git_output(workdir: &FsPath, args: &[&str]) -> crate::error::Result<String> {
     }
 }
 
-/// The full size of the change against the commit that was cloned: `git add
-/// -A` stages everything in the working tree (unstaged edits, untracked
-/// files, and anything the agent already staged), and the `--cached` diff
-/// against `cloned_head` then sees that staged snapshot PLUS any commits the
-/// agent made on top of it. Unlike the old `git diff --numstat` (working tree
-/// vs. index only), none of staged changes, untracked files, or agent commits
-/// can read as zero. A git failure is surfaced rather than folded into `(0,
-/// 0)`, which used to read as "no changes" to the human.
-fn change_stats(workdir: &FsPath, cloned_head: &str) -> crate::error::Result<(u64, u64)> {
-    git_in(workdir, &["add", "-A"])?;
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workdir)
-        .arg("diff")
-        .arg("--cached")
-        .arg("--numstat")
-        .arg(cloned_head)
-        .output()?;
-    if out.status.success() {
-        Ok(parse_numstat(&String::from_utf8_lossy(&out.stdout)))
-    } else {
-        Err(crate::provider::git_error(
-            "diff --cached --numstat",
-            &out,
-            None,
-        ))
+/// The decision gate, run after a successful Claude session. Order matters:
+/// unmerged paths are checked BEFORE anything is staged, so a conflict left
+/// behind (markers and all) is never `git add`ed into a commit. Then the
+/// runner concludes whatever the agent left uncommitted (including a staged
+/// but uncommitted merge), and measures every commit made since the cloned
+/// head, walking `--first-parent` only: that stays on the branch's own
+/// lineage (the agent's own commits, and the merge commit itself) and never
+/// descends into the base branch's individual commits, which is what makes a
+/// merge commit's `--remerge-diff` the right measurement rather than a
+/// double-count. An ordinary commit is measured by its own `--numstat`, a
+/// merge commit (more than one parent) by `--remerge-diff --numstat`, so a
+/// base-branch merge counts only the conflict resolution, never the lines the
+/// base branch brought in. `files` is the count of DISTINCT paths across
+/// every commit's numstat.
+fn run_decision_gate(
+    workdir: &FsPath,
+    cloned_head: &str,
+    cmd: &VerifiedCommentCommand,
+    src: &CommentWebhookSource,
+    claude_summary: &str,
+) -> crate::error::Result<Decision> {
+    let unmerged = git_output(workdir, &["diff", "--name-only", "--diff-filter=U"])?;
+    let paths: Vec<String> = unmerged
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !paths.is_empty() {
+        return Ok(Decision::UnresolvedConflicts { paths });
     }
+
+    git_in(workdir, &["add", "-A"])?;
+    if needs_commit(workdir)? {
+        let msg = commit_message(cmd, claude_summary, &src.skip_marker);
+        let msg_file = workdir.join(COMMIT_MSG_FILE);
+        std::fs::write(&msg_file, msg)?;
+        let msg_arg = msg_file.to_string_lossy();
+        git_in(workdir, &["commit", "--file", &msg_arg])?;
+    }
+
+    let range = format!("{cloned_head}..HEAD");
+    let commits: u64 = git_output(workdir, &["rev-list", "--first-parent", "--count", &range])?
+        .parse()
+        .map_err(|e| {
+            crate::error::Error::Other(anyhow::anyhow!("parsing the commit count failed: {e}"))
+        })?;
+
+    let shas = git_output(workdir, &["rev-list", "--first-parent", &range])?;
+    let mut files = std::collections::HashSet::new();
+    let mut lines = 0u64;
+    for sha in shas.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let parents = git_output(workdir, &["show", "-s", "--pretty=%P", sha])?;
+        let numstat = if parents.split_whitespace().count() > 1 {
+            git_output(
+                workdir,
+                &["show", "--remerge-diff", "--numstat", "--format=", sha],
+            )?
+        } else {
+            git_output(workdir, &["show", "--numstat", "--format=", sha])?
+        };
+        lines += numstat_files_and_lines(&numstat, &mut files);
+    }
+
+    Ok(decide(
+        claude_summary,
+        commits,
+        files.len() as u64,
+        lines,
+        src.max_files,
+        src.max_lines,
+    ))
 }
 
-/// Sum `git diff --numstat` into `(files, lines_changed)`.
-fn parse_numstat(stdout: &str) -> (u64, u64) {
-    let mut files = 0u64;
+/// Fold one `git show --numstat` (or `--remerge-diff --numstat`) output into
+/// the running set of distinct changed paths, returning the lines added plus
+/// deleted. A binary row (`-\t-\tpath`) counts as a file and 0 lines.
+fn numstat_files_and_lines(stdout: &str, files: &mut std::collections::HashSet<String>) -> u64 {
     let mut lines = 0u64;
     for raw in stdout.lines() {
         let line = raw.trim();
         if line.is_empty() {
             continue;
         }
-        files += 1;
-        let mut cols = line.split('\t');
+        let mut cols = line.splitn(3, '\t');
         let added = cols
             .next()
             .and_then(|c| c.trim().parse::<u64>().ok())
@@ -1526,32 +1612,25 @@ fn parse_numstat(stdout: &str) -> (u64, u64) {
             .next()
             .and_then(|c| c.trim().parse::<u64>().ok())
             .unwrap_or(0);
+        if let Some(file) = cols.next() {
+            let file = file.trim();
+            if !file.is_empty() {
+                files.insert(file.to_string());
+            }
+        }
         lines += added + deleted;
     }
-    (files, lines)
+    lines
 }
 
-/// Commit as the bot identity (with the CI skip marker) and push the PR branch.
+/// Push the PR branch. Push-only (CLAUDE-303): committing the leftovers now
+/// happens in [`run_decision_gate`], before the change is measured.
 fn push_fix(
     backend: &dyn Backend,
-    src: &CommentWebhookSource,
     cmd: &VerifiedCommentCommand,
     branch: &str,
     workdir: &FsPath,
-    claude_result: &ClaudeResult,
 ) -> crate::error::Result<()> {
-    git_in(workdir, &["config", "user.name", &src.bot_author])?;
-    git_in(workdir, &["config", "user.email", &src.bot_email])?;
-    git_in(workdir, &["add", "-A"])?;
-
-    if needs_commit(workdir)? {
-        let msg = commit_message(cmd, &claude_result.summary, &src.skip_marker);
-        let msg_file = workdir.join(COMMIT_MSG_FILE);
-        std::fs::write(&msg_file, msg)?;
-        let msg_arg = msg_file.to_string_lossy();
-        git_in(workdir, &["commit", "--file", &msg_arg])?;
-    }
-
     let push_url = backend.clone_url(&cmd.host, &cmd.repo)?;
     git_push(workdir, &push_url, branch)
 }
@@ -1614,8 +1693,10 @@ fn git_push(workdir: &FsPath, url: &str, branch: &str) -> crate::error::Result<(
     }
 }
 
-/// The commit message: a subject naming the PR, the agent's summary, and the CI
-/// skip marker so the push does not re-trigger the CI-fix action.
+/// The commit message: a subject naming the PR, the agent's summary, and the
+/// skip marker. Nothing reads the marker today; it is a marker of provenance
+/// for a human reading the log, not a loop guard (the `bot_logins` check is
+/// what stops the bot's own replies from re-triggering this listener).
 pub fn commit_message(cmd: &VerifiedCommentCommand, summary: &str, skip_marker: &str) -> String {
     [
         format!("chore: Claude comment command on PR #{}", cmd.number),
@@ -1808,6 +1889,25 @@ pub fn outcome_comment(
             "**Claude ran but made no changes.**".to_string(),
             String::new(),
             claude.summary.clone(),
+        ]
+        .join("\n"),
+        Decision::UnresolvedConflicts { paths } => [
+            "**Claude left unresolved merge conflicts.**".to_string(),
+            String::new(),
+            format!("Conflicted paths: {}", paths.join(", ")),
+            String::new(),
+            "Summary:".to_string(),
+            claude.summary.clone(),
+            String::new(),
+            "Nothing was staged, committed, or pushed; this needs human review.".to_string(),
+        ]
+        .join("\n"),
+        Decision::MeasureFailed { reason } => [
+            "**Measuring the change failed.**".to_string(),
+            String::new(),
+            reason.clone(),
+            String::new(),
+            "Nothing was pushed. See the runner journal for full context.".to_string(),
         ]
         .join("\n"),
         Decision::TooBig { files, lines } => [
@@ -2271,40 +2371,47 @@ mod tests {
 
     #[test]
     fn decision_gate_matches_the_ci_fix_shape() {
-        assert_eq!(decide("did it", 0, 0, 10, 300), Decision::NoChanges);
+        assert_eq!(decide("did it", 0, 0, 0, 10, 300), Decision::NoChanges);
         assert_eq!(
-            decide("Making no changes here.", 2, 4, 10, 300),
+            decide("Making no changes here.", 1, 2, 4, 10, 300),
             Decision::NoChanges
         );
         assert_eq!(
-            decide("big", 11, 5, 10, 300),
+            decide("big", 1, 11, 5, 10, 300),
             Decision::TooBig {
                 files: 11,
                 lines: 5
             }
         );
         assert_eq!(
-            decide("big", 2, 301, 10, 300),
+            decide("big", 1, 2, 301, 10, 300),
             Decision::TooBig {
                 files: 2,
                 lines: 301
             }
         );
         assert_eq!(
-            decide("fixed", 10, 300, 10, 300),
+            decide("fixed", 1, 10, 300, 10, 300),
             Decision::Push {
                 files: 10,
                 lines: 300
             }
         );
-        assert_eq!(parse_numstat("3\t1\ta.rs\n0\t5\tb.rs\n"), (2, 9));
+        // A clean base merge with no conflicts: one commit, no files touched.
+        assert_eq!(
+            decide("merged main", 1, 0, 0, 10, 300),
+            Decision::Push { files: 0, lines: 0 }
+        );
+        let mut files = std::collections::HashSet::new();
+        let lines = numstat_files_and_lines("3\t1\ta.rs\n0\t5\tb.rs\n", &mut files);
+        assert_eq!((files.len() as u64, lines), (2, 9));
     }
 
-    // ---- CLAUDE-302: staged / untracked / committed change measurement ----
+    // ---- CLAUDE-302 / CLAUDE-303: change measurement and the merge gate ---
 
     /// A minimal git repo with one committed file, ready for a test to mutate
-    /// the working tree and then call [`prepare_checkout`] / [`change_stats`]
-    /// / [`needs_commit`] against it exactly as `serve_run` / `push_fix` do.
+    /// the working tree and then call [`prepare_checkout`] / [`run_decision_gate`]
+    /// / [`needs_commit`] against it exactly as `serve_run` does.
     fn repo_with_one_commit(dir: &FsPath) {
         for args in [
             vec!["init", "-q", "-b", "main"],
@@ -2327,23 +2434,42 @@ mod tests {
         git_in(dir, &["commit", "-q", "-m", "initial"]).unwrap();
     }
 
+    fn gate_cmd() -> VerifiedCommentCommand {
+        command_of(&payload_json(
+            "created",
+            REPO,
+            "/claude merge main and resolve the conflicts",
+            "alice",
+            true,
+        ))
+        .unwrap()
+    }
+
+    fn gate_src() -> CommentWebhookSource {
+        CommentWebhookSource::default()
+    }
+
     #[test]
     fn prepare_checkout_excludes_the_scratch_files_from_the_diff() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         repo_with_one_commit(dir);
-        let head = prepare_checkout(dir).unwrap();
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
 
         // The scratch files land in the checkout with no other change.
         std::fs::write(dir.join(INSTRUCTION_FILE), "do the thing").unwrap();
         std::fs::write(dir.join(COMMIT_MSG_FILE), "msg").unwrap();
         std::fs::write(dir.join(PR_COMMENT_FILE), "reply").unwrap();
 
-        let (files, lines) = change_stats(dir, &head).unwrap();
-        assert_eq!((files, lines), (0, 0), "scratch files must not count");
+        let decision =
+            run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did nothing").unwrap();
+        assert_eq!(
+            decision,
+            Decision::NoChanges,
+            "scratch files must not count"
+        );
 
-        // They are excluded from a commit too.
-        assert!(!needs_commit(dir).unwrap());
+        // They are excluded from any commit too.
         git_in(dir, &["add", "-A"]).unwrap();
         let staged = git_output(dir, &["diff", "--cached", "--name-only"]).unwrap();
         assert!(
@@ -2353,66 +2479,105 @@ mod tests {
     }
 
     #[test]
-    fn change_stats_counts_a_staged_but_uncommitted_edit() {
+    fn plain_uncommitted_edits_are_committed_by_the_runner_and_counted() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         repo_with_one_commit(dir);
-        let head = prepare_checkout(dir).unwrap();
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
 
         std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
         git_in(dir, &["add", "a.txt"]).unwrap();
 
-        let (files, lines) = change_stats(dir, &head).unwrap();
-        assert_eq!(files, 1);
-        assert!(lines > 0);
-        assert_eq!(
-            decide("did it", files, lines, 10, 300),
-            Decision::Push { files, lines }
+        let decision = run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did it").unwrap();
+        assert_eq!(decision, Decision::Push { files: 1, lines: 1 });
+        assert!(
+            !needs_commit(dir).unwrap(),
+            "the runner already committed it"
         );
     }
 
     #[test]
-    fn change_stats_counts_an_untracked_file() {
+    fn an_untracked_new_file_is_counted() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         repo_with_one_commit(dir);
-        let head = prepare_checkout(dir).unwrap();
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
 
         std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
 
-        let (files, _lines) = change_stats(dir, &head).unwrap();
-        assert_eq!(files, 1);
+        let decision = run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did it").unwrap();
+        assert_eq!(decision, Decision::Push { files: 1, lines: 1 });
     }
 
     #[test]
-    fn change_stats_counts_a_commit_made_on_top_of_the_cloned_head_with_a_clean_tree() {
+    fn a_commit_made_on_top_of_the_cloned_head_with_a_clean_tree_is_counted_without_a_second_commit(
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         repo_with_one_commit(dir);
-        let head = prepare_checkout(dir).unwrap();
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
 
         std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
         git_in(dir, &["add", "a.txt"]).unwrap();
         git_in(dir, &["commit", "-q", "-m", "agent commit"]).unwrap();
+        let agent_commit = git_output(dir, &["rev-parse", "HEAD"]).unwrap();
 
-        let (files, lines) = change_stats(dir, &head).unwrap();
-        assert_eq!(files, 1);
-        assert!(lines > 0);
-
-        // The working tree (and index) are clean relative to the new HEAD, so
-        // `push_fix` has nothing left to commit before it pushes.
-        assert!(!needs_commit(dir).unwrap());
+        let decision = run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did it").unwrap();
+        assert_eq!(decision, Decision::Push { files: 1, lines: 1 });
+        assert_eq!(
+            git_output(dir, &["rev-parse", "HEAD"]).unwrap(),
+            agent_commit,
+            "no second, runner-made commit"
+        );
     }
 
     #[test]
-    fn needs_commit_is_true_while_a_merge_is_in_progress() {
+    fn the_three_scratch_files_alone_yield_no_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         repo_with_one_commit(dir);
-        prepare_checkout(dir).unwrap();
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+        std::fs::write(dir.join(INSTRUCTION_FILE), "do the thing").unwrap();
+        std::fs::write(dir.join(COMMIT_MSG_FILE), "msg").unwrap();
+        std::fs::write(dir.join(PR_COMMENT_FILE), "reply").unwrap();
 
-        // Two branches that touch the same line so the merge conflicts, then
-        // resolve and stage it exactly as an agent would (without committing).
+        let decision =
+            run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did nothing").unwrap();
+        assert_eq!(decision, Decision::NoChanges);
+        let log = git_output(dir, &["log", "--name-only", "--pretty=format:"]).unwrap();
+        for scratch in [INSTRUCTION_FILE, COMMIT_MSG_FILE, PR_COMMENT_FILE] {
+            assert!(!log.contains(scratch), "{scratch} must never be committed");
+        }
+    }
+
+    #[test]
+    fn no_commits_and_a_clean_tree_is_no_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+
+        let decision =
+            run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "did nothing").unwrap();
+        assert_eq!(decision, Decision::NoChanges);
+    }
+
+    #[test]
+    fn a_git_failure_while_measuring_is_measure_failed_not_no_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Not a git repository at all: both `prepare_checkout` and
+        // `run_decision_gate` must surface the failure rather than read as
+        // zero changes.
+        assert!(prepare_checkout(dir, "claude-run", "claude-run@a8n.run").is_err());
+        assert!(run_decision_gate(dir, "HEAD", &gate_cmd(), &gate_src(), "x").is_err());
+    }
+
+    /// Two branches that touch the same line so a merge conflicts. Returns the
+    /// working dir with `other` merged into `main` and `MERGE_HEAD` present.
+    fn repo_with_a_conflicting_merge_in_progress(dir: &FsPath) {
+        repo_with_one_commit(dir);
+        prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
         git_in(dir, &["checkout", "-q", "-b", "other"]).unwrap();
         std::fs::write(dir.join("a.txt"), "one\nbranch\n").unwrap();
         git_in(dir, &["commit", "-q", "-am", "branch change"]).unwrap();
@@ -2429,36 +2594,197 @@ mod tests {
             dir.join(".git").join("MERGE_HEAD").exists(),
             "the merge must conflict"
         );
+    }
+
+    #[test]
+    fn a_conflicted_merge_resolved_and_committed_by_the_agent_is_push_measured_by_remerge_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_a_conflicting_merge_in_progress(dir);
+        // Recompute the cloned head the same way `prepare_checkout` recorded
+        // it: it was captured before the merge started.
+        let cloned_head = git_output(dir, &["merge-base", "HEAD", "other"]).unwrap();
+
         std::fs::write(dir.join("a.txt"), "one\nresolved\n").unwrap();
         git_in(dir, &["add", "a.txt"]).unwrap();
+        git_in(dir, &["commit", "--no-edit"]).unwrap();
 
-        assert!(needs_commit(dir).unwrap());
-        git_in(
-            dir,
-            &["commit", "-q", "--file", &{
-                let f = dir.join(COMMIT_MSG_FILE);
-                std::fs::write(&f, "resolve merge").unwrap();
-                f.to_string_lossy().to_string()
-            }],
+        // Expected totals: walk first-parent history from the cloned head the
+        // same way the gate does, since "main change" (committed directly on
+        // `main` before the merge) is itself in range and must count too.
+        let expected = {
+            let mut files = std::collections::HashSet::new();
+            let mut lines = 0u64;
+            let range = format!("{cloned_head}..HEAD");
+            let shas = git_output(dir, &["rev-list", "--first-parent", &range]).unwrap();
+            for sha in shas.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                let parents = git_output(dir, &["show", "-s", "--pretty=%P", sha]).unwrap();
+                let numstat = if parents.split_whitespace().count() > 1 {
+                    git_output(
+                        dir,
+                        &["show", "--remerge-diff", "--numstat", "--format=", sha],
+                    )
+                    .unwrap()
+                } else {
+                    git_output(dir, &["show", "--numstat", "--format=", sha]).unwrap()
+                };
+                lines += numstat_files_and_lines(&numstat, &mut files);
+            }
+            (files.len() as u64, lines)
+        };
+
+        let decision =
+            run_decision_gate(dir, &cloned_head, &gate_cmd(), &gate_src(), "resolved it").unwrap();
+        match decision {
+            Decision::Push { files, lines } => assert_eq!((files, lines), expected),
+            other => panic!("expected Push, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_base_merge_bringing_in_many_lines_with_a_small_conflict_resolution_is_push_not_too_big() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        // The base brings in far more than `max_lines` (default 300).
+        for n in 0..320 {
+            git_in(
+                dir,
+                &[
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    &format!("base commit {n}"),
+                ],
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.join("base.txt"),
+            (0..320).map(|_| "x\n").collect::<String>(),
         )
         .unwrap();
+        git_in(dir, &["add", "base.txt"]).unwrap();
+        git_in(dir, &["commit", "-q", "-m", "base file"]).unwrap();
+        git_in(dir, &["branch", "base-branch"]).unwrap();
+
+        // A feature branch off the ORIGINAL tip, with the same conflicting
+        // line the base also touched, plus its own small extra file.
+        git_in(dir, &["checkout", "-q", "-b", "feat", "main~321"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\nfeat\n").unwrap();
+        git_in(dir, &["commit", "-q", "-am", "feat change"]).unwrap();
+
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+
+        git_in(dir, &["checkout", "-q", "base-branch"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\nmain\n").unwrap();
+        git_in(
+            dir,
+            &["commit", "-q", "-am", "base change on the shared line"],
+        )
+        .unwrap();
+        git_in(dir, &["checkout", "-q", "feat"]).unwrap();
+
+        let merge = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["merge", "-q", "--no-ff", "base-branch"])
+            .output()
+            .unwrap();
+        let _ = merge;
+        assert!(
+            dir.join(".git").join("MERGE_HEAD").exists(),
+            "the merge must conflict on the shared line"
+        );
+        std::fs::write(dir.join("a.txt"), "one\nresolved\n").unwrap();
+        git_in(dir, &["add", "-A"]).unwrap();
+        git_in(dir, &["commit", "--no-edit"]).unwrap();
+
+        let decision =
+            run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "merged and resolved").unwrap();
+        match decision {
+            Decision::Push { files, lines } => {
+                assert!(
+                    files <= 10 && lines <= 300,
+                    "only the conflict resolution should count: files={files} lines={lines}"
+                );
+            }
+            other => panic!("expected Push (remerge-diff bounds the caps), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_conflict_free_merge_with_no_other_change_is_push_with_zero_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_one_commit(dir);
+        git_in(dir, &["branch", "base-branch"]).unwrap();
+        git_in(dir, &["checkout", "-q", "-b", "feat"]).unwrap();
+        let head = prepare_checkout(dir, "claude-run", "claude-run@a8n.run").unwrap();
+
+        git_in(dir, &["checkout", "-q", "base-branch"]).unwrap();
+        std::fs::write(dir.join("other.txt"), "unrelated\n").unwrap();
+        git_in(dir, &["add", "other.txt"]).unwrap();
+        git_in(dir, &["commit", "-q", "-m", "unrelated base change"]).unwrap();
+        git_in(dir, &["checkout", "-q", "feat"]).unwrap();
+        git_in(dir, &["merge", "-q", "--no-ff", "base-branch"]).unwrap();
+        assert!(
+            !dir.join(".git").join("MERGE_HEAD").exists(),
+            "this merge must succeed cleanly"
+        );
+
+        let decision =
+            run_decision_gate(dir, &head, &gate_cmd(), &gate_src(), "merged cleanly").unwrap();
+        assert_eq!(decision, Decision::Push { files: 0, lines: 0 });
+    }
+
+    #[test]
+    fn a_conflicted_merge_resolved_but_left_staged_and_not_committed_is_committed_by_the_runner_as_a_merge_commit(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        repo_with_a_conflicting_merge_in_progress(dir);
+        let cloned_head = git_output(dir, &["merge-base", "HEAD", "other"]).unwrap();
+
+        // Resolve and stage, exactly as an agent that forgot to commit would.
+        std::fs::write(dir.join("a.txt"), "one\nresolved\n").unwrap();
+        git_in(dir, &["add", "a.txt"]).unwrap();
+        assert!(needs_commit(dir).unwrap());
+
+        let decision =
+            run_decision_gate(dir, &cloned_head, &gate_cmd(), &gate_src(), "resolved it").unwrap();
+
         let parents = git_output(dir, &["log", "-1", "--pretty=%P"]).unwrap();
         assert_eq!(
             parents.split_whitespace().count(),
             2,
             "the runner's commit must be the merge commit: {parents}"
         );
-        assert!(!needs_commit(dir).unwrap());
+        assert!(matches!(decision, Decision::Push { .. }), "{decision:?}");
     }
 
     #[test]
-    fn change_stats_reports_a_git_failure_instead_of_no_changes() {
+    fn unmerged_paths_left_behind_are_reported_and_never_committed() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        // Not a git repository at all: `prepare_checkout` and `change_stats`
-        // must both surface the failure rather than read as zero changes.
-        assert!(prepare_checkout(dir).is_err());
-        assert!(change_stats(dir, "HEAD").is_err());
+        repo_with_a_conflicting_merge_in_progress(dir);
+        let cloned_head = git_output(dir, &["merge-base", "HEAD", "other"]).unwrap();
+
+        // The conflict markers are left in place: nothing resolved, nothing
+        // staged.
+        let decision =
+            run_decision_gate(dir, &cloned_head, &gate_cmd(), &gate_src(), "gave up").unwrap();
+        match decision {
+            Decision::UnresolvedConflicts { paths } => {
+                assert_eq!(paths, vec!["a.txt".to_string()]);
+            }
+            other => panic!("expected UnresolvedConflicts, got {other:?}"),
+        }
+        // Nothing was committed, and the index still reports the conflict.
+        assert!(dir.join(".git").join("MERGE_HEAD").exists());
+        let unmerged = git_output(dir, &["diff", "--name-only", "--diff-filter=U"]).unwrap();
+        assert_eq!(unmerged, "a.txt");
     }
 
     #[test]
@@ -2495,6 +2821,25 @@ mod tests {
         .contains("too large"));
         let failed = ClaudeResult::synthesized("claude exited 1", "tail");
         assert!(outcome_comment(&Decision::ClaudeFailed, &failed, None).contains("FAILED"));
+        let unresolved = outcome_comment(
+            &Decision::UnresolvedConflicts {
+                paths: vec!["a.txt".to_string()],
+            },
+            &ok,
+            None,
+        );
+        assert!(unresolved.contains("unresolved merge conflicts"));
+        assert!(unresolved.contains("a.txt"));
+        assert!(unresolved.contains("Nothing was staged, committed, or pushed"));
+        let measure_failed = outcome_comment(
+            &Decision::MeasureFailed {
+                reason: "git diff exited 1".to_string(),
+            },
+            &ok,
+            None,
+        );
+        assert!(measure_failed.contains("Measuring the change failed"));
+        assert!(measure_failed.contains("git diff exited 1"));
         // Usage and busy replies are distinct and name what happened.
         assert!(help_comment("/claude", true).contains("/claude help"));
         assert!(busy_comment(true).contains("already running"));
@@ -2556,8 +2901,10 @@ mod tests {
             true,
         ))
         .unwrap();
-        let prompt = build_prompt(&cmd, "feat/x");
+        let prompt = build_prompt(&cmd, "feat/x", "main");
         assert!(prompt.contains(INSTRUCTION_FILE));
+        assert!(prompt.contains("Base branch: main"));
+        assert!(!prompt.contains("Do NOT commit, push"));
         // The human's own words never travel in the prompt string.
         assert!(!prompt.contains("pwned"), "{prompt}");
     }
