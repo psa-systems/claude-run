@@ -584,8 +584,9 @@ impl CliBackend {
     /// deriving the title and body from the head commit exactly like AGit
     /// autofill would (the body carries the bare `#<KEY>-N` reference, so
     /// YouTrack still links the PR). The body travels via a file (fj convention
-    /// for long bodies), written under the workdir with a RELATIVE path so the
-    /// runner key stays deterministic; removed best-effort afterwards. The head
+    /// for long bodies), written into the clone's git-directory scratch space
+    /// (CLAUDE-305) rather than the workdir, so it can never be staged or
+    /// committed; its removal failure is logged rather than swallowed. The head
     /// is `refs/heads/<branch>`, never `refs/pull/<N>/head`.
     ///
     /// CLAUDE-166: the feature branch is resolved authoritatively by NAME, never
@@ -701,6 +702,21 @@ impl CliBackend {
         Ok(Self::checked("git", out, &args)?.trim().to_string())
     }
 
+    /// CLAUDE-305: the run's scratch directory INSIDE the clone's own git
+    /// directory (`git rev-parse --absolute-git-dir`, never a hard-coded
+    /// `.git`, which is a FILE rather than a directory in a worktree or
+    /// submodule checkout), joined with `claude-run` and created if missing.
+    /// Git never tracks, stages, or commits anything under the git directory,
+    /// so a scratch file written here can never reach a commit.
+    fn git_dir_scratch(&self, workdir: &Path) -> Result<PathBuf> {
+        let args = ["rev-parse", "--absolute-git-dir"];
+        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        let git_dir = Self::checked("git", out, &args)?.trim().to_string();
+        let dir = PathBuf::from(git_dir).join("claude-run");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
     /// CLAUDE-170: the SHA of `origin/<branch>` if the branch exists on the
     /// remote, else `None`. `git ls-remote --heads origin <branch>` prints one
     /// `"<sha>\t<ref>"` line per matching head and nothing (exit 0) when the
@@ -805,7 +821,14 @@ impl CliBackend {
         let body = Self::checked("git", out, &body_args)?.trim().to_string();
 
         const BODY_FILE: &str = ".claude-run-pr-body.md";
-        std::fs::write(workdir.join(BODY_FILE), &body)?;
+        // CLAUDE-305: written into the clone's git-directory scratch space,
+        // never its work tree, so it can never be staged or committed; an
+        // absolute path is passed to `--body-file` since it no longer sits
+        // under `workdir`, the `fj` child's own cwd.
+        let scratch = self.git_dir_scratch(workdir)?;
+        let body_path = scratch.join(BODY_FILE);
+        std::fs::write(&body_path, &body)?;
+        let body_path_arg = body_path.to_string_lossy().to_string();
         let create_args = [
             "--host",
             host,
@@ -813,7 +836,7 @@ impl CliBackend {
             "create",
             title.as_str(),
             "--body-file",
-            BODY_FILE,
+            body_path_arg.as_str(),
             "--head",
             branch,
             "--json",
@@ -822,7 +845,15 @@ impl CliBackend {
             .runner
             .run_in_env(Some(workdir), &self.fj, &create_args, &self.fj_envs())
             .and_then(|out| Self::checked(&self.fj, out, &create_args));
-        let _ = std::fs::remove_file(workdir.join(BODY_FILE));
+        if let Err(e) = std::fs::remove_file(&body_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::error!(
+                    path = %body_path.display(),
+                    error = %e,
+                    "removing the PR body file failed"
+                );
+            }
+        }
         // CLAUDE-275: the branch-backed create just pushed this exact server
         // branch (`self.push_branch` / the fast-forward arm above), so it is
         // always the resulting PR's head, whatever `fj pr create --json` itself
@@ -2660,6 +2691,21 @@ mod tests {
         )
     }
 
+    /// CLAUDE-305: register the `git rev-parse --absolute-git-dir` lookup
+    /// `find_or_create_pr` issues before writing the PR body scratch file, and
+    /// return the scratch directory (`<git-dir>/claude-run`) the body file
+    /// lands in, so a test can compute the exact `--body-file` argument and
+    /// existence check.
+    fn with_git_dir_scratch(runner: StubRunner, wd: &std::path::Path) -> (StubRunner, PathBuf) {
+        let git_dir = wd.join(".git");
+        let r = runner.ok(
+            "git",
+            &["rev-parse", "--absolute-git-dir"],
+            &git_dir.to_string_lossy(),
+        );
+        (r, git_dir.join("claude-run"))
+    }
+
     #[test]
     fn create_pr_branch_strategy_pushes_branch_and_creates_via_api() {
         // CLAUDE-103 default: `pr_strategy: branch` pushes a real server branch
@@ -2692,23 +2738,26 @@ mod tests {
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
                 "Body of the commit.\n\n#MK-16\n",
-            )
-            .ok(
-                "fj",
-                &[
-                    "--host",
-                    "dev.a8n.run",
-                    "pr",
-                    "create",
-                    "feat(x): do the thing",
-                    "--body-file",
-                    ".claude-run-pr-body.md",
-                    "--head",
-                    "feat/x",
-                    "--json",
-                ],
-                r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
             );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path = scratch.join(".claude-run-pr-body.md");
+        let body_path_str = body_path.to_string_lossy().to_string();
+        let runner = runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "feat(x): do the thing",
+                "--body-file",
+                body_path_str.as_str(),
+                "--head",
+                "feat/x",
+                "--json",
+            ],
+            r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
+        );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         let pr = b
@@ -2717,7 +2766,7 @@ mod tests {
         assert_eq!(pr.number, Some(77));
         assert_eq!(pr.url, "https://dev.a8n.run/n/c/pulls/77");
         // The body file is cleaned up after the create.
-        assert!(!wd.path().join(".claude-run-pr-body.md").exists());
+        assert!(!body_path.exists());
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls
@@ -2777,23 +2826,28 @@ mod tests {
                 "git",
                 &["log", "-1", "--format=%b", "fix/CLAUDE-166-work"],
                 "#CLAUDE-166\n",
-            )
-            .ok(
-                "fj",
-                &[
-                    "--host",
-                    "dev.a8n.run",
-                    "pr",
-                    "create",
-                    "fix: harden PR creation",
-                    "--body-file",
-                    ".claude-run-pr-body.md",
-                    "--head",
-                    "fix/CLAUDE-166-work",
-                    "--json",
-                ],
-                r#"{"number":51,"html_url":"https://dev.a8n.run/n/c/pulls/51"}"#,
             );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "fix: harden PR creation",
+                "--body-file",
+                body_path_str.as_str(),
+                "--head",
+                "fix/CLAUDE-166-work",
+                "--json",
+            ],
+            r#"{"number":51,"html_url":"https://dev.a8n.run/n/c/pulls/51"}"#,
+        );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         let pr = b
@@ -3114,23 +3168,28 @@ mod tests {
                 "git",
                 &["log", "-1", "--format=%b", "feat/x"],
                 "#CLAUDE-170\n",
-            )
-            .ok(
-                "fj",
-                &[
-                    "--host",
-                    "dev.a8n.run",
-                    "pr",
-                    "create",
-                    "feat(x): more work",
-                    "--body-file",
-                    ".claude-run-pr-body.md",
-                    "--head",
-                    "feat/x",
-                    "--json",
-                ],
-                r#"{"number":90,"html_url":"https://dev.a8n.run/n/c/pulls/90"}"#,
             );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "feat(x): more work",
+                "--body-file",
+                body_path_str.as_str(),
+                "--head",
+                "feat/x",
+                "--json",
+            ],
+            r#"{"number":90,"html_url":"https://dev.a8n.run/n/c/pulls/90"}"#,
+        );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         let pr = b
@@ -3293,23 +3352,28 @@ mod tests {
                 "git",
                 &["log", "-1", "--format=%b", "fix/CLAUDE-206"],
                 "#CLAUDE-206\n",
-            )
-            .ok(
-                "fj",
-                &[
-                    "--host",
-                    "dev.a8n.run",
-                    "pr",
-                    "create",
-                    "fix(pr): degrade a failed lookup",
-                    "--body-file",
-                    ".claude-run-pr-body.md",
-                    "--head",
-                    "fix/CLAUDE-206",
-                    "--json",
-                ],
-                r#"{"number":206,"html_url":"https://dev.a8n.run/n/c/pulls/206"}"#,
             );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "fix(pr): degrade a failed lookup",
+                "--body-file",
+                body_path_str.as_str(),
+                "--head",
+                "fix/CLAUDE-206",
+                "--json",
+            ],
+            r#"{"number":206,"html_url":"https://dev.a8n.run/n/c/pulls/206"}"#,
+        );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         let pr = b
@@ -3378,8 +3442,13 @@ mod tests {
             "git",
             &["log", "-1", "--format=%b", "fix/CLAUDE-206"],
             "#CLAUDE-206\n",
-        )
-        .fail(
+        );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner.fail(
             "fj",
             &[
                 "--host",
@@ -3388,7 +3457,7 @@ mod tests {
                 "create",
                 "fix(pr): degrade a failed lookup",
                 "--body-file",
-                ".claude-run-pr-body.md",
+                body_path_str.as_str(),
                 "--head",
                 "fix/CLAUDE-206",
                 "--json",
@@ -3441,24 +3510,29 @@ mod tests {
                 "git",
                 &["log", "-1", "--format=%b", "fix/CLAUDE-206"],
                 "#CLAUDE-206\n",
-            )
-            .fail(
-                "fj",
-                &[
-                    "--host",
-                    "dev.a8n.run",
-                    "pr",
-                    "create",
-                    "fix(pr): degrade a failed lookup",
-                    "--body-file",
-                    ".claude-run-pr-body.md",
-                    "--head",
-                    "fix/CLAUDE-206",
-                    "--json",
-                ],
-                1,
-                "Error: not found: The target couldn't be found.",
             );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner.fail(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "fix(pr): degrade a failed lookup",
+                "--body-file",
+                body_path_str.as_str(),
+                "--head",
+                "fix/CLAUDE-206",
+                "--json",
+            ],
+            1,
+            "Error: not found: The target couldn't be found.",
+        );
         let b = CliBackend::new(Arc::new(runner));
         match b
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
@@ -4178,24 +4252,27 @@ mod tests {
                 &["log", "-1", "--format=%s", "feat/x"],
                 "feat(x): do the thing\n",
             )
-            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#MK-16\n")
-            .fail(
-                "fj",
-                &[
-                    "--host",
-                    "dev.a8n.run",
-                    "pr",
-                    "create",
-                    "feat(x): do the thing",
-                    "--body-file",
-                    ".claude-run-pr-body.md",
-                    "--head",
-                    "feat/x",
-                    "--json",
-                ],
-                1,
-                "not found: The target couldn't be found.",
-            );
+            .ok("git", &["log", "-1", "--format=%b", "feat/x"], "#MK-16\n");
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path = scratch.join(".claude-run-pr-body.md");
+        let body_path_str = body_path.to_string_lossy().to_string();
+        let runner = runner.fail(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "feat(x): do the thing",
+                "--body-file",
+                body_path_str.as_str(),
+                "--head",
+                "feat/x",
+                "--json",
+            ],
+            1,
+            "not found: The target couldn't be found.",
+        );
         let b = CliBackend::new(Arc::new(runner));
         let err = b
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
@@ -4205,7 +4282,7 @@ mod tests {
         assert!(err.contains("dev.a8n.run"), "got {err}");
         assert!(err.contains("may lack access"), "got {err}");
         // The body file is still cleaned up on the failure path.
-        assert!(!wd.path().join(".claude-run-pr-body.md").exists());
+        assert!(!body_path.exists());
     }
 
     #[test]
