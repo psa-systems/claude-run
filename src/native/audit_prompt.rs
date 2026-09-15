@@ -31,8 +31,8 @@ pub(crate) fn default_audit_prompt() -> String {
         "P1. Clone the target repository named in the description READ-ONLY to a path OUTSIDE {{workdir}} (for example `git clone <target-clone-url> /tmp/<repo>`). For the whole run make no edits, builds, test runs, package installs, commits, or pushes in it. Never clone either repo inside the other's working tree.",
         "P2. Read `<target>/_coverage.md` and `<target>/_deferred.md` in the audits checkout FIRST, per `prompts/_filing.md` step 0, and carry forward what is owed before anything found this run.",
         "P3. Execute the audit-type prompt's phases, including its verification phase. Drop what you cannot substantiate and state the dropped count.",
-        "P4. File the findings per `prompts/_filing.md`: dedup, group, and select at most 20 finding issues for this target, a roll-up issue included in that count. Write everything over the cap to the target's `_deferred.md`. For each finding issue, in this order: create it ONLY in one of these projects: {{write_projects}}; set its Priority; add its `Audit-<Type>` tag; link it `subtask of` {{key}} (plus any `relates` or `depends on` links the filing procedure calls for); and set `AI Agent` to `Queued` LAST, so the agent never picks up a half-filed issue. Then confirm with ONE batch query, `yt list --query \"issue ID: <KEY>, <KEY>\" --json --top <N>`, that every issue you filed shows its Priority and `AI Agent = Queued`, and fix any that does not.",
-        "P5. Write exactly the files the audit-type prompt names: the dated report, led by its `## Result` block and carrying its `## Filed` table, plus this target's `_coverage.md` and `_deferred.md` updates. Create nothing else.",
+        "P4. Write the dated report BEFORE filing anything: the file the audit-type prompt names, led by its `## Result` block and carrying one finding block per finding you are about to file. Per `prompts/_filing.md`: dedup, group, and select at most 20 finding issues for this target, a roll-up issue included in that count; write everything over the cap to the target's `_deferred.md`; update this target's `_coverage.md`. This report is the record a compacted context re-reads instead of reconstructing a finding from memory, so it must exist, complete, before P5's first `yt issue create`.",
+        "P5. File the findings, working only from the report P4 just wrote, never from conversation memory. For each finding, in this order: re-read that finding's block from the report ON DISK and re-open its first cited `file:line` in the clone; build the issue body from that re-read report text; create it ONLY in one of these projects: {{write_projects}}; set its Priority; add its `Audit-<Type>` tag; link it `subtask of` {{key}} (plus any `relates` or `depends on` links the filing procedure calls for); and set `AI Agent` to `Queued` LAST, so the agent never picks up a half-filed issue. Immediately after each `yt issue create`, before any other write for that finding, append one line `<finding id><TAB><issue key>` to the filing log at `/tmp/audit-filing-{{key}}.tsv` (outside {{workdir}}, so it survives regardless of what happens to this checkout). If you notice that earlier conversation has been replaced by a compaction summary, or you cannot account for a finding's text from your own prior turns, STOP before any further tracker write and re-read both the report and the filing log from disk: never create an issue for a finding id the filing log already lists, even if you no longer recall filing it. Once every finding is filed, append the `## Filed` table to the same report and confirm with ONE batch query, `yt list --query \"issue ID: <KEY>, <KEY>\" --json --top <N>`, that every issue you filed shows its Priority and `AI Agent = Queued`, and fix any that does not.",
         "P6. Tracker write-back for this target: post ONE summary comment for this target on the parent issue that {{key}} is a subtask of (if {{key}} has no parent, post none and say so in `## Result`), and rewrite the description of {{key}} so it leads with the `## Result` block, keeping the original instructions below it under `## Run instructions (completed <YYYY-MM-DD>)`. Do not touch the anchor issue.",
         "",
         "DAILY PARENT RUN steps:",
@@ -53,7 +53,7 @@ pub(crate) fn default_audit_prompt() -> String {
         "- On {{key}}: `yt issue update {{key}} --description-file <path>` to lead its description with the `## Result` block. Description only.",
         "- PER-TARGET RUN only: one `yt issue comment` carrying this target's summary on the parent issue that {{key}} is a subtask of.",
         "- PER-TARGET RUN only: `yt issue create`, ONLY in these projects: {{write_projects}}, and at most 20 finding issues for this target, a roll-up included.",
-        "- PER-TARGET RUN only, on issues you created during THIS run and only those: `yt issue update <KEY> --priority`, `yt issue tag add <KEY> Audit-<Type>`, `yt issue link` (`--type \"subtask of\" {{key}}`, `relates`, `depends on`), and `yt issue set-field <KEY> \"AI Agent\" Queued`. `Queued` is the only `AI Agent` value you may set; you set it on every finding issue you file, and it is the last write on each one.",
+        "- PER-TARGET RUN only, on issues you created during THIS run and only those: `yt issue update <KEY> --priority`, `yt issue tag add <KEY> Audit-<Type>`, `yt issue link` (`--type \"subtask of\" {{key}}`, `relates`, `depends on`), and `yt issue set-field <KEY> \"AI Agent\"` to `Queued` or, on a self-created issue only, to `Needs Review`. `Queued` and `Needs Review` are the only two `AI Agent` values you may set, both only on an issue you created during this run: `Queued` is the last write on every finding issue you file. `Needs Review` is for an issue you created this run whose content you later find wrong (a citation or file:line that does not exist, a duplicate, anything the filing log or a re-read of the report contradicts); record its key and the reason in the `## Result` block and in the run's final checklist. Delete stays banned either way; `Needs Review` is how a wrong self-filed issue leaves the queue.",
         "- PER-TARGET RUN only, on an existing OPEN issue that the dedup step matched to a finding: one `yt issue comment` carrying the new evidence. Nothing else on that issue.",
         "- DAILY PARENT RUN only: `yt issue update <ANCHOR> --description-file <path>` updating the standing table on the anchor issue named in the description of {{key}}. Description only.",
         "",
@@ -80,7 +80,82 @@ pub(crate) fn default_audit_prompt() -> String {
         "       {{workdir}}/{{skip_attempt_marker}}",
         "  d. Do NOT set any field on {{key}} yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.",
         "",
-        "When you finish, summarize the run as a checklist: the run shape, the branch and the files committed, the finding issues filed (key, priority, and confirmed `AI Agent = Queued` for each), existing issues commented on instead of filed, deferred entries added or drained, and each tracker write-back you performed. Do not include a pull request URL; the runner creates the pull request.",
+        "When you finish, summarize the run as a checklist: the run shape, the branch and the files committed, the finding issues filed (key, priority, and confirmed `AI Agent = Queued` for each), any self-created issue you instead set to `Needs Review` (key and reason), existing issues commented on instead of filed, deferred entries added or drained, and each tracker write-back you performed. Do not include a pull request URL; the runner creates the pull request.",
     ]
     .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_audit_prompt;
+
+    /// CLAUDE-304: AUDIT-253 filed 9 issues whose citations did not exist
+    /// because a compacted run rebuilt finding write-ups from a summary
+    /// instead of re-reading them. The prompt must order report-before-filing,
+    /// require each issue body to come from the on-disk report with its first
+    /// citation re-opened, and define the filing log and the resume rule.
+    #[test]
+    fn prompt_orders_report_before_filing_and_defines_the_filing_log() {
+        let p = default_audit_prompt();
+        let report_step = p.find("P4.").expect("P4 step present");
+        let filing_step = p.find("P5.").expect("P5 step present");
+        assert!(
+            report_step < filing_step,
+            "the report step (P4) must precede the filing step (P5)"
+        );
+        assert!(
+            p.contains("BEFORE filing anything"),
+            "P4 must write the report before any issue is filed"
+        );
+        assert!(
+            p.contains("re-read that finding's block from the report ON DISK"),
+            "P5 must build each issue body from the on-disk report"
+        );
+        assert!(
+            p.contains("re-open its first cited `file:line` in the clone"),
+            "P5 must re-open the finding's first citation before filing it"
+        );
+        assert!(
+            p.contains("/tmp/audit-filing-{{key}}.tsv"),
+            "P5 must define the filing log path"
+        );
+        assert!(
+            p.contains("append one line `<finding id><TAB><issue key>`"),
+            "P5 must define the filing log's line shape"
+        );
+        assert!(
+            p.contains("earlier conversation has been replaced by a compaction summary"),
+            "P5 must define the resume rule after a compaction"
+        );
+        assert!(
+            p.contains("never create an issue for a finding id the filing log already lists"),
+            "P5 must forbid re-filing a finding the log already recorded"
+        );
+    }
+
+    /// CLAUDE-304: `Needs Review` is now a second permitted `AI Agent` value,
+    /// but only on an issue the run created this run and found wrong; delete
+    /// stays banned regardless.
+    #[test]
+    fn prompt_permits_needs_review_only_on_self_created_issues_and_still_bans_delete() {
+        let p = default_audit_prompt();
+        assert!(
+            p.contains("or, on a self-created issue only, to `Needs Review`"),
+            "Needs Review must be scoped to self-created issues"
+        );
+        assert!(
+            p.contains(
+                "`Queued` and `Needs Review` are the only two `AI Agent` values you may set"
+            ),
+            "the permission list must name both allowed values"
+        );
+        assert!(
+            p.contains("record its key and the reason in the `## Result` block and in the run's final checklist"),
+            "a Needs Review self-correction must be recorded in the result block and checklist"
+        );
+        assert!(
+            p.contains("No `yt issue delete`, anywhere."),
+            "delete must still be banned unconditionally"
+        );
+    }
 }
