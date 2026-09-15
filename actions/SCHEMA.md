@@ -232,6 +232,34 @@ placeholder (or an unterminated `{{`) is left literal and logged at warn:
 | `{{existing_pr_url}}`    | Empty on a fresh pickup. On a re-queue with an open recorded PR (CLAUDE-275), the URL of that PR. |
 | `{{existing_branch}}`    | Empty on a fresh pickup. On a re-queue with an open recorded PR (CLAUDE-275), that PR's head branch, already checked out in `{{workdir}}`. |
 
+##### Audit prompt: filing from disk, not from a compacted context (CLAUDE-304)
+
+On 2026-09-15 an `audit-run` job compacted mid-run (`claude.autocompact`'s default 200000-token window) and, after the
+boundary, rebuilt 14 of its 20 finding write-ups from the compacted summary instead of re-reading them, filing nine
+issues whose `file:line` citations did not exist. The audit prompt (`default_audit_prompt`,
+`src/native/audit_prompt.rs`) now orders its per-target steps so that never has to happen:
+
+- **P4 writes the dated report, with every finding block, before P5 files anything.** The report is the on-disk record
+  a compacted run re-reads instead of reconstructing a finding from memory.
+- **P5 files each finding from that report, never from conversation memory:** it re-reads the finding's block from the
+  report on disk and re-opens its first cited `file:line` in the clone before building the issue body and calling
+  `yt issue create`. Immediately after each create, it appends `<finding id><TAB><issue key>` to a filing log outside
+  `{{workdir}}`, at `/tmp/audit-filing-{{key}}.tsv`. If the run notices its earlier conversation was replaced by a
+  compaction summary, or it cannot account for a finding's text from its own prior turns, it re-reads the report and
+  the filing log from disk before any further tracker write, and never files a finding id the log already lists.
+- **`AI Agent = Needs Review` is now permitted on a self-created issue**, in addition to `Queued`: an issue the run
+  created and filed this run, that it later finds wrong (a citation that does not exist, a duplicate, anything the
+  filing log or a re-read of the report contradicts), gets `Needs Review` instead, taking it out of the `youtrack`
+  action's queue for a person. Delete stays banned either way. The run records the key and its reason in the
+  `## Result` block and in its final checklist.
+
+Separately, `finalize` (`src/native/youtrack.rs`) reads its own run's stream log after every job and counts
+`compact_boundary` events (`crate::claude::count_compact_boundaries`). A non-zero count appends one line to the
+success or needs-review outcome comment, `Context was compacted <n> time(s) during this run; check the issues it
+created.`, and logs a `warn` naming the key and the count; a run with none gets neither. A stream-log read failure
+logs at `error` and the outcome comment still posts, without that line - the same "the comment is best-effort, the
+field write is authoritative" posture `finalize` already takes everywhere else.
+
 ##### Resuming an open PR on re-queue (CLAUDE-275)
 
 Every PR the `youtrack` action opens is recorded in the `agent_pull_requests` store (action, issue key, host, repo, PR
