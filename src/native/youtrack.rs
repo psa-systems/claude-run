@@ -5678,6 +5678,7 @@ mod tests {
             title: String::new(),
             head_sha: String::new(),
             head_ref: head_ref.to_string(),
+            base_ref: String::new(),
             author: String::new(),
             html_url: format!("https://dev.a8n.run/contoso/claude-run/pulls/{number}"),
             updated_at: String::new(),
