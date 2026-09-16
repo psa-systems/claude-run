@@ -587,10 +587,81 @@ pub fn shallow_clone(
         .arg(url)
         .arg(workdir)
         .output()?;
-    if out.status.success() {
-        return Ok(());
+    if !out.status.success() {
+        return Err(git_error("clone", &out, Some(url)));
     }
-    Err(git_error("clone", &out, Some(url)))
+    if let Some(pinned) = branch {
+        restore_default_branch_refs(url, pinned, workdir, depth)?;
+    }
+    Ok(())
+}
+
+/// CLAUDE-311: a pinned-branch clone (`--branch` implies `--single-branch`)
+/// carries only `refs/remotes/origin/<pinned>`, so it has no
+/// `refs/remotes/origin/HEAD` and no `refs/remotes/origin/<default>`. That
+/// breaks every base-branch lookup a resumed-PR workdir needs
+/// (`CliBackend::resolve_feature_branch`, `GithubForge::detect_base`), because
+/// there is nothing for `origin/HEAD` to resolve to. This fetches the
+/// remote's actual default branch (never assumed) and restores
+/// `origin/HEAD`, so a pinned clone ends up with the same base refs as a
+/// default-branch clone.
+fn restore_default_branch_refs(
+    url: &str,
+    pinned: &str,
+    workdir: &std::path::Path,
+    depth: u32,
+) -> Result<()> {
+    let out = std::process::Command::new("git")
+        .arg("ls-remote")
+        .arg("--symref")
+        .arg(url)
+        .arg("HEAD")
+        .output()?;
+    if !out.status.success() {
+        return Err(git_error("ls-remote", &out, Some(url)));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let default_branch = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("ref: refs/heads/"))
+        .and_then(|rest| rest.split_whitespace().next());
+    let Some(default_branch) = default_branch else {
+        let secrets = url_secrets(url);
+        return Err(Error::Other(anyhow::anyhow!(
+            "remote has no resolvable default branch: {}",
+            crate::forge_log::redact(stdout.trim(), &secrets)
+        )));
+    };
+    let default_branch = default_branch.to_string();
+
+    if default_branch != pinned {
+        let refspec = format!("+refs/heads/{default_branch}:refs/remotes/origin/{default_branch}");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("fetch")
+            .arg("--depth")
+            .arg(depth.to_string())
+            .arg("origin")
+            .arg(&refspec)
+            .output()?;
+        if !out.status.success() {
+            return Err(git_error("fetch", &out, Some(url)));
+        }
+    }
+
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .arg("remote")
+        .arg("set-head")
+        .arg("origin")
+        .arg(&default_branch)
+        .output()?;
+    if !out.status.success() {
+        return Err(git_error("remote set-head", &out, Some(url)));
+    }
+    Ok(())
 }
 
 /// The error for a failed git subprocess: the exit code plus the tail of git's
@@ -866,5 +937,147 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no usable provider backend"), "got {msg}");
         assert!(msg.contains("yt"), "got {msg}");
+    }
+
+    // ---- CLAUDE-311: a pinned clone still carries origin/HEAD -------------
+
+    /// A real origin repo (over `file://`) whose default branch is
+    /// `default_branch`, with one commit on it and a `feat` branch one commit
+    /// ahead. Returns the `file://` URL `shallow_clone` can pull from.
+    fn origin_with_default_branch(base: &std::path::Path, default_branch: &str) -> String {
+        let origin = base.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let git_in = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&["init", "-q", "-b", default_branch]);
+        git_in(&["config", "user.name", "t"]);
+        git_in(&["config", "user.email", "t@t.example"]);
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        git_in(&["add", "."]);
+        git_in(&["commit", "-q", "-m", "init"]);
+        git_in(&["checkout", "-q", "-b", "feat"]);
+        std::fs::write(origin.join("g.txt"), "y").unwrap();
+        git_in(&["add", "."]);
+        git_in(&["commit", "-q", "-m", "feat commit"]);
+        // The origin repo's own checked-out branch is what a `file://` clone's
+        // remote HEAD follows; leave it back on the default branch, or every
+        // clone (pinned or not) would see `origin/HEAD -> origin/feat`.
+        git_in(&["checkout", "-q", default_branch]);
+        format!("file://{}", origin.display())
+    }
+
+    fn rev_parse_abbrev(workdir: &std::path::Path, rev: &str) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .args(["rev-parse", "--abbrev-ref", rev])
+            .output()
+            .unwrap();
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn pinned_clone_restores_origin_head_when_default_is_main() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_default_branch(tmp.path(), "main");
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, Some("feat"), &clone, 50).unwrap();
+        assert_eq!(
+            rev_parse_abbrev(&clone, "origin/HEAD").as_deref(),
+            Some("origin/main")
+        );
+        assert_eq!(
+            rev_parse_abbrev(&clone, "origin/main").as_deref(),
+            Some("origin/main"),
+            "refs/remotes/origin/main must resolve"
+        );
+    }
+
+    #[test]
+    fn pinned_clone_restores_origin_head_when_default_is_not_main() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_default_branch(tmp.path(), "trunk");
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, Some("feat"), &clone, 50).unwrap();
+        assert_eq!(
+            rev_parse_abbrev(&clone, "origin/HEAD").as_deref(),
+            Some("origin/trunk")
+        );
+    }
+
+    #[test]
+    fn pinning_the_default_branch_itself_still_resolves_origin_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_default_branch(tmp.path(), "main");
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, Some("main"), &clone, 50).unwrap();
+        assert_eq!(
+            rev_parse_abbrev(&clone, "origin/HEAD").as_deref(),
+            Some("origin/main")
+        );
+    }
+
+    #[test]
+    fn an_unpinned_clone_is_unaffected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_default_branch(tmp.path(), "main");
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, None, &clone, 50).unwrap();
+        assert_eq!(
+            rev_parse_abbrev(&clone, "origin/HEAD").as_deref(),
+            Some("origin/main")
+        );
+    }
+
+    #[test]
+    fn ls_remote_failure_reports_gits_own_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = restore_default_branch_refs(
+            "/nonexistent/repo.git",
+            "feat",
+            &tmp.path().join("clone"),
+            50,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("git ls-remote exited"), "{err}");
+    }
+
+    #[test]
+    fn a_remote_with_no_head_symref_errors_rather_than_assuming_main() {
+        // An empty bare repo has no HEAD to report: `ls-remote --symref`
+        // succeeds with no `ref:` line, and that must never be read as "main".
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg("--bare")
+            .arg(&origin)
+            .output()
+            .unwrap();
+        let url = format!("file://{}", origin.display());
+        let err = restore_default_branch_refs(&url, "feat", &tmp.path().join("clone"), 50)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no resolvable default branch"),
+            "must never guess main: {err}"
+        );
     }
 }
