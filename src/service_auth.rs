@@ -16,6 +16,10 @@
 //!   same variable in the child's own env and still wins.
 //! - **Forgejo**: `keys.json` in the daemon's XDG data dir, the exact file
 //!   `fj auth add-key` writes, through the same writer the per-job path uses.
+//! - **GitHub**: `gh`'s own `hosts.yml`, written by `gh auth login --with-token`
+//!   itself (the tool's own writer, not a format this module reproduces) under
+//!   `<config_dir>/auth/gh`, pointed at by `GH_CONFIG_DIR` which the daemon
+//!   exports at startup next to `YOUTRACK_CLI_CONFIG`.
 //! - **Claude**: the API key is handed to [`crate::claude::ClaudeInvoker`] as
 //!   `ANTHROPIC_API_KEY` for the child. It is an alternative to an interactive
 //!   `claude auth login` inside the container, not a replacement: an OAuth login
@@ -25,6 +29,7 @@
 //! `config.auth` settings document. The tokens live encrypted in the secrets
 //! store and are read back only here.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -37,6 +42,11 @@ use crate::secrets::{resolve_secret, SecretsKey};
 /// Env var naming the single-file `yt` config. Exported by the daemon so every
 /// `yt` child inherits the configured login.
 pub const YT_CONFIG_ENV: &str = "YOUTRACK_CLI_CONFIG";
+
+/// Env var naming `gh`'s own config dir. Exported by the daemon so every `gh`
+/// child (the runner's own `GithubForge` calls and agent sessions) inherits
+/// the configured login.
+pub const GH_CONFIG_ENV: &str = "GH_CONFIG_DIR";
 
 /// Live Anthropic API key, shared with the `claude` invoker. A `std::sync`
 /// lock because the reader (`ClaudeInvoker::invoke`) is synchronous.
@@ -64,6 +74,24 @@ pub fn export_yt_config_env(paths: &Paths) {
     std::env::set_var(YT_CONFIG_ENV, yt_config_path(paths));
 }
 
+/// Where the materialized `gh` config lives. Fixed, so [`GH_CONFIG_ENV`] can be
+/// exported once at startup and stay correct as the credential changes.
+pub fn gh_config_dir(paths: &Paths) -> PathBuf {
+    paths.config_dir.join("auth").join("gh")
+}
+
+/// Export [`GH_CONFIG_ENV`] for this process and its children. See
+/// [`export_yt_config_env`] for why this runs unconditionally at serve start,
+/// before any child is spawned, and the same `set_var` safety note applies.
+///
+/// # Safety
+///
+/// `std::env::set_var` is not thread-safe against concurrent `getenv`. This
+/// runs on the serve path before the daemon spawns anything.
+pub fn export_gh_config_env(paths: &Paths) {
+    std::env::set_var(GH_CONFIG_ENV, gh_config_dir(paths));
+}
+
 /// What is configured, for the Settings page. Never carries a secret value.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AuthStatus {
@@ -73,6 +101,8 @@ pub struct AuthStatus {
     pub youtrack_base_url: Option<String>,
     /// The configured Forgejo host, when a token is stored for it.
     pub forgejo_host: Option<String>,
+    /// The configured GitHub host, when a token is stored for it.
+    pub github_host: Option<String>,
 }
 
 /// The XDG data dir `fj` reads its `keys.json` from. Callers pass this in; it is
@@ -96,6 +126,7 @@ pub async fn materialize(
     paths: &Paths,
     cfg: &AuthConfig,
     fj_data_home: &Path,
+    gh_binary: &str,
 ) -> Result<(AuthStatus, Option<String>)> {
     let mut status = AuthStatus::default();
     let mut api_key = None;
@@ -105,6 +136,7 @@ pub async fn materialize(
     if cfg.anthropic_key_ref.is_none()
         && cfg.youtrack_token_ref.is_none()
         && cfg.forgejo_token_ref.is_none()
+        && cfg.github_token_ref.is_none()
     {
         return Ok((status, None));
     }
@@ -141,6 +173,19 @@ pub async fn materialize(
             }
             Ok(_) => tracing::warn!(secret = name, "stored Forgejo token is empty; ignoring"),
             Err(e) => tracing::warn!(secret = name, error = %e, "Forgejo token not resolvable"),
+        }
+    }
+
+    if let (Some(name), Some(host)) = (&cfg.github_token_ref, &cfg.github_host) {
+        match resolve_secret(pool, &key, name).await {
+            Ok(token) if !token.is_empty() => {
+                match gh_login(gh_binary, &gh_config_dir(paths), host, &token) {
+                    Ok(()) => status.github_host = Some(host.clone()),
+                    Err(e) => tracing::warn!(host, error = %e, "gh auth login failed"),
+                }
+            }
+            Ok(_) => tracing::warn!(secret = name, "stored GitHub token is empty; ignoring"),
+            Err(e) => tracing::warn!(secret = name, error = %e, "GitHub token not resolvable"),
         }
     }
 
@@ -194,6 +239,75 @@ pub fn probe_claude_login(
             None => LoginProbeOutcome::Indeterminate(format!("no `loggedIn` field in: {stdout}")),
         },
         Err(e) => LoginProbeOutcome::Indeterminate(format!("unparseable output ({e}): {stdout}")),
+    }
+}
+
+/// Single-quote `s` for interpolation into a POSIX shell command line.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Run `gh auth login --hostname <host> --with-token --git-protocol https
+/// --insecure-storage`, delivering `token` on `gh`'s stdin via an explicit
+/// shell redirection from a throwaway 0600 file (rather than a pipe this
+/// process writes to directly): a `timeout(1)` that backgrounds its child
+/// (some test doubles do, and a real `timeout` never does) substitutes
+/// `/dev/null` for a backgrounded command's own inherited stdin per POSIX,
+/// which would silently hand `gh` an empty token; an explicit `<` redirection
+/// written on the command itself is unaffected because it is applied fresh
+/// when that command runs, regardless of what its parent's stdin was. `GH_CONFIG_DIR`
+/// is set to `config_dir` so the login lands there rather than in whatever
+/// config `gh` would otherwise resolve. `--insecure-storage` because the
+/// container has no keyring. Blocking: callers run this off the tokio worker
+/// (`crate::blocking::in_place`), per CLAUDE-228.
+///
+/// A non-zero exit is an error carrying the exit code and `gh`'s stderr, run
+/// through [`crate::forge_log::redact`] with the token as a known secret so it
+/// never reaches a log line or a rendered page.
+pub fn gh_login(gh_binary: &str, config_dir: &Path, host: &str, token: &str) -> Result<()> {
+    std::fs::create_dir_all(config_dir)?;
+    std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700))?;
+
+    let token_path = config_dir.join(format!(
+        ".gh-login-token-{}",
+        crate::secrets::unique_suffix()
+    ));
+    crate::secrets::write_0600(&token_path, token.as_bytes())?;
+    let cleanup = || {
+        let _ = std::fs::remove_file(&token_path);
+    };
+
+    let script = format!(
+        "exec {} auth login --hostname {} --with-token --git-protocol https --insecure-storage < {}",
+        shell_quote(gh_binary),
+        shell_quote(host),
+        shell_quote(token_path.to_string_lossy().as_ref()),
+    );
+
+    let out = std::process::Command::new("timeout")
+        .arg("30s")
+        .arg("sh")
+        .arg("-c")
+        .arg(&script)
+        .env(GH_CONFIG_ENV, config_dir)
+        .stdin(std::process::Stdio::null())
+        .output();
+    cleanup();
+    let out = out.map_err(|e| {
+        crate::error::Error::Other(anyhow::anyhow!("spawning {gh_binary} auth login: {e}"))
+    })?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let redacted = crate::forge_log::redact(&stderr, &[token.to_string()]);
+        Err(crate::error::Error::CliFailed {
+            binary: gh_binary.to_string(),
+            args: "auth login".to_string(),
+            exit_code: out.status.code().unwrap_or(-1),
+            stderr: redacted.trim().to_string(),
+        })
     }
 }
 
@@ -343,6 +457,7 @@ mod tests {
             &paths,
             &AuthConfig::default(),
             &tmp.path().join("fj-data"),
+            "gh",
         )
         .await
         .unwrap();
@@ -352,5 +467,112 @@ mod tests {
             !yt_config_path(&paths).exists(),
             "an unconfigured instance must not clobber a hand-made login"
         );
+    }
+
+    /// CLAUDE-307: `gh_login` passes the documented flag set, points `GH_CONFIG_DIR`
+    /// at the given dir, and delivers the token on stdin rather than as an argv
+    /// value (which would leak it into `ps`).
+    #[test]
+    fn gh_login_passes_flags_env_and_stdin_to_the_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("gh-stub.sh");
+        let record = dir.path().join("record.txt");
+        crate::testutil::write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\n{{ printf 'args: %s\\n' \"$*\"; printf 'GH_CONFIG_DIR: %s\\n' \"$GH_CONFIG_DIR\"; printf 'stdin: '; cat; printf '\\n'; }} > \"{}\"\n",
+                record.display()
+            ),
+        );
+        let config_dir = dir.path().join("gh-config");
+
+        gh_login(
+            stub.to_str().unwrap(),
+            &config_dir,
+            "github.com",
+            "ghp_secret",
+        )
+        .unwrap();
+
+        let body = std::fs::read_to_string(&record).unwrap();
+        assert!(
+            body.contains("args: auth login --hostname github.com --with-token --git-protocol https --insecure-storage"),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!("GH_CONFIG_DIR: {}", config_dir.display())),
+            "{body}"
+        );
+        assert!(body.contains("stdin: ghp_secret"), "{body}");
+    }
+
+    /// A failing `gh` names the exit code and its stderr, with the token
+    /// redacted so it never lands in a log line or a rendered page.
+    #[test]
+    fn gh_login_failure_carries_exit_code_and_redacts_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("gh-stub.sh");
+        crate::testutil::write_stub(
+            &stub,
+            "#!/bin/sh\ncat >/dev/null\necho 'error: bad credentials for ghp_secret' >&2\nexit 1\n",
+        );
+        let config_dir = dir.path().join("gh-config");
+
+        let err = gh_login(
+            stub.to_str().unwrap(),
+            &config_dir,
+            "github.com",
+            "ghp_secret",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exit 1"), "{err}");
+        assert!(!err.contains("ghp_secret"), "{err}");
+        assert!(err.contains("[REDACTED]"), "{err}");
+    }
+
+    /// A configured GitHub credential calls `gh_login` and reports the host in
+    /// `AuthStatus`; nothing configured still writes nothing (the existing
+    /// `nothing_configured_writes_nothing` case above).
+    #[tokio::test]
+    async fn materialize_with_github_credential_calls_gh_login() {
+        use age::secrecy::ExposeSecret;
+
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("key.txt");
+        let identity = age::x25519::Identity::generate();
+        std::fs::write(&key_path, identity.to_string().expose_secret()).unwrap();
+        std::env::set_var(crate::secrets::KEY_FILE_ENV, &key_path);
+
+        let paths = paths_in(tmp.path());
+        let pool = crate::db::test_pool().await;
+        let key = SecretsKey::load().unwrap();
+        let ciphertext = key.encrypt("ghp_secret").unwrap();
+        crate::state::secret_create(&pool, "auth-github-token", &ciphertext)
+            .await
+            .unwrap();
+
+        let stub = tmp.path().join("gh-stub.sh");
+        crate::testutil::write_stub(&stub, "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+
+        let cfg = AuthConfig {
+            github_host: Some("github.com".to_string()),
+            github_token_ref: Some("auth-github-token".to_string()),
+            ..Default::default()
+        };
+
+        let (status, _key) = materialize(
+            &pool,
+            &paths,
+            &cfg,
+            &tmp.path().join("fj-data"),
+            stub.to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.github_host.as_deref(), Some("github.com"));
+
+        std::env::remove_var(crate::secrets::KEY_FILE_ENV);
     }
 }

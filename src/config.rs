@@ -870,16 +870,18 @@ pub const ANTHROPIC_KEY_SECRET: &str = "auth-anthropic-api-key";
 pub const YOUTRACK_TOKEN_SECRET: &str = "auth-youtrack-token";
 /// See [`ANTHROPIC_KEY_SECRET`].
 pub const FORGEJO_TOKEN_SECRET: &str = "auth-forgejo-token";
+/// See [`ANTHROPIC_KEY_SECRET`].
+pub const GITHUB_TOKEN_SECRET: &str = "auth-github-token";
 
 /// The `config.auth` settings section: the daemon's own logins to Claude,
-/// YouTrack and Forgejo, entered on the Settings page.
+/// YouTrack, Forgejo and GitHub, entered on the Settings page.
 ///
 /// Only non-secret fields and secret NAMES live here. The tokens themselves go
 /// into the encrypted secrets store under the constants above, and
-/// [`crate::service_auth`] materializes them into the credential files the `yt`
-/// and `fj` CLIs read. An action's own `token_ref` still wins for its runs; this
-/// is the default the daemon's own provider calls use, which before had nothing
-/// but whatever the host operator had logged in.
+/// [`crate::service_auth`] materializes them into the credential files the `yt`,
+/// `fj` and `gh` CLIs read. An action's own `token_ref` still wins for its runs;
+/// this is the default the daemon's own provider calls use, which before had
+/// nothing but whatever the host operator had logged in.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
@@ -894,6 +896,10 @@ pub struct AuthConfig {
     pub forgejo_host: Option<String>,
     /// Secret name holding the Forgejo token.
     pub forgejo_token_ref: Option<String>,
+    /// GitHub host, e.g. `github.com` (no scheme).
+    pub github_host: Option<String>,
+    /// Secret name holding the GitHub token.
+    pub github_token_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1075,6 +1081,27 @@ mod tests {
         assert_eq!(out, "bar/x");
         let out = expand_path("~/x");
         assert!(out.starts_with('/'));
+    }
+
+    /// CLAUDE-307: a `config.auth` document stored before `github_host` /
+    /// `github_token_ref` existed must still deserialize, with both new fields
+    /// defaulting to `None`.
+    #[test]
+    fn auth_config_without_github_fields_still_deserializes() {
+        let json = serde_json::json!({
+            "anthropic_key_ref": "auth-anthropic-api-key",
+            "youtrack_base_url": "https://yt.example.com",
+            "youtrack_token_ref": "auth-youtrack-token",
+            "forgejo_host": "dev.example.com",
+            "forgejo_token_ref": "auth-forgejo-token",
+        });
+        let cfg: AuthConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            cfg.youtrack_base_url.as_deref(),
+            Some("https://yt.example.com")
+        );
+        assert!(cfg.github_host.is_none());
+        assert!(cfg.github_token_ref.is_none());
     }
 
     #[test]
