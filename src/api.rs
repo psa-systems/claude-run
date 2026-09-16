@@ -11,6 +11,7 @@
 //! | POST | `/actions/<name>/trigger` | queue an immediate run |
 //! | POST | `/actions/<name>/pause` | pause a single action |
 //! | POST | `/actions/<name>/resume` | resume a single action |
+//! | POST | `/actions/<name>/attempts/<key>/reset` | clear one key's attempt counter (CLAUDE-238) |
 //! | POST | `/actions/<name>/delete` | delete an action (file + index + control state) |
 //! | POST | `/runs/<id>/cancel` | cancel an in-flight run |
 //! | POST | `/pause` | global pause |
@@ -107,6 +108,7 @@ pub fn router(state: AppState) -> Router {
         .route("/actions/:name/trigger", post(trigger_action))
         .route("/actions/:name/pause", post(pause_action))
         .route("/actions/:name/resume", post(resume_action))
+        .route("/actions/:name/attempts/:key/reset", post(reset_attempts))
         .route("/actions/:name/delete", post(delete_action))
         .route("/runs/:id/cancel", post(cancel_run))
         .route("/pause", post(global_pause_handler))
@@ -395,6 +397,39 @@ async fn resume_action(
     Ok(Json(AckResponse {
         ok: true,
         message: format!("resumed `{name}`"),
+    }))
+}
+
+/// CLAUDE-238: clear one key's attempt counter so a job parked at the cap can
+/// be retried. 404s a key with no counter row rather than a silent no-op on a
+/// mistyped key, and records the reset at `warn` (naming the discarded count)
+/// so it is not an invisible mutation.
+async fn reset_attempts(
+    State(s): State<Arc<AppState>>,
+    AxumPath((name, key)): AxumPath<(String, String)>,
+) -> Result<Json<AckResponse>, AppError> {
+    let count = state::attempts_get(&s.pool, &name, &key).await?;
+    if count == 0 {
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("no attempt counter for `{name}`/`{key}`"),
+        });
+    }
+    state::attempts_clear(&s.pool, &name, &key).await?;
+    state::run_events_record(
+        &s.pool,
+        &name,
+        &state::now_iso(),
+        &[state::InputEvent {
+            level: "warn".into(),
+            context: Some(key.clone()),
+            message: format!("attempt counter reset for `{key}`: {count} attempt(s) discarded"),
+        }],
+    )
+    .await?;
+    Ok(Json(AckResponse {
+        ok: true,
+        message: format!("cleared {count} attempt(s) for `{name}`/`{key}`"),
     }))
 }
 
@@ -761,6 +796,47 @@ mod tests {
             .await
             .expect_err("malformed body must be rejected");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// CLAUDE-238: clearing a key with a live counter succeeds, records a
+    /// `warn` run event naming the discarded count, and a second reset of the
+    /// same key 404s since the row is already gone.
+    #[tokio::test]
+    async fn reset_attempts_clears_a_counter_and_404s_when_already_clear() {
+        let s = app_state().await;
+        state::attempts_increment(&s.pool, "act", "job-1")
+            .await
+            .unwrap();
+        state::attempts_increment(&s.pool, "act", "job-1")
+            .await
+            .unwrap();
+
+        let Json(ack) = reset_attempts(
+            State(s.clone()),
+            AxumPath(("act".to_string(), "job-1".to_string())),
+        )
+        .await
+        .expect("clears an existing counter");
+        assert!(ack.ok);
+        assert_eq!(
+            state::attempts_get(&s.pool, "act", "job-1").await.unwrap(),
+            0
+        );
+
+        let events = state::run_events_for_action(&s.pool, "act", 10)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.level == "warn" && e.message.contains("2 attempt(s) discarded")),
+            "{events:?}"
+        );
+
+        let err = reset_attempts(State(s), AxumPath(("act".to_string(), "job-1".to_string())))
+            .await
+            .expect_err("an already-clear counter 404s");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
     /// CLAUDE-101: an unknown section path 404s; a valid one round-trips JSON

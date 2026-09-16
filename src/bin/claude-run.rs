@@ -206,6 +206,10 @@ enum ActionCmd {
     /// (paused/counters/ledger). Run history is kept. Refuses with
     /// `exit::CONFLICT` when a run for the action is in flight.
     Delete { name: String },
+    /// Clear one key's attempt counter, so a job parked at the action's
+    /// per-key cap (`limits.max_attempts_per_key`) can be retried. Exits
+    /// `exit::CONFIG_ERROR` when the key has no counter row.
+    ResetAttempts { name: String, key: String },
 }
 
 #[derive(Subcommand)]
@@ -1098,6 +1102,52 @@ async fn action_cmd(
                 return Ok(exit::CONFIG_ERROR);
             }
             paint::success(&format!("deleted `{name}`"));
+        }
+        ActionCmd::ResetAttempts { name, key } => {
+            // CLAUDE-238: delegate to the daemon when it is up (so the reset's
+            // `run_events` row is journaled through the same pool the daemon
+            // itself writes through); otherwise clear directly against the DB,
+            // matching the pause / resume / delete split above.
+            if reachable {
+                let c = DaemonClient::new(&sock);
+                let (status, body) = c
+                    .post_status(&format!("/actions/{name}/attempts/{key}/reset"), None)
+                    .await?;
+                return match status {
+                    200 => {
+                        paint::success(&format!("cleared attempt counter for `{name}`/`{key}`"));
+                        Ok(exit::OK)
+                    }
+                    404 => {
+                        paint::error(&format!("no attempt counter for `{name}`/`{key}`"));
+                        Ok(exit::CONFIG_ERROR)
+                    }
+                    _ => {
+                        paint::error(&format!("daemon returned {status}: {body}"));
+                        Ok(exit::UNEXPECTED)
+                    }
+                };
+            }
+            let count = state::attempts_get(&pool, &name, &key).await?;
+            if count == 0 {
+                paint::error(&format!("no attempt counter for `{name}`/`{key}`"));
+                return Ok(exit::CONFIG_ERROR);
+            }
+            state::attempts_clear(&pool, &name, &key).await?;
+            state::run_events_record(
+                &pool,
+                &name,
+                &state::now_iso(),
+                &[state::InputEvent {
+                    level: "warn".into(),
+                    context: Some(key.clone()),
+                    message: format!(
+                        "attempt counter reset for `{key}`: {count} attempt(s) discarded"
+                    ),
+                }],
+            )
+            .await?;
+            paint::success(&format!("cleared {count} attempt(s) for `{name}`/`{key}`"));
         }
     }
     Ok(exit::OK)
