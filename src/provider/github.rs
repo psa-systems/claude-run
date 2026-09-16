@@ -283,12 +283,20 @@ impl GithubForge {
     /// the symbolic ref is unset (a shallow clone may not carry it).
     fn detect_base(&self, workdir: &Path) -> String {
         match self.git(workdir, &["rev-parse", "--abbrev-ref", "origin/HEAD"]) {
-            Ok(s) => s
-                .strip_prefix("origin/")
-                .map(str::to_string)
-                .filter(|b| !b.is_empty())
-                .unwrap_or_else(|| "main".to_string()),
-            Err(_) => "main".to_string(),
+            Ok(s) => match s.strip_prefix("origin/").filter(|b| !b.is_empty()) {
+                Some(b) => b.to_string(),
+                None => {
+                    tracing::warn!(
+                        origin_head = %s,
+                        "origin/HEAD resolved to an empty branch name; falling back to main"
+                    );
+                    "main".to_string()
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "could not resolve origin/HEAD; falling back to main");
+                "main".to_string()
+            }
         }
     }
 

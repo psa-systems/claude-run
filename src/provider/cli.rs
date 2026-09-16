@@ -4862,4 +4862,51 @@ mod tests {
             .expect_err("a missing path must not read as content");
         assert!(err.contains("check.yml"), "{err}");
     }
+
+    /// CLAUDE-311 regression (BUNYIP-726 shape): a resumed-PR clone pins the
+    /// feature branch, which `git clone --branch` turns into
+    /// `--single-branch`. Before CLAUDE-311's fix in `provider::shallow_clone`
+    /// that left no `origin/HEAD`, so `resolve_feature_branch`'s first command
+    /// failed outright. With the fix, the pinned clone still carries
+    /// `origin/HEAD`, and `resolve_feature_branch` finds the feature branch.
+    #[test]
+    fn resolve_feature_branch_succeeds_on_a_pinned_resume_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let git_in = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&origin, &["init", "-q", "-b", "main"]);
+        git_in(&origin, &["config", "user.name", "t"]);
+        git_in(&origin, &["config", "user.email", "t@t.example"]);
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-q", "-m", "init"]);
+        git_in(&origin, &["checkout", "-q", "-b", "feat"]);
+        std::fs::write(origin.join("g.txt"), "y").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-q", "-m", "feat commit"]);
+        // The origin repo's own checked-out branch is what a `file://` clone's
+        // remote HEAD follows; leave it back on `main`.
+        git_in(&origin, &["checkout", "-q", "main"]);
+
+        let url = format!("file://{}", origin.display());
+        let clone = tmp.path().join("clone");
+        crate::provider::shallow_clone(&url, Some("feat"), &clone, 50).unwrap();
+
+        let b = CliBackend::new(Arc::new(ProcessRunner::new()));
+        let branch = b.resolve_feature_branch(&clone).unwrap();
+        assert_eq!(branch, "feat");
+    }
 }
