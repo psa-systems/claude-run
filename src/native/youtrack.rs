@@ -1350,14 +1350,22 @@ async fn resolve_pr_resume(
             return Ok(None);
         }
     };
-    if open.iter().any(|p| p.number as i64 == rec.pr_number) {
+    if let Some(pr) = open.iter().find(|p| p.number as i64 == rec.pr_number) {
         info!(key = %job.key, pr = rec.pr_number, branch = %rec.head_branch, "CLAUDE-275: resuming the recorded open PR's branch");
-        return Ok(Some(PrResume {
-            branch: rec.head_branch.clone(),
-            pr_url: format!(
+        // CLAUDE-308: prefer the listed PR's own URL, which is correct for any
+        // backend (GitHub's `/pull/<n>` vs Forgejo's `/pulls/<n>`); the `format!`
+        // is only a fallback for a listing that carries no `html_url`.
+        let pr_url = if pr.html_url.is_empty() {
+            format!(
                 "{}/{}/pulls/{}",
                 job.repo_host, job.repo_path, rec.pr_number
-            ),
+            )
+        } else {
+            pr.html_url.clone()
+        };
+        return Ok(Some(PrResume {
+            branch: rec.head_branch.clone(),
+            pr_url,
         }));
     }
     // Confirmed no longer open. Whether it was merged or closed cannot be told
