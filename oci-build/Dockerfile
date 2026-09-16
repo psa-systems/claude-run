@@ -105,7 +105,8 @@ RUN nu --version \
     && git --version \
     && timeout --version \
     && setpriv --version \
-    && cargo --version
+    && cargo --version \
+    && catatonit -V
 
 # claude-run itself, from the builder stage above.
 COPY --from=builder /build/target/release/claude-run /usr/local/bin/claude-run
@@ -186,13 +187,17 @@ WORKDIR /home/claudebot
 COPY oci-build/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
+# catatonit is PID 1 so orphaned processes an agent session leaves behind are
+# reaped instead of accumulating as zombies for the life of the container
+# (CLAUDE-310); it execs entrypoint.sh as its only child and forwards signals.
+#
 # Foreground daemon (no --detach), and no unix-socket API. That socket is the
 # CLI's control plane on a host install; this image has no CLI operator (the web
 # UI and its /api routes are the whole interface), so binding it would only leave
 # an unauthenticated second copy of the control plane inside the container,
 # reachable by the agent the daemon spawns. Override the command to `serve` if a
 # deployment really does want it.
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/catatonit", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["serve", "--no-socket"]
 
 # Export stage: pull just the binary out, no runtime base.
