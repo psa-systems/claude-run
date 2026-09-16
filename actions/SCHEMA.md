@@ -211,7 +211,7 @@ native:
 | `forgejo.pr_strategy`   | `branch`                           | PR-creation strategy (CLAUDE-103). `branch`: resolve the feature branch by name (independent of the current `HEAD`; CLAUDE-166), push it as `git push --set-upstream origin <branch>:<branch>`, and open the PR over the API with an explicit `--head`, so the PR stays mergeable and updatable. `agit`: `fj pr create -aA`, a branchless PR whose head lives only at `refs/pull/<N>/head` and loses its merge button if it falls behind an up-to-date base. The selected strategy is authoritative (no silent cross-strategy fallback). Both strategies are gated by the same pre-dispatch ahead check (CLAUDE-212): PR creation is attempted only when exactly one local branch has commits ahead of the base, so a run that produced no commits fails loudly instead of opening an empty PR. |
 | `github.hosts`          | empty                              | Extra GitHub host(s) beyond `github.com` to treat as GitHub (e.g. GitHub Enterprise). Bare hosts.   |
 | `github.mcp_endpoint`   | `https://api.githubcopilot.com/mcp/` | Remote GitHub MCP endpoint used to open the PR (no local server to install).                      |
-| `github.token_ref`      | none                               | Name of an encrypted secret holding the GitHub PAT (CLAUDE-26). `None` uses host `gh` auth / `GH_TOKEN`. |
+| `github.token_ref`      | none                               | Name of an encrypted secret holding the GitHub PAT (CLAUDE-26). `None` falls back to the daemon's own GitHub service login (CLAUDE-307), resolved lazily via `gh auth token --hostname <host>`. |
 
 ##### Prompt placeholders (CLAUDE-125)
 
@@ -495,8 +495,10 @@ mode-`0600` credential files (a single-file `yt` config and a temp forgejo `keys
 `fj` children for that job only and scrubbing them when the job finishes. The GitHub PAT (`github.token_ref`) is
 injected as the `gh` child's `GH_TOKEN`, the MCP bearer, and the authenticated push URL for that job only; being an
 env-var / URL component it leaves no on-disk plaintext to scrub and is dropped with the job. The gather step and the forge preflight materialize their own short-lived stores; every such directory carries a process-wide unique suffix, so two overlapping polls of one action never share a path and one poll finishing can never scrub another's live credential files (CLAUDE-209). When no block sets
-`token_ref`, the CLIs fall back to host-configured credentials (`gh` host auth / `GH_TOKEN` for GitHub) exactly as the
-scripted action did.
+`token_ref`, `yt` and `fj` fall back to host-configured credentials exactly as the scripted action did; `github` falls
+back instead to the daemon's own GitHub service login (CLAUDE-307, Settings -> Auth), resolved lazily and cached
+per `GithubForge` via `gh auth token --hostname <host>` rather than a `GH_TOKEN` env var, so a job with no
+`github.token_ref` still clones, pushes and opens its PR authenticated as that login.
 
 #### `kind: closed-issue-summary`
 

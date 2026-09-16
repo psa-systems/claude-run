@@ -183,6 +183,8 @@ impl Daemon {
             }
         }
         crate::service_auth::export_yt_config_env(&self.paths);
+        crate::service_auth::export_gh_config_env(&self.paths);
+        let gh_binary = "gh";
         let auth_cfg = settings.auth_config().await;
         let anthropic_key: crate::service_auth::ApiKeyHandle = {
             let (status, key) = crate::service_auth::materialize(
@@ -190,12 +192,14 @@ impl Daemon {
                 &self.paths,
                 &auth_cfg,
                 &crate::service_auth::default_fj_data_home(),
+                gh_binary,
             )
             .await?;
             info!(
                 anthropic_key = status.anthropic_key,
                 youtrack = status.youtrack_base_url.as_deref().unwrap_or("<unset>"),
                 forgejo = status.forgejo_host.as_deref().unwrap_or("<unset>"),
+                github = status.github_host.as_deref().unwrap_or("<unset>"),
                 "service auth materialized"
             );
             Arc::new(std::sync::RwLock::new(key))
@@ -259,6 +263,7 @@ impl Daemon {
                 .claude_binary
                 .clone()
                 .unwrap_or_else(|| "claude".to_string()),
+            gh_binary: gh_binary.to_string(),
             agent_config_dir: Some(agent_config_dir.clone()),
             settings: settings.clone(),
             paths: self.paths.clone(),

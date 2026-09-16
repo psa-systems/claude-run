@@ -26,10 +26,10 @@
 
 <div class="card" style="margin-bottom: 16px;" id="section-auth">
   <h3>Service auth <span class="badge neutral">apply: live</span></h3>
-  <span class="dim">The daemon's own logins to Claude, YouTrack and Forgejo, used by
+  <span class="dim">The daemon's own logins to Claude, YouTrack, Forgejo and GitHub, used by
   the scheduler's own polling and by every action that does not carry its own
   <code>token_ref</code>. Values are written to the encrypted secrets store and to the
-  credential files the <code>yt</code> and <code>fj</code> CLIs read; they are never shown
+  credential files the <code>yt</code>, <code>fj</code> and <code>gh</code> CLIs read; they are never shown
   again here. Saving applies to the next invocation, with no restart.</span>
 
   {% if let Some(e) = auth.error %}
@@ -130,6 +130,23 @@
     <label for="auth-fj-token" style="margin-top: 8px;">Token</label>
     <input id="auth-fj-token" name="token" type="password" autocomplete="off" required>
     <button type="submit" style="margin-top: 8px;">Save Forgejo login</button>
+  </form>
+
+  <h4 style="margin: 20px 0 4px;">GitHub
+    {% if let Some(host) = auth.github_host %}<span class="badge ok">{{ host }}</span>
+    {% else %}<span class="badge neutral">not set</span>{% endif %}
+  </h4>
+  <span class="dim">Host (default github.com) and a personal access token. Equivalent to
+  <code>gh auth login --with-token</code>. A classic token needs <code>repo</code>,
+  <code>read:org</code> and <code>gist</code> (gh's own minimum at login); a fine-grained
+  token needs Contents and Pull requests read and write on the target repositories.</span>
+  <form method="post" action="/settings/auth/github" style="margin-top: 8px;">
+    <label for="auth-gh-host">Host</label>
+    <input id="auth-gh-host" name="host" type="text" placeholder="github.com"
+           {% if let Some(host) = auth.github_host %}value="{{ host }}"{% endif %}>
+    <label for="auth-gh-token" style="margin-top: 8px;">Token</label>
+    <input id="auth-gh-token" name="token" type="password" autocomplete="off" required>
+    <button type="submit" style="margin-top: 8px;">Save GitHub login</button>
   </form>
 </div>
 
