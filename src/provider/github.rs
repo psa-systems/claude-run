@@ -190,6 +190,9 @@ pub struct GithubForge {
     priority: Vec<BackendKind>,
     git: String,
     gh: String,
+    /// Lazy `gh auth token` fallback result, cached after the first lookup.
+    /// Only consulted when `token` is `None`.
+    resolved_token: std::sync::Mutex<Option<std::result::Result<String, String>>>,
 }
 
 impl GithubForge {
@@ -213,6 +216,7 @@ impl GithubForge {
             priority: GITHUB_PRIORITY.to_vec(),
             git: "git".to_string(),
             gh: "gh".to_string(),
+            resolved_token: std::sync::Mutex::new(None),
         }
     }
 
@@ -220,6 +224,44 @@ impl GithubForge {
     pub fn with_priority(mut self, priority: Vec<BackendKind>) -> Self {
         self.priority = priority;
         self
+    }
+
+    /// Resolve the token to authenticate as. Returns `self.token` directly
+    /// when set (never invoking `gh auth token`); otherwise falls back to the
+    /// daemon's own `gh` login for `host` via `gh auth token`, caching the
+    /// result (success or failure) after the first lookup.
+    fn effective_token(&self, host: &str) -> std::result::Result<String, String> {
+        if let Some(token) = &self.token {
+            return Ok(token.clone());
+        }
+        let mut cached = self.resolved_token.lock().unwrap();
+        if let Some(result) = cached.as_ref() {
+            return result.clone();
+        }
+        let result = self.gh_auth_token(host);
+        *cached = Some(result.clone());
+        result
+    }
+
+    /// Run `gh auth token --hostname <host>`, returning the trimmed token or a
+    /// formatted error naming the failure.
+    fn gh_auth_token(&self, host: &str) -> std::result::Result<String, String> {
+        let out = self
+            .runner
+            .run(&self.gh, &["auth", "token", "--hostname", host])
+            .map_err(|e| format!("gh auth token --hostname {host} failed: {e}"))?;
+        if !out.ok {
+            return Err(format!(
+                "gh auth token --hostname {host} exited {}: {}",
+                out.exit_code,
+                out.stderr.trim()
+            ));
+        }
+        let token = out.stdout.trim().to_string();
+        if token.is_empty() {
+            return Err(format!("gh auth token --hostname {host} returned no token"));
+        }
+        Ok(token)
     }
 
     /// Run `git args...` in `workdir`, returning trimmed stdout or a typed error.
@@ -250,19 +292,27 @@ impl GithubForge {
         }
     }
 
-    /// Push the working branch to the GitHub remote. With a token, push to an
-    /// authenticated HTTPS URL; without one, push to `origin` (host git auth).
+    /// Push the working branch to the GitHub remote. With a resolvable token
+    /// (the action's own, or the daemon's `gh` login), push to an
+    /// authenticated HTTPS URL; otherwise fall back to `origin` (host git
+    /// auth), warning with both misses named rather than failing silently.
     fn push(&self, workdir: &Path, host: &str, repo: &str, branch: &str) -> Result<()> {
         let refspec = format!("HEAD:{branch}");
-        let out = match &self.token {
-            Some(token) => {
+        let out = match self.effective_token(host) {
+            Ok(token) => {
                 let url = format!("https://x-access-token:{token}@{host}/{repo}.git");
                 self.runner
                     .run_in(workdir, &self.git, &["push", &url, &refspec])?
             }
-            None => self
-                .runner
-                .run_in(workdir, &self.git, &["push", "origin", &refspec])?,
+            Err(e) => {
+                tracing::warn!(
+                    host,
+                    repo,
+                    "no github.token_ref on the action and {e}; falling back to origin"
+                );
+                self.runner
+                    .run_in(workdir, &self.git, &["push", "origin", &refspec])?
+            }
         };
         if out.ok {
             Ok(())
@@ -404,10 +454,11 @@ impl Forge for GithubForge {
     }
 
     fn clone_url(&self, host: &str, repo: &str) -> Result<String> {
-        match &self.token {
-            Some(token) => Ok(format!("https://x-access-token:{token}@{host}/{repo}.git")),
-            None => Err(Error::Other(anyhow::anyhow!(
-                "no GitHub token configured to build an authenticated clone URL for {host}/{repo}"
+        match self.effective_token(host) {
+            Ok(token) => Ok(format!("https://x-access-token:{token}@{host}/{repo}.git")),
+            Err(e) => Err(Error::Other(anyhow::anyhow!(
+                "no github.token_ref on the action to build an authenticated clone URL for \
+                 {host}/{repo}, and {e}"
             ))),
         }
     }
@@ -831,8 +882,15 @@ mod tests {
 
     #[test]
     fn create_pr_prefers_mcp() {
-        // MCP reachable -> create_pull_request used; gh never invoked.
-        let runner = Arc::new(with_git(StubRunner::new(), "feat/x", "origin"));
+        // MCP reachable -> create_pull_request used; the PR itself never
+        // consults gh, though the push below falls back to the daemon's own
+        // `gh` login since no action token_ref is set.
+        let push_remote = "https://x-access-token:ghp_from_login@github.com/octo/widget.git";
+        let runner = Arc::new(with_git(StubRunner::new(), "feat/x", push_remote).ok(
+            "gh",
+            &["auth", "token", "--hostname", "github.com"],
+            "ghp_from_login\n",
+        ));
         let transport = Arc::new(StubTransport::new(
             true,
             json!({"structuredContent": {"number": 11, "html_url": "https://github.com/octo/widget/pull/11"}}),
@@ -857,13 +915,21 @@ mod tests {
             tcalls.iter().any(|c| c == "call:create_pull_request"),
             "{tcalls:?}"
         );
-        // The branch was pushed and gh was not consulted.
+        // The branch was pushed to the authenticated URL resolved through the
+        // daemon's own `gh` login, and PR creation never consulted `gh` itself.
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls.iter().any(|c| c == "git push origin HEAD:feat/x"),
+            calls
+                .iter()
+                .any(|c| *c == format!("git push {push_remote} HEAD:feat/x")),
             "{calls:?}"
         );
-        assert!(!calls.iter().any(|c| c.starts_with("gh ")), "{calls:?}");
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("gh ") && c != "gh auth token --hostname github.com"),
+            "{calls:?}"
+        );
     }
 
     #[test]
@@ -1121,6 +1187,36 @@ mod tests {
     }
 
     #[test]
+    fn clone_url_falls_back_to_gh_auth_token_when_no_token_ref() {
+        // No action token: `clone_url` resolves through `gh auth token`.
+        let runner = Arc::new(StubRunner::new().ok(
+            "gh",
+            &["auth", "token", "--hostname", "github.com"],
+            "ghp_from_login\n",
+        ));
+        let transport = Arc::new(StubTransport::new(true, json!({})));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        let url = forge.clone_url("github.com", "octo/widget").unwrap();
+        assert_eq!(
+            url,
+            "https://x-access-token:ghp_from_login@github.com/octo/widget.git"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("gh auth token"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn list_open_prs_errors_on_nonzero_exit() {
         let runner = Arc::new(StubRunner::new().fail(
             "gh",
@@ -1180,5 +1276,53 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("truncated"), "got {err}");
+    }
+
+    #[test]
+    fn clone_url_with_action_token_never_invokes_gh_auth_token() {
+        // A token_ref on the action is used directly; `gh auth token` must not run.
+        let runner = Arc::new(StubRunner::new());
+        let transport = Arc::new(StubTransport::new(true, json!({})));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_action".into()),
+        );
+        let url = forge.clone_url("github.com", "octo/widget").unwrap();
+        assert_eq!(
+            url,
+            "https://x-access-token:ghp_action@github.com/octo/widget.git"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("gh auth token")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn clone_url_reports_gh_auth_token_failure_when_no_token_ref() {
+        // No action token and `gh auth token` fails: the error names both misses.
+        let runner = Arc::new(StubRunner::new().fail(
+            "gh",
+            &["auth", "token", "--hostname", "github.com"],
+            1,
+            "no oauth token found",
+        ));
+        let transport = Arc::new(StubTransport::new(true, json!({})));
+        let forge = GithubForge::with_transport(
+            runner,
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        let err = forge
+            .clone_url("github.com", "octo/widget")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no github.token_ref"), "got {err}");
+        assert!(err.contains("gh auth token"), "got {err}");
+        assert!(err.contains("no oauth token found"), "got {err}");
     }
 }
