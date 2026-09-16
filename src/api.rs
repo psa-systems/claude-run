@@ -89,6 +89,9 @@ pub struct AppState {
     /// The `claude` binary the login broker spawns (mirrors the daemon's own
     /// `[daemon].claude_binary` override).
     pub claude_binary: String,
+    /// The `gh` binary the GitHub service-auth save runs `gh auth login`
+    /// through. Default `"gh"`; overridable in tests to point at a stub.
+    pub gh_binary: String,
     /// Where an interactive sign-in writes its credential: the agent's
     /// `CLAUDE_CONFIG_DIR`, so the agent picks the login up directly.
     pub agent_config_dir: Option<std::path::PathBuf>,
@@ -731,6 +734,7 @@ mod tests {
             claude_login: None,
             fj_data_home: std::path::PathBuf::from("/nonexistent/test-fj-data"),
             claude_binary: "claude".to_string(),
+            gh_binary: "gh".to_string(),
             agent_config_dir: None,
             settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
             paths: crate::config::Paths::resolve().unwrap(),
