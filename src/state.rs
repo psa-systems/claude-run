@@ -302,6 +302,22 @@ pub async fn attempts_increment(pool: &DbPool, action: &str, key: &str) -> Resul
     attempts_get(pool, action, key).await
 }
 
+/// CLAUDE-238: clear one (action, key) counter so a job parked at the cap can
+/// be retried under the same key. Returns whether a row was removed, so the
+/// caller (the API handler) can 404 an unknown counter instead of a silent
+/// no-op on a mistyped key.
+pub async fn attempts_clear(pool: &DbPool, action: &str, key: &str) -> Result<bool> {
+    let result = sqlx::query(&crate::db::q(
+        pool,
+        "DELETE FROM attempt_counters WHERE action_name = ? AND job_key = ?",
+    ))
+    .bind(action)
+    .bind(key)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn daily_count_get(pool: &DbPool, action: &str) -> Result<u32> {
     let today = today_local().to_string();
     let row: Option<(i64,)> = sqlx::query_as(&crate::db::q(
@@ -2026,6 +2042,24 @@ mod tests {
         assert!(action_index_delete(&pool, "act").await.unwrap());
         assert!(!action_index_delete(&pool, "act").await.unwrap());
         assert!(!action_index_delete(&pool, "ghost").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn attempts_clear_removes_one_key_and_reports_existence() {
+        let pool = mem_pool().await;
+        attempts_increment(&pool, "act", "job-1").await.unwrap();
+        attempts_increment(&pool, "act", "job-2").await.unwrap();
+
+        // Clearing a key that has no row is a reported no-op.
+        assert!(!attempts_clear(&pool, "act", "ghost").await.unwrap());
+
+        // Clearing the seeded key removes only that key's row.
+        assert!(attempts_clear(&pool, "act", "job-1").await.unwrap());
+        assert_eq!(attempts_get(&pool, "act", "job-1").await.unwrap(), 0);
+        assert_eq!(attempts_get(&pool, "act", "job-2").await.unwrap(), 1);
+
+        // Clearing it again is now a no-op.
+        assert!(!attempts_clear(&pool, "act", "job-1").await.unwrap());
     }
 
     #[tokio::test]
