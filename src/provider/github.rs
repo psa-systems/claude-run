@@ -532,12 +532,57 @@ impl Forge for GithubForge {
         Ok(out.stdout.trim().to_string())
     }
 
-    // The CI-fix-only operations are Forgejo-specific. A GitHub repo never enters
-    // the Forgejo-only CI-fix scan (auto-route-by-host), so these are unsupported
-    // on the GitHub backend; split the `Forge` trait later if a GitHub CI-fix
-    // handler is wanted.
-    fn list_open_prs(&self, _host: &str, _repo: &str) -> Result<Vec<ForgePullRequest>> {
-        Err(unsupported("list_open_prs"))
+    // The remaining CI-fix-only operations are Forgejo-specific; `list_open_prs`
+    // is the one exception (CLAUDE-308), needed by CLAUDE-275's PR-resume lookup
+    // for every backend. A GitHub repo never enters the Forgejo-only CI-fix scan
+    // (auto-route-by-host), so the rest are unsupported on the GitHub backend;
+    // split the `Forge` trait later if a GitHub CI-fix handler is wanted.
+    //
+    // CLAUDE-308: `gh pr list --json ...`, run with the action's PAT as
+    // `GH_TOKEN` exactly as `repo_access` does. `--limit 1000` bounds a single
+    // page; exactly 1000 entries back means the listing may be truncated, so
+    // that is reported as an error rather than answered from a partial list.
+    fn list_open_prs(&self, _host: &str, repo: &str) -> Result<Vec<ForgePullRequest>> {
+        const LIMIT: usize = 1000;
+        let envs: Vec<(&str, &str)> = match &self.token {
+            Some(t) => vec![("GH_TOKEN", t.as_str())],
+            None => Vec::new(),
+        };
+        let limit_str = LIMIT.to_string();
+        let args = [
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--limit",
+            &limit_str,
+            "--json",
+            "number,title,headRefOid,headRefName,baseRefName,author,url",
+        ];
+        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        if !out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: "pr list --json".to_string(),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        let entries: Vec<GhPrEntry> =
+            serde_json::from_str(&out.stdout).map_err(|source| Error::CliParse {
+                binary: self.gh.clone(),
+                context: "gh pr list --json".to_string(),
+                source,
+            })?;
+        if entries.len() == LIMIT {
+            return Err(Error::Other(anyhow::anyhow!(
+                "gh pr list for `{repo}` returned exactly the {LIMIT}-entry limit; the open-PR \
+                 listing may be truncated"
+            )));
+        }
+        Ok(entries.into_iter().map(GhPrEntry::into_forge_pr).collect())
     }
 
     fn pr_ci_state(&self, _host: &str, _repo: &str, _pr_number: u64) -> Result<String> {
@@ -679,6 +724,45 @@ fn parse_pr_from_gh(stdout: &str) -> PullRequest {
         url,
         // CLAUDE-275: filled in by the caller, which knows the branch it pushed.
         head_branch: None,
+    }
+}
+
+/// One entry of `gh pr list --json number,title,headRefOid,headRefName,baseRefName,author,url`.
+#[derive(Debug, serde::Deserialize)]
+struct GhPrEntry {
+    number: u64,
+    #[serde(default)]
+    title: String,
+    #[serde(default, rename = "headRefOid")]
+    head_ref_oid: String,
+    #[serde(default, rename = "headRefName")]
+    head_ref_name: String,
+    #[serde(default, rename = "baseRefName")]
+    base_ref_name: String,
+    #[serde(default)]
+    author: GhPrAuthor,
+    #[serde(default)]
+    url: String,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct GhPrAuthor {
+    #[serde(default)]
+    login: String,
+}
+
+impl GhPrEntry {
+    fn into_forge_pr(self) -> ForgePullRequest {
+        ForgePullRequest {
+            number: self.number,
+            title: self.title,
+            head_sha: self.head_ref_oid,
+            head_ref: self.head_ref_name,
+            base_ref: self.base_ref_name,
+            author: self.author.login,
+            html_url: self.url,
+            updated_at: String::new(),
+        }
     }
 }
 
@@ -1047,6 +1131,61 @@ mod tests {
         );
     }
 
+    /// CLAUDE-308: the args `list_open_prs` passes to `gh pr list`.
+    fn list_open_prs_args(repo: &str) -> Vec<&str> {
+        vec![
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--limit",
+            "1000",
+            "--json",
+            "number,title,headRefOid,headRefName,baseRefName,author,url",
+        ]
+    }
+
+    #[test]
+    fn list_open_prs_parses_gh_json_and_maps_every_field() {
+        let json = r#"[{"number":52,"title":"feat: x","headRefOid":"abc123","headRefName":"feat/x","baseRefName":"main","author":{"login":"octocat"},"url":"https://github.com/octo/widget/pull/52"}]"#;
+        let runner = Arc::new(StubRunner::new().ok("gh", &list_open_prs_args("octo/widget"), json));
+        let forge = GithubForge::new(
+            runner,
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        );
+        let prs = forge.list_open_prs("github.com", "octo/widget").unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 52);
+        assert_eq!(prs[0].title, "feat: x");
+        assert_eq!(prs[0].head_sha, "abc123");
+        assert_eq!(prs[0].head_ref, "feat/x");
+        assert_eq!(prs[0].base_ref, "main");
+        assert_eq!(prs[0].author, "octocat");
+        assert_eq!(prs[0].html_url, "https://github.com/octo/widget/pull/52");
+    }
+
+    #[test]
+    fn list_open_prs_passes_the_token_as_gh_token() {
+        let runner = Arc::new(StubRunner::new().ok("gh", &list_open_prs_args("octo/widget"), "[]"));
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        );
+        forge.list_open_prs("github.com", "octo/widget").unwrap();
+        let envs = runner.envs.lock().unwrap();
+        assert_eq!(envs.len(), 1);
+        let (bin, env) = &envs[0];
+        assert_eq!(bin, "gh");
+        assert_eq!(
+            *env,
+            vec![("GH_TOKEN".to_string(), "ghp_secret".to_string())]
+        );
+    }
+
     #[test]
     fn clone_url_falls_back_to_gh_auth_token_when_no_token_ref() {
         // No action token: `clone_url` resolves through `gh auth token`.
@@ -1075,6 +1214,68 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn list_open_prs_errors_on_nonzero_exit() {
+        let runner = Arc::new(StubRunner::new().fail(
+            "gh",
+            &list_open_prs_args("octo/widget"),
+            1,
+            "HTTP 404: Not Found",
+        ));
+        let forge = GithubForge::new(
+            runner,
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        );
+        let err = forge
+            .list_open_prs("github.com", "octo/widget")
+            .unwrap_err();
+        match err {
+            Error::CliFailed { exit_code, .. } => assert_eq!(exit_code, 1),
+            other => panic!("expected CliFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_open_prs_errors_on_unparseable_json() {
+        let runner =
+            Arc::new(StubRunner::new().ok("gh", &list_open_prs_args("octo/widget"), "not json"));
+        let forge = GithubForge::new(
+            runner,
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        );
+        let err = forge
+            .list_open_prs("github.com", "octo/widget")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gh pr list --json"), "got {err}");
+    }
+
+    #[test]
+    fn list_open_prs_errors_when_exactly_at_the_limit() {
+        let entries: Vec<String> = (0..1000)
+            .map(|i| {
+                format!(
+                    r#"{{"number":{i},"title":"","headRefOid":"","headRefName":"","baseRefName":"","author":{{"login":""}},"url":""}}"#
+                )
+            })
+            .collect();
+        let json = format!("[{}]", entries.join(","));
+        let runner =
+            Arc::new(StubRunner::new().ok("gh", &list_open_prs_args("octo/widget"), &json));
+        let forge = GithubForge::new(
+            runner,
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        );
+        let err = forge
+            .list_open_prs("github.com", "octo/widget")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("truncated"), "got {err}");
     }
 
     #[test]
