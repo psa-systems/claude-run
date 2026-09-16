@@ -2129,21 +2129,88 @@ fn merged_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
-/// CLAUDE-278: the PR's checks went green but the branch is behind its base,
-/// so it is not mergeable. The webhook success handler has no workdir to run
-/// `Forge::update_branch` from (unlike the old poll loop, which could), so it
-/// only comments and leaves the issue at Code Review for a human to update and
-/// re-merge (or push a new commit, which retriggers CI and a later success
-/// event).
-pub(crate) fn automerge_needs_update_comment(pr_url: &str) -> String {
+/// CLAUDE-309: the PR's checks went green but Forgejo reports it as not
+/// mergeable (a conflict, still being checked, or a WIP PR) - unrelated to
+/// whether it is behind its base, which is decided separately by
+/// `behind_base` before this comment is ever reached. Comments and leaves the
+/// issue at Code Review for a human to resolve.
+pub(crate) fn automerge_not_mergeable_comment(pr_url: &str) -> String {
     [
-        "This PR's checks passed, but its branch is behind its base so it cannot be automerged."
+        "This PR's checks passed, but Forgejo reports it as not mergeable (a conflict, still \
+         being checked, or a WIP PR)."
             .to_string(),
         String::new(),
         format!("PR: {pr_url}"),
         String::new(),
-        "Update the branch (or push a new commit) and it will be automerged on the next green run; AI Agent stays at Code Review."
+        "A human needs to resolve this; AI Agent stays at Code Review.".to_string(),
+    ]
+    .join("\n")
+}
+
+/// CLAUDE-309: the PR's checks went green and its branch is behind its base
+/// (`behind_base: true`). The runner updated it through Forgejo's Update-branch
+/// endpoint, which retriggers CI; a later `success` event re-evaluates and
+/// merges once that run goes green.
+pub(crate) fn automerge_branch_updated_comment(pr_url: &str) -> String {
+    [
+        "This PR's branch was behind its base; the runner updated it from the base branch."
             .to_string(),
+        String::new(),
+        format!("PR: {pr_url}"),
+        String::new(),
+        "It will be automerged on its next green CI run.".to_string(),
+    ]
+    .join("\n")
+}
+
+/// CLAUDE-309: the branch was behind its base, and updating it against the
+/// base failed (for example a 409 conflict). Left at Code Review for a human
+/// to resolve; `error` carries Forgejo's own reason when `fj` reports one.
+pub(crate) fn automerge_update_failed_comment(pr_url: &str, error: &str) -> String {
+    [
+        "This PR's branch is behind its base, and the runner could not update it.".to_string(),
+        String::new(),
+        format!("PR: {pr_url}"),
+        String::new(),
+        format!("Error: {error}"),
+        String::new(),
+        "A human needs to resolve this.".to_string(),
+    ]
+    .join("\n")
+}
+
+/// CLAUDE-309: `fj pr status` did not report `behind_base` at all, meaning the
+/// runtime's `fj` predates FJ-99. Automerge cannot tell whether the branch is
+/// up to date, so it takes no merge action and leaves the issue at Code
+/// Review for a human to check.
+pub(crate) fn automerge_behind_base_missing_comment(pr_url: &str) -> String {
+    [
+        "This PR's checks passed, but the runner could not tell whether its branch is behind \
+         its base."
+            .to_string(),
+        String::new(),
+        format!("PR: {pr_url}"),
+        String::new(),
+        "`fj pr status` did not report `behind_base`; the runtime's fj must include FJ-99. A \
+         human needs to check and merge this PR."
+            .to_string(),
+    ]
+    .join("\n")
+}
+
+/// CLAUDE-309: the merge itself was refused by Forgejo (for example a
+/// protected base blocking an outdated branch with a 405). Left at Code
+/// Review for a human to resolve; `error` carries Forgejo's own refusal
+/// reason when `fj` reports one (FJ-99).
+pub(crate) fn automerge_merge_failed_comment(pr_url: &str, error: &str) -> String {
+    [
+        "This PR's checks passed, but the runner could not merge it.".to_string(),
+        String::new(),
+        format!("PR: {pr_url}"),
+        String::new(),
+        format!("Error: {error}"),
+        String::new(),
+        "A human needs to resolve this.".to_string(),
     ]
     .join("\n")
 }
