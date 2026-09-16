@@ -6314,6 +6314,13 @@ mod tests {
             html.contains("AI Agent"),
             "banner must say what releases the job: {html}"
         );
+        // CLAUDE-238: each row carries a Reset control posting to the
+        // per-key reset endpoint.
+        assert!(
+            html.contains("/api/actions/youtrack/attempts/CLAUDE-9/reset"),
+            "reset control missing: {html}"
+        );
+        assert!(html.contains(">Reset<"), "reset button missing: {html}");
     }
 
     // ---- job-outcome filter, DB-backed (CLAUDE-230) -----------------------
