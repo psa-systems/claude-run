@@ -3619,58 +3619,165 @@ async fn handle_action_success_for_pr(
             .map_err(|e| format!("pr_status failed: {e}"))?;
 
     match status.state.trim() {
-        "success" if status.mergeable => {
-            let backend = mint.backend.clone();
-            let host_owned = host.to_string();
-            let repo_owned = repo.to_string();
-            let issue_key = row.issue_key.clone();
-            let pr_url_owned = pr_url.to_string();
-            tokio::task::spawn_blocking(move || {
-                crate::native::youtrack::complete_automerge(
-                    backend.as_ref(),
-                    backend.as_ref(),
-                    &youtrack_cfg,
-                    &issue_key,
-                    &host_owned,
-                    &repo_owned,
+        "success" => match status.behind_base {
+            // CLAUDE-309: `mergeable` alone cannot tell whether the branch is
+            // behind base (Forgejo's `mergeable` ignores that entirely), so an
+            // `fj` that does not report `behind_base` at all (predates FJ-99)
+            // takes no merge action rather than guessing.
+            None => {
+                let msg = format!(
+                    "PR #{pr_number}: fj pr status did not report behind_base; the runtime's fj must include FJ-99"
+                );
+                let body = crate::native::youtrack::automerge_behind_base_missing_comment(pr_url);
+                post_issue_comment(
+                    mint,
+                    &row.issue_key,
+                    body,
+                    repo,
                     pr_number,
-                    &pr_url_owned,
+                    "action-run success: behind_base-missing comment failed",
                 )
-            })
-            .await
-            .map_err(|e| format!("complete_automerge task panicked: {e}"))?
-            .map_err(|e| format!("complete_automerge failed: {e}"))?;
-            info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: merged PR and advanced issue to Done");
-            Ok(format!(
-                "merged PR #{pr_number}; issue {} advanced to Done",
-                row.issue_key
-            ))
-        }
-        "success" => {
-            let body = crate::native::youtrack::automerge_needs_update_comment(pr_url);
-            let backend = mint.backend.clone();
-            let issue_key = row.issue_key.clone();
-            let comment_result =
-                tokio::task::spawn_blocking(move || backend.comment(&issue_key, &body)).await;
-            match comment_result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(repo = %repo, pr = pr_number, error = %e, "action-run success: needs-update comment failed (continuing)");
-                }
-                Err(e) => {
-                    warn!(repo = %repo, pr = pr_number, error = %e, "action-run success: needs-update comment task panicked (continuing)");
+                .await;
+                warn!(repo = %repo, pr = pr_number, "action-run success: {msg}");
+                Err(msg)
+            }
+            Some(true) => {
+                let backend = mint.backend.clone();
+                let host_owned = host.to_string();
+                let repo_owned = repo.to_string();
+                let update_result = tokio::task::spawn_blocking(move || {
+                    backend.update_pr_branch(&host_owned, &repo_owned, pr_number)
+                })
+                .await
+                .map_err(|e| format!("update_pr_branch task panicked: {e}"))?;
+                match update_result {
+                    Ok(()) => {
+                        let body =
+                            crate::native::youtrack::automerge_branch_updated_comment(pr_url);
+                        post_issue_comment(
+                            mint,
+                            &row.issue_key,
+                            body,
+                            repo,
+                            pr_number,
+                            "action-run success: branch-updated comment failed",
+                        )
+                        .await;
+                        info!(repo = %repo, pr = pr_number, "action-run success: branch behind base; updated, left at Code Review");
+                        Ok(format!(
+                            "PR #{pr_number} branch updated from base; will automerge on next green run"
+                        ))
+                    }
+                    Err(e) => {
+                        let msg = format!("update_pr_branch failed: {e}");
+                        let body =
+                            crate::native::youtrack::automerge_update_failed_comment(pr_url, &msg);
+                        post_issue_comment(
+                            mint,
+                            &row.issue_key,
+                            body,
+                            repo,
+                            pr_number,
+                            "action-run success: update-failed comment failed",
+                        )
+                        .await;
+                        Err(msg)
+                    }
                 }
             }
-            info!(repo = %repo, pr = pr_number, "action-run success: green but not mergeable; commented, left at Code Review");
-            Ok(format!(
-                "PR #{pr_number} green but not mergeable; commented, left at Code Review"
-            ))
-        }
+            Some(false) if !status.mergeable => {
+                let body = crate::native::youtrack::automerge_not_mergeable_comment(pr_url);
+                post_issue_comment(
+                    mint,
+                    &row.issue_key,
+                    body,
+                    repo,
+                    pr_number,
+                    "action-run success: not-mergeable comment failed",
+                )
+                .await;
+                info!(repo = %repo, pr = pr_number, "action-run success: not mergeable; commented, left at Code Review");
+                Ok(format!(
+                    "PR #{pr_number} not mergeable; commented, left at Code Review"
+                ))
+            }
+            Some(false) => {
+                let backend = mint.backend.clone();
+                let host_owned = host.to_string();
+                let repo_owned = repo.to_string();
+                let issue_key = row.issue_key.clone();
+                let pr_url_owned = pr_url.to_string();
+                let merge_result = tokio::task::spawn_blocking(move || {
+                    crate::native::youtrack::complete_automerge(
+                        backend.as_ref(),
+                        backend.as_ref(),
+                        &youtrack_cfg,
+                        &issue_key,
+                        &host_owned,
+                        &repo_owned,
+                        pr_number,
+                        &pr_url_owned,
+                    )
+                })
+                .await
+                .map_err(|e| format!("complete_automerge task panicked: {e}"))?;
+                match merge_result {
+                    Ok(()) => {
+                        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: merged PR and advanced issue to Done");
+                        Ok(format!(
+                            "merged PR #{pr_number}; issue {} advanced to Done",
+                            row.issue_key
+                        ))
+                    }
+                    Err(e) => {
+                        let msg = format!("complete_automerge failed: {e}");
+                        let body =
+                            crate::native::youtrack::automerge_merge_failed_comment(pr_url, &msg);
+                        post_issue_comment(
+                            mint,
+                            &row.issue_key,
+                            body,
+                            repo,
+                            pr_number,
+                            "action-run success: merge-failed comment failed",
+                        )
+                        .await;
+                        Err(msg)
+                    }
+                }
+            }
+        },
         other => {
             info!(repo = %repo, pr = pr_number, state = %other, "action-run success: checks not successful; no action");
             Ok(format!(
                 "PR #{pr_number} checks not successful ({other}); no action"
             ))
+        }
+    }
+}
+
+/// Post a best-effort issue comment on a CLAUDE-309 automerge decision path. A
+/// failed comment (write error, or the blocking task itself panicking) logs at
+/// `error` naming the issue and the cause; it never replaces the caller's own
+/// `Result`, since the underlying decision (branch updated, merge refused, ...)
+/// is the outcome that matters even when the tracker write announcing it fails.
+async fn post_issue_comment(
+    mint: &MintContext,
+    issue_key: &str,
+    body: String,
+    repo: &str,
+    pr_number: u64,
+    context: &str,
+) {
+    let backend = mint.backend.clone();
+    let key = issue_key.to_string();
+    match tokio::task::spawn_blocking(move || backend.comment(&key, &body)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!(repo = %repo, pr = pr_number, issue = %issue_key, error = %e, "{context}");
+        }
+        Err(e) => {
+            error!(repo = %repo, pr = pr_number, issue = %issue_key, error = %e, "{context} (task panicked)");
         }
     }
 }
@@ -4154,6 +4261,10 @@ mod tests {
         /// tests. `None` (the default) errors, matching every pre-existing test
         /// that never reaches the automerge path.
         pr_status: StdMutex<Option<crate::provider::PrStatus>>,
+        /// CLAUDE-309: when set, `update_pr_branch` fails with this message.
+        update_pr_branch_error: StdMutex<Option<String>>,
+        /// CLAUDE-309: when set, `merge_pr` fails with this message.
+        merge_pr_error: StdMutex<Option<String>>,
     }
 
     impl StoreBackend {
@@ -4165,6 +4276,8 @@ mod tests {
                 open_prs: StdMutex::new(Vec::new()),
                 open_prs_error: StdMutex::new(None),
                 pr_status: StdMutex::new(None),
+                update_pr_branch_error: StdMutex::new(None),
+                merge_pr_error: StdMutex::new(None),
             }
         }
         fn with_legacy_match(self, key: &str) -> Self {
@@ -4179,11 +4292,31 @@ mod tests {
             *self.open_prs_error.lock().unwrap() = Some(message.to_string());
             self
         }
+        /// CLAUDE-309: `behind_base` defaults to `Some(false)` (not behind), so
+        /// every pre-existing call site keeps its original meaning without
+        /// having to name a value it never tested.
         fn with_pr_status(self, state: &str, mergeable: bool) -> Self {
+            self.with_pr_status_behind(state, mergeable, Some(false))
+        }
+        fn with_pr_status_behind(
+            self,
+            state: &str,
+            mergeable: bool,
+            behind_base: Option<bool>,
+        ) -> Self {
             *self.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
                 state: state.to_string(),
                 mergeable,
+                behind_base,
             });
+            self
+        }
+        fn with_update_pr_branch_error(self, message: &str) -> Self {
+            *self.update_pr_branch_error.lock().unwrap() = Some(message.to_string());
+            self
+        }
+        fn with_merge_pr_error(self, message: &str) -> Self {
+            *self.merge_pr_error.lock().unwrap() = Some(message.to_string());
             self
         }
         fn calls(&self) -> Vec<String> {
@@ -4338,6 +4471,24 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("merge_pr {pr_number}"));
+            if let Some(message) = self.merge_pr_error.lock().unwrap().clone() {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(message)));
+            }
+            Ok(())
+        }
+        fn update_pr_branch(
+            &self,
+            _host: &str,
+            _repo: &str,
+            pr_number: u64,
+        ) -> crate::error::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("update_pr_branch {pr_number}"));
+            if let Some(message) = self.update_pr_branch_error.lock().unwrap().clone() {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(message)));
+            }
             Ok(())
         }
     }
@@ -8004,6 +8155,7 @@ mod tests {
             *backend.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
                 state: "success".to_string(),
                 mergeable: true,
+                behind_base: Some(false),
             });
             let result2 = handle_action_success_for_pr(
                 &ctx,
@@ -8126,6 +8278,219 @@ mod tests {
                 !calls.iter().any(|c| c.starts_with("merge_pr")),
                 "{calls:?}"
             );
+            assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
+        }
+
+        #[tokio::test]
+        async fn behind_base_updates_branch_and_leaves_code_review() {
+            // CLAUDE-309: success and behind_base=true updates the branch
+            // instead of merging, comments, and does not touch State/AI Agent.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend =
+                Arc::new(StoreBackend::new().with_pr_status_behind("success", true, Some(true)));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("branch updated"), "{result}");
+            let calls = backend.calls();
+            assert!(calls.iter().any(|c| c == "update_pr_branch 7"), "{calls:?}");
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+            assert!(
+                calls.iter().any(|c| c.starts_with("comment MK-16")),
+                "{calls:?}"
+            );
+            assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
+        }
+
+        #[tokio::test]
+        async fn behind_base_update_failure_comments_error_and_fails_run() {
+            // CLAUDE-309: an update_pr_branch failure (e.g. a 409 conflict)
+            // comments the error and fails the run; State/AI Agent unchanged.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_pr_status_behind("success", true, Some(true))
+                    .with_update_pr_branch_error(
+                        "409 Conflict: unable to fast-forward: not up to date",
+                    ),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                result.contains("unable to fast-forward: not up to date"),
+                "{result}"
+            );
+            let calls = backend.calls();
+            assert!(calls.iter().any(|c| c == "update_pr_branch 7"), "{calls:?}");
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+            let comment = calls
+                .iter()
+                .find(|c| c.starts_with("comment MK-16"))
+                .unwrap_or_else(|| panic!("expected a comment, got {calls:?}"));
+            assert!(
+                comment.contains("unable to fast-forward: not up to date"),
+                "{comment}"
+            );
+            assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
+            assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
+        }
+
+        #[tokio::test]
+        async fn behind_base_null_comments_and_fails_run() {
+            // CLAUDE-309: `behind_base: null` (an `fj` predating FJ-99) takes no
+            // merge action, comments, and fails the run so the gap is visible.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend =
+                Arc::new(StoreBackend::new().with_pr_status_behind("success", true, None));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap_err();
+            assert!(result.contains("behind_base"), "{result}");
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|c| c.starts_with("update_pr_branch")),
+                "{calls:?}"
+            );
+            assert!(
+                calls.iter().any(|c| c.starts_with("comment MK-16")),
+                "{calls:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn merge_error_comments_error_and_fails_run() {
+            // CLAUDE-309: a merge failure (e.g. Forgejo's 405 refusal) comments
+            // the error and fails the run; State/AI Agent unchanged.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(
+                StoreBackend::new().with_pr_status("success", true).with_merge_pr_error(
+                    "405 Method Not Allowed: not allowed to merge [reason: The head branch is behind the base branch]",
+                ),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap_err();
+            assert!(result.contains("not allowed to merge"), "{result}");
+            let calls = backend.calls();
+            assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
+            let comment = calls
+                .iter()
+                .find(|c| c.starts_with("comment MK-16"))
+                .unwrap_or_else(|| panic!("expected a comment, got {calls:?}"));
+            assert!(comment.contains("not allowed to merge"), "{comment}");
             assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
             assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
         }
