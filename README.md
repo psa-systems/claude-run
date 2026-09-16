@@ -787,11 +787,14 @@ The **Auth** card at the top of `/settings` takes those credentials in the brows
 | Claude | interactive sign-in, or an API key | `claude auth login` / `ANTHROPIC_API_KEY` | the agent's own config dir / that env var on each child |
 | YouTrack | base URL, token | `yt auth login --base-url <url>` | single-file `yt` config at `<CLAUDE_RUN_CONFIG_DIR>/auth/youtrack.yml`, named by `YOUTRACK_CLI_CONFIG` |
 | Forgejo | host, token | `fj auth add-key` | `keys.json` in the daemon's XDG data dir, the same file `fj` writes |
+| GitHub | host (default `github.com`), token | `gh auth login --with-token` | `gh`'s own `hosts.yml` under `<CLAUDE_RUN_CONFIG_DIR>/auth/gh`, named by `GH_CONFIG_DIR` |
 
 Each value is encrypted into the secrets store under a fixed name (`auth-anthropic-api-key`, `auth-youtrack-token`,
-`auth-forgejo-token`); the `config.auth` settings document holds only the URL, the host, and those names, and the page
-never renders a stored value back. Saving applies to the next invocation with no restart: `YOUTRACK_CLI_CONFIG` is
-exported once at serve start and points at a fixed path whose contents the save rewrites.
+`auth-forgejo-token`, `auth-github-token`); the `config.auth` settings document holds only the URL, the host, and those
+names, and the page never renders a stored value back. Saving applies to the next invocation with no restart:
+`YOUTRACK_CLI_CONFIG` and `GH_CONFIG_DIR` are exported once at serve start and point at fixed paths whose contents the
+save rewrites, so every `yt`, `fj` and `gh` child (the runner's own calls, and every `claude` session it spawns) picks
+up a saved login with no restart.
 
 **Signing in to Claude from the page.** `claude auth login` is an OAuth flow, but its redirect is a paste-the-code
 callback rather than a `localhost` listener, and with pipes on stdin/stdout it prints the authorize URL and then reads
@@ -1406,7 +1409,7 @@ the host, and logins still happen inside the container.
 
 **Web bind and first-run setup.** The image seeds a bootstrap `config.toml` (from `deploy/container-config.toml`) that binds `0.0.0.0:7321`, because a loopback bind inside a container is reachable from nothing outside it, published port or reverse proxy included. A non-loopback bind requires auth, and that credential is created in the browser: open the URL and the daemon serves `/setup`, which takes a username and a password and creates the administrator. No token, no key file, no CLI. The seeded `config.toml` is copied only when the config volume has none, so operator edits survive restarts and image upgrades. See "Web UI / API auth" for what setup is and is not (it is trust-on-first-use; bring the instance up behind the proxy).
 
-**First-run logins.** Everything is in the browser: after creating the administrator, open **Settings -> Auth**, press **Sign in with Anthropic** (or store an API key), and enter the YouTrack base URL plus token and the Forgejo host plus token. No restart, and no CLI. Until the Claude credential exists the scheduler runs nothing and says so on the dashboard. The `exec` route below remains for operators who would rather the CLIs own their own config. The daemon comes up before any login exists (a missing Claude credential is a `warn`, not a startup failure), so the container is there to exec into:
+**First-run logins.** Everything is in the browser: after creating the administrator, open **Settings -> Auth**, press **Sign in with Anthropic** (or store an API key), and enter the YouTrack base URL plus token, the Forgejo host plus token, and the GitHub host plus token. No restart, and no CLI. Until the Claude credential exists the scheduler runs nothing and says so on the dashboard. The `exec` route below remains for operators who would rather the CLIs own their own config. The daemon comes up before any login exists (a missing Claude credential is a `warn`, not a startup failure), so the container is there to exec into:
 
 ```nu
 docker compose up --detach
@@ -1415,13 +1418,14 @@ docker compose up --detach
 docker compose exec --user claudebot claude-bot claude auth login
 docker compose exec --user claudebot claude-bot yt auth login --base-url https://yt.example.com
 docker compose exec --user claudebot claude-bot fj auth add-key
+docker compose exec --user claudebot claude-bot gh auth login
 docker compose exec --user claudebot claude-bot git config --global user.name "claude-bot"
 docker compose exec --user claudebot claude-bot git config --global user.email "claude-bot@example.com"
 
 docker compose restart
 ```
 
-`claude auth login` needs the interactive TTY that `docker compose exec` provides; `claude setup-token` is the long-lived-token alternative. Verify with `claude auth status`, `yt auth list`, and `fj auth list` through the same `exec --user claudebot` form.
+`claude auth login` needs the interactive TTY that `docker compose exec` provides; `claude setup-token` is the long-lived-token alternative. Verify with `claude auth status`, `yt auth list`, `fj auth list` and `gh auth status` through the same `exec --user claudebot` form.
 
 To use an API key instead of an interactive Claude login, set `ANTHROPIC_API_KEY` in the service `environment:` and skip `claude auth login`. Nothing else changes: since CLAUDE-247 the daemon no longer requires a credentials file to start.
 

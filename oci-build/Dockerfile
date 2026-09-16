@@ -72,7 +72,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Runtime stage (CLAUDE-37, rebased onto opensuse-dev in CLAUDE-287): the daemon
 # plus its full runtime toolchain in one image. The base carries the whole
-# toolchain already (nu, claude, yt, fj, just, kingfisher, docker, git,
+# toolchain already (nu, claude, yt, fj, gh, just, kingfisher, docker, git,
 # coreutils, cargo/rustc), so this stage only creates the runtime user, copies
 # the binary and shipped config, and smoke-checks the tools it did not install.
 # Moving a tool means bumping the base image tag, not editing a RUN block here.
@@ -96,6 +96,7 @@ RUN nu --version \
     && claude --version \
     && yt --version \
     && fj version \
+    && gh --version \
     && just --version \
     && kingfisher --version \
     && docker --version \
