@@ -1497,11 +1497,16 @@ impl Forge for CliBackend {
             // than racing a premature merge.
             #[serde(default)]
             mergeable: bool,
+            // Absent (an `fj` predating FJ-99) or explicit `null` both parse to
+            // `None`: unknown, never collapsed to `false` (CLAUDE-309).
+            #[serde(default)]
+            behind_base: Option<bool>,
         }
         let status: Status = Self::parse_json(&self.fj, "fj pr status --json", &stdout)?;
         Ok(super::PrStatus {
             state: status.state,
             mergeable: status.mergeable,
+            behind_base: status.behind_base,
         })
     }
 
@@ -1524,32 +1529,16 @@ impl Forge for CliBackend {
         Ok(())
     }
 
-    fn update_branch(&self, workdir: &Path) -> Result<()> {
-        // CLAUDE-126: `fj` exposes no `pr update-branch` subcommand, so perform
-        // the Forgejo "Update Branch" with the git CLI (the same binary that
-        // cloned and pushed the branch) instead of the REST API: refresh the
-        // remote, merge the base branch into the PR head, and push. The push
-        // retriggers CI, which the caller then re-polls.
-        let fetch = ["fetch", "origin"];
-        let out = self.runner.run_in_env(Some(workdir), "git", &fetch, &[])?;
-        Self::checked("git", out, &fetch)?;
-
-        // The base branch is whatever `origin/HEAD` points at, e.g. `origin/main`.
-        let base_args = ["rev-parse", "--abbrev-ref", "origin/HEAD"];
+    fn update_pr_branch(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
+        // CLAUDE-309 (FJ-99): Forgejo's Update-branch endpoint. `--style merge`
+        // matches CLAUDE-126's merge-commit policy and never rewrites the
+        // agent's branch.
+        let id = format!("{repo}#{pr_number}");
+        let args = ["--host", host, "pr", "update", &id, "--style", "merge"];
         let out = self
             .runner
-            .run_in_env(Some(workdir), "git", &base_args, &[])?;
-        let base = Self::checked("git", out, &base_args)?.trim().to_string();
-
-        let merge_args = ["merge", "--no-edit", base.as_str()];
-        let out = self
-            .runner
-            .run_in_env(Some(workdir), "git", &merge_args, &[])?;
-        Self::checked("git", out, &merge_args)?;
-
-        let push = ["push", "origin", "HEAD"];
-        let out = self.runner.run_in_env(Some(workdir), "git", &push, &[])?;
-        Self::checked("git", out, &push)?;
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        Self::checked(&self.fj, out, &args)?;
         Ok(())
     }
 
@@ -3679,7 +3668,7 @@ mod tests {
     fn pr_status_extracts_state_and_mergeable() {
         // CLAUDE-126: pr_status surfaces both the combined CI state and the
         // mergeability verdict from the same `fj pr status --json`.
-        let json = r#"{"pr":52,"head_sha":"abc","state":"success","statuses":[],"mergeable":true,"merged":false}"#;
+        let json = r#"{"pr":52,"head_sha":"abc","state":"success","statuses":[],"mergeable":true,"merged":false,"behind_base":true}"#;
         let b = backend(StubRunner::new().ok(
             "fj",
             &[
@@ -3697,6 +3686,75 @@ mod tests {
             .unwrap();
         assert_eq!(st.state, "success");
         assert!(st.mergeable);
+        assert_eq!(st.behind_base, Some(true));
+    }
+
+    #[test]
+    fn pr_status_behind_base_false_when_forge_reports_up_to_date() {
+        // CLAUDE-309: `behind_base: false` parses to `Some(false)`.
+        let json = r#"{"pr":52,"head_sha":"abc","state":"success","statuses":[],"mergeable":true,"merged":false,"behind_base":false}"#;
+        let b = backend(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "status",
+                "contoso/claude-run#52",
+                "--json",
+            ],
+            json,
+        ));
+        let st = b
+            .pr_status("dev.a8n.run", "contoso/claude-run", 52)
+            .unwrap();
+        assert_eq!(st.behind_base, Some(false));
+    }
+
+    #[test]
+    fn pr_status_behind_base_null_parses_to_none() {
+        // CLAUDE-309: an explicit `null` (Forgejo has not computed merge_base
+        // yet, or the PR is merged) must never collapse to `false`.
+        let json = r#"{"pr":52,"head_sha":"abc","state":"success","statuses":[],"mergeable":true,"merged":false,"behind_base":null}"#;
+        let b = backend(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "status",
+                "contoso/claude-run#52",
+                "--json",
+            ],
+            json,
+        ));
+        let st = b
+            .pr_status("dev.a8n.run", "contoso/claude-run", 52)
+            .unwrap();
+        assert_eq!(st.behind_base, None);
+    }
+
+    #[test]
+    fn pr_status_behind_base_absent_parses_to_none() {
+        // CLAUDE-309: an `fj` predating FJ-99 omits the field entirely, which
+        // must also read as unknown rather than `false`.
+        let json = r#"{"pr":52,"head_sha":"abc","state":"success","statuses":[],"mergeable":true,"merged":false}"#;
+        let b = backend(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "status",
+                "contoso/claude-run#52",
+                "--json",
+            ],
+            json,
+        ));
+        let st = b
+            .pr_status("dev.a8n.run", "contoso/claude-run", 52)
+            .unwrap();
+        assert_eq!(st.behind_base, None);
     }
 
     #[test]
@@ -3731,29 +3789,31 @@ mod tests {
     }
 
     #[test]
-    fn update_branch_merges_base_into_head_and_pushes() {
-        // CLAUDE-126: the git-based "Update Branch" fetches, resolves the base
-        // from origin/HEAD, merges it into the PR head, and pushes.
-        let runner = std::sync::Arc::new(
-            StubRunner::new()
-                .ok("git", &["fetch", "origin"], "")
-                .ok(
-                    "git",
-                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
-                    "origin/main\n",
-                )
-                .ok("git", &["merge", "--no-edit", "origin/main"], "")
-                .ok("git", &["push", "origin", "HEAD"], ""),
-        );
+    fn update_pr_branch_invokes_fj_update_with_merge_style() {
+        // CLAUDE-309 (FJ-99): Forgejo's Update-branch endpoint, addressed as
+        // owner/repo#n, always with `--style merge` (never rebase, matching
+        // CLAUDE-126's merge-commit policy).
+        let runner = std::sync::Arc::new(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "update",
+                "contoso/claude-run#52",
+                "--style",
+                "merge",
+            ],
+            "",
+        ));
         let b = CliBackend::new(runner.clone());
-        b.update_branch(Path::new("/tmp/wd")).unwrap();
+        b.update_pr_branch("dev.a8n.run", "contoso/claude-run", 52)
+            .unwrap();
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls.iter().any(|c| c == "git merge --no-edit origin/main"),
-            "{calls:?}"
-        );
-        assert!(
-            calls.iter().any(|c| c == "git push origin HEAD"),
+            calls.iter().any(|c| {
+                c == "fj --host dev.a8n.run pr update contoso/claude-run#52 --style merge"
+            }),
             "{calls:?}"
         );
     }

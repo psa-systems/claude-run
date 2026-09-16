@@ -88,14 +88,24 @@ flowchart TD
         AM2 -- no --> AN1
         AM2 -- yes --> AM3{"that PR's action: automerge.enabled?"}
         AM3 -- no --> AN1
-        AM3 -- yes --> AM4["fj pr status"]
-        AM4 -- "success, mergeable" --> AM5["merge_pr; State=state_done; comment; AI Agent=done"]
-        AM4 -- "success, not mergeable" --> AM6["comment: needs branch update; leave at Code Review"]
-        AM4 -- "pending / failure" --> AN1
+        AM3 -- yes --> AM4["fj pr status --json (behind_base)"]
+        AM4 -- "success, behind_base missing" --> AM6b["comment: fj must include FJ-99; fail run"]
+        AM4 -- "success, behind_base=true" --> AM7{"update_pr_branch (fj pr update --style merge)"}
+        AM7 -- ok --> AM7a["comment: branch updated; leave at Code Review"]
+        AM7 -- error --> AM7b["comment: update failed; fail run"]
+        AM4 -- "success, behind_base=false, not mergeable" --> AM6["comment: not mergeable; leave at Code Review"]
+        AM4 -- "success, behind_base=false, mergeable" --> AM5{"merge_pr"}
+        AM5 -- ok --> AM5a["State=state_done; comment; AI Agent=done"]
+        AM5 -- error --> AM5b["comment: merge failed; fail run"]
+        AM4 -- "not success" --> AN1
     end
 
-    AM5 --> YT
+    AM5a --> YT
+    AM5b --> YT
     AM6 --> YT
+    AM6b --> YT
+    AM7a --> YT
+    AM7b --> YT
 
     subgraph SC ["scheduled actions, independent of each other"]
         YT -- "AI Agent: Queued" --> Y1["youtrack: fix the code"]:::claude
