@@ -129,6 +129,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/settings/auth/claude/banner", get(auth_claude_banner))
         .route("/settings/auth/youtrack", post(auth_save_youtrack))
         .route("/settings/auth/forgejo", post(auth_save_forgejo))
+        .route("/settings/auth/github", post(auth_save_github))
         .route("/settings/:section", post(settings_save))
         // CLAUDE-117: historical reporting page (spend / runs / time-of-day /
         // day-of-week). Global by default; `action` + `range` query params narrow
@@ -3779,6 +3780,7 @@ struct AuthCardView {
     anthropic_key: bool,
     youtrack_base_url: Option<String>,
     forgejo_host: Option<String>,
+    github_host: Option<String>,
     error: Option<String>,
     /// Whether a Claude credential exists at all (an OAuth login in the agent
     /// config dir, a stored API key, or the env). This is what gates the
@@ -4130,6 +4132,11 @@ async fn render_settings_full(
                 .is_some()
                 .then_some(auth_cfg.forgejo_host)
                 .flatten(),
+            github_host: auth_cfg
+                .github_token_ref
+                .is_some()
+                .then_some(auth_cfg.github_host)
+                .flatten(),
             error: auth_error,
         },
     };
@@ -4201,6 +4208,12 @@ struct AuthForgejoForm {
     token: String,
 }
 
+#[derive(Deserialize)]
+struct AuthGithubForm {
+    host: String,
+    token: String,
+}
+
 /// Store `value` under `name`, creating or rotating as needed. The caller has
 /// already checked the value is non-empty.
 async fn put_secret(s: &WebState, name: &str, value: &str) -> std::result::Result<(), String> {
@@ -4237,10 +4250,15 @@ async fn save_auth_config(
             crate::settings::SaveError::Invalid(m) => m,
             crate::settings::SaveError::Db(e) => e.to_string(),
         })?;
-    let (_, api_key) =
-        crate::service_auth::materialize(&s.api.pool, &s.api.paths, cfg, &s.api.fj_data_home)
-            .await
-            .map_err(|e| e.to_string())?;
+    let (_, api_key) = crate::service_auth::materialize(
+        &s.api.pool,
+        &s.api.paths,
+        cfg,
+        &s.api.fj_data_home,
+        &s.api.gh_binary,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if let Some(handle) = &s.api.anthropic_key {
         match handle.write() {
             Ok(mut slot) => *slot = api_key,
@@ -4366,6 +4384,65 @@ async fn auth_save_forgejo(
             .await;
     }
     Ok(Redirect::to("/settings?saved=Forgejo+auth").into_response())
+}
+
+/// POST `/settings/auth/github`: `gh auth login` runs BEFORE anything is
+/// stored, so a bad token shows on the page instead of failing at the first
+/// job. A blank host defaults to `github.com`; a pasted scheme is stripped the
+/// same way the Forgejo host is.
+async fn auth_save_github(
+    State(s): State<WebState>,
+    Form(form): Form<AuthGithubForm>,
+) -> Result<Response, WebError> {
+    let trimmed = form
+        .host
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    let host = if trimmed.is_empty() {
+        "github.com".to_string()
+    } else {
+        trimmed
+    };
+    let token = form.token.trim().to_string();
+    if token.is_empty() {
+        return render_settings_with(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            None,
+            Some("a GitHub token is required".to_string()),
+        )
+        .await;
+    }
+    let config_dir = crate::service_auth::gh_config_dir(&s.api.paths);
+    if let Err(e) = crate::blocking::in_place(|| {
+        crate::service_auth::gh_login(&s.api.gh_binary, &config_dir, &host, &token)
+    }) {
+        return render_settings_with(
+            &s,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+            None,
+            Some(e.to_string()),
+        )
+        .await;
+    }
+    let name = crate::config::GITHUB_TOKEN_SECRET;
+    if let Err(e) = put_secret(&s, name, &token).await {
+        return render_settings_with(&s, StatusCode::UNPROCESSABLE_ENTITY, None, None, Some(e))
+            .await;
+    }
+    let mut cfg = s.api.settings.auth_config().await;
+    cfg.github_host = Some(host);
+    cfg.github_token_ref = Some(name.to_string());
+    if let Err(e) = save_auth_config(&s, &cfg).await {
+        return render_settings_with(&s, StatusCode::UNPROCESSABLE_ENTITY, None, None, Some(e))
+            .await;
+    }
+    Ok(Redirect::to("/settings?saved=GitHub+auth").into_response())
 }
 
 #[derive(Deserialize)]
@@ -6408,6 +6485,7 @@ mod tests {
                 claude_login: None,
                 fj_data_home: tmp.join("fj-data"),
                 claude_binary: "claude".to_string(),
+                gh_binary: "gh".to_string(),
                 agent_config_dir: None,
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
                 // Tmp, not `Paths::resolve()`: handlers that write credential
@@ -9598,8 +9676,8 @@ mod tests {
     /// instead of a CLI (the container has no CLI operator).
     mod service_auth_ui {
         use super::super::{
-            auth_save_forgejo, auth_save_youtrack, settings_page, AuthForgejoForm,
-            AuthYoutrackForm, SettingsQuery,
+            auth_save_forgejo, auth_save_github, auth_save_youtrack, settings_page,
+            AuthForgejoForm, AuthGithubForm, AuthYoutrackForm, SettingsQuery,
         };
         use super::secrets_ui::{body_string, web_state};
         use age::secrecy::ExposeSecret;
@@ -9764,6 +9842,103 @@ mod tests {
 
             std::env::remove_var(crate::secrets::KEY_FILE_ENV);
         }
+
+        /// `gh auth login` runs before anything is stored: a working stub
+        /// records the host and secret name exactly like the Forgejo/YouTrack
+        /// logins above.
+        #[tokio::test]
+        async fn github_login_is_stored_and_materialized() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            use_temp_key(tmp.path());
+            let mut s = web_state(tmp.path()).await;
+            let stub = tmp.path().join("gh-stub.sh");
+            crate::testutil::write_stub(&stub, "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+            s.api = std::sync::Arc::new(crate::api::AppState {
+                gh_binary: stub.to_str().unwrap().to_string(),
+                ..(*s.api).clone()
+            });
+
+            let resp = auth_save_github(
+                State(s.clone()),
+                Form(AuthGithubForm {
+                    host: "https://github.com/".into(),
+                    token: "ghp_secret".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+            let cfg = s.api.settings.auth_config().await;
+            assert_eq!(
+                cfg.github_host.as_deref(),
+                Some("github.com"),
+                "the pasted scheme is stripped"
+            );
+            assert_eq!(
+                cfg.github_token_ref.as_deref(),
+                Some(crate::config::GITHUB_TOKEN_SECRET)
+            );
+
+            let page = body_string(
+                settings_page(State(s.clone()), Query(SettingsQuery { saved: None }))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(page.contains("github.com"));
+            assert!(!page.contains("ghp_secret"), "the token is write-only");
+
+            std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+        }
+
+        /// A failing `gh auth login` shows gh's redacted message on the page and
+        /// stores no secret and no `config.auth` change, so a bad token never
+        /// looks configured.
+        #[tokio::test]
+        async fn github_login_failure_is_refused_and_stores_nothing() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            use_temp_key(tmp.path());
+            let mut s = web_state(tmp.path()).await;
+            let stub = tmp.path().join("gh-stub.sh");
+            crate::testutil::write_stub(
+                &stub,
+                "#!/bin/sh\ncat >/dev/null\necho 'error: bad credentials for ghp_secret' >&2\nexit 1\n",
+            );
+            s.api = std::sync::Arc::new(crate::api::AppState {
+                gh_binary: stub.to_str().unwrap().to_string(),
+                ..(*s.api).clone()
+            });
+
+            let resp = auth_save_github(
+                State(s.clone()),
+                Form(AuthGithubForm {
+                    host: "github.com".into(),
+                    token: "ghp_secret".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let html = body_string(resp).await;
+            assert!(html.contains("exit 1"), "{html}");
+            assert!(!html.contains("ghp_secret"), "{html}");
+
+            assert!(s
+                .api
+                .settings
+                .auth_config()
+                .await
+                .github_token_ref
+                .is_none());
+
+            std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+        }
     }
 
     mod secrets_ui {
@@ -9795,6 +9970,7 @@ mod tests {
                 claude_login: None,
                 fj_data_home: tmp.join("fj-data"),
                 claude_binary: "claude".to_string(),
+                gh_binary: "gh".to_string(),
                 agent_config_dir: None,
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
                 // Tmp, not `Paths::resolve()`: handlers that write credential
@@ -10048,6 +10224,7 @@ mod tests {
                 claude_login: None,
                 fj_data_home: std::path::PathBuf::from("/nonexistent/test-fj-data"),
                 claude_binary: "claude".to_string(),
+                gh_binary: "gh".to_string(),
                 agent_config_dir: None,
                 settings: Arc::new(crate::settings::LiveSettings::detached(pool)),
                 paths: Paths::resolve().unwrap(),
