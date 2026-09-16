@@ -1082,15 +1082,23 @@ on `POST /webhooks/forgejo/<source>` - the same endpoint the CI-failure listener
    `open` there, is left alone.
 3. Loads that PR's own action from disk to check `automerge.enabled`; if it is not (or the action no longer exists),
    nothing happens.
-4. Reads the PR's combined CI status (`fj pr status`):
-   - **Success and mergeable:** merges it as a merge-commit, sets State to `state_done` and AI Agent to `done`, and
-     posts a "runner merged" comment - the same sequence the old poll loop made on green.
-   - **Success but not mergeable** (the branch is behind its base): comments that the branch needs updating and leaves
-     the issue at Code Review. Unlike the old poll loop, the webhook handler has no workdir to run `Forge::update_branch`
-     from, so it does not attempt one; updating the branch (or pushing a new commit) retriggers CI, and the next
-     `success` event tries again.
-   - **Anything else** (other checks still pending, or a failure): no action. There is no budget to exhaust and nothing
-     to time out - a later `success` event on the same PR is what retries, for as long as CI takes.
+4. Reads the PR's combined CI status (`fj pr status --json`, CLAUDE-309: including its `behind_base` field), and
+   dispatches on `behind_base` first, because Forgejo's `mergeable` never reflects whether the branch is behind its
+   base - the two are unrelated:
+   - **`behind_base` missing** (an `fj` predating FJ-99): takes no merge action, comments that the runtime's `fj` needs
+     upgrading, and fails the run so the gap is visible rather than silently never automerging.
+   - **`behind_base: true`:** runs `fj pr update <repo>#<n> --style merge` (`Forge::update_pr_branch`, CLAUDE-309) to
+     merge the base into the branch, instead of racing into Forgejo's 405 refusal to merge a behind-base PR. A
+     successful update comments that the branch was updated and leaves the issue at Code Review; updating a branch
+     retriggers CI, and the next `success` event tries again. A failed update (e.g. a real conflict) comments the
+     failure and fails the run.
+   - **`behind_base: false` and not mergeable** (a real conflict, still-checking, or a WIP PR): comments that the PR
+     is not mergeable and leaves the issue at Code Review.
+   - **`behind_base: false` and mergeable:** merges it as a merge-commit, sets State to `state_done` and AI Agent to
+     `done`, and posts a "runner merged" comment - the same sequence the old poll loop made on green. A merge failure
+     here (Forgejo refusing for a reason `mergeable` did not predict) comments the failure and fails the run.
+   - **Anything else** (checks not `success`): no action. There is no budget to exhaust and nothing to time out - a
+     later `success` event on the same PR is what retries, for as long as CI takes.
 
 Because the wait is event-driven, no job slot, timeout, or `check_interval_seconds` poll is involved any more; both
 `automerge.wait_seconds` and `automerge.check_interval_seconds` are deprecated (parsed, for a still-loading action file,

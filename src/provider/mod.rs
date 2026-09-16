@@ -97,15 +97,26 @@ pub struct ForgePullRequest {
 
 /// The mergeability snapshot of a PR as `fj pr status --json` reports it
 /// (CLAUDE-126). `state` is the combined CI status (`"success"` / `"failure"` /
-/// `"pending"`); `mergeable` is the forge's verdict on whether the PR can be
-/// merged right now (false when behind a base that requires an up-to-date
-/// branch). Only the fields automerge consumes are modelled.
+/// `"pending"`); `mergeable` is Forgejo's verdict that the PR has no conflict,
+/// is not still being checked, and is not a WIP PR - it says nothing about
+/// whether the branch is up to date with its base (CLAUDE-309: that used to be
+/// the assumption here, and it is wrong - Forgejo's `mergeable` ignores being
+/// behind). `behind_base` answers that separately: `Some(true)` /
+/// `Some(false)` when both Forgejo's `merge_base` and `base.sha` are known,
+/// `None` when either is missing or the PR is merged, meaning unknown and
+/// never collapsed to `false` (FJ-99). Only the fields automerge consumes are
+/// modelled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrStatus {
     /// Combined CI status: `"success"` / `"failure"` / `"pending"`.
     pub state: String,
-    /// Whether the forge will merge the PR as-is (false when behind base).
+    /// Whether Forgejo will merge the PR as-is: no conflict, not still being
+    /// checked, not WIP. Does not reflect whether the branch is behind base.
     pub mergeable: bool,
+    /// Whether the PR's head is behind its base. `None` means unknown (an
+    /// `fj` predating FJ-99, or a value Forgejo has not computed yet).
+    #[serde(default)]
+    pub behind_base: Option<bool>,
 }
 
 /// A pull request opened by a [`Forge`] backend.
@@ -472,16 +483,15 @@ pub trait Forge: Send + Sync {
         )))
     }
 
-    /// CLAUDE-126: bring the PR branch checked out in `workdir` up to date with
-    /// its base (the Forgejo "Update Branch" step), retriggering CI. `fj`
-    /// exposes no `pr update-branch` subcommand, so the Forgejo backend performs
-    /// it with the git CLI (merge the base into the head and push) rather than
-    /// hitting the REST API directly. The default errors for backends without
-    /// automerge.
-    fn update_branch(&self, workdir: &std::path::Path) -> Result<()> {
-        let _ = workdir;
+    /// CLAUDE-309: bring PR `pr_number` in `repo` on `host` up to date with its
+    /// base through Forgejo's Update-branch endpoint (`fj pr update <repo>#<n>
+    /// --style merge`, FJ-99), retriggering CI. `--style merge` matches
+    /// CLAUDE-126's merge-commit policy and never rewrites the agent's branch.
+    /// The default errors for backends without automerge.
+    fn update_pr_branch(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
+        let _ = (host, repo, pr_number);
         Err(Error::Other(anyhow::anyhow!(
-            "update_branch (automerge) not supported by this forge backend"
+            "update_pr_branch (automerge) not supported by this forge backend"
         )))
     }
 

@@ -375,6 +375,7 @@ Every `fj` command the runner issues, the fj-source call it makes, and the categ
 | `pr search --repo <r> --state open --json` (`list_open_prs`) | `fj_core::issues::list_page` -> `issue_list_issues` (`type=pulls`), then one `prs::get` per hit | `GET /repos/{o}/{r}/issues?type=pulls`, `GET /repos/{o}/{r}/pulls/{i}` | **issue (read)** + repository (read) |
 | `pr status <id> --json` (`pr_status`)            | `prs::get` + `prs::get_commit_statuses`                      | `GET /repos/{o}/{r}/pulls/{i}`, `GET /repos/{o}/{r}/commits/{sha}/status` | repository (read)  |
 | `pr merge <id> --method merge --delete` (`merge_pr`) | `repo::get` + `prs::get` + `prs::merge` -> `repo_merge_pull_request` | `POST /repos/{o}/{r}/pulls/{i}/merge`          | repository (write) |
+| `pr update <id> --style merge` (`update_pr_branch`, CLAUDE-309/FJ-99) | `fj_core::prs::update_branch` -> `repo_update_pull_request` | `POST /repos/{o}/{r}/pulls/{i}/update` | repository (write) |
 | `pr comment <id> --body-file <f>` (`pr_comment`) | `fj_core::issues::create_comment` -> `issue_create_comment`  | `POST /repos/{o}/{r}/issues/{i}/comments`              | **issue (write)**  |
 | `issue comment <repo>#<n> --body-file <f>` (`issue_comment`) | `fj_core::issues::create_comment` -> `issue_create_comment` | `POST /repos/{o}/{r}/issues/{i}/comments` | **issue (write)** |
 | `pr edit <id> labels --add <label>` (`pr_add_labels`) | `fj_core::issues::edit_labels` -> `issue_list_labels` + `issue_add_label` | `GET /repos/{o}/{r}/labels`, `POST /repos/{o}/{r}/issues/{i}/labels` | **issue (write)**  |
@@ -414,16 +415,23 @@ is disabled. The merge instead happens later, driven by a Forgejo webhook `succe
 PR's head commit (`POST /webhooks/forgejo/<source>`, the same endpoint the CI-failure listener uses) - so the wait holds
 no job slot no matter how long the suite takes, and there is nothing to time out. On each such event, once the daemon has
 resolved which recorded agent PR it belongs to and confirmed that PR's action still has automerge enabled, it reads the
-PR's combined CI status (`fj pr status`):
+PR's combined CI status (`fj pr status --json`, CLAUDE-309: including its `behind_base` field) and dispatches on
+`behind_base` first, since Forgejo's `mergeable` never reflects whether the branch is behind its base:
 
-- **Green and up to date:** the PR is merged as a **merge-commit** (never squash/rebase, so the single commit's bare
-  `#<KEY>` reference survives in history), State is set to `state_done` and AI Agent to `done`, and a "runner merged"
-  comment is posted.
-- **Green but not mergeable** (the branch is behind its base): the webhook handler has no workdir to run the Forgejo
-  "Update Branch" step from, so it only comments that the branch needs updating and leaves the issue at Code Review;
-  updating the branch (or pushing a new commit) retriggers CI, and the next `success` event tries again.
-- **Anything else** (other checks still pending, or a failure): no action. A later `success` event on the same PR is what
-  retries; a real CI failure is handled by the existing CI-failure webhook routing, not by this path.
+- **`behind_base` missing** (an `fj` predating FJ-99): no merge action is taken; the handler comments that the
+  runtime's `fj` must include FJ-99 and fails the run so a stale deployment does not silently stop automerging.
+- **Green and `behind_base: true`:** the branch is updated with `fj pr update <repo>#<n> --style merge`
+  (`update_pr_branch`, CLAUDE-309/FJ-99), which merges the base into the head branch through Forgejo's own
+  Update-branch endpoint, instead of racing straight into a 405 from `pr merge`. A successful update comments that the
+  branch was updated and leaves the issue at Code Review; updating a branch retriggers CI, and the next `success`
+  event tries again. A failed update comments the failure and fails the run.
+- **Green, `behind_base: false`, and not mergeable** (a real conflict, still-checking, or a WIP PR): the handler
+  comments that the PR is not mergeable and leaves the issue at Code Review.
+- **Green, `behind_base: false`, and mergeable:** the PR is merged as a **merge-commit** (never squash/rebase, so the
+  single commit's bare `#<KEY>` reference survives in history), State is set to `state_done` and AI Agent to `done`,
+  and a "runner merged" comment is posted. A merge failure here comments the failure and fails the run.
+- **Anything else** (checks not `success`): no action. A later `success` event on the same PR is what retries; a real
+  CI failure is handled by the existing CI-failure webhook routing, not by this path.
 
 Operators must point their Forgejo webhook at "Action Run" success **and** recover events, in addition to failure, for
 this to fire (see the README "Webhook (Forgejo)" operator-setup note). `automerge.wait_seconds` and
