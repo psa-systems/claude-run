@@ -150,9 +150,13 @@ will want to know about:
   until a write actually lands. The generic scripted runner has no tracker field to write, so a scripted action's cap
   hit still just skips the job with a `warn` and no outcome row, exactly as before. The same list is on `/api/status`
   as `attempt_cap_hits`, with or without the daemon. Unlike a dependency gate, the counter row does not clear itself:
-  it is the durable record of the attempts, so a key stays listed until the counter is gone (today only an action
-  delete purges it, or a per-key reset once CLAUDE-238 lands), and the runner cannot retry a capped key until then.
-  Raising the action's cap grants one more attempt. See `actions/SCHEMA.md`, "`limits`".
+  it is the durable record of the attempts, so a key stays listed until the counter is gone. CLAUDE-238 gives the
+  operator that reset directly, per (action, key), without raising the action's whole cap or deleting the action: a
+  Reset control on each banner row (`POST /api/actions/<name>/attempts/<key>/reset`, 404s an unknown key), and the
+  equivalent `claude-run action reset-attempts <name> <key>` on the CLI, with or without the daemon. A reset is
+  recorded at `warn` naming the discarded count, so it is not an invisible mutation, and the banner clears itself the
+  moment the row is gone. Raising the action's cap instead still grants one more attempt without a reset. See
+  `actions/SCHEMA.md`, "`limits`".
 
   A third cap bounds what a single run may WRITE rather than how often it fires: `limits.max_issues_per_run`
   (CLAUDE-234, default 25) is the ceiling on issues one run may create in YouTrack. It is enforced at the provider
