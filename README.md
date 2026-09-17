@@ -1324,7 +1324,7 @@ run `claude` once to log in, or set `ANTHROPIC_API_KEY`. A regular `.credentials
 is left alone rather than replaced by the link, because in a container that file is the login itself. On macOS
 credentials live in the Keychain rather than `.credentials.json`, so the symlink step is Linux-only.
 
-**Image.** `oci-build/Dockerfile` has a `runtime` target built on `dev.a8n.run/pandoras-box/opensuse-dev:v1.9.0-leap-16.0`
+**Image.** `oci-build/Dockerfile` has a `runtime` target built on `dev.a8n.run/pandoras-box/opensuse-dev:v1.10.0-leap-16.0`
 (CLAUDE-287), the org's dev image. It already carries the whole runtime toolchain: `nu`, the `claude` CLI, coreutils
 `timeout`, `git`, `yt` (youtrack-cli), `fj` (forgejo-cli), `just`, `kingfisher`, and `docker` (client, Compose, buildx).
 Tool versions come from the base image tag; moving a tool means bumping that tag, not editing a Dockerfile `RUN` block.
