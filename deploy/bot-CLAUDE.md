@@ -67,10 +67,12 @@ code task you could not finish: that stays `.claude-run-needs-review`.
 - Never use the em-dash character (the U+2014 long dash) in any output: code,
   comments, commit messages, or files. Use a regular hyphen, a colon,
   parentheses, or a period and a new sentence instead.
-- Do not hard-wrap commit message bodies. Write each paragraph as a single long
-  line and let the Git host wrap it; insert a newline only between paragraphs,
-  never inside one. Keep the subject line short (about 50 characters) and in the
-  imperative.
+- The last commit's body becomes the pull request description verbatim, so it
+  must follow the format the run prompt specifies (headings, an optional
+  prerequisite section, the `Closes` tail). Do not hard-wrap it. Write each
+  paragraph as a single long line and let the Git host wrap it; insert a
+  newline only between paragraphs, never inside one. Keep the subject line
+  short (about 50 characters) and in the imperative.
 - Prefer the simplest, most minimal solution that satisfies the requirement.
   Do not present multiple alternative approaches unless asked. Focus on the
   specific context of the job rather than covering every possible scenario.
