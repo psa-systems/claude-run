@@ -86,7 +86,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # CLAUDE-247: the image is self-contained. It mounts nothing from the host, and
 # the operator logs claude / yt / fj / git in INSIDE the container, onto named
 # volumes. See README "Containerized deployment".
-FROM dev.a8n.run/pandoras-box/opensuse-dev:v1.9.0-leap-16.0 AS runtime
+FROM dev.a8n.run/pandoras-box/opensuse-dev:v1.10.0-leap-16.0 AS runtime
 
 USER root
 
