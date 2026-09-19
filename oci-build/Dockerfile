@@ -25,9 +25,10 @@ WORKDIR /build
 # sqlite-static lib but not musl-dev.
 RUN apk add --no-cache musl-dev
 
-ARG CARGO_BUILD_JOBS=2
+# The runner or caller owns parallelism; `default` is cargo's own CPU count (DEV-769).
+ARG CARGO_BUILD_JOBS=default
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
-RUN echo "build parallelism: CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} (host nproc=$(nproc))"
+RUN echo "build parallelism: CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"
 
 # Prime the dep cache with a dummy lib + bin so cargo builds only the
 # dependency graph in this layer. BuildKit cache mounts catch what the layer

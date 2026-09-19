@@ -37,7 +37,8 @@ on:
 jobs:
   build-and-publish:
     name: Build and publish claude-run binary
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    # HEAVY: runs `docker buildx build`, a full cargo compile of the binary (DEV-769).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
     permissions:
       contents: read
       packages: write
@@ -52,6 +53,14 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v5
         with:
           fetch-depth: 0
+
+      - name: Take build parallelism from the runner
+        # Exports CARGO_BUILD_JOBS / NEXTEST_TEST_THREADS / CI_JOBS; warns and
+        # falls back to a low CPU-derived value when the runner did not set them (DEV-769).
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/build-parallelism@main
+
+      - name: Start job metrics sampler
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-start@main
 
       # CLAUDE-135 (GOV-13 / CLAUDE-122): a release commit is pushed to `main`
       # and tagged `v*` at the same commit, firing BOTH the branch-push and the
@@ -115,7 +124,8 @@ jobs:
         run: |
           let git_hash = "${{ steps.build-meta.outputs.git_hash }}"
           let build_date = "${{ steps.build-meta.outputs.build_date }}"
-          let jobs = ((sys cpu | length) | into int)
+          # The runner owns build parallelism; build-parallelism exported it above.
+          let jobs = $env.CARGO_BUILD_JOBS
           print $"CARGO_BUILD_JOBS=($jobs)"
           let build_args = [
               --build-arg $"GIT_SHA=($git_hash)"
@@ -208,3 +218,8 @@ jobs:
           let dry_run = ("${{ steps.resolve.outputs.dry_run }}" == "true")
           let prefix = if $dry_run { "[dry-run] WOULD publish generic package:" } else { "Generic package:" }
           print $"($prefix) https://($env.REGISTRY_PROVIDER)/api/packages/($env.REGISTRY_USER)/generic/claude-run/($tag)/claude-run-linux-x86_64"
+
+      - name: Report job metrics
+        # Last and always(), so a failing job still reports (composite actions have no post hook).
+        if: always()
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main
