@@ -2,8 +2,8 @@
 
 # Validate code on every push and pull request.
 # Mirrors the local `just check` recipe. This stays a standalone workflow rather
-# than calling common's reusable check.yml, which hardcodes `cargo test --bins`
-# and would skip this crate's library-target unit tests; see PC-6.
+# than calling common's reusable check.yml: that workflow cannot declare the
+# PostgreSQL service or run the suite a second time against it (CLAUDE-250).
 #
 # CLAUDE-286: the compile job is skipped when a push or pull request changes
 # only documentation (docs/**, README.md, CLAUDE.md). This is NOT a workflow-
@@ -27,9 +27,8 @@ on:
 jobs:
   changes:
     name: classify changed files
-    # Base image, not dev: this job only diffs file paths and compiles
-    # nothing (governance CI.md "Runner labels").
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    # MEDIUM: only diffs file paths, compiles nothing (DEV-769).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
     outputs:
       code: ${{ steps.classify.outputs.code }}
     steps:
@@ -103,10 +102,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     name: fmt + clippy + build + tests
-    # Dev image, not base: this job compiles natively, and base ships cargo/rustc but no
-    # `cc`, so crate build scripts fail to link (CLAUDE-203). The sibling workflows only
-    # drive docker/nu/git, so they stay on the smaller base image.
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    # HEAVY: compiles natively and needs the dev image's `cc` for crate build
+    # scripts (CLAUDE-203, DEV-769).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # CLAUDE-250: the runner supports SQLite and PostgreSQL through one sqlx
     # `Any` pool, so the suite runs twice: once on the default SQLite and once
@@ -131,9 +129,13 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Cap build parallelism
-        # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
-        run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
+      - name: Take build parallelism from the runner
+        # Exports CARGO_BUILD_JOBS / NEXTEST_TEST_THREADS / CI_JOBS; warns and
+        # falls back to a low CPU-derived value when the runner did not set them (DEV-769).
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/build-parallelism@main
+
+      - name: Start job metrics sampler
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-start@main
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -153,3 +155,8 @@ jobs:
         env:
           CLAUDE_RUN_TEST_DATABASE_URL: postgres://claude_run:claude_run@postgres:5432/claude_run
         run: cargo test
+
+      - name: Report job metrics
+        # Last and always(), so a failing job still reports (composite actions have no post hook).
+        if: always()
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main

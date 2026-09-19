@@ -6,8 +6,8 @@
 #
 # `runs-on` is set on this caller job, not left to the reusable workflow: this
 # Forgejo does not carry a caller's `${{ vars.* }}` into the expanded job's
-# runs-on, so the label must resolve here. Base is correct: the job runs git
-# and the Forgejo API, it compiles nothing.
+# runs-on, so the label must resolve here. MEDIUM is correct: the job runs git
+# and the Forgejo API, it compiles nothing (DEV-769).
 #
 # `secrets: inherit` is required. A called workflow receives no secret it is
 # not passed, and the release POST needs FORGEJO_PAT (write:repository).
@@ -26,5 +26,6 @@ jobs:
       github.event.pull_request.merged == true
       && startsWith(github.event.pull_request.head.ref, 'release/v')
     uses: psa-systems/common/.forgejo/workflows/create-release.yml@main
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    # MEDIUM: git and API calls only (see header).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
     secrets: inherit
