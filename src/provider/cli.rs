@@ -172,6 +172,131 @@ fn bare_issue_ref(s: &str) -> Option<String> {
     None
 }
 
+/// CLAUDE-319: does `trimmed` (already `trim_start`'d) open or close a fenced
+/// code block?
+fn is_fence_line(trimmed: &str) -> bool {
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+/// CLAUDE-319: an ATX heading, `#` to `######` followed by a space.
+fn is_atx_heading(line: &str) -> bool {
+    let t = line.trim_start();
+    let hashes = t.chars().take_while(|&c| c == '#').count();
+    (1..=6).contains(&hashes) && t.as_bytes().get(hashes) == Some(&b' ')
+}
+
+/// CLAUDE-319: a bullet (`- `, `* `, `+ `) or ordered (`1. ` style) list item,
+/// optionally indented.
+fn is_list_item(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
+        return true;
+    }
+    let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && t[digits..].starts_with(". ")
+}
+
+/// CLAUDE-319: a `Co-Authored-By:` / `Signed-off-by:` / `Reviewed-by:` trailer,
+/// unindented (a commit trailer never is).
+fn is_trailer_line(line: &str) -> bool {
+    line.starts_with("Co-Authored-By:")
+        || line.starts_with("Signed-off-by:")
+        || line.starts_with("Reviewed-by:")
+}
+
+/// CLAUDE-319: does `line` end in an intentional Markdown hard break (two or
+/// more trailing spaces, or a trailing backslash)?
+fn ends_with_hard_break(line: &str) -> bool {
+    line.ends_with('\\') || line.len() - line.trim_end_matches(' ').len() >= 2
+}
+
+/// CLAUDE-319: is `line` a blockquote, optionally indented?
+fn is_blockquote(line: &str) -> bool {
+    line.trim_start().starts_with('>')
+}
+
+/// CLAUDE-319: does `line` start a new Markdown block, so it is never joined
+/// onto the previous line? Covers headings, list items, blockquotes, table
+/// rows, fence lines, the `Closes` line, a bare issue reference, and a commit
+/// trailer.
+fn starts_new_block(line: &str) -> bool {
+    let trimmed = line.trim();
+    is_atx_heading(line)
+        || is_list_item(line)
+        || is_blockquote(line)
+        || line.trim_start().starts_with('|')
+        || is_fence_line(line.trim_start())
+        || trimmed == "Closes"
+        || bare_issue_ref(trimmed).is_some()
+        || is_trailer_line(line)
+}
+
+/// CLAUDE-319: once `line` has been emitted (whether it started a new block or
+/// was itself a joined continuation), can a following wrapped line join onto
+/// it? A list item or blockquote wraps like prose; a heading, table row,
+/// `Closes` line, bare issue reference, or trailer never takes a
+/// continuation, since each is a single, complete line by construction.
+fn accepts_continuation(line: &str) -> bool {
+    if is_atx_heading(line)
+        || line.trim_start().starts_with('|')
+        || line.trim() == "Closes"
+        || bare_issue_ref(line.trim()).is_some()
+        || is_trailer_line(line)
+    {
+        return false;
+    }
+    !ends_with_hard_break(line)
+}
+
+/// CLAUDE-319: reflow hard-wrapped prose in a PR body so Forgejo renders it at
+/// full page width instead of a ragged column at the agent's commit-wrap
+/// width. Line by line: a fenced code block is copied untouched (including
+/// blank lines inside it); a blank line ends the current paragraph and is
+/// kept as is; a line that starts a new block (see [`starts_new_block`]) is
+/// never joined onto the previous line; any other non-blank line is a wrapped
+/// continuation, joined onto the previous line with a single space; a line
+/// ending in a hard break (two or more trailing spaces, or a backslash) is
+/// never joined to by the line after it. Infallible, introduces no new error
+/// path.
+fn unwrap_prose(body: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    let mut prev_continues = false;
+
+    for line in body.lines() {
+        if in_fence {
+            out.push(line.to_string());
+            if is_fence_line(line.trim_start()) {
+                in_fence = false;
+            }
+            prev_continues = false;
+            continue;
+        }
+        if is_fence_line(line.trim_start()) {
+            out.push(line.to_string());
+            in_fence = true;
+            prev_continues = false;
+            continue;
+        }
+        if line.trim().is_empty() {
+            out.push(line.to_string());
+            prev_continues = false;
+            continue;
+        }
+        if prev_continues && !starts_new_block(line) {
+            if let Some(last) = out.last_mut() {
+                last.push(' ');
+                last.push_str(line.trim());
+            }
+        } else {
+            out.push(line.to_string());
+        }
+        prev_continues = accepts_continuation(line);
+    }
+
+    out.join("\n")
+}
+
 /// Captured result of running an external command.
 #[derive(Debug, Clone)]
 pub struct CmdOutput {
@@ -818,7 +943,7 @@ impl CliBackend {
         let out = self
             .runner
             .run_in_env(Some(workdir), "git", &body_args, &[])?;
-        let body = Self::checked("git", out, &body_args)?.trim().to_string();
+        let body = unwrap_prose(Self::checked("git", out, &body_args)?.trim());
 
         const BODY_FILE: &str = ".claude-run-pr-body.md";
         // CLAUDE-305: written into the clone's git-directory scratch space,
@@ -2195,6 +2320,7 @@ mod tests {
     use super::testutil::StubRunner;
     use super::*;
     use crate::action::PrStrategy;
+    use std::sync::Mutex;
 
     fn backend(runner: StubRunner) -> CliBackend {
         CliBackend::new(Arc::new(runner))
@@ -4908,5 +5034,176 @@ mod tests {
         let b = CliBackend::new(Arc::new(ProcessRunner::new()));
         let branch = b.resolve_feature_branch(&clone).unwrap();
         assert_eq!(branch, "feat");
+    }
+
+    // CLAUDE-319: `unwrap_prose` reflows hard-wrapped commit-body prose so the
+    // PR description Forgejo renders uses the full page width.
+
+    #[test]
+    fn unwrap_prose_joins_pms_1281_body_to_one_paragraph_line() {
+        let body = "compose.dev.yml pinned name: dev-billing while every container, volume\n\
+                    and network was already ${USER}-suffixed, so the project itself was\n\
+                    shared: a docker compose run under one USER could treat another\n\
+                    developer's network as an orphan of the same project (or wipe their\n\
+                    volumes via just down / just dev-clean). Make the project name\n\
+                    dev-billing-${USER} so each developer's stack is its own project, and\n\
+                    document the one-time migration step in CLAUDE.md.\n\
+                    \n\
+                    #GAMMA-1281\n\
+                    \n\
+                    Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
+        let expected = "compose.dev.yml pinned name: dev-billing while every container, volume and network was already ${USER}-suffixed, so the project itself was shared: a docker compose run under one USER could treat another developer's network as an orphan of the same project (or wipe their volumes via just down / just dev-clean). Make the project name dev-billing-${USER} so each developer's stack is its own project, and document the one-time migration step in CLAUDE.md.\n\
+                        \n\
+                        #GAMMA-1281\n\
+                        \n\
+                        Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
+        assert_eq!(unwrap_prose(body), expected);
+    }
+
+    #[test]
+    fn unwrap_prose_leaves_a_fenced_code_block_untouched() {
+        let body = "Summary line.\n\
+                    \n\
+                    ```\n\
+                    line one\n\
+                    \n\
+                    line two, not joined\n\
+                    ```\n\
+                    \n\
+                    #KEY-1";
+        assert_eq!(unwrap_prose(body), body);
+    }
+
+    #[test]
+    fn unwrap_prose_keeps_heading_separate_and_joins_its_paragraph() {
+        let body = "## Summary\n\
+                    This is a wrapped\n\
+                    paragraph that should\n\
+                    become one line.";
+        let expected = "## Summary\nThis is a wrapped paragraph that should become one line.";
+        assert_eq!(unwrap_prose(body), expected);
+    }
+
+    #[test]
+    fn unwrap_prose_joins_list_item_continuation_but_not_the_next_item() {
+        let body = "- first item wraps\n\
+                    onto this line\n\
+                    - second item stays separate";
+        let expected = "- first item wraps onto this line\n- second item stays separate";
+        assert_eq!(unwrap_prose(body), expected);
+    }
+
+    #[test]
+    fn unwrap_prose_keeps_closes_and_issue_ref_on_their_own_lines() {
+        let body = "Summary.\n\
+                    \n\
+                    Closes\n\
+                    #KEY-2";
+        assert_eq!(unwrap_prose(body), body);
+    }
+
+    #[test]
+    fn unwrap_prose_respects_a_trailing_two_space_hard_break() {
+        let body = "First line.  \nSecond line, kept separate.";
+        assert_eq!(unwrap_prose(body), body);
+    }
+
+    #[test]
+    fn unwrap_prose_leaves_an_already_unwrapped_body_unchanged() {
+        let body = "## Summary\n\
+                    Already one line per paragraph.\n\
+                    \n\
+                    Closes\n\
+                    #KEY-3\n\
+                    \n\
+                    Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
+        assert_eq!(unwrap_prose(body), body);
+    }
+
+    /// CLAUDE-319: a `CommandRunner` that forwards every call to `inner`, but
+    /// captures the `--body-file` scratch file's content the instant `fj pr
+    /// create` runs, before `find_or_create_pr`'s own cleanup deletes it.
+    struct BodyCapturingRunner {
+        inner: StubRunner,
+        body_path: PathBuf,
+        captured: Arc<Mutex<Option<String>>>,
+    }
+
+    impl CommandRunner for BodyCapturingRunner {
+        fn run_in_env(
+            &self,
+            dir: Option<&Path>,
+            binary: &str,
+            args: &[&str],
+            envs: &[(&str, &str)],
+        ) -> Result<CmdOutput> {
+            if binary == "fj" && args.contains(&"create") {
+                *self.captured.lock().unwrap() =
+                    Some(std::fs::read_to_string(&self.body_path).unwrap());
+            }
+            self.inner.run_in_env(dir, binary, args, envs)
+        }
+    }
+
+    #[test]
+    fn create_pr_branch_writes_the_reflowed_body_to_the_scratch_file() {
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "abc123", "");
+        let runner = with_open_pr_search(runner, "[]")
+            .ok(
+                "git",
+                &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "feat(x): do the thing\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "Wrapped line one\nwrapped line two.\n\n#MK-16\n",
+            );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path = scratch.join(".claude-run-pr-body.md");
+        let body_path_str = body_path.to_string_lossy().to_string();
+        let runner = runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "feat(x): do the thing",
+                "--body-file",
+                body_path_str.as_str(),
+                "--head",
+                "feat/x",
+                "--json",
+            ],
+            r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
+        );
+        let captured = Arc::new(Mutex::new(None));
+        let capturing = BodyCapturingRunner {
+            inner: runner,
+            body_path,
+            captured: captured.clone(),
+        };
+        let b = CliBackend::new(Arc::new(capturing));
+        let pr = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+        assert_eq!(pr.number, Some(77));
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("Wrapped line one wrapped line two.\n\n#MK-16")
+        );
     }
 }
