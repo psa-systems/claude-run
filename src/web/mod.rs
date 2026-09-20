@@ -3910,6 +3910,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 badge: "next event",
                 note: "CLAUDE-276: fix attempts on the agent's own open PR before its issue is flagged Needs Review instead of re-queued.",
             },
+            FieldDoc {
+                name: "max_runs_per_day",
+                badge: "next event",
+                note: "CLAUDE-323: daily run cap of the webhook-forgejo ledger (default 20, at least 1).",
+            },
         ],
         WebhookComment => vec![
             FieldDoc {
@@ -3921,6 +3926,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 name: "max_instruction_chars",
                 badge: "live",
                 note: "longer instructions are refused with a reply naming the limit.",
+            },
+            FieldDoc {
+                name: "max_runs_per_day",
+                badge: "next event",
+                note: "CLAUDE-323: daily run cap of the webhook-forgejo-comment ledger (default 20, at least 1).",
             },
             FieldDoc {
                 name: "sources",
