@@ -234,6 +234,10 @@ pub struct WebhookConfig {
     /// flagged `Needs Review` instead. Matched against
     /// `agent_pull_requests.fix_attempts`. Default 3.
     pub agent_pr_fix_attempts: u32,
+    /// CLAUDE-323: daily run cap of the synthetic `webhook-forgejo` action's
+    /// ledger, read per event so a Settings save applies to the next one.
+    /// Must be at least 1 (validated in `src/settings.rs`); default 20.
+    pub max_runs_per_day: u32,
 }
 
 impl Default for WebhookConfig {
@@ -245,6 +249,7 @@ impl Default for WebhookConfig {
             analysis_concurrency: 2,
             auto_fix: false,
             agent_pr_fix_attempts: 3,
+            max_runs_per_day: 20,
         }
     }
 }
@@ -373,6 +378,10 @@ pub struct CommentWebhookConfig {
     /// way [`WebhookConfig::sources`] keys are. An empty map disables the
     /// listener (no endpoints, fail closed).
     pub sources: BTreeMap<String, CommentWebhookSource>,
+    /// CLAUDE-323: daily run cap of the synthetic `webhook-forgejo-comment`
+    /// action's ledger, read per command so a Settings save applies to the next
+    /// one. Must be at least 1 (validated in `src/settings.rs`); default 20.
+    pub max_runs_per_day: u32,
 }
 
 impl Default for CommentWebhookConfig {
@@ -381,6 +390,7 @@ impl Default for CommentWebhookConfig {
             trigger: "/claude".to_string(),
             max_instruction_chars: 4000,
             sources: BTreeMap::new(),
+            max_runs_per_day: 20,
         }
     }
 }
