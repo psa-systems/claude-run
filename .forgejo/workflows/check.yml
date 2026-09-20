@@ -160,3 +160,8 @@ jobs:
         # Last and always(), so a failing job still reports (composite actions have no post hook).
         if: always()
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main
+
+  secrets:
+    uses: psa-systems/common/.forgejo/workflows/check-secrets.yml@main
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    secrets: inherit
