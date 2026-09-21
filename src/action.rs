@@ -724,7 +724,8 @@ pub struct Action {
 
     /// Optional URL template for rendering job keys as clickable links in the
     /// web UI. `{key}` is substituted with the job key. Example:
-    /// `https://example.myjetbrains.com/issue/{key}`.
+    /// `https://youtrack.example.com/issue/{key}`. Optional override: YouTrack
+    /// actions default to the Auth card's base URL.
     #[serde(default)]
     pub link_template: Option<String>,
 
@@ -762,8 +763,8 @@ mod tests {
     #[test]
     fn render_link_substitutes_key() {
         assert_eq!(
-            render_link("https://example.myjetbrains.com/issue/{key}", "MK-16"),
-            "https://example.myjetbrains.com/issue/MK-16"
+            render_link("https://youtrack.example.com/issue/{key}", "MK-16"),
+            "https://youtrack.example.com/issue/MK-16"
         );
     }
 
