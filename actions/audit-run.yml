@@ -96,7 +96,5 @@ native:
     # base_url / token_ref omitted, as in youtrack.yml: host `fj` credentials, forge host derived from the AUDIT
     # project's VCS integration.
 
-link_template: "https://example.myjetbrains.com/issue/{key}"
-
 output:
   file: audit-run.jsonl
