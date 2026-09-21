@@ -1322,7 +1322,7 @@ native:
             Some("builtin:default")
         );
         // Generic blocks stay on the Action, not in the native config.
-        assert_eq!(action.workdir_base.as_deref(), Some("~/workspace"));
+        assert_eq!(action.workdir_base, None);
         assert_eq!(action.limits.max_attempts_per_key, Some(3));
 
         // Serialize -> parse round-trip yields an identical native config.
