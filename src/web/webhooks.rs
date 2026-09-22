@@ -1272,6 +1272,7 @@ async fn triage_and_mint(
             infra_kind,
             test_ids,
             log_token,
+            webhook_cfg.max_runs_per_day,
         )
         .await;
     };
@@ -2260,7 +2261,7 @@ async fn mint_for_two_branch_pr_only_failure(
         attempts,
         max_attempts: ctx.defaults.max_attempts_per_key,
         daily,
-        max_runs_per_day: ctx.defaults.max_runs_per_day,
+        max_runs_per_day: webhook_cfg.max_runs_per_day,
     };
 
     let backend = ctx.backend.clone();
@@ -2508,6 +2509,7 @@ async fn classify_and_mint(
     infra_kind: Option<String>,
     test_ids: Vec<String>,
     log_token: Option<String>,
+    max_runs_per_day: u32,
 ) -> WebhookRunSummary {
     // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
     // run's (repo, index); the daily ledger is per synthetic action. The
@@ -2525,7 +2527,7 @@ async fn classify_and_mint(
         attempts,
         max_attempts: ctx.defaults.max_attempts_per_key,
         daily,
-        max_runs_per_day: ctx.defaults.max_runs_per_day,
+        max_runs_per_day,
     };
 
     // CLAUDE-80: surface what the blocking pipeline is doing. The blocking
@@ -4879,6 +4881,7 @@ mod tests {
 
         let cfg = WebhookConfig {
             analysis_concurrency: 2,
+            max_runs_per_day: 20,
             ..WebhookConfig::default()
         };
         consume_events(
@@ -7336,6 +7339,7 @@ mod tests {
                 auto_fix: false,
                 analysis_timeout_secs: 600,
                 analysis_concurrency: 2,
+                max_runs_per_day: 20,
                 agent_pr_fix_attempts: 3,
             }
         }
@@ -7460,6 +7464,7 @@ mod tests {
                 auto_fix: false,
                 analysis_timeout_secs: 600,
                 analysis_concurrency: 2,
+                max_runs_per_day: 20,
                 agent_pr_fix_attempts: 3,
             };
             let (tx, _rx) = mpsc::channel(8);
