@@ -162,6 +162,27 @@ jobs:
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main
 
   secrets:
-    uses: psa-systems/common/.forgejo/workflows/check-secrets.yml@main
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
-    secrets: inherit
+    steps:
+      - name: Rename .gitconfig
+        # The runner's ~/.gitconfig prevents actions/checkout from working.
+        shell: nu {0}
+        run: |
+          let gitconfig = ([$env.HOME .gitconfig] | path join)
+          if ($gitconfig | path expand | path exists) {
+            mv $gitconfig ([$gitconfig 'disabled'] | str join '-')
+          }
+
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Secrets scan
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/check-secrets@main
+        with:
+          # Placeholder credentials only, also present in git history: the CI
+          # Postgres service password above, the README and compose.yml example
+          # URIs, and the token-shaped remote URLs in src/provider tests.
+          kingfisher_skip_regex: 'claude_run:(claude_run|secret|\(\$password\)|<that password>)@|^x-access-token$|oauth2:secret@|ghp_(secret|from_login|action)@'

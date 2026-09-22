@@ -1,0 +1,9 @@
+# Nosey Parker has only path-based ignores. Every match in these files is a
+# placeholder, verified by hand (CLAUDE-320):
+# redaction-test fixture tokens
+src/forge_log.rs
+# example Postgres URIs with placeholder passwords
+README.md
+compose.yml
+# password of the throwaway CI Postgres service container
+.forgejo/workflows/check.yml
