@@ -58,9 +58,6 @@ schedule:
   kind: interval
   spec: 5m
 
-# /home has more space than /tmp; matches youtrack.yml so both actions share the disk budget.
-workdir_base: ~/workspace
-
 claude:
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
   permission_mode: acceptEdits
