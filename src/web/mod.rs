@@ -5131,6 +5131,20 @@ struct RunDetailQuery {
     out_counted: String,
 }
 
+/// The template that links a run's job keys: the action's own override, else
+/// (for actions whose keys are YouTrack issue keys) `{base}/issue/{key}` from
+/// the Auth card's YouTrack URL, else none (keys render as plain text).
+fn effective_link_template(
+    declared: Option<String>,
+    keys_are_youtrack: bool,
+    base_url: Option<&str>,
+) -> Option<String> {
+    declared.or_else(|| {
+        let base = base_url?.trim().trim_end_matches('/');
+        (keys_are_youtrack && !base.is_empty()).then(|| format!("{base}/issue/{{key}}"))
+    })
+}
+
 async fn run_detail(
     State(s): State<WebState>,
     AxumPath(id): AxumPath<i64>,
@@ -5155,8 +5169,9 @@ async fn run_detail(
     .await?;
 
     // Look up the action's link_template once and reuse for both planned
-    // jobs and the outcomes table.
-    let link_template: Option<String> = sqlx::query_scalar(&crate::db::q(
+    // jobs and the outcomes table. YouTrack-keyed actions with no template
+    // fall back to the Auth card's base URL.
+    let declared: Option<String> = sqlx::query_scalar(&crate::db::q(
         pool,
         "SELECT link_template FROM actions WHERE name = ?",
     ))
@@ -5164,6 +5179,11 @@ async fn run_detail(
     .fetch_optional(pool)
     .await?
     .flatten();
+    let keys_are_youtrack = crate::action::load(&run.action_name, &s.paths.actions_dir())
+        .map(|l| l.action.kind.is_native())
+        .unwrap_or(false);
+    let base = s.api.settings.auth_config().await.youtrack_base_url;
+    let link_template = effective_link_template(declared, keys_are_youtrack, base.as_deref());
 
     let planned_keys = state::run_job_keys(pool, run.id).await.unwrap_or_default();
     // CLAUDE-93: per-job links recorded on the run (the webhook
@@ -5671,7 +5691,7 @@ mod tests {
         };
         let job_links = std::collections::BTreeMap::from([(
             "CLAUDE-108".to_string(),
-            "https://example.myjetbrains.com/issue/CLAUDE-108".to_string(),
+            "https://youtrack.example.com/issue/CLAUDE-108".to_string(),
         )]);
         let tpl = RunDetailTpl {
             version: "test",
@@ -5687,7 +5707,7 @@ mod tests {
         let html = tpl.render().expect("render run_detail");
         assert!(
             html.contains(
-                "<a href=\"https://example.myjetbrains.com/issue/CLAUDE-108\" target=\"_blank\" rel=\"noopener\">CLAUDE-108</a> - attempt 2"
+                "<a href=\"https://youtrack.example.com/issue/CLAUDE-108\" target=\"_blank\" rel=\"noopener\">CLAUDE-108</a> - attempt 2"
             ),
             "modal heading should link the key with attempt outside the anchor: {html}"
         );
@@ -5695,23 +5715,47 @@ mod tests {
 
     // ---- run-detail link_template links (CLAUDE-222) ----------------------
 
-    /// A run links every key from the shipped action's `link_template`: the
-    /// planned-jobs table, the outcomes table, and the summary-modal heading.
-    /// The template comes from the shipped YAML, so a run screen and the
-    /// config it ships with are checked together.
+    /// The shipped actions declare no `link_template`; the fallback builds
+    /// `{base}/issue/{key}` from the configured base URL.
     #[test]
-    fn run_links_every_key_from_the_shipped_link_template() {
+    fn shipped_actions_declare_no_link_template() {
+        for src in [
+            include_str!("../../actions/youtrack.yml"),
+            include_str!("../../actions/audit-run.yml"),
+            include_str!("../../actions/closed-issue-summary.yml"),
+        ] {
+            let a = crate::action::validate_str(src, "<test>").unwrap().action;
+            assert_eq!(a.link_template, None);
+        }
+    }
+
+    #[test]
+    fn link_template_fallback_cases() {
+        use super::effective_link_template as eff;
+        let want = Some("https://youtrack.example.com/issue/{key}".to_string());
+        assert_eq!(eff(None, true, Some("https://youtrack.example.com")), want);
+        assert_eq!(eff(None, true, Some("https://youtrack.example.com/")), want);
+        assert_eq!(eff(None, true, None), None);
+        assert_eq!(eff(None, false, Some("https://youtrack.example.com")), None);
+        let own = Some("https://other.example.com/i/{key}".to_string());
+        assert_eq!(
+            eff(own.clone(), true, Some("https://youtrack.example.com")),
+            own
+        );
+    }
+
+    /// Every key links out once a template is present: planned-jobs table,
+    /// outcomes table, and the summary-modal heading.
+    #[test]
+    fn run_links_every_key_from_the_link_template() {
         use super::{JobOutcomeRow, PlannedJob, RunDetailTpl, RunRow};
         use askama::Template;
 
-        const SHIPPED: &str = include_str!("../../actions/closed-issue-summary.yml");
-        let template = crate::action::validate_str(SHIPPED, "<test>")
-            .unwrap()
-            .action
-            .link_template
-            .expect("shipped link_template");
+        let template =
+            super::effective_link_template(None, true, Some("https://youtrack.example.com/"))
+                .unwrap();
         let href = crate::action::render_link(&template, "CLAUDE-222");
-        assert_eq!(href, "https://example.myjetbrains.com/issue/CLAUDE-222");
+        assert_eq!(href, "https://youtrack.example.com/issue/CLAUDE-222");
 
         let run = RunRow {
             id: 3,
