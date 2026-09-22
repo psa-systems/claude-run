@@ -264,7 +264,7 @@ XDG-compliant; each path overridable by the matching env var.
 | `$XDG_RUNTIME_DIR/claude-run/` | `CLAUDE_RUN_RUNTIME_DIR` | `daemon.pid`, `daemon.sock` (absent under `serve --no-socket`), `locks/<action>.lock`           |
 
 `workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-job workdirs live; defaults to
-`$DATA_DIR/workdirs/`. Supports `~`, `$VAR`, `${VAR}` expansion.
+`$CLAUDE_RUN_DATA_DIR/workdirs` (`/data/workdirs` in the container). Supports `~`, `$VAR`, `${VAR}` expansion.
 
 ## State store backend: SQLite or PostgreSQL (CLAUDE-250)
 

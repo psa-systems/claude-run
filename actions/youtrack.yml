@@ -58,11 +58,6 @@ schedule:
   kind: interval
   spec: 5m
 
-# /home has more space than /tmp.
-# Plain shell expansion: ~, $VAR, and ${VAR} are honored. The old nu-eval
-# form ($"...") is gone with the Rust port.
-workdir_base: ~/workspace
-
 claude:
   allowed_tools: "Read,Edit,Write,Bash,Glob,Grep"
   permission_mode: acceptEdits
@@ -102,10 +97,6 @@ native:
   forgejo: {}
     # base_url / token_ref (CLAUDE-26): omitted, so the host fj credentials are used and the forge host derives from
     # each issue's resolved VCS integration.
-
-# Per-action link template (CLAUDE-1). Job keys (idReadable, e.g. MK-16) render as clickable links to the YouTrack issue
-# in the web UI.
-link_template: "https://example.myjetbrains.com/issue/{key}"
 
 output:
   file: youtrack.jsonl
