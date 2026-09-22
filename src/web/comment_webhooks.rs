@@ -811,11 +811,16 @@ pub enum Admission {
 /// that same counter is the redelivery guard, keyed by
 /// `hash(repo, number, comment_id)`. The daily ledger is the synthetic
 /// action's, shared with every other command.
-pub fn admit(attempts: u32, daily: u32, defaults: &RunnerDefaults) -> Admission {
+pub fn admit(
+    attempts: u32,
+    daily: u32,
+    defaults: &RunnerDefaults,
+    max_runs_per_day: u32,
+) -> Admission {
     if attempts >= defaults.max_attempts_per_key.min(1) {
         return Admission::AlreadyHandled;
     }
-    if daily >= defaults.max_runs_per_day {
+    if daily >= max_runs_per_day {
         return Admission::DailyCapReached;
     }
     Admission::Run
@@ -947,7 +952,8 @@ async fn run_instruction(
     let daily = state::daily_count_get(&ctx.pool, WEBHOOK_COMMENT_ACTION)
         .await
         .unwrap_or(0);
-    match admit(attempts, daily, &ctx.defaults) {
+    let max_runs_per_day = ctx.config.read().await.max_runs_per_day;
+    match admit(attempts, daily, &ctx.defaults, max_runs_per_day) {
         Admission::Run => {}
         Admission::AlreadyHandled => {
             info!(repo = %cmd.repo, number = cmd.number, comment = cmd.comment_id, attempts, "comment already handled (redelivery / attempt cap); running nothing");
@@ -1903,7 +1909,7 @@ pub fn cap_comment() -> String {
         "**Command dropped: the runner's daily run cap for comment commands is reached.**"
             .to_string(),
         String::new(),
-        "Nothing was run. Try again after the cap resets, or raise it in the runner settings."
+        "Nothing was run. Try again after the cap resets, or raise `max_runs_per_day` in Settings -> Webhook comment."
             .to_string(),
     ]
     .join("\n")
@@ -3214,14 +3220,61 @@ mod tests {
         let d = RunnerDefaults::default();
         assert!(d.max_attempts_per_key >= 1);
         // First sighting runs.
-        assert_eq!(admit(0, 0, &d), Admission::Run);
+        assert_eq!(admit(0, 0, &d, d.max_runs_per_day), Admission::Run);
         // A redelivery of the SAME comment (the key is the comment hash) is
         // refused however high the runner's per-key default is.
-        assert_eq!(admit(1, 0, &d), Admission::AlreadyHandled);
-        assert_eq!(admit(2, 0, &d), Admission::AlreadyHandled);
+        assert_eq!(
+            admit(1, 0, &d, d.max_runs_per_day),
+            Admission::AlreadyHandled
+        );
+        assert_eq!(
+            admit(2, 0, &d, d.max_runs_per_day),
+            Admission::AlreadyHandled
+        );
         // The daily ledger still bounds a busy day of distinct comments.
-        assert_eq!(admit(0, d.max_runs_per_day, &d), Admission::DailyCapReached);
-        assert_eq!(admit(0, d.max_runs_per_day - 1, &d), Admission::Run);
+        assert_eq!(
+            admit(0, d.max_runs_per_day, &d, d.max_runs_per_day),
+            Admission::DailyCapReached
+        );
+        assert_eq!(
+            admit(0, d.max_runs_per_day - 1, &d, d.max_runs_per_day),
+            Admission::Run
+        );
+    }
+
+    #[test]
+    fn admit_honours_a_configured_daily_cap() {
+        let d = RunnerDefaults::default();
+        // Raised above the default: the default's boundary no longer trips.
+        assert_eq!(admit(0, 20, &d, 50), Admission::Run);
+        assert_eq!(admit(0, 50, &d, 50), Admission::DailyCapReached);
+        // Lowered below the default.
+        assert_eq!(admit(0, 5, &d, 5), Admission::DailyCapReached);
+        assert_eq!(admit(0, 4, &d, 5), Admission::Run);
+    }
+
+    #[test]
+    fn comment_config_without_the_cap_loads_at_20_and_zero_is_rejected() {
+        let cfg: CommentWebhookConfig = serde_json::from_str(r#"{"trigger":"/x"}"#).unwrap();
+        assert_eq!(cfg.max_runs_per_day, 20);
+        let zero = CommentWebhookConfig {
+            max_runs_per_day: 0,
+            ..CommentWebhookConfig::default()
+        };
+        let err = crate::settings::validate_comment_webhook(&zero).unwrap_err();
+        assert!(err.contains("max_runs_per_day"));
+    }
+
+    #[test]
+    fn webhook_config_without_the_cap_loads_at_20_and_zero_is_rejected() {
+        let cfg: WebhookConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.max_runs_per_day, 20);
+        let zero = WebhookConfig {
+            max_runs_per_day: 0,
+            ..WebhookConfig::default()
+        };
+        let err = crate::settings::validate_webhook(&zero).unwrap_err();
+        assert!(err.contains("max_runs_per_day"));
     }
 
     #[tokio::test]
@@ -3235,7 +3288,7 @@ mod tests {
         let attempts = state::attempts_get(&pool, WEBHOOK_COMMENT_ACTION, &key)
             .await
             .unwrap();
-        assert_eq!(admit(attempts, 0, &d), Admission::Run);
+        assert_eq!(admit(attempts, 0, &d, d.max_runs_per_day), Admission::Run);
 
         state::attempts_increment(&pool, WEBHOOK_COMMENT_ACTION, &key)
             .await
@@ -3244,7 +3297,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            admit(attempts, 0, &d),
+            admit(attempts, 0, &d, d.max_runs_per_day),
             Admission::AlreadyHandled,
             "the same comment redelivered must not run the work twice"
         );
@@ -3254,7 +3307,7 @@ mod tests {
         let attempts = state::attempts_get(&pool, WEBHOOK_COMMENT_ACTION, &other)
             .await
             .unwrap();
-        assert_eq!(admit(attempts, 0, &d), Admission::Run);
+        assert_eq!(admit(attempts, 0, &d, d.max_runs_per_day), Admission::Run);
     }
 
     /// CLAUDE-221: the mint route deduplicates through that SAME counter, so a
@@ -3271,7 +3324,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            admit(attempts, 0, &d),
+            admit(attempts, 0, &d, d.max_runs_per_day),
             Admission::Run,
             "first sighting mints"
         );
@@ -3285,7 +3338,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            admit(attempts, 0, &d),
+            admit(attempts, 0, &d, d.max_runs_per_day),
             Admission::AlreadyHandled,
             "the same issue comment redelivered must not mint a second issue"
         );

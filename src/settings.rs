@@ -939,6 +939,9 @@ pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> 
     if cfg.agent_pr_fix_attempts < 1 {
         return Err("agent_pr_fix_attempts must be >= 1".to_string());
     }
+    if cfg.max_runs_per_day < 1 {
+        return Err("max_runs_per_day must be >= 1".to_string());
+    }
     Ok(())
 }
 
@@ -948,6 +951,9 @@ pub fn validate_comment_webhook(cfg: &CommentWebhookConfig) -> std::result::Resu
     }
     if cfg.max_instruction_chars == 0 {
         return Err("max_instruction_chars must be >= 1".to_string());
+    }
+    if cfg.max_runs_per_day < 1 {
+        return Err("max_runs_per_day must be >= 1".to_string());
     }
     for (name, src) in &cfg.sources {
         if src.allowed_permissions.is_empty() {
