@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # claude-run
 
 YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Forgejo PRs, ...), feed each job to `claude --print`, do something with the result. Shipped as a single Rust binary (`claude-run`) that doubles as a CLI and a long-running daemon with a unix-socket API.
@@ -10,6 +14,23 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 - Daemon (`claude-run serve`) owns scheduling and exposes an HTTP API over `$CLAUDE_RUN_RUNTIME_DIR/daemon.sock`. CLI subcommands delegate to the daemon when reachable, else operate directly on the DB. The socket is the CLI's control plane and nothing else: `api::router` is built twice from one `api_state`, bare-path on the socket and nested under `/api` on the TCP listener, which is what the web UI's own buttons POST to. `serve --no-socket` skips the bind for a deployment with no CLI operator, and the container image runs that way (`CMD ["serve", "--no-socket"]`) because the socket has no auth gate (the CLAUDE-48 token wraps only the TCP router) and would otherwise sit in the same container as the agent, running as the same user. `trigger` and `cancel` then fail naming that reason instead of "no daemon"; the DB-direct subcommands are unaffected.
 - Runtime tool dependencies (host-installed, not bundled in the binary): `nu`, `claude` (Claude Code CLI), `timeout` (coreutils). Optional: `yt`, `fj`, `git` if the actions need them.
 - Forgejo home: `psa-systems/claude-run`.
+
+## Commands
+
+- `just check`: fmt + clippy + build + tests + builder-stage docker compile (the full CI gate). `just pre-commit` runs the checks inside the builder image via `docker run`.
+- CI's exact steps (`.forgejo/workflows/check.yml`): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build --all-targets`, then `cargo test` twice: once on SQLite, once with `CLAUDE_RUN_TEST_DATABASE_URL=postgres://...` set, which switches every test fixture onto Postgres (one schema per test). A DB change must pass both.
+- Single test: `cargo test <name_substring>` (e.g. `cargo test shipped_action_queries_are_disjoint`); one module: `cargo test native::youtrack::`. Unit tests live inline in `src/**` under `mod tests` on the library target; `tests/fixtures/` holds data only.
+- `just run <args>` = `cargo run -- <args>` (debug build). `just build-static` builds the musl binary via Docker into `./dist/claude-run`.
+- Any test that execs a stub script must create it with `testutil::write_stub`, never `fs::write` + `set_permissions` (ETXTBSY race across test threads, CLAUDE-224 / CLAUDE-255).
+
+## Code map
+
+- Entry: `src/bin/claude-run.rs` (clap) -> `client.rs` (talk to the daemon socket) or direct DB ops. `daemon.rs` hosts `serve`: `scheduler.rs` ticks, `Dispatcher::execute` runs an action via `run_action_inner`.
+- Two action kinds (`ActionKind` in `action.rs`): `scripted` runs the generic nu pipeline in `job.rs` (`snippet.rs` execs `nu`, `claude.rs` execs `claude`); native kinds route through `native::handler_for` to a Rust handler in `src/native/` (`youtrack`, `closed_issue_summary`) that owns its whole run. Adding a native kind means a new `ActionKind` variant, a handler, a `handler_for` arm, and usually a structured editor in `web/native_forms.rs` + `templates/*_editor.html`.
+- Native handlers reach YouTrack / Forgejo / GitHub only through the `provider` traits (`IssueTracker`, `Forge`); `provider/cli.rs` shells out to `yt` / `fj`, `provider/github.rs` covers GitHub, and `provider/audit.rs` wraps the tracker to cap and attribute a run's issue writes (CLAUDE-234). No raw REST in handlers.
+- Web: `web/mod.rs` (axum + askama templates from `templates/`, compiled into the binary) mounts `api::router` under `/api` plus the two webhook listeners. `settings.rs` owns DB-backed runtime config; `config.rs` holds the serde schema and bootstrap file.
+- DB: `db.rs` holds the pool and two embedded migrators, `migrations/sqlite/` and `migrations/postgres/`. Every schema change needs a matching migration in BOTH directories. Queries are runtime `sqlx::query` (no compile-time macros, no offline `.sqlx` data).
+- Shipped actions in `actions/*.yml` are `include_str!`'d by tests in `action.rs`, so editing one can break a unit test.
 
 ## Conventions
 

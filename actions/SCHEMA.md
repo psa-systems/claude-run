@@ -18,7 +18,7 @@ name: <kebab-id>            # required
 kind: scripted              # optional: scripted (default) | youtrack | closed-issue-summary
 enabled: true               # optional, default true; false skips the action in the scheduler
 workdir_base: /path/to/dir  # optional, overrides $CLAUDE_RUN_WORKDIR_BASE for this action
-link_template: https://youtrack/issue/{key}  # optional; {key} -> job key, builds a per-job link (render_link)
+link_template: https://tracker.example.com/issue/{key}  # optional override; {key} -> job key (render_link). Default for YouTrack actions: the Settings -> Auth card's YouTrack URL + /issue/{key}
 input:
   command: |                # required, nu snippet, stdout = JSON array
     #!/usr/bin/env nu
@@ -578,7 +578,7 @@ neither clones a repository nor opens a pull request.
 ### `workdir_base` (string, optional)
 
 Per-job working directories are rooted under `<workdir_base>/<name>/<key>`. Defaults to `$CLAUDE_RUN_WORKDIR_BASE`
-(which itself defaults to `/tmp/claude-run`). Setting this on the action overrides the env for that action only - useful
+(which itself defaults to `$CLAUDE_RUN_DATA_DIR/workdirs`, i.e. `/data/workdirs` in the container). The shipped actions set none. Setting this on the action overrides the env for that action only - useful
 when one action needs more disk than `/tmp` allows (e.g., a workspace mounted on a large data volume) or when you want
 per-action isolation on disk for cleanup or quota reasons.
 
@@ -587,8 +587,8 @@ per-action isolation on disk for cleanup or quota reasons.
 - If the value starts with `$`, it is evaluated as a nu expression and the result is used. Lets you do things like:
 
   ```yaml
-  workdir_base: $nu.home-dir | path join workspace
-  workdir_base: $"($env.HOME)/workspace"
+  workdir_base: $nu.home-dir | path join scratch
+  workdir_base: $"($env.HOME)/scratch"
   workdir_base: $"($env.XDG_DATA_HOME)/claude-run"
   ```
 
@@ -596,9 +596,9 @@ per-action isolation on disk for cleanup or quota reasons.
   references that `path expand` understands still work for literal values.
 
   ```yaml
-  workdir_base: ~/workspace                          # literal, ~ expanded
+  workdir_base: ~/scratch                            # literal, ~ expanded
   workdir_base: /mnt/data/claude-run                 # literal, absolute
-  workdir_base: $nu.home-dir | path join workspace   # evaluated
+  workdir_base: $nu.home-dir | path join scratch     # evaluated
   ```
 
 ### `input.command` (nu snippet, required for `kind: scripted`)

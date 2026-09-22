@@ -77,10 +77,6 @@ native:
   # over the cap renders the cap plus an explicit "and N more" line.
   max_listed_per_project: 100
 
-# Per-action link template (CLAUDE-1). Job keys are parent issue ids, so they
-# render as clickable links to the YouTrack issue in the web UI.
-link_template: "https://example.myjetbrains.com/issue/{key}"
-
 output:
   file: closed-issue-summary.jsonl
 
