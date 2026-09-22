@@ -981,7 +981,7 @@ verbatim, so use lowercase `[a-z0-9_-]`; a name needing URL escaping is warned a
 Triage sorts each verified failure into one of three buckets: a failing PR check that a code change fixes (`code_fix`)
 mints an issue and sets `AI Agent = Queued` so the runner opens the fix PR; a failure no PR fixes (`human_action`,
 e.g. a main-branch / tag / release / missing-secret failure) mints a human-assigned issue with no PR; a transient /
-infra / flaky failure (`transient`) mints nothing. The reused per-key + daily caps throttle a storm of failures.
+infra / flaky failure (`transient`) mints nothing. The reused per-key + daily caps throttle a storm of failures; the daily cap is `config.webhook.max_runs_per_day` (default 20, at least 1), editable on the Settings page and applied to the next event with no restart.
 
 **CLAUDE-208: a stopped run is not a broken one.** Forgejo fires `action_run_failure` for every non-success done status, and it reports run-level `failure` for a run whose jobs were merely CANCELLED, which is what a newer push to the same ref produces when it supersedes an in-flight run. The run-level status alone therefore cannot tell a broken build from a stopped one, so the consumer reads the per-job statuses that come back with the log: when no job failed and every job ended `cancelled` or `skipped`, the delivery is acked and the run closed with a summary naming those statuses, with no triage and no issue. Any other status set (including an all-`success` run under a run-level `failure`) still triages and mints, and a job list that did not resolve at all (a rejected log token, a pruned run) fails open and mints as before.
 
@@ -1280,8 +1280,8 @@ so a plain issue can never block the like-numbered pull request. A second comman
 saying so and is dropped.
 
 **Configuration** is the `Comment webhook` section on the Settings page (`GET` / `PUT
-/api/settings/webhook_comment`, DB key `config.webhook_comment`). Top level: `trigger`, `max_instruction_chars`, and
-`sources`. Per source: `secret_ref` (HMAC; unset means the endpoint `401`s everything), `allowed_repos` (the same three
+/api/settings/webhook_comment`, DB key `config.webhook_comment`). Top level: `trigger`, `max_instruction_chars`,
+`max_runs_per_day` (the daily run cap of this listener's ledger, default 20, at least 1, live), and `sources`. Per source: `secret_ref` (HMAC; unset means the endpoint `401`s everything), `allowed_repos` (the same three
 pattern forms as the CI-failure allow-list; empty denies all), `rate_limit_per_min`, `write_token_ref`,
 `allowed_permissions`, the `max_files` / `max_lines` decision-gate caps, and the commit identity (`bot_author`,
 `bot_email`, `skip_marker`). The plain-issue route adds no settings of its own: it reads the existing `Mint` section
