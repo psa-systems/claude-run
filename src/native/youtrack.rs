@@ -2913,6 +2913,7 @@ mod tests {
             transient: false,
             timed_out: false,
             login_required: false,
+            killed: false,
         }
     }
 
@@ -2927,6 +2928,7 @@ mod tests {
             transient: false,
             timed_out: true,
             login_required: false,
+            killed: false,
         }
     }
 
@@ -2945,6 +2947,7 @@ mod tests {
             transient: true,
             timed_out: false,
             login_required: false,
+            killed: false,
         };
         let body = failure_comment(&r);
         assert!(body.starts_with("Claude AI agent run FAILED (claude exited 1, see stream.jsonl):"));
