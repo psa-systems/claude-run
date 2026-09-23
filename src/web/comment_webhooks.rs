@@ -1936,14 +1936,18 @@ pub fn outcome_comment(
 ) -> String {
     match decision {
         Decision::ClaudeFailed => {
-            let mut body = [
-                format!("**Claude run FAILED ({}).**", claude.error),
-                String::new(),
-                claude.summary.clone(),
-                String::new(),
+            let mut lines = vec![format!("**Claude run FAILED ({}).**", claude.error)];
+            lines.push(String::new());
+            if let Some(hint) = crate::claude::failure_hint(claude.timed_out, claude.killed) {
+                lines.push(hint.to_string());
+                lines.push(String::new());
+            }
+            lines.push(claude.summary.clone());
+            lines.push(String::new());
+            lines.push(
                 "Nothing was pushed. See the per-attempt stream log on the runner host for full context.".to_string(),
-            ]
-            .join("\n");
+            );
+            let mut body = lines.join("\n");
             body.push_str(&crate::claude::raw_event_details(&claude.raw));
             body
         }
@@ -2903,6 +2907,7 @@ mod tests {
             transient: false,
             timed_out: false,
             login_required: false,
+            killed: false,
         };
         let pushed = outcome_comment(&Decision::Push { files: 1, lines: 2 }, &ok, None);
         assert!(pushed.contains("Claude pushed a commit."));
@@ -2947,6 +2952,36 @@ mod tests {
         // Usage and busy replies are distinct and name what happened.
         assert!(help_comment("/claude", true).contains("/claude help"));
         assert!(busy_comment(true).contains("already running"));
+    }
+
+    /// CLAUDE-326: a recognized failure exit code (124 = timeout, 137 =
+    /// SIGKILL) gets one plain-language hint line in the FAILED comment; any
+    /// other exit code leaves the comment byte-identical to before this issue.
+    #[test]
+    fn claude_failed_comment_explains_recognized_exit_codes() {
+        let mut timed_out = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "");
+        timed_out.timed_out = true;
+        let body = outcome_comment(&Decision::ClaudeFailed, &timed_out, None);
+        assert!(body.contains("timeout"), "{body}");
+        assert!(body.contains("claude_timeout_seconds"), "{body}");
+
+        let mut killed = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
+        killed.killed = true;
+        let body = outcome_comment(&Decision::ClaudeFailed, &killed, None);
+        assert!(body.contains("SIGKILL"), "{body}");
+        assert!(body.contains("out-of-memory"), "{body}");
+
+        let plain = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "tail");
+        let with_hint = outcome_comment(&Decision::ClaudeFailed, &plain, None);
+        let without_hint_field = {
+            let mut r = plain.clone();
+            r.timed_out = false;
+            r.killed = false;
+            outcome_comment(&Decision::ClaudeFailed, &r, None)
+        };
+        assert_eq!(with_hint, without_hint_field);
+        assert!(!with_hint.contains("timeout"), "{with_hint}");
+        assert!(!with_hint.contains("SIGKILL"), "{with_hint}");
     }
 
     /// CLAUDE-221: the plain-issue route's own reply bodies. Both outcomes name

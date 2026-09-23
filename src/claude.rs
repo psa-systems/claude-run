@@ -84,6 +84,12 @@ pub struct ClaudeResult {
     /// specifically (rather than just retry later, the generic transient path)
     /// branch on this field.
     pub login_required: bool,
+    /// CLAUDE-326: exit code 137 (SIGKILL) was observed with no captured
+    /// terminal result, i.e. an out-of-memory kill or a forced external kill
+    /// rather than a claude-side failure. Always paired with `ok = false`.
+    /// Mutually exclusive with `timed_out` in practice (the two exit codes
+    /// differ), but never assumed so by callers.
+    pub killed: bool,
 }
 
 impl ClaudeResult {
@@ -98,6 +104,7 @@ impl ClaudeResult {
             transient: false,
             timed_out: false,
             login_required: false,
+            killed: false,
         }
     }
 }
@@ -517,6 +524,8 @@ impl ClaudeInvoker {
                 // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
                 timed_out: exit_code == 124,
                 login_required: false,
+                // CLAUDE-326: exit 137 is SIGKILL, typically an OOM kill.
+                killed: exit_code == 137,
             });
         }
 
@@ -535,6 +544,9 @@ impl ClaudeInvoker {
                 transient: false,
                 timed_out: false,
                 login_required: false,
+                // Reached only when `exit_code == 0` (a nonzero code with no
+                // finalized-on-result outcome already returned above).
+                killed: false,
             });
         }
 
@@ -577,6 +589,9 @@ impl ClaudeInvoker {
                     transient: false,
                     timed_out: false,
                     login_required: false,
+                    // A captured terminal result means the run completed; not
+                    // the SIGKILL-with-no-result case `killed` classifies.
+                    killed: false,
                 });
             }
             Ok(_) => {}
@@ -611,6 +626,7 @@ impl ClaudeInvoker {
             transient: false,
             timed_out: false,
             login_required: false,
+            killed: false,
         })
     }
 }
@@ -1067,6 +1083,27 @@ fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -> String {
     }
 }
 
+/// CLAUDE-326: a one-sentence plain-language explanation of a recognized
+/// failure exit code, for callers that want to surface it alongside the raw
+/// `claude.error` / `claude.summary` text. `timed_out` takes precedence over
+/// `killed` (the two are expected to be mutually exclusive in practice, since
+/// they come from different exit codes). Neither set returns `None`.
+pub fn failure_hint(timed_out: bool, killed: bool) -> Option<&'static str> {
+    if timed_out {
+        Some(
+            "This looks like a timeout: the run hit the action's configured \
+             `claude_timeout_seconds` and was killed before it finished.",
+        )
+    } else if killed {
+        Some(
+            "This looks like a SIGKILL: most commonly an out-of-memory kill, \
+             or a forced external kill of the process.",
+        )
+    } else {
+        None
+    }
+}
+
 /// CLAUDE-256: the operator-facing summary for a stream log that could not be
 /// read. Never empty, and it names the path so the file can be inspected.
 fn unreadable_log_summary(stream_log: &Path, err: &std::io::Error) -> String {
@@ -1114,6 +1151,7 @@ fn login_required_result(message: &str) -> ClaudeResult {
         transient: true,
         timed_out: false,
         login_required: true,
+        killed: false,
     }
 }
 
@@ -1141,6 +1179,8 @@ fn relay_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Clau
         // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
         timed_out: exit_code == 124,
         login_required: false,
+        // CLAUDE-326: exit 137 is SIGKILL, typically an OOM kill.
+        killed: exit_code == 137,
     }
 }
 
@@ -1174,6 +1214,8 @@ fn read_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Claud
         // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
         timed_out: exit_code == 124,
         login_required: false,
+        // CLAUDE-326: exit 137 is SIGKILL, typically an OOM kill.
+        killed: exit_code == 137,
     }
 }
 
@@ -1235,6 +1277,19 @@ mod tests {
     use super::*;
     use crate::testutil::write_stub;
     use serde_json::json;
+
+    #[test]
+    fn failure_hint_classifies_recognized_exit_codes() {
+        let hint = failure_hint(true, false).expect("timed_out yields a hint");
+        assert!(hint.contains("timeout"), "{hint}");
+        assert!(hint.contains("claude_timeout_seconds"), "{hint}");
+
+        let hint = failure_hint(false, true).expect("killed yields a hint");
+        assert!(hint.contains("SIGKILL"), "{hint}");
+        assert!(hint.contains("out-of-memory"), "{hint}");
+
+        assert!(failure_hint(false, false).is_none());
+    }
 
     #[test]
     fn transient_only_on_rate_limit_signal() {
