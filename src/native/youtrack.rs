@@ -452,6 +452,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 &job,
                 pr_strategy,
                 bypass_backoff,
+                run_id,
             )
             .await;
             if let Err(e) = state::run_inflight_remove(&pool, run_id, &job.key).await {
@@ -972,6 +973,10 @@ async fn process_job(
     job: &YoutrackJob,
     pr_strategy: crate::action::PrStrategy,
     bypass_backoff: bool,
+    // CLAUDE-315: the run row this job belongs to, for the invocation's usage
+    // record; the job itself already threads `run_id` through the calling
+    // scheduler loop for `run_inflight_add`/`run_inflight_remove`.
+    run_id: i64,
 ) -> Result<ProcessedJob> {
     let started = Instant::now();
     let action = &loaded.action;
@@ -1135,6 +1140,17 @@ async fn process_job(
             )?;
             // DEV-707: bill the run before any branch discards `r`.
             spend.record(&r);
+            // CLAUDE-315: persist this invocation's plan usage before any
+            // branch discards `r`, mirroring the billing call above.
+            crate::usage::record_invocation(
+                pool,
+                &action.name,
+                Some(key),
+                Some(run_id),
+                &stream_log,
+                &r,
+            )
+            .await;
             if cancel.is_cancelled() {
                 // The token tripped mid-run; `invoke` already terminated the
                 // child. Synthesize a cancelled result so finalize runs and no
@@ -2706,6 +2722,7 @@ mod tests {
             &j,
             PrStrategy::Branch,
             false,
+            1,
         )
         .await
         .unwrap();
@@ -2789,6 +2806,7 @@ mod tests {
             &j,
             PrStrategy::Branch,
             false,
+            1,
         )
         .await
         .unwrap();
@@ -2878,6 +2896,7 @@ mod tests {
             &j,
             PrStrategy::Branch,
             false,
+            1,
         )
         .await
         .unwrap();
@@ -2914,6 +2933,7 @@ mod tests {
             timed_out: false,
             login_required: false,
             killed: false,
+            exit_code: Some(0),
         }
     }
 
@@ -2929,6 +2949,7 @@ mod tests {
             timed_out: true,
             login_required: false,
             killed: false,
+            exit_code: Some(124),
         }
     }
 
@@ -2948,6 +2969,7 @@ mod tests {
             timed_out: false,
             login_required: false,
             killed: false,
+            exit_code: Some(1),
         };
         let body = failure_comment(&r);
         assert!(body.starts_with("Claude AI agent run FAILED (claude exited 1, see stream.jsonl):"));

@@ -1008,6 +1008,7 @@ async fn run_instruction(
         let workdir = workdir.clone();
         let stream_log = stream_log.clone();
         let run_spend = spend.clone();
+        let pool = &ctx.pool;
         tokio::task::block_in_place(move || {
             serve_run(
                 backend.as_ref(),
@@ -1019,6 +1020,9 @@ async fn run_instruction(
                 &stream_log,
                 timeout,
                 &run_spend,
+                pool,
+                run_id,
+                key,
             )
         })
     } else {
@@ -1108,6 +1112,14 @@ fn serve_run(
     timeout: Duration,
     // DEV-705 / DEV-707: this delivery's ledger and frozen ceiling.
     spend: &crate::usage::RunSpend,
+    // CLAUDE-315: where this invocation's `claude_invocations` row is written.
+    // `serve_run` is synchronous and always run inside
+    // `tokio::task::block_in_place` (never `spawn_blocking`), which moves this
+    // closure off the active async worker before it runs, so bridging into
+    // the async write with `Handle::current().block_on` is safe here too.
+    pool: &crate::db::DbPool,
+    run_id: Option<i64>,
+    key: &str,
 ) -> RunOutcome {
     let cancel = CancellationToken::new();
 
@@ -1184,6 +1196,16 @@ fn serve_run(
                                 ClaudeResult::synthesized("claude invocation failed", e.to_string())
                             }
                         };
+                        tokio::runtime::Handle::current().block_on(
+                            crate::usage::record_invocation(
+                                pool,
+                                WEBHOOK_COMMENT_ACTION,
+                                Some(key),
+                                run_id,
+                                stream_log,
+                                &result,
+                            ),
+                        );
                         // The instruction does not outlive the session, on
                         // success and failure alike. The file is already
                         // outside the work tree and cannot be committed, so a
@@ -2908,6 +2930,7 @@ mod tests {
             timed_out: false,
             login_required: false,
             killed: false,
+            exit_code: Some(0),
         };
         let pushed = outcome_comment(&Decision::Push { files: 1, lines: 2 }, &ok, None);
         assert!(pushed.contains("Claude pushed a commit."));

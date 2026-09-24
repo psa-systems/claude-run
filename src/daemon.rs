@@ -685,6 +685,7 @@ fn build_mint_context(
             crate::usage::RunBudget::new(defaults.daily_budget_usd, defaults.budget_warn_fraction)
         },
         Some(paths.usage_log()),
+        pool.clone(),
     ));
 
     info!(backend = backend.name(), "webhook mint enabled");
