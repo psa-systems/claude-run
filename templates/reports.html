@@ -48,6 +48,84 @@
   </div>
 </div>
 
+<h2>Claude plan usage</h2>
+{# CLAUDE-315: rate-limit utilization per `claude` invocation, from
+   `claude_invocations`. Inline SVG, same pattern as the per-action duration
+   chart (templates/action_chart.html): no JS charting library. An invocation
+   with no `rate_limit_event` at all (an old CLI, or a session that made no
+   API call reporting one) leaves a gap in the line rather than a fabricated
+   0%, and the count of such gaps is stated below the chart. #}
+{% if let Some(c) = usage_chart %}
+<div class="card">
+  <svg viewBox="0 0 {{ c.width }} {{ c.height }}" width="100%" role="img"
+       aria-label="Line chart of five-hour and seven-day rate-limit utilization for the last {{ c.count }} claude invocations, oldest to newest"
+       style="display: block; font-family: var(--mono); font-size: 11px;">
+    {% for t in c.y_ticks %}
+      <line x1="{{ c.plot_l }}" y1="{{ t.y }}" x2="{{ c.plot_r }}" y2="{{ t.y }}"
+            style="stroke: var(--border); stroke-width: 1;" />
+      <text x="{{ c.plot_l - 8 }}" y="{{ t.y + 4 }}" text-anchor="end"
+            style="fill: var(--fg-dim);">{{ t.label }}</text>
+    {% endfor %}
+    <line x1="{{ c.plot_l }}" y1="{{ c.plot_b }}" x2="{{ c.plot_r }}" y2="{{ c.plot_b }}"
+          style="stroke: var(--border); stroke-width: 1;" />
+    {# five-hour window: accent color #}
+    {% for seg in c.five_hour_polylines %}
+      <polyline points="{{ seg }}" fill="none" style="stroke: var(--accent); stroke-width: 2;" />
+    {% endfor %}
+    {% for p in c.five_hour_points %}
+      <circle cx="{{ p.x }}" cy="{{ p.y }}" r="3"
+              style="fill: {% if p.timed_out || !p.ok %}#e05252{% else %}var(--accent){% endif %};">
+        <title>5h: {{ p.label }}</title>
+      </circle>
+    {% endfor %}
+    {# seven-day window: a second, dimmer series so the two are distinguishable #}
+    {% for seg in c.seven_day_polylines %}
+      <polyline points="{{ seg }}" fill="none" style="stroke: var(--fg-dim); stroke-width: 2; stroke-dasharray: 4 2;" />
+    {% endfor %}
+    {% for p in c.seven_day_points %}
+      <circle cx="{{ p.x }}" cy="{{ p.y }}" r="3"
+              style="fill: {% if p.timed_out || !p.ok %}#e05252{% else %}var(--fg-dim){% endif %};">
+        <title>7d: {{ p.label }}</title>
+      </circle>
+    {% endfor %}
+    <text x="{{ c.plot_l }}" y="{{ c.height - 8 }}" text-anchor="start"
+          style="fill: var(--fg-dim);">{{ c.x_start }}</text>
+    <text x="{{ c.plot_r }}" y="{{ c.height - 8 }}" text-anchor="end"
+          style="fill: var(--fg-dim);">{{ c.x_end }}</text>
+  </svg>
+  <div class="dim" style="font-size: 12px; margin-top: 8px;">
+    {{ c.count }} invocation{% if c.count != 1 %}s{% endif %}, oldest to newest. Solid = five-hour window, dashed = seven-day window. Red markers are timed-out or failed invocations.
+    {% if usage_missing_count > 0 %}
+      {{ usage_missing_count }} invocation{% if usage_missing_count != 1 %}s{% endif %} had no rate-limit data at all and appear as a gap in the line.
+    {% endif %}
+  </div>
+</div>
+{% else %}
+<div class="card"><span class="dim">No claude invocations recorded in this window.</span></div>
+{% endif %}
+
+{% if !usage_recent.is_empty() %}
+<table>
+  <thead>
+    <tr><th>Timestamp</th><th>Action</th><th>Job key</th><th>Outcome</th><th>5h</th><th>7d</th><th>Status</th><th>API retries</th></tr>
+  </thead>
+  <tbody>
+    {% for r in usage_recent %}
+      <tr>
+        <td class="mono dim">{{ r.ts }}</td>
+        <td class="mono">{{ r.action }}</td>
+        <td class="mono">{{ r.job_key }}</td>
+        <td class="mono">{{ r.outcome }}</td>
+        <td class="mono">{{ r.five_hour_pct }}</td>
+        <td class="mono">{{ r.seven_day_pct }}</td>
+        <td class="mono">{{ r.status }}</td>
+        <td class="mono">{{ r.api_retries }}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
 <h2>Daily spend</h2>
 {% if daily.is_empty() %}
   <div class="card"><span class="dim">No spend recorded in this window.</span></div>

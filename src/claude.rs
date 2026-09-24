@@ -26,7 +26,7 @@ use chrono::SecondsFormat;
 
 use serde::Serialize;
 use serde_json::Value;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::action::ClaudeBlock;
 use crate::cancel::CancellationToken;
@@ -90,6 +90,12 @@ pub struct ClaudeResult {
     /// Mutually exclusive with `timed_out` in practice (the two exit codes
     /// differ), but never assumed so by callers.
     pub killed: bool,
+    /// CLAUDE-315: the `timeout(1)`-wrapped child's exit code, when this
+    /// result came from one actually exiting. `None` on a result synthesized
+    /// before or without a child process (a login-required short-circuit, a
+    /// stream-log I/O failure caught before the process outcome could be
+    /// read, or a test/cancel path that never spawned `claude` at all).
+    pub exit_code: Option<i32>,
 }
 
 impl ClaudeResult {
@@ -105,6 +111,7 @@ impl ClaudeResult {
             timed_out: false,
             login_required: false,
             killed: false,
+            exit_code: None,
         }
     }
 }
@@ -462,6 +469,63 @@ impl ClaudeInvoker {
         // failed still spent what it spent.
         let usage = crate::usage::parse_stream_usage(stream_log);
 
+        // CLAUDE-315: one line per invocation that reaches this point, so plan
+        // usage is visible without opening the stream log or waiting for the
+        // Reports chart. `warn!` (not `info!`) when the plan itself is
+        // unhappy: a non-"allowed" status, or either window at or past 90%
+        // utilization, since that is the point an operator needs to notice
+        // before the next invocation gets rate-limited outright.
+        match &usage.rate_limit {
+            Some(rl) => {
+                let hot = rl.status.as_deref().is_some_and(|s| s != "allowed")
+                    || rl.five_hour_utilization.is_some_and(|u| u >= 0.9)
+                    || rl.seven_day_utilization.is_some_and(|u| u >= 0.9);
+                let fields = (
+                    rl.status.as_deref().unwrap_or("(absent)"),
+                    rl.rate_limit_type.as_deref().unwrap_or("(absent)"),
+                    rl.five_hour_utilization,
+                    rl.seven_day_utilization,
+                    rl.surpassed_threshold,
+                    rl.is_using_overage,
+                    rl.overage_status.as_deref().unwrap_or("(absent)"),
+                    usage.api_retries.values().sum::<u64>(),
+                );
+                if hot {
+                    warn!(
+                        stream_log = %stream_log.display(),
+                        status = fields.0,
+                        rate_limit_type = fields.1,
+                        five_hour_utilization = fields.2,
+                        seven_day_utilization = fields.3,
+                        surpassed_threshold = fields.4,
+                        is_using_overage = fields.5,
+                        overage_status = fields.6,
+                        api_retries = fields.7,
+                        "claude usage"
+                    );
+                } else {
+                    info!(
+                        stream_log = %stream_log.display(),
+                        status = fields.0,
+                        rate_limit_type = fields.1,
+                        five_hour_utilization = fields.2,
+                        seven_day_utilization = fields.3,
+                        surpassed_threshold = fields.4,
+                        is_using_overage = fields.5,
+                        overage_status = fields.6,
+                        api_retries = fields.7,
+                        "claude usage"
+                    );
+                }
+            }
+            None => info!(
+                stream_log = %stream_log.display(),
+                rate_limit = "absent",
+                api_retries = usage.api_retries.values().sum::<u64>(),
+                "claude usage"
+            ),
+        }
+
         // CLAUDE-233: the relay is the stream log's only writer, so a relay that
         // stopped early means the log is missing every event after that point.
         // With the terminal `result` already captured the run is still decidable
@@ -526,6 +590,7 @@ impl ClaudeInvoker {
                 login_required: false,
                 // CLAUDE-326: exit 137 is SIGKILL, typically an OOM kill.
                 killed: exit_code == 137,
+                exit_code: Some(exit_code),
             });
         }
 
@@ -547,6 +612,7 @@ impl ClaudeInvoker {
                 // Reached only when `exit_code == 0` (a nonzero code with no
                 // finalized-on-result outcome already returned above).
                 killed: false,
+                exit_code: Some(exit_code),
             });
         }
 
@@ -592,6 +658,7 @@ impl ClaudeInvoker {
                     // A captured terminal result means the run completed; not
                     // the SIGKILL-with-no-result case `killed` classifies.
                     killed: false,
+                    exit_code: Some(exit_code),
                 });
             }
             Ok(_) => {}
@@ -627,6 +694,7 @@ impl ClaudeInvoker {
             timed_out: false,
             login_required: false,
             killed: false,
+            exit_code: Some(exit_code),
         })
     }
 }
@@ -1152,6 +1220,9 @@ fn login_required_result(message: &str) -> ClaudeResult {
         timed_out: false,
         login_required: true,
         killed: false,
+        // No process exit is meaningful here: a login failure is a runner-side
+        // short-circuit, not a `claude` child that ran and exited.
+        exit_code: None,
     }
 }
 
@@ -1181,6 +1252,7 @@ fn relay_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Clau
         login_required: false,
         // CLAUDE-326: exit 137 is SIGKILL, typically an OOM kill.
         killed: exit_code == 137,
+        exit_code: Some(exit_code),
     }
 }
 
@@ -1216,6 +1288,7 @@ fn read_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Claud
         login_required: false,
         // CLAUDE-326: exit 137 is SIGKILL, typically an OOM kill.
         killed: exit_code == 137,
+        exit_code: Some(exit_code),
     }
 }
 

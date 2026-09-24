@@ -1886,6 +1886,41 @@ mod tests {
         }
     }
 
+    /// CLAUDE-315: every `claude` invocation must leave a `claude_invocations`
+    /// row, so plan usage is queryable history rather than only a log line. A
+    /// call site that reaches `ClaudeInvoker::invoke` (or the trait method of
+    /// the same name) without a matching `record_invocation` call in the same
+    /// file loses that history silently. Enumerated mechanically over the
+    /// known call sites, matching `every_runner_pairs_run_begin_with_a_run_guard`
+    /// above, so a new `.invoke(` call site added without its
+    /// `record_invocation` companion fails here instead of shipping a gap in
+    /// the usage record. Test modules are excluded: a mock invoker's `.invoke(`
+    /// in a test fixture records nothing.
+    #[test]
+    fn every_claude_invoke_call_site_pairs_with_a_record_invocation_call() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let call_sites = [
+            "job.rs",
+            "native/youtrack.rs",
+            "triage.rs",
+            "web/comment_webhooks.rs",
+        ];
+        for file in call_sites {
+            let text = std::fs::read_to_string(src_dir.join(file)).unwrap();
+            let code = text.split("\n#[cfg(test)]").next().unwrap();
+            let invokes = code.matches(".invoke(").count();
+            let records = code.matches("record_invocation(").count();
+            assert!(
+                invokes > 0,
+                "{file} no longer calls claude.invoke(); update this list"
+            );
+            assert_eq!(
+                invokes, records,
+                "{file}: {invokes} .invoke() call(s) but {records} record_invocation() call(s); a claude invocation must always leave a claude_invocations row"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn secrets_crud_round_trips() {
         let pool = mem_pool().await;
