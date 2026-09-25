@@ -46,6 +46,7 @@ use crate::cancel::CancellationToken;
 use crate::ci_failure::analysis::{self as analysis, AnalysisInputs, RunCoordinates};
 use crate::claude::ClaudeInvoker;
 use crate::config::AutoFixConfig;
+use crate::db::DbPool;
 use crate::error::Result;
 use crate::forge_log::ForgeReads;
 
@@ -470,6 +471,12 @@ pub struct AnalysisClassifier {
     budget: crate::usage::RunBudget,
     /// DEV-707: where each classification's usage record is appended.
     usage_log: Option<PathBuf>,
+    /// CLAUDE-315: where this classification's `claude_invocations` row is
+    /// written. `classify` is synchronous and always run inside
+    /// `tokio::task::spawn_blocking` (never `block_in_place`), so bridging into
+    /// the async write with `Handle::current().block_on` blocks only that
+    /// dedicated blocking-pool thread, not an async worker.
+    pool: DbPool,
 }
 
 impl AnalysisClassifier {
@@ -487,6 +494,7 @@ impl AnalysisClassifier {
         fj: Arc<dyn ForgeReads>,
         budget: crate::usage::RunBudget,
         usage_log: Option<PathBuf>,
+        pool: DbPool,
     ) -> Self {
         Self {
             invoker,
@@ -497,6 +505,7 @@ impl AnalysisClassifier {
             fj,
             budget,
             usage_log,
+            pool,
         }
     }
 
@@ -631,6 +640,18 @@ impl FailureClassifier for AnalysisClassifier {
         // record: one classification is one unit of spend, with no run row.
         spend.record(&result);
         spend.finish(None, spend.exit_code(crate::exit::OK));
+        // CLAUDE-315: this classification has neither a scheduled job key nor
+        // a run row, so both are `None`. `classify` runs inside
+        // `spawn_blocking` (see the `pool` field doc), so blocking this thread
+        // on the async write is safe.
+        tokio::runtime::Handle::current().block_on(crate::usage::record_invocation(
+            &self.pool,
+            crate::web::webhooks::WEBHOOK_MINT_ACTION,
+            None,
+            None,
+            &stream_log,
+            &result,
+        ));
         if !result.ok {
             // CLAUDE-146: surface the reason claude actually reported
             // (`result.summary`, built by `friendly_failure_summary`) instead
@@ -1102,8 +1123,8 @@ mod tests {
     /// with the configured allowed tools, timeout, and a prompt naming the log
     /// and workflow files. Asserted against a stub `claude` binary recording
     /// its own argv and the prompt it was invoked with.
-    #[test]
-    fn analysis_classifier_invokes_claude_with_the_configured_session_shape() {
+    #[tokio::test]
+    async fn analysis_classifier_invokes_claude_with_the_configured_session_shape() {
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("claude-stub.sh");
         let argv_file = dir.path().join("argv.txt");
@@ -1137,13 +1158,21 @@ mod tests {
             Arc::new(NoForgeReads),
             crate::usage::RunBudget::new(1.0, 0.8),
             None,
+            crate::db::test_pool().await,
         );
         // The configured timeout, asserted on the struct directly: the actual
         // wall-clock bound is enforced by the `timeout(1)` wrapper `invoke`
         // shells out to, which is outside what this stub's own argv can see.
         assert_eq!(classifier.timeout, Duration::from_secs(600));
         let input = input_with_log("test foo ... FAILED");
-        let verdict = classifier.classify(&input).unwrap();
+        // `classify` is synchronous and calls `Handle::current().block_on` to
+        // persist the usage record, mirroring the production call through
+        // `spawn_blocking` rather than calling it inline on the test's own
+        // async task (which would deadlock).
+        let verdict = tokio::task::spawn_blocking(move || classifier.classify(&input))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(verdict.bucket, TriageBucket::CodeFix);
 
         let argv = std::fs::read_to_string(&argv_file).unwrap();

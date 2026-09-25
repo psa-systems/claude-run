@@ -160,6 +160,59 @@ pub struct HourBucket {
     pub run_starts: i64,
 }
 
+/// CLAUDE-315: one `claude_invocations` row, oldest-to-newest, for the plan
+/// usage chart. `five_hour_utilization` / `seven_day_utilization` are `None`
+/// when the invocation's stream log had no `rate_limit_event` at all (an old
+/// CLI, or a session that made no API call reporting one): those points are
+/// rendered as gaps rather than a fabricated zero.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaudeUsagePoint {
+    pub ts: String,
+    pub action: String,
+    pub job_key: Option<String>,
+    pub ok: bool,
+    pub timed_out: bool,
+    pub five_hour_utilization: Option<f64>,
+    pub seven_day_utilization: Option<f64>,
+}
+
+impl ClaudeUsagePoint {
+    /// Neither window has a reading: this invocation's log carried no
+    /// `rate_limit_event` at all, so the chart draws a gap here.
+    pub fn has_no_rate_limit_data(&self) -> bool {
+        self.five_hour_utilization.is_none() && self.seven_day_utilization.is_none()
+    }
+}
+
+/// One row of the "most recent invocations" table.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentInvocation {
+    pub ts: String,
+    pub action: String,
+    pub job_key: Option<String>,
+    pub ok: bool,
+    pub timed_out: bool,
+    pub five_hour_utilization: Option<f64>,
+    pub seven_day_utilization: Option<f64>,
+    pub rate_limit_status: Option<String>,
+    /// Sum of every `api_retries_json` count for this invocation (0 when the
+    /// column is NULL, i.e. no retry was observed).
+    pub api_retries: u64,
+}
+
+/// The whole "Claude plan usage" report section: the chart series plus the
+/// most-recent-invocations table, both honoring the same `range`/`action`
+/// filters as the rest of `/reports`.
+#[derive(Debug, Default, Serialize)]
+pub struct ClaudeUsageReport {
+    pub points: Vec<ClaudeUsagePoint>,
+    /// Count of `points` with no rate-limit data at all, stated explicitly
+    /// next to the chart rather than left for the reader to notice gaps.
+    pub missing_data_count: usize,
+    /// The 20 most recent invocations in the window, newest first.
+    pub recent: Vec<RecentInvocation>,
+}
+
 // ---- aggregations ---------------------------------------------------------
 
 /// Daily spend + run-count series from `daily_ledger`, oldest to newest.
@@ -380,6 +433,135 @@ pub async fn summary(pool: &DbPool, range: Range, action: Option<&str>) -> Resul
     })
 }
 
+/// CLAUDE-315: the `claude_invocations` chart series plus the 20-most-recent
+/// table, both filtered by the same `range`/`action` the rest of the page
+/// uses. The chart reads every row in the window (oldest first, so the SVG
+/// draws left-to-right); the table re-queries the same window newest-first
+/// and caps at 20, rather than reversing and slicing the chart's own rows, so
+/// a huge window's chart cost is not doubled by also holding the sorted
+/// reverse.
+pub async fn claude_usage(
+    pool: &DbPool,
+    range: Range,
+    action: Option<&str>,
+) -> Result<ClaudeUsageReport> {
+    let cutoff = ts_cutoff(range);
+
+    let mut sql = String::from(
+        "SELECT ts, action, job_key, ok, timed_out, five_hour_utilization, seven_day_utilization \
+         FROM claude_invocations WHERE 1 = 1",
+    );
+    if cutoff.is_some() {
+        sql.push_str(" AND ts >= ?");
+    }
+    if action.is_some() {
+        sql.push_str(" AND action = ?");
+    }
+    sql.push_str(" ORDER BY ts ASC");
+    let sql = crate::db::q(pool, &sql).into_owned();
+    #[allow(clippy::type_complexity)]
+    let mut q = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Option<String>,
+            i64,
+            i64,
+            Option<f64>,
+            Option<f64>,
+        ),
+    >(&sql);
+    if let Some(c) = &cutoff {
+        q = q.bind(c);
+    }
+    if let Some(a) = action {
+        q = q.bind(a);
+    }
+    let points: Vec<ClaudeUsagePoint> = q
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(
+            |(ts, action, job_key, ok, timed_out, five_hour, seven_day)| ClaudeUsagePoint {
+                ts,
+                action,
+                job_key,
+                ok: ok != 0,
+                timed_out: timed_out != 0,
+                five_hour_utilization: five_hour,
+                seven_day_utilization: seven_day,
+            },
+        )
+        .collect();
+    let missing_data_count = points.iter().filter(|p| p.has_no_rate_limit_data()).count();
+
+    let mut recent_sql = String::from(
+        "SELECT ts, action, job_key, ok, timed_out, five_hour_utilization, \
+         seven_day_utilization, rate_limit_status, api_retries_json \
+         FROM claude_invocations WHERE 1 = 1",
+    );
+    if cutoff.is_some() {
+        recent_sql.push_str(" AND ts >= ?");
+    }
+    if action.is_some() {
+        recent_sql.push_str(" AND action = ?");
+    }
+    recent_sql.push_str(" ORDER BY ts DESC LIMIT 20");
+    let recent_sql = crate::db::q(pool, &recent_sql).into_owned();
+    #[allow(clippy::type_complexity)]
+    let mut rq = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Option<String>,
+            i64,
+            i64,
+            Option<f64>,
+            Option<f64>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(&recent_sql);
+    if let Some(c) = &cutoff {
+        rq = rq.bind(c);
+    }
+    if let Some(a) = action {
+        rq = rq.bind(a);
+    }
+    let recent = rq
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(
+            |(ts, action, job_key, ok, timed_out, five_hour, seven_day, status, retries_json)| {
+                let api_retries = retries_json
+                    .and_then(|j| serde_json::from_str::<BTreeMap<String, u64>>(&j).ok())
+                    .map(|m| m.values().sum())
+                    .unwrap_or(0);
+                RecentInvocation {
+                    ts,
+                    action,
+                    job_key,
+                    ok: ok != 0,
+                    timed_out: timed_out != 0,
+                    five_hour_utilization: five_hour,
+                    seven_day_utilization: seven_day,
+                    rate_limit_status: status,
+                    api_retries,
+                }
+            },
+        )
+        .collect();
+
+    Ok(ClaudeUsageReport {
+        points,
+        missing_data_count,
+        recent,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,5 +704,162 @@ mod tests {
         // The finished run's 10 minutes land in exactly one weekday bucket.
         let wd_minutes: f64 = weekdays.iter().map(|d| d.run_minutes).sum();
         assert!((wd_minutes - 10.0).abs() < 1e-9);
+    }
+
+    async fn seed_run(pool: &DbPool, action: &str) -> i64 {
+        sqlx::query_scalar(&crate::db::q(
+            pool,
+            "INSERT INTO runs (action_name, started_at) VALUES (?, ?) RETURNING id",
+        ))
+        .bind(action)
+        .bind("2026-06-14T00:00:00Z")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_invocation(
+        pool: &DbPool,
+        ts: &str,
+        action: &str,
+        job_key: Option<&str>,
+        run_id: i64,
+        ok: bool,
+        timed_out: bool,
+        five_hour: Option<f64>,
+        seven_day: Option<f64>,
+        api_retries_json: Option<&str>,
+    ) {
+        sqlx::query(&crate::db::q(
+            pool,
+            "INSERT INTO claude_invocations \
+             (ts, action, job_key, run_id, exit_code, timed_out, ok, cost_usd, total_tokens, \
+              rate_limit_status, rate_limit_type, five_hour_utilization, five_hour_resets_at, \
+              seven_day_utilization, seven_day_resets_at, max_five_hour_utilization, \
+              max_seven_day_utilization, overage_status, is_using_overage, api_retries_json, \
+              stream_log_path) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ))
+        .bind(ts)
+        .bind(action)
+        .bind(job_key)
+        .bind(run_id)
+        .bind(if timed_out { 124i64 } else { 0i64 })
+        .bind(timed_out as i64)
+        .bind(ok as i64)
+        .bind(0.01f64)
+        .bind(100i64)
+        .bind(five_hour.map(|_| "allowed".to_string()))
+        .bind(None::<String>)
+        .bind(five_hour)
+        .bind(None::<String>)
+        .bind(seven_day)
+        .bind(None::<String>)
+        .bind(five_hour)
+        .bind(seven_day)
+        .bind(None::<String>)
+        .bind(0i64)
+        .bind(api_retries_json)
+        .bind("/logs/act/streams/K-attempt-1.jsonl")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// CLAUDE-315: a populated window includes a timed-out invocation and a row
+    /// with no rate-limit data at all; the gap count reflects only the latter.
+    #[tokio::test]
+    async fn claude_usage_reports_the_series_gaps_and_recent_table() {
+        let pool = mem_pool().await;
+        let run_id = seed_run(&pool, "alpha").await;
+
+        insert_invocation(
+            &pool,
+            "2026-06-14T01:00:00Z",
+            "alpha",
+            Some("K-1"),
+            run_id,
+            true,
+            false,
+            Some(0.10),
+            Some(0.05),
+            None,
+        )
+        .await;
+        // Timed out: no rate-limit event was ever reached.
+        insert_invocation(
+            &pool,
+            "2026-06-14T02:00:00Z",
+            "alpha",
+            Some("K-2"),
+            run_id,
+            false,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await;
+        insert_invocation(
+            &pool,
+            "2026-06-14T03:00:00Z",
+            "alpha",
+            Some("K-3"),
+            run_id,
+            true,
+            false,
+            Some(0.20),
+            Some(0.08),
+            Some(r#"{"rate_limited":2}"#),
+        )
+        .await;
+
+        let report = claude_usage(&pool, Range::All, None).await.unwrap();
+        assert_eq!(report.points.len(), 3);
+        assert_eq!(
+            report.missing_data_count, 1,
+            "only the timed-out row has no rate-limit data"
+        );
+        assert!(report.points[1].timed_out);
+        // Oldest first for the chart.
+        assert_eq!(report.points[0].ts, "2026-06-14T01:00:00Z");
+        assert_eq!(report.points[2].ts, "2026-06-14T03:00:00Z");
+
+        // Recent table: newest first, and the retries JSON is summed.
+        assert_eq!(report.recent.len(), 3);
+        assert_eq!(report.recent[0].ts, "2026-06-14T03:00:00Z");
+        assert_eq!(report.recent[0].api_retries, 2);
+        assert_eq!(report.recent[1].api_retries, 0);
+
+        // The action filter narrows both series.
+        let other_run = seed_run(&pool, "beta").await;
+        insert_invocation(
+            &pool,
+            "2026-06-14T04:00:00Z",
+            "beta",
+            Some("K-4"),
+            other_run,
+            true,
+            false,
+            Some(0.5),
+            Some(0.5),
+            None,
+        )
+        .await;
+        let alpha_only = claude_usage(&pool, Range::All, Some("alpha"))
+            .await
+            .unwrap();
+        assert_eq!(alpha_only.points.len(), 3);
+    }
+
+    /// Empty data renders both series without panicking.
+    #[tokio::test]
+    async fn claude_usage_empty_window_yields_empty_series() {
+        let pool = mem_pool().await;
+        let report = claude_usage(&pool, Range::All, None).await.unwrap();
+        assert!(report.points.is_empty());
+        assert_eq!(report.missing_data_count, 0);
+        assert!(report.recent.is_empty());
     }
 }

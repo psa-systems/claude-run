@@ -31,9 +31,10 @@ use std::time::Instant;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::claude::ClaudeResult;
+use crate::db::DbPool;
 
 /// Attribution bucket for turns billed with no tool result in context: the
 /// opening turn and any pure-reasoning turn between operations.
@@ -104,6 +105,73 @@ pub struct StreamUsage {
     pub peak_context_tokens: u64,
     /// Sum of every turn's input side: what the whole conversation resent.
     pub cumulative_context_tokens: u64,
+    /// CLAUDE-315: the last `rate_limit_event` seen in this invocation's
+    /// stream log, `None` when the invocation reported no such event at all
+    /// (an older CLI, or a session that made no API call that carried one).
+    pub rate_limit: Option<RateLimitSnapshot>,
+    /// CLAUDE-315: `system`/`api_retry` events, counted by their `error`
+    /// value. Empty, not absent, when the invocation retried nothing: unlike
+    /// `rate_limit`, "no retries happened" is itself the meaningful reading.
+    pub api_retries: BTreeMap<String, u64>,
+}
+
+/// One invocation's rate-limit picture, taken from the plan's
+/// `rate_limit_event` stream events. Every field is `Option`: an absent field
+/// means the event did not carry it, and must never be read as zero or
+/// "allowed" by default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct RateLimitSnapshot {
+    pub status: Option<String>,
+    pub rate_limit_type: Option<String>,
+    pub surpassed_threshold: Option<bool>,
+    pub is_using_overage: Option<bool>,
+    pub overage_status: Option<String>,
+    pub five_hour_utilization: Option<f64>,
+    pub five_hour_resets_at: Option<String>,
+    pub seven_day_utilization: Option<f64>,
+    pub seven_day_resets_at: Option<String>,
+    /// Highest `five_hour` utilization seen across every `rate_limit_event`
+    /// folded into this snapshot (one invocation, or a whole run once merged).
+    pub max_five_hour_utilization: Option<f64>,
+    pub max_seven_day_utilization: Option<f64>,
+    /// Count of `rate_limit_event` events folded into this snapshot.
+    pub events: u64,
+}
+
+impl RateLimitSnapshot {
+    /// Fold a later event into this snapshot: the point-in-time fields take
+    /// `other`'s value (it is the more recent event), the per-window maximums
+    /// and the event count accumulate.
+    fn merge(&mut self, other: &RateLimitSnapshot) {
+        if other.status.is_some() {
+            self.status = other.status.clone();
+            self.rate_limit_type = other.rate_limit_type.clone();
+            self.surpassed_threshold = other.surpassed_threshold;
+            self.is_using_overage = other.is_using_overage;
+            self.overage_status = other.overage_status.clone();
+            self.five_hour_utilization = other.five_hour_utilization;
+            self.five_hour_resets_at = other.five_hour_resets_at.clone();
+            self.seven_day_utilization = other.seven_day_utilization;
+            self.seven_day_resets_at = other.seven_day_resets_at.clone();
+        }
+        self.max_five_hour_utilization = max_opt(
+            self.max_five_hour_utilization,
+            other.max_five_hour_utilization,
+        );
+        self.max_seven_day_utilization = max_opt(
+            self.max_seven_day_utilization,
+            other.max_seven_day_utilization,
+        );
+        self.events += other.events;
+    }
+}
+
+fn max_opt(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
 }
 
 impl StreamUsage {
@@ -130,6 +198,14 @@ impl StreamUsage {
             let slot = self.by_tool.entry(name.clone()).or_default();
             slot.calls += usage.calls;
             slot.tokens.add(usage.tokens);
+        }
+        match (&mut self.rate_limit, &other.rate_limit) {
+            (Some(s), Some(o)) => s.merge(o),
+            (None, Some(o)) => self.rate_limit = Some(o.clone()),
+            _ => {}
+        }
+        for (key, count) in &other.api_retries {
+            *self.api_retries.entry(key.clone()).or_default() += count;
         }
     }
 }
@@ -203,6 +279,23 @@ pub fn parse_stream_usage(stream_log: &Path) -> StreamUsage {
                         .unwrap_or_else(|| NO_TOOL.to_string());
                 }
             }
+            Some("rate_limit_event") => {
+                let snapshot = parse_rate_limit_event(&event);
+                match &mut out.rate_limit {
+                    Some(existing) => existing.merge(&snapshot),
+                    None => out.rate_limit = Some(snapshot),
+                }
+            }
+            Some("system")
+                if event.get("subtype").and_then(|v| v.as_str()) == Some("api_retry") =>
+            {
+                let key = event
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unknown)")
+                    .to_string();
+                *out.api_retries.entry(key).or_default() += 1;
+            }
             _ => {}
         }
     }
@@ -217,6 +310,42 @@ fn content_blocks(event: &Value) -> Vec<&Value> {
         .and_then(|c| c.as_array())
         .map(|a| a.iter().collect())
         .unwrap_or_default()
+}
+
+/// Read one `rate_limit_event`'s `rate_limit_info` into a snapshot. Every
+/// field is read independently with `Option`, so a CLI version that omits one
+/// (or the whole `unifiedWindows` object) never fabricates a zero or an
+/// "allowed" default for it.
+fn parse_rate_limit_event(event: &Value) -> RateLimitSnapshot {
+    let info = event.get("rate_limit_info").unwrap_or(&Value::Null);
+    let str_field = |k: &str| info.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let bool_field = |k: &str| info.get(k).and_then(|v| v.as_bool());
+    let windows = info.get("unifiedWindows").unwrap_or(&Value::Null);
+    let window = |name: &str| windows.get(name).unwrap_or(&Value::Null);
+    let utilization = |w: &Value| w.get("utilization").and_then(|v| v.as_f64());
+    let resets_at = |w: &Value| {
+        w.get("resetsAt")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let five = window("five_hour");
+    let seven = window("seven_day");
+    let five_util = utilization(five);
+    let seven_util = utilization(seven);
+    RateLimitSnapshot {
+        status: str_field("status"),
+        rate_limit_type: str_field("rateLimitType"),
+        surpassed_threshold: bool_field("surpassedThreshold"),
+        is_using_overage: bool_field("isUsingOverage"),
+        overage_status: str_field("overageStatus"),
+        five_hour_utilization: five_util,
+        five_hour_resets_at: resets_at(five),
+        seven_day_utilization: seven_util,
+        seven_day_resets_at: resets_at(seven),
+        max_five_hour_utilization: five_util,
+        max_seven_day_utilization: seven_util,
+        events: 1,
+    }
 }
 
 /// A run's spend ceiling, frozen before the run starts.
@@ -479,6 +608,131 @@ fn append_record(path: &Path, record: &Value) {
     }
 }
 
+/// CLAUDE-315: persist one row per `claude` invocation to `claude_invocations`,
+/// so the Reports page's plan-usage chart has queryable history rather than
+/// only the "claude usage" log line. `job_key` and `run_id` are `None` for an
+/// invocation with no scheduled job or run (a triage classification). A write
+/// failure is logged at `error` and swallowed: the invocation already
+/// happened and its own outcome must not be lost because the usage record
+/// could not be saved.
+pub async fn record_invocation(
+    pool: &DbPool,
+    action: &str,
+    job_key: Option<&str>,
+    run_id: Option<i64>,
+    stream_log: &Path,
+    result: &ClaudeResult,
+) {
+    if let Err(e) = try_record_invocation(pool, action, job_key, run_id, stream_log, result).await {
+        error!(
+            action = %action,
+            job_key = job_key.unwrap_or("-"),
+            stream_log = %stream_log.display(),
+            error = %e,
+            "failed to persist claude invocation usage record"
+        );
+    }
+}
+
+async fn try_record_invocation(
+    pool: &DbPool,
+    action: &str,
+    job_key: Option<&str>,
+    run_id: Option<i64>,
+    stream_log: &Path,
+    result: &ClaudeResult,
+) -> std::result::Result<(), sqlx::Error> {
+    let rl = result.rate_limit_row();
+    let api_retries_json = if result.usage.api_retries.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&result.usage.api_retries).unwrap_or_default())
+    };
+    sqlx::query(&crate::db::q(
+        pool,
+        r#"
+        INSERT INTO claude_invocations (
+            ts, action, job_key, run_id, exit_code, timed_out, ok, cost_usd,
+            total_tokens, rate_limit_status, rate_limit_type,
+            five_hour_utilization, five_hour_resets_at,
+            seven_day_utilization, seven_day_resets_at,
+            max_five_hour_utilization, max_seven_day_utilization,
+            overage_status, is_using_overage, api_retries_json, stream_log_path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    ))
+    .bind(crate::state::now_iso())
+    .bind(action)
+    .bind(job_key)
+    .bind(run_id)
+    .bind(result.exit_code)
+    .bind(result.timed_out as i32)
+    .bind(result.ok as i32)
+    .bind(result.cost)
+    .bind(result.usage.tokens.total() as i64)
+    .bind(rl.status)
+    .bind(rl.rate_limit_type)
+    .bind(rl.five_hour_utilization)
+    .bind(rl.five_hour_resets_at)
+    .bind(rl.seven_day_utilization)
+    .bind(rl.seven_day_resets_at)
+    .bind(rl.max_five_hour_utilization)
+    .bind(rl.max_seven_day_utilization)
+    .bind(rl.overage_status)
+    .bind(rl.is_using_overage.map(|b| b as i32))
+    .bind(api_retries_json)
+    .bind(stream_log.display().to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The rate-limit fields of a `claude_invocations` row, pulled out of
+/// `ClaudeResult.usage.rate_limit` (or all-`None` when absent).
+struct RateLimitRow {
+    status: Option<String>,
+    rate_limit_type: Option<String>,
+    five_hour_utilization: Option<f64>,
+    five_hour_resets_at: Option<String>,
+    seven_day_utilization: Option<f64>,
+    seven_day_resets_at: Option<String>,
+    max_five_hour_utilization: Option<f64>,
+    max_seven_day_utilization: Option<f64>,
+    overage_status: Option<String>,
+    is_using_overage: Option<bool>,
+}
+
+impl ClaudeResult {
+    fn rate_limit_row(&self) -> RateLimitRow {
+        match &self.usage.rate_limit {
+            Some(rl) => RateLimitRow {
+                status: rl.status.clone(),
+                rate_limit_type: rl.rate_limit_type.clone(),
+                five_hour_utilization: rl.five_hour_utilization,
+                five_hour_resets_at: rl.five_hour_resets_at.clone(),
+                seven_day_utilization: rl.seven_day_utilization,
+                seven_day_resets_at: rl.seven_day_resets_at.clone(),
+                max_five_hour_utilization: rl.max_five_hour_utilization,
+                max_seven_day_utilization: rl.max_seven_day_utilization,
+                overage_status: rl.overage_status.clone(),
+                is_using_overage: rl.is_using_overage,
+            },
+            None => RateLimitRow {
+                status: None,
+                rate_limit_type: None,
+                five_hour_utilization: None,
+                five_hour_resets_at: None,
+                seven_day_utilization: None,
+                seven_day_resets_at: None,
+                max_five_hour_utilization: None,
+                max_seven_day_utilization: None,
+                overage_status: None,
+                is_using_overage: None,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,6 +985,116 @@ mod tests {
         assert!(rec["duration_ms"].is_u64());
     }
 
+    fn rate_limit_event(
+        status: &str,
+        five_util: f64,
+        seven_util: f64,
+        surpassed_threshold: bool,
+        overage_status: &str,
+    ) -> String {
+        json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": status,
+                "rateLimitType": "five_hour",
+                "surpassedThreshold": surpassed_threshold,
+                "isUsingOverage": surpassed_threshold,
+                "overageStatus": overage_status,
+                "unifiedWindows": {
+                    "five_hour": {"utilization": five_util, "resetsAt": "2026-09-24T12:00:00Z"},
+                    "seven_day": {"utilization": seven_util, "resetsAt": "2026-09-29T00:00:00Z"},
+                },
+            },
+        })
+        .to_string()
+    }
+
+    fn api_retry_event(error: &str) -> String {
+        json!({"type": "system", "subtype": "api_retry", "error": error}).to_string()
+    }
+
+    #[test]
+    fn rate_limit_event_records_unified_window_utilization() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = write_log(
+            dir.path(),
+            "stream.jsonl",
+            &[rate_limit_event("allowed", 0.42, 0.10, false, "none")],
+        );
+        let usage = parse_stream_usage(&log);
+        let rl = usage.rate_limit.expect("a rate_limit_event was logged");
+        assert_eq!(rl.status.as_deref(), Some("allowed"));
+        assert_eq!(rl.rate_limit_type.as_deref(), Some("five_hour"));
+        assert_eq!(rl.five_hour_utilization, Some(0.42));
+        assert_eq!(
+            rl.five_hour_resets_at.as_deref(),
+            Some("2026-09-24T12:00:00Z")
+        );
+        assert_eq!(rl.seven_day_utilization, Some(0.10));
+        assert_eq!(
+            rl.seven_day_resets_at.as_deref(),
+            Some("2026-09-29T00:00:00Z")
+        );
+        assert_eq!(rl.events, 1);
+    }
+
+    #[test]
+    fn rate_limit_event_records_status_and_threshold_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = write_log(
+            dir.path(),
+            "stream.jsonl",
+            &[rate_limit_event(
+                "allowed_warning",
+                0.95,
+                0.60,
+                true,
+                "active",
+            )],
+        );
+        let usage = parse_stream_usage(&log);
+        let rl = usage.rate_limit.expect("a rate_limit_event was logged");
+        assert_eq!(rl.status.as_deref(), Some("allowed_warning"));
+        assert_eq!(rl.surpassed_threshold, Some(true));
+        assert_eq!(rl.is_using_overage, Some(true));
+        assert_eq!(rl.overage_status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn no_rate_limit_event_leaves_the_field_absent_not_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = write_log(dir.path(), "stream.jsonl", &[assistant((10, 1, 0, 0), &[])]);
+        let usage = parse_stream_usage(&log);
+        assert!(usage.rate_limit.is_none());
+        assert!(usage.api_retries.is_empty());
+    }
+
+    #[test]
+    fn multiple_rate_limit_events_take_the_last_status_and_the_max_utilization() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = write_log(
+            dir.path(),
+            "stream.jsonl",
+            &[
+                rate_limit_event("allowed", 0.80, 0.30, false, "none"),
+                api_retry_event("rate_limited"),
+                rate_limit_event("allowed", 0.55, 0.35, false, "none"),
+                api_retry_event("rate_limited"),
+                api_retry_event("overloaded"),
+            ],
+        );
+        let usage = parse_stream_usage(&log);
+        let rl = usage.rate_limit.expect("rate_limit_events were logged");
+        // Last event wins for the point-in-time reading...
+        assert_eq!(rl.five_hour_utilization, Some(0.55));
+        // ...but the maximum across the invocation is still the first, higher one.
+        assert_eq!(rl.max_five_hour_utilization, Some(0.80));
+        assert_eq!(rl.max_seven_day_utilization, Some(0.35));
+        assert_eq!(rl.events, 2);
+        assert_eq!(usage.api_retries["rate_limited"], 2);
+        assert_eq!(usage.api_retries["overloaded"], 1);
+    }
+
     /// Usage accumulates across invocations, which is what makes a multi-job run
     /// report one total rather than the last job's.
     #[test]
@@ -757,5 +1121,58 @@ mod tests {
         assert_eq!(usage.by_tool["mcp__youtrack__get_issue"].tokens.input, 100);
         assert_eq!(usage.by_tool[NO_TOOL].tokens.input, 20);
         assert!((spend.cost_usd() - 0.20).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn record_invocation_persists_one_row_with_rate_limit_fields() {
+        let pool = crate::db::test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = write_log(
+            dir.path(),
+            "stream.jsonl",
+            &[rate_limit_event("allowed", 0.42, 0.10, false, "none")],
+        );
+        let run_id: i64 = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "INSERT INTO runs (action_name, started_at) VALUES (?, ?) RETURNING id",
+        ))
+        .bind("youtrack")
+        .bind("2026-09-01T00:00:00Z")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut r = ClaudeResult::synthesized("", "did the work");
+        r.ok = true;
+        r.cost = 0.05;
+        r.exit_code = Some(0);
+        r.usage = parse_stream_usage(&log);
+        record_invocation(&pool, "youtrack", Some("CLAUDE-1"), Some(run_id), &log, &r).await;
+
+        let row: (String, Option<String>, Option<i64>, f64, Option<f64>) = sqlx::query_as(&crate::db::q(
+            &pool,
+            "SELECT action, job_key, run_id, cost_usd, five_hour_utilization FROM claude_invocations",
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "youtrack");
+        assert_eq!(row.1.as_deref(), Some("CLAUDE-1"));
+        assert_eq!(row.2, Some(run_id));
+        assert!((row.3 - 0.05).abs() < 1e-9);
+        assert_eq!(row.4, Some(0.42));
+    }
+
+    /// A write failure (here, a pool for a database with no schema applied) is
+    /// logged and swallowed rather than propagated: the invocation itself
+    /// already happened and must not be lost over a usage-record write error.
+    #[tokio::test]
+    async fn record_invocation_write_failure_is_swallowed_not_propagated() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::AnyPool::connect("sqlite::memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let log = write_log(dir.path(), "stream.jsonl", &[assistant((1, 1, 0, 0), &[])]);
+        let r = ClaudeResult::synthesized("", "did the work");
+        // No panic and no propagated error: the call is `()`-returning.
+        record_invocation(&pool, "youtrack", None, None, &log, &r).await;
     }
 }
