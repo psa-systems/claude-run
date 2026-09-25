@@ -54,6 +54,7 @@ pub const TABLES: &[&str] = &[
     "ci_failure_tests",
     "ci_failure_runs",
     "agent_pull_requests",
+    "claude_invocations",
 ];
 
 /// sqlx's own bookkeeping table. The target ran its own migration set before
@@ -73,6 +74,7 @@ const IDENTITY_COLUMNS: &[(&str, &str)] = &[
     ("ci_failures", "id"),
     ("ci_failure_runs", "id"),
     ("agent_pull_requests", "id"),
+    ("claude_invocations", "id"),
 ];
 
 /// How the import treats a target that already holds rows.
@@ -679,6 +681,39 @@ mod tests {
         .bind("open")
         .bind("2026-09-01T00:00:00Z")
         .bind("2026-09-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(&q(
+            "INSERT INTO claude_invocations \
+             (ts, action, job_key, run_id, exit_code, timed_out, ok, cost_usd, total_tokens, \
+              rate_limit_status, rate_limit_type, five_hour_utilization, five_hour_resets_at, \
+              seven_day_utilization, seven_day_resets_at, max_five_hour_utilization, \
+              max_seven_day_utilization, overage_status, is_using_overage, api_retries_json, \
+              stream_log_path) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ))
+        .bind("2026-09-01T00:00:00Z")
+        .bind("youtrack")
+        .bind("CLAUDE-1")
+        .bind(run_id)
+        .bind(0i64)
+        .bind(0i64)
+        .bind(1i64)
+        .bind(0.5f64)
+        .bind(1000i64)
+        .bind("allowed")
+        .bind(None::<String>)
+        .bind(0.2f64)
+        .bind("2026-09-01T05:00:00Z")
+        .bind(0.1f64)
+        .bind("2026-09-08T00:00:00Z")
+        .bind(0.2f64)
+        .bind(0.1f64)
+        .bind(None::<String>)
+        .bind(0i64)
+        .bind(None::<String>)
+        .bind("/logs/youtrack/streams/CLAUDE-1-attempt-1.jsonl")
         .execute(pool)
         .await
         .unwrap();

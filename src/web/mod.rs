@@ -457,6 +457,153 @@ fn build_duration_chart(series: &[(String, i64)]) -> DurationChart {
     }
 }
 
+// ---- claude usage chart (CLAUDE-315) ---------------------------------------
+
+/// One plotted utilization reading: pixel position plus a `<title>` tooltip.
+/// `timed_out` / `ok` decide the marker's CSS class so a stalled or failed
+/// invocation stands out from an ordinary reading at the same utilization.
+#[derive(Serialize)]
+struct UsagePoint {
+    x: i64,
+    y: i64,
+    label: String,
+    ok: bool,
+    timed_out: bool,
+}
+
+/// Precomputed SVG geometry for the plan-usage chart: two utilization series
+/// (five-hour, seven-day), each 0-100%, each possibly broken into several
+/// `<polyline>` segments where an invocation reported no rate-limit data at
+/// all (see [`crate::report::ClaudeUsagePoint::has_no_rate_limit_data`]), so a
+/// gap in the data is a visible gap in the line rather than an interpolated
+/// zero.
+#[derive(Serialize)]
+struct UsageChart {
+    width: i64,
+    height: i64,
+    plot_l: i64,
+    plot_r: i64,
+    plot_t: i64,
+    plot_b: i64,
+    /// One `<polyline points="...">` string per contiguous run of data.
+    five_hour_polylines: Vec<String>,
+    seven_day_polylines: Vec<String>,
+    five_hour_points: Vec<UsagePoint>,
+    seven_day_points: Vec<UsagePoint>,
+    y_ticks: Vec<YTick>,
+    x_start: String,
+    x_end: String,
+    count: usize,
+}
+
+/// Build one series' polyline segments + point markers off a `pct` selector
+/// (returns `None` for a gap). Utilization is stored as a `0.0..=1.0`
+/// fraction; the chart plots it as a `0..=100` percentage.
+fn usage_series(
+    points: &[crate::report::ClaudeUsagePoint],
+    plot_l: i64,
+    plot_w: i64,
+    plot_b: i64,
+    plot_h: i64,
+    select: impl Fn(&crate::report::ClaudeUsagePoint) -> Option<f64>,
+) -> (Vec<String>, Vec<UsagePoint>) {
+    let count = points.len();
+    let x_at = |i: usize| -> i64 {
+        if count <= 1 {
+            plot_l + plot_w / 2
+        } else {
+            plot_l + (i as i64) * plot_w / (count as i64 - 1)
+        }
+    };
+    let y_at =
+        |pct: f64| -> i64 { plot_b - ((pct.clamp(0.0, 100.0) / 100.0) * plot_h as f64) as i64 };
+
+    let mut polylines = Vec::new();
+    let mut current = Vec::new();
+    let mut markers = Vec::new();
+    for (i, p) in points.iter().enumerate() {
+        match select(p) {
+            Some(frac) => {
+                let pct = frac * 100.0;
+                let x = x_at(i);
+                let y = y_at(pct);
+                current.push(format!("{x},{y}"));
+                let status = if p.timed_out {
+                    " (timed out)"
+                } else if !p.ok {
+                    " (failed)"
+                } else {
+                    ""
+                };
+                markers.push(UsagePoint {
+                    x,
+                    y,
+                    label: format!("{pct:.0}% at {}{status}", p.ts),
+                    ok: p.ok,
+                    timed_out: p.timed_out,
+                });
+            }
+            None => {
+                if !current.is_empty() {
+                    polylines.push(current.join(" "));
+                    current = Vec::new();
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        polylines.push(current.join(" "));
+    }
+    (polylines, markers)
+}
+
+/// Compute the usage-chart geometry from the report's chart series (oldest to
+/// newest). Caller guarantees `points` is non-empty.
+fn build_usage_chart(points: &[crate::report::ClaudeUsagePoint]) -> UsageChart {
+    let count = points.len();
+    let plot_l = CHART_PAD_L;
+    let plot_r = CHART_W - CHART_PAD_R;
+    let plot_t = CHART_PAD_T;
+    let plot_b = CHART_H - CHART_PAD_B;
+    let plot_w = plot_r - plot_l;
+    let plot_h = plot_b - plot_t;
+
+    let (five_hour_polylines, five_hour_points) =
+        usage_series(points, plot_l, plot_w, plot_b, plot_h, |p| {
+            p.five_hour_utilization
+        });
+    let (seven_day_polylines, seven_day_points) =
+        usage_series(points, plot_l, plot_w, plot_b, plot_h, |p| {
+            p.seven_day_utilization
+        });
+
+    let y_at = |pct: f64| -> i64 { plot_b - ((pct / 100.0) * plot_h as f64) as i64 };
+    let y_ticks = vec![0.0, 25.0, 50.0, 75.0, 100.0]
+        .into_iter()
+        .map(|pct| YTick {
+            y: y_at(pct),
+            label: format!("{pct:.0}%"),
+        })
+        .collect();
+
+    UsageChart {
+        width: CHART_W,
+        height: CHART_H,
+        plot_l,
+        plot_r,
+        plot_t,
+        plot_b,
+        five_hour_polylines,
+        seven_day_polylines,
+        five_hour_points,
+        seven_day_points,
+        y_ticks,
+        x_start: points.first().map(|p| p.ts.clone()).unwrap_or_default(),
+        x_end: points.last().map(|p| p.ts.clone()).unwrap_or_default(),
+        count,
+    }
+}
+
 /// CLAUDE-289: whether each event-driven listener has at least one configured
 /// source, read live off the shared settings handles rather than a startup
 /// snapshot. Saving the first source (or removing the last one) for either
@@ -2095,6 +2242,22 @@ struct WeekdayBar {
     pct: u32,
 }
 
+/// One row of the "recent invocations" table, with the fields the template
+/// prints already formatted (the DB stores fractions; the table shows
+/// percentages, and a missing reading prints as an em-dash string rather than
+/// the template special-casing `None`).
+#[derive(Serialize)]
+struct RecentInvocationRow {
+    ts: String,
+    action: String,
+    job_key: String,
+    outcome: String,
+    five_hour_pct: String,
+    seven_day_pct: String,
+    status: String,
+    api_retries: u64,
+}
+
 #[derive(Template)]
 #[template(path = "reports.html")]
 struct ReportsTpl {
@@ -2112,6 +2275,12 @@ struct ReportsTpl {
     hours: Vec<HourBar>,
     /// Always 7 buckets, Sunday first.
     weekdays: Vec<WeekdayBar>,
+    /// `None` when no invocation fell in the window: the template renders an
+    /// explicit empty-state message rather than a blank chart.
+    usage_chart: Option<UsageChart>,
+    /// Count of charted invocations with no rate-limit data at all.
+    usage_missing_count: usize,
+    usage_recent: Vec<RecentInvocationRow>,
 }
 
 /// Query params for `/reports`: `range` (default all-time) and an optional
@@ -2200,6 +2369,38 @@ async fn reports_page(
         .map(|a| a.name)
         .collect();
 
+    let usage = crate::report::claude_usage(pool, range, action_filter).await?;
+    let usage_chart = (!usage.points.is_empty()).then(|| build_usage_chart(&usage.points));
+    let usage_recent = usage
+        .recent
+        .iter()
+        .map(|r| RecentInvocationRow {
+            ts: r.ts.clone(),
+            action: r.action.clone(),
+            job_key: r.job_key.clone().unwrap_or_else(|| "-".to_string()),
+            outcome: if r.timed_out {
+                "timed out".to_string()
+            } else if r.ok {
+                "ok".to_string()
+            } else {
+                "failed".to_string()
+            },
+            five_hour_pct: r
+                .five_hour_utilization
+                .map(|u| format!("{:.0}%", u * 100.0))
+                .unwrap_or_else(|| "-".to_string()),
+            seven_day_pct: r
+                .seven_day_utilization
+                .map(|u| format!("{:.0}%", u * 100.0))
+                .unwrap_or_else(|| "-".to_string()),
+            status: r
+                .rate_limit_status
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+            api_retries: r.api_retries,
+        })
+        .collect();
+
     let tpl = ReportsTpl {
         version: s.api.version,
         range: range.as_param().to_string(),
@@ -2210,6 +2411,9 @@ async fn reports_page(
         weekly,
         hours,
         weekdays,
+        usage_chart,
+        usage_missing_count: usage.missing_data_count,
+        usage_recent,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
@@ -5623,7 +5827,8 @@ impl IntoResponse for WebError {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_duration_chart, format_duration_ms, latest_attempt_on_disk, render_summary_markdown,
+        build_duration_chart, build_usage_chart, format_duration_ms, latest_attempt_on_disk,
+        render_summary_markdown,
     };
 
     // ---- summary markdown rendering (CLAUDE-89) ----------------------------
@@ -10236,6 +10441,78 @@ mod tests {
         ];
         let c = build_duration_chart(&flat);
         assert!(c.points.iter().all(|p| p.y == c.plot_b));
+    }
+
+    fn usage_point(
+        ts: &str,
+        ok: bool,
+        timed_out: bool,
+        five_hour: Option<f64>,
+        seven_day: Option<f64>,
+    ) -> crate::report::ClaudeUsagePoint {
+        crate::report::ClaudeUsagePoint {
+            ts: ts.to_string(),
+            action: "youtrack".to_string(),
+            job_key: Some("CLAUDE-1".to_string()),
+            ok,
+            timed_out,
+            five_hour_utilization: five_hour,
+            seven_day_utilization: seven_day,
+        }
+    }
+
+    #[test]
+    fn usage_chart_breaks_polylines_at_gaps_and_flags_timed_out_markers() {
+        let points = vec![
+            usage_point(
+                "2026-05-26T10:00:00+00:00",
+                true,
+                false,
+                Some(0.2),
+                Some(0.1),
+            ),
+            // No rate-limit data at all: a gap in both series.
+            usage_point("2026-05-26T11:00:00+00:00", true, false, None, None),
+            usage_point(
+                "2026-05-26T12:00:00+00:00",
+                false,
+                true,
+                Some(0.95),
+                Some(0.5),
+            ),
+        ];
+        let c = build_usage_chart(&points);
+        assert_eq!(c.count, 3);
+        // The gap in the middle splits each series into two polyline segments.
+        assert_eq!(c.five_hour_polylines.len(), 2);
+        assert_eq!(c.seven_day_polylines.len(), 2);
+        // Only the two points with data produce markers per series.
+        assert_eq!(c.five_hour_points.len(), 2);
+        assert_eq!(c.seven_day_points.len(), 2);
+        // The timed-out/failed reading's marker carries both flags through.
+        let last = c.five_hour_points.last().unwrap();
+        assert!(last.timed_out);
+        assert!(!last.ok);
+        assert!(last.label.contains("(timed out)"));
+        // The first reading's marker is a normal, non-timed-out success.
+        let first = c.five_hour_points.first().unwrap();
+        assert!(!first.timed_out);
+        assert!(first.ok);
+        assert!(!first.label.contains("(timed out)"));
+        assert_eq!(c.x_start, "2026-05-26T10:00:00+00:00");
+        assert_eq!(c.x_end, "2026-05-26T12:00:00+00:00");
+    }
+
+    #[test]
+    fn usage_chart_empty_window_has_no_points_or_polylines() {
+        let c = build_usage_chart(&[]);
+        assert_eq!(c.count, 0);
+        assert!(c.five_hour_polylines.is_empty());
+        assert!(c.seven_day_polylines.is_empty());
+        assert!(c.five_hour_points.is_empty());
+        assert!(c.seven_day_points.is_empty());
+        assert_eq!(c.x_start, "");
+        assert_eq!(c.x_end, "");
     }
 
     #[test]

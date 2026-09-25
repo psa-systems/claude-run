@@ -199,7 +199,12 @@ will want to know about:
   row per probe. `/secrets` grows a per-secret **Check** button that lands here with that credential's identity probe
   already run. See "Access check".
 - **Reports** (`/reports`, CLAUDE-117) is the historical reporting page (spend / runs / time-of-day / day-of-week),
-  global by default and narrowable with `action` + `range` query params.
+  global by default and narrowable with `action` + `range` query params. Its "Claude plan usage" section (CLAUDE-315)
+  charts the Claude subscription's own rate-limit utilization (five-hour and seven-day windows, 0-100%) per `claude`
+  invocation, separate from the dollar spend above: a solid line for the five-hour window, a dashed line for the
+  seven-day window, a red marker for a timed-out or failed invocation, and a gap in the line (with a stated count)
+  wherever an invocation's log carried no rate-limit reading at all rather than a fabricated zero. A table below the
+  chart lists the 20 most recent invocations with their status and API-retry counts.
 - **About** (`/about`, CLAUDE-129) shows version + build info and drives the on-demand self-update check / apply (see
   "Self-update"). Its **Activity** card (CLAUDE-223) carries the global Pause / Resume control and the live quiet
   indicator (see "Global pause and the restart-safety workflow").

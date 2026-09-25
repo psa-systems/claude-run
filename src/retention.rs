@@ -45,6 +45,9 @@ pub struct RetentionTable {
 /// `agent_pull_requests`) are deliberately absent: a resolved failure or a
 /// merged PR must still match a regression months later, so only the
 /// per-sighting history is bounded.
+/// `claude_invocations` (CLAUDE-315) joins the same list for the same reason:
+/// one row per `claude` invocation is per-occurrence history, not a lookup
+/// table another feature needs to match against indefinitely.
 pub const RETENTION_TABLES: &[RetentionTable] = &[
     RetentionTable {
         table: "job_outcomes",
@@ -56,6 +59,10 @@ pub const RETENTION_TABLES: &[RetentionTable] = &[
     },
     RetentionTable {
         table: "ci_failure_runs",
+        ts_col: "ts",
+    },
+    RetentionTable {
+        table: "claude_invocations",
         ts_col: "ts",
     },
 ];

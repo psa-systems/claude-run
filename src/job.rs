@@ -419,6 +419,17 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                 // DEV-707: bill the run before any branch discards `r`, so a
                 // cancelled invocation still reports what it spent.
                 ctx.spend.record(&r);
+                // CLAUDE-315: persist this invocation's plan usage before any
+                // branch discards `r`, mirroring the billing call above.
+                crate::usage::record_invocation(
+                    ctx.pool,
+                    &action.name,
+                    Some(&key),
+                    Some(ctx.run_id),
+                    &stream_log,
+                    &r,
+                )
+                .await;
                 if ctx.cancel.is_cancelled() {
                     // The token tripped mid-run; `invoke` already terminated the
                     // claude child. Synthesize a cancelled result so post runs
