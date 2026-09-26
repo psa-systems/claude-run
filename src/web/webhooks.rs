@@ -3510,8 +3510,17 @@ async fn process_action_success_event(
         return;
     };
 
+    // CLAUDE-328: neither of the next two steps knows yet which (if any)
+    // recorded agent PR this event concerns - that is only resolved once the
+    // commit is matched to a PR below - so a failure here cannot itself name
+    // an issue. Rather than dropping it as pure noise, `notify_agent_prs_of_repo_fault`
+    // surfaces it on every OPEN agent PR already recorded for this repo with
+    // automerge enabled (any of them could be the one that just went green);
+    // a repo with none recorded stays silent.
     let Some(host) = forge_host_from_url(&ev.html_url) else {
-        warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge host from action-run html_url");
+        let msg = "could not derive forge host from action-run html_url";
+        warn!(repo = %ev.repo, html_url = %ev.html_url, "{msg}");
+        notify_agent_prs_of_repo_fault(&mint, &pool, &ev.repo, "action-run success", msg).await;
         return;
     };
 
@@ -3525,11 +3534,17 @@ async fn process_action_success_event(
     {
         Ok(Ok(prs)) => prs,
         Ok(Err(e)) => {
-            warn!(repo = %ev.repo, error = %e, "action-run success: list_open_prs failed");
+            let msg = format!("list_open_prs failed: {e}");
+            warn!(repo = %ev.repo, error = %e, "action-run success: {msg}");
+            notify_agent_prs_of_repo_fault(&mint, &pool, &ev.repo, "action-run success", &msg)
+                .await;
             return;
         }
         Err(e) => {
-            warn!(repo = %ev.repo, error = %e, "action-run success: list_open_prs task panicked");
+            let msg = format!("list_open_prs task panicked: {e}");
+            warn!(repo = %ev.repo, error = %e, "action-run success: {msg}");
+            notify_agent_prs_of_repo_fault(&mint, &pool, &ev.repo, "action-run success", &msg)
+                .await;
             return;
         }
     };
@@ -3561,11 +3576,95 @@ async fn process_action_success_event(
     finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None).await;
 }
 
+/// CLAUDE-328: a fault that happened before the failing commit could be
+/// matched to a specific PR (host derivation, `list_open_prs`) still concerns
+/// this repo, and any currently-open, automerge-enabled agent PR recorded for
+/// it could be the one that just went green and now silently will not
+/// automerge. Rather than drop the fault as pure noise (nothing identifiable
+/// to comment on) or guess at a single PR, this notifies every such row: an
+/// `error` log and a `run_events` row unconditionally, plus a best-effort
+/// issue comment per matching row. A repo with no open agent PR recorded logs
+/// nothing beyond the caller's own warning, since there is nothing an
+/// operator could act on.
+async fn notify_agent_prs_of_repo_fault(
+    mint: &MintContext,
+    pool: &DbPool,
+    repo: &str,
+    context: &str,
+    error_msg: &str,
+) {
+    let open_rows = match ci_failure_store::open_agent_prs(pool).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!(repo = %repo, error = %e, "{context}: {error_msg} (and listing open agent PRs to notify also failed: {e})");
+            record_run_event(
+                pool,
+                None,
+                WEBHOOK_MINT_ACTION,
+                "error",
+                format!("{context}: {error_msg} (listing open agent PRs to notify failed: {e})"),
+            )
+            .await;
+            return;
+        }
+    };
+
+    for row in open_rows.iter().filter(|r| r.repo == repo) {
+        let actions_dir = mint.paths.actions_dir();
+        let action_name = row.action_name.clone();
+        let loaded =
+            tokio::task::spawn_blocking(move || crate::action::load(&action_name, &actions_dir))
+                .await;
+        let automerge_enabled = match loaded {
+            Ok(Ok(loaded)) => matches!(
+                loaded.action.native,
+                Some(crate::action::NativeConfig::Youtrack(cfg)) if cfg.youtrack.automerge.enabled
+            ),
+            Ok(Err(e)) => {
+                warn!(repo = %repo, pr = row.pr_number, action = %row.action_name, error = %e, "{context}: could not load action to check automerge while notifying of repo fault");
+                false
+            }
+            Err(e) => {
+                warn!(repo = %repo, pr = row.pr_number, action = %row.action_name, error = %e, "{context}: action-load task panicked while notifying of repo fault");
+                false
+            }
+        };
+        if !automerge_enabled {
+            continue;
+        }
+
+        let msg = format!("{context}: {error_msg}");
+        error!(repo = %repo, pr = row.pr_number, issue = %row.issue_key, "{msg}");
+        record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
+        let pr_url = agent_pr_url(&row.host, repo, row.pr_number);
+        let body = format!(
+            "The runner could not check this PR's automerge status: {msg}.\n\nPR: {pr_url}\n\nA later Action Run event or the periodic reconciler will retry automatically."
+        );
+        post_issue_comment(
+            mint,
+            &row.issue_key,
+            body,
+            repo,
+            row.pr_number as u64,
+            "action-run success: repo-fault comment failed",
+        )
+        .await;
+    }
+}
+
+/// Build a PR's web URL from its recorded host/repo/number, without an extra
+/// forge call: every caller already has these three fields from the
+/// `agent_pull_requests` row.
+fn agent_pr_url(host: &str, repo: &str, pr_number: i64) -> String {
+    format!("https://{host}/{repo}/pulls/{pr_number}")
+}
+
 /// CLAUDE-278: the per-PR decision once a success event's PR is known. Looks
-/// up the `agent_pull_requests` row, loads that row's action to check
-/// `automerge.enabled`, and on green+mergeable calls
-/// [`crate::native::youtrack::complete_automerge`] - the same merge + State +
-/// AI-Agent write sequence the old CLAUDE-126 poll loop made.
+/// up the `agent_pull_requests` row and, once found and open, delegates the
+/// rest of the decision to [`apply_automerge_decision`] - the same function
+/// [`reconcile_automerge`] (CLAUDE-328) calls for a PR it already has the row
+/// for, so the two entry points never diverge on the behind_base / mergeable /
+/// `complete_automerge` logic.
 async fn handle_action_success_for_pr(
     mint: &MintContext,
     pool: &DbPool,
@@ -3574,9 +3673,15 @@ async fn handle_action_success_for_pr(
     pr_number: u64,
     pr_url: &str,
 ) -> Result<String, String> {
-    let row = ci_failure_store::agent_pr(pool, host, repo, pr_number as i64)
-        .await
-        .map_err(|e| format!("agent_pull_requests lookup failed: {e}"))?;
+    let row = match ci_failure_store::agent_pr(pool, host, repo, pr_number as i64).await {
+        Ok(row) => row,
+        Err(e) => {
+            let msg = format!("agent_pull_requests lookup failed: {e}");
+            error!(repo = %repo, pr = pr_number, error = %e, "action-run success: {msg}");
+            record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
+            return Err(msg);
+        }
+    };
     let Some(row) = row else {
         info!(repo = %repo, pr = pr_number, "action-run success: PR is not a recorded agent PR; no action");
         return Ok("not a recorded agent PR; no action".to_string());
@@ -3589,13 +3694,60 @@ async fn handle_action_success_for_pr(
         ));
     }
 
+    apply_automerge_decision(mint, pool, host, repo, pr_number, pr_url, &row).await
+}
+
+/// CLAUDE-328: the shared decision body both [`handle_action_success_for_pr`]
+/// (the webhook's low-latency trigger) and [`reconcile_automerge`] (the
+/// tick-driven backstop for a missed webhook) call once a recorded, open
+/// `agent_pull_requests` row is already in hand: load the row's action to
+/// check `automerge.enabled`, read the PR's live CI status, and on
+/// green+mergeable call [`crate::native::youtrack::complete_automerge`] - the
+/// same merge + State + AI-Agent write sequence the old CLAUDE-126 poll loop
+/// made. An action-load failure and a `pr_status` failure both concern this
+/// already-known, recorded, automerge-eligible PR, so unlike the caller's own
+/// pre-resolution faults, both are made loud here: an `error` log, a
+/// `run_events` row, and a best-effort issue comment.
+async fn apply_automerge_decision(
+    mint: &MintContext,
+    pool: &DbPool,
+    host: &str,
+    repo: &str,
+    pr_number: u64,
+    pr_url: &str,
+    row: &ci_failure_store::AgentPullRequest,
+) -> Result<String, String> {
     let actions_dir = mint.paths.actions_dir();
     let action_name = row.action_name.clone();
     let loaded =
-        tokio::task::spawn_blocking(move || crate::action::load(&action_name, &actions_dir))
-            .await
-            .map_err(|e| format!("loading action `{}` task panicked: {e}", row.action_name))?
-            .map_err(|e| format!("loading action `{}` failed: {e}", row.action_name))?;
+        tokio::task::spawn_blocking(move || crate::action::load(&action_name, &actions_dir)).await;
+    let loaded = match loaded {
+        Ok(Ok(loaded)) => loaded,
+        Ok(Err(e)) => {
+            let msg = format!("loading action `{}` failed: {e}", row.action_name);
+            error!(repo = %repo, pr = pr_number, issue = %row.issue_key, error = %e, "action-run success: {msg}");
+            record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
+            let body = format!(
+                "The runner could not check this PR's automerge status: {msg}.\n\nPR: {pr_url}\n\nA later Action Run event or the periodic reconciler will retry automatically."
+            );
+            post_issue_comment(
+                mint,
+                &row.issue_key,
+                body,
+                repo,
+                pr_number,
+                "action-run success: action-load-failed comment failed",
+            )
+            .await;
+            return Err(msg);
+        }
+        Err(e) => {
+            let msg = format!("loading action `{}` task panicked: {e}", row.action_name);
+            error!(repo = %repo, pr = pr_number, issue = %row.issue_key, error = %e, "action-run success: {msg}");
+            record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
+            return Err(msg);
+        }
+    };
     let youtrack_cfg = match loaded.action.native {
         Some(crate::action::NativeConfig::Youtrack(cfg)) => cfg.youtrack,
         _ => {
@@ -3616,9 +3768,34 @@ async fn handle_action_success_for_pr(
     let repo_owned = repo.to_string();
     let status =
         tokio::task::spawn_blocking(move || backend.pr_status(&host_owned, &repo_owned, pr_number))
-            .await
-            .map_err(|e| format!("pr_status task panicked: {e}"))?
-            .map_err(|e| format!("pr_status failed: {e}"))?;
+            .await;
+    let status = match status {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
+            let msg = format!("pr_status failed: {e}");
+            error!(repo = %repo, pr = pr_number, issue = %row.issue_key, error = %e, "action-run success: {msg}");
+            record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
+            let body = format!(
+                "The runner could not check this PR's automerge status: {msg}.\n\nPR: {pr_url}\n\nA later Action Run event or the periodic reconciler will retry automatically."
+            );
+            post_issue_comment(
+                mint,
+                &row.issue_key,
+                body,
+                repo,
+                pr_number,
+                "action-run success: pr-status-failed comment failed",
+            )
+            .await;
+            return Err(msg);
+        }
+        Err(e) => {
+            let msg = format!("pr_status task panicked: {e}");
+            error!(repo = %repo, pr = pr_number, issue = %row.issue_key, error = %e, "action-run success: {msg}");
+            record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
+            return Err(msg);
+        }
+    };
 
     match status.state.trim() {
         "success" => match status.behind_base {
@@ -3755,6 +3932,63 @@ async fn handle_action_success_for_pr(
                 "PR #{pr_number} checks not successful ({other}); no action"
             ))
         }
+    }
+}
+
+/// CLAUDE-328: the reconciler backstop for a missed, dropped, or too-early
+/// Action Run success webhook. Runs on its own tick (`daemon::automerge_reconciler_loop`),
+/// independent of any webhook delivery: lists every `agent_pull_requests` row
+/// still `open` and, for each, calls the exact same [`apply_automerge_decision`]
+/// the webhook path calls, so a green+mergeable PR is merged on the next tick
+/// even if no event for it ever arrives. Idempotent: a PR already merged or
+/// closed since it was listed is caught by the row's own `agent_pr` state on
+/// the webhook path, and here by `pr_status` simply reporting a state that
+/// still routes to "no action" (or, for a PR that raced closed between the
+/// list and the status call, by the forge call itself failing, which is
+/// surfaced the same way any other `apply_automerge_decision` fault is).
+pub(crate) async fn reconcile_automerge(
+    pool: &DbPool,
+    mint: &MintContext,
+    keygate: &crate::concurrency::KeyGate,
+) {
+    let rows = match ci_failure_store::open_agent_prs(pool).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            let msg = format!("automerge reconciler: listing open agent PRs failed: {e}");
+            error!(error = %e, "{msg}");
+            record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg).await;
+            return;
+        }
+    };
+
+    for row in rows {
+        let key = format!("{}#{}", row.repo, row.pr_number);
+        let _key_guard = keygate.acquire(&key).await;
+        let pr_url = agent_pr_url(&row.host, &row.repo, row.pr_number);
+        let job_key = format!(
+            "automerge-reconcile-{}-{}",
+            row.repo.replace('/', "_"),
+            row.pr_number
+        );
+        let run_id = begin_webhook_run(pool, WEBHOOK_MINT_ACTION, &job_key, &pr_url).await;
+        let result = apply_automerge_decision(
+            mint,
+            pool,
+            &row.host,
+            &row.repo,
+            row.pr_number as u64,
+            &pr_url,
+            &row,
+        )
+        .await;
+        let (ok, summary) = match &result {
+            Ok(s) => (true, s.clone()),
+            Err(e) => (false, e.clone()),
+        };
+        if !ok {
+            warn!(repo = %row.repo, pr = row.pr_number, error = %summary, "automerge reconciler: decision failed");
+        }
+        finish_webhook_run(pool, run_id, &job_key, &summary, ok, None).await;
     }
 }
 
@@ -8038,7 +8272,11 @@ mod tests {
         /// Writes a minimal youtrack action YAML under `dir/actions/<name>.yml`
         /// (the layout `crate::action::load` resolves against), with automerge
         /// set to `enabled`.
-        fn write_youtrack_action(dir: &std::path::Path, name: &str, automerge_enabled: bool) {
+        pub(super) fn write_youtrack_action(
+            dir: &std::path::Path,
+            name: &str,
+            automerge_enabled: bool,
+        ) {
             let actions_dir = dir.join("actions");
             std::fs::create_dir_all(&actions_dir).unwrap();
             let yaml = format!(
@@ -8498,6 +8736,391 @@ mod tests {
             assert!(comment.contains("not allowed to merge"), "{comment}");
             assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
             assert!(!calls.iter().any(|c| c.contains("Done")), "{calls:?}");
+        }
+    }
+
+    // ---- CLAUDE-328: the reconciler backstop, its fault visibility, and its
+    // agreement with the webhook entry point on the shared decision function ---
+    mod automerge_reconciler {
+        use super::automerge_success::write_youtrack_action;
+        use super::*;
+
+        fn ctx_for(
+            pool: DbPool,
+            backend: Arc<StoreBackend>,
+            paths_dir: &std::path::Path,
+        ) -> MintContext {
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            store_mint_context_in(
+                pool,
+                backend,
+                classifier,
+                paths_dir,
+                Arc::new(crate::provider::cli::testutil::StubRunner::new()),
+            )
+        }
+
+        /// One (state, mergeable, behind_base) combination, driven through both
+        /// [`handle_action_success_for_pr`] (the webhook entry point) and
+        /// [`reconcile_automerge`] (the CLAUDE-328 tick-driven entry point),
+        /// against two otherwise-identical setups, asserting the two entry
+        /// points make IDENTICAL backend calls: this is the "one shared decision
+        /// function" acceptance criterion.
+        async fn assert_same_decision(state: &str, mergeable: bool, behind_base: Option<bool>) {
+            let now = "2026-09-01T00:00:00Z";
+
+            let pool_a = crate::db::test_pool().await;
+            let dir_a = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir_a.path(), "yt", true);
+            ci_failure_store::record_agent_pr(
+                &pool_a,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend_a =
+                Arc::new(StoreBackend::new().with_pr_status_behind(state, mergeable, behind_base));
+            let ctx_a = ctx_for(pool_a.clone(), backend_a.clone(), dir_a.path());
+            let _ = handle_action_success_for_pr(
+                &ctx_a,
+                &pool_a,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await;
+
+            let pool_b = crate::db::test_pool().await;
+            let dir_b = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir_b.path(), "yt", true);
+            ci_failure_store::record_agent_pr(
+                &pool_b,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend_b =
+                Arc::new(StoreBackend::new().with_pr_status_behind(state, mergeable, behind_base));
+            let ctx_b = ctx_for(pool_b.clone(), backend_b.clone(), dir_b.path());
+            reconcile_automerge(&pool_b, &ctx_b, &crate::concurrency::KeyGate::new()).await;
+
+            assert_eq!(
+                backend_a.calls(),
+                backend_b.calls(),
+                "webhook path and reconciler diverged for state={state} mergeable={mergeable} behind_base={behind_base:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn webhook_and_reconciler_agree_on_every_decision_shape() {
+            assert_same_decision("success", true, Some(false)).await; // green + mergeable
+            assert_same_decision("success", true, Some(true)).await; // green + behind base
+            assert_same_decision("success", false, Some(false)).await; // green + not mergeable
+            assert_same_decision("pending", false, Some(false)).await; // not green
+        }
+
+        #[tokio::test]
+        async fn reconciler_merges_open_automerge_pr_with_no_webhook_event() {
+            // Acceptance: an open agent PR with automerge on and status success
+            // is merged by the reconciler alone, with no webhook event at all.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+
+            let calls = backend.calls();
+            assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
+            assert!(
+                calls.iter().any(|c| c == "set_state MK-16 Done"),
+                "{calls:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn reconciler_leaves_automerge_disabled_pr_alone() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", false);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+        }
+
+        #[tokio::test]
+        async fn reconciler_leaves_non_open_pr_alone() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "merged",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+        }
+
+        #[tokio::test]
+        async fn reconciler_leaves_non_success_pr_alone() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("pending", false));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+
+            assert!(
+                !backend.calls().iter().any(|c| c.starts_with("merge_pr")),
+                "{:?}",
+                backend.calls()
+            );
+        }
+
+        #[tokio::test]
+        async fn action_load_failure_logs_errors_records_event_and_comments() {
+            // Acceptance: an action-load failure for a known, recorded,
+            // automerge-eligible PR is loud: error log (asserted implicitly by
+            // the run_events row below, which is written from the same call
+            // site), a `run_events` row, and a best-effort issue comment.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            // Deliberately no `write_youtrack_action`: the row names an action
+            // that does not exist on disk, so `crate::action::load` fails.
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "does-not-exist",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new());
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap_err();
+            assert!(result.contains("loading action"), "{result}");
+
+            let comment = backend
+                .calls()
+                .into_iter()
+                .find(|c| c.starts_with("comment MK-16"))
+                .unwrap_or_else(|| panic!("expected an issue comment, got {:?}", backend.calls()));
+            assert!(comment.contains("automerge status"), "{comment}");
+
+            let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 10)
+                .await
+                .unwrap();
+            assert!(
+                events.iter().any(|e| e.message.contains("loading action")),
+                "{events:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_host_notifies_every_open_automerge_pr_for_the_repo() {
+            // Acceptance: a fault before the commit is matched to a PR (host
+            // derivation) still concerns this repo, so every currently open,
+            // automerge-enabled agent PR recorded for it is notified: error
+            // log, `run_events` row, and a best-effort issue comment.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new());
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let mint = Arc::new(ctx);
+
+            let ev = VerifiedActionSuccessEvent {
+                repo: "contoso/claude-run".to_string(),
+                commit_sha: "deadbeef".to_string(),
+                // No `scheme://host` prefix: `forge_host_from_url` yields `None`.
+                html_url: String::new(),
+                source: "test".to_string(),
+            };
+            process_action_success_event(
+                ev,
+                pool.clone(),
+                Some(mint),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+
+            let comment = backend
+                .calls()
+                .into_iter()
+                .find(|c| c.starts_with("comment MK-16"))
+                .unwrap_or_else(|| panic!("expected an issue comment, got {:?}", backend.calls()));
+            assert!(comment.contains("automerge status"), "{comment}");
+
+            let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 10)
+                .await
+                .unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.message.contains("could not derive forge host")),
+                "{events:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn list_open_prs_failure_notifies_every_open_automerge_pr_for_the_repo() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_open_prs_error("fj: connection reset"));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let mint = Arc::new(ctx);
+
+            let ev = VerifiedActionSuccessEvent {
+                repo: "contoso/claude-run".to_string(),
+                commit_sha: "deadbeef".to_string(),
+                html_url: "https://dev.a8n.run/contoso/claude-run/actions/runs/9".to_string(),
+                source: "test".to_string(),
+            };
+            process_action_success_event(
+                ev,
+                pool.clone(),
+                Some(mint),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+
+            let comment = backend
+                .calls()
+                .into_iter()
+                .find(|c| c.starts_with("comment MK-16"))
+                .unwrap_or_else(|| panic!("expected an issue comment, got {:?}", backend.calls()));
+            assert!(comment.contains("automerge status"), "{comment}");
+
+            let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 10)
+                .await
+                .unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.message.contains("list_open_prs failed")),
+                "{events:?}"
+            );
         }
     }
 }

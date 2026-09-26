@@ -385,6 +385,21 @@ pub async fn agent_pr_for_issue(
     row.as_ref().map(agent_pr_from_row).transpose()
 }
 
+/// Every `agent_pull_requests` row still `open`, for the CLAUDE-328
+/// reconciler: a webhook is the low-latency trigger for automerge, but a
+/// missed delivery must not leave a green PR stuck at Code Review forever, so
+/// the reconciler walks this list on its own tick independent of any webhook.
+pub async fn open_agent_prs(pool: &DbPool) -> Result<Vec<AgentPullRequest>> {
+    let rows = sqlx::query(&db::q(
+        pool,
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, created_at, updated_at \
+         FROM agent_pull_requests WHERE state = 'open' ORDER BY id",
+    ))
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(agent_pr_from_row).collect()
+}
+
 /// Increment `id`'s `fix_attempts` by one.
 pub async fn bump_fix_attempts(pool: &DbPool, id: i64, now: &str) -> Result<()> {
     sqlx::query(&db::q(

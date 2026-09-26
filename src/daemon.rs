@@ -418,6 +418,15 @@ impl Daemon {
             mint_ctx.clone(),
             keygate.clone(),
         ));
+        // CLAUDE-328: the reconciler backstop for a missed/dropped/too-early
+        // success webhook. Independent of the consumers above: it ticks on its
+        // own schedule and walks every recorded open agent PR through the same
+        // decision function `success_consumer` calls per event.
+        let automerge_reconciler_task = tokio::spawn(automerge_reconciler_loop(
+            pool.clone(),
+            mint_ctx.clone(),
+            keygate.clone(),
+        ));
         let webhook_consumer = tokio::spawn(crate::web::webhooks::consume_events(
             webhook_rx,
             pool.clone(),
@@ -612,6 +621,7 @@ impl Daemon {
         webhook_consumer.abort();
         pr_consumer.abort();
         success_consumer.abort();
+        automerge_reconciler_task.abort();
         comment_consumer.abort();
         // pidfile lock released on drop
         if unix_socket {
@@ -1795,6 +1805,41 @@ async fn stream_log_gc_loop(
             ),
             Err(e) => warn!(error = %e, "webhook-log GC sweep task failed"),
         }
+    }
+}
+
+/// CLAUDE-328: the automerge reconciler's own tick. Independent of both the
+/// scheduler's [`TICK_SECS`] (too chatty: every open agent PR would take a
+/// forge `pr_status` call five times a minute) and the hourly [`GC_TICK_SECS`]
+/// (too slow a backstop for a PR that only needed a missed webhook re-tried),
+/// this is a fixed middle ground chosen for a first cut; revisit if it proves
+/// too chatty against the forge or too slow as a backstop in practice.
+const AUTOMERGE_RECONCILE_TICK_SECS: u64 = 300;
+
+/// CLAUDE-328: the reconciler backstop for a missed, dropped, or too-early
+/// Action Run success webhook. Ticks independently of any webhook delivery,
+/// on [`AUTOMERGE_RECONCILE_TICK_SECS`] (first tick immediate, so a sweep also
+/// runs on serve start), and calls
+/// [`crate::web::webhooks::reconcile_automerge`], which walks every currently
+/// `open` `agent_pull_requests` row through the exact same decision function
+/// the webhook path uses. A `None` mint context (no usable provider backend)
+/// skips the tick entirely, matching how the webhook consumers themselves
+/// degrade with no backend to call.
+async fn automerge_reconciler_loop(
+    pool: DbPool,
+    mint: Option<crate::web::webhooks::MintContext>,
+    keygate: KeyGate,
+) {
+    let Some(mint) = mint else {
+        warn!("automerge reconciler disabled: no usable provider backend (mint disabled)");
+        return;
+    };
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+        AUTOMERGE_RECONCILE_TICK_SECS,
+    ));
+    loop {
+        ticker.tick().await;
+        crate::web::webhooks::reconcile_automerge(&pool, &mint, &keygate).await;
     }
 }
 
