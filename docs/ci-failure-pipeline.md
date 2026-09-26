@@ -3,128 +3,16 @@
 How a failed Forgejo Actions run becomes YouTrack work, as the code runs today. Any change to the pipeline updates this
 file in the same PR. The improvement discussion lives in [`ROADMAP.md`](ROADMAP.md#ci-failure-pipeline).
 
-Steps with an orange border call `claude`.
-
-```mermaid
-flowchart TD
-    F(["Forgejo: Actions run finished"])
-
-    subgraph WH ["webhook-forgejo"]
-        W1{"run failed?"}
-        W1 -- "no: cancelled" --> N1["ignored"]
-        W1 -- "no: success, recover" --> AM1
-        W1 -- yes --> W2["fetch run logs"]
-        W2 --> FP0["fingerprint failing tests"]
-        FP0 --> PR1["resolve_open_pr: this commit's own open PR, if any"]
-        PR1 -- "lookup error" --> N4["run fails (ok=false); nothing minted or commented"]
-        PR1 --> PR2{"open PR for this commit?"}
-
-        PR2 -- no --> S1{"ci_failure store match?"}
-        S1 -- "open" --> S2["attach run + tests, comment"]
-        S1 -- "resolved" --> S3["reopen: set_state, regression comment"]
-        S3 --> T1
-        S1 -- "none / pr_only" --> L1{"legacy YouTrack marker search hit?"}
-        L1 -- yes --> L2["adopt: record store row, attach"]
-        L1 -- no --> T1{"transient failure?"}
-        T1 -- yes --> N2["no issue"]
-        T1 -- no --> T2{"known mechanical fix? cargo fmt, checks workflow"}
-        T2 -- yes --> BA["auto_fix"]
-        T2 -- no --> T3["AnalysisClassifier: Read/Grep/Bash over the full log + failing workflow YAML, one fenced JSON verdict"]:::claude
-        T3 -- "code_defect" --> BC["code_fix"]
-        T3 -- "needs_human" --> BH["human_action"]
-        T3 -- "flaky / infra" --> N2
-        BA --> I1["create YouTrack issue"]
-        BC --> I1
-        BH --> I1
-        I1 --> R0["record ci_failures row"]
-        R0 --> I2{"bucket"}
-        I2 -- human_action --> I3["assign a human"]
-        I2 -- "code_fix, auto_fix" --> G2{"webhook auto_fix on?"}
-        G2 -- yes --> I4["AI Agent: Queued"]
-        G2 -- no --> I5["no AI Agent write"]
-        S3 --> G3{"code_fix/auto_fix bucket and auto_fix on?"}
-        G3 -- yes --> I4
-
-        PR2 -- yes --> AG1{"agent_pull_requests row open for this PR?"}
-        AG1 -- yes --> AG2{"fix_attempts below config.webhook.agent_pr_fix_attempts?"}
-        AG2 -- yes --> AG3["comment the issue: run + failing tests + analysis; bump fix_attempts; AI Agent: Queued"]
-        AG2 -- no --> AG4["AI Agent: Needs Review; comment lists every attempt's run"]
-        AG1 -- no --> H1{"failing tests match a ci_failure row?"}
-        H1 -- "open" --> H2["comment PR: already tracked in KEY; attach run; no analysis"]
-        H1 -- "pr_only, now 2+ distinct branches" --> H3["mint issue, point the store row at it, comment BOTH PRs"]
-        H1 -- "pr_only (still 1 branch) / none" --> H4["analyze, comment the PR, record/keep a pr_only row"]
-    end
-
-    F --> W1
-    I3 --> YT[("open CI-failure issues")]
-    I4 --> YT
-    I5 --> YT
-    S2 --> YT
-    L2 --> YT
-    AG3 --> YT
-    AG4 --> YT
-    H3 --> YT
-
-    FPR(["Forgejo: pull_request closed"])
-
-    subgraph WHPR ["webhook-forgejo: pull_request closed (CLAUDE-277, same endpoint, dispatched by X-Forgejo-Event)"]
-        M1{"merged?"}
-        M1 -- no --> M2["mark this PR's agent_pull_requests row closed, if any"]
-        M1 -- yes --> M3["mark this PR's agent_pull_requests row merged, if any"]
-        M3 --> M4["collect open ci_failures rows this PR references: its agent-PR issue key + pr_referenced_issues"]
-        M4 --> M5{"failing workflow green at the PR's head commit?"}
-        M5 -- yes --> M6["close issue: State=mint.resolved_state, comment; store row resolved"]
-        M5 -- "no / not found" --> M7["comment: left open"]
-    end
-
-    FPR --> M1
-    M6 --> YT
-    M7 --> YT
-
-    subgraph WHAM ["webhook-forgejo: success/recover (CLAUDE-126, event-driven since CLAUDE-278, same endpoint, dispatched by payload.action)"]
-        AM1["find open PR matching this commit"]
-        AM1 -- "no match" --> AN1["ignored"]
-        AM1 -- match --> AM2{"agent_pull_requests row open for this PR?"}
-        AM2 -- no --> AN1
-        AM2 -- yes --> AM3{"that PR's action: automerge.enabled?"}
-        AM3 -- no --> AN1
-        AM3 -- yes --> AM4["fj pr status --json (behind_base)"]
-        AM4 -- "success, behind_base missing" --> AM6b["comment: fj must include FJ-99; fail run"]
-        AM4 -- "success, behind_base=true" --> AM7{"update_pr_branch (fj pr update --style merge)"}
-        AM7 -- ok --> AM7a["comment: branch updated; leave at Code Review"]
-        AM7 -- error --> AM7b["comment: update failed; fail run"]
-        AM4 -- "success, behind_base=false, not mergeable" --> AM6["comment: not mergeable; leave at Code Review"]
-        AM4 -- "success, behind_base=false, mergeable" --> AM5{"merge_pr"}
-        AM5 -- ok --> AM5a["State=state_done; comment; AI Agent=done"]
-        AM5 -- error --> AM5b["comment: merge failed; fail run"]
-        AM4 -- "not success" --> AN1
-    end
-
-    AM5a --> YT
-    AM5b --> YT
-    AM6 --> YT
-    AM6b --> YT
-    AM7a --> YT
-    AM7b --> YT
-
-    subgraph SC ["scheduled actions, independent of each other"]
-        YT -- "AI Agent: Queued" --> Y1["youtrack: fix the code"]:::claude
-        Y1 --> Y2["open PR"]
-    end
-
-    Y2 -. "CI runs on the PR" .-> F
-
-    classDef claude stroke:#d9480f,stroke-width:4px
-```
+Steps with an orange border call `claude`. See [CI failures pipeline](./ci-failures-pipeline.mmd).
 
 ## Where this lives
 
-| Step                              | Code                                  |
-|-----------------------------------|---------------------------------------|
-| Webhook ingest, store dedupe, and triage | `src/web/webhooks.rs`, `src/triage.rs` |
-| Close-on-merge (`pull_request` delivery) | `src/web/webhooks.rs`, `src/ci_failure/close.rs`, `src/forge_log.rs` (`CommitRunsClient`), `src/provider/cli.rs` |
-| Event-driven automerge (`success`/`recover` delivery) | `src/web/webhooks.rs` (`consume_action_success_events`), `src/native/youtrack.rs` (`complete_automerge`) |
-| At-ingest analysis (`AnalysisClassifier`) | `src/ci_failure/analysis.rs` |
-| Failing-test fingerprint and the `ci_failures` store | `src/ci_failure/fingerprint.rs`, `src/ci_failure/store.rs` |
-| Gates and issue creation (no dedupe)     | `src/mint.rs`                   |
-| youtrack                          | `src/native/youtrack.rs`              |
+| Step                                                  | Code                                                                                                             |
+|-------------------------------------------------------|------------------------------------------------------------------------------------------------------------------|
+| Webhook ingest, store dedupe, and triage              | `src/web/webhooks.rs`, `src/triage.rs`                                                                           |
+| Close-on-merge (`pull_request` delivery)              | `src/web/webhooks.rs`, `src/ci_failure/close.rs`, `src/forge_log.rs` (`CommitRunsClient`), `src/provider/cli.rs` |
+| Event-driven automerge (`success`/`recover` delivery) | `src/web/webhooks.rs` (`consume_action_success_events`), `src/native/youtrack.rs` (`complete_automerge`)         |
+| At-ingest analysis (`AnalysisClassifier`)             | `src/ci_failure/analysis.rs`                                                                                     |
+| Failing-test fingerprint and the `ci_failures` store  | `src/ci_failure/fingerprint.rs`, `src/ci_failure/store.rs`                                                       |
+| Gates and issue creation (no dedupe)                  | `src/mint.rs`                                                                                                    |
+| youtrack                                              | `src/native/youtrack.rs`                                                                                         |
