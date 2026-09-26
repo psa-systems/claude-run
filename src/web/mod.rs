@@ -2794,8 +2794,6 @@ struct YoutrackEditForm {
     state_in_progress: String,
     /// AI Agent `done` label written after a successful automerge (CLAUDE-126).
     state_done: String,
-    /// Standard `State` field value written after automerge (CLAUDE-126).
-    state_state_done: String,
     /// Present ("on") when the automerge checkbox is checked (CLAUDE-126).
     automerge_enabled: Option<String>,
     fj_base_url: String,
@@ -2904,7 +2902,6 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
         state_failed: c.youtrack.states.failed,
         state_in_progress: c.youtrack.states.in_progress,
         state_done: c.youtrack.states.done,
-        state_state_done: c.youtrack.states.state_done,
         concurrency_max_parallel: conc.max_parallel.to_string(),
         concurrency_key: conc.key.join(", "),
         fj_pr_strategy: c.forgejo.pr_strategy.as_str().to_string(),
@@ -2945,7 +2942,6 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         state_failed: yt.youtrack.states.failed.clone(),
         state_in_progress: yt.youtrack.states.in_progress.clone(),
         state_done: yt.youtrack.states.done.clone(),
-        state_state_done: yt.youtrack.states.state_done.clone(),
         automerge_enabled: yt.youtrack.automerge.enabled.then(|| "on".to_string()),
         fj_base_url: s(&yt.forgejo.base_url),
         fj_token_ref: s(&yt.forgejo.token_ref),
@@ -3106,13 +3102,13 @@ fn youtrack_form_to_yaml(
     if let Some(v) = opt(&form.state_in_progress) {
         states.in_progress = v;
     }
-    // CLAUDE-133: the form now owns the `done` / `state_done` labels and the
-    // automerge block; a blank label falls back to its default.
+    // CLAUDE-133: the form owns the `done` label and the automerge block; a
+    // blank label falls back to its default. CLAUDE-327: the form no longer
+    // exposes `states.state_done` (deprecated and ignored), so saving always
+    // resets it to the default, clearing the load-time deprecation warning
+    // for an action that still carries a non-default value from before.
     if let Some(v) = opt(&form.state_done) {
         states.done = v;
-    }
-    if let Some(v) = opt(&form.state_state_done) {
-        states.state_done = v;
     }
     // CLAUDE-293: automerge is now just the checkbox. Saving the form always
     // resets the (deprecated, ignored) timing fields to their defaults, which
@@ -4058,7 +4054,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "resolved_state",
                 badge: "next event",
-                note: "State set on a CI-failure issue when its fix PR merges with the failing workflow green.",
+                note: "State the runner treats as resolved when it reads a CI-failure issue's own State (the YouTrack workflow, not the runner, sets it).",
             },
             FieldDoc {
                 name: "ai_agent_field",
@@ -8178,13 +8174,12 @@ mod tests {
         }
 
         #[test]
-        fn done_labels_round_trip_from_form() {
-            // CLAUDE-133: the done / state_done labels are owned by the form;
-            // non-default values serialize and reload.
+        fn done_label_round_trips_from_form() {
+            // CLAUDE-133: the done label is owned by the form; a non-default
+            // value serializes and reloads.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             f.state_done = "Merged".to_string();
-            f.state_state_done = "Resolved".to_string();
             let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
             let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
             let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.as_ref().unwrap()
@@ -8192,11 +8187,12 @@ mod tests {
                 panic!("expected youtrack native config");
             };
             assert_eq!(yt.youtrack.states.done, "Merged");
-            assert_eq!(yt.youtrack.states.state_done, "Resolved");
+            // CLAUDE-327: `states.state_done` is deprecated, absent from the
+            // form, and always resolves to its default on save.
+            assert_eq!(yt.youtrack.states.state_done, "Done");
 
             let form = action_to_youtrack_form(&loaded.action).unwrap();
             assert_eq!(form.state_done, "Merged");
-            assert_eq!(form.state_state_done, "Resolved");
         }
 
         #[test]
