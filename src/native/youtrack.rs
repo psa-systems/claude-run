@@ -2121,14 +2121,15 @@ fn append_compaction_note(body: &str, stream_log: Option<&Path>, key: &str) -> S
 /// Action-run webhook event has already confirmed are green and mergeable.
 /// Called from `crate::web::webhooks`'s success-event handler, not from
 /// `finalize` (which no longer waits for CI itself). Merges as a merge-commit,
-/// then makes the same writes the old CLAUDE-126 poll loop made on green:
-/// State=Done first, then a comment + AI Agent=Done as the authoritative last
-/// write (mirrors [`comment_then_field`]).
-#[allow(clippy::too_many_arguments)]
+/// then posts a best-effort comment: a comment failure is logged at `error`
+/// and never fails the merge result, since the merge already succeeded on its
+/// own terms. CLAUDE-327: no `State` or `AI Agent` write here - both stay at
+/// Code Review after a runner merge, and the YouTrack workflow
+/// (`docs/yt-workflow-resolve-on-pr-merge.js`) resolves the issue once it sees
+/// the merge.
 pub(crate) fn complete_automerge(
     backend: &dyn IssueTracker,
     forge: &dyn Forge,
-    src: &YoutrackSource,
     issue_key: &str,
     host: &str,
     repo: &str,
@@ -2136,9 +2137,11 @@ pub(crate) fn complete_automerge(
     pr_url: &str,
 ) -> Result<()> {
     forge.merge_pr(host, repo, pr_number)?;
-    backend.set_state(issue_key, &src.states.state_done)?;
     let body = merged_comment(pr_url);
-    comment_then_field(backend, src, issue_key, &body, &src.states.done)
+    if let Err(e) = backend.comment(issue_key, &body) {
+        error!(key = %issue_key, error = %e, "post-automerge comment failed");
+    }
+    Ok(())
 }
 
 fn merged_comment(pr_url: &str) -> String {
@@ -2146,8 +2149,6 @@ fn merged_comment(pr_url: &str) -> String {
         "The runner merged this PR after its CI checks passed (automerge).".to_string(),
         String::new(),
         format!("PR: {pr_url}"),
-        String::new(),
-        "The issue has been advanced to Done.".to_string(),
     ]
     .join("\n")
 }
@@ -5156,11 +5157,12 @@ mod tests {
     }
 
     #[test]
-    fn complete_automerge_merges_and_advances_to_done() {
-        // CLAUDE-278: the shared merge sequence the webhook success handler
-        // calls once it has confirmed a recorded agent PR's checks are green and
-        // mergeable: merge as a merge-commit, State=Done, then comment + AI
-        // Agent=Done as the authoritative last write.
+    fn complete_automerge_merges_and_comments_with_no_state_or_field_write() {
+        // CLAUDE-327: the shared merge sequence the webhook success handler
+        // calls once it has confirmed a recorded agent PR's checks are green
+        // and mergeable: merge as a merge-commit, then a best-effort comment.
+        // No `State` and no `AI Agent` write - the YouTrack workflow resolves
+        // the issue once it observes the merge.
         let runner = Arc::new(
             StubRunner::new()
                 .ok(
@@ -5177,10 +5179,14 @@ mod tests {
                     ],
                     "",
                 )
-                .ok("yt", &["issue", "set-state", "MK-16", "Done"], "")
                 .ok(
                     "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Done"],
+                    &[
+                        "issue",
+                        "comment",
+                        "MK-16",
+                        "The runner merged this PR after its CI checks passed (automerge).\n\nPR: https://dev.a8n.run/contoso/claude-run/pulls/7",
+                    ],
                     "",
                 ),
         );
@@ -5188,7 +5194,6 @@ mod tests {
         complete_automerge(
             &backend,
             &backend,
-            &src(),
             "MK-16",
             "dev.a8n.run",
             "contoso/claude-run",
@@ -5202,16 +5207,8 @@ mod tests {
                 == "fj --host dev.a8n.run pr merge contoso/claude-run#7 --method merge --delete"),
             "{calls:?}"
         );
-        assert!(
-            calls.iter().any(|c| c == "yt issue set-state MK-16 Done"),
-            "{calls:?}"
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|c| c == "yt issue set-field MK-16 AI Agent Done"),
-            "{calls:?}"
-        );
+        assert!(!calls.iter().any(|c| c.contains("set-state")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
     }
 
     // ---- CLAUDE-161 pre-clone dependency gate ----

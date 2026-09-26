@@ -493,11 +493,13 @@ pub struct MintConfig {
     pub human_assignee: Option<String>,
     /// `State` value set on a freshly minted issue. Default `To do`.
     pub target_state: String,
-    /// CLAUDE-277: `State` value set on a CI-failure issue when its fix PR
-    /// merges with the failing workflow green at the merge commit. Default
-    /// `Done`. Separate from [`MintConfig::target_state`], which is what a
-    /// fresh mint (or a regression reopen) sets, not what a merge-driven close
-    /// sets.
+    /// CLAUDE-327: the `State` value a YouTrack workflow (see
+    /// `docs/yt-workflow-resolve-on-pr-merge.js`) sets on an issue when its own
+    /// PR merges, resolving the issue. The runner never writes this value: it
+    /// only READS it at match time, at CI-failure dispatch, to tell an issue
+    /// already resolved (a regression) from one still open. Default `Done`.
+    /// Separate from [`MintConfig::target_state`], which is what a fresh mint
+    /// (or a regression reopen) sets.
     pub resolved_state: String,
     /// `AI Agent` custom-field name driven on the minted issue.
     pub ai_agent_field: String,
