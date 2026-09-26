@@ -428,6 +428,10 @@ pub struct YoutrackStates {
     /// AI Agent value set on a hard failure.
     pub failed: String,
     /// AI Agent value set after the runner automerges the PR (CLAUDE-126).
+    /// Also the default for [`YoutrackStates::no_code_label`], the label used
+    /// on a deliberate no-code run: no PR ever merges there, so the YouTrack
+    /// workflow that closes an issue on its own PR's merge cannot reach it
+    /// (CLAUDE-327).
     pub done: String,
     /// AI Agent value set when a successful run deliberately produced no commits
     /// and left the `.claude-run-no-code-change` marker (CLAUDE-214). `None` (the
@@ -437,8 +441,12 @@ pub struct YoutrackStates {
     pub no_code: Option<String>,
     /// Standard `State` field value set in the pre step.
     pub in_progress: String,
-    /// Standard `State` field value set after the runner automerges the PR
-    /// (CLAUDE-126).
+    /// Deprecated and ignored (CLAUDE-327): the runner no longer writes
+    /// `State` when a PR merges. A YouTrack workflow
+    /// (`docs/yt-workflow-resolve-on-pr-merge.js`) resolves an issue when its
+    /// own PR merges instead. Kept only so an existing action file or stored
+    /// setting that names it still loads; `validate_native` warns once when
+    /// it is set away from its default.
     pub state_done: String,
 }
 
@@ -2025,6 +2033,18 @@ fn validate_native(action: &Action, label: &str) -> Result<()> {
                 action = %action.name,
                 path = %label,
                 "automerge.wait_seconds / automerge.check_interval_seconds are deprecated and ignored: automerge is now triggered by the run-succeeded webhook instead of a polling wait. Remove both keys from the action file, or save the action's structured form, which resets them."
+            );
+        }
+        // CLAUDE-327: `states.state_done` no longer does anything (a YouTrack
+        // workflow closes the issue when its own PR merges, not the runner),
+        // but an action file that still sets it away from the default must
+        // keep loading rather than failing `deny_unknown_fields`-style.
+        let default_states = YoutrackStates::default();
+        if cfg.youtrack.states.state_done != default_states.state_done {
+            warn!(
+                action = %action.name,
+                path = %label,
+                "states.state_done is deprecated and ignored: a YouTrack workflow now resolves an issue when its own PR merges, not the runner. Remove the key from the action file, or save the action's structured form, which resets it."
             );
         }
     }

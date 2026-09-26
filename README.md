@@ -1045,36 +1045,32 @@ allow-list, rate limit, `secret_ref`, `log_token_ref`, `write_token_ref`) and th
 take effect live, as does `agent_pr_fix_attempts` (CLAUDE-276, default 3, applies to the next event); `replay_window_secs`
 applies on restart. A mint edit is honored by the next event.
 
-### Closing a CI-failure issue on merge (CLAUDE-277)
+### Resolving a CI-failure issue on merge (CLAUDE-277, CLAUDE-327)
 
-Closing a CI-failure issue by finding its failing job green needs a run of that workflow on the repo's `default_branch`,
-which never happens for a workflow that only ever runs on pull requests: it has no run on `main` at all. CLAUDE-277 adds
-a second, event-driven close: `POST /webhooks/forgejo/<source>` now also accepts Forgejo `pull_request` deliveries,
-dispatched by the delivery's event-type header (`X-Forgejo-Event`, mirroring Gitea's `X-Gitea-Event`; a deployment must
-confirm this against its own Forgejo's actual delivery, since Forgejo's webhook headers are undocumented upstream - see
-the operator note below). A `pull_request` delivery runs through the SAME signature / replay / rate-limit / pause /
-allow-list gates the Action-run path does; only a terminal `action: "closed"` delivery does anything, everything else is
-acked and dropped.
+`POST /webhooks/forgejo/<source>` accepts Forgejo `pull_request` deliveries, dispatched by the delivery's event-type
+header (`X-Forgejo-Event`, mirroring Gitea's `X-Gitea-Event`; a deployment must confirm this against its own Forgejo's
+actual delivery, since Forgejo's webhook headers are undocumented upstream - see the operator note below). A
+`pull_request` delivery runs through the SAME signature / replay / rate-limit / pause / allow-list gates the Action-run
+path does; only a terminal `action: "closed"` delivery does anything, everything else is acked and dropped.
 
-- **Merged, with the failing workflow green at the PR's head commit:** every open `ci_failures` row the PR references
-  (its own `agent_pull_requests` issue, plus every key `Forge::pr_referenced_issues` finds) is closed -
-  `set_state(mint.resolved_state)` (a new setting, default `Done`, separate from `mint.target_state`, which is what a
-  fresh mint or a regression reopen sets) plus a comment linking the PR and the green run - and the store row is marked
-  `resolved`. "Green" is the run's own status, not a specific job's: the acceptance criterion speaks of the workflow, not
-  one job within it.
-- **Merged, with that workflow red or no run found at the head commit:** the issue is left open with a comment saying
-  so; nothing else changes. A later run of the same failing test still reopens it the ordinary CLAUDE-273 way.
-- **Closed without merging:** the only effect is marking the PR's own `agent_pull_requests` row `closed` (a human's PR,
-  with no such row, changes nothing); the runner's own re-queue logic (CLAUDE-275) then treats it as needing a fresh
-  branch rather than resuming a dead one.
+The runner itself never resolves an issue on a PR merge. A YouTrack workflow does that instead
+(`docs/yt-workflow-resolve-on-pr-merge.js`), for any issue whose own PR merges - not only ones the runner opened - by
+setting `State` to `Done` when the merged PR's title or body claims the issue (a title token, a bare `#KEY-N` line, or
+`Closes KEY-N`; the runner's own PR bodies already end with `Closes` and the bare issue key). On a merged or closed
+delivery the runner only updates its own `agent_pull_requests` bookkeeping: a merge marks the row `merged`, a close
+without a merge marks it `closed`. Neither makes a tracker call or a forge run-list call.
 
-The failing workflow's run at the merge commit is found by paging `fj actions runs` for the commit (`CommitRunsClient`,
-a second seam over the same JSON `ActionRunsClient::list_runs` reads, needed because `RunEntry` carries no commit sha).
+Because the store's own `ci_failures` row for a matched failure no longer flips to `resolved` on a merge the runner
+sees, a CI-failure dispatch that matches an `open` row reads that issue's live YouTrack `State` before deciding what to
+do: if it already equals `mint.resolved_state` (default `Done`, case-insensitive), the match is a regression and is
+reopened exactly as a `resolved` store row is; otherwise it attaches or comments as before. A failed read never falls
+back to "still open": it logs an error, records a `run_events` row, and fails the run rather than risking a false
+attach or a duplicate comment on an issue that is actually done.
 
 **Operator setup:** each Forgejo webhook pointed at `/webhooks/forgejo/<source>` must also send pull-request events
 (**Pull request events > Modification** in Forgejo's webhook form, which covers opened, closed, reopened and edited),
-alongside the Action-run events it already sends. Until it does, nothing closes on merge, and the run list shows no
-pull-request deliveries.
+alongside the Action-run events it already sends, so the `agent_pull_requests` bookkeeping stays current. Every project
+the runner works must also have the YouTrack workflow attached, or an issue there stays open after its PR merges.
 
 ### Event-driven automerge (CLAUDE-126, CLAUDE-278)
 
@@ -1106,9 +1102,10 @@ on `POST /webhooks/forgejo/<source>` - the same endpoint the CI-failure listener
      failure and fails the run.
    - **`behind_base: false` and not mergeable** (a real conflict, still-checking, or a WIP PR): comments that the PR
      is not mergeable and leaves the issue at Code Review.
-   - **`behind_base: false` and mergeable:** merges it as a merge-commit, sets State to `state_done` and AI Agent to
-     `done`, and posts a "runner merged" comment - the same sequence the old poll loop made on green. A merge failure
-     here (Forgejo refusing for a reason `mergeable` did not predict) comments the failure and fails the run.
+   - **`behind_base: false` and mergeable:** merges it as a merge-commit and posts a "runner merged" comment; it makes
+     no `State` or `AI Agent` write (CLAUDE-327: the YouTrack workflow resolves the issue once it sees the merge, not
+     the runner). A merge failure here (Forgejo refusing for a reason `mergeable` did not predict) comments the failure
+     and fails the run.
    - **Anything else** (checks not `success`): no action. There is no budget to exhaust and nothing to time out - a
      later `success` event on the same PR is what retries, for as long as CI takes.
 
