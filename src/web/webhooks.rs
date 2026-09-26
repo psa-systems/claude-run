@@ -3764,21 +3764,35 @@ async fn apply_automerge_decision(
     let status = match status {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
-            let msg = format!("pr_status failed: {e}");
+            // CLAUDE-333: the message names the PR so the previous `run_events`
+            // row for THIS PR can be found; an unchanged fault (the reconciler
+            // re-hits it every tick) is logged and recorded each time but
+            // commented on the issue only once.
+            let prefix = format!("PR {repo}#{pr_number}: ");
+            let msg = format!("{prefix}pr_status failed: {e}");
+            let previous =
+                state::run_events_last_message_containing(pool, WEBHOOK_MINT_ACTION, &prefix)
+                    .await
+                    .unwrap_or_else(|read_err| {
+                        warn!(error = %read_err, "reading the previous pr_status failure failed; commenting anyway");
+                        None
+                    });
             error!(repo = %repo, pr = pr_number, issue = %row.issue_key, error = %e, "action-run success: {msg}");
             record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
-            let body = format!(
-                "The runner could not check this PR's automerge status: {msg}.\n\nPR: {pr_url}\n\nA later Action Run event or the periodic reconciler will retry automatically."
-            );
-            post_issue_comment(
-                mint,
-                &row.issue_key,
-                body,
-                repo,
-                pr_number,
-                "action-run success: pr-status-failed comment failed",
-            )
-            .await;
+            if previous.as_deref() != Some(msg.as_str()) {
+                let body = format!(
+                    "The runner could not check this PR's automerge status: {msg}.\n\nPR: {pr_url}\n\nA later Action Run event or the periodic reconciler will retry automatically."
+                );
+                post_issue_comment(
+                    mint,
+                    &row.issue_key,
+                    body,
+                    repo,
+                    pr_number,
+                    "action-run success: pr-status-failed comment failed",
+                )
+                .await;
+            }
             return Err(msg);
         }
         Err(e) => {
@@ -9350,6 +9364,56 @@ mod tests {
                 "{:?}",
                 backend.calls()
             );
+        }
+
+        #[tokio::test]
+        async fn identical_pr_status_failure_comments_once_but_records_every_pass() {
+            // CLAUDE-333: an unchanged fault is recorded each tick, commented once;
+            // a changed message comments again.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            // No canned pr_status: every call fails with the same message.
+            let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(7, "")]));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let gate = crate::concurrency::KeyGate::new();
+            let comments = |b: &StoreBackend| {
+                b.calls()
+                    .iter()
+                    .filter(|c| c.starts_with("comment MK-16"))
+                    .count()
+            };
+            let events = || async {
+                state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 50)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.message.contains("pr_status failed"))
+                    .count()
+            };
+
+            reconcile_automerge(&pool, &ctx, &gate).await;
+            reconcile_automerge(&pool, &ctx, &gate).await;
+            assert_eq!(comments(&backend), 1, "{:?}", backend.calls());
+            assert_eq!(events().await, 2);
+
+            // A different failure message posts a new comment.
+            // Simulate a different message having been recorded last.
+            state::run_events_record(
+                &pool,
+                WEBHOOK_MINT_ACTION,
+                "2999-01-01T00:00:00Z",
+                &[state::InputEvent {
+                    level: "error".into(),
+                    context: None,
+                    message: "PR contoso/claude-run#7: pr_status failed: something else".into(),
+                }],
+            )
+            .await
+            .unwrap();
+            reconcile_automerge(&pool, &ctx, &gate).await;
+            assert_eq!(comments(&backend), 2, "{:?}", backend.calls());
         }
 
         #[tokio::test]
