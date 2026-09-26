@@ -403,13 +403,12 @@ impl Daemon {
             &self.paths,
         );
         // CLAUDE-277/278: the pull-request and success-event consumers share
-        // the same MintContext (backend, mint config, commit-runs client) as
-        // the failure consumer; built once, cloned for each extra task.
+        // the same MintContext (backend, mint config) as the failure
+        // consumer; built once, cloned for each extra task.
         let pr_consumer = tokio::spawn(crate::web::webhooks::consume_pr_events(
             pr_rx,
             pool.clone(),
             mint_ctx.clone(),
-            settings.webhook_handle(),
             keygate.clone(),
         ));
         let success_consumer = tokio::spawn(crate::web::webhooks::consume_action_success_events(
@@ -700,9 +699,6 @@ fn build_mint_context(
         )),
         paths: paths.clone(),
         pr_comment_runner: Arc::new(crate::provider::ProcessRunner::new()),
-        commit_runs: Arc::new(crate::provider::FjForgeReads::new(Arc::new(
-            crate::provider::ProcessRunner::new(),
-        ))),
     })
 }
 
