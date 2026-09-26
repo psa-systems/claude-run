@@ -706,6 +706,16 @@ struct ServeEnv {
 
 /// Serve one accepted command end to end: authorize, then help / refuse / run.
 async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
+    // CLAUDE-335: a command accepted before a pause was set must not act after it.
+    if crate::web::webhooks::webhook_action_paused(
+        &ctx.pool,
+        WEBHOOK_COMMENT_ACTION,
+        "comment command",
+    )
+    .await
+    {
+        return;
+    }
     let key = cmd.key();
     let (cfg, src) = {
         let cfg = ctx.config.read().await;
@@ -3436,6 +3446,32 @@ mod tests {
         // Releasing lets the PR be worked again.
         drop(held);
         assert!(gate.try_acquire(&cmd.pr_gate_key()).is_some());
+    }
+
+    // ---- CLAUDE-335: a queued command honours pause -----------------------
+
+    #[tokio::test]
+    async fn queued_command_pause_check_covers_global_and_own_action_only() {
+        use crate::web::webhooks::webhook_action_paused;
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = setup_pool(tmp.path()).await;
+        let paused = || webhook_action_paused(&pool, WEBHOOK_COMMENT_ACTION, "comment command");
+        assert!(!paused().await);
+        state::action_pause_set(&pool, "webhook-forgejo", Some("t"))
+            .await
+            .unwrap();
+        assert!(!paused().await, "the other listener's pause is not ours");
+        state::action_pause_set(&pool, WEBHOOK_COMMENT_ACTION, Some("t"))
+            .await
+            .unwrap();
+        assert!(paused().await);
+        state::action_pause_clear(&pool, WEBHOOK_COMMENT_ACTION)
+            .await
+            .unwrap();
+        assert!(!paused().await);
+        state::global_pause_set(&pool, Some("t")).await.unwrap();
+        assert!(paused().await);
     }
 
     // ---- the write token never leaves the encrypted store -----------------
