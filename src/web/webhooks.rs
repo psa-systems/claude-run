@@ -8825,10 +8825,7 @@ mod tests {
             assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
             // CLAUDE-327: the reconciler makes no `State` or `AI Agent` write; a
             // YouTrack workflow resolves the issue once it observes the merge.
-            assert!(
-                !calls.iter().any(|c| c.contains("set_state")),
-                "{calls:?}"
-            );
+            assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
         }
 
         #[tokio::test]
