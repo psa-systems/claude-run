@@ -676,8 +676,9 @@ The workflow:
    nothing new starts: the scheduler tick returns immediately, a manual trigger is refused with `409` naming the pause
    (instead of the old "queued trigger" ack for a run that was then silently dropped), an inbound delivery to either
    webhook listener is accepted with a `2xx` and dropped (a dropped delivery is not recovered after Resume), the automerge
-   reconciler tick and a queued Action Run success event do nothing while the daemon or `webhook-forgejo` is paused (an
-   unreadable pause flag also skips them, CLAUDE-332), and any run still in flight stops picking up its NEXT job.
+   reconciler tick and every queued event (Action Run failure, success, and pull request events, and `/claude` comment
+   commands, which check `webhook-forgejo-comment`) do nothing while the daemon or their listener's action is paused (an
+   unreadable pause flag also skips them, CLAUDE-332, CLAUDE-335; a skipped queued event is not replayed after Resume), and any run still in flight stops picking up its NEXT job.
 2. **Watch the indicator drain.** It polls itself every 2s and reads exactly one of three states: **busy** (each active
    run listed and linked), **idle** ("safe to restart or reboot"), or **unknown**. `unknown` means the activity check
    itself failed; it is never rendered as idle, and the underlying error is logged at `error`. Do not restart on
