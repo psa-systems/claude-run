@@ -1700,6 +1700,19 @@ mod tests {
     }
 
     #[test]
+    fn two_branches_with_runner_unavailable_share_one_marker_and_create() {
+        // CLAUDE-266: `could not resolve host` now reaches the mint as a
+        // human-assigned issue keyed on the branch-agnostic infra kind.
+        let t = triage(TriageBucket::HumanAction);
+        let first = req_infra(&t, "runner-unavailable", "fix/a", "aaaa1111");
+        let second = req_infra(&t, "runner-unavailable", "feat/b", "bbbb2222");
+        assert_eq!(infra_marker(&first), infra_marker(&second));
+        let tracker = StubTracker::new();
+        let out = mint(&tracker, &cfg(), &route_cache(), &second, &caps()).unwrap();
+        assert!(matches!(out, MintOutcome::Created { .. }), "{out:?}");
+    }
+
+    #[test]
     fn different_infra_kinds_on_the_same_job_yield_distinct_markers() {
         // A full disk and an OOM kill are separate conditions and still key
         // differently, even on the same job and the same branch.
