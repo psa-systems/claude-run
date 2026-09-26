@@ -71,7 +71,7 @@
       <input type="checkbox" name="automerge_enabled"{% if form.is_automerge_enabled() %} checked{% endif %}>
       <span>Enabled (merge the PR once its CI goes green, then advance the issue to Done)</span>
     </label>
-    <p class="hint dim">When enabled, a successful run still stops at Code Review. The runner merges the PR later, when a Forgejo Action Run Success or Recover webhook reports its CI green and the branch is mergeable, then comments on the issue; AI Agent and State stay at Code Review, and a YouTrack workflow (see <code>docs/yt-workflow-resolve-on-pr-merge.js</code>) resolves the issue once the merge lands. The webhook must send those events (see the README "Event-driven automerge" section). Disabled (the default) leaves the PR for a human to merge.</p>
+    <p class="hint dim">When enabled, a successful run still stops at Code Review. The runner merges the PR later, once its CI goes green and the branch is mergeable, then comments on the issue; AI Agent and State stay at Code Review, and a YouTrack workflow (see <code>docs/yt-workflow-resolve-on-pr-merge.js</code>) resolves the issue once the merge lands. Normally the merge happens within seconds of a Forgejo Action Run Success or Recover webhook; if that webhook is missed, dropped, or never configured, a periodic reconciler pass merges it within a few minutes instead, so the webhook is a low-latency trigger and not a requirement (see the README "Event-driven automerge" section). Disabled (the default) leaves the PR for a human to merge.</p>
   </div>
 
   <div class="card">
