@@ -3813,7 +3813,7 @@ async fn apply_automerge_decision(
                     }
                 }
             }
-            Some(false) if !status.mergeable => {
+            Some(false) if status.mergeable != Some(true) => {
                 let body = crate::native::youtrack::automerge_not_mergeable_comment(pr_url);
                 post_issue_comment(
                     mint,
@@ -4500,7 +4500,7 @@ mod tests {
         ) -> Self {
             *self.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
                 state: state.to_string(),
-                mergeable,
+                mergeable: Some(mergeable),
                 behind_base,
             });
             self
@@ -8358,7 +8358,7 @@ mod tests {
             // A later success event: the forge now reports green + mergeable.
             *backend.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
                 state: "success".to_string(),
-                mergeable: true,
+                mergeable: Some(true),
                 behind_base: Some(false),
             });
             let result2 = handle_action_success_for_pr(
@@ -8435,6 +8435,53 @@ mod tests {
             .unwrap();
             assert!(result.contains("automerge disabled"), "{result}");
             assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+        }
+
+        #[tokio::test]
+        async fn merged_pr_with_unknown_mergeable_takes_no_action() {
+            // CLAUDE-330: fj reports `mergeable: null` for a merged PR.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                "2026-09-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(StoreBackend::new());
+            *backend.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
+                state: "merged".to_string(),
+                mergeable: None,
+                behind_base: None,
+            });
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            let result = handle_action_success_for_pr(
+                &ctx,
+                &pool,
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "https://dev.a8n.run/contoso/claude-run/pulls/7",
+            )
+            .await
+            .unwrap();
+            assert!(result.contains("no action"), "{result}");
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("comment MK-16")
+                    || c.starts_with("merge_pr")
+                    || c.starts_with("update_pr_branch")),
+                "{calls:?}"
+            );
         }
 
         #[tokio::test]

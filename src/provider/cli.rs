@@ -1585,11 +1585,10 @@ impl Forge for CliBackend {
         #[derive(Deserialize)]
         struct Status {
             state: String,
-            // A `fj` predating CLAUDE-126's field, or a PR with no verdict yet,
-            // is treated as not-mergeable so automerge updates the branch rather
-            // than racing a premature merge.
+            // Absent or `null` (a merged PR, or no verdict yet) is unknown and
+            // never merges: only `Some(true)` does (CLAUDE-330).
             #[serde(default)]
-            mergeable: bool,
+            mergeable: Option<bool>,
             // Absent (an `fj` predating FJ-99) or explicit `null` both parse to
             // `None`: unknown, never collapsed to `false` (CLAUDE-309).
             #[serde(default)]
@@ -3682,8 +3681,32 @@ mod tests {
             .pr_status("dev.a8n.run", "contoso/claude-run", 52)
             .unwrap();
         assert_eq!(st.state, "success");
-        assert!(st.mergeable);
+        assert_eq!(st.mergeable, Some(true));
         assert_eq!(st.behind_base, Some(true));
+    }
+
+    #[test]
+    fn pr_status_merged_pr_null_mergeable_parses_to_none() {
+        // CLAUDE-330: a merged PR reports `"mergeable": null` and no `behind_base`.
+        let json = r#"{"pr":336,"head_sha":null,"state":"merged","statuses":[],"mergeable":null,"merged":true}"#;
+        let b = backend(StubRunner::new().ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "status",
+                "contoso/claude-run#336",
+                "--json",
+            ],
+            json,
+        ));
+        let st = b
+            .pr_status("dev.a8n.run", "contoso/claude-run", 336)
+            .unwrap();
+        assert_eq!(st.state, "merged");
+        assert_eq!(st.mergeable, None);
+        assert_eq!(st.behind_base, None);
     }
 
     #[test]
