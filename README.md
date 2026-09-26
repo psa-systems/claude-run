@@ -1130,7 +1130,7 @@ marks a row `closed` when its PR is no longer listed (a PR closed without merge,
 not asked about again (CLAUDE-334); a failed listing leaves that repo's rows `open` and is logged at `error`. Every fault this pass or the webhook path can hit while a
 recorded, automerge-enabled PR is involved (a forge-host lookup failure, a `list_open_prs` failure, a failed action
 load, a failed `pr_status` call, a failed merge or branch update) is logged at `error`, written to `run_events`, and
-posted as a PR comment naming the failure, rather than left as a silent `warn`.
+posted as a PR comment naming the failure, rather than left as a silent `warn`. A `pr_status` failure that repeats with an identical message for the same PR (for example `no commits in pr`) is still logged and recorded on every tick, but commented on the issue only once (CLAUDE-333); a changed message comments again.
 
 **Operator setup:** each Forgejo webhook pointed at `/webhooks/forgejo/<source>` should still send Action Run
 **Success** and **Recover** events, in addition to Failure, for any org running a `youtrack` action with automerge
