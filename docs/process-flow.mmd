@@ -1,21 +1,68 @@
-stateDiagram-v2
-    direction TB
+---
+config:
+  themeVariables:
+    edgeLabelBackground: "transparent"
+  flowchart:
+    nodeSpacing: 80
+    rankSpacing: 120
+---
+flowchart TB
+    yt["YouTrack<br/>Issue"]
+    yt_ci["YouTrack<br/>CI Failure issue (new)"]
+    yt_ci_old["YouTrack<br/>Existing CI Failure issue"]
+    yt_gap["YouTrack<br/>Gap or bug issue (new)"]
 
-    [*] --> ToDo : yt issue create
+    audit_action["Claude Run<br/>'audit-run' action"]
+    cc_audit["'claude code'<br/>audits a repository<br/>(read-only clone)<br/>prompts from the audits repo"]
 
-    state "To do" as ToDo
-    state "In Progress" as InProg
-    state "Done" as Done
+    yt_action["Claude Run<br/>'youtrack' action"]
+    cc_work["'claude code'<br/>works the issue"]
 
-    ToDo --> InProg : yt issue apply 'State In Progress' (before first edit)
-    InProg --> InProg : commit references issue as bare #KEY-N (link only, no State command), open PR
-    InProg --> Done : human merges PR, then yt issue apply 'State Done' (explicit, post-merge)
-    Done --> [*]
+    wh_action["Claude Run<br/>'webhook-forgejo' action"]
+    cc_triage["'claude code'<br/>analyzes the failed run<br/>(read-only)"]
 
-    note right of InProg
-        Commit trailers are applied when the VCS integration parses the
-        pushed commit, not on PR merge. A bare #KEY-N links the PR to the
-        issue without transitioning it, so the issue stays In Progress
-        through review. State Done is a deliberate post-merge action via
-        yt issue apply, never a commit trailer.
-    end note
+    fj_pr["Forgejo<br/>Pull request"]
+    fj_ci["Forgejo<br/>Workflows"]
+
+    yt -->|"<span style='color:#f59e0b'>Queued</span><br/>any other issue"| yt_action
+
+    yt_action -->|"issue prompt"| cc_work
+    cc_work -->|"commits"| yt_action
+    cc_work -->|"problem identified"| yt_gap
+
+    yt -->|"<span style='color:#f59e0b'>Queued</span><br/>project: AUDIT, tag: Audit-*"| audit_action
+    audit_action -->|"built-in audit prompt"| cc_audit
+    cc_audit -->|"creates issues<br/><span style='color:#f59e0b'>Queued</span>"| yt
+    cc_audit -->|"commit report"| audit_action
+    audit_action -->|"audits repo PR<br/><span style='color:#38bdf8'>In Progress</span><br/><span style='color:#f59e0b'>Code Review</span>"| fj_pr
+
+    yt_action -->|"<span style='color:#ff2200'>failure</span><br/><span style='color:#f59e0b'>Failed</span><br/>or <span style='color:#f59e0b'>Needs Review</span>"| yt
+    yt_action -->|"no change<br/>summary comment<br/><span style='color:#f59e0b'>Done</span>"| yt
+    yt_action -->|"opens PR<br/><span style='color:#38bdf8'>In Progress</span><br/><span style='color:#f59e0b'>Code Review</span>"| fj_pr
+
+    fj_pr -->|"<span style='color:#38bdf8'>In Progress</span><br/><span style='color:#f59e0b'>Code Review</span>"| fj_ci
+
+    fj_ci -->|"<span style='color:#22ff00'>passed</span><br/>automerge on"| wh_action
+    wh_action -->|"automerge:<br/>merges the PR"| fj_pr
+    fj_pr -->|"PR merged:<br/>YouTrack workflow<br/><span style='color:#38bdf8'>Done</span>"| yt
+
+    fj_ci -->|"<span style='color:#ff2200'>failed</span>"| wh_action
+    wh_action -->|"logs"| cc_triage
+    cc_triage -->|"verdict"| wh_action
+    wh_action -->|"agent PR, attempts left:<br/><span style='color:#f59e0b'>Queued</span>"| yt
+    wh_action -->|"agent PR, none left:<br/><span style='color:#f59e0b'>Needs Review</span>"| yt
+    wh_action -->|"new failure, no PR:<br/>code defect, auto-fix on:<br/>creates issue<br/><span style='color:#f59e0b'>Queued</span>"| yt
+    wh_action -->|"new failure, no PR:<br/>needs a human, or auto-fix off:<br/>creates issue<br/><span style='color:#38bdf8'>To do</span>"| yt_ci
+    wh_action -->|"already tracked:<br/>run attached"| yt_ci_old
+    wh_action -->|"regression:<br/>reopens issue<br/><span style='color:#38bdf8'>To do</span>"| yt_ci_old
+    wh_action -->|"human PR:<br/>comments on the PR"| fj_pr
+
+
+    classDef youtrack stroke:#38bdf8,stroke-width:2px
+    classDef action stroke:#f59e0b,stroke-width:2px
+    classDef claude stroke:#a855f7,stroke-width:2px
+    classDef forgejo stroke:#10b981,stroke-width:2px
+    class yt,yt_ci,yt_ci_old,yt_gap youtrack
+    class yt_action,audit_action,wh_action action
+    class cc_work,cc_audit,cc_triage claude
+    class fj_pr,fj_ci forgejo

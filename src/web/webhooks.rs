@@ -538,10 +538,6 @@ pub struct MintContext {
     /// can exercise a PR-comment routing decision against a canned `fj`
     /// response with no real subprocess or network call.
     pub pr_comment_runner: Arc<dyn CommandRunner>,
-    /// CLAUDE-277: seam over `fj actions runs` carrying the commit sha, used by
-    /// the merge-close pull-request path to find the failing workflow's run at
-    /// a merged PR's head commit.
-    pub commit_runs: Arc<dyn crate::forge_log::CommitRunsClient>,
 }
 
 /// Drain emitted events. For each verified failure this fetches the run's logs
@@ -1236,6 +1232,44 @@ async fn triage_and_mint(
         // exactly as before this issue.
         if let Some(m) = store_match {
             if m.state == "open" {
+                if let Some(key) = m.issue_key.clone() {
+                    let resolved_state = ctx.mint_cfg.read().await.resolved_state.clone();
+                    match issue_state_is_resolved(ctx, &key, &resolved_state).await {
+                        Ok(true) => {
+                            return reopen_resolved_failure(
+                                ctx,
+                                run_id,
+                                ev,
+                                log_text,
+                                log_available,
+                                log_unavailable_reason,
+                                auto_fix_enabled,
+                                branch,
+                                test_ids,
+                                log_token,
+                                m,
+                            )
+                            .await;
+                        }
+                        Ok(false) => {
+                            return attach_to_open_failure(ctx, ev, &branch, &test_ids, m).await;
+                        }
+                        Err(e) => {
+                            error!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "youtrack state read failed; not attaching");
+                            record_run_event(
+                                &ctx.pool,
+                                run_id,
+                                WEBHOOK_MINT_ACTION,
+                                "error",
+                                format!("youtrack state read failed: {e}"),
+                            )
+                            .await;
+                            return WebhookRunSummary::error(format!(
+                                "youtrack state read failed: {e}"
+                            ));
+                        }
+                    }
+                }
                 return attach_to_open_failure(ctx, ev, &branch, &test_ids, m).await;
             }
             if m.state == "resolved" {
@@ -1345,6 +1379,30 @@ fn attach_comment_body(ev: &VerifiedFailureEvent, branch: &str, test_ids: &[Stri
         "`{}` failed again on `{}` (run #{}, {}, branch `{}`).\n- Run: {}\n- Failing tests: {tests}",
         ev.workflow_id, ev.repo, ev.index_in_repo, short_sha, branch, ev.html_url
     )
+}
+
+/// CLAUDE-327: read `key`'s live YouTrack `State` and report whether it
+/// already equals `resolved_state` (case-insensitive). The store's own
+/// `open`/`resolved` column no longer changes on merge (the runner writes no
+/// `State` there itself: `docs/yt-workflow-resolve-on-pr-merge.js` does), so
+/// an `open` store row can still name an issue the workflow already
+/// resolved; this is the match-time check that tells the two apart. A read
+/// failure is never read as "still open": the caller reports it as an error
+/// rather than risking a false attach.
+async fn issue_state_is_resolved(
+    ctx: &MintContext,
+    key: &str,
+    resolved_state: &str,
+) -> crate::error::Result<bool> {
+    let backend = ctx.backend.clone();
+    let key = key.to_string();
+    match tokio::task::spawn_blocking(move || backend.get_field(&key, "State")).await {
+        Ok(Ok(state)) => Ok(state.eq_ignore_ascii_case(resolved_state)),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(crate::error::Error::Other(anyhow::anyhow!(
+            "state-read task panicked: {e}"
+        ))),
+    }
 }
 
 /// CLAUDE-273: attach `ev` to the already-tracked, still-`open` failure `m`
@@ -1975,6 +2033,42 @@ async fn route_human_pr_failure(
 ) -> WebhookRunSummary {
     match store_match {
         Some(m) if m.state == "open" => {
+            if let Some(key) = m.issue_key.clone() {
+                let resolved_state = ctx.mint_cfg.read().await.resolved_state.clone();
+                match issue_state_is_resolved(ctx, &key, &resolved_state).await {
+                    Ok(true) => {
+                        return reopen_resolved_failure(
+                            ctx,
+                            run_id,
+                            ev,
+                            log_text,
+                            log_available,
+                            log_unavailable_reason,
+                            auto_fix_enabled,
+                            branch.to_string(),
+                            test_ids.to_vec(),
+                            log_token,
+                            m,
+                        )
+                        .await;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        error!(repo = %ev.repo, run = ev.index_in_repo, %key, error = %e, "youtrack state read failed; not attaching");
+                        record_run_event(
+                            &ctx.pool,
+                            run_id,
+                            WEBHOOK_MINT_ACTION,
+                            "error",
+                            format!("youtrack state read failed: {e}"),
+                        )
+                        .await;
+                        return WebhookRunSummary::error(format!(
+                            "youtrack state read failed: {e}"
+                        ));
+                    }
+                }
+            }
             route_pr_matches_open_failure(
                 ctx,
                 run_id,
@@ -3186,7 +3280,6 @@ pub async fn consume_pr_events(
     mut rx: mpsc::Receiver<VerifiedPullRequestEvent>,
     pool: DbPool,
     mint: Option<MintContext>,
-    webhook_cfg: Arc<RwLock<WebhookConfig>>,
     keygate: crate::concurrency::KeyGate,
 ) {
     let mint = mint.map(Arc::new);
@@ -3194,10 +3287,9 @@ pub async fn consume_pr_events(
     while let Some(ev) = rx.recv().await {
         let pool = pool.clone();
         let mint = mint.clone();
-        let webhook_cfg = webhook_cfg.clone();
         let keygate = keygate.clone();
         tasks.push(tokio::spawn(async move {
-            process_pr_event(ev, pool, mint, webhook_cfg, keygate).await;
+            process_pr_event(ev, pool, mint, keygate).await;
         }));
         tasks.retain(|t| !t.is_finished());
     }
@@ -3215,17 +3307,16 @@ async fn process_pr_event(
     ev: VerifiedPullRequestEvent,
     pool: DbPool,
     mint: Option<Arc<MintContext>>,
-    webhook_cfg: Arc<RwLock<WebhookConfig>>,
     keygate: crate::concurrency::KeyGate,
 ) {
-    let Some(mint) = mint else {
+    if mint.is_none() {
         info!(
             repo = %ev.repo,
             number = ev.number,
             "pull-request event dropped: no usable provider backend (mint disabled)"
         );
         return;
-    };
+    }
 
     // CLAUDE-274-style: one key per (repo, PR), so two deliveries of the same
     // PR (a retried delivery, or closed-then-reopened-then-merged in quick
@@ -3242,9 +3333,7 @@ async fn process_pr_event(
     let run_id = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
 
     let result = if ev.merged {
-        let webhook_cfg = webhook_cfg.read().await.clone();
-        let token = source_log_token(&pool, &webhook_cfg, &ev.source).await;
-        handle_merged_pr(&mint, &pool, &host, &ev, token).await
+        handle_merged_pr(&pool, &host, &ev).await
     } else {
         handle_closed_unmerged_pr(&pool, &host, &ev).await
     };
@@ -3286,178 +3375,34 @@ async fn handle_closed_unmerged_pr(
     ))
 }
 
-/// CLAUDE-277: a merged PR. Marks the agent's own PR record `merged` when one
-/// exists, collects every open store failure the PR references (its own
-/// agent-PR issue key, plus [`Forge::pr_referenced_issues`]), and for each,
-/// closes the issue when the failing workflow is green at the PR's head
-/// commit, else leaves it open with an explanatory comment.
+/// CLAUDE-277/CLAUDE-327: a merged PR. Marks the agent's own PR record
+/// `merged` when one exists; makes no tracker call and no forge run-list
+/// call. A YouTrack workflow (`docs/yt-workflow-resolve-on-pr-merge.js`)
+/// resolves whichever issue the merged PR claims, for any issue, not only one
+/// the runner tracks, so this handler does not need to find or close it.
 async fn handle_merged_pr(
-    mint: &MintContext,
     pool: &DbPool,
     host: &str,
     ev: &VerifiedPullRequestEvent,
-    log_token: Option<String>,
 ) -> Result<String, String> {
     let now = state::now_iso();
 
     let agent_row = ci_failure_store::agent_pr(pool, host, &ev.repo, ev.number)
         .await
         .map_err(|e| format!("agent_pull_requests lookup failed: {e}"))?;
-    if let Some(row) = &agent_row {
-        ci_failure_store::set_agent_pr_state(pool, row.id, "merged", &now)
-            .await
-            .map_err(|e| format!("marking agent_pull_requests merged failed: {e}"))?;
-    }
-
-    let mut keys: Vec<String> = Vec::new();
-    if let Some(row) = &agent_row {
-        keys.push(row.issue_key.clone());
-    }
-    let backend = mint.backend.clone();
-    let host_owned = host.to_string();
-    let repo = ev.repo.clone();
-    let number = ev.number as u64;
-    let referenced = tokio::task::spawn_blocking(move || {
-        backend.pr_referenced_issues(&host_owned, &repo, number)
-    })
-    .await
-    .map_err(|e| format!("pr_referenced_issues task panicked: {e}"))?
-    .map_err(|e| format!("pr_referenced_issues failed: {e}"))?;
-    for k in referenced {
-        if !keys.contains(&k) {
-            keys.push(k);
-        }
-    }
-
-    if keys.is_empty() {
+    let Some(row) = agent_row else {
         return Ok(format!(
-            "PR #{} merged; no linked issue keys found",
+            "PR #{} merged; no agent_pull_requests row",
             ev.number
         ));
-    }
-
-    let mint_cfg = mint.mint_cfg.read().await.clone();
-    let mut summaries = Vec::new();
-    for key in keys {
-        let failure = match ci_failure_store::failure_for_issue(pool, &key).await {
-            Ok(Some(f)) if f.state == "open" => f,
-            Ok(_) => continue,
-            Err(e) => {
-                summaries.push(format!("{key}: store read failed: {e}"));
-                continue;
-            }
-        };
-        match close_or_leave_open(
-            mint,
-            pool,
-            host,
-            ev,
-            log_token.as_deref(),
-            &mint_cfg,
-            &key,
-            &failure,
-        )
+    };
+    ci_failure_store::set_agent_pr_state(pool, row.id, "merged", &now)
         .await
-        {
-            Ok(s) => summaries.push(s),
-            Err(e) => summaries.push(format!("{key}: {e}")),
-        }
-    }
-    Ok(summaries.join("; "))
-}
-
-/// CLAUDE-277: paged deep enough to find a run that finished moments ago (this
-/// fires right at merge time, not a scan over deep history), the same shape
-/// the reconciler's own page ceiling uses for the same reason.
-const MERGE_CHECK_MAX_PAGES: u32 = 10;
-
-/// CLAUDE-277: the per-issue decision - find the failing workflow's run at the
-/// merged PR's head commit ("failing workflow green at the head commit" is a
-/// RUN-level status, not a job-level one: the acceptance criterion speaks of
-/// the workflow, not a specific job within it), then close the issue when it
-/// is green, or comment "left open" when it is red or no run was found.
-#[allow(clippy::too_many_arguments)]
-async fn close_or_leave_open(
-    mint: &MintContext,
-    pool: &DbPool,
-    host: &str,
-    ev: &VerifiedPullRequestEvent,
-    log_token: Option<&str>,
-    mint_cfg: &MintConfig,
-    key: &str,
-    failure: &ci_failure_store::Failure,
-) -> Result<String, String> {
-    let runs =
-        match mint
-            .commit_runs
-            .list_commit_runs(host, &ev.repo, MERGE_CHECK_MAX_PAGES, log_token)
-        {
-            crate::forge_log::CommitRunsOutcome::Resolved(r) => r,
-            crate::forge_log::CommitRunsOutcome::NotFound => Vec::new(),
-            crate::forge_log::CommitRunsOutcome::AuthDenied(code) => {
-                return Err(format!("commit-runs list auth denied ({code})"));
-            }
-            crate::forge_log::CommitRunsOutcome::Failed(reason) => {
-                return Err(format!("commit-runs list failed: {reason}"));
-            }
-        };
-    let matched =
-        crate::ci_failure::close::latest_run_at_commit(&runs, &failure.workflow_id, &ev.head_sha)
-            .cloned();
-
-    match matched {
-        Some(run) if crate::ci_failure::close::is_green(&run.status) => {
-            let backend = mint.backend.clone();
-            let key_owned = key.to_string();
-            let state_owned = mint_cfg.resolved_state.clone();
-            let body = format!(
-                "Closed: {} merged and `{}` is green at {}.",
-                ev.html_url, failure.workflow_id, run.html_url
-            );
-            let body_for_task = body.clone();
-            let close_result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
-                backend.set_state(&key_owned, &state_owned)?;
-                backend.comment(&key_owned, &body_for_task)?;
-                Ok(())
-            })
-            .await;
-            match close_result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(format!("closing issue failed: {e}")),
-                Err(e) => return Err(format!("close task panicked: {e}")),
-            }
-            let now = state::now_iso();
-            ci_failure_store::set_failure_state(pool, failure.id, "resolved", &now)
-                .await
-                .map_err(|e| format!("store resolve failed: {e}"))?;
-            Ok(format!("closed ({body})"))
-        }
-        other => {
-            let workflow_url = other.map(|r| r.html_url);
-            let body = match workflow_url {
-                Some(url) => format!(
-                    "Merged without a green `{}` run; left open. PR: {}. Run: {url}.",
-                    failure.workflow_id, ev.html_url
-                ),
-                None => format!(
-                    "Merged without a green `{}` run; left open. PR: {}. No run found at the head commit.",
-                    failure.workflow_id, ev.html_url
-                ),
-            };
-            let backend = mint.backend.clone();
-            let key_owned = key.to_string();
-            let body_for_task = body.clone();
-            let comment_result =
-                tokio::task::spawn_blocking(move || backend.comment(&key_owned, &body_for_task))
-                    .await;
-            match comment_result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(format!("left-open comment failed: {e}")),
-                Err(e) => return Err(format!("left-open comment task panicked: {e}")),
-            }
-            Ok(format!("left open ({body})"))
-        }
-    }
+        .map_err(|e| format!("marking agent_pull_requests merged failed: {e}"))?;
+    Ok(format!(
+        "agent PR #{} merged; marked merged (issue {})",
+        ev.number, row.issue_key
+    ))
 }
 
 /// CLAUDE-278: drain verified `success`/`recover` Action-run deliveries for the
@@ -3664,7 +3609,9 @@ fn agent_pr_url(host: &str, repo: &str, pr_number: i64) -> String {
 /// rest of the decision to [`apply_automerge_decision`] - the same function
 /// [`reconcile_automerge`] (CLAUDE-328) calls for a PR it already has the row
 /// for, so the two entry points never diverge on the behind_base / mergeable /
-/// `complete_automerge` logic.
+/// `complete_automerge` logic, which merges the PR and comments; it makes no
+/// `State` or `AI Agent` write (CLAUDE-327), since the YouTrack workflow
+/// resolves the issue once it observes the merge.
 async fn handle_action_success_for_pr(
     mint: &MintContext,
     pool: &DbPool,
@@ -3703,8 +3650,10 @@ async fn handle_action_success_for_pr(
 /// `agent_pull_requests` row is already in hand: load the row's action to
 /// check `automerge.enabled`, read the PR's live CI status, and on
 /// green+mergeable call [`crate::native::youtrack::complete_automerge`] - the
-/// same merge + State + AI-Agent write sequence the old CLAUDE-126 poll loop
-/// made. An action-load failure and a `pr_status` failure both concern this
+/// same merge + comment sequence the old CLAUDE-126 poll loop made, with no
+/// `State` or `AI Agent` write (CLAUDE-327), since the YouTrack workflow
+/// resolves the issue once it observes the merge. An action-load failure and
+/// a `pr_status` failure both concern this
 /// already-known, recorded, automerge-eligible PR, so unlike the caller's own
 /// pre-resolution faults, both are made loud here: an `error` log, a
 /// `run_events` row, and a best-effort issue comment.
@@ -3890,7 +3839,6 @@ async fn apply_automerge_decision(
                     crate::native::youtrack::complete_automerge(
                         backend.as_ref(),
                         backend.as_ref(),
-                        &youtrack_cfg,
                         &issue_key,
                         &host_owned,
                         &repo_owned,
@@ -3902,9 +3850,9 @@ async fn apply_automerge_decision(
                 .map_err(|e| format!("complete_automerge task panicked: {e}"))?;
                 match merge_result {
                     Ok(()) => {
-                        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: merged PR and advanced issue to Done");
+                        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: merged PR; the YouTrack workflow will resolve the issue");
                         Ok(format!(
-                            "merged PR #{pr_number}; issue {} advanced to Done",
+                            "merged PR #{pr_number}; issue {} left for the YouTrack workflow to resolve",
                             row.issue_key
                         ))
                     }
@@ -4501,6 +4449,14 @@ mod tests {
         update_pr_branch_error: StdMutex<Option<String>>,
         /// CLAUDE-309: when set, `merge_pr` fails with this message.
         merge_pr_error: StdMutex<Option<String>>,
+        /// CLAUDE-327: canned `get_field` result for the match-time YouTrack
+        /// `State` read. Defaults to a value that never equals a test's
+        /// `resolved_state` ("Done"), so every pre-existing test that reaches
+        /// an `open`-match dispatch keeps taking the non-regression path with
+        /// no change.
+        state_field: StdMutex<Option<String>>,
+        /// CLAUDE-327: when set, `get_field` fails with this message.
+        state_field_error: StdMutex<Option<String>>,
     }
 
     impl StoreBackend {
@@ -4514,6 +4470,8 @@ mod tests {
                 pr_status: StdMutex::new(None),
                 update_pr_branch_error: StdMutex::new(None),
                 merge_pr_error: StdMutex::new(None),
+                state_field: StdMutex::new(None),
+                state_field_error: StdMutex::new(None),
             }
         }
         fn with_legacy_match(self, key: &str) -> Self {
@@ -4555,6 +4513,16 @@ mod tests {
             *self.merge_pr_error.lock().unwrap() = Some(message.to_string());
             self
         }
+        /// CLAUDE-327: make the match-time `State` read return `state`.
+        fn with_state_field(self, state: &str) -> Self {
+            *self.state_field.lock().unwrap() = Some(state.to_string());
+            self
+        }
+        /// CLAUDE-327: make the match-time `State` read fail with `message`.
+        fn with_state_field_error(self, message: &str) -> Self {
+            *self.state_field_error.lock().unwrap() = Some(message.to_string());
+            self
+        }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
@@ -4568,8 +4536,20 @@ mod tests {
                 None => Ok(Vec::new()),
             }
         }
-        fn get_field(&self, _key: &str, _field: &str) -> crate::error::Result<String> {
-            unreachable!()
+        fn get_field(&self, key: &str, field: &str) -> crate::error::Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("get_field {key} {field}"));
+            if let Some(message) = self.state_field_error.lock().unwrap().clone() {
+                return Err(crate::error::Error::Other(anyhow::anyhow!(message)));
+            }
+            Ok(self
+                .state_field
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "Open".to_string()))
         }
         fn set_field(&self, key: &str, field: &str, value: &str) -> crate::error::Result<()> {
             self.calls
@@ -4735,38 +4715,6 @@ mod tests {
         }
     }
 
-    /// CLAUDE-277: a canned [`crate::forge_log::CommitRunsClient`], returning
-    /// one fixed outcome for every call. Defaults to an empty resolved list (no
-    /// run found), which is what every PRE-EXISTING failure-event test needs
-    /// (they never reach the merge-close path).
-    struct ScriptedCommitRuns {
-        outcome: StdMutex<crate::forge_log::CommitRunsOutcome>,
-    }
-
-    impl ScriptedCommitRuns {
-        fn new(outcome: crate::forge_log::CommitRunsOutcome) -> Self {
-            Self {
-                outcome: StdMutex::new(outcome),
-            }
-        }
-
-        fn empty() -> Self {
-            Self::new(crate::forge_log::CommitRunsOutcome::Resolved(Vec::new()))
-        }
-    }
-
-    impl crate::forge_log::CommitRunsClient for ScriptedCommitRuns {
-        fn list_commit_runs(
-            &self,
-            _host: &str,
-            _repo: &str,
-            _max_pages: u32,
-            _token: Option<&str>,
-        ) -> crate::forge_log::CommitRunsOutcome {
-            self.outcome.lock().unwrap().clone()
-        }
-    }
-
     /// A [`FailureClassifier`] that always returns `code_fix`, recording how
     /// many times it ran so a test can assert the store dedupe skipped it.
     struct CountingClassifier {
@@ -4844,27 +4792,6 @@ mod tests {
         paths_dir: &std::path::Path,
         pr_comment_runner: Arc<dyn CommandRunner>,
     ) -> MintContext {
-        store_mint_context_with_commit_runs(
-            pool,
-            backend,
-            classifier,
-            paths_dir,
-            pr_comment_runner,
-            Arc::new(ScriptedCommitRuns::empty()),
-        )
-    }
-
-    /// CLAUDE-277: like [`store_mint_context_in`], with an injectable
-    /// [`crate::forge_log::CommitRunsClient`] for the merge-close tests.
-    #[allow(clippy::too_many_arguments)]
-    fn store_mint_context_with_commit_runs(
-        pool: DbPool,
-        backend: Arc<StoreBackend>,
-        classifier: Arc<dyn FailureClassifier>,
-        paths_dir: &std::path::Path,
-        pr_comment_runner: Arc<dyn CommandRunner>,
-        commit_runs: Arc<dyn crate::forge_log::CommitRunsClient>,
-    ) -> MintContext {
         MintContext {
             pool,
             classifier,
@@ -4874,7 +4801,6 @@ mod tests {
             route_cache: Arc::new(route_cache()),
             paths: test_paths(paths_dir),
             pr_comment_runner,
-            commit_runs,
         }
     }
 
@@ -5217,6 +5143,202 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(failure.state, "open");
+    }
+
+    /// CLAUDE-327 acceptance criterion: an `open` store row whose issue's live
+    /// YouTrack `State` is NOT the workflow's resolved state attaches exactly
+    /// as it did before this issue.
+    #[tokio::test]
+    async fn open_match_still_at_an_unresolved_state_attaches() {
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        let failure_id = ci_failure_store::record_failure(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            None,
+            Some("CLAUDE-41"),
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+        ci_failure_store::add_tests(&pool, failure_id, &["mod_a::test_one".to_string()])
+            .await
+            .unwrap();
+
+        let backend = Arc::new(StoreBackend::new().with_state_field("In Progress"));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(6100);
+        let log = failing_test_log("mod_a", "test_one", "main");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| c == "get_field CLAUDE-41 State"),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("comment CLAUDE-41 |")),
+            "attached with a comment: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("set_state")),
+            "no regression reopen: {calls:?}"
+        );
+
+        let failure = ci_failure_store::get_failure(&pool, failure_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.state, "open");
+    }
+
+    /// CLAUDE-327 acceptance criterion: an `open` store row whose issue's live
+    /// YouTrack `State` already equals the workflow's resolved state (the
+    /// `docs/yt-workflow-resolve-on-pr-merge.js` workflow already closed it on
+    /// merge) is a regression: reopen instead of attaching.
+    #[tokio::test]
+    async fn open_match_already_resolved_in_youtrack_reopens_as_a_regression() {
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        let failure_id = ci_failure_store::record_failure(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            None,
+            Some("CLAUDE-42"),
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+        ci_failure_store::add_tests(&pool, failure_id, &["mod_a::test_one".to_string()])
+            .await
+            .unwrap();
+
+        let backend = Arc::new(StoreBackend::new().with_state_field("Done"));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(6101);
+        let log = failing_test_log("mod_a", "test_one", "main");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| c == "get_field CLAUDE-42 State"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("comment CLAUDE-42 | Regression")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("set_state CLAUDE-42")),
+            "regression reopen writes State: {calls:?}"
+        );
+
+        let failure = ci_failure_store::get_failure(&pool, failure_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.state, "open");
+    }
+
+    /// CLAUDE-327 acceptance criterion: a failed live-`State` read never
+    /// silently attaches; it fails the run and leaves no comment behind.
+    #[tokio::test]
+    async fn open_match_state_read_failure_fails_the_run_with_no_comment() {
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        let failure_id = ci_failure_store::record_failure(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            None,
+            Some("CLAUDE-43"),
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+        ci_failure_store::add_tests(&pool, failure_id, &["mod_a::test_one".to_string()])
+            .await
+            .unwrap();
+
+        let backend = Arc::new(StoreBackend::new().with_state_field_error("yt: not found"));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(6102);
+        let log = failing_test_log("mod_a", "test_one", "main");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(!result.ok, "a failed state read must fail the run");
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("comment")),
+            "no comment on a failed read: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("set_state")),
+            "no reopen on a failed read: {calls:?}"
+        );
+
+        let failure = ci_failure_store::get_failure(&pool, failure_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failure.state, "open",
+            "store row untouched on a failed read"
+        );
     }
 
     #[tokio::test]
@@ -6897,6 +7019,148 @@ mod tests {
         assert!(body.contains("CLAUDE-42"), "{body}");
     }
 
+    /// CLAUDE-327 acceptance criterion: on a human PR, an `open` store row
+    /// whose issue's live `State` already equals the workflow's resolved
+    /// state is a regression: reopen instead of a PR-only attach comment.
+    #[tokio::test]
+    async fn human_pr_sharing_an_already_resolved_open_match_reopens_as_a_regression() {
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        let failure_id = ci_failure_store::record_failure(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            None,
+            Some("CLAUDE-44"),
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+        ci_failure_store::add_tests(&pool, failure_id, &["mod_a::test_one".to_string()])
+            .await
+            .unwrap();
+
+        let backend = Arc::new(
+            StoreBackend::new()
+                .with_open_prs(vec![pr(20, "commit-7106")])
+                .with_state_field("Done"),
+        );
+        let counting = Arc::new(CountingClassifier::new());
+        let classifier: Arc<dyn FailureClassifier> = counting.clone();
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(7106);
+        let log = failing_test_log("mod_a", "test_one", "human/branch3");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(result.ok, "{}", result.text);
+        assert_eq!(counting.call_count(), 1, "the reopen triages");
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| c == "get_field CLAUDE-44 State"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("comment CLAUDE-44 | Regression")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("set_state CLAUDE-44")),
+            "regression reopen writes State: {calls:?}"
+        );
+
+        let failure = ci_failure_store::get_failure(&pool, failure_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.state, "open");
+    }
+
+    /// CLAUDE-327 acceptance criterion: on a human PR, a failed live-`State`
+    /// read never silently attaches; it fails the run with no PR comment.
+    #[tokio::test]
+    async fn human_pr_sharing_an_open_match_state_read_failure_fails_the_run() {
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        let failure_id = ci_failure_store::record_failure(
+            &pool,
+            "acme/widgets",
+            "ci.yml",
+            "test",
+            None,
+            Some("CLAUDE-45"),
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+        ci_failure_store::add_tests(&pool, failure_id, &["mod_a::test_one".to_string()])
+            .await
+            .unwrap();
+
+        let backend = Arc::new(
+            StoreBackend::new()
+                .with_open_prs(vec![pr(21, "commit-7107")])
+                .with_state_field_error("yt: not found"),
+        );
+        let counting = Arc::new(CountingClassifier::new());
+        let classifier: Arc<dyn FailureClassifier> = counting.clone();
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+        let ev = store_event(7107);
+        let log = failing_test_log("mod_a", "test_one", "human/branch4");
+        let result = triage_and_mint(
+            &ctx,
+            None,
+            &ev,
+            log,
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+        )
+        .await;
+        assert!(!result.ok, "a failed state read must fail the run");
+        assert_eq!(counting.call_count(), 0, "no triage on a failed read");
+        let calls = backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("comment")),
+            "no comment on a failed read: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("set_state")),
+            "no reopen on a failed read: {calls:?}"
+        );
+
+        let failure = ci_failure_store::get_failure(&pool, failure_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failure.state, "open",
+            "store row untouched on a failed read"
+        );
+    }
+
     #[tokio::test]
     async fn human_pr_on_a_second_branch_mints_one_issue_and_comments_both_prs() {
         // CLAUDE-276 acceptance criterion: the same failing tests on a second
@@ -7068,58 +7332,14 @@ mod tests {
             }
         }
 
-        fn commit_run(
-            global_id: i64,
-            workflow_id: &str,
-            commit_sha: &str,
-            status: &str,
-        ) -> crate::forge_log::CommitRun {
-            crate::forge_log::CommitRun {
-                global_id,
-                index: global_id,
-                workflow_id: workflow_id.to_string(),
-                commit_sha: commit_sha.to_string(),
-                status: status.to_string(),
-                html_url: format!("https://dev.a8n.run/acme/widgets/actions/runs/{global_id}"),
-            }
-        }
-
-        fn ctx_with_runs(
-            pool: DbPool,
-            backend: Arc<StoreBackend>,
-            outcome: crate::forge_log::CommitRunsOutcome,
-        ) -> MintContext {
-            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
-            store_mint_context_with_commit_runs(
-                pool,
-                backend,
-                classifier,
-                std::env::temp_dir().as_path(),
-                Arc::new(crate::provider::cli::testutil::StubRunner::new()),
-                Arc::new(ScriptedCommitRuns::new(outcome)),
-            )
-        }
-
         #[tokio::test]
-        async fn merged_pr_with_green_workflow_closes_the_issue_and_resolves_the_store_row() {
-            // Acceptance criterion 1: a merged PR referencing an open store
-            // failure, with the failing workflow green at the head commit,
-            // closes the issue (state write plus comment) and marks the store
-            // row `resolved`.
+        async fn merged_agent_pr_is_marked_merged_and_makes_no_tracker_call() {
+            // CLAUDE-327 acceptance criterion: the merged-PR handler still
+            // sets `agent_pull_requests.state = merged` and makes no tracker
+            // call at all - the YouTrack workflow resolves the issue, not the
+            // runner.
             let pool = crate::db::test_pool().await;
             let now = "2026-09-01T00:00:00Z";
-            let failure_id = ci_failure_store::record_failure(
-                &pool,
-                "acme/widgets",
-                "ci.yml",
-                "test",
-                None,
-                Some("CLAUDE-50"),
-                "open",
-                now,
-            )
-            .await
-            .unwrap();
             ci_failure_store::record_agent_pr(
                 &pool,
                 "youtrack",
@@ -7135,35 +7355,22 @@ mod tests {
             .unwrap();
 
             let backend = Arc::new(StoreBackend::new());
-            let ctx = ctx_with_runs(
-                pool.clone(),
-                backend.clone(),
-                crate::forge_log::CommitRunsOutcome::Resolved(vec![commit_run(
-                    1,
-                    "ci.yml",
-                    "deadbeefcafefeed",
-                    "success",
-                )]),
-            );
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
 
             let ev = merge_event("acme/widgets", 99, "deadbeefcafefeed");
             process_pr_event(
                 ev,
                 pool.clone(),
                 Some(Arc::new(ctx)),
-                Arc::new(RwLock::new(WebhookConfig::default())),
                 crate::concurrency::KeyGate::new(),
             )
             .await;
 
-            let calls = backend.calls();
             assert!(
-                calls.iter().any(|c| c == "set_state CLAUDE-50 Done"),
-                "{calls:?}"
-            );
-            assert!(
-                calls.iter().any(|c| c.starts_with("comment CLAUDE-50")),
-                "{calls:?}"
+                backend.calls().is_empty(),
+                "the merged-PR handler must make no tracker call: {:?}",
+                backend.calls()
             );
 
             let row = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 99)
@@ -7171,168 +7378,35 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(row.state, "merged");
-
-            let failure = ci_failure_store::get_failure(&pool, failure_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(failure.state, "resolved");
         }
 
         #[tokio::test]
-        async fn merged_pr_with_red_workflow_leaves_the_issue_open() {
-            // Acceptance criterion 2: a merged PR with that workflow red gets
-            // the "left open" comment, and the issue stays open.
+        async fn a_merged_pr_with_no_agent_pull_request_row_makes_no_tracker_call() {
+            // A human's merged PR (no `agent_pull_requests` row) changes
+            // nothing and makes no tracker call.
             let pool = crate::db::test_pool().await;
-            let now = "2026-09-01T00:00:00Z";
-            let failure_id = ci_failure_store::record_failure(
-                &pool,
-                "acme/widgets",
-                "ci.yml",
-                "test",
-                None,
-                Some("CLAUDE-51"),
-                "open",
-                now,
-            )
-            .await
-            .unwrap();
-            ci_failure_store::record_agent_pr(
-                &pool,
-                "youtrack",
-                "CLAUDE-51",
-                "dev.a8n.run",
-                "acme/widgets",
-                100,
-                "fix/CLAUDE-51",
-                "open",
-                now,
-            )
-            .await
-            .unwrap();
-
             let backend = Arc::new(StoreBackend::new());
-            let ctx = ctx_with_runs(
-                pool.clone(),
-                backend.clone(),
-                crate::forge_log::CommitRunsOutcome::Resolved(vec![commit_run(
-                    1,
-                    "ci.yml",
-                    "cafefeeddeadbeef",
-                    "failure",
-                )]),
-            );
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
 
-            let ev = merge_event("acme/widgets", 100, "cafefeeddeadbeef");
+            let ev = merge_event("acme/widgets", 200, "deadbeefcafefeed");
             process_pr_event(
                 ev,
                 pool.clone(),
                 Some(Arc::new(ctx)),
-                Arc::new(RwLock::new(WebhookConfig::default())),
                 crate::concurrency::KeyGate::new(),
             )
             .await;
 
-            let calls = backend.calls();
-            assert!(
-                !calls.iter().any(|c| c.starts_with("set_state")),
-                "issue state must not change: {calls:?}"
-            );
-            assert!(
-                calls
-                    .iter()
-                    .any(|c| c.starts_with("comment CLAUDE-51") && c.contains("left open")),
-                "{calls:?}"
-            );
-
-            let failure = ci_failure_store::get_failure(&pool, failure_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(failure.state, "open");
-        }
-
-        #[tokio::test]
-        async fn merged_pr_with_no_run_at_the_head_commit_leaves_the_issue_open() {
-            // Same "left open" outcome when no run matches the head commit at
-            // all (the workflow may not have run there, or the runs list is
-            // stale).
-            let pool = crate::db::test_pool().await;
-            let now = "2026-09-01T00:00:00Z";
-            ci_failure_store::record_failure(
-                &pool,
-                "acme/widgets",
-                "ci.yml",
-                "test",
-                None,
-                Some("CLAUDE-52"),
-                "open",
-                now,
-            )
-            .await
-            .unwrap();
-            ci_failure_store::record_agent_pr(
-                &pool,
-                "youtrack",
-                "CLAUDE-52",
-                "dev.a8n.run",
-                "acme/widgets",
-                101,
-                "fix/CLAUDE-52",
-                "open",
-                now,
-            )
-            .await
-            .unwrap();
-
-            let backend = Arc::new(StoreBackend::new());
-            let ctx = ctx_with_runs(
-                pool.clone(),
-                backend.clone(),
-                crate::forge_log::CommitRunsOutcome::Resolved(Vec::new()),
-            );
-
-            let ev = merge_event("acme/widgets", 101, "no-such-commit");
-            process_pr_event(
-                ev,
-                pool.clone(),
-                Some(Arc::new(ctx)),
-                Arc::new(RwLock::new(WebhookConfig::default())),
-                crate::concurrency::KeyGate::new(),
-            )
-            .await;
-
-            let calls = backend.calls();
-            assert!(
-                !calls.iter().any(|c| c.starts_with("set_state")),
-                "{calls:?}"
-            );
-            assert!(
-                calls
-                    .iter()
-                    .any(|c| c.starts_with("comment CLAUDE-52") && c.contains("left open")),
-                "{calls:?}"
-            );
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
         }
 
         #[tokio::test]
         async fn closed_unmerged_agent_pr_is_marked_closed_and_changes_no_issue() {
-            // Acceptance criterion 3: a closed, unmerged agent PR sets
-            // `agent_pull_requests.state = closed` and changes no issue.
+            // A closed, unmerged agent PR sets `agent_pull_requests.state =
+            // closed` and changes no issue.
             let pool = crate::db::test_pool().await;
             let now = "2026-09-01T00:00:00Z";
-            ci_failure_store::record_failure(
-                &pool,
-                "acme/widgets",
-                "ci.yml",
-                "test",
-                None,
-                Some("CLAUDE-53"),
-                "open",
-                now,
-            )
-            .await
-            .unwrap();
             ci_failure_store::record_agent_pr(
                 &pool,
                 "youtrack",
@@ -7348,18 +7422,14 @@ mod tests {
             .unwrap();
 
             let backend = Arc::new(StoreBackend::new());
-            let ctx = ctx_with_runs(
-                pool.clone(),
-                backend.clone(),
-                crate::forge_log::CommitRunsOutcome::Resolved(Vec::new()),
-            );
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
 
             let ev = closed_unmerged_event("acme/widgets", 102);
             process_pr_event(
                 ev,
                 pool.clone(),
                 Some(Arc::new(ctx)),
-                Arc::new(RwLock::new(WebhookConfig::default())),
                 crate::concurrency::KeyGate::new(),
             )
             .await;
@@ -7382,121 +7452,7 @@ mod tests {
             let ev = merge_event("acme/widgets", 103, "deadbeef");
             // `mint: None` is what the daemon passes when no `yt`/`fj` backend is
             // usable; the event must simply be dropped, not panic.
-            process_pr_event(
-                ev,
-                pool,
-                None,
-                Arc::new(RwLock::new(WebhookConfig::default())),
-                crate::concurrency::KeyGate::new(),
-            )
-            .await;
-        }
-
-        #[tokio::test]
-        async fn a_close_then_a_shared_failing_test_reopens_the_issue() {
-            // Acceptance criterion 6, end to end: after this issue's merge-close
-            // sets a store row `resolved`, a later failure sharing one of its
-            // originally-recorded failing tests reopens the issue - exercising
-            // the merge-close write and the pre-existing CLAUDE-273 reopen path
-            // together.
-            let pool = crate::db::test_pool().await;
-            let now = "2026-09-01T00:00:00Z";
-            let failure_id = ci_failure_store::record_failure(
-                &pool,
-                "acme/widgets",
-                "ci.yml",
-                "test",
-                None,
-                Some("CLAUDE-54"),
-                "open",
-                now,
-            )
-            .await
-            .unwrap();
-            ci_failure_store::add_tests(&pool, failure_id, &["mod_a::test_one".to_string()])
-                .await
-                .unwrap();
-            ci_failure_store::record_agent_pr(
-                &pool,
-                "youtrack",
-                "CLAUDE-54",
-                "dev.a8n.run",
-                "acme/widgets",
-                104,
-                "fix/CLAUDE-54",
-                "open",
-                now,
-            )
-            .await
-            .unwrap();
-
-            let backend = Arc::new(StoreBackend::new());
-            let close_ctx = ctx_with_runs(
-                pool.clone(),
-                backend.clone(),
-                crate::forge_log::CommitRunsOutcome::Resolved(vec![commit_run(
-                    1,
-                    "ci.yml",
-                    "deadbeefcafefeed",
-                    "success",
-                )]),
-            );
-            let ev = merge_event("acme/widgets", 104, "deadbeefcafefeed");
-            process_pr_event(
-                ev,
-                pool.clone(),
-                Some(Arc::new(close_ctx)),
-                Arc::new(RwLock::new(WebhookConfig::default())),
-                crate::concurrency::KeyGate::new(),
-            )
-            .await;
-            let closed = ci_failure_store::get_failure(&pool, failure_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                closed.state, "resolved",
-                "merge-close must resolve it first"
-            );
-
-            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
-            let mint_ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
-            let regression_ev = store_event(9001);
-            let log = failing_test_log("mod_a", "test_one", "main");
-            let result = triage_and_mint(
-                &mint_ctx,
-                None,
-                &regression_ev,
-                log,
-                true,
-                None,
-                None,
-                true,
-                "test".to_string(),
-                None,
-                &crate::concurrency::KeyGate::new(),
-                &WebhookConfig::default(),
-            )
-            .await;
-            assert!(result.ok, "{}", result.text);
-
-            let calls = backend.calls();
-            assert!(
-                calls.iter().any(|c| c == "set_state CLAUDE-54 To do"),
-                "the reopen must set the target_state: {calls:?}"
-            );
-            assert!(
-                calls
-                    .iter()
-                    .any(|c| c.starts_with("comment CLAUDE-54 | Regression")),
-                "{calls:?}"
-            );
-
-            let reopened = ci_failure_store::get_failure(&pool, failure_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(reopened.state, "open");
+            process_pr_event(ev, pool, None, crate::concurrency::KeyGate::new()).await;
         }
     }
 
@@ -8301,10 +8257,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn success_and_mergeable_merges_and_advances_to_done() {
-            // Acceptance criterion 1: a success event on a recorded agent PR,
-            // with automerge enabled and pr_status success+mergeable, merges the
-            // PR and advances the issue to Done.
+        async fn success_and_mergeable_merges_and_comments_with_no_state_or_field_write() {
+            // CLAUDE-327: a success event on a recorded agent PR, with
+            // automerge enabled and pr_status success+mergeable, merges the PR
+            // and comments, but writes no State or AI Agent field: a YouTrack
+            // workflow resolves the issue once the merge lands.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
@@ -8339,12 +8296,16 @@ mod tests {
             let calls = backend.calls();
             assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
             assert!(
-                calls.iter().any(|c| c == "set_state MK-16 Done"),
+                calls.iter().any(|c| c.starts_with("comment MK-16")),
                 "{calls:?}"
             );
             assert!(
-                calls.iter().any(|c| c == "set_field MK-16 AI Agent Done"),
-                "{calls:?}"
+                !calls.iter().any(|c| c.starts_with("set_state")),
+                "no State write: {calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|c| c.starts_with("set_field")),
+                "no AI Agent write: {calls:?}"
             );
         }
 
@@ -8862,8 +8823,10 @@ mod tests {
 
             let calls = backend.calls();
             assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
+            // CLAUDE-327: the reconciler makes no `State` or `AI Agent` write; a
+            // YouTrack workflow resolves the issue once it observes the merge.
             assert!(
-                calls.iter().any(|c| c == "set_state MK-16 Done"),
+                !calls.iter().any(|c| c.contains("set_state")),
                 "{calls:?}"
             );
         }

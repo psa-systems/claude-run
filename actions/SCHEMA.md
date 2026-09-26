@@ -162,13 +162,15 @@ native:
       code_review: Code Review
       needs_review: Needs Review
       failed: Failed
-      done: Done                          # AI Agent value set when automerge merges the PR
+      done: Done                          # unused unless a no_code label falls back to it (states.no_code)
       in_progress: In Progress            # the standard State field value set in pre
-      state_done: Done                    # the standard State value set when automerge merges the PR
+      state_done: Done                    # deprecated and ignored (CLAUDE-327); a YouTrack workflow
+                                           # resolves the issue on merge, not the runner
     automerge:                            # optional; CI-gated automerge of the opened PR (CLAUDE-126)
       enabled: false                      # off by default; finalize stops at Code Review either way.
                                            # when true, a later success/recover webhook event merges
-                                           # once checks are green (CLAUDE-278; finalize never polls)
+                                           # once checks are green (CLAUDE-278; finalize never polls);
+                                           # merging writes no State or AI Agent field (CLAUDE-327)
     dependencies:                         # optional; pre-clone dependency gate (CLAUDE-161)
       enabled: true                       # on by default; false makes the gate a no-op
       recheck_timeout: 5m                 # backoff before a blocked issue is re-evaluated
@@ -197,7 +199,8 @@ native:
 | `youtrack.prompt`       | none                               | Full-replacement agent prompt override (CLAUDE-125). Resolution order: this text when set, otherwise the built-in preset named by `prompt_preset`. When set, the text fully replaces the preset (so the operator owns the runner contract: the commit body used as the PR description (the runner joins any hard-wrapped prose lines back together before posting it), ending with a `Closes` line followed by the bare `#<KEY>` line, the `.claude-run-needs-review` / `.claude-run-skip-attempt` blocker markers, the `.claude-run-no-code-change` no-code marker, no push / no PR, and whichever tracker writes the operator chooses to permit), and it no longer changes when the binary's preset improves. Editable in the structured web form, which shows the prompt source (`override` or `builtin:<preset>`) and stores no override when the text equals the action's preset. See the placeholders below. |
 | `youtrack.prompt_preset` | `default`                         | Built-in prompt used when `prompt` is unset. `default` is the engineering prompt (`default_youtrack_prompt`, `src/native/youtrack.rs`); `audit` is the scheduled-audit prompt (`default_audit_prompt`, `src/native/audit_prompt.rs`), selected by `actions/audit-run.yml`. Preset text is compiled into the binary, so an upgrade updates it. Omitted on serialize when `default`. Any other value is rejected at load, naming `native.youtrack.prompt_preset`. No structured-form UI; the value is carried forward across form saves. `claude-run action show <name>` prints `prompt_source` (`override`, `builtin:default`, `builtin:audit`) and `prompt_preset` read from the YAML. |
 | `youtrack.write_projects` | empty                            | Projects the agent may create issues in for a descoped piece of the triggering issue (CLAUDE-214), and the fallback for an out-of-scope bug when no project or more than one project binds the buggy repo (CLAUDE-297); rendered into the prompt as `{{write_projects}}`. Empty (the default) resolves to the **triggering issue's own project**, so filing a deferred item satisfies the `No orphan notes` rule with no site-specific configuration and none is baked into the binary. The list is a prompt instruction, not an enforced grant: the hard boundary is the YouTrack token's own permissions. Exposed in the structured editor as a comma-separated "Write projects" field (CLAUDE-298). |
-| `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value. `done` (AI Agent) and `state_done` (State) are set only when automerge merges the PR, normally on a `success`/`recover` webhook event and, as a backstop, on the reconciler's own tick (CLAUDE-126, event-driven since CLAUDE-278, reconciler backstop since CLAUDE-328). |
+| `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value. `done` is unused except as the fallback default for `states.no_code`; the runner writes no `State` or `AI Agent` on merge, whether by automerge or otherwise, whether through the webhook or the CLAUDE-328 reconciler (CLAUDE-327: a YouTrack workflow resolves the issue instead). |
+| `youtrack.states.state_done` | `Done`                        | **Deprecated and ignored (CLAUDE-327):** the runner no longer writes `State` on merge; a YouTrack workflow resolves the issue instead. Still parsed (an action file setting it still loads) but otherwise ignored, with one deprecation warning at load when it is set away from its default. Saving the action's structured form resets it to the default; absent from the structured web editor. |
 | `youtrack.states.no_code` | the `done` label                 | AI Agent label set when a successful run deliberately produced no commits and left `.claude-run-no-code-change` (CLAUDE-214). Defaults to whatever `states.done` is, because there is no PR for a human to review. `State` is left untouched, so the issue stays In Progress until a human closes it. Exposed in the structured editor as the "No-code label" field, blank meaning inherit the Done label (CLAUDE-298). |
 | `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge (CLAUDE-126). When `false`, the PR is never merged by the runner (unchanged behavior). When `true`, `finalize` still stops at Code Review immediately; the merge happens later, normally driven by a `success`/`recover` Action-run webhook event (CLAUDE-278) and, if that event is missed, by the reconciler's own periodic pass (CLAUDE-328) - the webhook is a low-latency trigger, not the only one. |
 | `youtrack.automerge.wait_seconds` | `1800`                   | **Deprecated (CLAUDE-278):** the runner no longer polls, so this is parsed (an action file setting it still loads) but otherwise ignored; setting it away from its default logs one deprecation warning at load. Saving the action's structured form resets it to the default. |
@@ -305,24 +308,34 @@ case-sensitive, and the runner's own Forgejo login (`Claude-Run`) never matched 
 `config.mint.bot_logins` is unchanged and still used by the separate `/claude` PR-comment listener's own bot-login
 check.
 
-##### Closing a CI-failure issue on merge (CLAUDE-277)
+##### Resolving a CI-failure issue on merge (CLAUDE-277, CLAUDE-327)
 
-Closing a CI-failure issue by finding its failing job green needs a run on `default_branch`, which a PR-only workflow
-never satisfies (it has no run on `main` at all). The CI-failure webhook (`webhook-forgejo`) closes
-that gap with a second delivery kind on the same endpoint: `POST /webhooks/forgejo/<source>` now also accepts Forgejo
+Closing a CI-failure issue by finding its failing job green needed a run on `default_branch`, which a PR-only workflow
+never satisfies (it has no run on `main` at all). The CI-failure webhook (`webhook-forgejo`) closed
+that gap with a second delivery kind on the same endpoint: `POST /webhooks/forgejo/<source>` also accepts Forgejo
 `pull_request` deliveries, dispatched by the delivery's `X-Forgejo-Event` header before parsing (a value the deployed
 Forgejo's Action-run notifier does not send; an operator adding this must confirm the header against their own
 instance's actual delivery). A `pull_request` delivery runs through the same signature / replay / rate-limit / pause /
 allow-list gates the Action-run path does; only a terminal `action: "closed"` delivery does anything.
 
-- **Merged, with the failing workflow green at the PR's head commit:** every open `ci_failures` row the PR
-  references (its own `agent_pull_requests` issue, plus every key `Forge::pr_referenced_issues` finds) is closed -
-  `State` set to `config.mint.resolved_state` (default `Done`, distinct from `mint.target_state`) plus a comment
-  linking the PR and the run - and the store row marked `resolved`.
-- **Merged, with that workflow red or no run found at the head commit:** the issue is left open with a comment
-  saying so.
+CLAUDE-327 removes the rest of what this delivery used to decide. The runner never writes `State` on merge, whether
+the issue was minted by the runner or not: a YouTrack workflow (`docs/yt-workflow-resolve-on-pr-merge.js`, attached
+per-project by an operator; see the README operator-setup note) resolves the issue once it observes the merge,
+matching by title token, a bare `#KEY-N` line, or a `Closes/Fixes/Resolves KEY-N` line in the PR body - the same tail
+`mint::build_description` already writes.
+
+- **Merged:** the PR's own `agent_pull_requests` row (if any) is marked `merged`. No tracker call, no forge run-list
+  call.
 - **Closed without merging:** the PR's own `agent_pull_requests` row (if any) is marked `closed`; a human's PR, with
   no such row, is unaffected.
+
+Because the store's `open`/`resolved` column no longer changes on merge, an `open` `ci_failures` row can still name an
+issue the workflow already resolved by the time a later CI failure on the same failing tests is triaged. Both
+CI-failure dispatch sites (the no-open-PR path in `triage_and_mint`, and `route_human_pr_failure`) read the issue's
+live `State` at match time before deciding: equal to `config.mint.resolved_state` (default `Done`, compared
+case-insensitively) is a regression, handled exactly as a `resolved` store row already is (`reopen_resolved_failure`);
+not equal is the ordinary open-and-still-open attach; a failed read fails the run (an `error` log, a `run_events` row,
+no comment or attach) rather than risking a false attach on a state it could not confirm.
 
 Finding the failing workflow's run at the head commit reads `fj actions runs` again, through the same `log_token_ref`
 this listener already resolves for the Action-run path - no new credential.
@@ -432,8 +445,10 @@ PR's combined CI status (`fj pr status --json`, CLAUDE-309: including its `behin
 - **Green, `behind_base: false`, and not mergeable** (a real conflict, still-checking, or a WIP PR): the handler
   comments that the PR is not mergeable and leaves the issue at Code Review.
 - **Green, `behind_base: false`, and mergeable:** the PR is merged as a **merge-commit** (never squash/rebase, so the
-  single commit's bare `#<KEY>` reference survives in history), State is set to `state_done` and AI Agent to `done`,
-  and a "runner merged" comment is posted. A merge failure here comments the failure and fails the run.
+  single commit's bare `#<KEY>` reference survives in history), and a "runner merged" comment is posted. CLAUDE-327
+  removed the `State`/`AI Agent` write that used to follow the merge here: a YouTrack workflow
+  (`docs/yt-workflow-resolve-on-pr-merge.js`) resolves the issue once it observes the merge, not the runner. A merge
+  failure here comments the failure and fails the run.
 - **Anything else** (checks not `success`): no action. A later `success` event on the same PR is what retries; a real
   CI failure is handled by the existing CI-failure webhook routing, not by this path.
 
