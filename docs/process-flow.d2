@@ -1,0 +1,88 @@
+direction: down
+
+# Box outline = system: YouTrack blue, Claude Run amber, claude code purple, Forgejo green.
+# YouTrack boxes name the field they show. State: In Progress is implied while the work is in flight, and
+# once State is Done the AI Agent value no longer matters.
+classes: {
+  youtrack: {
+    style.stroke: "#0284c7"
+    style.stroke-width: 2
+  }
+  action: {
+    style.stroke: "#f59e0b"
+    style.stroke-width: 2
+  }
+  claude: {
+    style.stroke: "#a855f7"
+    style.stroke-width: 2
+  }
+  forgejo: {
+    style.stroke: "#10b981"
+    style.stroke-width: 2
+  }
+  passed: {
+    style.font-color: "#16a34a"
+  }
+  failed: {
+    style.font-color: "#dc2626"
+  }
+}
+
+yt_queued: "YouTrack\nAI Agent: Queued" {class: youtrack}
+yt_needs: "YouTrack\nAI Agent: Needs Review" {class: youtrack}
+yt_ci: "YouTrack\nCI Failure issue (new)\nState: To do" {class: youtrack}
+yt_ci_old: "YouTrack\nCI Failure issue" {class: youtrack}
+yt_gap: "YouTrack\nGap or bug issue (new)" {class: youtrack}
+
+audit_action: "Claude Run\n'audit-run' action" {class: action}
+cc_audit: "'claude code'\naudits a repository\n(read-only clone)\nprompts from the audits repo" {class: claude}
+
+yt_done: "YouTrack\nState: Done" {class: youtrack}
+yt_review: "YouTrack\nAI Agent: Code Review" {class: youtrack}
+yt_agent_done: "YouTrack\nAI Agent: Done" {class: youtrack}
+cc_work: "'claude code'\nworks the issue" {class: claude}
+yt_failed: "YouTrack\nAI Agent: Failed" {class: youtrack}
+yt_action: "Claude Run\n'youtrack' action" {class: action}
+
+wh_action: "Claude Run\n'webhook-forgejo' action" {class: action}
+cc_triage: "'claude code'\nanalyzes the failed run\n(read-only)" {class: claude}
+
+fj_pr: "Forgejo\nPull request" {class: forgejo}
+fj_ci: "Forgejo\nWorkflows" {class: forgejo}
+
+yt_queued -> yt_action: "any other issue"
+yt_queued -> audit_action: "project: AUDIT, tag: Audit-*"
+
+yt_action -> cc_work: "issue prompt"
+cc_work -> yt_action: "commits"
+cc_work -> yt_gap: "problem identified"
+
+audit_action -> cc_audit: "built-in audit prompt"
+cc_audit -> yt_queued: "creates issues"
+cc_audit -> audit_action: "commit report"
+
+audit_action -> yt_review: "PR opened"
+yt_action -> yt_review: "PR opened"
+audit_action -> fj_pr: "opens PR"
+yt_action -> fj_pr: "opens PR"
+
+yt_action -> yt_needs: "blocker"
+yt_action -> yt_failed: "failure"
+yt_action -> yt_agent_done: "no change\nsummary comment"
+
+fj_pr -> fj_ci: "checks run"
+
+fj_ci -> wh_action: "passed\nautomerge on" {class: passed}
+fj_pr -> yt_done: "PR merged:\nYouTrack workflow"
+wh_action -> fj_pr: "automerge:\nmerges the PR"
+
+fj_ci -> wh_action: "failed" {class: failed}
+wh_action -> cc_triage: "logs"
+wh_action -> yt_queued: "new failure, no PR:\ncode defect, auto-fix on:\ncreates issue"
+wh_action -> yt_ci: "new failure, no PR:\nneeds a human, or auto-fix off:\ncreates issue"
+cc_triage -> wh_action: "verdict"
+wh_action -> yt_queued: "agent PR, attempts left"
+wh_action -> yt_needs: "agent PR, none left"
+wh_action -> yt_ci_old: "already tracked:\nrun attached"
+wh_action -> yt_ci_old: "regression:\nreopens issue\nState: To do"
+wh_action -> fj_pr: "human PR:\ncomments on the PR"
