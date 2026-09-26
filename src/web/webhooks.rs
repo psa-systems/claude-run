@@ -3851,6 +3851,7 @@ async fn apply_automerge_decision(
                 match merge_result {
                     Ok(()) => {
                         info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: merged PR; the YouTrack workflow will resolve the issue");
+                        mark_agent_pr_merged(pool, row, repo, pr_number).await?;
                         Ok(format!(
                             "merged PR #{pr_number}; issue {} left for the YouTrack workflow to resolve",
                             row.issue_key
@@ -3874,11 +3875,39 @@ async fn apply_automerge_decision(
                 }
             }
         },
+        "merged" => {
+            mark_agent_pr_merged(pool, row, repo, pr_number).await?;
+            info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR already merged; marked merged");
+            Ok(format!(
+                "agent PR #{pr_number} already merged; marked merged"
+            ))
+        }
         other => {
             info!(repo = %repo, pr = pr_number, state = %other, "action-run success: checks not successful; no action");
             Ok(format!(
                 "PR #{pr_number} checks not successful ({other}); no action"
             ))
+        }
+    }
+}
+
+/// CLAUDE-331: record a recorded agent PR as merged so neither the webhook nor
+/// the reconciler walks it again. A store failure is logged at `error`, written
+/// as a `run_events` row, and returned: an unrecorded merge would be re-walked
+/// on every tick.
+async fn mark_agent_pr_merged(
+    pool: &DbPool,
+    row: &ci_failure_store::AgentPullRequest,
+    repo: &str,
+    pr_number: u64,
+) -> Result<(), String> {
+    match ci_failure_store::set_agent_pr_state(pool, row.id, "merged", &state::now_iso()).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let msg = format!("marking agent PR #{pr_number} merged failed: {e}");
+            error!(repo = %repo, pr = pr_number, issue = %row.issue_key, error = %e, "action-run success: {msg}");
+            record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
+            Err(msg)
         }
     }
 }
@@ -8439,7 +8468,7 @@ mod tests {
 
         #[tokio::test]
         async fn merged_pr_with_unknown_mergeable_takes_no_action() {
-            // CLAUDE-330: fj reports `mergeable: null` for a merged PR.
+            // CLAUDE-330: fj reports `mergeable: null` for a merged PR; CLAUDE-331 marks the row merged.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
@@ -8474,7 +8503,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(result.contains("no action"), "{result}");
+            assert!(result.contains("marked merged"), "{result}");
             let calls = backend.calls();
             assert!(
                 !calls.iter().any(|c| c.starts_with("comment MK-16")
@@ -8482,6 +8511,12 @@ mod tests {
                     || c.starts_with("update_pr_branch")),
                 "{calls:?}"
             );
+            // CLAUDE-331: an observed merge retires the row.
+            let row = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 7)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "merged");
         }
 
         #[tokio::test]
@@ -8927,6 +8962,69 @@ mod tests {
             reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
 
             assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+        }
+
+        async fn seed_open_row(pool: &DbPool) {
+            ci_failure_store::record_agent_pr(
+                pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                "2026-09-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn row_state(pool: &DbPool) -> String {
+            ci_failure_store::agent_pr(pool, "dev.a8n.run", "contoso/claude-run", 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+        }
+
+        #[tokio::test]
+        async fn reconciler_marks_merged_pr_merged_and_never_walks_it_again() {
+            // CLAUDE-331: `pr_status` reporting `merged` must retire the row.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(StoreBackend::new().with_pr_status("merged", false));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let gate = crate::concurrency::KeyGate::new();
+
+            reconcile_automerge(&pool, &ctx, &gate).await;
+            assert_eq!(row_state(&pool).await, "merged");
+            assert!(ci_failure_store::open_agent_prs(&pool)
+                .await
+                .unwrap()
+                .is_empty());
+
+            let calls_after_first = backend.calls().len();
+            reconcile_automerge(&pool, &ctx, &gate).await;
+            assert_eq!(backend.calls().len(), calls_after_first);
+        }
+
+        #[tokio::test]
+        async fn runner_merge_marks_the_row_merged() {
+            // CLAUDE-331: the runner's own successful merge records it too.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+
+            assert!(backend.calls().iter().any(|c| c == "merge_pr 7"));
+            assert_eq!(row_state(&pool).await, "merged");
         }
 
         #[tokio::test]
