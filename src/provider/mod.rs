@@ -112,7 +112,9 @@ pub struct PrStatus {
     pub state: String,
     /// Whether Forgejo will merge the PR as-is: no conflict, not still being
     /// checked, not WIP. Does not reflect whether the branch is behind base.
-    pub mergeable: bool,
+    /// `None` is unknown: `fj` reports an explicit `null` for a merged PR.
+    #[serde(default)]
+    pub mergeable: Option<bool>,
     /// Whether the PR's head is behind its base. `None` means unknown (an
     /// `fj` predating FJ-99, or a value Forgejo has not computed yet).
     #[serde(default)]
