@@ -1124,7 +1124,9 @@ action is not a `youtrack` action or has automerge disabled, and runs the same `
 event would run - so a PR still merges within one tick even if its `success` event was never delivered, was dropped, or
 arrived before the PR's row was recorded. The reconciler is idempotent: a PR that is not yet green is left exactly where the
 webhook path would have left it, and a PR that `pr_status` reports as `merged` (or that the runner just merged) has its
-row marked `merged` so later ticks skip it (CLAUDE-331). Every fault this pass or the webhook path can hit while a
+row marked `merged` so later ticks skip it (CLAUDE-331). Each tick also lists the forge's open PRs once per repo and
+marks a row `closed` when its PR is no longer listed (a PR closed without merge, for which `fj pr status` fails), so it is
+not asked about again (CLAUDE-334); a failed listing leaves that repo's rows `open` and is logged at `error`. Every fault this pass or the webhook path can hit while a
 recorded, automerge-enabled PR is involved (a forge-host lookup failure, a `list_open_prs` failure, a failed action
 load, a failed `pr_status` call, a failed merge or branch update) is logged at `error`, written to `run_events`, and
 posted as a PR comment naming the failure, rather than left as a silent `warn`.
