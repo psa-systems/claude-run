@@ -718,6 +718,25 @@ pub async fn run_events_for_action(
     Ok(rows)
 }
 
+/// CLAUDE-333: the newest message an action recorded that contains `needle`,
+/// so a caller can tell whether a fault it is about to report repeats the one
+/// it reported last time.
+pub async fn run_events_last_message_containing(
+    pool: &DbPool,
+    action: &str,
+    needle: &str,
+) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(&crate::db::q(
+        pool,
+        "SELECT message FROM run_events WHERE action_name = ? AND strpos(message, ?) > 0 ORDER BY ts DESC, id DESC LIMIT 1",
+    ))
+    .bind(action)
+    .bind(needle)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
 /// CLAUDE-235: how many input-phase diagnostics an action has recorded since
 /// `started_at`, for the action-detail one-line summary. The rows themselves live
 /// on the Logs page; this is only the signal that there are some.
