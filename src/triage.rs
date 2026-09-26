@@ -216,7 +216,6 @@ const TRANSIENT_SIGNATURES: &[&str] = &[
     "connection refused",
     "i/o timeout",
     "tls handshake timeout",
-    "could not resolve host",
     "temporary failure in name resolution",
     "503 service unavailable",
     "502 bad gateway",
@@ -261,6 +260,16 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
             TriageBucket::Transient,
             "job was skipped by its workflow condition ('Skipping job ... due to ...'); nothing ran, no issue needed",
         ));
+    }
+
+    // CLAUDE-266: a runner that cannot reach its network is an operator concern
+    // no corrective PR can fix. It mints one grouped, branch-agnostic issue
+    // (keyed on the infra kind) for a human instead of vanishing as transient.
+    // This runs BEFORE the transient scan so the detector owns its phrases.
+    if let Some(infra) = crate::infra_failure::detect(&input.log) {
+        if infra.kind == "runner-unavailable" {
+            return Some(Triage::rules(TriageBucket::HumanAction, infra.problem));
+        }
     }
 
     if let Some(sig) = TRANSIENT_SIGNATURES
@@ -760,7 +769,6 @@ mod tests {
             "denied: requested access to the resource is denied",
             "Get \"https://registry/v2/\": 401 Unauthorized",
             "dial tcp 10.0.0.1:443: connect: connection refused",
-            "could not resolve host: registry.example.com",
             "received unexpected HTTP status: 503 Service Unavailable",
         ];
         for log in cases {
@@ -769,6 +777,29 @@ mod tests {
             assert_eq!(verdict.bucket, TriageBucket::Transient, "{log:?}");
             assert_eq!(verdict.classified_by, ClassifiedBy::Rules, "{log:?}");
         }
+    }
+
+    #[test]
+    fn rules_route_runner_unavailable_to_a_human() {
+        // CLAUDE-266: the detector's network conditions leave the transient
+        // bucket; a reset on a line naming a registry counts, a bare one does not.
+        for log in [
+            "could not resolve host: registry.example.com",
+            "error: failed to fetch from registry: connection reset by peer",
+        ] {
+            let verdict = triage_rules(&input_with_log(log))
+                .unwrap_or_else(|| panic!("expected a rules verdict for {log:?}"));
+            assert_eq!(verdict.bucket, TriageBucket::HumanAction, "{log:?}");
+            assert_eq!(verdict.classified_by, ClassifiedBy::Rules, "{log:?}");
+        }
+        let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "unused"));
+        let verdict = triage(
+            &input_with_log("could not resolve host: index.crates.io"),
+            &stub,
+            &autofix_cfg(),
+        );
+        assert_eq!(verdict.bucket, TriageBucket::HumanAction);
+        assert_eq!(stub.calls(), 0, "the classifier must NOT be consulted");
     }
 
     #[test]

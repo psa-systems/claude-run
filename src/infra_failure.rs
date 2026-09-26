@@ -84,12 +84,10 @@ fn detect_out_of_memory(lower: &str) -> Option<InfraFailure> {
 /// peer` is not (a test asserting on a socket error prints it too), so it counts
 /// only on a line that also names a package or container registry.
 ///
-/// Note the overlap with [`crate::triage`]'s `TRANSIENT_SIGNATURES`, which
-/// already carries `could not resolve host` and `connection reset`: such a
-/// failure is routed to bucket 3 and mints nothing, so this kind reaches the
-/// mint only if that list changes. It is implemented because the condition is
-/// real and the classification of it belongs here, not because it fires today.
-/// See CLAUDE-266.
+/// [`crate::triage::triage_rules`] routes this kind to `HumanAction` before its
+/// transient-signature scan, so it reaches the mint and collapses onto one
+/// grouped issue. A bare `connection reset` with no registry marker is not
+/// matched here and stays transient. See CLAUDE-266.
 fn detect_runner_unavailable(lower: &str) -> Option<InfraFailure> {
     const REGISTRY_MARKERS: &[&str] = &[
         "registry",

@@ -976,8 +976,11 @@ condition is the preferred failure mode. The `ci_failure` store dedupes an infra
 now (by its `infra:<kind>` fingerprint id, CLAUDE-272's `fingerprint::fingerprint`), so the branch-agnostic collapse
 described here matters mainly to the legacy-adoption fallback, not to the primary path.
 
-Nothing about triage buckets, routing, or the auto-fix path changes: an infra failure is still classified and assigned
-the same way, because reclaiming disk is a human action.
+Routing changes only for `runner-unavailable` (CLAUDE-266): `triage_rules` runs the detector before its transient scan and
+routes that kind to `human_action` with no LLM call, so an unreachable registry mints one grouped, human-assigned issue
+instead of vanishing as transient. `could not resolve host` is no longer a transient signature; a bare `connection reset`
+with no registry on the line stays transient. Every other infra failure is still classified and assigned the same way,
+because reclaiming disk is a human action.
 
 The listener is multi-source (CLAUDE-87): each `<source>` is a `[webhook.sources.<source>]` config block with its own
 HMAC secret and allow-list, served at its own URL path. One Forgejo org webhook per source means a leaked org secret
@@ -989,7 +992,7 @@ verbatim, so use lowercase `[a-z0-9_-]`; a name needing URL escaping is warned a
 Triage sorts each verified failure into one of three buckets: a failing PR check that a code change fixes (`code_fix`)
 mints an issue and sets `AI Agent = Queued` so the runner opens the fix PR; a failure no PR fixes (`human_action`,
 e.g. a main-branch / tag / release / missing-secret failure) mints a human-assigned issue with no PR; a transient /
-infra / flaky failure (`transient`) mints nothing. The reused per-key + daily caps throttle a storm of failures; the daily cap is `config.webhook.max_runs_per_day` (default 20, at least 1), editable on the Settings page and applied to the next event with no restart.
+infra / flaky failure (`transient`) mints nothing, except a `runner-unavailable` infra failure, which is `human_action`. The reused per-key + daily caps throttle a storm of failures; the daily cap is `config.webhook.max_runs_per_day` (default 20, at least 1), editable on the Settings page and applied to the next event with no restart.
 
 **CLAUDE-208: a stopped run is not a broken one.** Forgejo fires `action_run_failure` for every non-success done status, and it reports run-level `failure` for a run whose jobs were merely CANCELLED, which is what a newer push to the same ref produces when it supersedes an in-flight run. The run-level status alone therefore cannot tell a broken build from a stopped one, so the consumer reads the per-job statuses that come back with the log: when no job failed and every job ended `cancelled` or `skipped`, the delivery is acked and the run closed with a summary naming those statuses, with no triage and no issue. Any other status set (including an all-`success` run under a run-level `failure`) still triages and mints, and a job list that did not resolve at all (a rejected log token, a pruned run) fails open and mints as before.
 
