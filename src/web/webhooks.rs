@@ -3981,7 +3981,38 @@ pub(crate) async fn reconcile_automerge(
         }
     };
 
+    // CLAUDE-334: one open-PR listing per (host, repo). A row whose PR is not
+    // listed is retired instead of asking `pr_status` about it, which fails
+    // for a PR closed without merge (`fj`: "no commits in pr").
+    let mut open_by_repo: std::collections::HashMap<(String, String), Option<Vec<u64>>> =
+        std::collections::HashMap::new();
     for row in rows {
+        let repo_key = (row.host.clone(), row.repo.clone());
+        if !open_by_repo.contains_key(&repo_key) {
+            let listed = list_open_pr_numbers(pool, mint, &row.host, &row.repo).await;
+            open_by_repo.insert(repo_key.clone(), listed);
+        }
+        match &open_by_repo[&repo_key] {
+            None => continue,
+            Some(open) if !open.contains(&(row.pr_number as u64)) => {
+                let now = state::now_iso();
+                match ci_failure_store::set_agent_pr_state(pool, row.id, "closed", &now).await {
+                    Ok(()) => {
+                        info!(repo = %row.repo, pr = row.pr_number, issue = %row.issue_key, "automerge reconciler: PR is no longer open on the forge; marked closed")
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "automerge reconciler: marking agent PR {}#{} closed failed: {e}",
+                            row.repo, row.pr_number
+                        );
+                        error!(repo = %row.repo, pr = row.pr_number, error = %e, "{msg}");
+                        record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg).await;
+                    }
+                }
+                continue;
+            }
+            Some(_) => {}
+        }
         let key = format!("{}#{}", row.repo, row.pr_number);
         let _key_guard = keygate.acquire(&key).await;
         let pr_url = agent_pr_url(&row.host, &row.repo, row.pr_number);
@@ -4010,6 +4041,30 @@ pub(crate) async fn reconcile_automerge(
         }
         finish_webhook_run(pool, run_id, &job_key, &summary, ok, None).await;
     }
+}
+
+/// CLAUDE-334: the numbers of the PRs the forge lists as open for `repo`, or
+/// `None` when the listing failed (logged at `error` and written to
+/// `run_events`), so the caller leaves that repo's rows alone rather than
+/// reading an unknown as "closed".
+async fn list_open_pr_numbers(
+    pool: &DbPool,
+    mint: &MintContext,
+    host: &str,
+    repo: &str,
+) -> Option<Vec<u64>> {
+    let backend = mint.backend.clone();
+    let (host_owned, repo_owned) = (host.to_string(), repo.to_string());
+    let outcome =
+        tokio::task::spawn_blocking(move || backend.list_open_prs(&host_owned, &repo_owned)).await;
+    let msg = match outcome {
+        Ok(Ok(prs)) => return Some(prs.into_iter().map(|p| p.number).collect()),
+        Ok(Err(e)) => format!("automerge reconciler: list_open_prs for {repo} failed: {e}"),
+        Err(e) => format!("automerge reconciler: list_open_prs task for {repo} panicked: {e}"),
+    };
+    error!(repo = %repo, "{msg}");
+    record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg).await;
+    None
 }
 
 /// Post a best-effort issue comment on a CLAUDE-309 automerge decision path. A
@@ -8871,8 +8926,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend_a =
-                Arc::new(StoreBackend::new().with_pr_status_behind(state, mergeable, behind_base));
+            let backend_a = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind(state, mergeable, behind_base),
+            );
             let ctx_a = ctx_for(pool_a.clone(), backend_a.clone(), dir_a.path());
             let _ = handle_action_success_for_pr(
                 &ctx_a,
@@ -8900,8 +8958,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend_b =
-                Arc::new(StoreBackend::new().with_pr_status_behind(state, mergeable, behind_base));
+            let backend_b = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind(state, mergeable, behind_base),
+            );
             let ctx_b = ctx_for(pool_b.clone(), backend_b.clone(), dir_b.path());
             reconcile_automerge(&pool_b, &ctx_b, &crate::concurrency::KeyGate::new()).await;
 
@@ -8941,7 +9002,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("success", true),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
@@ -8972,7 +9037,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("success", true),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
@@ -8999,7 +9068,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("success", true),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
@@ -9038,7 +9111,11 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
             seed_open_row(&pool).await;
-            let backend = Arc::new(StoreBackend::new().with_pr_status("merged", false));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("merged", false),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
             let gate = crate::concurrency::KeyGate::new();
 
@@ -9061,13 +9138,54 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
             seed_open_row(&pool).await;
-            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("success", true),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
 
             assert!(backend.calls().iter().any(|c| c == "merge_pr 7"));
             assert_eq!(row_state(&pool).await, "merged");
+        }
+
+        #[tokio::test]
+        async fn reconciler_retires_row_for_pr_no_longer_listed_open() {
+            // CLAUDE-334: a PR closed without merge is absent from the open
+            // listing; it is marked closed with no `pr_status` call.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(99, "")]));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+
+            assert_eq!(row_state(&pool).await, "closed");
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+            assert!(ci_failure_store::open_agent_prs(&pool)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        #[tokio::test]
+        async fn reconciler_leaves_rows_open_when_the_listing_fails() {
+            // CLAUDE-334: an unknown is never read as "closed".
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(StoreBackend::new().with_open_prs_error("fj: connection reset"));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+
+            assert_eq!(row_state(&pool).await, "open");
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
         }
 
         #[tokio::test]
@@ -9101,7 +9219,6 @@ mod tests {
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
-
             assert!(backend.calls().is_empty(), "{:?}", backend.calls());
         }
 
@@ -9124,7 +9241,11 @@ mod tests {
             )
             .await
             .unwrap();
-            let backend = Arc::new(StoreBackend::new().with_pr_status("pending", false));
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("pending", false),
+            );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
             reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
