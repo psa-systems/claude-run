@@ -9280,7 +9280,7 @@ mod tests {
             write_youtrack_action(dir.path(), "yt", true);
             seed_open_row(&pool).await;
             // No canned pr_status: every call fails with the same message.
-            let backend = Arc::new(StoreBackend::new());
+            let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(7, "")]));
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
             let gate = crate::concurrency::KeyGate::new();
             let comments = |b: &StoreBackend| {
