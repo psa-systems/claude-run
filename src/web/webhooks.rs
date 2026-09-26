@@ -129,6 +129,39 @@ pub(crate) async fn paused_accept_and_drop(
     }
 }
 
+/// CLAUDE-332: true when a timer- or queue-driven `webhook-forgejo` path must
+/// not act: the daemon is globally paused, `webhook-forgejo` is paused, or a
+/// pause flag could not be read (fail safe: a writer must never act against a
+/// pause it could not check, unlike the cached `PauseGate` read).
+async fn webhook_action_paused(pool: &DbPool, what: &str) -> bool {
+    match state::global_pause_status(pool).await {
+        Ok(Some((paused_at, _))) => {
+            info!(what, paused_at = %paused_at, "globally paused; skipping");
+            return true;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            error!(what, error = %e, "global pause read failed; skipping so a pause that could not be read is never acted against");
+            return true;
+        }
+    }
+    match state::action_pause_status(pool, WEBHOOK_MINT_ACTION).await {
+        Ok(Some(_)) => {
+            info!(
+                what,
+                action = WEBHOOK_MINT_ACTION,
+                "action is paused; skipping"
+            );
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            error!(what, action = WEBHOOK_MINT_ACTION, error = %e, "action pause read failed; skipping so a pause that could not be read is never acted against");
+            true
+        }
+    }
+}
+
 /// CLAUDE-269: right after the pause check, accept-and-drop a delivery while
 /// the Claude login needs renewing. 2xx for the same reason as a pause: a
 /// retry cannot help (the delivery id is already in the replay store), and
@@ -3455,6 +3488,11 @@ async fn process_action_success_event(
         return;
     };
 
+    // CLAUDE-332: an event accepted before a pause was set must not act after it.
+    if webhook_action_paused(&pool, "action-run success event").await {
+        return;
+    }
+
     // CLAUDE-328: neither of the next two steps knows yet which (if any)
     // recorded agent PR this event concerns - that is only resolved once the
     // commit is matched to a PR below - so a failure here cannot itself name
@@ -3928,6 +3966,11 @@ pub(crate) async fn reconcile_automerge(
     mint: &MintContext,
     keygate: &crate::concurrency::KeyGate,
 ) {
+    // CLAUDE-332: the reconciler writes to the forge and tracker, so it honours
+    // the same pauses the webhook ingest does.
+    if webhook_action_paused(pool, "automerge reconciler").await {
+        return;
+    }
     let rows = match ci_failure_store::open_agent_prs(pool).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -9142,6 +9185,40 @@ mod tests {
             reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
 
             assert_eq!(row_state(&pool).await, "open");
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+        }
+
+        #[tokio::test]
+        async fn reconciler_does_nothing_while_globally_paused() {
+            // CLAUDE-332
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            state::global_pause_set(&pool, Some("test")).await.unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+            assert_eq!(row_state(&pool).await, "open");
+        }
+
+        #[tokio::test]
+        async fn reconciler_does_nothing_while_webhook_action_paused() {
+            // CLAUDE-332
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            state::action_pause_set(&pool, WEBHOOK_MINT_ACTION, Some("test"))
+                .await
+                .unwrap();
+            let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
             assert!(backend.calls().is_empty(), "{:?}", backend.calls());
         }
 
