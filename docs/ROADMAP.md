@@ -18,7 +18,8 @@ Epic: CLAUDE-270.
 4. CLAUDE-274: one analysis at ingest on a bounded worker pool, routing by its verdict.
 5. CLAUDE-275: the `youtrack` action records the PR it opens and continues it when its issue is re-queued.
 6. CLAUDE-276: route a failure on an open PR by who opened it.
-7. CLAUDE-277: close an issue when its fix PR merges green.
+7. CLAUDE-277: close an issue when its fix PR merges green (later superseded by CLAUDE-327: a YouTrack workflow
+   resolves the issue, not the runner).
 8. CLAUDE-278: automerge on the run-succeeded event instead of a polling wait.
 9. CLAUDE-279: retire `ci-failure-reconcile`, the scheduled `ci-failure-analysis`, and `forgejo-ci-fix`, once their
    replacements have landed.
@@ -110,6 +111,12 @@ flowchart TD
 Orange-bordered steps call `claude`. Analysis runs on a bounded worker pool fed by the webhook, not inside the serial
 consumer, and only for a fingerprint the runner has not seen.
 
+CLAUDE-327 supersedes step P3 above: the runner no longer closes the issue itself. A YouTrack workflow
+(`docs/yt-workflow-resolve-on-pr-merge.js`) resolves any issue whose own PR merges, so P3 is now "mark the PR's own
+`agent_pull_requests` row merged; the YouTrack workflow resolves the issue". A CI-failure match against an `open`
+row whose issue the workflow already resolved is read at match time and handled as step D3 (reopen as a regression),
+not as a silent no-op.
+
 ### What changes
 
 | Today                                                                                   | Proposed                                                                                               |
@@ -118,7 +125,7 @@ consumer, and only for a fingerprint the runner has not seen.
 | Dedupe by YouTrack full-text search on branch-scoped markers                              | Fingerprint table in the runner's database, branch-agnostic, exact and immediate                        |
 | A failure matching a resolved issue is dropped silently                                   | The issue is reopened as a regression                                                                   |
 | `webhook.auto_fix` off drops code failures; the open-PR check drops them silently         | Every code defect gets an issue; a human's PR gets the analysis as a PR comment                          |
-| `ci-failure-reconcile` collapses duplicates and polls for green on `main`                 | Removed: duplicates cannot form, and an issue closes when its fix PR merges green                       |
+| `ci-failure-reconcile` collapses duplicates and polls for green on `main`                 | Removed: duplicates cannot form; a YouTrack workflow resolves an issue when its own PR merges (CLAUDE-327) |
 | `forgejo-ci-fix` iterates on the bot's PRs, matched by login string                       | Removed: a failure on an agent PR goes back to its source issue, identified by the runner's own PR record |
 | Automerge polls for 300s                                                                  | A "run succeeded" event triggers automerge                                                              |
 | A PR merged before its CI finished leaves the failure on a dead branch                    | A failure with no open PR belongs to `main`, and the fix branches from `main`                           |

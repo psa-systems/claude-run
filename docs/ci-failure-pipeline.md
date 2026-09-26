@@ -71,15 +71,14 @@ flowchart TD
         M1{"merged?"}
         M1 -- no --> M2["mark this PR's agent_pull_requests row closed, if any"]
         M1 -- yes --> M3["mark this PR's agent_pull_requests row merged, if any"]
-        M3 --> M4["collect open ci_failures rows this PR references: its agent-PR issue key + pr_referenced_issues"]
-        M4 --> M5{"failing workflow green at the PR's head commit?"}
-        M5 -- yes --> M6["close issue: State=mint.resolved_state, comment; store row resolved"]
-        M5 -- "no / not found" --> M7["comment: left open"]
     end
 
     FPR --> M1
-    M6 --> YT
-    M7 --> YT
+
+    YTW(["YouTrack workflow: issue.pullRequests changed (CLAUDE-327, not the runner)"])
+    YTW --> YTW1{"a linked PR just merged and its title/body owns this issue's id?"}
+    YTW1 -- yes --> YTW2["issue.fields.State = Fixed"]
+    YTW1 -- no --> YTW3["no write"]
 
     subgraph WHAM ["webhook-forgejo: success/recover (CLAUDE-126, event-driven since CLAUDE-278, same endpoint, dispatched by payload.action)"]
         AM1["find open PR matching this commit"]
@@ -95,7 +94,7 @@ flowchart TD
         AM7 -- error --> AM7b["comment: update failed; fail run"]
         AM4 -- "success, behind_base=false, not mergeable" --> AM6["comment: not mergeable; leave at Code Review"]
         AM4 -- "success, behind_base=false, mergeable" --> AM5{"merge_pr"}
-        AM5 -- ok --> AM5a["State=state_done; comment; AI Agent=done"]
+        AM5 -- ok --> AM5a["comment: runner merged (no State or AI Agent write; the YouTrack workflow resolves the issue)"]
         AM5 -- error --> AM5b["comment: merge failed; fail run"]
         AM4 -- "not success" --> AN1
     end
@@ -122,7 +121,8 @@ flowchart TD
 | Step                              | Code                                  |
 |-----------------------------------|---------------------------------------|
 | Webhook ingest, store dedupe, and triage | `src/web/webhooks.rs`, `src/triage.rs` |
-| Close-on-merge (`pull_request` delivery) | `src/web/webhooks.rs`, `src/ci_failure/close.rs`, `src/forge_log.rs` (`CommitRunsClient`), `src/provider/cli.rs` |
+| PR-merge bookkeeping (`pull_request` delivery); resolving the issue is a YouTrack workflow, not the runner (CLAUDE-327) | `src/web/webhooks.rs` (`handle_merged_pr`), `docs/yt-workflow-resolve-on-pr-merge.js` |
+| Match-time regression check against the live YouTrack `State` (CLAUDE-327) | `src/web/webhooks.rs` (`issue_state_is_resolved`) |
 | Event-driven automerge (`success`/`recover` delivery) | `src/web/webhooks.rs` (`consume_action_success_events`), `src/native/youtrack.rs` (`complete_automerge`) |
 | At-ingest analysis (`AnalysisClassifier`) | `src/ci_failure/analysis.rs` |
 | Failing-test fingerprint and the `ci_failures` store | `src/ci_failure/fingerprint.rs`, `src/ci_failure/store.rs` |

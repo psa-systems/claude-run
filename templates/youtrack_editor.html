@@ -61,8 +61,8 @@
       {% call m::textfield("Failed", "state_failed", form.state_failed, "Failed") %}
       {% call m::textfield("In progress (State field)", "state_in_progress", form.state_in_progress, "In Progress") %}
       {% call m::textfield("Done", "state_done", form.state_done, "Done") %}
-      {% call m::textfield("Done (State field)", "state_state_done", form.state_state_done, "Done") %}
     </div>
+    <p class="hint dim">These are AI Agent labels except "In progress", which is the State field written at pickup. There is no State-on-merge field here: the runner never writes State on merge (CLAUDE-327). A YouTrack workflow (see <code>docs/yt-workflow-resolve-on-pr-merge.js</code>) resolves the issue once its own PR merges.</p>
   </div>
 
   <div class="card">
@@ -71,7 +71,7 @@
       <input type="checkbox" name="automerge_enabled"{% if form.is_automerge_enabled() %} checked{% endif %}>
       <span>Enabled (merge the PR once its CI goes green, then advance the issue to Done)</span>
     </label>
-    <p class="hint dim">When enabled, a successful run still stops at Code Review. The runner merges the PR later, when a Forgejo Action Run Success or Recover webhook reports its CI green and the branch is mergeable, then sets the AI Agent / State to the Done labels above. The webhook must send those events (see the README "Event-driven automerge" section). Disabled (the default) leaves the PR for a human to merge.</p>
+    <p class="hint dim">When enabled, a successful run still stops at Code Review. The runner merges the PR later, when a Forgejo Action Run Success or Recover webhook reports its CI green and the branch is mergeable, then comments on the issue; AI Agent and State stay at Code Review, and a YouTrack workflow (see <code>docs/yt-workflow-resolve-on-pr-merge.js</code>) resolves the issue once the merge lands. The webhook must send those events (see the README "Event-driven automerge" section). Disabled (the default) leaves the PR for a human to merge.</p>
   </div>
 
   <div class="card">
