@@ -129,11 +129,12 @@ pub(crate) async fn paused_accept_and_drop(
     }
 }
 
-/// CLAUDE-332: true when a timer- or queue-driven `webhook-forgejo` path must
-/// not act: the daemon is globally paused, `webhook-forgejo` is paused, or a
+/// CLAUDE-332 / CLAUDE-335: true when a timer- or queue-driven path of the
+/// synthetic action `action` must not act: the daemon is globally paused,
+/// `action` is paused, or a
 /// pause flag could not be read (fail safe: a writer must never act against a
 /// pause it could not check, unlike the cached `PauseGate` read).
-async fn webhook_action_paused(pool: &DbPool, what: &str) -> bool {
+pub(crate) async fn webhook_action_paused(pool: &DbPool, action: &str, what: &str) -> bool {
     match state::global_pause_status(pool).await {
         Ok(Some((paused_at, _))) => {
             info!(what, paused_at = %paused_at, "globally paused; skipping");
@@ -145,18 +146,14 @@ async fn webhook_action_paused(pool: &DbPool, what: &str) -> bool {
             return true;
         }
     }
-    match state::action_pause_status(pool, WEBHOOK_MINT_ACTION).await {
+    match state::action_pause_status(pool, action).await {
         Ok(Some(_)) => {
-            info!(
-                what,
-                action = WEBHOOK_MINT_ACTION,
-                "action is paused; skipping"
-            );
+            info!(what, action, "action is paused; skipping");
             true
         }
         Ok(None) => false,
         Err(e) => {
-            error!(what, action = WEBHOOK_MINT_ACTION, error = %e, "action pause read failed; skipping so a pause that could not be read is never acted against");
+            error!(what, action, error = %e, "action pause read failed; skipping so a pause that could not be read is never acted against");
             true
         }
     }
@@ -654,6 +651,10 @@ async fn process_event(
     webhook_cfg: WebhookConfig,
     keygate: crate::concurrency::KeyGate,
 ) {
+    // CLAUDE-335: an event accepted before a pause was set must not act after it.
+    if webhook_action_paused(&pool, WEBHOOK_MINT_ACTION, "action-run failure event").await {
+        return;
+    }
     let cfg = crate::forge_log::LogFetchConfig::default();
     let mint = mint.as_deref();
     {
@@ -3342,6 +3343,10 @@ async fn process_pr_event(
     mint: Option<Arc<MintContext>>,
     keygate: crate::concurrency::KeyGate,
 ) {
+    // CLAUDE-335: an event accepted before a pause was set must not act after it.
+    if webhook_action_paused(&pool, WEBHOOK_MINT_ACTION, "pull-request event").await {
+        return;
+    }
     if mint.is_none() {
         info!(
             repo = %ev.repo,
@@ -3489,7 +3494,7 @@ async fn process_action_success_event(
     };
 
     // CLAUDE-332: an event accepted before a pause was set must not act after it.
-    if webhook_action_paused(&pool, "action-run success event").await {
+    if webhook_action_paused(&pool, WEBHOOK_MINT_ACTION, "action-run success event").await {
         return;
     }
 
@@ -3968,7 +3973,7 @@ pub(crate) async fn reconcile_automerge(
 ) {
     // CLAUDE-332: the reconciler writes to the forge and tracker, so it honours
     // the same pauses the webhook ingest does.
-    if webhook_action_paused(pool, "automerge reconciler").await {
+    if webhook_action_paused(pool, WEBHOOK_MINT_ACTION, "automerge reconciler").await {
         return;
     }
     let rows = match ci_failure_store::open_agent_prs(pool).await {
@@ -5120,6 +5125,58 @@ mod tests {
         )
         .await;
         slow.peak()
+    }
+
+    /// CLAUDE-335: a queued failure event does no fetch, triage, or tracker
+    /// call while globally paused or while `webhook-forgejo` is paused, and is
+    /// processed again once neither is set.
+    #[tokio::test]
+    async fn queued_failure_event_is_skipped_while_paused() {
+        for scope in [
+            None,
+            Some(WEBHOOK_MINT_ACTION),
+            Some("webhook-forgejo-comment"),
+        ] {
+            for paused in [true, false] {
+                let pool = crate::db::test_pool().await;
+                if paused {
+                    match scope {
+                        None => state::global_pause_set(&pool, Some("t")).await.unwrap(),
+                        Some(a) => state::action_pause_set(&pool, a, Some("t")).await.unwrap(),
+                    }
+                }
+                // Only the global pause and this listener's own action stop it.
+                let expect_skip = paused && scope != Some("webhook-forgejo-comment");
+                let backend = Arc::new(StoreBackend::new());
+                let counting = Arc::new(CountingClassifier::new());
+                let classifier: Arc<dyn FailureClassifier> = counting.clone();
+                let mut logs = HashMap::new();
+                logs.insert(1, failing_test_log("mod_a", "test_one", "main"));
+                let (tx, rx) = mpsc::channel(4);
+                tx.send(store_event(1)).await.unwrap();
+                drop(tx);
+                consume_events(
+                    rx,
+                    pool.clone(),
+                    Arc::new(ScriptedFailingLogs { logs }),
+                    tempfile::tempdir().unwrap().path().to_path_buf(),
+                    Some(store_mint_context(
+                        pool.clone(),
+                        backend.clone(),
+                        classifier,
+                    )),
+                    Arc::new(RwLock::new(WebhookConfig::default())),
+                    crate::concurrency::KeyGate::new(),
+                )
+                .await;
+                if expect_skip {
+                    assert_eq!(counting.call_count(), 0, "scope {scope:?}");
+                    assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+                } else {
+                    assert!(counting.call_count() > 0, "scope {scope:?} paused {paused}");
+                }
+            }
+        }
     }
 
     /// AC 5: with `analysis_concurrency = 2`, a slow stub shows a second event
@@ -7505,6 +7562,44 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(row.state, "merged");
+        }
+
+        #[tokio::test]
+        async fn a_queued_pr_event_is_skipped_while_paused() {
+            // CLAUDE-335: neither the store row nor the tracker is touched.
+            let pool = crate::db::test_pool().await;
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-50",
+                "dev.a8n.run",
+                "acme/widgets",
+                99,
+                "fix/CLAUDE-50",
+                "open",
+                "2026-09-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            state::global_pause_set(&pool, Some("t")).await.unwrap();
+            let backend = Arc::new(StoreBackend::new());
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+
+            process_pr_event(
+                merge_event("acme/widgets", 99, "deadbeefcafefeed"),
+                pool.clone(),
+                Some(Arc::new(ctx)),
+                crate::concurrency::KeyGate::new(),
+            )
+            .await;
+
+            assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+            let row = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 99)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "open");
         }
 
         #[tokio::test]
