@@ -645,8 +645,9 @@ Epic `parent for` open issues in the product projects. `dependencies.block_cross
 those, or an Epic retried after a transient failure would wait until every one of its findings was worked.
 `concurrency.max_parallel: 1` keeps one audit in flight at a time; per-target caps and the coverage ledger, not
 serialization, are what keep a rotation affordable. `automerge.enabled: true` merges an audit pull request once its CI
-is green, which is what resolves its Epic and so releases the gated daily parent; the merge is event-driven, so the
-webhook must send Action Run Success and Recover (see "Event-driven automerge").
+is green, which is what resolves its Epic and so releases the gated daily parent; the merge is normally event-driven,
+so the webhook should send Action Run Success and Recover for low latency, and the reconciler backstop merges it
+within one tick either way (see "Event-driven automerge").
 
 **Migrating an existing deployment to the audit preset.** The container entrypoint copies the shipped action files into
 `/config/actions/` only when that directory holds no `*.yml` file, so an existing deployment keeps its own
@@ -1085,9 +1086,12 @@ happened for billing-service's ~25-minute integration suite (GAMMA-1174) - timed
 nothing watching it afterward.
 
 `finalize` no longer waits for CI at all: a successful run opens the PR and stops at Code Review immediately, whether or
-not automerge is enabled. The merge instead happens later, driven by a `success` or `recover` Action-run webhook event
-on `POST /webhooks/forgejo/<source>` - the same endpoint the CI-failure listener uses, dispatched on the payload's
-`action` field rather than dropped as "non-failure" the way it used to be. On such an event the daemon:
+not automerge is enabled. The merge instead happens later, normally driven by a `success` or `recover` Action-run
+webhook event on `POST /webhooks/forgejo/<source>` - the same endpoint the CI-failure listener uses, dispatched on the
+payload's `action` field rather than dropped as "non-failure" the way it used to be - and, as a backstop for a webhook
+that is missed, dropped, or delivered before the PR's `agent_pull_requests` row exists, by a reconciler pass on the
+daemon's own tick (CLAUDE-328, see below). Both entry points make the same decision through one shared function,
+`apply_automerge_decision`. On a webhook event, the daemon:
 
 1. Finds the open PR (if any) whose head matches the run's commit.
 2. Looks it up in the `agent_pull_requests` store (CLAUDE-275); a PR the runner did not open, or one no longer marked
@@ -1116,10 +1120,21 @@ Because the wait is event-driven, no job slot, timeout, or `check_interval_secon
 `automerge.wait_seconds` and `automerge.check_interval_seconds` are deprecated (parsed, for a still-loading action file,
 but otherwise ignored - one deprecation warning is logged per action at load if either is set away from its default).
 
-**Operator setup:** each Forgejo webhook pointed at `/webhooks/forgejo/<source>` must send Action Run **Success** and
-**Recover** events, in addition to Failure, for any org running a `youtrack` action with automerge enabled (see the
-migration note above). Without them, a PR opened by such an action sits at Code Review forever, exactly as if automerge
-were disabled.
+**Reconciler backstop (CLAUDE-328):** the webhook is the low-latency path, not the only one. Every
+`AUTOMERGE_RECONCILE_TICK_SECS` (300s) the daemon lists every `open` row in `agent_pull_requests`, skips any whose
+action is not a `youtrack` action or has automerge disabled, and runs the same `apply_automerge_decision` a webhook
+event would run - so a PR still merges within one tick even if its `success` event was never delivered, was dropped, or
+arrived before the PR's row was recorded. The reconciler is idempotent: a PR that already merged or is not yet green is
+left exactly where the webhook path would have left it. Every fault this pass or the webhook path can hit while a
+recorded, automerge-enabled PR is involved (a forge-host lookup failure, a `list_open_prs` failure, a failed action
+load, a failed `pr_status` call, a failed merge or branch update) is logged at `error`, written to `run_events`, and
+posted as a PR comment naming the failure, rather than left as a silent `warn`.
+
+**Operator setup:** each Forgejo webhook pointed at `/webhooks/forgejo/<source>` should still send Action Run
+**Success** and **Recover** events, in addition to Failure, for any org running a `youtrack` action with automerge
+enabled (see the migration note above), so a green PR merges within seconds rather than waiting for the next
+reconciler tick. Without them, the reconciler is what keeps a PR opened by such an action from sitting at Code Review
+forever; automerge itself does not depend on the webhook.
 
 ### Auto-fix for mechanically-fixable failures (CLAUDE-104)
 
@@ -1182,9 +1197,10 @@ migration signal. To switch from the single SITE-level system webhook to one ORG
 2. In Forgejo, on each org's Settings -> Webhooks, add a **Forgejo** webhook with URL
    `https://<daemon-host>/webhooks/forgejo/<source>`, Secret set to that org's stored value, and the Action Run Failure
    event selected. If any `youtrack` action in this org has `automerge.enabled: true`, also select Action Run Success
-   and Action Run Recover (CLAUDE-278: that is what triggers the merge once CI goes green - see "Event-driven automerge"
-   below); otherwise leave them unselected so `success` / `recover` deliveries stay off the wire entirely (any that do
-   arrive are acked and dropped, same as before).
+   and Action Run Recover (CLAUDE-278: that is the low-latency trigger for merging once CI goes green - see
+   "Event-driven automerge" below; the CLAUDE-328 reconciler backstop merges within one tick either way, but the
+   webhook avoids that wait); otherwise leave them unselected so `success` / `recover` deliveries stay off the wire
+   entirely (any that do arrive are acked and dropped, same as before).
 3. Replace the old `[webhook]` block in `config.toml` with the sources shape above and restart the daemon. It refuses to
    start while any old key is present, naming it.
 4. Delete the SITE-level system webhook (and any old per-repo pilot webhook).

@@ -197,9 +197,9 @@ native:
 | `youtrack.prompt`       | none                               | Full-replacement agent prompt override (CLAUDE-125). Resolution order: this text when set, otherwise the built-in preset named by `prompt_preset`. When set, the text fully replaces the preset (so the operator owns the runner contract: the commit body used as the PR description (the runner joins any hard-wrapped prose lines back together before posting it), ending with a `Closes` line followed by the bare `#<KEY>` line, the `.claude-run-needs-review` / `.claude-run-skip-attempt` blocker markers, the `.claude-run-no-code-change` no-code marker, no push / no PR, and whichever tracker writes the operator chooses to permit), and it no longer changes when the binary's preset improves. Editable in the structured web form, which shows the prompt source (`override` or `builtin:<preset>`) and stores no override when the text equals the action's preset. See the placeholders below. |
 | `youtrack.prompt_preset` | `default`                         | Built-in prompt used when `prompt` is unset. `default` is the engineering prompt (`default_youtrack_prompt`, `src/native/youtrack.rs`); `audit` is the scheduled-audit prompt (`default_audit_prompt`, `src/native/audit_prompt.rs`), selected by `actions/audit-run.yml`. Preset text is compiled into the binary, so an upgrade updates it. Omitted on serialize when `default`. Any other value is rejected at load, naming `native.youtrack.prompt_preset`. No structured-form UI; the value is carried forward across form saves. `claude-run action show <name>` prints `prompt_source` (`override`, `builtin:default`, `builtin:audit`) and `prompt_preset` read from the YAML. |
 | `youtrack.write_projects` | empty                            | Projects the agent may create issues in for a descoped piece of the triggering issue (CLAUDE-214), and the fallback for an out-of-scope bug when no project or more than one project binds the buggy repo (CLAUDE-297); rendered into the prompt as `{{write_projects}}`. Empty (the default) resolves to the **triggering issue's own project**, so filing a deferred item satisfies the `No orphan notes` rule with no site-specific configuration and none is baked into the binary. The list is a prompt instruction, not an enforced grant: the hard boundary is the YouTrack token's own permissions. Exposed in the structured editor as a comma-separated "Write projects" field (CLAUDE-298). |
-| `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value. `done` (AI Agent) and `state_done` (State) are set only when a `success`/`recover` webhook event automerges the PR (CLAUDE-126, event-driven since CLAUDE-278). |
+| `youtrack.states.*`     | see above                          | Labels the handler reads/writes for each AI Agent / State value. `done` (AI Agent) and `state_done` (State) are set only when automerge merges the PR, normally on a `success`/`recover` webhook event and, as a backstop, on the reconciler's own tick (CLAUDE-126, event-driven since CLAUDE-278, reconciler backstop since CLAUDE-328). |
 | `youtrack.states.no_code` | the `done` label                 | AI Agent label set when a successful run deliberately produced no commits and left `.claude-run-no-code-change` (CLAUDE-214). Defaults to whatever `states.done` is, because there is no PR for a human to review. `State` is left untouched, so the issue stays In Progress until a human closes it. Exposed in the structured editor as the "No-code label" field, blank meaning inherit the Done label (CLAUDE-298). |
-| `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge (CLAUDE-126). When `false`, the PR is never merged by the runner (unchanged behavior). When `true`, `finalize` still stops at Code Review immediately; the merge happens later, driven by a `success`/`recover` Action-run webhook event (CLAUDE-278). |
+| `youtrack.automerge.enabled` | `false`                       | Master switch for CI-gated automerge (CLAUDE-126). When `false`, the PR is never merged by the runner (unchanged behavior). When `true`, `finalize` still stops at Code Review immediately; the merge happens later, normally driven by a `success`/`recover` Action-run webhook event (CLAUDE-278) and, if that event is missed, by the reconciler's own periodic pass (CLAUDE-328) - the webhook is a low-latency trigger, not the only one. |
 | `youtrack.automerge.wait_seconds` | `1800`                   | **Deprecated (CLAUDE-278):** the runner no longer polls, so this is parsed (an action file setting it still loads) but otherwise ignored; setting it away from its default logs one deprecation warning at load. Saving the action's structured form resets it to the default. |
 | `youtrack.automerge.check_interval_seconds` | `30`           | **Deprecated (CLAUDE-278):** same as `wait_seconds`.                                                  |
 | `youtrack.dependencies.enabled` | `true`                    | Master switch for the pre-clone dependency gate (CLAUDE-161). When `true`, a queued issue with any unmet dependency is left Queued (not cloned, no claude spend) and re-evaluated after `recheck_timeout`. When `false`, the gate is a no-op and pickup proceeds exactly as before. See [Pre-clone dependency gate](#pre-clone-dependency-gate-claude-161). Editable in the structured web form (CLAUDE-298). |
@@ -406,14 +406,18 @@ equivalent, so the backend pushes the working branch before opening the PR. The 
 must carry the **`repo`** and **`pull_request`** scopes (used for the authenticated push, the MCP call, and `gh`). The
 gather-time preflight probes one capability per scope, so a PAT short of either is rejected before the run (CLAUDE-207).
 
-##### CI-gated automerge (CLAUDE-126, event-driven since CLAUDE-278)
+##### CI-gated automerge (CLAUDE-126, event-driven since CLAUDE-278, reconciler backstop since CLAUDE-328)
 
 By default a successful run opens the PR, sets AI Agent to `code_review`, and stops; the issue stays In Progress until a
 human merges. Setting `youtrack.automerge.enabled: true` opts each successful run into merging the PR itself once its CI
 checks pass. `finalize` itself never waits for CI: once the PR is opened it stops at Code Review exactly as when automerge
-is disabled. The merge instead happens later, driven by a Forgejo webhook `success` or `recover` Action-run event on that
-PR's head commit (`POST /webhooks/forgejo/<source>`, the same endpoint the CI-failure listener uses) - so the wait holds
-no job slot no matter how long the suite takes, and there is nothing to time out. On each such event, once the daemon has
+is disabled. The merge instead happens later, normally driven by a Forgejo webhook `success` or `recover` Action-run
+event on that PR's head commit (`POST /webhooks/forgejo/<source>`, the same endpoint the CI-failure listener uses) - so
+the wait holds no job slot no matter how long the suite takes, and there is nothing to time out. The webhook is not the
+only trigger: a reconciler pass on the daemon's own tick (every 300s, CLAUDE-328) lists every `open` `agent_pull_requests`
+row, skips any whose action is not automerge-enabled, and runs the exact same decision through the shared
+`apply_automerge_decision` function a webhook event runs, so a PR still merges within one tick when its `success` event
+was never delivered, was dropped, or arrived before the PR's row was recorded. On either entry point, once the daemon has
 resolved which recorded agent PR it belongs to and confirmed that PR's action still has automerge enabled, it reads the
 PR's combined CI status (`fj pr status --json`, CLAUDE-309: including its `behind_base` field) and dispatches on
 `behind_base` first, since Forgejo's `mergeable` never reflects whether the branch is behind its base:
@@ -433,8 +437,12 @@ PR's combined CI status (`fj pr status --json`, CLAUDE-309: including its `behin
 - **Anything else** (checks not `success`): no action. A later `success` event on the same PR is what retries; a real
   CI failure is handled by the existing CI-failure webhook routing, not by this path.
 
-Operators must point their Forgejo webhook at "Action Run" success **and** recover events, in addition to failure, for
-this to fire (see the README "Webhook (Forgejo)" operator-setup note). `automerge.wait_seconds` and
+Operators should point their Forgejo webhook at "Action Run" success **and** recover events, in addition to failure, so
+this fires within seconds instead of waiting for the next reconciler tick (see the README "Webhook (Forgejo)"
+operator-setup note); without them the reconciler backstop is what keeps a green PR from sitting at Code Review
+forever. Every fault either entry point can hit while a recorded, automerge-enabled PR is involved (a forge-host lookup
+failure, a `list_open_prs` failure, a failed action load, a failed status read, a failed merge or branch update) is
+logged at `error`, written to `run_events`, and posted as a PR comment naming the failure. `automerge.wait_seconds` and
 `automerge.check_interval_seconds` are deprecated: the runner no longer polls, so an action file still setting them keeps
 loading (with one deprecation warning at load) but the values are otherwise ignored.
 
