@@ -5822,21 +5822,27 @@ mod tests {
         )
         .await
         .unwrap();
-        let runner = Arc::new(StubRunner::new().ok(
-            "fj",
-            &[
-                "--host",
-                "dev.a8n.run",
-                "pr",
-                "search",
-                "--repo",
-                "contoso/claude-run",
-                "--state",
-                "open",
-                "--json",
-            ],
-            &serde_json::to_string(&[open_pr(7, "fix/MK-16")]).unwrap(),
-        ));
+        let runner = Arc::new(
+            StubRunner::new().ok(
+                "fj",
+                &[
+                    "--host",
+                    "dev.a8n.run",
+                    "pr",
+                    "search",
+                    "--repo",
+                    "contoso/claude-run",
+                    "--state",
+                    "open",
+                    "--json",
+                ],
+                &serde_json::json!({
+                    "total_count": 1,
+                    "pull_requests": [open_pr(7, "fix/MK-16")],
+                })
+                .to_string(),
+            ),
+        );
         let forge = CliBackend::new(runner);
 
         let resume = resolve_pr_resume(&pool, &forge, &job(), PrStrategy::Branch)
@@ -5881,7 +5887,7 @@ mod tests {
                 "open",
                 "--json",
             ],
-            "[]",
+            r#"{"total_count":0,"pull_requests":[]}"#,
         ));
         let forge = CliBackend::new(runner);
 

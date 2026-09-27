@@ -13,8 +13,16 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::{Backend, Forge, IssueTracker, PullRequest, VcsMapEntry, VcsRepo};
+use super::{Backend, Forge, ForgePullRequest, IssueTracker, PullRequest, VcsMapEntry, VcsRepo};
 use crate::error::{Error, Result};
+
+/// The envelope `fj pr search --json` reports as of `fj` 0.17.1
+/// (`{"total_count": N, "pull_requests": [...]}`); older `fj` versions emitted
+/// the bare array. `total_count` is read by nothing here; the array is.
+#[derive(Deserialize)]
+struct PrSearchResponse {
+    pull_requests: Vec<ForgePullRequest>,
+}
 
 /// CLAUDE-194: restate a `fj pr create` failure with the repo, the host, and the
 /// permission hypothesis. The bare CLI text for a repo the token cannot see is
@@ -1565,7 +1573,11 @@ impl Forge for CliBackend {
             .runner
             .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
         let stdout = Self::checked(&self.fj, out, &args)?;
-        Self::parse_json(&self.fj, "fj pr search --json", &stdout)
+        // `fj` 0.17.1 wraps the results in `{"total_count": N, "pull_requests":
+        // [...]}` rather than emitting the bare array older versions did.
+        let response: PrSearchResponse =
+            Self::parse_json(&self.fj, "fj pr search --json", &stdout)?;
+        Ok(response.pull_requests)
     }
 
     fn pr_ci_state(&self, host: &str, repo: &str, pr_number: u64) -> Result<String> {
@@ -2670,9 +2682,12 @@ mod tests {
     ];
 
     /// CLAUDE-170: the `fj pr search` open-PR lookup the branch path issues.
-    /// `json` is the stdout to return (`"[]"` = no open PRs).
-    fn with_open_pr_search(runner: StubRunner, json: &str) -> StubRunner {
-        runner.ok("fj", &OPEN_PR_SEARCH, json)
+    /// `prs_json` is the bare JSON array of PRs to return (`"[]"` = no open
+    /// PRs); this wraps it in the `{"total_count", "pull_requests"}` envelope
+    /// `fj` 0.17.1 actually emits.
+    fn with_open_pr_search(runner: StubRunner, prs_json: &str) -> StubRunner {
+        let wrapped = format!(r#"{{"total_count":0,"pull_requests":{prs_json}}}"#);
+        runner.ok("fj", &OPEN_PR_SEARCH, &wrapped)
     }
 
     /// CLAUDE-206: the same lookup, failing the way a token without the issue
@@ -3620,7 +3635,7 @@ mod tests {
 
     #[test]
     fn list_open_prs_parses_search_json() {
-        let json = r#"[{"number":52,"title":"feat: x","state":"open","head_sha":"abc","head_ref":"feat/x","base_ref":"main","author":"David","html_url":"https://dev.a8n.run/n/c/pulls/52","updated_at":"2026-05-29T11:10:28Z","draft":false,"labels":[]}]"#;
+        let json = r#"{"total_count":1,"pull_requests":[{"number":52,"title":"feat: x","state":"open","head_sha":"abc","head_ref":"feat/x","base_ref":"main","author":"David","html_url":"https://dev.a8n.run/n/c/pulls/52","updated_at":"2026-05-29T11:10:28Z","draft":false,"labels":[]}]}"#;
         let b = backend(StubRunner::new().ok(
             "fj",
             &[
