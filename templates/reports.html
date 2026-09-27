@@ -112,7 +112,7 @@
   <tbody>
     {% for r in usage_recent %}
       <tr>
-        <td class="mono dim">{{ r.ts }}</td>
+        <td class="mono dim">{{ r.ts|datetime }}</td>
         <td class="mono">{{ r.action }}</td>
         <td class="mono">{{ r.job_key }}</td>
         <td class="mono">{{ r.outcome }}</td>
