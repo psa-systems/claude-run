@@ -1622,11 +1622,21 @@ impl Forge for CliBackend {
     }
 
     fn update_pr_branch(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
-        // CLAUDE-309 (FJ-99): Forgejo's Update-branch endpoint. `--style merge`
-        // matches CLAUDE-126's merge-commit policy and never rewrites the
-        // agent's branch.
+        // CLAUDE-309 (FJ-99): Forgejo's Update-branch endpoint. `--update-style
+        // merge` matches CLAUDE-126's merge-commit policy and never rewrites
+        // the agent's branch. CLAUDE-353 (FJ-107): renamed from `--style`,
+        // which collided with the global output-styling flag of the same
+        // name and caused a clap panic.
         let id = format!("{repo}#{pr_number}");
-        let args = ["--host", host, "pr", "update", &id, "--style", "merge"];
+        let args = [
+            "--host",
+            host,
+            "pr",
+            "update",
+            &id,
+            "--update-style",
+            "merge",
+        ];
         let out = self
             .runner
             .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
@@ -3811,8 +3821,9 @@ mod tests {
     #[test]
     fn update_pr_branch_invokes_fj_update_with_merge_style() {
         // CLAUDE-309 (FJ-99): Forgejo's Update-branch endpoint, addressed as
-        // owner/repo#n, always with `--style merge` (never rebase, matching
-        // CLAUDE-126's merge-commit policy).
+        // owner/repo#n, always with `--update-style merge` (never rebase,
+        // matching CLAUDE-126's merge-commit policy). CLAUDE-353 (FJ-107):
+        // flag renamed from `--style`.
         let runner = std::sync::Arc::new(StubRunner::new().ok(
             "fj",
             &[
@@ -3821,7 +3832,7 @@ mod tests {
                 "pr",
                 "update",
                 "contoso/claude-run#52",
-                "--style",
+                "--update-style",
                 "merge",
             ],
             "",
@@ -3832,7 +3843,7 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls.iter().any(|c| {
-                c == "fj --host dev.a8n.run pr update contoso/claude-run#52 --style merge"
+                c == "fj --host dev.a8n.run pr update contoso/claude-run#52 --update-style merge"
             }),
             "{calls:?}"
         );
