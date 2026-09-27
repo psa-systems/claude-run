@@ -487,8 +487,9 @@ pub trait Forge: Send + Sync {
 
     /// CLAUDE-309: bring PR `pr_number` in `repo` on `host` up to date with its
     /// base through Forgejo's Update-branch endpoint (`fj pr update <repo>#<n>
-    /// --style merge`, FJ-99), retriggering CI. `--style merge` matches
-    /// CLAUDE-126's merge-commit policy and never rewrites the agent's branch.
+    /// --update-style merge`, FJ-99; flag renamed by FJ-107 / CLAUDE-353),
+    /// retriggering CI. `--update-style merge` matches CLAUDE-126's
+    /// merge-commit policy and never rewrites the agent's branch.
     /// The default errors for backends without automerge.
     fn update_pr_branch(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
         let _ = (host, repo, pr_number);
