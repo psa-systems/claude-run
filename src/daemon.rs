@@ -687,13 +687,6 @@ fn build_mint_context(
         analysis_base_dir,
         paths.logs_dir(),
         fj,
-        // DEV-705: a classification bills against the runner's default budget,
-        // frozen here; there is no per-action YAML for the webhook mint path.
-        {
-            let defaults = RunnerDefaults::default();
-            crate::usage::RunBudget::new(defaults.daily_budget_usd, defaults.budget_warn_fraction)
-        },
-        Some(paths.usage_log()),
         pool.clone(),
     ));
 
