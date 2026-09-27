@@ -292,7 +292,16 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
 pub trait FailureClassifier: Send + Sync {
     /// Classify a non-transient failure (the rules abstained). Returning `Err`
     /// is allowed; [`triage`] degrades it to [`TriageBucket::HumanAction`].
-    fn classify(&self, input: &TriageInput) -> Result<Triage>;
+    ///
+    /// `spend` is the caller's own per-delivery ledger (CLAUDE-337): an
+    /// implementation that shells out to `claude` records its cost onto it
+    /// (and caps the child at `spend.remaining_usd()`) rather than owning a
+    /// ledger of its own, since a classifier is a daemon-lifetime `Arc`
+    /// shared across concurrent deliveries and a ledger held on it would race.
+    /// The caller reads the ledger back after `classify` returns and finishes
+    /// it exactly once, so an implementation must never call
+    /// [`crate::usage::RunSpend::finish`] itself.
+    fn classify(&self, input: &TriageInput, spend: &crate::usage::RunSpend) -> Result<Triage>;
 }
 
 /// Hybrid triage: deterministic rules first, then the deterministic auto-fix
@@ -313,6 +322,7 @@ pub fn triage(
     input: &TriageInput,
     classifier: &dyn FailureClassifier,
     autofix_cfg: &AutoFixConfig,
+    spend: &crate::usage::RunSpend,
 ) -> Triage {
     if let Some(verdict) = triage_rules(input) {
         return verdict;
@@ -326,7 +336,7 @@ pub fn triage(
             return Triage::auto_fix(detail);
         }
     }
-    match classifier.classify(input) {
+    match classifier.classify(input, spend) {
         Ok(verdict) => verdict,
         Err(e) => Triage::llm(
             TriageBucket::HumanAction,
@@ -475,11 +485,6 @@ pub struct AnalysisClassifier {
     analysis_base_dir: PathBuf,
     logs_dir: PathBuf,
     fj: Arc<dyn ForgeReads>,
-    /// DEV-705: the ceiling ONE classification runs under, frozen at build time
-    /// from the runner defaults.
-    budget: crate::usage::RunBudget,
-    /// DEV-707: where each classification's usage record is appended.
-    usage_log: Option<PathBuf>,
     /// CLAUDE-315: where this classification's `claude_invocations` row is
     /// written. `classify` is synchronous and always run inside
     /// `tokio::task::spawn_blocking` (never `block_in_place`), so bridging into
@@ -501,8 +506,6 @@ impl AnalysisClassifier {
         analysis_base_dir: PathBuf,
         logs_dir: PathBuf,
         fj: Arc<dyn ForgeReads>,
-        budget: crate::usage::RunBudget,
-        usage_log: Option<PathBuf>,
         pool: DbPool,
     ) -> Self {
         Self {
@@ -512,8 +515,6 @@ impl AnalysisClassifier {
             analysis_base_dir,
             logs_dir,
             fj,
-            budget,
-            usage_log,
             pool,
         }
     }
@@ -528,7 +529,7 @@ impl AnalysisClassifier {
 }
 
 impl FailureClassifier for AnalysisClassifier {
-    fn classify(&self, input: &TriageInput) -> Result<Triage> {
+    fn classify(&self, input: &TriageInput, spend: &crate::usage::RunSpend) -> Result<Triage> {
         let Some(index_in_repo) = analysis::run_index_from_url(&input.html_url) else {
             warn!(html_url = %input.html_url, "could not derive the run number from the run URL; routing to a human");
             return Ok(Triage::llm(
@@ -628,13 +629,6 @@ impl FailureClassifier for AnalysisClassifier {
         );
         // Classification is not cancellable on its own; a fresh token never trips.
         let cancel = CancellationToken::new();
-        // DEV-707: a fresh ledger per classification, so each one appends its own
-        // record rather than folding into the last.
-        let spend = crate::usage::RunSpend::new(
-            crate::web::webhooks::WEBHOOK_MINT_ACTION,
-            self.budget,
-            self.usage_log.clone(),
-        );
         let result = self.invoker.invoke(
             &prompt,
             &self.claude_cfg,
@@ -642,13 +636,14 @@ impl FailureClassifier for AnalysisClassifier {
             &cwd,
             &stream_log,
             &cancel,
-            // DEV-705: cap the child at this classification's ceiling.
+            // DEV-705: cap the child at the caller's remaining per-delivery ceiling.
             Some(spend.remaining_usd()),
         )?;
-        // DEV-707: record the classification's tokens and cost, then close the
-        // record: one classification is one unit of spend, with no run row.
+        // CLAUDE-337: fold this call's tokens and cost into the caller's own
+        // ledger; the caller (the webhook mint consumer) owns the ledger and
+        // finishes it exactly once, after `classify` returns, with the run's
+        // real `run_id`.
         spend.record(&result);
-        spend.finish(None, spend.exit_code(crate::exit::OK));
         // CLAUDE-315: this classification has neither a scheduled job key nor
         // a run row, so both are `None`. `classify` runs inside
         // `spawn_blocking` (see the `pool` field doc), so blocking this thread
@@ -715,10 +710,20 @@ mod tests {
     }
 
     impl FailureClassifier for StubClassifier {
-        fn classify(&self, _input: &TriageInput) -> Result<Triage> {
+        fn classify(
+            &self,
+            _input: &TriageInput,
+            _spend: &crate::usage::RunSpend,
+        ) -> Result<Triage> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.reply.clone())
         }
+    }
+
+    /// A fresh, unbounded per-test ledger; no assertion in this module reads
+    /// it, so its budget never matters.
+    fn test_spend() -> crate::usage::RunSpend {
+        crate::usage::RunSpend::new("test", crate::usage::RunBudget::new(1000.0, 0.8), None)
     }
 
     fn input_with_log(log: &str) -> TriageInput {
@@ -797,6 +802,7 @@ mod tests {
             &input_with_log("could not resolve host: index.crates.io"),
             &stub,
             &autofix_cfg(),
+            &test_spend(),
         );
         assert_eq!(verdict.bucket, TriageBucket::HumanAction);
         assert_eq!(stub.calls(), 0, "the classifier must NOT be consulted");
@@ -870,7 +876,7 @@ mod tests {
     fn hybrid_short_circuits_a_skipped_job_without_calling_classifier() {
         let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "unused"));
         let log = "Skipping job 'release' due to 'startsWith(github.ref, refs/tags)'";
-        let verdict = triage(&input_with_log(log), &stub, &autofix_cfg());
+        let verdict = triage(&input_with_log(log), &stub, &autofix_cfg(), &test_spend());
         assert_eq!(verdict.bucket, TriageBucket::Transient);
         assert_eq!(stub.calls(), 0, "classifier untouched");
     }
@@ -887,6 +893,7 @@ mod tests {
             &input_with_log("test foo ... FAILED"),
             &stub,
             &autofix_cfg(),
+            &test_spend(),
         );
         assert_eq!(verdict.bucket, TriageBucket::CodeFix);
         assert_eq!(verdict.classified_by, ClassifiedBy::Llm);
@@ -901,6 +908,7 @@ mod tests {
             &input_with_log("fatal: connection reset by peer"),
             &stub,
             &autofix_cfg(),
+            &test_spend(),
         );
         assert_eq!(verdict.bucket, TriageBucket::Transient);
         assert_eq!(verdict.classified_by, ClassifiedBy::Rules);
@@ -921,7 +929,7 @@ mod tests {
         );
         input.workflow_id = "check.yml".to_string();
         input.has_open_pr = false;
-        let verdict = triage(&input, &stub, &autofix_cfg());
+        let verdict = triage(&input, &stub, &autofix_cfg(), &test_spend());
         assert_eq!(verdict.bucket, TriageBucket::AutoFix);
         assert_eq!(verdict.classified_by, ClassifiedBy::Rules);
         assert_eq!(stub.calls(), 0, "auto-fix short-circuits before the LLM");
@@ -944,7 +952,7 @@ mod tests {
         let mut input = input_with_log(log);
         input.workflow_id = "check.yml".to_string();
         input.has_open_pr = false;
-        let verdict = triage(&input, &stub, &autofix_cfg());
+        let verdict = triage(&input, &stub, &autofix_cfg(), &test_spend());
         assert_eq!(verdict.bucket, TriageBucket::AutoFix);
         assert_eq!(verdict.auto_fix.unwrap().kind, "checks-workflow");
         assert_eq!(stub.calls(), 0, "auto-fix short-circuits before the LLM");
@@ -954,7 +962,7 @@ mod tests {
         let mut input = input_with_log(log);
         input.workflow_id = "check.yml".to_string();
         input.has_open_pr = true;
-        let verdict = triage(&input, &stub, &autofix_cfg());
+        let verdict = triage(&input, &stub, &autofix_cfg(), &test_spend());
         assert_eq!(verdict.bucket, TriageBucket::CodeFix);
         assert!(verdict.auto_fix.is_none());
         assert_eq!(
@@ -976,7 +984,7 @@ mod tests {
         let mut input = input_with_log("Run cargo fmt --check\nDiff in src/main.rs at line 1:\n");
         input.workflow_id = "check.yml".to_string();
         input.has_open_pr = true;
-        let verdict = triage(&input, &stub, &autofix_cfg());
+        let verdict = triage(&input, &stub, &autofix_cfg(), &test_spend());
         assert_eq!(verdict.bucket, TriageBucket::CodeFix);
         assert!(verdict.auto_fix.is_none());
         assert_eq!(stub.calls(), 1);
@@ -990,7 +998,7 @@ mod tests {
         let stub = StubClassifier::new(Triage::llm(TriageBucket::CodeFix, "unused"));
         let mut input = input_with_log("Error: No runner is available for this job");
         input.workflow_id = "check.yml".to_string();
-        let verdict = triage(&input, &stub, &autofix_cfg());
+        let verdict = triage(&input, &stub, &autofix_cfg(), &test_spend());
         assert_eq!(verdict.bucket, TriageBucket::Transient);
         assert!(verdict.auto_fix.is_none());
         assert_eq!(stub.calls(), 0);
@@ -1007,7 +1015,7 @@ mod tests {
         let stub = StubClassifier::new(Triage::llm(TriageBucket::HumanAction, "human"));
         let mut input = input_with_log("Run cargo fmt --check\nDiff in src/main.rs at line 1:\n");
         input.workflow_id = "check.yml".to_string();
-        let verdict = triage(&input, &stub, &disabled);
+        let verdict = triage(&input, &stub, &disabled, &test_spend());
         assert_eq!(verdict.bucket, TriageBucket::HumanAction);
         assert_eq!(stub.calls(), 1, "classifier consulted when auto-fix is off");
     }
@@ -1187,8 +1195,6 @@ mod tests {
             dir.path().join("analysis"),
             dir.path().join("logs"),
             Arc::new(NoForgeReads),
-            crate::usage::RunBudget::new(1.0, 0.8),
-            None,
             crate::db::test_pool().await,
         );
         // The configured timeout, asserted on the struct directly: the actual
@@ -1196,15 +1202,25 @@ mod tests {
         // shells out to, which is outside what this stub's own argv can see.
         assert_eq!(classifier.timeout, Duration::from_secs(600));
         let input = input_with_log("test foo ... FAILED");
+        let spend =
+            crate::usage::RunSpend::new("test", crate::usage::RunBudget::new(1.0, 0.8), None);
+        let spend_for_classify = spend.clone();
         // `classify` is synchronous and calls `Handle::current().block_on` to
         // persist the usage record, mirroring the production call through
         // `spawn_blocking` rather than calling it inline on the test's own
         // async task (which would deadlock).
-        let verdict = tokio::task::spawn_blocking(move || classifier.classify(&input))
-            .await
-            .unwrap()
-            .unwrap();
+        let verdict =
+            tokio::task::spawn_blocking(move || classifier.classify(&input, &spend_for_classify))
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(verdict.bucket, TriageBucket::CodeFix);
+        // CLAUDE-337: the classifier records its cost onto the caller's own
+        // ledger instead of owning one, so the caller can attribute it to the
+        // right run.
+        assert_eq!(spend.cost_usd(), 0.1);
+        assert!(spend.claude_ran());
+        assert!(spend.claude_ok());
 
         let argv = std::fs::read_to_string(&argv_file).unwrap();
         assert!(
