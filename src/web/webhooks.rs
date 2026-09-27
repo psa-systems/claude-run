@@ -695,7 +695,7 @@ async fn process_event(
                 "run status is '{}', not 'failure'; log fetch and triage skipped; no issue",
                 ev.status
             );
-            finish_webhook_run(&pool, run_id, &job_key, &summary, true, None).await;
+            finish_webhook_run(&pool, run_id, &job_key, &summary, true, None, None).await;
             return;
         }
 
@@ -719,6 +719,7 @@ async fn process_event(
                 &job_key,
                 "could not derive forge host from html_url; log fetch skipped",
                 false,
+                None,
                 None,
             )
             .await;
@@ -871,6 +872,7 @@ async fn process_event(
                     &summary,
                     true,
                     log_artifact.as_deref(),
+                    None,
                 )
                 .await;
                 return;
@@ -898,11 +900,23 @@ async fn process_event(
                 summary,
                 true,
                 log_artifact.as_deref(),
+                None,
             )
             .await;
             return;
         };
         let artifact = log_artifact.clone();
+        // DEV-707/CLAUDE-337: one ledger for this delivery, so the triage
+        // classification's cost lands on this run's outcome row and daily
+        // ledger instead of only `logs/usage.jsonl` with no run id.
+        let spend = crate::usage::RunSpend::new(
+            WEBHOOK_MINT_ACTION,
+            crate::usage::RunBudget::new(
+                ctx.defaults.daily_budget_usd,
+                ctx.defaults.budget_warn_fraction,
+            ),
+            Some(ctx.paths.usage_log()),
+        );
         // CLAUDE-190/204: the failing job's name comes from the jobs `fj` already
         // returned with the log, so the root-cause dedupe key is job-scoped with
         // no extra request. A logless failure degrades to a job-agnostic key,
@@ -924,8 +938,16 @@ async fn process_event(
             log_token,
             &keygate,
             &webhook_cfg,
+            &spend,
         )
         .await;
+        if spend.cost_usd() > 0.0 {
+            if let Err(e) =
+                state::daily_cost_add(&pool, WEBHOOK_MINT_ACTION, spend.cost_usd()).await
+            {
+                warn!(error = %e, "recording the webhook mint run cost failed");
+            }
+        }
         finish_webhook_run(
             &pool,
             run_id,
@@ -933,6 +955,7 @@ async fn process_event(
             &result.text,
             result.ok,
             artifact.as_deref(),
+            Some(&spend),
         )
         .await;
     }
@@ -1029,11 +1052,14 @@ pub(crate) async fn begin_webhook_run(
 
 /// CLAUDE-61: close a webhook run. Writes one `job_outcomes` row
 /// carrying the human-readable `summary` (triage bucket + mint result, plus the
-/// redacted-log artifact path when present) and finalizes the run. A webhook run
-/// has no `claude --print` stream (`claude_ran = false`), so the run-detail page
-/// shows the summary instead of a stream link. `attempt_counted = false`: the
+/// redacted-log artifact path when present) and finalizes the run. `spend` is
+/// this delivery's own ledger (CLAUDE-337): `None` for a path that never reached
+/// triage (nothing to bill), `Some` for every path that did, so `claude_ran` /
+/// `claude_ok` / `claude_cost_usd` reflect what the classification actually
+/// spent instead of always reading false/zero. `attempt_counted = false`: the
 /// DEV-335 caps ledger is advanced separately inside [`triage_and_mint`] and
-/// must not be double counted here. A no-op when `run_id` is `None`.
+/// must not be double counted here. A no-op when `run_id` is `None`, except
+/// that a real `spend` must still be finished so its usage record is not lost.
 async fn finish_webhook_run(
     pool: &DbPool,
     run_id: Option<i64>,
@@ -1041,8 +1067,12 @@ async fn finish_webhook_run(
     summary: &str,
     ok: bool,
     artifact: Option<&std::path::Path>,
+    spend: Option<&crate::usage::RunSpend>,
 ) {
     let Some(run_id) = run_id else {
+        if let Some(spend) = spend {
+            spend.finish(None, crate::exit::UNEXPECTED);
+        }
         return;
     };
     let full = match artifact {
@@ -1055,14 +1085,11 @@ async fn finish_webhook_run(
         job_key,
         attempt: 1,
         ok,
-        // DEV-707: the triage classification this run performed DID spend, and
-        // its tokens / cost land in `logs/usage.jsonl` under this action name.
-        // Carrying that cost onto this row (and into the daily ledger) needs
-        // `FailureClassifier::classify` to return it, which is tracked in
-        // DEV-726.
-        claude_ran: false,
-        claude_ok: false,
-        claude_cost_usd: 0.0,
+        // DEV-707/CLAUDE-337: the triage classification's own cost, read back
+        // off the caller's per-delivery ledger.
+        claude_ran: spend.is_some_and(|s| s.claude_ran()),
+        claude_ok: spend.is_some_and(|s| s.claude_ok()),
+        claude_cost_usd: spend.map(|s| s.cost_usd()).unwrap_or(0.0),
         attempt_counted: false,
         summary: Some(&full),
         stream_log_path: None,
@@ -1072,13 +1099,18 @@ async fn finish_webhook_run(
     if let Err(e) = state::job_outcome_insert(pool, &outcome).await {
         warn!(error = %e, "recording webhook run outcome failed");
     }
-    let exit_code = if ok {
+    let base_exit_code = if ok {
         crate::exit::OK
     } else {
         crate::exit::UNEXPECTED
     };
+    // DEV-705: an over-budget stop overrides only an otherwise-clean outcome.
+    let exit_code = spend.map_or(base_exit_code, |s| s.exit_code(base_exit_code));
     if let Err(e) = state::run_finish(pool, run_id, exit_code, 1).await {
         warn!(error = %e, "finalizing webhook run failed");
+    }
+    if let Some(spend) = spend {
+        spend.finish(Some(run_id), exit_code);
     }
 }
 
@@ -1185,6 +1217,7 @@ async fn triage_and_mint(
     log_token: Option<String>,
     keygate: &crate::concurrency::KeyGate,
     webhook_cfg: &WebhookConfig,
+    spend: &crate::usage::RunSpend,
 ) -> WebhookRunSummary {
     // CLAUDE-274: the store lookup, analysis and mint for one event run under a
     // key gate on (repo, workflow_id, job_name), so two concurrent failures of
@@ -1282,6 +1315,7 @@ async fn triage_and_mint(
                                 test_ids,
                                 log_token,
                                 m,
+                                spend,
                             )
                             .await;
                         }
@@ -1319,6 +1353,7 @@ async fn triage_and_mint(
                     test_ids,
                     log_token,
                     m,
+                    spend,
                 )
                 .await;
             }
@@ -1341,6 +1376,7 @@ async fn triage_and_mint(
             test_ids,
             log_token,
             webhook_cfg.max_runs_per_day,
+            spend,
         )
         .await;
     };
@@ -1367,6 +1403,7 @@ async fn triage_and_mint(
                 &test_ids,
                 record,
                 webhook_cfg,
+                spend,
             )
             .await
         }
@@ -1389,6 +1426,7 @@ async fn triage_and_mint(
                 &pr,
                 &host,
                 webhook_cfg,
+                spend,
             )
             .await
         }
@@ -1521,6 +1559,7 @@ async fn reopen_resolved_failure(
     test_ids: Vec<String>,
     log_token: Option<String>,
     m: ci_failure_store::FailureMatch,
+    spend: &crate::usage::RunSpend,
 ) -> WebhookRunSummary {
     let Some(key) = m.issue_key.clone() else {
         error!(repo = %ev.repo, run = ev.index_in_repo, failure_id = m.id, "resolved ci_failures row has no issue_key");
@@ -1556,6 +1595,7 @@ async fn reopen_resolved_failure(
     let event = ev.clone();
     let key2 = key.clone();
     let regression_body = regression_comment_body(ev, &branch, &test_ids);
+    let spend = spend.clone();
     let bucket =
         tokio::task::spawn_blocking(move || -> crate::error::Result<triage::TriageBucket> {
             backend.set_state(&key2, &mint_cfg.target_state)?;
@@ -1572,7 +1612,7 @@ async fn reopen_resolved_failure(
                 has_open_pr,
                 log_token,
             };
-            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix, &spend);
             backend.comment(&key2, &verdict.analysis)?;
             if mint::queues_for_fix(verdict.bucket) && auto_fix_enabled {
                 backend.set_field(&key2, &mint_cfg.ai_agent_field, &mint_cfg.queued_value)?;
@@ -1827,12 +1867,14 @@ async fn analyze_and_comment_pr(
     pr_number: u64,
     host: &str,
     env: PrCommentEnv,
+    spend: &crate::usage::RunSpend,
 ) -> crate::error::Result<String> {
     let classifier = ctx.classifier.clone();
     let mint_cfg = ctx.mint_cfg.read().await.clone();
     let event = ev.clone();
     let host_owned = host.to_string();
     let body_file = pr_comment_body_path(&ctx.paths, &ev.repo, pr_number);
+    let spend = spend.clone();
     let result = tokio::task::spawn_blocking(move || -> crate::error::Result<String> {
         let input = TriageInput {
             repo: event.repo.clone(),
@@ -1845,7 +1887,7 @@ async fn analyze_and_comment_pr(
             has_open_pr: true,
             log_token,
         };
-        let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+        let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix, &spend);
         write_and_post_pr_comment(
             env.backend.as_ref(),
             &host_owned,
@@ -1892,6 +1934,7 @@ async fn route_agent_pr_failure(
     test_ids: &[String],
     record: ci_failure_store::AgentPullRequest,
     webhook_cfg: &WebhookConfig,
+    spend: &crate::usage::RunSpend,
 ) -> WebhookRunSummary {
     let now = state::now_iso();
     let failure_id = match ci_failure_store::failure_for_issue(&ctx.pool, &record.issue_key).await {
@@ -1948,6 +1991,7 @@ async fn route_agent_pr_failure(
         let key = record.issue_key.clone();
         let tests = test_ids.to_vec();
         let branch_owned = branch.to_string();
+        let spend = spend.clone();
         let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
             let input = TriageInput {
                 repo: event.repo.clone(),
@@ -1960,7 +2004,7 @@ async fn route_agent_pr_failure(
                 has_open_pr: true,
                 log_token,
             };
-            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix, &spend);
             let tests_display = if tests.is_empty() {
                 "(no test ids parsed)".to_string()
             } else {
@@ -2064,6 +2108,7 @@ async fn route_human_pr_failure(
     pr: &ForgePullRequest,
     host: &str,
     webhook_cfg: &WebhookConfig,
+    spend: &crate::usage::RunSpend,
 ) -> WebhookRunSummary {
     match store_match {
         Some(m) if m.state == "open" => {
@@ -2083,6 +2128,7 @@ async fn route_human_pr_failure(
                             test_ids.to_vec(),
                             log_token,
                             m,
+                            spend,
                         )
                         .await;
                     }
@@ -2133,6 +2179,7 @@ async fn route_human_pr_failure(
                 test_ids.to_vec(),
                 log_token,
                 m,
+                spend,
             )
             .await
         }
@@ -2155,6 +2202,7 @@ async fn route_human_pr_failure(
                 pr,
                 host,
                 webhook_cfg,
+                spend,
             )
             .await
         }
@@ -2174,6 +2222,7 @@ async fn route_human_pr_failure(
                 pr,
                 host,
                 webhook_cfg,
+                spend,
             )
             .await
         }
@@ -2276,6 +2325,7 @@ async fn route_pr_matches_pr_only_failure(
     pr: &ForgePullRequest,
     host: &str,
     webhook_cfg: &WebhookConfig,
+    spend: &crate::usage::RunSpend,
 ) -> WebhookRunSummary {
     let now = state::now_iso();
     if let Err(e) = ci_failure_store::add_tests(&ctx.pool, m.id, test_ids).await {
@@ -2321,6 +2371,7 @@ async fn route_pr_matches_pr_only_failure(
             m.id,
             host,
             webhook_cfg,
+            spend,
         )
         .await;
     }
@@ -2339,6 +2390,7 @@ async fn route_pr_matches_pr_only_failure(
         pr.number,
         host,
         env,
+        spend,
     )
     .await
     {
@@ -2377,6 +2429,7 @@ async fn mint_for_two_branch_pr_only_failure(
     failure_id: i64,
     host: &str,
     webhook_cfg: &WebhookConfig,
+    spend: &crate::usage::RunSpend,
 ) -> WebhookRunSummary {
     let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
     let attempts = state::attempts_get(&ctx.pool, WEBHOOK_MINT_ACTION, &job_key)
@@ -2402,6 +2455,7 @@ async fn mint_for_two_branch_pr_only_failure(
     let branch_owned = branch.to_string();
     let sig_owned = failure_signature.map(str::to_string);
     let infra_owned = infra_kind.map(str::to_string);
+    let spend = spend.clone();
 
     let decision = tokio::task::spawn_blocking(
         move || -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
@@ -2417,7 +2471,7 @@ async fn mint_for_two_branch_pr_only_failure(
                 has_open_pr: true,
                 log_token,
             };
-            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix);
+            let verdict = triage::triage(&input, classifier.as_ref(), &mint_cfg.auto_fix, &spend);
             let req = MintRequest {
                 repo: &event.repo,
                 index_in_repo: event.index_in_repo,
@@ -2546,6 +2600,7 @@ async fn route_new_pr_only_failure(
     pr: &ForgePullRequest,
     host: &str,
     webhook_cfg: &WebhookConfig,
+    spend: &crate::usage::RunSpend,
 ) -> WebhookRunSummary {
     let env = match require_pr_comment_backend(ctx, run_id, ev, host, webhook_cfg).await {
         Ok(env) => env,
@@ -2561,6 +2616,7 @@ async fn route_new_pr_only_failure(
         pr.number,
         host,
         env,
+        spend,
     )
     .await
     {
@@ -2638,6 +2694,7 @@ async fn classify_and_mint(
     test_ids: Vec<String>,
     log_token: Option<String>,
     max_runs_per_day: u32,
+    spend: &crate::usage::RunSpend,
 ) -> WebhookRunSummary {
     // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
     // run's (repo, index); the daily ledger is per synthetic action. The
@@ -2693,6 +2750,7 @@ async fn classify_and_mint(
     let job_name_for_blocking = job_name.clone();
     let sig_for_blocking = failure_signature.clone();
     let infra_for_blocking = infra_kind.clone();
+    let spend = spend.clone();
     let decision = tokio::task::spawn_blocking(move || {
         let report_stage = move |stage: &'static str| {
             let _ = stage_tx.send(stage);
@@ -2719,6 +2777,7 @@ async fn classify_and_mint(
             infra_for_blocking.as_deref(),
             log_token,
             &report_stage,
+            &spend,
         )
     })
     .await;
@@ -2816,6 +2875,7 @@ fn decide_with_legacy_adoption(
     infra_kind: Option<&str>,
     log_token: Option<String>,
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
+    spend: &crate::usage::RunSpend,
 ) -> crate::error::Result<DecideOutcome> {
     // CLAUDE-273: before spending a `claude` classification, check whether this
     // exact collapse key already has an issue minted before the `ci_failure`
@@ -2847,6 +2907,7 @@ fn decide_with_legacy_adoption(
         job_name,
         log_token,
         report_stage,
+        spend,
     )?;
     Ok(DecideOutcome::Mint(bucket, outcome))
 }
@@ -2875,6 +2936,7 @@ fn decide_mint(
     job_name: &str,
     log_token: Option<String>,
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
+    spend: &crate::usage::RunSpend,
 ) -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
     // CLAUDE-190: derive the deterministic failure signature and the branch from
     // the redacted log before it is moved into the triage input. The branch's
@@ -2914,7 +2976,7 @@ fn decide_mint(
         inner: classifier,
         report: report_stage,
     };
-    let verdict = triage::triage(&input, &reporting, &mint_cfg.auto_fix);
+    let verdict = triage::triage(&input, &reporting, &mint_cfg.auto_fix, spend);
     report_stage(STAGE_MINTING);
     let req = MintRequest {
         repo: &ev.repo,
@@ -2947,9 +3009,13 @@ struct ReportingClassifier<'a> {
 }
 
 impl FailureClassifier for ReportingClassifier<'_> {
-    fn classify(&self, input: &TriageInput) -> crate::error::Result<crate::triage::Triage> {
+    fn classify(
+        &self,
+        input: &TriageInput,
+        spend: &crate::usage::RunSpend,
+    ) -> crate::error::Result<crate::triage::Triage> {
         (self.report)(STAGE_CLASSIFYING);
-        self.inner.classify(input)
+        self.inner.classify(input, spend)
     }
 }
 
@@ -3383,7 +3449,7 @@ async fn process_pr_event(
             (false, e.clone())
         }
     };
-    finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None).await;
+    finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None, None).await;
 }
 
 /// CLAUDE-277: a PR closed WITHOUT merging. The only action is marking the
@@ -3561,7 +3627,7 @@ async fn process_action_success_event(
     if !ok {
         warn!(repo = %ev.repo, pr = pr_number, error = %summary, "action-run success handling failed");
     }
-    finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None).await;
+    finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None, None).await;
 }
 
 /// CLAUDE-328: a fault that happened before the failing commit could be
@@ -4058,7 +4124,7 @@ pub(crate) async fn reconcile_automerge(
         if !ok {
             warn!(repo = %row.repo, pr = row.pr_number, error = %summary, "automerge reconciler: decision failed");
         }
-        finish_webhook_run(pool, run_id, &job_key, &summary, ok, None).await;
+        finish_webhook_run(pool, run_id, &job_key, &summary, ok, None, None).await;
     }
 }
 
@@ -4242,6 +4308,16 @@ mod tests {
     use super::*;
 
     const SECRET: &[u8] = b"super-secret-webhook-key";
+
+    /// A fresh, unbounded per-test ledger; no assertion in this module reads
+    /// it unless it says otherwise, so its budget never matters.
+    fn test_spend() -> crate::usage::RunSpend {
+        crate::usage::RunSpend::new(
+            WEBHOOK_MINT_ACTION,
+            crate::usage::RunBudget::new(1000.0, 0.8),
+            None,
+        )
+    }
 
     fn sign(secret: &[u8], body: &[u8]) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
@@ -4475,11 +4551,57 @@ mod tests {
     }
 
     impl FailureClassifier for StubClassifier {
-        fn classify(&self, _input: &TriageInput) -> crate::error::Result<Triage> {
+        fn classify(
+            &self,
+            _input: &TriageInput,
+            _spend: &crate::usage::RunSpend,
+        ) -> crate::error::Result<Triage> {
             *self.calls.lock().unwrap() += 1;
             Ok(Triage {
                 bucket: self.bucket,
                 analysis: "stub analysis".to_string(),
+                classified_by: ClassifiedBy::Llm,
+                auto_fix: None,
+            })
+        }
+    }
+
+    /// CLAUDE-337: a classifier that records a real invocation cost onto the
+    /// caller's ledger, the way `AnalysisClassifier` does, so a test can assert
+    /// the cost reaches the webhook run's outcome row and daily ledger.
+    struct CostingClassifier {
+        bucket: TriageBucket,
+        cost: f64,
+    }
+
+    impl CostingClassifier {
+        fn new(bucket: TriageBucket, cost: f64) -> Self {
+            Self { bucket, cost }
+        }
+    }
+
+    impl FailureClassifier for CostingClassifier {
+        fn classify(
+            &self,
+            _input: &TriageInput,
+            spend: &crate::usage::RunSpend,
+        ) -> crate::error::Result<Triage> {
+            spend.record(&crate::claude::ClaudeResult {
+                ok: true,
+                summary: "classified".to_string(),
+                cost: self.cost,
+                usage: Default::default(),
+                raw: serde_json::Value::Null,
+                error: String::new(),
+                transient: false,
+                timed_out: false,
+                login_required: false,
+                killed: false,
+                exit_code: Some(0),
+            });
+            Ok(Triage {
+                bucket: self.bucket,
+                analysis: "costing analysis".to_string(),
                 classified_by: ClassifiedBy::Llm,
                 auto_fix: None,
             })
@@ -4879,7 +5001,11 @@ mod tests {
     }
 
     impl FailureClassifier for CountingClassifier {
-        fn classify(&self, _input: &TriageInput) -> crate::error::Result<Triage> {
+        fn classify(
+            &self,
+            _input: &TriageInput,
+            _spend: &crate::usage::RunSpend,
+        ) -> crate::error::Result<Triage> {
             *self.calls.lock().unwrap() += 1;
             Ok(Triage {
                 bucket: TriageBucket::CodeFix,
@@ -5056,6 +5182,179 @@ mod tests {
         assert_eq!(counting.call_count(), 1, "the classifier ran exactly once");
     }
 
+    /// CLAUDE-337: a mint run's triage classification cost is not thrown away.
+    /// It lands on the run's own `job_outcomes` row, advances the
+    /// `webhook-forgejo` daily ledger, and the `logs/usage.jsonl` record for the
+    /// delivery carries the run's own id rather than `null`.
+    #[tokio::test]
+    async fn classification_cost_reaches_the_outcome_row_the_daily_ledger_and_the_usage_log() {
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new());
+        let classifier: Arc<dyn FailureClassifier> =
+            Arc::new(CostingClassifier::new(TriageBucket::CodeFix, 0.42));
+        let out_dir = tempfile::tempdir().unwrap();
+        let paths_dir = tempfile::tempdir().unwrap();
+
+        let mut logs = HashMap::new();
+        logs.insert(1, failing_test_log("mod_a", "test_one", "main"));
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(store_event(1)).await.unwrap();
+        drop(tx);
+
+        consume_events(
+            rx,
+            pool.clone(),
+            Arc::new(ScriptedFailingLogs { logs }),
+            out_dir.path().to_path_buf(),
+            Some(store_mint_context_in(
+                pool.clone(),
+                backend,
+                classifier,
+                paths_dir.path(),
+                Arc::new(crate::provider::cli::testutil::StubRunner::new()),
+            )),
+            Arc::new(RwLock::new(WebhookConfig::default())),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+
+        let (run_id,): (i64,) = sqlx::query_as(&crate::db::q(&pool, "SELECT id FROM runs"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let (claude_ran, claude_ok, claude_cost_usd): (i64, i64, f64) =
+            sqlx::query_as(&crate::db::q(
+                &pool,
+                "SELECT claude_ran, claude_ok, claude_cost_usd FROM job_outcomes",
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(claude_ran, 1, "claude_ran must reflect the classification");
+        assert_eq!(claude_ok, 1, "claude_ok must reflect the classification");
+        assert_eq!(
+            claude_cost_usd, 0.42,
+            "the outcome must carry the real cost"
+        );
+
+        let daily = state::daily_cost_get(&pool, WEBHOOK_MINT_ACTION)
+            .await
+            .unwrap();
+        assert_eq!(
+            daily, 0.42,
+            "the daily ledger must advance by the run's cost"
+        );
+
+        let usage_path = test_paths(paths_dir.path()).usage_log();
+        let usage_contents = std::fs::read_to_string(&usage_path).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(usage_contents.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            record["run_id"].as_i64(),
+            Some(run_id),
+            "the usage record must carry the mint run's own id, not null: {record}"
+        );
+    }
+
+    /// CLAUDE-337: the deterministic rules pass (no classifier call at all)
+    /// still records zero cost rather than leaving the outcome row stale.
+    #[tokio::test]
+    async fn deterministic_autofix_short_circuit_records_zero_cost() {
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new());
+        let counting = Arc::new(CountingClassifier::new());
+        let classifier: Arc<dyn FailureClassifier> = counting.clone();
+        let out_dir = tempfile::tempdir().unwrap();
+
+        let mut logs = HashMap::new();
+        // An infra signature routes to bucket 3 by the deterministic rules pass
+        // alone; the classifier never runs, so no cost is ever recorded.
+        logs.insert(1, "error: no runner available for this job".to_string());
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(store_event(1)).await.unwrap();
+        drop(tx);
+
+        consume_events(
+            rx,
+            pool.clone(),
+            Arc::new(ScriptedFailingLogs { logs }),
+            out_dir.path().to_path_buf(),
+            Some(store_mint_context(pool.clone(), backend, classifier)),
+            Arc::new(RwLock::new(WebhookConfig::default())),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+
+        assert_eq!(counting.call_count(), 0, "the classifier never ran");
+        let (claude_ran, claude_cost_usd): (i64, f64) = sqlx::query_as(&crate::db::q(
+            &pool,
+            "SELECT claude_ran, claude_cost_usd FROM job_outcomes",
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(claude_ran, 0, "no invocation happened");
+        assert_eq!(claude_cost_usd, 0.0, "no invocation means no cost");
+        let daily = state::daily_cost_get(&pool, WEBHOOK_MINT_ACTION)
+            .await
+            .unwrap();
+        assert_eq!(daily, 0.0, "the daily ledger must not move with no spend");
+    }
+
+    /// CLAUDE-337: a mint run whose classification alone exceeds the action's
+    /// daily budget stops with `exit::OVER_BUDGET`, not the generic
+    /// `exit::UNEXPECTED` every other failure used to share.
+    #[tokio::test]
+    async fn a_classification_that_exceeds_the_budget_stops_with_over_budget() {
+        let pool = crate::db::test_pool().await;
+        let backend = Arc::new(StoreBackend::new());
+        let classifier: Arc<dyn FailureClassifier> =
+            Arc::new(CostingClassifier::new(TriageBucket::CodeFix, 5.00));
+        let out_dir = tempfile::tempdir().unwrap();
+        let paths_dir = tempfile::tempdir().unwrap();
+
+        let mut logs = HashMap::new();
+        logs.insert(1, failing_test_log("mod_a", "test_one", "main"));
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(store_event(1)).await.unwrap();
+        drop(tx);
+
+        let mut ctx = store_mint_context_in(
+            pool.clone(),
+            backend,
+            classifier,
+            paths_dir.path(),
+            Arc::new(crate::provider::cli::testutil::StubRunner::new()),
+        );
+        ctx.defaults = RunnerDefaults {
+            daily_budget_usd: 1.00,
+            ..RunnerDefaults::default()
+        };
+
+        consume_events(
+            rx,
+            pool.clone(),
+            Arc::new(ScriptedFailingLogs { logs }),
+            out_dir.path().to_path_buf(),
+            Some(ctx),
+            Arc::new(RwLock::new(WebhookConfig::default())),
+            crate::concurrency::KeyGate::new(),
+        )
+        .await;
+
+        let (exit,): (Option<i64>,) =
+            sqlx::query_as(&crate::db::q(&pool, "SELECT exit_code FROM runs"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            exit,
+            Some(crate::exit::OVER_BUDGET as i64),
+            "a spend-ceiling stop must not read as exit::UNEXPECTED"
+        );
+    }
+
     /// A classifier that sleeps `delay` while classifying, tracking how many
     /// calls overlap (`peak`) so a test can observe the worker pool's actual
     /// concurrency rather than inferring it from timing.
@@ -5084,7 +5383,11 @@ mod tests {
     }
 
     impl FailureClassifier for SlowClassifier {
-        fn classify(&self, _input: &TriageInput) -> crate::error::Result<Triage> {
+        fn classify(
+            &self,
+            _input: &TriageInput,
+            _spend: &crate::usage::RunSpend,
+        ) -> crate::error::Result<Triage> {
             use std::sync::atomic::Ordering::SeqCst;
             self.calls.fetch_add(1, SeqCst);
             let now = self.live.fetch_add(1, SeqCst) + 1;
@@ -5309,6 +5612,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -5384,6 +5688,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -5450,6 +5755,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -5516,6 +5822,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(!result.ok, "a failed state read must fail the run");
@@ -5583,6 +5890,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -5621,6 +5929,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -5676,6 +5985,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(!result.ok, "a store read failure must fail the run");
@@ -5752,6 +6062,7 @@ mod tests {
             "",
             None,
             &|_| {},
+            &test_spend(),
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::HumanAction);
@@ -5794,6 +6105,7 @@ mod tests {
             "",
             None,
             &|_| {},
+            &test_spend(),
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::Transient);
@@ -5826,6 +6138,7 @@ mod tests {
             "",
             None,
             &|_| {},
+            &test_spend(),
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::CodeFix);
@@ -5872,6 +6185,7 @@ mod tests {
             "",
             None,
             &|_| {},
+            &test_spend(),
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::HumanAction);
@@ -5917,6 +6231,7 @@ mod tests {
             "",
             None,
             &|_| {},
+            &test_spend(),
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::AutoFix);
@@ -5974,6 +6289,7 @@ mod tests {
             "",
             None,
             &|_| {},
+            &test_spend(),
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::CodeFix);
@@ -6016,6 +6332,7 @@ mod tests {
             infra_kind.as_deref(),
             None,
             &|_| {},
+            &test_spend(),
         );
         tracker
             .calls()
@@ -6074,6 +6391,7 @@ mod tests {
             "",
             None,
             &|_| {},
+            &test_spend(),
         )
         .unwrap();
         assert_eq!(bucket, TriageBucket::CodeFix);
@@ -6757,6 +7075,7 @@ mod tests {
             "",
             None,
             &report,
+            &test_spend(),
         )
         .unwrap();
         assert_eq!(
@@ -6789,6 +7108,7 @@ mod tests {
             "",
             None,
             &report,
+            &test_spend(),
         )
         .unwrap();
         assert_eq!(*stages.lock().unwrap(), vec![STAGE_MINTING]);
@@ -6887,6 +7207,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(
@@ -6946,6 +7267,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -7016,6 +7338,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -7093,6 +7416,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &webhook_cfg_with_write_token(Some("write-ref")),
+            &test_spend(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -7194,6 +7518,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &webhook_cfg_with_write_token(Some("write-ref")),
+            &test_spend(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -7263,6 +7588,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(result.ok, "{}", result.text);
@@ -7335,6 +7661,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &WebhookConfig::default(),
+            &test_spend(),
         )
         .await;
         assert!(!result.ok, "a failed state read must fail the run");
@@ -7429,6 +7756,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &webhook_cfg,
+            &test_spend(),
         )
         .await;
         assert!(result_a.ok, "{}", result_a.text);
@@ -7448,6 +7776,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &webhook_cfg,
+            &test_spend(),
         )
         .await;
         assert!(result_b.ok, "{}", result_b.text);
@@ -7494,6 +7823,7 @@ mod tests {
             None,
             &crate::concurrency::KeyGate::new(),
             &webhook_cfg_with_write_token(None),
+            &test_spend(),
         )
         .await;
         assert!(!result.ok, "no write_token_ref must fail the run");
