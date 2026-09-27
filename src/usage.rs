@@ -394,6 +394,10 @@ struct Inner {
     cost_usd: f64,
     warned: bool,
     reported: bool,
+    /// `result.ok` of the last recorded invocation. Meaningful only once
+    /// `claude_calls > 0`; a caller that never invoked anything reads
+    /// [`RunSpend::claude_ran`] as `false` and ignores this.
+    claude_ok: bool,
 }
 
 /// Shared per-run spend ledger. Cloned into every per-job task, so one run's
@@ -433,6 +437,17 @@ impl RunSpend {
         self.lock().cost_usd
     }
 
+    /// Whether any invocation has been recorded against this ledger yet.
+    pub fn claude_ran(&self) -> bool {
+        self.lock().claude_calls > 0
+    }
+
+    /// `result.ok` of the most recently recorded invocation. Only meaningful
+    /// when [`Self::claude_ran`] is `true`.
+    pub fn claude_ok(&self) -> bool {
+        self.lock().claude_ok
+    }
+
     /// True once the run has reached its ceiling. Checked before each job pickup
     /// and before each invocation.
     pub fn exceeded(&self) -> bool {
@@ -455,6 +470,7 @@ impl RunSpend {
             let mut inner = self.lock();
             inner.claude_calls += 1;
             inner.cost_usd += result.cost;
+            inner.claude_ok = result.ok;
             inner.usage.merge(&result.usage);
             let cost = inner.cost_usd;
             if cost >= self.budget.budget_usd {
