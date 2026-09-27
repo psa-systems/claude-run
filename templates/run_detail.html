@@ -255,7 +255,7 @@
             {% if o.attempt_counted %}<span class="badge warn">counted</span>
             {% else %}<span class="badge pause">parked</span>{% endif %}
           </td>
-          <td class="mono dim">{{ o.ts }}</td>
+          <td class="mono dim">{{ o.ts|datetime }}</td>
           <td class="mono">{{ o.duration() }}</td>
           <td>
             {% if o.claude_ran %}

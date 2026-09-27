@@ -291,7 +291,7 @@
             <td>{{ h.action_name }}</td>
             <td class="mono"><a href="/runs/{{ h.run_id }}/jobs/{{ h.job_key }}/attempt/{{ h.attempt }}">{{ h.job_key }}</a></td>
             <td class="mono">{{ h.attempt }}</td>
-            <td class="mono dim">{{ h.ts }}</td>
+            <td class="mono dim">{{ h.ts|datetime }}</td>
             <td class="mono">
               {% if h.timed_out %}<span class="badge warn">timed out</span>
               {% else if h.ok %}<span class="badge ok">ok</span>
