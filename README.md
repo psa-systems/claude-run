@@ -250,6 +250,10 @@ A YouTrack project the token cannot read comes back as HTTP 400 `invalid_query`,
 query; the row's remediation says what it really is. A failed repo probe carries the `probe_denied` text verbatim, which
 names the scope or the permission grant to add (see "Forge repo-access preflight" in `actions/SCHEMA.md`).
 
+For a GitHub-bound project, the VCS binding probe resolving to an empty repo (no `owner/repo` after the host) means the
+token can read the project but lacks **Update Project** permission, which is what gates YouTrack's own visibility into
+the GitHub VCS integration's resolved path (see "Service auth" above); it is not a broken or missing VCS integration.
+
 **Dashboard banner.** A poll-time repo-access preflight failure is recorded as a `run_events` row (CLAUDE-147); the
 Dashboard counts those from the last 24 hours in its diagnostics banner and links to `/access`, so the operator is told
 rather than having to go looking. A later poll whose preflight passes records a recovery marker for the same repo and
@@ -807,6 +811,13 @@ names, and the page never renders a stored value back. Saving applies to the nex
 `YOUTRACK_CLI_CONFIG` and `GH_CONFIG_DIR` are exported once at serve start and point at fixed paths whose contents the
 save rewrites, so every `yt`, `fj` and `gh` child (the runner's own calls, and every `claude` session it spawns) picks
 up a saved login with no restart.
+
+The YouTrack token needs **Update Project** permission on every project the daemon polls, not just issue read/write
+access. YouTrack only returns a GitHub-bound project's VCS integration `path` (the `owner/repo` a `yt project vcs
+list` resolves, see "Access check" below) to a token with that permission; without it the field comes back empty and
+the job's clone URL loses its repo path (`https://github.com/.git`), failing deep inside `git clone` with no
+indication of the missing permission. A Forgejo/Gitea VCS integration is unaffected, since its `path` is a stored
+value rather than one gated by a live external-app connection.
 
 **Signing in to Claude from the page.** `claude auth login` is an OAuth flow, but its redirect is a paste-the-code
 callback rather than a `localhost` listener, and with pipes on stdin/stdout it prints the authorize URL and then reads
