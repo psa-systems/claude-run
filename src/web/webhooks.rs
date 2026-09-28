@@ -3096,6 +3096,10 @@ async fn forgejo_webhook(
     // secret-decrypt / channel-send awaits below.
     let src_cfg = {
         let cfg = st.config.read().await;
+        if !cfg.enabled {
+            warn!(source = %source, "forgejo webhook rejected: disabled");
+            return StatusCode::NOT_FOUND.into_response();
+        }
         match cfg.sources.get(&source) {
             Some(s) => s.clone(),
             None => {
@@ -8145,6 +8149,7 @@ mod tests {
             .into_iter()
             .collect();
             WebhookConfig {
+                enabled: true,
                 replay_window_secs: 300,
                 sources,
                 auto_fix: false,
@@ -8188,6 +8193,32 @@ mod tests {
                 State(st),
                 Path("no-such-source".to_string()),
                 headers(Some(&sig), Some("d-0")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn disabled_listener_404s_even_with_a_configured_source() {
+            // CLAUDE-360: `enabled: false` 404s every request regardless of
+            // whether the source is fully configured (a valid signature),
+            // ahead of the source lookup.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = setup_pool(tmp.path()).await;
+            let cfg = WebhookConfig {
+                enabled: false,
+                ..two_source_config(60)
+            };
+            let (tx, _rx) = mpsc::channel(8);
+            let st = WebhookState::new(pool, cfg, tx);
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(SOURCE_A.to_string()),
+                headers(Some(&sig), Some("d-disabled")),
                 Bytes::from(raw),
             )
             .await;
@@ -8270,6 +8301,7 @@ mod tests {
             .into_iter()
             .collect();
             let config = WebhookConfig {
+                enabled: true,
                 replay_window_secs: 300,
                 sources,
                 auto_fix: false,
