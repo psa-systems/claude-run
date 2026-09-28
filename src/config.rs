@@ -195,6 +195,18 @@ impl Default for WebConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookConfig {
+    /// CLAUDE-360: master on/off switch for the listener, defaulting `false`.
+    /// While `false`, `/webhooks/forgejo/<source>` 404s every request
+    /// regardless of `sources`, with its own log line distinct from an
+    /// unknown-source rejection. A save that sets this `true` is rejected
+    /// (`src/settings.rs::validate_webhook`) unless `sources` is non-empty and
+    /// every entry has `secret_ref` set, so "enabled" can never mean "accepting
+    /// requests with no real authentication configured behind it." An upgrade
+    /// from a version with no such flag deserializes a stored document with no
+    /// `enabled` key to this default, so a pre-existing, fully-configured
+    /// listener goes quiet on upgrade; `serve` start warns once when `sources`
+    /// is non-empty but this is `false`, naming the section.
+    pub enabled: bool,
     /// Replay-protection window in seconds, shared across all sources. A delivery
     /// whose `X-Forgejo-Delivery` id was already seen inside this window is
     /// rejected with 409 (a duplicate delivered to two sources is caught too).
@@ -242,6 +254,7 @@ pub struct WebhookConfig {
 impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             replay_window_secs: 300,
             sources: BTreeMap::new(),
             analysis_timeout_secs: 600,
@@ -365,6 +378,11 @@ impl Default for WebhookSource {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommentWebhookConfig {
+    /// CLAUDE-360: master on/off switch for the listener, mirroring
+    /// [`WebhookConfig::enabled`] (same default, same save-time secret-presence
+    /// requirement in `src/settings.rs::validate_comment_webhook`, same startup
+    /// warning when `sources` is non-empty but this is `false`).
+    pub enabled: bool,
     /// Command prefix the first line of a comment must start with, e.g.
     /// `/claude fix the clippy lint`. Configurable so an operator can rename the
     /// command without a code change.
@@ -386,6 +404,7 @@ pub struct CommentWebhookConfig {
 impl Default for CommentWebhookConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             trigger: "/claude".to_string(),
             max_instruction_chars: 4000,
             sources: BTreeMap::new(),
