@@ -425,6 +425,10 @@ async fn forgejo_comment_webhook(
     // 0. Resolve the source off the live config; unknown -> 404.
     let (cfg, src_cfg) = {
         let cfg = st.config.read().await;
+        if !cfg.enabled {
+            warn!(source = %source, "forgejo comment webhook rejected: disabled");
+            return StatusCode::NOT_FOUND.into_response();
+        }
         match cfg.sources.get(&source) {
             Some(s) => (cfg.clone(), s.clone()),
             None => {
@@ -2163,6 +2167,7 @@ mod tests {
         .into_iter()
         .collect();
         CommentWebhookConfig {
+            enabled: true,
             sources,
             ..Default::default()
         }
@@ -3779,6 +3784,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_listener_404s_even_with_a_configured_source() {
+        // CLAUDE-360: `enabled: false` 404s every request regardless of
+        // whether the source is fully configured (a valid signature), ahead
+        // of the source lookup.
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = setup_pool(tmp.path()).await;
+        let cfg = CommentWebhookConfig {
+            enabled: false,
+            ..config()
+        };
+        let (tx, _rx) = mpsc::channel(8);
+        let st = CommentWebhookState::new(pool, cfg, tx);
+        let raw = payload_json("created", REPO, "/claude fix it", "alice", true);
+        let sig = sign(SECRET.as_bytes(), raw.as_bytes());
+        assert_eq!(
+            post(&st, SOURCE, &raw, Some(&sig), Some("d-disabled")).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
     async fn unset_secret_ref_fails_closed_401() {
         let _env = crate::secrets::key_file_env_lock().await;
         let tmp = tempfile::tempdir().unwrap();
@@ -3797,6 +3824,7 @@ mod tests {
         let st = CommentWebhookState::new(
             pool,
             CommentWebhookConfig {
+                enabled: true,
                 sources,
                 ..Default::default()
             },

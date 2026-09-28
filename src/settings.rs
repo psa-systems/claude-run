@@ -24,7 +24,7 @@
 //! new value on the next event / invocation. `replay_window_secs` applies on
 //! restart only (the replay store is built once at start).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::db::DbPool;
@@ -32,9 +32,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
-    AuthConfig, ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig, ConcurrencyConfig,
-    DbRetentionConfig, MintConfig, OnDiskConfig, Paths, PreferencesConfig, StreamLogGcConfig,
-    UpdateConfig, WebhookConfig, WorkdirGcConfig,
+    AuthConfig, ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig, CommentWebhookSource,
+    ConcurrencyConfig, DbRetentionConfig, MintConfig, OnDiskConfig, Paths, PreferencesConfig,
+    StreamLogGcConfig, UpdateConfig, WebhookConfig, WebhookSource, WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -932,6 +932,10 @@ fn comment_rate_map(cfg: &CommentWebhookConfig) -> HashMap<String, Mutex<RateLim
 /// CLAUDE-276: `agent_pr_fix_attempts` must be at least 1 - a `0` would flag
 /// the agent's own PR `Needs Review` on its very first failure, never giving
 /// it a chance to fix its own regression.
+/// CLAUDE-360: `enabled: true` is rejected unless every configured source
+/// carries a `secret_ref`, and at least one source is configured, so
+/// "enabled" can never mean "accepting requests with no real authentication
+/// configured behind it."
 pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> {
     if cfg.analysis_concurrency < 1 {
         return Err("analysis_concurrency must be >= 1".to_string());
@@ -942,7 +946,52 @@ pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> 
     if cfg.max_runs_per_day < 1 {
         return Err("max_runs_per_day must be >= 1".to_string());
     }
+    if cfg.enabled {
+        validate_enabled_sources(&cfg.sources)?;
+    }
     Ok(())
+}
+
+/// Shared by [`validate_webhook`] and [`validate_comment_webhook`]: a listener
+/// being enabled requires at least one source and every source to carry a
+/// `secret_ref`, naming every offending source key in one error.
+fn validate_enabled_sources<S>(sources: &BTreeMap<String, S>) -> std::result::Result<(), String>
+where
+    S: HasSecretRef,
+{
+    if sources.is_empty() {
+        return Err("enabled requires at least one configured source".to_string());
+    }
+    let missing: Vec<&str> = sources
+        .iter()
+        .filter(|(_, s)| s.secret_ref().is_none())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "enabled requires secret_ref on every source; missing on: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Lets [`validate_enabled_sources`] read `secret_ref` off either source type
+/// with no duplicated body.
+trait HasSecretRef {
+    fn secret_ref(&self) -> Option<&String>;
+}
+
+impl HasSecretRef for WebhookSource {
+    fn secret_ref(&self) -> Option<&String> {
+        self.secret_ref.as_ref()
+    }
+}
+
+impl HasSecretRef for CommentWebhookSource {
+    fn secret_ref(&self) -> Option<&String> {
+        self.secret_ref.as_ref()
+    }
 }
 
 pub fn validate_comment_webhook(cfg: &CommentWebhookConfig) -> std::result::Result<(), String> {
@@ -962,7 +1011,28 @@ pub fn validate_comment_webhook(cfg: &CommentWebhookConfig) -> std::result::Resu
             ));
         }
     }
+    if cfg.enabled {
+        validate_enabled_sources(&cfg.sources)?;
+    }
     Ok(())
+}
+
+/// CLAUDE-360: the webhook / webhook_comment sections whose `sources` are
+/// non-empty but `enabled` is `false`, in the order `["webhook",
+/// "webhook_comment"]` filtered to what applies. This is the upgrade-time
+/// transition (a stored document with no `enabled` key deserializes to the
+/// new default `false`), and `serve` start logs one `warn` per entry this
+/// returns, naming the section, rather than the listener going quiet with no
+/// explanation.
+pub fn disabled_but_configured_webhook_sections(effective: &EffectiveRuntime) -> Vec<&'static str> {
+    let mut sections = Vec::new();
+    if !effective.webhook.enabled && !effective.webhook.sources.is_empty() {
+        sections.push("webhook");
+    }
+    if !effective.webhook_comment.enabled && !effective.webhook_comment.sources.is_empty() {
+        sections.push("webhook_comment");
+    }
+    sections
 }
 
 fn parse<T: DeserializeOwned>(json: &str) -> std::result::Result<T, SaveError> {
@@ -1793,5 +1863,168 @@ mod tests {
             .await
             .expect_err("stale log_filter must error");
         assert!(err.to_string().contains("log_filter"), "{err}");
+    }
+
+    // ---- CLAUDE-360: enabled requires configured, secret-bearing sources ---
+
+    #[test]
+    fn webhook_enabled_with_no_sources_is_rejected() {
+        let cfg = WebhookConfig {
+            enabled: true,
+            ..WebhookConfig::default()
+        };
+        let err = validate_webhook(&cfg).unwrap_err();
+        assert!(err.contains("at least one configured source"), "{err}");
+    }
+
+    #[test]
+    fn webhook_enabled_with_a_source_missing_secret_ref_is_rejected() {
+        let mut cfg = WebhookConfig {
+            enabled: true,
+            ..WebhookConfig::default()
+        };
+        cfg.sources.insert(
+            "no-secret".to_string(),
+            WebhookSource {
+                secret_ref: None,
+                ..WebhookSource::default()
+            },
+        );
+        let err = validate_webhook(&cfg).unwrap_err();
+        assert!(err.contains("no-secret"), "{err}");
+    }
+
+    #[test]
+    fn webhook_enabled_with_every_source_secret_backed_is_accepted() {
+        let mut cfg = WebhookConfig {
+            enabled: true,
+            ..WebhookConfig::default()
+        };
+        cfg.sources.insert(
+            "ok".to_string(),
+            WebhookSource {
+                secret_ref: Some("hmac-ok".to_string()),
+                ..WebhookSource::default()
+            },
+        );
+        validate_webhook(&cfg).expect("fully-configured source must pass");
+    }
+
+    #[test]
+    fn webhook_disabled_with_no_sources_is_accepted() {
+        validate_webhook(&WebhookConfig::default()).expect("disabled needs no sources");
+    }
+
+    #[test]
+    fn comment_webhook_enabled_with_no_sources_is_rejected() {
+        let cfg = CommentWebhookConfig {
+            enabled: true,
+            ..CommentWebhookConfig::default()
+        };
+        let err = validate_comment_webhook(&cfg).unwrap_err();
+        assert!(err.contains("at least one configured source"), "{err}");
+    }
+
+    #[test]
+    fn comment_webhook_enabled_with_a_source_missing_secret_ref_is_rejected() {
+        let mut cfg = CommentWebhookConfig {
+            enabled: true,
+            ..CommentWebhookConfig::default()
+        };
+        cfg.sources.insert(
+            "no-secret".to_string(),
+            CommentWebhookSource {
+                secret_ref: None,
+                ..CommentWebhookSource::default()
+            },
+        );
+        let err = validate_comment_webhook(&cfg).unwrap_err();
+        assert!(err.contains("no-secret"), "{err}");
+    }
+
+    #[test]
+    fn disabled_but_configured_flags_a_pre_existing_sources_document_with_no_enabled_key() {
+        // Simulates the upgrade-time transition: a stored document from before
+        // this flag existed deserializes with no `enabled` key, defaulting to
+        // `false`, while `sources` is already populated.
+        let mut effective = eff_default();
+        let cfg: WebhookConfig =
+            serde_json::from_str(r#"{"sources":{"legacy":{"secret_ref":"hmac-legacy"}}}"#).unwrap();
+        assert!(!cfg.enabled);
+        effective.webhook = cfg;
+        assert_eq!(
+            disabled_but_configured_webhook_sections(&effective),
+            vec!["webhook"]
+        );
+    }
+
+    #[test]
+    fn disabled_but_configured_is_silent_when_enabled_or_empty() {
+        // Enabled: no warning even with sources.
+        let mut effective = eff_default();
+        let mut enabled_cfg = WebhookConfig {
+            enabled: true,
+            ..WebhookConfig::default()
+        };
+        enabled_cfg.sources.insert(
+            "ok".to_string(),
+            WebhookSource {
+                secret_ref: Some("hmac-ok".to_string()),
+                ..WebhookSource::default()
+            },
+        );
+        effective.webhook = enabled_cfg;
+        assert!(disabled_but_configured_webhook_sections(&effective).is_empty());
+
+        // Disabled but no sources: nothing to warn about.
+        assert!(disabled_but_configured_webhook_sections(&eff_default()).is_empty());
+    }
+
+    #[test]
+    fn disabled_but_configured_flags_both_sections_independently() {
+        let mut effective = eff_default();
+        let mut webhook = WebhookConfig::default();
+        webhook.sources.insert(
+            "a".to_string(),
+            WebhookSource {
+                secret_ref: Some("hmac-a".to_string()),
+                ..WebhookSource::default()
+            },
+        );
+        effective.webhook = webhook;
+        let mut comment = CommentWebhookConfig::default();
+        comment.sources.insert(
+            "b".to_string(),
+            CommentWebhookSource {
+                secret_ref: Some("hmac-b".to_string()),
+                ..CommentWebhookSource::default()
+            },
+        );
+        effective.webhook_comment = comment;
+        assert_eq!(
+            disabled_but_configured_webhook_sections(&effective),
+            vec!["webhook", "webhook_comment"]
+        );
+    }
+
+    #[tokio::test]
+    async fn saving_webhook_enabled_with_no_sources_is_rejected_and_not_persisted() {
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+        let err = live
+            .save_section(Section::Webhook, r#"{"enabled":true}"#)
+            .await
+            .expect_err("enabling with no sources must reject");
+        match err {
+            SaveError::Invalid(m) => assert!(m.contains("at least one configured source"), "{m}"),
+            other => panic!("expected Invalid, got {other}"),
+        }
+        assert!(
+            get_json::<WebhookConfig>(&pool, Section::Webhook.key())
+                .await
+                .unwrap()
+                .is_none(),
+            "rejected save must not persist"
+        );
     }
 }

@@ -1042,6 +1042,8 @@ a `run_events` row naming the source, and the run finishes `ok = false` - it is 
 agent's-own-PR case, before `mint` is ever reached. `config.mint.bot_logins` is unchanged and still used by the
 `/claude` PR-comment listener's own, separate bot-login check.
 
+**CLAUDE-360: the listener has its own `enabled` switch.** `config.webhook.enabled` defaults `false`; while off, `POST /webhooks/forgejo/<source>` 404s every request regardless of `sources` (logged as `"forgejo webhook rejected: disabled"`, distinct from an unknown-source 404), ahead of any source lookup. A Settings save that sets it `true` is rejected unless `sources` is non-empty and every source carries `secret_ref`, naming every offending source, so "enabled" can never mean "accepting requests with no real authentication configured behind it." At `serve` start, a stored document with `sources` already configured but `enabled` unset (the state an upgrade from a version with no such flag deserializes to) logs one `warn` naming the section.
+
 **CLAUDE-153/CLAUDE-273: the webhook is a configurable action.** It is named `webhook-forgejo` (formerly `webhook-fast-path`), and a per-webhook `auto_fix` toggle on the `Webhook` settings decides only whether a failure the webhook triages into a fixup bucket (`code_fix` / `auto_fix`) gets `AI Agent = Queued`. It defaults to `false` (opt-in): with `auto_fix` off, a red PR check still creates an issue but with no `AI Agent` write, so no fixup PR is queued and the failure stays reported on the original PR for its author to fix in place (a `human_action` failure is unaffected either way); with it on, the corrective-fixup behavior above applies. This toggle is webhook-scoped and independent of the framework-wide `[mint].auto_fix.enabled` detector switch. The `webhook-forgejo` action also participates in **Pause** like every other action: Pause/Resume controls and a Paused badge appear on the dashboard, and while it is paused an inbound `POST /webhooks/forgejo/<source>` is still authenticated (signature, replay, and rate-limit checks run) and acked with a 2xx, but the delivery is dropped without minting or queuing so Forgejo does not retry. A dropped delivery is not recovered after Resume. CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment, checked first. Edit / export / delete remain rejected (it is synthetic and has no backing YAML).
 
 A minted issue is routed to a YouTrack project in this order (CLAUDE-86): an explicit `repo_project_map` override, then
@@ -1245,9 +1247,11 @@ verification, the single replay-store instance (so one `X-Forgejo-Delivery` id f
 caught), the per-source rate-limiter type and builder, the `owner/repo` allow-list matcher, and the accept-and-drop
 pause gate (CLAUDE-223), which checks the GLOBAL pause before each listener's own synthetic action.
 
-**Request pipeline**, in the same order as the CI-failure endpoint: unknown source `404` -> per-source rate limit `429`
--> missing / unresolvable `secret_ref` `401` -> bad or missing signature `401` -> missing `X-Forgejo-Delivery` `400` ->
-replayed delivery id `409` -> Pause check, global then per-action, accept-and-drop with `2xx` (CLAUDE-223) -> parse. Every post-authentication drop is acked
+**Request pipeline**, in the same order as the CI-failure endpoint: disabled listener `404` (CLAUDE-360:
+`config.webhook_comment.enabled = false`, ahead of the source lookup) -> unknown source `404` -> per-source rate limit
+`429` -> missing / unresolvable `secret_ref` `401` -> bad or missing signature `401` -> missing `X-Forgejo-Delivery`
+`400` -> replayed delivery id `409` -> Pause check, global then per-action, accept-and-drop with `2xx` (CLAUDE-223) ->
+parse. Every post-authentication drop is acked
 with `2xx` (so Forgejo does not retry) and logged with its reason: a comment `action` other than `created`, a repo
 outside `allowed_repos`, a first line that does not open with the trigger, or an author in the mint config's
 loop-safety `bot_logins` (so the bot's own reply can never re-trigger a run).
