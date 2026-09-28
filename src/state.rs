@@ -2671,13 +2671,13 @@ mod tests {
         let caps = |pairs: &[(&str, u32)]| -> std::collections::BTreeMap<String, u32> {
             pairs.iter().map(|(a, c)| (a.to_string(), *c)).collect()
         };
-        // `audit` caps at 2, `youtrack` takes the default 3, `webhook-forgejo`
+        // `audit` caps at 2, `youtrack` takes the default 3, `webhook-triage`
         // has no YAML at all and so is absent from the map.
         for (action, key, n) in [
             ("audit", "AUD-31", 2),
             ("youtrack", "CLAUDE-9", 3),
             ("youtrack", "CLAUDE-8", 2),
-            ("webhook-forgejo", "deadbeef", 4),
+            ("webhook-triage", "deadbeef", 4),
         ] {
             for _ in 0..n {
                 attempts_increment(&pool, action, key).await.unwrap();

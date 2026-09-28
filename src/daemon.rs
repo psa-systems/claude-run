@@ -745,25 +745,35 @@ async fn serve_tcp(listener: tokio::net::TcpListener, app: axum::Router) -> Resu
     Ok(())
 }
 
-/// Rename the webhook action's on-disk stream-log directory from the old
-/// `logs/webhook-fast-path/` to `logs/webhook-forgejo/` at serve start, so past
+/// Rename the webhook action's on-disk stream-log directory to the current
+/// [`crate::web::webhooks::WEBHOOK_MINT_ACTION`] name at serve start, so past
 /// webhook run logs stay reachable under the renamed action (the DB rows are
-/// migrated by migration `0013`; the log dir lives outside SQLite).
+/// migrated by migration `0013`; the log dir lives outside SQLite). The action
+/// has carried this log directory under two earlier names: `webhook-fast-path`
+/// (pre-CLAUDE-153) and `webhook-forgejo` (pre-CLAUDE-361, when the listener's
+/// route and synthetic action name stopped being Forgejo-specific).
 ///
-/// Best-effort and idempotent: it acts only when the old path exists and the new
+/// Best-effort and idempotent: it acts only when an old path exists and the new
 /// one does not, so a second start (new dir already present) is a no-op, and it
 /// never clobbers a directory. Any rename failure is logged and swallowed rather
 /// than blocking startup: the logs are diagnostic history, not operational state.
 fn rename_webhook_log_dir(paths: &Paths) {
     let logs = paths.logs_dir();
-    let old = logs.join("webhook-fast-path");
-    let new = logs.join("webhook-forgejo");
-    if old.exists() && !new.exists() {
+    let new = logs.join(crate::web::webhooks::WEBHOOK_MINT_ACTION);
+    if new.exists() {
+        return;
+    }
+    for old_name in ["webhook-fast-path", "webhook-forgejo"] {
+        let old = logs.join(old_name);
+        if !old.exists() {
+            continue;
+        }
         match std::fs::rename(&old, &new) {
             Ok(()) => info!(
                 from = %old.display(),
                 to = %new.display(),
-                "renamed webhook log directory to the webhook-forgejo name (CLAUDE-153)"
+                "renamed webhook log directory to the {} name (CLAUDE-153, CLAUDE-361)",
+                crate::web::webhooks::WEBHOOK_MINT_ACTION
             ),
             Err(e) => warn!(
                 from = %old.display(),
@@ -772,6 +782,7 @@ fn rename_webhook_log_dir(paths: &Paths) {
                 "renaming webhook log directory failed; old run logs stay under the former name"
             ),
         }
+        return;
     }
 }
 
@@ -1056,8 +1067,8 @@ pub async fn scan_actions(pool: &DbPool, actions_dir: &Path) -> Result<()> {
         }
         match action::load_from_path(&path) {
             Ok(la) => {
-                // `webhook-forgejo` and
-                // `webhook-forgejo-comment` are reserved synthetic action names
+                // `webhook-triage` and
+                // `webhook-comment` are reserved synthetic action names
                 // the web layer injects for the event-driven listeners. An
                 // on-disk YAML claiming one would be editable / schedulable and
                 // would collide with the synthetic entry, so refuse to index it.
@@ -2711,8 +2722,8 @@ mod tests {
         let actions_dir = tmp.path().join("actions");
         std::fs::create_dir_all(&actions_dir).unwrap();
         assert!(
-            crate::web::SYNTHETIC_ACTIONS.contains(&"webhook-forgejo")
-                && crate::web::SYNTHETIC_ACTIONS.contains(&"webhook-forgejo-comment"),
+            crate::web::SYNTHETIC_ACTIONS.contains(&"webhook-triage")
+                && crate::web::SYNTHETIC_ACTIONS.contains(&"webhook-comment"),
             "both listeners are reserved"
         );
         for name in crate::web::SYNTHETIC_ACTIONS {
@@ -2884,7 +2895,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_runtime(tmp.path());
         let old = paths.logs_dir().join("webhook-fast-path");
-        let new = paths.logs_dir().join("webhook-forgejo");
+        let new = paths
+            .logs_dir()
+            .join(crate::web::webhooks::WEBHOOK_MINT_ACTION);
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("marker.jsonl"), b"{}").unwrap();
 
@@ -2898,6 +2911,31 @@ mod tests {
         // Second start: new dir already present, old absent -> no-op, no panic.
         rename_webhook_log_dir(&paths);
         assert!(new.join("marker.jsonl").exists());
+    }
+
+    // A deployment that already went through the CLAUDE-153 rename (so its logs
+    // sit at the intermediate `webhook-forgejo` name) is carried forward to the
+    // current name too.
+    #[test]
+    fn rename_webhook_log_dir_moves_the_intermediate_forgejo_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        let old = paths.logs_dir().join("webhook-forgejo");
+        let new = paths
+            .logs_dir()
+            .join(crate::web::webhooks::WEBHOOK_MINT_ACTION);
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("marker.jsonl"), b"{}").unwrap();
+
+        rename_webhook_log_dir(&paths);
+        assert!(
+            !old.exists(),
+            "the intermediate-name dir is gone after the rename"
+        );
+        assert!(
+            new.join("marker.jsonl").exists(),
+            "logs moved to the current name"
+        );
     }
 
     // The global-cap resolver. An explicit `max_parallel_global > 0`
@@ -2957,7 +2995,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_runtime(tmp.path());
         let old = paths.logs_dir().join("webhook-fast-path");
-        let new = paths.logs_dir().join("webhook-forgejo");
+        let new = paths
+            .logs_dir()
+            .join(crate::web::webhooks::WEBHOOK_MINT_ACTION);
         std::fs::create_dir_all(&old).unwrap();
         std::fs::create_dir_all(&new).unwrap();
         std::fs::write(new.join("keep.jsonl"), b"new").unwrap();

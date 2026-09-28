@@ -1,7 +1,9 @@
-//! Forgejo comment listener.
+//! Comment-command webhook listener.
 //!
-//! `POST /webhooks/forgejo-comment/{source}` receives Forgejo `issue_comment`
-//! deliveries. A human comments `/claude <instruction>` and claude-run serves it
+//! `POST /webhooks/{provider}/comment/{source}` receives `issue_comment`
+//! deliveries from the forge named by `{provider}` ([`super::webhooks::WebhookProvider`];
+//! only `forgejo` is implemented today). A human comments `/claude <instruction>`
+//! and claude-run serves it
 //! on one of two routes, chosen by whether the comment's thread is a pull
 //! request:
 //!
@@ -24,7 +26,8 @@
 //! two get independent Pause switches.
 //!
 //! What IS shared with [`super::webhooks`], deliberately and by reference rather
-//! than by copy: [`super::webhooks::verify_signature`], the single
+//! than by copy: [`super::webhooks::WebhookProvider`] (header names and signature
+//! verification), the single
 //! [`super::webhooks::SeenDeliveries`] replay-store INSTANCE (so one delivery id
 //! fanned out to both endpoints is still caught), the
 //! [`super::webhooks::RateLimiter`] type plus its
@@ -34,12 +37,14 @@
 //!
 //! Per-request pipeline, in the SAME order as the CI-failure endpoint:
 //!
-//! 0. Resolve `{source}`; unknown -> 404.
+//! 0. Resolve `{provider}`; unrecognized -> 404. Resolve `{source}`; unknown,
+//!    or configured for a different provider than `{provider}`, -> 404.
 //! 1. Per-source rate limit (before any crypto) -> 429.
 //! 2. Resolve the source's HMAC secret, fail closed -> 401.
-//! 3. Verify HMAC-SHA256 over the raw body -> 401.
-//! 4. Require `X-Forgejo-Delivery` -> 400; reject a replay -> 409.
-//! 5. Pause check on `webhook-forgejo-comment` -> accept-and-drop (2xx).
+//! 3. Verify the signature over the raw body (Forgejo: HMAC-SHA256) -> 401.
+//! 4. Require the delivery-id header (Forgejo: `X-Forgejo-Delivery`) -> 400;
+//!    reject a replay -> 409.
+//! 5. Pause check on `webhook-comment` -> accept-and-drop (2xx).
 //! 6. Parse, then drop (ack 2xx, log the reason) anything that is not a
 //!    `created` comment on an allow-listed repo carrying the configured trigger
 //!    from a non-bot author.
@@ -76,14 +81,16 @@ use crate::secrets::{self, SecretsKey};
 use crate::state;
 
 use super::webhooks::{
-    begin_webhook_run, rate_map_from, repo_allowed, verify_signature, ActionUser, RateLimiter,
-    SeenDeliveries, DELIVERY_HEADER, SIGNATURE_HEADER,
+    begin_webhook_run, rate_map_from, repo_allowed, ActionUser, RateLimiter, SeenDeliveries,
+    WebhookProvider,
 };
 
 /// Synthetic action name the comment listener records its runs and caps
-/// under, alongside `webhook-forgejo`. Reserved: an on-disk YAML claiming it is
+/// under, alongside `webhook-triage`. Reserved: an on-disk YAML claiming it is
 /// refused at scan, and trigger / edit / export / delete are rejected for it.
-pub const WEBHOOK_COMMENT_ACTION: &str = "webhook-forgejo-comment";
+/// Renamed from `webhook-forgejo-comment` (CLAUDE-361, when the listener's
+/// route and name stopped being Forgejo-specific).
+pub const WEBHOOK_COMMENT_ACTION: &str = "webhook-comment";
 
 /// File the reply body is written to before `fj pr|issue comment`. For the
 /// clone-and-push route this lives in the checkout's git-directory scratch
@@ -404,11 +411,12 @@ impl CommentWebhookState {
 }
 
 /// Router carrying the per-source comment route, merged into the daemon's TCP
-/// app alongside the CI-failure webhook router.
+/// app alongside the CI-failure webhook router. `{provider}` names the
+/// sending forge ([`WebhookProvider`]).
 pub fn router(state: CommentWebhookState) -> Router {
     Router::new()
         .route(
-            "/webhooks/forgejo-comment/:source",
+            "/webhooks/:provider/comment/:source",
             post(forgejo_comment_webhook),
         )
         .with_state(state)
@@ -416,23 +424,39 @@ pub fn router(state: CommentWebhookState) -> Router {
 
 async fn forgejo_comment_webhook(
     State(st): State<CommentWebhookState>,
-    Path(source): Path<String>,
+    Path((provider, source)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let now = Instant::now();
 
-    // 0. Resolve the source off the live config; unknown -> 404.
+    // 0. Resolve the provider segment: unrecognized -> 404.
+    let Some(provider) = WebhookProvider::parse(&provider) else {
+        warn!(provider = %provider, source = %source, "webhook rejected: unrecognized provider");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    // Resolve the source off the live config; unknown, or configured for a
+    // different provider than the URL's `:provider` segment, -> 404.
     let (cfg, src_cfg) = {
         let cfg = st.config.read().await;
         if !cfg.enabled {
-            warn!(source = %source, "forgejo comment webhook rejected: disabled");
+            warn!(source = %source, "webhook rejected: disabled");
             return StatusCode::NOT_FOUND.into_response();
         }
         match cfg.sources.get(&source) {
-            Some(s) => (cfg.clone(), s.clone()),
+            Some(s) if s.provider == provider => (cfg.clone(), s.clone()),
+            Some(s) => {
+                warn!(
+                    source = %source,
+                    provider = %provider,
+                    configured_provider = %s.provider,
+                    "webhook rejected: source is configured for a different provider"
+                );
+                return StatusCode::NOT_FOUND.into_response();
+            }
             None => {
-                warn!(source = %source, "forgejo comment webhook rejected: unknown source");
+                warn!(source = %source, "webhook rejected: unknown source");
                 return StatusCode::NOT_FOUND.into_response();
             }
         }
@@ -442,11 +466,11 @@ async fn forgejo_comment_webhook(
     {
         let rate = st.rate.read().await;
         let Some(limiter) = rate.get(&source) else {
-            warn!(source = %source, "forgejo comment webhook: no rate limiter for source (bug)");
+            warn!(source = %source, "webhook: no rate limiter for source (bug)");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
         if !limiter.lock().await.allow(now) {
-            warn!(source = %source, "forgejo comment webhook rate limited");
+            warn!(source = %source, "webhook rate limited");
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
     }
@@ -455,43 +479,47 @@ async fn forgejo_comment_webhook(
     let secret = match resolve_secret(&st.pool, &src_cfg).await {
         Ok(s) => s,
         Err(e) => {
-            warn!(source = %source, error = %e, "forgejo comment webhook secret unavailable; rejecting");
+            warn!(source = %source, error = %e, "webhook secret unavailable; rejecting");
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
 
     let delivery = headers
-        .get(DELIVERY_HEADER)
+        .get(provider.delivery_header())
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let delivery_label = if delivery.is_empty() { "-" } else { delivery };
 
     // 3. Verify the signature over the RAW body before any parsing.
-    let Some(signature) = headers.get(SIGNATURE_HEADER).and_then(|v| v.to_str().ok()) else {
+    let Some(signature) = headers
+        .get(provider.signature_header())
+        .and_then(|v| v.to_str().ok())
+    else {
         warn!(
             source = %source,
             delivery = delivery_label,
-            "forgejo comment webhook rejected: missing X-Forgejo-Signature header"
+            header = provider.signature_header(),
+            "webhook rejected: missing signature header"
         );
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if !verify_signature(secret.as_bytes(), &body, signature) {
+    if !provider.verify_signature(secret.as_bytes(), &body, signature) {
         warn!(
             source = %source,
             delivery = delivery_label,
             body_bytes = body.len(),
-            "forgejo comment webhook rejected: signature mismatch"
+            "webhook rejected: signature mismatch"
         );
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
     // 4. Replay protection against the SHARED store.
     if delivery.is_empty() {
-        warn!(source = %source, "forgejo comment webhook rejected: missing X-Forgejo-Delivery header");
+        warn!(source = %source, header = provider.delivery_header(), "webhook rejected: missing delivery header");
         return StatusCode::BAD_REQUEST.into_response();
     }
     if !st.seen.lock().await.check_and_record(delivery, now) {
-        warn!(source = %source, delivery, "forgejo comment webhook replay rejected");
+        warn!(source = %source, delivery, "webhook replay rejected");
         return StatusCode::CONFLICT.into_response();
     }
 
@@ -499,11 +527,11 @@ async fn forgejo_comment_webhook(
         source = %source,
         delivery,
         body_bytes = body.len(),
-        "forgejo comment webhook authenticated"
+        "webhook authenticated"
     );
 
     // 5. Pause: accept-and-drop, matching every other action's "paused = does not
-    // run" and keeping Forgejo from retrying. The GLOBAL pause is checked
+    // run" and keeping the forge from retrying. The GLOBAL pause is checked
     // first, through the same shared gate the CI-failure listener takes.
     if crate::web::webhooks::paused_accept_and_drop(
         &st.pool,
@@ -520,7 +548,7 @@ async fn forgejo_comment_webhook(
     let payload: CommentPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
-            warn!(source = %source, error = %e, "forgejo comment webhook payload parse failed");
+            warn!(source = %source, error = %e, "webhook payload parse failed");
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
@@ -549,7 +577,7 @@ async fn forgejo_comment_webhook(
                 action = %payload.action,
                 repo = %payload.repository.full_name,
                 reason,
-                "forgejo comment webhook delivery dropped"
+                "webhook delivery dropped"
             );
             StatusCode::OK.into_response()
         }
@@ -2117,6 +2145,7 @@ mod tests {
     use super::*;
     use crate::config::WebhookConfig;
     use crate::provider::cli::testutil::StubRunner;
+    use crate::web::webhooks::{DELIVERY_HEADER, SIGNATURE_HEADER};
     use age::secrecy::ExposeSecret;
     use axum::http::HeaderValue;
     use hmac::{Hmac, Mac};
@@ -3463,7 +3492,7 @@ mod tests {
         let pool = setup_pool(tmp.path()).await;
         let paused = || webhook_action_paused(&pool, WEBHOOK_COMMENT_ACTION, "comment command");
         assert!(!paused().await);
-        state::action_pause_set(&pool, "webhook-forgejo", Some("t"))
+        state::action_pause_set(&pool, crate::web::webhooks::WEBHOOK_MINT_ACTION, Some("t"))
             .await
             .unwrap();
         assert!(!paused().await, "the other listener's pause is not ours");
@@ -3732,7 +3761,7 @@ mod tests {
     ) -> StatusCode {
         forgejo_comment_webhook(
             State(st.clone()),
-            Path(source.to_string()),
+            Path(("forgejo".to_string(), source.to_string())),
             headers(signature, delivery),
             Bytes::from(body.to_string()),
         )
@@ -3781,6 +3810,78 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unrecognized_provider_is_404() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _rx) = state_for(tmp.path()).await;
+        let raw = payload_json("created", REPO, "/claude fix it", "alice", true);
+        let sig = sign(SECRET.as_bytes(), raw.as_bytes());
+        let resp = forgejo_comment_webhook(
+            State(st.clone()),
+            Path(("github".to_string(), SOURCE.to_string())),
+            headers(Some(&sig), Some("d-provider")),
+            Bytes::from(raw),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A [`WebhookProvider`] has exactly one variant today, so an actual
+    /// provider/source mismatch (a source configured for one provider, hit
+    /// through a URL naming another) cannot yet be constructed. This pins the
+    /// default-and-round-trip mechanics `provider == provider` depends on, so
+    /// the mismatch check in the handler stays meaningful once a second
+    /// variant exists.
+    #[test]
+    fn comment_webhook_source_provider_defaults_to_forgejo_and_round_trips() {
+        let src: CommentWebhookSource = serde_json::from_str(r#"{"secret_ref":"x"}"#).unwrap();
+        assert_eq!(src.provider, WebhookProvider::Forgejo);
+        assert_eq!(
+            CommentWebhookSource::default().provider,
+            WebhookProvider::Forgejo
+        );
+    }
+
+    #[tokio::test]
+    async fn router_serves_new_route_and_404s_the_old_one() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, mut rx) = state_for(tmp.path()).await;
+        let raw = payload_json("created", REPO, "/claude fix it", "alice", true);
+        let sig = sign(SECRET.as_bytes(), raw.as_bytes());
+
+        let mut app = router(st);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/webhooks/forgejo/comment/{SOURCE}"))
+            .header(SIGNATURE_HEADER, sig.clone())
+            .header(DELIVERY_HEADER, "d-router-new")
+            .body(axum::body::Body::from(raw.clone()))
+            .unwrap();
+        let resp = tower::Service::call(&mut app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert!(
+            rx.recv().await.is_some(),
+            "the new route dispatched a verified comment command"
+        );
+
+        let req_old = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/webhooks/forgejo-comment/{SOURCE}"))
+            .header(SIGNATURE_HEADER, sig)
+            .header(DELIVERY_HEADER, "d-router-old")
+            .body(axum::body::Body::from(raw))
+            .unwrap();
+        let resp_old = tower::Service::call(&mut app, req_old).await.unwrap();
+        assert_eq!(
+            resp_old.status(),
+            StatusCode::NOT_FOUND,
+            "the pre-CLAUDE-361 route no longer exists"
+        );
     }
 
     #[tokio::test]

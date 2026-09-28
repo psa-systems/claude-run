@@ -1,27 +1,33 @@
-//! Forgejo webhook listener.
+//! CI-failure triage webhook listener.
 //!
-//! `POST /webhooks/forgejo/{source}` routes on the daemon's TCP app receive
-//! Forgejo Action-run webhook deliveries. Each `{source}` names a configured
-//! [`crate::config::WebhookSource`] with its own HMAC secret, allow-list, and
-//! rate-limit bucket; the replay store is shared across sources (delivery ids are
-//! globally unique). The per-request pipeline, in order:
+//! `POST /webhooks/{provider}/triage/{source}` routes on the daemon's TCP app
+//! receive Action-run webhook deliveries. `{provider}` names the sending forge
+//! ([`WebhookProvider`]; only `forgejo` is implemented today). Each `{source}`
+//! names a configured [`crate::config::WebhookSource`] with its own HMAC
+//! secret, allow-list, and rate-limit bucket; the replay store is shared
+//! across sources (delivery ids are globally unique). The per-request
+//! pipeline, in order:
 //!
-//! 0. Resolve `{source}` from the config sources map; an unknown source -> 404.
+//! 0. Resolve `{provider}` to a [`WebhookProvider`]; unrecognized -> 404.
+//!    Resolve `{source}` from the config sources map; an unknown source, or a
+//!    source whose own configured `provider` does not match `{provider}`,
+//!    -> 404.
 //! 1. Per-source rate limit (fixed window, before any crypto) -> 429 when
 //!    exceeded. One source's storm never starves another's bucket.
 //! 2. Resolve that source's HMAC secret (`secrets` table); a missing
 //!    `secret_ref` or unresolvable secret fails closed -> 401.
-//! 3. Verify the HMAC-SHA256 over the raw body against `X-Forgejo-Signature`
-//!    with a constant-time compare -> 401 on mismatch / missing signature. The
-//!    secret is the source's own, so a payload signed for one source's secret
-//!    401s on a different source's path.
-//! 4. Replay protection (shared store): reject a delivery whose
-//!    `X-Forgejo-Delivery` id was already seen inside the configured window ->
-//!    409. A missing id is a malformed request -> 400.
+//! 3. Verify the signature over the raw body against the provider's own
+//!    signature header (Forgejo: `X-Forgejo-Signature`, HMAC-SHA256, constant-time
+//!    compare) -> 401 on mismatch / missing signature. The secret is the
+//!    source's own, so a payload signed for one source's secret 401s on a
+//!    different source's path.
+//! 4. Replay protection (shared store): reject a delivery whose delivery-id
+//!    header (Forgejo: `X-Forgejo-Delivery`) was already seen inside the
+//!    configured window -> 409. A missing id is a malformed request -> 400.
 //! 5. Parse the `ActionPayload`. Keep only `action_run_failure` (payload
 //!    `action == "failure"`) for a repo in that source's allow-list and emit a
 //!    typed [`VerifiedFailureEvent`] to [`consume_events`] -> 202. Every other
-//!    authenticated event is acked -> 200 and dropped so Forgejo does not retry.
+//!    authenticated event is acked -> 200 and dropped so the forge does not retry.
 //!
 //! Every per-request log line carries the `source` field so a rejection or ack
 //! is always attributable to its endpoint.
@@ -66,13 +72,15 @@ use crate::secrets::{self, SecretsKey};
 use crate::state;
 use crate::triage::{self, FailureClassifier, TriageInput};
 
-/// Synthetic action name the Forgejo webhook records its caps under
+/// Synthetic action name the CI-failure triage webhook records its caps under
 /// (per-key attempt counter + daily run ledger in [`crate::state`]), so the
 /// event-driven mint throttles on the same accounting shape as the scheduled
 /// actions instead of re-deriving its own. Renamed from the former
-/// `webhook-fast-path`; a startup data migration (migration `0013` plus
-/// the log-dir rename in [`crate::daemon`]) carries existing history across.
-pub const WEBHOOK_MINT_ACTION: &str = "webhook-forgejo";
+/// `webhook-fast-path`, then from `webhook-forgejo` (CLAUDE-361, when the
+/// listener's route and name stopped being Forgejo-specific); a startup data
+/// migration (migration `0013` plus the log-dir rename in [`crate::daemon`])
+/// carries existing history across each rename.
+pub const WEBHOOK_MINT_ACTION: &str = "webhook-triage";
 
 /// The pause gate both webhook listeners take, once
 /// signature / replay / rate-limit have passed. True means "accept the delivery
@@ -223,6 +231,78 @@ const ACTION_RUN_EVENT_PREFIX: &str = "action_run_";
 /// other action (`opened`, `edited`, `synchronized`, ...) is acked and dropped:
 /// nothing to reconcile until the PR is terminal.
 const PR_ACTION_CLOSED: &str = "closed";
+
+/// The forge sending a webhook delivery, named by the `:provider` URL path
+/// segment (`/webhooks/:provider/triage/:source`,
+/// `/webhooks/:provider/comment/:source`). One variant today; a second
+/// provider is a future issue. This is deliberately a thin data-carrying type
+/// (its own header names, its own signature check, parse/serialize to the
+/// path segment / config value) rather than a trait: the two listeners still
+/// share one signature-verification algorithm (HMAC-SHA256) and one delivery
+/// pipeline, only the header names and the config `provider` value vary by
+/// forge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookProvider {
+    #[default]
+    Forgejo,
+}
+
+impl WebhookProvider {
+    /// Parse the `:provider` URL path segment. `None` for anything
+    /// unrecognized, so the caller can 404 it the same way an unconfigured
+    /// `:source` 404s.
+    pub fn parse(segment: &str) -> Option<Self> {
+        match segment {
+            "forgejo" => Some(WebhookProvider::Forgejo),
+            _ => None,
+        }
+    }
+
+    /// The `:provider` URL path segment / config `provider` value this
+    /// variant round-trips as.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WebhookProvider::Forgejo => "forgejo",
+        }
+    }
+
+    /// Header carrying the hex-encoded HMAC-SHA256 of the raw body.
+    pub fn signature_header(&self) -> &'static str {
+        match self {
+            WebhookProvider::Forgejo => SIGNATURE_HEADER,
+        }
+    }
+
+    /// Header carrying the delivery's unique id, used for replay protection.
+    pub fn delivery_header(&self) -> &'static str {
+        match self {
+            WebhookProvider::Forgejo => DELIVERY_HEADER,
+        }
+    }
+
+    /// Header carrying the delivery's event type.
+    pub fn event_header(&self) -> &'static str {
+        match self {
+            WebhookProvider::Forgejo => EVENT_HEADER,
+        }
+    }
+
+    /// Constant-time signature verification of `body` against the
+    /// hex-encoded `signature` under `secret`, in this provider's own scheme.
+    /// Forgejo's is HMAC-SHA256, exactly [`verify_signature`].
+    pub fn verify_signature(&self, secret: &[u8], body: &[u8], signature: &str) -> bool {
+        match self {
+            WebhookProvider::Forgejo => verify_signature(secret, body, signature),
+        }
+    }
+}
+
+impl std::fmt::Display for WebhookProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// The subset of Forgejo's `pull_request` webhook payload the
 /// merge-close path consumes. Extra fields are ignored (no
@@ -523,11 +603,11 @@ impl WebhookState {
 }
 
 /// Router carrying the per-source webhook route, merged into the daemon's TCP
-/// app. `{source}` is an axum path param resolved against the configured sources
-/// map.
+/// app. `{provider}` names the sending forge ([`WebhookProvider`]); `{source}`
+/// is an axum path param resolved against the configured sources map.
 pub fn router(state: WebhookState) -> Router {
     Router::new()
-        .route("/webhooks/forgejo/:source", post(forgejo_webhook))
+        .route("/webhooks/:provider/triage/:source", post(forgejo_webhook))
         .with_state(state)
 }
 
@@ -3082,26 +3162,43 @@ fn log_mint_outcome(ev: &VerifiedFailureEvent, outcome: &MintOutcome) {
 
 async fn forgejo_webhook(
     State(st): State<WebhookState>,
-    Path(source): Path<String>,
+    Path((provider, source)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let now = Instant::now();
 
-    // Resolve the source from the live config. An unknown source
-    // 404s (it is not a configured endpoint), logged so a misdirected webhook is
-    // diagnosable. Clone the source out so no read guard is held across the
-    // secret-decrypt / channel-send awaits below.
+    // Resolve the provider segment first: unrecognized -> 404, same treatment
+    // as an unconfigured source, before anything reads the config.
+    let Some(provider) = WebhookProvider::parse(&provider) else {
+        warn!(provider = %provider, source = %source, "webhook rejected: unrecognized provider");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    // Resolve the source from the live config. An unknown source, or one whose
+    // own configured provider does not match the URL's `:provider` segment,
+    // 404s (it is not a configured endpoint for this provider), logged so a
+    // misdirected webhook is diagnosable. Clone the source out so no read
+    // guard is held across the secret-decrypt / channel-send awaits below.
     let src_cfg = {
         let cfg = st.config.read().await;
         if !cfg.enabled {
-            warn!(source = %source, "forgejo webhook rejected: disabled");
+            warn!(source = %source, "webhook rejected: disabled");
             return StatusCode::NOT_FOUND.into_response();
         }
         match cfg.sources.get(&source) {
-            Some(s) => s.clone(),
+            Some(s) if s.provider == provider => s.clone(),
+            Some(s) => {
+                warn!(
+                    source = %source,
+                    provider = %provider,
+                    configured_provider = %s.provider,
+                    "webhook rejected: source is configured for a different provider"
+                );
+                return StatusCode::NOT_FOUND.into_response();
+            }
             None => {
-                warn!(source = %source, "forgejo webhook rejected: unknown source");
+                warn!(source = %source, "webhook rejected: unknown source");
                 return StatusCode::NOT_FOUND.into_response();
             }
         }
@@ -3115,11 +3212,11 @@ async fn forgejo_webhook(
     {
         let rate = st.rate.read().await;
         let Some(limiter) = rate.get(&source) else {
-            warn!(source = %source, "forgejo webhook: no rate limiter for source (bug)");
+            warn!(source = %source, "webhook: no rate limiter for source (bug)");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
         if !limiter.lock().await.allow(now) {
-            warn!(source = %source, "forgejo webhook rate limited");
+            warn!(source = %source, "webhook rate limited");
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
     }
@@ -3131,7 +3228,7 @@ async fn forgejo_webhook(
     let secret = match resolve_secret(&st, &src_cfg).await {
         Ok(s) => s,
         Err(e) => {
-            warn!(source = %source, error = %e, "forgejo webhook secret unavailable; rejecting");
+            warn!(source = %source, error = %e, "webhook secret unavailable; rejecting");
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
@@ -3141,7 +3238,7 @@ async fn forgejo_webhook(
     // fine, acting on it is not, so it is only recorded in the replay store after
     // authentication succeeds.
     let delivery = headers
-        .get(DELIVERY_HEADER)
+        .get(provider.delivery_header())
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let delivery_label = if delivery.is_empty() { "-" } else { delivery };
@@ -3149,21 +3246,24 @@ async fn forgejo_webhook(
     // Verify the signature over the RAW body before any parsing. Both rejection
     // branches log the reason (never the signature value, the computed MAC, or
     // the body) so a silent 401 is always explained by the journal.
-    let signature = headers.get(SIGNATURE_HEADER).and_then(|v| v.to_str().ok());
+    let signature = headers
+        .get(provider.signature_header())
+        .and_then(|v| v.to_str().ok());
     let Some(signature) = signature else {
         warn!(
             source = %source,
             delivery = delivery_label,
-            "forgejo webhook rejected: missing X-Forgejo-Signature header (is the webhook Secret set in Forgejo?)"
+            header = provider.signature_header(),
+            "webhook rejected: missing signature header (is the webhook Secret set on the forge side?)"
         );
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if !verify_signature(secret.as_bytes(), &body, signature) {
+    if !provider.verify_signature(secret.as_bytes(), &body, signature) {
         warn!(
             source = %source,
             delivery = delivery_label,
             body_bytes = body.len(),
-            "forgejo webhook rejected: signature mismatch (stored secret and Forgejo webhook Secret differ?)"
+            "webhook rejected: signature mismatch (stored secret and the forge's webhook Secret differ?)"
         );
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -3172,11 +3272,11 @@ async fn forgejo_webhook(
     // A missing delivery id is malformed; a previously-seen id inside the window
     // is a replay (including the same delivery fanned out to two sources).
     if delivery.is_empty() {
-        warn!(source = %source, "forgejo webhook rejected: missing X-Forgejo-Delivery header");
+        warn!(source = %source, header = provider.delivery_header(), "webhook rejected: missing delivery header");
         return StatusCode::BAD_REQUEST.into_response();
     }
     if !st.seen.lock().await.check_and_record(delivery, now) {
-        warn!(source = %source, delivery, "forgejo webhook replay rejected");
+        warn!(source = %source, delivery, "webhook replay rejected");
         return StatusCode::CONFLICT.into_response();
     }
 
@@ -3186,7 +3286,7 @@ async fn forgejo_webhook(
         source = %source,
         delivery,
         body_bytes = body.len(),
-        "forgejo webhook authenticated"
+        "webhook authenticated"
     );
 
     if paused_accept_and_drop(&st.pool, WEBHOOK_MINT_ACTION, &source, delivery).await {
@@ -3201,7 +3301,7 @@ async fn forgejo_webhook(
     // Action-run header keeps the pre-existing path below; anything else is an
     // event type this endpoint does not handle, acked and dropped.
     let event_type = headers
-        .get(EVENT_HEADER)
+        .get(provider.event_header())
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
@@ -3213,7 +3313,7 @@ async fn forgejo_webhook(
             source = %source,
             delivery,
             event = %event_type,
-            "forgejo webhook delivery of an unhandled event type acked and dropped"
+            "webhook delivery of an unhandled event type acked and dropped"
         );
         return StatusCode::OK.into_response();
     }
@@ -3222,7 +3322,7 @@ async fn forgejo_webhook(
     let payload: ActionPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
-            warn!(source = %source, error = %e, "forgejo webhook payload parse failed");
+            warn!(source = %source, error = %e, "webhook payload parse failed");
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
@@ -3237,14 +3337,14 @@ async fn forgejo_webhook(
     match verified_failure_event(&payload, &src_cfg.allowed_repos, &source) {
         Some(event) => {
             if st.events.send(event).await.is_err() {
-                warn!(source = %source, "forgejo webhook event channel closed; dropping event");
+                warn!(source = %source, "webhook event channel closed; dropping event");
             }
             StatusCode::ACCEPTED.into_response()
         }
-        // Authenticated but not an allow-listed failure: ack + drop so Forgejo
-        // marks the delivery delivered and does not retry. Log which of the two
-        // drop conditions fired so a 200-ack drop is never silent (the rest of
-        // the handler logs every other branch).
+        // Authenticated but not an allow-listed failure: ack + drop so the
+        // forge marks the delivery delivered and does not retry. Log which of
+        // the two drop conditions fired so a 200-ack drop is never silent (the
+        // rest of the handler logs every other branch).
         None => {
             let reason = if payload.action != "failure" {
                 "non-failure action"
@@ -3257,7 +3357,7 @@ async fn forgejo_webhook(
                 action = %payload.action,
                 repo = %payload.run.repository.full_name,
                 reason,
-                "forgejo webhook event dropped"
+                "webhook event dropped"
             );
             StatusCode::OK.into_response()
         }
@@ -3284,7 +3384,7 @@ async fn handle_action_success(
             delivery,
             action = %payload.action,
             repo = %repo,
-            "forgejo webhook event dropped: repo not in allowed_repos"
+            "webhook event dropped: repo not in allowed_repos"
         );
         return StatusCode::OK.into_response();
     }
@@ -3324,7 +3424,7 @@ async fn handle_pull_request_delivery(
     let payload: PullRequestPayload = match serde_json::from_slice(body) {
         Ok(p) => p,
         Err(e) => {
-            warn!(source = %source, delivery, error = %e, "forgejo pull_request payload parse failed");
+            warn!(source = %source, delivery, error = %e, "webhook pull_request payload parse failed");
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
@@ -5506,11 +5606,7 @@ mod tests {
     /// processed again once neither is set.
     #[tokio::test]
     async fn queued_failure_event_is_skipped_while_paused() {
-        for scope in [
-            None,
-            Some(WEBHOOK_MINT_ACTION),
-            Some("webhook-forgejo-comment"),
-        ] {
+        for scope in [None, Some(WEBHOOK_MINT_ACTION), Some("webhook-comment")] {
             for paused in [true, false] {
                 let pool = crate::db::test_pool().await;
                 if paused {
@@ -5520,7 +5616,7 @@ mod tests {
                     }
                 }
                 // Only the global pause and this listener's own action stop it.
-                let expect_skip = paused && scope != Some("webhook-forgejo-comment");
+                let expect_skip = paused && scope != Some("webhook-comment");
                 let backend = Arc::new(StoreBackend::new());
                 let counting = Arc::new(CountingClassifier::new());
                 let classifier: Arc<dyn FailureClassifier> = counting.clone();
@@ -8131,6 +8227,7 @@ mod tests {
                         rate_limit_per_min: rate_per_min,
                         log_token_ref: None,
                         write_token_ref: None,
+                        provider: WebhookProvider::Forgejo,
                     },
                 ),
                 (
@@ -8141,6 +8238,7 @@ mod tests {
                         rate_limit_per_min: rate_per_min,
                         log_token_ref: None,
                         write_token_ref: None,
+                        provider: WebhookProvider::Forgejo,
                     },
                 ),
             ]
@@ -8189,12 +8287,94 @@ mod tests {
             // before any rate / crypto work.
             let resp = forgejo_webhook(
                 State(st),
-                Path("no-such-source".to_string()),
+                Path(("forgejo".to_string(), "no-such-source".to_string())),
                 headers(Some(&sig), Some("d-0")),
                 Bytes::from(raw),
             )
             .await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        // An unrecognized `:provider` segment 404s before the config is even
+        // read, the same treatment an unconfigured `:source` gets.
+        #[tokio::test]
+        async fn unrecognized_provider_is_404() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx) = state(tmp.path()).await;
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_A.to_string())),
+                headers(Some(&sig), Some("d-provider-unknown")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        // Every configured source's provider matches the one recognized
+        // `WebhookProvider` variant today, so the source-vs-URL-provider
+        // mismatch branch in `forgejo_webhook` cannot be driven end-to-end
+        // until a second provider exists to mismatch against. Pin the
+        // comparison it relies on directly instead: a source's `provider`
+        // field is what the handler compares the parsed `:provider` segment
+        // to, and it must default to `Forgejo` so every pre-CLAUDE-361 stored
+        // source (serialized with no `provider` key at all) resolves as a
+        // Forgejo source rather than failing to match anything.
+        #[test]
+        fn webhook_source_provider_defaults_to_forgejo_and_round_trips() {
+            let src: WebhookSource = serde_json::from_str(r#"{"secret_ref":"x"}"#).unwrap();
+            assert_eq!(src.provider, WebhookProvider::Forgejo);
+            assert_eq!(WebhookSource::default().provider, WebhookProvider::Forgejo);
+            let json = serde_json::to_string(&WebhookProvider::Forgejo).unwrap();
+            assert_eq!(json, "\"forgejo\"");
+            assert_eq!(
+                serde_json::from_str::<WebhookProvider>("\"forgejo\"").unwrap(),
+                WebhookProvider::Forgejo
+            );
+        }
+
+        // Router-level: the new route accepts a valid delivery and the old,
+        // pre-CLAUDE-361 route no longer exists at all.
+        #[tokio::test]
+        async fn router_serves_new_route_and_404s_the_old_one() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state(tmp.path()).await;
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+
+            let mut app = router(st);
+
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/webhooks/forgejo/triage/{SOURCE_A}"))
+                .header(SIGNATURE_HEADER, sig.clone())
+                .header(DELIVERY_HEADER, "d-router-new")
+                .body(axum::body::Body::from(raw.clone()))
+                .unwrap();
+            let resp = tower::Service::call(&mut app, req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            assert!(
+                rx.recv().await.is_some(),
+                "the new route dispatched a verified failure event"
+            );
+
+            let req_old = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/webhooks/forgejo/{SOURCE_A}"))
+                .header(SIGNATURE_HEADER, sig)
+                .header(DELIVERY_HEADER, "d-router-old")
+                .body(axum::body::Body::from(raw))
+                .unwrap();
+            let resp_old = tower::Service::call(&mut app, req_old).await.unwrap();
+            assert_eq!(
+                resp_old.status(),
+                StatusCode::NOT_FOUND,
+                "the pre-CLAUDE-361 route no longer exists"
+            );
         }
 
         #[tokio::test]
@@ -8215,7 +8395,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig), Some("d-disabled")),
                 Bytes::from(raw),
             )
@@ -8231,7 +8411,7 @@ mod tests {
             let body = Bytes::from(failure_payload("contoso/claude-run"));
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(None, Some("d-1")),
                 body,
             )
@@ -8249,7 +8429,7 @@ mod tests {
             // into a log; only the delivery id and body length are recorded.
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some("deadbeef"), Some("d-2")),
                 body,
             )
@@ -8270,7 +8450,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_B.to_string()),
+                Path(("forgejo".to_string(), SOURCE_B.to_string())),
                 headers(Some(&sig), Some("x-1")),
                 Bytes::from(raw),
             )
@@ -8294,6 +8474,7 @@ mod tests {
                     rate_limit_per_min: 60,
                     log_token_ref: None,
                     write_token_ref: None,
+                    provider: WebhookProvider::Forgejo,
                 },
             )]
             .into_iter()
@@ -8314,7 +8495,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path("secretless".to_string()),
+                Path(("forgejo".to_string(), "secretless".to_string())),
                 headers(Some(&sig), Some("s-1")),
                 Bytes::from(raw),
             )
@@ -8331,7 +8512,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig), None),
                 Bytes::from(raw),
             )
@@ -8348,7 +8529,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig), Some("d-3")),
                 Bytes::from(raw),
             )
@@ -8376,7 +8557,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig), Some("p-1")),
                 Bytes::from(raw),
             )
@@ -8409,7 +8590,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st.clone()),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig), Some("lr-1")),
                 Bytes::from(raw),
             )
@@ -8451,7 +8632,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st.clone()),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig), Some("gp-1")),
                 Bytes::from(raw.clone()),
             )
@@ -8469,7 +8650,7 @@ mod tests {
             state::global_pause_clear(&st.pool).await.unwrap();
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig), Some("gp-2")),
                 Bytes::from(raw),
             )
@@ -8495,7 +8676,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig), Some("p-2")),
                 Bytes::from(raw),
             )
@@ -8517,7 +8698,7 @@ mod tests {
             let sig_a = sign(SECRET_A.as_bytes(), raw_a.as_bytes());
             let resp_a = forgejo_webhook(
                 State(st.clone()),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig_a), Some("a-1")),
                 Bytes::from(raw_a),
             )
@@ -8528,7 +8709,7 @@ mod tests {
             let sig_b = sign(SECRET_B.as_bytes(), raw_b.as_bytes());
             let resp_b = forgejo_webhook(
                 State(st),
-                Path(SOURCE_B.to_string()),
+                Path(("forgejo".to_string(), SOURCE_B.to_string())),
                 headers(Some(&sig_b), Some("b-1")),
                 Bytes::from(raw_b),
             )
@@ -8553,7 +8734,7 @@ mod tests {
             let sig1 = sign(SECRET_A.as_bytes(), raw1.as_bytes());
             let r1 = forgejo_webhook(
                 State(st.clone()),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig1), Some("r-1")),
                 Bytes::from(raw1),
             )
@@ -8565,7 +8746,7 @@ mod tests {
             let sig2 = sign(SECRET_A.as_bytes(), raw2.as_bytes());
             let r2 = forgejo_webhook(
                 State(st.clone()),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig2), Some("r-2")),
                 Bytes::from(raw2),
             )
@@ -8577,7 +8758,7 @@ mod tests {
             let sig3 = sign(SECRET_B.as_bytes(), raw3.as_bytes());
             let r3 = forgejo_webhook(
                 State(st),
-                Path(SOURCE_B.to_string()),
+                Path(("forgejo".to_string(), SOURCE_B.to_string())),
                 headers(Some(&sig3), Some("r-3")),
                 Bytes::from(raw3),
             )
@@ -8599,7 +8780,7 @@ mod tests {
             let sig_a = sign(SECRET_A.as_bytes(), raw_a.as_bytes());
             let r1 = forgejo_webhook(
                 State(st.clone()),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig_a), Some("dup-1")),
                 Bytes::from(raw_a),
             )
@@ -8610,7 +8791,7 @@ mod tests {
             let sig_b = sign(SECRET_B.as_bytes(), raw_b.as_bytes());
             let r2 = forgejo_webhook(
                 State(st),
-                Path(SOURCE_B.to_string()),
+                Path(("forgejo".to_string(), SOURCE_B.to_string())),
                 headers(Some(&sig_b), Some("dup-1")),
                 Bytes::from(raw_b),
             )
@@ -8628,7 +8809,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig), Some("d-4")),
                 Bytes::from(raw),
             )
@@ -8650,7 +8831,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig), Some("d-5")),
                 Bytes::from(raw),
             )
@@ -8712,7 +8893,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers_with_event(Some(&sig), Some("u-1"), Some("issues")),
                 Bytes::from(raw),
             )
@@ -8732,7 +8913,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers_with_event(Some(&sig), Some("ar-1"), Some("action_run_failure")),
                 Bytes::from(raw),
             )
@@ -8749,7 +8930,7 @@ mod tests {
             let raw = pull_request_payload("contoso/claude-run", 42, "closed", true);
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers_with_event(None, Some("pr-1"), Some(PULL_REQUEST_EVENT_TYPE)),
                 Bytes::from(raw),
             )
@@ -8768,7 +8949,7 @@ mod tests {
                 headers_with_event(Some(&sig), Some("pr-dup"), Some(PULL_REQUEST_EVENT_TYPE));
             let r1 = forgejo_webhook(
                 State(st.clone()),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers1,
                 Bytes::from(raw.clone()),
             )
@@ -8780,7 +8961,7 @@ mod tests {
                 headers_with_event(Some(&sig), Some("pr-dup"), Some(PULL_REQUEST_EVENT_TYPE));
             let r2 = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers2,
                 Bytes::from(raw),
             )
@@ -8800,7 +8981,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers_with_event(Some(&sig), Some("pr-pause"), Some(PULL_REQUEST_EVENT_TYPE)),
                 Bytes::from(raw),
             )
@@ -8818,7 +8999,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers_with_event(Some(&sig), Some("pr-sync"), Some(PULL_REQUEST_EVENT_TYPE)),
                 Bytes::from(raw),
             )
@@ -8836,7 +9017,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers_with_event(
                     Some(&sig),
                     Some("pr-unlisted"),
@@ -8858,7 +9039,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(SOURCE_A.to_string()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
                 headers_with_event(Some(&sig), Some("pr-merged"), Some(PULL_REQUEST_EVENT_TYPE)),
                 Bytes::from(raw),
             )
