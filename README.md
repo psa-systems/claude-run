@@ -1450,7 +1450,7 @@ the host, and logins still happen inside the container.
 
 **Web bind and first-run setup.** The image seeds a bootstrap `config.toml` (from `deploy/container-config.toml`) that binds `0.0.0.0:7321`, because a loopback bind inside a container is reachable from nothing outside it, published port or reverse proxy included. A non-loopback bind requires auth, and that credential is created in the browser: open the URL and the daemon serves `/setup`, which takes a username and a password and creates the administrator. No token, no key file, no CLI. The seeded `config.toml` is copied only when the config volume has none, so operator edits survive restarts and image upgrades. See "Web UI / API auth" for what setup is and is not (it is trust-on-first-use; bring the instance up behind the proxy).
 
-**First-run logins.** Everything is in the browser: after creating the administrator, open **Settings -> Auth**, press **Sign in with Anthropic** (or store an API key), and enter the YouTrack base URL plus token, the Forgejo host plus token, and the GitHub host plus token. No restart, and no CLI. Until the Claude credential exists the scheduler runs nothing and says so on the dashboard. The `exec` route below remains for operators who would rather the CLIs own their own config. The daemon comes up before any login exists (a missing Claude credential is a `warn`, not a startup failure), so the container is there to exec into:
+**First-run logins.** Everything is in the browser: after creating the administrator, open **Settings -> Auth**, press **Sign in with Anthropic** (or store an API key), and enter the YouTrack base URL plus token, the Forgejo host plus token, and the GitHub host plus token. No restart, and no CLI. Until the Claude credential exists the scheduler runs nothing and says so on the dashboard. Git commit identity (`user.name` / `user.email` for the commits the agent makes inside a job's clone) is on the same page: leave it unset and the daemon defaults it to `claude-run <claude-run@a8n.run>`, or type your own name and email to override it, materialized to the path `GIT_CONFIG_GLOBAL` names with no `exec` step required (CLAUDE-358). The `exec` route below remains for operators who would rather the CLIs own their own config. The daemon comes up before any login exists (a missing Claude credential is a `warn`, not a startup failure), so the container is there to exec into:
 
 ```nu
 docker compose up --detach
@@ -1460,8 +1460,6 @@ docker compose exec --user claudebot claude-bot claude auth login
 docker compose exec --user claudebot claude-bot yt auth login --base-url https://yt.example.com
 docker compose exec --user claudebot claude-bot fj auth add-key
 docker compose exec --user claudebot claude-bot gh auth login
-docker compose exec --user claudebot claude-bot git config --global user.name "claude-bot"
-docker compose exec --user claudebot claude-bot git config --global user.email "claude-bot@example.com"
 
 docker compose restart
 ```

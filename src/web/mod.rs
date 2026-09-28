@@ -130,6 +130,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/settings/auth/youtrack", post(auth_save_youtrack))
         .route("/settings/auth/forgejo", post(auth_save_forgejo))
         .route("/settings/auth/github", post(auth_save_github))
+        .route("/settings/auth/git", post(auth_save_git))
         .route("/settings/:section", post(settings_save))
         // CLAUDE-117: historical reporting page (spend / runs / time-of-day /
         // day-of-week). Global by default; `action` + `range` query params narrow
@@ -3981,6 +3982,11 @@ struct AuthCardView {
     youtrack_base_url: Option<String>,
     forgejo_host: Option<String>,
     github_host: Option<String>,
+    /// Git commit author name/email actually in effect (configured or
+    /// defaulted); always present since a git identity is always
+    /// materialized. See `crate::service_auth::AuthStatus`.
+    git_author_name: String,
+    git_author_email: String,
     error: Option<String>,
     /// Whether a Claude credential exists at all (an OAuth login in the agent
     /// config dir, a stored API key, or the env). This is what gates the
@@ -4347,6 +4353,14 @@ async fn render_settings_full(
                 .is_some()
                 .then_some(auth_cfg.github_host)
                 .flatten(),
+            git_author_name: auth_cfg
+                .git_author_name
+                .clone()
+                .unwrap_or_else(|| crate::config::DEFAULT_GIT_AUTHOR_NAME.to_string()),
+            git_author_email: auth_cfg
+                .git_author_email
+                .clone()
+                .unwrap_or_else(|| crate::config::DEFAULT_GIT_AUTHOR_EMAIL.to_string()),
             error: auth_error,
         },
     };
@@ -4422,6 +4436,12 @@ struct AuthForgejoForm {
 struct AuthGithubForm {
     host: String,
     token: String,
+}
+
+#[derive(Deserialize)]
+struct AuthGitForm {
+    name: String,
+    email: String,
 }
 
 /// Store `value` under `name`, creating or rotating as needed. The caller has
@@ -4653,6 +4673,27 @@ async fn auth_save_github(
             .await;
     }
     Ok(Redirect::to("/settings?saved=GitHub+auth").into_response())
+}
+
+/// POST `/settings/auth/git`: sets the git commit identity the agent's
+/// commits are authored as (CLAUDE-358). Not a credential (no secret store
+/// entry), so an empty field clears it back to the `"claude-run"` /
+/// `"claude-run@a8n.run"` default that `service_auth::materialize` falls back
+/// to, rather than being rejected as required input.
+async fn auth_save_git(
+    State(s): State<WebState>,
+    Form(form): Form<AuthGitForm>,
+) -> Result<Response, WebError> {
+    let name = form.name.trim().to_string();
+    let email = form.email.trim().to_string();
+    let mut cfg = s.api.settings.auth_config().await;
+    cfg.git_author_name = (!name.is_empty()).then_some(name);
+    cfg.git_author_email = (!email.is_empty()).then_some(email);
+    if let Err(e) = save_auth_config(&s, &cfg).await {
+        return render_settings_with(&s, StatusCode::UNPROCESSABLE_ENTITY, None, None, Some(e))
+            .await;
+    }
+    Ok(Redirect::to("/settings?saved=Git+identity").into_response())
 }
 
 #[derive(Deserialize)]
@@ -9938,8 +9979,8 @@ mod tests {
     /// instead of a CLI (the container has no CLI operator).
     mod service_auth_ui {
         use super::super::{
-            auth_save_forgejo, auth_save_github, auth_save_youtrack, settings_page,
-            AuthForgejoForm, AuthGithubForm, AuthYoutrackForm, SettingsQuery,
+            auth_save_forgejo, auth_save_git, auth_save_github, auth_save_youtrack, settings_page,
+            AuthForgejoForm, AuthGitForm, AuthGithubForm, AuthYoutrackForm, SettingsQuery,
         };
         use super::secrets_ui::{body_string, web_state};
         use age::secrecy::ExposeSecret;
@@ -10198,6 +10239,61 @@ mod tests {
                 .await
                 .github_token_ref
                 .is_none());
+
+            std::env::remove_var(crate::secrets::KEY_FILE_ENV);
+        }
+
+        /// CLAUDE-358: saving a git identity records both fields verbatim and
+        /// the resolved values (not the `"claude-run"` default) show on the
+        /// page; leaving a field blank clears it back to the default rather
+        /// than being refused as required input.
+        #[tokio::test]
+        async fn git_identity_is_stored_and_shown_and_blank_clears_to_default() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            use_temp_key(tmp.path());
+            let s = web_state(tmp.path()).await;
+
+            let resp = auth_save_git(
+                State(s.clone()),
+                Form(AuthGitForm {
+                    name: "Ops Bot".into(),
+                    email: "ops@example.com".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+            let cfg = s.api.settings.auth_config().await;
+            assert_eq!(cfg.git_author_name.as_deref(), Some("Ops Bot"));
+            assert_eq!(cfg.git_author_email.as_deref(), Some("ops@example.com"));
+
+            let page = body_string(
+                settings_page(State(s.clone()), Query(SettingsQuery { saved: None }))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(page.contains("Ops Bot"), "{page}");
+            assert!(page.contains("ops@example.com"), "{page}");
+
+            let resp = auth_save_git(
+                State(s.clone()),
+                Form(AuthGitForm {
+                    name: "".into(),
+                    email: "".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let cfg = s.api.settings.auth_config().await;
+            assert!(cfg.git_author_name.is_none());
+            assert!(cfg.git_author_email.is_none());
 
             std::env::remove_var(crate::secrets::KEY_FILE_ENV);
         }

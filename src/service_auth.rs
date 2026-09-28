@@ -35,7 +35,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::db::DbPool;
 
-use crate::config::{AuthConfig, Paths};
+use crate::config::{AuthConfig, Paths, DEFAULT_GIT_AUTHOR_EMAIL, DEFAULT_GIT_AUTHOR_NAME};
 use crate::error::Result;
 use crate::secrets::{resolve_secret, SecretsKey};
 
@@ -92,6 +92,30 @@ pub fn export_gh_config_env(paths: &Paths) {
     std::env::set_var(GH_CONFIG_ENV, gh_config_dir(paths));
 }
 
+/// Where the materialized git identity config lives: the path
+/// `GIT_CONFIG_GLOBAL` names in the container image
+/// (`oci-build/Dockerfile`: `/config/git/config`, i.e.
+/// `<config_dir>/git/config`), so the env var can be exported once at startup
+/// and stay correct as the credential changes. A host install leaves
+/// `GIT_CONFIG_GLOBAL` unset and resolves git config the normal way; this path
+/// only matters once [`export_git_config_env`] points the var at it.
+pub fn git_config_path(paths: &Paths) -> PathBuf {
+    paths.config_dir.join("git").join("config")
+}
+
+/// Export `GIT_CONFIG_GLOBAL` for this process and its children, pointing at
+/// [`git_config_path`]. See [`export_yt_config_env`] for why this runs
+/// unconditionally at serve start, before any child is spawned, and the same
+/// `set_var` safety note applies.
+///
+/// # Safety
+///
+/// `std::env::set_var` is not thread-safe against concurrent `getenv`. This
+/// runs on the serve path before the daemon spawns anything.
+pub fn export_git_config_env(paths: &Paths) {
+    std::env::set_var("GIT_CONFIG_GLOBAL", git_config_path(paths));
+}
+
 /// What is configured, for the Settings page. Never carries a secret value.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AuthStatus {
@@ -103,6 +127,13 @@ pub struct AuthStatus {
     pub forgejo_host: Option<String>,
     /// The configured GitHub host, when a token is stored for it.
     pub github_host: Option<String>,
+    /// The git commit author name actually in effect: the configured value, or
+    /// the `"claude-run"` default when unset. Always present, since a git
+    /// identity is always materialized.
+    pub git_author_name: String,
+    /// The git commit author email actually in effect. See
+    /// [`AuthStatus::git_author_name`].
+    pub git_author_email: String,
 }
 
 /// The XDG data dir `fj` reads its `keys.json` from. Callers pass this in; it is
@@ -131,8 +162,25 @@ pub async fn materialize(
     let mut status = AuthStatus::default();
     let mut api_key = None;
 
-    // Nothing configured: leave every file alone (an operator may have logged the
-    // CLIs in by hand inside the container, and overwriting that would be rude).
+    // CLAUDE-358: git identity is written unconditionally, defaulted rather
+    // than gated on "something else is configured", so a fresh deployment
+    // with nothing set in Settings -> Auth still produces a working commit
+    // identity with no exec step.
+    let git_author_name = cfg
+        .git_author_name
+        .clone()
+        .unwrap_or_else(|| DEFAULT_GIT_AUTHOR_NAME.to_string());
+    let git_author_email = cfg
+        .git_author_email
+        .clone()
+        .unwrap_or_else(|| DEFAULT_GIT_AUTHOR_EMAIL.to_string());
+    write_git_config(&git_config_path(paths), &git_author_name, &git_author_email)?;
+    status.git_author_name = git_author_name;
+    status.git_author_email = git_author_email;
+
+    // Nothing configured: leave every other file alone (an operator may have
+    // logged the CLIs in by hand inside the container, and overwriting that
+    // would be rude).
     if cfg.anthropic_key_ref.is_none()
         && cfg.youtrack_token_ref.is_none()
         && cfg.forgejo_token_ref.is_none()
@@ -325,6 +373,20 @@ fn write_yt_config(path: &Path, base_url: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write the minimal `[user]` git config block `GIT_CONFIG_GLOBAL` names, 0600
+/// like [`write_yt_config`]'s output (not a credential, but the file also has
+/// no reason to be group- or world-readable).
+fn write_git_config(path: &Path, name: &str, email: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::secrets::write_0600(
+        path,
+        format!("[user]\n\tname = {name}\n\temail = {email}\n").as_bytes(),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,7 +509,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_configured_writes_nothing() {
+    async fn nothing_configured_writes_nothing_but_the_defaulted_git_identity() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
         let pool = crate::db::test_pool().await;
@@ -461,11 +523,72 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(status, AuthStatus::default());
+        assert_eq!(
+            status,
+            AuthStatus {
+                git_author_name: "claude-run".to_string(),
+                git_author_email: "claude-run@a8n.run".to_string(),
+                ..AuthStatus::default()
+            },
+            "git identity is the one login that always defaults; everything \
+             else stays unset with nothing configured"
+        );
         assert!(key.is_none());
         assert!(
             !yt_config_path(&paths).exists(),
             "an unconfigured instance must not clobber a hand-made login"
+        );
+        let body = std::fs::read_to_string(git_config_path(&paths)).unwrap();
+        assert_eq!(
+            body,
+            "[user]\n\tname = claude-run\n\temail = claude-run@a8n.run\n"
+        );
+    }
+
+    /// CLAUDE-358: both fields configured are used verbatim; only one
+    /// configured leaves the other defaulted; the materialized file is 0600.
+    #[tokio::test]
+    async fn git_identity_configured_fields_are_used_verbatim_and_unset_fields_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let pool = crate::db::test_pool().await;
+
+        let cfg = AuthConfig {
+            git_author_name: Some("Ops Bot".to_string()),
+            git_author_email: None,
+            ..Default::default()
+        };
+        let (status, _key) = materialize(&pool, &paths, &cfg, &tmp.path().join("fj-data"), "gh")
+            .await
+            .unwrap();
+        assert_eq!(status.git_author_name, "Ops Bot");
+        assert_eq!(status.git_author_email, "claude-run@a8n.run");
+        let body = std::fs::read_to_string(git_config_path(&paths)).unwrap();
+        assert_eq!(
+            body,
+            "[user]\n\tname = Ops Bot\n\temail = claude-run@a8n.run\n"
+        );
+        let mode = std::fs::metadata(git_config_path(&paths))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let cfg = AuthConfig {
+            git_author_name: Some("Ops Bot".to_string()),
+            git_author_email: Some("ops@example.com".to_string()),
+            ..Default::default()
+        };
+        let (status, _key) = materialize(&pool, &paths, &cfg, &tmp.path().join("fj-data"), "gh")
+            .await
+            .unwrap();
+        assert_eq!(status.git_author_name, "Ops Bot");
+        assert_eq!(status.git_author_email, "ops@example.com");
+        let body = std::fs::read_to_string(git_config_path(&paths)).unwrap();
+        assert_eq!(
+            body,
+            "[user]\n\tname = Ops Bot\n\temail = ops@example.com\n"
         );
     }
 

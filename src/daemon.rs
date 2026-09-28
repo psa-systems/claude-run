@@ -184,6 +184,7 @@ impl Daemon {
         }
         crate::service_auth::export_yt_config_env(&self.paths);
         crate::service_auth::export_gh_config_env(&self.paths);
+        crate::service_auth::export_git_config_env(&self.paths);
         let gh_binary = "gh";
         let auth_cfg = settings.auth_config().await;
         let anthropic_key: crate::service_auth::ApiKeyHandle = {
@@ -200,6 +201,7 @@ impl Daemon {
                 youtrack = status.youtrack_base_url.as_deref().unwrap_or("<unset>"),
                 forgejo = status.forgejo_host.as_deref().unwrap_or("<unset>"),
                 github = status.github_host.as_deref().unwrap_or("<unset>"),
+                git_author = %format!("{} <{}>", status.git_author_name, status.git_author_email),
                 "service auth materialized"
             );
             Arc::new(std::sync::RwLock::new(key))
