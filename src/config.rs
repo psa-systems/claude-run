@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::web::webhooks::WebhookProvider;
 
 /// The per-run usage record, directly under `logs/`. Shared with
 /// `crate::gc` so the writer's path and the sweep's target cannot drift apart.
@@ -321,13 +322,14 @@ impl WebhookConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookSource {
-    /// Name of the secret (in the `secrets` table) holding this source's Forgejo
-    /// webhook HMAC secret. When unset, this source's endpoint fails closed and
-    /// rejects every request with 401.
+    /// Name of the secret (in the `secrets` table) holding the webhook HMAC
+    /// secret for this source's configured [`WebhookSource::provider`]. When
+    /// unset, this source's endpoint fails closed and rejects every request
+    /// with 401.
     pub secret_ref: Option<String>,
     /// Allow-list of repo patterns for this source. Only `action_run_failure`
     /// events from a matching repo produce a verified-failure event; every other
-    /// authenticated request is acked (2xx) and dropped so Forgejo does not
+    /// authenticated request is acked (2xx) and dropped so the forge does not
     /// retry. Three pattern forms: exact `owner/repo`, per-owner
     /// `owner/*`, and the global `*`. Matching is case-sensitive; an empty list
     /// denies all (fail closed).
@@ -337,14 +339,14 @@ pub struct WebhookSource {
     /// exhausting its budget never 429s another.
     pub rate_limit_per_min: u32,
     /// Name of the secret (in the `secrets` table) holding a
-    /// Forgejo PAT (`read:repository` scope) that authorizes this source's
-    /// `fj actions logs` reads. It reaches the `fj` child in a temp single-host
-    /// `keys.json` carrying that one secret and nothing else. Unset, the fetch
-    /// runs unauthenticated, which serves a public repo; a private failure then
-    /// mints a human-action issue with no log attached.
+    /// read-scoped PAT that authorizes this source's `fj actions logs` reads
+    /// (Forgejo's `read:repository` scope). It reaches the `fj` child in a temp
+    /// single-host `keys.json` carrying that one secret and nothing else. Unset,
+    /// the fetch runs unauthenticated, which serves a public repo; a private
+    /// failure then mints a human-action issue with no log attached.
     pub log_token_ref: Option<String>,
     /// Name of the secret (in the `secrets` table) holding a
-    /// Forgejo PAT that authorizes commenting on this source's pull requests
+    /// PAT that authorizes commenting on this source's pull requests
     /// (routing a CI failure on an open PR back to its issue, or onto the
     /// human author's PR). Reaches `fj` the same way `log_token_ref` does: a
     /// temp single-host `keys.json` carrying only this one secret. Unset, a
@@ -352,6 +354,13 @@ pub struct WebhookSource {
     /// row naming this source, and fails the run rather than posting nothing
     /// silently.
     pub write_token_ref: Option<String>,
+    /// The forge sending this source's deliveries, and the `:provider` URL
+    /// path segment (`/webhooks/<provider>/triage/<source>`) the request
+    /// must arrive on. `#[serde(default)]` so every source stored before this
+    /// field existed deserializes as [`WebhookProvider::Forgejo`], which was
+    /// the only behavior before CLAUDE-361 split the route on provider.
+    #[serde(default)]
+    pub provider: WebhookProvider,
 }
 
 impl Default for WebhookSource {
@@ -362,6 +371,7 @@ impl Default for WebhookSource {
             rate_limit_per_min: 60,
             log_token_ref: None,
             write_token_ref: None,
+            provider: WebhookProvider::Forgejo,
         }
     }
 }
@@ -444,15 +454,16 @@ impl CommentWebhookConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommentWebhookSource {
-    /// Name of the secret holding this source's Forgejo webhook HMAC secret.
-    /// Unset means the endpoint fails closed and 401s every request.
+    /// Name of the secret holding this source's webhook HMAC secret for its
+    /// configured [`CommentWebhookSource::provider`]. Unset means the endpoint
+    /// fails closed and 401s every request.
     pub secret_ref: Option<String>,
     /// Allow-list of repo patterns, read by [`repo_matches`] (the same three
     /// forms as the CI-failure sources; empty denies all).
     pub allowed_repos: Vec<String>,
     /// Fixed-window rate limit: max accepted requests per minute for this source.
     pub rate_limit_per_min: u32,
-    /// Name of the secret holding a Forgejo PAT with WRITE scope. It authorizes
+    /// Name of the secret holding a PAT with WRITE scope. It authorizes
     /// the commenter's permission read, the PR replies, and the branch push, and
     /// reaches `fj` in a temp single-host `keys.json` carrying that one secret.
     /// Unset means no command can be served (every delivery is refused).
@@ -473,6 +484,12 @@ pub struct CommentWebhookSource {
     /// Marker appended to the commit message so the bot's own push does not
     /// re-trigger the CI-fix action.
     pub skip_marker: String,
+    /// The forge sending this source's deliveries, and the `:provider` URL
+    /// path segment (`/webhooks/<provider>/comment/<source>`) the request
+    /// must arrive on. See [`WebhookSource::provider`] for the same
+    /// `#[serde(default)]` upgrade reasoning.
+    #[serde(default)]
+    pub provider: WebhookProvider,
 }
 
 impl Default for CommentWebhookSource {
@@ -488,6 +505,7 @@ impl Default for CommentWebhookSource {
             bot_author: DEFAULT_GIT_AUTHOR_NAME.to_string(),
             bot_email: DEFAULT_GIT_AUTHOR_EMAIL.to_string(),
             skip_marker: "[skip claude]".to_string(),
+            provider: WebhookProvider::Forgejo,
         }
     }
 }

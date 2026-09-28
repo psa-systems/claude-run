@@ -179,7 +179,7 @@ struct ActionView {
     last_run_started: Option<String>,
     paused: Option<PauseInfo>,
     /// A synthetic, read-only, event-driven action (the
-    /// `webhook-forgejo` entry). The templates label it event-driven and hide
+    /// `webhook-triage` entry). The templates label it event-driven and hide
     /// the edit / delete / trigger controls, which do not apply. The
     /// Pause / Resume controls DO apply and are shown (a paused webhook accepts
     /// and drops deliveries).
@@ -673,7 +673,7 @@ async fn enriched_actions(
     Ok(out)
 }
 
-/// Build the synthetic `webhook-forgejo` action view. Read-only and
+/// Build the synthetic webhook action view (e.g. `webhook-triage`). Read-only and
 /// event-driven: no schedule, no file, always "enabled" (it fires on webhook
 /// deliveries, not a timer). Its `last_run_started` comes from the recorded
 /// webhook runs so the dashboard shows recency like any other action.
@@ -4094,7 +4094,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "sources",
                 badge: "live",
-                note: "a saved source puts webhook-forgejo on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref, write_token_ref (WRITE scope, required to comment on a PR).",
+                note: "a saved source puts webhook-triage on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref, write_token_ref (WRITE scope, required to comment on a PR).",
             },
             FieldDoc {
                 name: "auto_fix",
@@ -4119,7 +4119,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "max_runs_per_day",
                 badge: "next event",
-                note: "daily run cap of the webhook-forgejo ledger (default 20, at least 1).",
+                note: "daily run cap of the webhook-triage ledger (default 20, at least 1).",
             },
         ],
         WebhookComment => vec![
@@ -4136,12 +4136,12 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "max_runs_per_day",
                 badge: "next event",
-                note: "daily run cap of the webhook-forgejo-comment ledger (default 20, at least 1).",
+                note: "daily run cap of the webhook-comment ledger (default 20, at least 1).",
             },
             FieldDoc {
                 name: "sources",
                 badge: "live",
-                note: "a saved source puts webhook-forgejo-comment on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, write_token_ref (WRITE scope), allowed_permissions, max_files, max_lines.",
+                note: "a saved source puts webhook-comment on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, write_token_ref (WRITE scope), allowed_permissions, max_files, max_lines.",
             },
         ],
         LogFilter => vec![FieldDoc {
@@ -8741,7 +8741,7 @@ mod tests {
             .await;
             assert!(
                 !before.contains(synthetic),
-                "webhook-forgejo listed before any source is configured"
+                "webhook-triage listed before any source is configured"
             );
 
             s.api
@@ -8762,7 +8762,7 @@ mod tests {
             .await;
             assert!(
                 with_source.contains(synthetic),
-                "webhook-forgejo missing from the dashboard immediately after saving a source"
+                "webhook-triage missing from the dashboard immediately after saving a source"
             );
 
             s.api
@@ -8780,7 +8780,7 @@ mod tests {
             .await;
             assert!(
                 !after_removal.contains(synthetic),
-                "webhook-forgejo still listed after removing its only source"
+                "webhook-triage still listed after removing its only source"
             );
         }
 
@@ -8799,7 +8799,7 @@ mod tests {
             .await;
             assert!(
                 !before.contains(synthetic),
-                "webhook-forgejo-comment listed before any source is configured"
+                "webhook-comment listed before any source is configured"
             );
 
             s.api
@@ -8821,7 +8821,7 @@ mod tests {
             .await;
             assert!(
                 with_source.contains(synthetic),
-                "webhook-forgejo-comment missing from the dashboard immediately after saving a source"
+                "webhook-comment missing from the dashboard immediately after saving a source"
             );
 
             s.api
@@ -8842,7 +8842,7 @@ mod tests {
             .await;
             assert!(
                 !after_removal.contains(synthetic),
-                "webhook-forgejo-comment still listed after removing its only source"
+                "webhook-comment still listed after removing its only source"
             );
         }
 
