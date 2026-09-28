@@ -6,7 +6,7 @@
 <h2>Settings</h2>
 
 <div class="card" style="margin-bottom: 16px;">
-  <span class="dim">Runtime configuration moved out of <code>config.toml</code> (CLAUDE-101).
+  <span class="dim">Runtime configuration moved out of <code>config.toml</code>.
   Each section is validated against the same config struct the file parser uses
   (unknown fields are rejected) and stored in the database. <code>config.toml</code>
   keeps only bootstrap keys (<code>[web]</code>, <code>[daemon]</code> binary
@@ -193,7 +193,7 @@
   {% endif %}
   <form method="post" action="/settings/{{ sec.path }}">
     {% if sec.path == "preferences" %}
-    {# CLAUDE-154: preset buttons fill the datetime_format field in the JSON
+    {# Preset buttons fill the datetime_format field in the JSON
        editor below; free-form editing of the textarea still works. #}
     <div class="dim" style="margin-bottom: 6px;">Date/time format presets:</div>
     <div class="preset-row" style="margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 6px;">
@@ -205,7 +205,7 @@
     </div>
     {% endif %}
     {% if sec.path == "claude" %}
-    {# CLAUDE-259: effort buttons rewrite the `effort` key in the JSON editor
+    {# Effort buttons rewrite the `effort` key in the JSON editor
        below (Default sets it back to null); free-form editing still works. #}
     <div class="dim" style="margin-bottom: 6px;">Default effort level:</div>
     <div class="preset-row" style="margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 6px;">
@@ -227,7 +227,7 @@
 {% endfor %}
 
 <script>
-  // CLAUDE-154: a preset button rewrites the datetime_format value inside its
+  // A preset button rewrites the datetime_format value inside its
   // section's JSON editor, preserving the rest of the document. Free-form edits
   // to the textarea keep working; the stored value is always the JSON blob.
   document.querySelectorAll('.preset-btn').forEach(function (btn) {
@@ -246,7 +246,7 @@
     });
   });
 
-  // CLAUDE-259: same pattern for the claude section's effort level. An empty
+  // Same pattern for the claude section's effort level. An empty
   // data-effort writes null, which is "no --effort flag, the CLI's own default".
   document.querySelectorAll('.effort-btn').forEach(function (btn) {
     btn.addEventListener('click', function () {

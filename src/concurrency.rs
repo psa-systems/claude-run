@@ -1,4 +1,4 @@
-//! CLAUDE-28: keyed, bounded-parallel job execution.
+//! Keyed, bounded-parallel job execution.
 //!
 //! A run's jobs used to execute strictly sequentially (one `claude` at a time),
 //! serializing independent work. This module replaces that loop with a bounded
@@ -12,13 +12,13 @@
 //!   (alongside the dispatcher's per-action `in_flight` set) so the
 //!   one-execution-per-key guarantee survives a scheduled run overlapping a
 //!   manual trigger, not just the jobs within a single run.
-//! - [`Limiter`] (CLAUDE-162): the daemon-wide, config-rebuilt semaphore pair. A
+//! - [`Limiter`]: the daemon-wide, config-rebuilt semaphore pair. A
 //!   single global semaphore caps total concurrent jobs across every action; a
 //!   per-action semaphore caps concurrent jobs for one action. Both are shared
 //!   and daemon-lived, so a cap holds across *overlapping* runs of an action, not
 //!   just within one run (the old per-run [`Semaphore`] only bounded a single
 //!   run's snapshot).
-//! - [`GatherGate`] (CLAUDE-228): a per-action "gathering right now" marker. The
+//! - [`GatherGate`]: a per-action "gathering right now" marker. The
 //!   scheduler skips a pickup for an action whose previous gather has not
 //!   finished, so a slow `yt list` no longer stacks one gather per tick.
 //! - [`Executor`]: spawns one task per job, each acquiring, in order, (a) its key

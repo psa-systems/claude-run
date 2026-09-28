@@ -59,7 +59,7 @@ mod tests {
         let b = ActionLock::try_acquire(dir.path(), "test").unwrap();
         assert!(b.is_none(), "second acquire should fail while first held");
         drop(a);
-        // CLAUDE-110: the lock releases on drop, but another test thread mid
+        // The lock releases on drop, but another test thread mid
         // `fork`/`exec` can hold an inherited duplicate of the lock fd until its
         // `exec` (the fd is `O_CLOEXEC`, which closes it at `exec`, not at
         // `fork`), transiently keeping the `flock` held. Under the parallel test

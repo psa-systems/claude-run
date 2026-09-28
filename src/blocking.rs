@@ -1,4 +1,4 @@
-//! CLAUDE-228: hand the worker thread back to tokio around a blocking call.
+//! Hand the worker thread back to tokio around a blocking call.
 //!
 //! The runner is a thin async shell over synchronous work: `yt` / `fj` / `git`
 //! children, the `claude` session, `nu` snippets, and the automerge poll loop.
