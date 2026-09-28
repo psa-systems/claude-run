@@ -88,6 +88,18 @@ impl Daemon {
         crate::settings::migrate_config_file(&pool, &self.paths).await?;
         let effective = crate::settings::effective(&pool, &self.on_disk).await?;
         let replay_window_secs = effective.webhook.replay_window_secs;
+
+        // CLAUDE-360: an `enabled`-unset (defaulted `false`) section with
+        // pre-existing sources is the upgrade-time transition this flag adds -
+        // surface it loudly rather than letting the listener go quiet with no
+        // explanation.
+        for section in crate::settings::disabled_but_configured_webhook_sections(&effective) {
+            warn!(
+                section,
+                "webhook listener is disabled (enabled = false); it will 404 every request until \
+                 enabled on /settings, even though sources are configured"
+            );
+        }
         let settings = Arc::new(crate::settings::LiveSettings::new(
             pool.clone(),
             effective,
