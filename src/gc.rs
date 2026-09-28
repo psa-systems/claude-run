@@ -1,10 +1,9 @@
 //! GC sweepers for the unbounded on-disk trees: preserved and aside workdirs
-//! ([`sweep`], CLAUDE-106), per-attempt stream logs ([`sweep_stream_logs`],
-//! CLAUDE-245), the two size-bounded files under `logs/`
-//! ([`sweep_oversized_logs`], CLAUDE-257), per-job snippet directories
-//! ([`sweep_snippets`], CLAUDE-262), and redacted webhook CI logs
-//! ([`sweep_webhook_logs`], CLAUDE-262). All are scheduled by the daemon on the
-//! same tick and read their own DB-backed retention window.
+//! ([`sweep`]), per-attempt stream logs ([`sweep_stream_logs`]), the two
+//! size-bounded files under `logs/` ([`sweep_oversized_logs`]), per-job
+//! snippet directories ([`sweep_snippets`]), and redacted webhook CI logs
+//! ([`sweep_webhook_logs`]). All are scheduled by the daemon on the same tick
+//! and read their own DB-backed retention window.
 //!
 //! The YouTrack runner intentionally keeps some workdirs rather than deleting
 //! them: [`crate::native::youtrack`] preserves a directory that holds
@@ -17,8 +16,8 @@
 //!
 //! [`sweep`] walks `<base>/*/*` and deletes any directory older than the
 //! configured retention window. A directory that still holds local-only work
-//! (CLAUDE-281 / CLAUDE-284: unpushed commits, a dirty tracked/untracked
-//! tree, or a stash) is respected (kept) until a separate, longer hard-cap
+//! (unpushed commits, a dirty tracked/untracked tree, or a stash) is
+//! respected (kept) until a separate, longer hard-cap
 //! age, so genuinely un-saved work is not discarded the moment the window
 //! passes. Every deletion is logged with action, key, path, age, and bytes
 //! reclaimed so a sweep is auditable.
@@ -60,7 +59,7 @@ pub struct SweepStats {
 
 /// Walk `<base>/<source>/<key>` and delete every workdir older than the
 /// retention window, keeping workdirs holding local-only work (unpushed
-/// commits, a dirty tree, or a stash - CLAUDE-284) until the longer hard cap.
+/// commits, a dirty tree, or a stash) until the longer hard cap.
 ///
 /// `now` is injected (production passes [`SystemTime::now`]) so a test can age a
 /// directory by passing a future instant rather than mutating its mtime. A
@@ -155,8 +154,8 @@ where
     stats
 }
 
-/// CLAUDE-245: walk `<logs_dir>/<action>/streams/*.jsonl` and delete every
-/// stream log older than the retention window.
+/// Walk `<logs_dir>/<action>/streams/*.jsonl` and delete every stream log
+/// older than the retention window.
 ///
 /// `in_flight` is the set of `(action, job_key)` pairs whose job is still
 /// running, read by the caller from `run_inflight_jobs` joined to the runs that
@@ -267,9 +266,9 @@ fn stream_log_key(file_name: &str) -> Option<String> {
     Some(key.to_string())
 }
 
-/// CLAUDE-262: walk `<state_dir>/snippets/<action>/<job_key>/` and delete every
-/// snippet directory older than `cfg.snippet_retention_days`, keeping one whose
-/// job is still in flight regardless of age.
+/// Walk `<state_dir>/snippets/<action>/<job_key>/` and delete every snippet
+/// directory older than `cfg.snippet_retention_days`, keeping one whose job
+/// is still in flight regardless of age.
 ///
 /// The shape is the per-source/per-key walk [`sweep`] already does for
 /// workdirs, but with the stream-log sweep's in-flight guard rather than the
@@ -365,8 +364,8 @@ pub fn sweep_snippets(
     stats
 }
 
-/// CLAUDE-262: walk the files directly under `<state_dir>/webhook-logs/` and
-/// delete every one older than `cfg.webhook_log_retention_days`.
+/// Walk the files directly under `<state_dir>/webhook-logs/` and delete every
+/// one older than `cfg.webhook_log_retention_days`.
 ///
 /// Only files DIRECTLY under `webhook-logs/` are considered: `write_artifact`
 /// ([`crate::forge_log`]) is the only writer that puts one there, one per
@@ -440,8 +439,8 @@ pub struct BoundStats {
     pub bytes_reclaimed: u64,
 }
 
-/// CLAUDE-257 / CLAUDE-268: bound the append-forever files under `<logs_dir>`
-/// by SIZE: `daemon.log`, `usage.jsonl`, and every `logs/<action>/<output.file>`.
+/// Bound the append-forever files under `<logs_dir>` by SIZE: `daemon.log`,
+/// `usage.jsonl`, and every `logs/<action>/<output.file>`.
 ///
 /// None is a per-run artifact, so the age window [`sweep_stream_logs`] uses
 /// does not apply: each is one file that a long-lived daemon appends to for the
@@ -469,8 +468,8 @@ pub fn sweep_oversized_logs(logs_dir: &Path, cfg: &StreamLogGcConfig) -> BoundSt
         "daemon log",
         &mut stats,
     );
-    // CLAUDE-268: sits directly under `logs/`, so the action walk below (which
-    // only descends into directories) never reaches it. Bounded explicitly, the
+    // Sits directly under `logs/`, so the action walk below (which only
+    // descends into directories) never reaches it. Bounded explicitly, the
     // same way `daemon.log` is.
     bound_one(
         &logs_dir.join(crate::config::USAGE_LOG),
@@ -751,7 +750,7 @@ mod tests {
         assert_eq!(stats, SweepStats::default());
     }
 
-    // ---- CLAUDE-245: stream-log sweep --------------------------------------
+    // ---- stream-log sweep ---------------------------------------------------
 
     fn log_cfg(enabled: bool) -> StreamLogGcConfig {
         StreamLogGcConfig {
@@ -911,7 +910,7 @@ mod tests {
         assert_eq!(stats, SweepStats::default());
     }
 
-    // ---- CLAUDE-262: snippet directories ------------------------------------
+    // ---- snippet directories --------------------------------------------------
 
     /// Create `<base>/<action>/<key>/` with one file of `bytes` bytes inside,
     /// mirroring what [`crate::snippet::snippet_dir_for`] plus
@@ -1005,7 +1004,7 @@ mod tests {
         assert_eq!(stats, SweepStats::default());
     }
 
-    // ---- CLAUDE-262: webhook-logs/ -------------------------------------------
+    // ---- webhook-logs/ --------------------------------------------------------
 
     fn make_webhook_log(dir: &Path, name: &str, bytes: usize) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
@@ -1070,7 +1069,7 @@ mod tests {
         assert_eq!(stats, SweepStats::default());
     }
 
-    // ---- CLAUDE-257: size ceilings on daemon.log and output.file -----------
+    // ---- size ceilings on daemon.log and output.file -------------------------
 
     /// `bytes` bytes of numbered lines, so a test can tell head from tail.
     fn numbered_lines(bytes: usize) -> Vec<u8> {
@@ -1207,8 +1206,9 @@ mod tests {
 
     /// `0` is the documented opt-out for an operator who rotates the sink
     /// themselves; the master toggle parks the whole pass.
-    /// CLAUDE-268 AC: an oversized `usage.jsonl` comes back under its ceiling
-    /// and every surviving line is still a whole JSON record. A cut that landed
+    ///
+    /// AC: an oversized `usage.jsonl` comes back under its ceiling and every
+    /// surviving line is still a whole JSON record. A cut that landed
     /// mid-object would leave the file unparseable, which is the specific way
     /// this sweep could corrupt the thing it is bounding.
     #[test]
@@ -1256,8 +1256,8 @@ mod tests {
         assert_eq!(stats.kept, 0);
     }
 
-    /// CLAUDE-268 AC: a usage log already inside its ceiling is left
-    /// byte-for-byte alone and grows no predecessor.
+    /// AC: a usage log already inside its ceiling is left byte-for-byte alone
+    /// and grows no predecessor.
     #[test]
     fn usage_log_inside_its_ceiling_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1273,9 +1273,9 @@ mod tests {
         assert_eq!(stats.kept, 1);
     }
 
-    /// CLAUDE-268: the usage log sits directly under `logs/`, so the
-    /// action-directory walk must not treat it as an `output.file` sink and
-    /// bound it against the wrong ceiling.
+    /// The usage log sits directly under `logs/`, so the action-directory walk
+    /// must not treat it as an `output.file` sink and bound it against the
+    /// wrong ceiling.
     #[test]
     fn the_usage_log_is_not_swept_as_an_action_output_file() {
         let tmp = tempfile::tempdir().unwrap();

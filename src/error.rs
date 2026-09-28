@@ -49,7 +49,7 @@ pub enum Error {
     #[error("native action kind `{kind}` is not implemented yet")]
     NativeUnimplemented { kind: String },
 
-    #[error("action kind `{kind}` was retired in CLAUDE-270 and is no longer supported ({path})")]
+    #[error("action kind `{kind}` was retired and is no longer supported ({path})")]
     ActionRetiredKind { kind: String, path: String },
 
     #[error("snippet {phase} failed (exit {exit_code}): {stderr}")]
@@ -89,7 +89,7 @@ pub enum Error {
     #[error("no usable provider backend (tried: {0})")]
     NoBackend(String),
 
-    /// CLAUDE-234: the run already created `cap` issues, so the provider refused
+    /// The run already created `cap` issues, so the provider refused
     /// to create another. `run` is the run id, or `none` outside a run.
     #[error(
         "run {run} reached its per-run issue-creation cap of {cap}; refusing to create another \

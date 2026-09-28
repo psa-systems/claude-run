@@ -5,7 +5,7 @@
 
 <h2>Logs</h2>
 
-{# CLAUDE-235: the way in to a filter, not a second log. Both cards count the
+{# The way in to a filter, not a second log. Both cards count the
    last 24h at warn/error regardless of the table's current filter, so the
    dashboard banner's count and these agree, and each row is a link that applies
    its own filter over the same window. A NULL/empty context has no filter that
@@ -49,7 +49,7 @@
 </div>
 {% endif %}
 
-{# CLAUDE-171: every filter control re-requests this region with its selection
+{# Every filter control re-requests this region with its selection
    encoded in the URL and morph-swaps the result in place, exactly as on the
    dashboard. Each select carries every param EXCEPT its own (`query_without`),
    because htmx already sends the triggering element's own name/value: repeating

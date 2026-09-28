@@ -1,17 +1,16 @@
-//! Native YouTrack action handler (CLAUDE-32, Phase 3 of the native-action
-//! epic CLAUDE-25).
+//! Native YouTrack action handler.
 //!
 //! Ports the scripted `actions/youtrack.yml` pipeline to typed Rust on the
-//! Phase 1 dispatch seam ([`super`]) and the Phase 2 provider abstraction
+//! dispatch seam ([`super`]) and the provider abstraction
 //! ([`crate::provider`]). The pipeline is:
 //!
 //! ```text
 //! gather   -> IssueTracker::list_queued + resolve_vcs per project (drop no-VCS)
-//!             + CLAUDE-194 forge repo-access preflight, once per repo: drop the
+//!             + forge repo-access preflight, once per repo: drop the
 //!             repo's issues (leaving them Queued) when the forge token cannot
 //!             read it, rather than failing at `pr create` after a paid run
-//! eligible -> CLAUDE-182 gather-time pass, BEFORE the KeyGate: live AI Agent
-//!             re-read (drop unless still Queued) + CLAUDE-161 dependency gate
+//! eligible -> gather-time pass, BEFORE the KeyGate: live AI Agent
+//!             re-read (drop unless still Queued) + dependency gate
 //!             (drop unmet-blocker issues, keeping their Queued/comment/backoff
 //!             side effects). Ineligible issues are dropped here so they never
 //!             hold a project's single per-poll concurrency slot and starve a
@@ -20,12 +19,12 @@
 //!             AI Agent re-read + dependency gate guard the cross-run TOCTOU right
 //!             before the first mutation (skip unless still Queued / unblocked)
 //! pre      -> AI Agent=Working, State=In Progress, git clone --depth 50
-//! prompt  -> build the CLAUDE-24 local-only instruction text in Rust
+//! prompt  -> build the local-only instruction text in Rust
 //! claude  -> ClaudeInvoker with the action's claude block + timeout
 //! post    -> finalize state machine, runs on EVERY path (success, claude
 //!            error, timeout, pre/post failure, cancel):
 //!              blocker  (.claude-run-needs-review) -> AI Agent=Needs Review, no PR
-//!              no-code  (.claude-run-no-code-change, CLAUDE-214) -> AI Agent=
+//!              no-code  (.claude-run-no-code-change) -> AI Agent=
 //!                       states.no_code (default Done), marker text commented,
 //!                       no PR
 //!              success  -> Forge::create_pr, AI Agent=Code Review
@@ -36,11 +35,11 @@
 //! State is never set to Done here; it stays In Progress until a human merges
 //! the PR. Every external mutation (PR, comment, AI Agent transition) happens
 //! in [`finalize`], after claude exits, gated on the outcome - matching the
-//! merged CLAUDE-24 runner-creates-PR contract. The agent itself does local
-//! engineering work only (no push, no PR) and, since CLAUDE-214, the bounded
+//! runner-creates-PR contract. The agent itself does local
+//! engineering work only (no push, no PR) and the bounded
 //! tracker writes [`default_youtrack_prompt`] permits: a descoped piece of the
 //! triggering issue goes to the configured `write_projects`, linked `subtask
-//! of` the triggering issue; an out-of-scope bug found elsewhere (CLAUDE-297)
+//! of` the triggering issue; an out-of-scope bug found elsewhere
 //! goes to the project whose VCS integration binds the buggy repo (falling
 //! back to `write_projects`), linked `relates to` the triggering issue. Either
 //! way the agent may update / comment / link only the issues it created this
@@ -77,7 +76,7 @@ const NEEDS_REVIEW_MARKER: &str = ".claude-run-needs-review";
 /// Workdir marker that suppresses attempt counting for this run.
 const SKIP_ATTEMPT_MARKER: &str = ".claude-run-skip-attempt";
 /// Workdir marker the agent writes when it deliberately finishes a run that
-/// produces tracker output rather than code (CLAUDE-214). Its contents are the
+/// produces tracker output rather than code. Its contents are the
 /// human-facing summary, posted verbatim as the issue comment. Never an escape
 /// hatch for a code task the agent could not finish: that stays
 /// [`NEEDS_REVIEW_MARKER`].
@@ -98,7 +97,7 @@ struct YoutrackJob {
     clone_url: String,
 }
 
-/// Built-in YouTrack handler (CLAUDE-32). Routed to by [`super::handler_for`].
+/// Built-in YouTrack handler. Routed to by [`super::handler_for`].
 pub struct YoutrackHandler;
 
 impl NativeHandler for YoutrackHandler {
@@ -116,7 +115,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     let action = &loaded.action;
     let pool = ctx.pool;
 
-    // Typed config (CLAUDE-33). Validation guarantees a matching `native` block
+    // Typed config. Validation guarantees a matching `native` block
     // for `kind: youtrack`, so anything else is a misrouted action.
     let (src, forge, gh) = match &action.native {
         Some(NativeConfig::Youtrack(cfg)) => (&cfg.youtrack, &cfg.forgejo, &cfg.github),
@@ -127,7 +126,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         }
     };
 
-    // CLAUDE-103: capture the configured PR-creation strategy before the inner
+    // Capture the configured PR-creation strategy before the inner
     // loop shadows `forge` with the resolved `&dyn Forge`. `PrStrategy` is Copy.
     let pr_strategy = forge.pr_strategy;
 
@@ -147,11 +146,11 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     }
 
     // Resolve a CLI runner (CLI-first). Errors clearly if yt/fj absent. The
-    // runner is shared across the CLAUDE-28 per-job tasks, each of which builds
+    // runner is shared across the per-job tasks, each of which builds
     // its own (optionally credentialed) backend from it.
     let runner = provider::resolve_runner(provider::DEFAULT_PRIORITY)?;
 
-    // CLAUDE-26: resolve any `token_ref` to a decrypted credential once per run.
+    // Resolve any `token_ref` to a decrypted credential once per run.
     // An all-None set (the shipped, host-auth config) materializes nothing and
     // every backend below falls back to host `yt` / `fj` auth.
     let creds = Arc::new(secrets::resolve_youtrack_credentials(pool, src, forge, gh).await?);
@@ -159,12 +158,12 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
 
     // gather (before run_begin: a gather failure is a no-op run, same as the
     // scripted path). gather only invokes `yt`, so its credentials are yt-only.
-    // CLAUDE-147: stamp the poll once so the input-phase events recorded now
+    // Stamp the poll once so the input-phase events recorded now
     // (before the run row exists) can be backfilled onto the run after
     // `run_begin`, and so a zero-job poll still associates its events with this
     // timestamp on the action page.
     let poll_ts = state::now_iso();
-    // CLAUDE-182: keep the gather backend alive past `gather` so the gather-time
+    // Keep the gather backend alive past `gather` so the gather-time
     // eligibility pass below reuses its yt-only credentials for the AI Agent
     // re-read and dependency-gate reads.
     let (gather_backend, gather_guard) = if creds.is_empty() {
@@ -175,11 +174,11 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         let backend = credentialed_backend(&runner, &guard);
         (backend, Some(guard))
     };
-    // CLAUDE-194: the forge repo-access preflight. It needs its own per-host
+    // The forge repo-access preflight. It needs its own per-host
     // credential store (the gather backend's is yt-only), so it materializes one
     // per probed repo; `None` when the action references no forge secret.
     let access = forge_access_check(&runner, &creds, &cred_base, gh);
-    // CLAUDE-228: hold the gather marker so the scheduler does not stack another
+    // Hold the gather marker so the scheduler does not stack another
     // pickup while this one is still gathering.
     let gather_marker = ctx.gather.try_acquire(&action.name);
     let Gathered {
@@ -191,7 +190,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         &src.query,
         access.as_ref().map(|a| a as &dyn RepoAccess),
     )?;
-    // CLAUDE-225: drop dependency-gate rows for issues this query no longer
+    // Drop dependency-gate rows for issues this query no longer
     // matches. Only a successful query reaches here, so a `yt` failure never
     // prunes. Non-fatal: a bookkeeping failure must not abort the poll, but it is
     // logged, because a prune that stops running silently repopulates the
@@ -199,11 +198,11 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     if let Err(e) = state::dependency_gate_retain(pool, &action.name, &candidate_keys).await {
         warn!(action = %action.name, error = %e, "dependency-gate prune failed (non-fatal); the stale-gate banner may list issues that are no longer queued");
     }
-    // CLAUDE-147: persist input-phase diagnostics before `run_begin` so they
+    // Persist input-phase diagnostics before `run_begin` so they
     // survive even if no run row is ever created. Non-fatal: a bookkeeping
     // failure must not abort the poll.
     if !input_events.is_empty() {
-        // CLAUDE-216: keep a preflight-passed marker only when it clears an open
+        // Keep a preflight-passed marker only when it clears an open
         // failure; a query failure here leaves the events untouched rather than
         // dropping diagnostics.
         let input_events = match access::retain_access_recoveries(pool, &action.name, &input_events)
@@ -222,11 +221,11 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     }
     info!(action = %action.name, count = jobs.len(), "youtrack jobs gathered");
 
-    // CLAUDE-162 / CLAUDE-163: admission check. Drop gathered jobs whose
+    // Admission check. Drop gathered jobs whose
     // CONCURRENCY key (project) is already in flight in another (overlapping) run
     // of this action, then, if nothing fresh remains, return WITHOUT `run_begin`
     // so a re-gather that only re-sees already-claimed work does not litter run
-    // history with empty run rows. CLAUDE-163: deduping by concurrency key (not
+    // history with empty run rows. Deduping by concurrency key (not
     // issue id) stops a run from gathering a second same-project issue while that
     // project is already in flight; such a sibling could only park on the KeyGate
     // and defer, so gathering it is pure churn. The live AI-Agent re-read filter,
@@ -252,17 +251,17 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         return Ok(());
     }
 
-    // CLAUDE-182: gather-time eligibility pass. Evaluate the two read-only checks
-    // (live `AI Agent` re-read, CLAUDE-161 dependency gate) BEFORE building
+    // Gather-time eligibility pass. Evaluate the two read-only checks
+    // (live `AI Agent` re-read, dependency gate) BEFORE building
     // executor items and acquiring the KeyGate, and drop every ineligible issue.
     // A blocked or no-longer-Queued issue is a pure read (it never clones,
     // branches, or opens a PR), so it must not hold its project's single per-poll
     // concurrency slot: doing so starved a workable same-project sibling, because
     // the blocked issue won the shared project key each poll and consumed the
-    // slot without doing work. Blocked issues keep every CLAUDE-161 side effect
+    // slot without doing work. Blocked issues keep every dependency-gate side effect
     // (stay Queued, idempotent blocker comment, `blocked_until` backoff, persisted
     // signature); only genuinely-workable issues compete for the project key here.
-    // CLAUDE-195: a human-initiated run (daemon `trigger` or a direct `run`, i.e.
+    // A human-initiated run (daemon `trigger` or a direct `run`, i.e.
     // any origin other than the scheduler's periodic pickup) forces the dependency
     // gate to read links live, ignoring any open backoff window. Both gate call
     // sites in this run receive the same value.
@@ -288,22 +287,22 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         return Ok(());
     }
 
-    // CLAUDE-228: the gather marker covers the whole pre-`run_begin` phase (the
+    // The gather marker covers the whole pre-`run_begin` phase (the
     // work a stacked pickup would redo); released here, so overlapping runs past
-    // this point stay allowed exactly as CLAUDE-162 intends.
+    // this point stay allowed as intended.
     drop(gather_marker);
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
-    // CLAUDE-228: from here the row MUST be closed on every exit path, including
+    // From here the row MUST be closed on every exit path, including
     // an early `?` out of the bookkeeping below.
     let run_guard = state::RunGuard::new(pool, run_id);
-    // CLAUDE-147: backfill this poll's input-phase events onto the new run row.
+    // Backfill this poll's input-phase events onto the new run row.
     if !input_events.is_empty() {
         if let Err(e) = state::run_events_attach(pool, run_id, &action.name, &poll_ts).await {
             warn!(error = %e, "run_events_attach failed (non-fatal)");
         }
     }
 
-    // CLAUDE-9: register a cancellation token and ensure it is unregistered on
+    // Register a cancellation token and ensure it is unregistered on
     // every exit path (including the `?` early returns below).
     let cancel = match ctx.registry {
         Some(r) => r.register(run_id),
@@ -313,18 +312,18 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         registry: ctx.registry,
         run_id,
     };
-    // CLAUDE-223: run-scoped global-pause gate. Consulted by the executor before
+    // Run-scoped global-pause gate. Consulted by the executor before
     // each job pickup, by `process_job` before it spends a claude call, and by
     // the automerge CI wait; any trip makes the run finish with `exit::PAUSED`.
     let run_pause = ctx.pause.for_action_run(&action.name);
 
-    // CLAUDE-1: record planned job keys so the web UI shows what is queued.
+    // Record planned job keys so the web UI shows what is queued.
     let planned_keys: Vec<String> = jobs.iter().map(|j| j.key.clone()).collect();
     if let Err(e) = state::run_set_job_keys(pool, run_id, &planned_keys).await {
         warn!(error = %e, "run_set_job_keys failed (non-fatal)");
     }
 
-    // CLAUDE-108: the canonical YouTrack issue URL is fully determined by the
+    // The canonical YouTrack issue URL is fully determined by the
     // source `base_url` and each job's `idReadable` key, so persist per-job
     // `job_links` (the same mechanism the Forgejo webhook uses) to light up the
     // key hyperlinks in the web UI with zero operator config. When `base_url`
@@ -341,12 +340,12 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         }
     }
 
-    // CLAUDE-234: ONE issue-write ledger for the whole run, shared by every
+    // ONE issue-write ledger for the whole run, shared by every
     // per-job backend below, so the ceiling is per run rather than per job and
     // every write this run makes carries `run_id` into the journal.
     let audit = IssueWriteAudit::new(Some(run_id), limits.max_issues_per_run);
 
-    // CLAUDE-28: keyed, bounded-parallel execution. Distinct repos (the
+    // Keyed, bounded-parallel execution. Distinct repos (the
     // concurrency key) run in parallel; jobs against the same repo serialize so
     // they never collide on the clone dir / branch / PR. `max_parallel: 1`
     // reproduces the original strictly-sequential behavior.
@@ -376,7 +375,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         let job_spend = ctx.spend.clone();
         let fut: crate::concurrency::JobFuture = Box::pin(async move {
             let action = &loaded.action;
-            // CLAUDE-28: best-effort cap/budget check before launch; bounded
+            // Best-effort cap/budget check before launch; bounded
             // overshoot of at most `max_parallel - 1`.
             if state::daily_count_get(&pool, &action.name).await? >= limits.max_runs_per_day {
                 warn!(action = %action.name, "daily cap reached, skipping job");
@@ -386,17 +385,17 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 warn!(action = %action.name, "daily budget reached, skipping job");
                 return Ok(false);
             }
-            // DEV-705: the run's own ceiling; a run that reached it picks up
+            // The run's own ceiling; a run that reached it picks up
             // nothing further.
             if job_spend.exceeded() {
                 warn!(action = %action.name, "{}", job_spend.stop_reason());
                 return Ok(false);
             }
-            // CLAUDE-26: materialize this job's own credential files (yt config +
+            // Materialize this job's own credential files (yt config +
             // forge keys.json keyed by the issue's resolved VCS host). The guard
             // scrubs them when the job's provider calls finish; concurrent jobs
             // never share a credential file. No token_ref -> host auth, no files.
-            // CLAUDE-209: `run-{run_id}/{job_key}` is already unique per run and
+            // `run-{run_id}/{job_key}` is already unique per run and
             // job, so this site needs no extra sequence.
             let (job_backend, _job_creds): (CliBackend, Option<JobCredentials>) =
                 if creds.is_empty() {
@@ -413,7 +412,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
             if let Err(e) = state::run_inflight_add(&pool, run_id, &job.key, &inflight_ckey).await {
                 warn!(error = %e, "run_inflight_add failed (non-fatal)");
             }
-            // CLAUDE-50: pick the Forge by the job's resolved host. A GitHub host
+            // Pick the Forge by the job's resolved host. A GitHub host
             // (github.com plus any configured GHE host) routes to the GitHub
             // backend; every other host reuses the credentialed `fj` backend
             // unchanged. The GitHub PAT (when an action set `github.token_ref`)
@@ -433,7 +432,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
                 Some(f) => f,
                 None => &job_backend,
             };
-            // CLAUDE-234: the job writes through the RUN's ledger, so each
+            // The job writes through the RUN's ledger, so each
             // comment / field write is journalled with `run_id` and the issue
             // key, and any issue this job creates spends the run's ceiling.
             let tracker = AuditedTracker::new(&job_backend, job_audit);
@@ -458,7 +457,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
             if let Err(e) = state::run_inflight_remove(&pool, run_id, &job.key).await {
                 warn!(error = %e, "run_inflight_remove failed (non-fatal)");
             }
-            // CLAUDE-206: surface forge-side degradations (an open-PR lookup
+            // Surface forge-side degradations (an open-PR lookup
             // that failed and fell through to `pr create`) on the action page,
             // not only in the daemon journal. Drained before the `?` below so a
             // failed job still reports them. Non-fatal bookkeeping.
@@ -508,7 +507,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         }
     }
 
-    // CLAUDE-234: a run stopped by its issue-creation ceiling surfaces on the
+    // A run stopped by its issue-creation ceiling surfaces on the
     // action page, not only in the daemon journal. The ledger is the run's, so
     // the drain is here rather than per job. Non-fatal bookkeeping.
     let notices = audit.take_notices();
@@ -527,7 +526,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         }
     }
 
-    // DEV-705: an over-budget stop is this run's outcome unless a cancel or a
+    // An over-budget stop is this run's outcome unless a cancel or a
     // pause already claimed it.
     let exit_code = ctx
         .spend
@@ -536,7 +535,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         warn!(action = %action.name, "{}", ctx.spend.stop_reason());
     }
     run_guard.finish(exit_code, processed).await?;
-    // DEV-707: one summary line and one machine-readable record per run.
+    // One summary line and one machine-readable record per run.
     ctx.spend.finish(Some(run_id), exit_code);
     if let Some(e) = first_err {
         warn!(action = %action.name, error = %e, "one or more jobs errored during the run");
@@ -545,7 +544,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
     Ok(())
 }
 
-/// CLAUDE-28: resolve a YouTrack job's concurrency key from the configured key
+/// Resolve a YouTrack job's concurrency key from the configured key
 /// fields. `project` is the issue id's prefix, `repo` is the resolved repo path;
 /// `workflow` is reserved for a future action and unset today (it contributes
 /// nothing). Falls back to the issue id when no field resolves, so each job is
@@ -571,7 +570,7 @@ fn concurrency_key(fields: &[String], job: &YoutrackJob) -> String {
     }
 }
 
-/// CLAUDE-26: build a [`CliBackend`] from `runner`, applying a job's materialized
+/// Build a [`CliBackend`] from `runner`, applying a job's materialized
 /// credentials (yt config env, fj store env, and the temp `keys.json` path so
 /// `clone_url` reads the same store). An empty credential set leaves host auth.
 pub(crate) fn credentialed_backend(
@@ -597,7 +596,7 @@ fn sanitize_key(key: &str) -> String {
     key.replace(['/', '\\', '.'], "_")
 }
 
-/// CLAUDE-209: the gather step's credential directory, unique per poll.
+/// The gather step's credential directory, unique per poll.
 ///
 /// Every [`JobCredentials::materialize`] path must be unique per guard, because
 /// the guard's `Drop` removes the whole directory. The three call sites:
@@ -612,7 +611,7 @@ fn gather_cred_dir(cred_base: &Path) -> PathBuf {
     cred_base.join(format!("gather-{}", secrets::unique_suffix()))
 }
 
-/// CLAUDE-194: the gather-time forge repo-access preflight, injected so `gather`
+/// The gather-time forge repo-access preflight, injected so `gather`
 /// can probe the FORGE identity (which needs a per-host credential store) without
 /// owning credential materialization.
 trait RepoAccess {
@@ -620,7 +619,7 @@ trait RepoAccess {
     fn check(&self, host: &str, repo: &str) -> Result<()>;
 }
 
-/// CLAUDE-194: the real [`RepoAccess`], which materializes the action's forge
+/// The real [`RepoAccess`], which materializes the action's forge
 /// token into a per-host credential store and asks the matching backend for
 /// [`Forge::repo_access`]. Routes by host exactly as the per-job forge selection
 /// does, so a GitHub-hosted repo is probed with the GitHub PAT.
@@ -652,7 +651,7 @@ impl RepoAccess for ForgeAccessCheck {
         if self.creds.fj_token.is_none() {
             return Ok(());
         }
-        // CLAUDE-209: `{pid}-{seq}`, so two concurrent polls probing the same
+        // `{pid}-{seq}`, so two concurrent polls probing the same
         // repo get separate directories (see [`gather_cred_dir`]).
         let dir = self.cred_base.join(format!(
             "access-{}-{}-{}",
@@ -666,7 +665,7 @@ impl RepoAccess for ForgeAccessCheck {
     }
 }
 
-/// CLAUDE-194: build the gather-time preflight, or `None` when the action
+/// Build the gather-time preflight, or `None` when the action
 /// references no forge secret at all. With no `token_ref` the CLIs fall back to
 /// host auth (`src/secrets.rs`), so a probe would exercise the operator's
 /// identity rather than the bot's and could pass for a repo the bot cannot read.
@@ -692,16 +691,16 @@ fn forge_access_check(
 /// drop issues whose project has no usable VCS integration. Mirrors the
 /// scripted `input.command`.
 ///
-/// CLAUDE-194: `access` additionally preflights that the forge token can work
+/// `access` additionally preflights that the forge token can work
 /// each resolved repo, once per repo per poll, and drops the repo's issues when
 /// it cannot. `AI Agent` is left at `Queued` on that path: the condition is a
 /// missing permission grant, not a defect in the issue, so the next poll after
-/// the grant picks it up with no manual field edit. CLAUDE-207: the probe covers
+/// the grant picks it up with no manual field edit. The probe covers
 /// both capability categories the PR path crosses, a repository read and a
 /// pull-request read (`actions/SCHEMA.md`, "Forgejo token scopes"), so a token
 /// short of either scope is caught here rather than mid-run.
 ///
-/// Returns the eligible jobs plus the CLAUDE-147 input-phase events (the
+/// Returns the eligible jobs plus the input-phase events (the
 /// per-project probe failures and no-VCS drops) that the caller persists to
 /// `run_events` so they surface in the web UI rather than only in the journal.
 fn gather(
@@ -710,7 +709,7 @@ fn gather(
     access: Option<&dyn RepoAccess>,
 ) -> Result<Gathered> {
     let issues = backend.list_queued(query)?;
-    // CLAUDE-225: every key the QUERY matched, before the VCS / access filters
+    // Every key the QUERY matched, before the VCS / access filters
     // below drop any. This is "still a candidate for this action", which is what
     // decides whether a dependency-gate row is still live.
     let candidate_keys: Vec<String> = issues
@@ -720,7 +719,7 @@ fn gather(
         .collect();
     let mut vcs_cache: std::collections::HashMap<String, Option<provider::VcsRepo>> =
         std::collections::HashMap::new();
-    // CLAUDE-194: repo -> "the forge token can read it", so N issues in one
+    // repo -> "the forge token can read it", so N issues in one
     // project (or across projects sharing a repo) cost ONE `repo view` call.
     let mut access_cache: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
@@ -739,7 +738,7 @@ fn gather(
                 // `list --json`): the legitimate drop path.
                 Err(Error::NoVcsIntegration(_)) => {
                     info!(project = %project, "dropping issues: no usable VCS integration");
-                    // CLAUDE-147: surface the drop so an operator can see why a
+                    // Surface the drop so an operator can see why a
                     // project's issues never became jobs.
                     events.push(state::InputEvent {
                         level: "info".into(),
@@ -751,10 +750,10 @@ fn gather(
                 // A probe tool error (e.g. `yt` exit 2) is NOT the same as
                 // "no integration": the project may well have one and the
                 // probe failed. Surface it as a provider-CLI error rather
-                // than silently collapsing it into the drop path (CLAUDE-124).
+                // than silently collapsing it into the drop path.
                 Err(e) => {
                     warn!(project = %project, error = %e, "VCS probe failed (provider-CLI error); skipping project this poll, not treating as missing integration");
-                    // CLAUDE-147: persist the probe failure so it is visible in
+                    // Persist the probe failure so it is visible in
                     // the web UI, not only in the daemon journal.
                     events.push(state::InputEvent {
                         level: "warn".into(),
@@ -772,7 +771,7 @@ fn gather(
         let Some(repo) = vcs_cache.get(&project).and_then(|r| r.clone()) else {
             continue;
         };
-        // CLAUDE-194: forge repo-access preflight. `git push` authenticates from
+        // Forge repo-access preflight. `git push` authenticates from
         // the host's git credentials, so a repo the forge token cannot see clones
         // and pushes fine and only fails at `fj pr create` with a bare 404, after
         // a whole Claude run is paid for. Probe the forge identity here instead
@@ -783,7 +782,7 @@ fn gather(
             if !access_cache.contains_key(&cache_key) {
                 let readable = match access.check(&host, &repo.repo_path) {
                     Ok(()) => {
-                        // CLAUDE-216: the recovery marker that clears the
+                        // The recovery marker that clears the
                         // dashboard's access banner. Kept only when this repo was
                         // actually failing (`access::retain_access_recoveries`),
                         // so a healthy poll records nothing.
@@ -843,9 +842,9 @@ fn gather(
 struct Gathered {
     /// Workable jobs (query matches that survived the VCS / access filters).
     jobs: Vec<YoutrackJob>,
-    /// CLAUDE-147 input-phase diagnostics the caller persists to `run_events`.
+    /// Input-phase diagnostics the caller persists to `run_events`.
     events: Vec<state::InputEvent>,
-    /// CLAUDE-225: every key the query matched, filters aside. A dependency-gate
+    /// Every key the query matched, filters aside. A dependency-gate
     /// row for a key absent from this list holds nothing: the issue left the
     /// action's candidate set (resolved by hand, re-fielded, query changed), so
     /// the row is dead state that would otherwise sit in the stale-gate banner
@@ -862,7 +861,7 @@ fn project_key(idreadable: &str) -> String {
         .to_string()
 }
 
-/// CLAUDE-182: a candidate's gather-time verdict. Only [`Eligibility::Eligible`]
+/// A candidate's gather-time verdict. Only [`Eligibility::Eligible`]
 /// issues are built into executor items and compete for the KeyGate; a
 /// [`Eligibility::Filtered`] (no longer Queued) or [`Eligibility::Blocked`]
 /// (unmet dependency) issue is dropped before the gate so it never holds its
@@ -873,11 +872,11 @@ enum Eligibility {
     Blocked,
 }
 
-/// CLAUDE-182: run the two read-only eligibility checks for one gathered
+/// Run the two read-only eligibility checks for one gathered
 /// candidate BEFORE any executor item is built or the KeyGate acquired: the live
-/// `AI Agent` re-read (drop unless still Queued) then the CLAUDE-161 dependency
+/// `AI Agent` re-read (drop unless still Queued) then the dependency
 /// gate (drop an issue with unmet blockers). A blocked issue keeps every
-/// CLAUDE-161 side effect; this only moves WHEN the gate runs (at gather, not
+/// dependency-gate side effect; this only moves WHEN the gate runs (at gather, not
 /// after winning the concurrency key), so a blocked issue no longer consumes the
 /// project's per-poll work slot. `process_job` still re-runs both checks after it
 /// wins the key: that post-gate re-read is the authoritative cross-run TOCTOU
@@ -906,7 +905,7 @@ async fn evaluate_eligibility(
             return Eligibility::Filtered;
         }
     }
-    // ---- dependency gate (CLAUDE-161) ----
+    // ---- dependency gate ----
     match dependency_gate(pool, backend, src, action, key, bypass_backoff).await {
         Ok(GateDecision::Proceed) => Eligibility::Eligible,
         Ok(GateDecision::Blocked { blockers }) => {
@@ -927,7 +926,7 @@ async fn evaluate_eligibility(
     }
 }
 
-/// CLAUDE-182: keep only the workable candidates, dropping every issue the
+/// Keep only the workable candidates, dropping every issue the
 /// gather-time eligibility pass rules out (no-longer-Queued or dependency-
 /// blocked). Runs per candidate, before the executor is built, so ineligible
 /// issues never compete for a project's concurrency key.
@@ -968,12 +967,12 @@ async fn process_job(
     limits: &EffectiveLimits,
     cancel: &CancellationToken,
     pause: &crate::pause::RunPause,
-    // DEV-705 / DEV-707: the run's shared ledger and frozen ceiling.
+    // The run's shared ledger and frozen ceiling.
     spend: &crate::usage::RunSpend,
     job: &YoutrackJob,
     pr_strategy: crate::action::PrStrategy,
     bypass_backoff: bool,
-    // CLAUDE-315: the run row this job belongs to, for the invocation's usage
+    // The run row this job belongs to, for the invocation's usage
     // record; the job itself already threads `run_id` through the calling
     // scheduler loop for `run_inflight_add`/`run_inflight_remove`.
     run_id: i64,
@@ -985,12 +984,12 @@ async fn process_job(
 
     // YouTrack jobs always carry a stable key (idReadable), so the attempt cap
     // always applies.
-    // CLAUDE-301: the issue no longer just sits at Queued to be skipped again
+    // The issue no longer just sits at Queued to be skipped again
     // on the next poll. It gets one comment naming the cap and moves to
     // Needs Review, the same label the needs-review marker and the timeout
     // path use for "parked pending a human decision". A write failure here
     // must not swallow the cap hit: `report_cap_reached` logs each failure at
-    // `error` and this still returns `CapHit` so the CLAUDE-232 banner keeps
+    // `error` and this still returns `CapHit` so the banner keeps
     // showing the key.
     if attempts >= limits.max_attempts_per_key {
         warn!(
@@ -1015,7 +1014,7 @@ async fn process_job(
     let workdir_path = workdir::job_workdir(&wb_base, &action.name, key);
 
     // ---- filter: live AI Agent re-read ----
-    // CLAUDE-182: the gather-time eligibility pass ([`filter_eligible`]) already
+    // The gather-time eligibility pass ([`filter_eligible`]) already
     // dropped issues that were not Queued, so this poll's candidate never should
     // have reached the KeyGate ineligible. This re-read is the authoritative
     // post-gate re-check for the cross-run TOCTOU: an overlapping run may have
@@ -1036,8 +1035,8 @@ async fn process_job(
         }
     }
 
-    // ---- dependency gate (CLAUDE-161) ----
-    // CLAUDE-182: the gather-time pass already dropped issues with unmet blockers
+    // ---- dependency gate ----
+    // The gather-time pass already dropped issues with unmet blockers
     // before the KeyGate, so a blocked issue no longer holds the project's per-poll
     // slot. This post-gate re-check catches the rare case where a dependency became
     // unmet between gather and winning the key; the gate's side effects are
@@ -1069,10 +1068,10 @@ async fn process_job(
         }
     }
 
-    // ---- CLAUDE-275: resume an existing open PR's branch on a re-queue ----
+    // ---- resume an existing open PR's branch on a re-queue ----
     // A DB lookup (async) plus, when a record is found, a live confirmation
     // against the forge (sync, so wrapped). Any failure here just means a fresh
-    // pickup, exactly as before CLAUDE-275; it never fails the job.
+    // pickup; it never fails the job.
     let resume = match resolve_pr_resume(pool, forge, job, pr_strategy).await {
         Ok(r) => r,
         Err(e) => {
@@ -1081,13 +1080,13 @@ async fn process_job(
         }
     };
 
-    // CLAUDE-102: a preserved workdir from a failed finalize (unpushed commits)
+    // A preserved workdir from a failed finalize (unpushed commits)
     // must not be clobbered by this attempt's clone; move it aside first.
     preserve_aside(&workdir_path);
     std::fs::create_dir_all(&workdir_path)?;
 
     // ---- pre: mark Working / In Progress, then clone ----
-    // CLAUDE-228: `yt` field writes plus a full `git clone` of the target repo,
+    // `yt` field writes plus a full `git clone` of the target repo,
     // all synchronous; keep them off the async worker thread.
     let resume_branch = resume.as_ref().map(|r| r.branch.as_str());
     let pre_result = crate::blocking::in_place(|| {
@@ -1095,7 +1094,7 @@ async fn process_job(
     });
 
     // ---- prompt + claude (skipped on pre failure / cancel / global pause) ----
-    // CLAUDE-223: the gate is read once here (not in a match guard, which cannot
+    // The gate is read once here (not in a match guard, which cannot
     // `await`) and reused below so a paused job's attempt is not counted.
     let paused_before_claude = pre_result.is_ok() && !cancel.is_cancelled() && pause.stop().await;
     let (claude_result, claude_ran) = match pre_result {
@@ -1135,12 +1134,12 @@ async fn process_job(
                 &workdir_path,
                 &stream_log,
                 cancel,
-                // DEV-705: cap the child at the run's remaining ceiling.
+                // Cap the child at the run's remaining ceiling.
                 Some(spend.remaining_usd()),
             )?;
-            // DEV-707: bill the run before any branch discards `r`.
+            // Bill the run before any branch discards `r`.
             spend.record(&r);
-            // CLAUDE-315: persist this invocation's plan usage before any
+            // Persist this invocation's plan usage before any
             // branch discards `r`, mirroring the billing call above.
             crate::usage::record_invocation(
                 pool,
@@ -1179,7 +1178,7 @@ async fn process_job(
     // Transient claude error: no finalize, no attempt counted, no daily count.
     if claude_result.transient {
         info!(action = %action.name, key = %key, error = %claude_result.error, "transient claude error, not counting attempt");
-        // CLAUDE-228: the preserve decision runs `git ls-remote` against the
+        // The preserve decision runs `git ls-remote` against the
         // remote (network) and may then run `git clean -fdX`; keep it off the
         // async worker thread.
         crate::blocking::in_place(|| cleanup_or_preserve(&workdir_path, &action.name, key));
@@ -1190,7 +1189,7 @@ async fn process_job(
         state::daily_cost_add(pool, &action.name, claude_result.cost).await?;
     }
 
-    // CLAUDE-304: computed once, before finalize, so both finalize's
+    // Computed once, before finalize, so both finalize's
     // compaction check and the `ProcessedJob::Done` field below read the same
     // path; `None` when claude never ran, so there is no log to check.
     let stream_log = claude_ran.then(|| {
@@ -1198,7 +1197,7 @@ async fn process_job(
     });
 
     // ---- finalize (the native "post"): every external mutation lives here ----
-    // CLAUDE-228: synchronous. CLAUDE-278: finalize no longer polls CI (that
+    // Synchronous. Finalize no longer polls CI (that
     // wait is now driven by a webhook event), so it returns promptly.
     let finalize_res = crate::blocking::in_place(|| {
         finalize(
@@ -1212,7 +1211,7 @@ async fn process_job(
             stream_log.as_deref(),
         )
     });
-    // ---- CLAUDE-275: record a newly opened PR against its issue ----
+    // ---- record a newly opened PR against its issue ----
     // Only for a fresh PR (`resume` is `None`): a resumed job's PR is already
     // recorded, and re-inserting it would collide with the store's
     // `UNIQUE(host, repo, pr_number)`. `finalize` cannot make this DB write
@@ -1252,7 +1251,7 @@ async fn process_job(
         }
     };
 
-    // ---- skip-attempt marker (parked / blocker), cancel, or pause (CLAUDE-223) ----
+    // ---- skip-attempt marker (parked / blocker), cancel, or pause ----
     let skip_marker = workdir_path.join(SKIP_ATTEMPT_MARKER);
     let cancelled = cancel.is_cancelled();
     let skip_attempt = skip_marker.exists() || cancelled || paused_before_claude;
@@ -1270,14 +1269,14 @@ async fn process_job(
         state::daily_count_increment(pool, &action.name).await?;
     }
 
-    // CLAUDE-102: a finalize failure can cost a retry, never the work. Only a
+    // A finalize failure can cost a retry, never the work. Only a
     // successfully opened PR skips the branch-vs-remote check (the AGit push
     // leaves no remote-tracking ref, so that check cannot clear it); every
     // other outcome deletes only when no unpushed commits would be lost. A
     // panic anywhere above preserves trivially: deletion only ever happens
     // here, explicitly.
-    // CLAUDE-228: same as above, the preserve branch shells out to git.
-    // CLAUDE-281: a Code Review PR still leaves the branch-vs-remote check
+    // Same as above, the preserve branch shells out to git.
+    // A Code Review PR still leaves the branch-vs-remote check
     // skipped, but a dirty tree or stash is work that never made it into the
     // PR at all, so it is checked and preserved just the same.
     crate::blocking::in_place(|| match &finalize_res {
@@ -1323,7 +1322,7 @@ async fn process_job(
     })
 }
 
-/// CLAUDE-275: an open recorded PR this job continues rather than reopening.
+/// An open recorded PR this job continues rather than reopening.
 struct PrResume {
     /// The PR's server head branch, cloned instead of the default branch.
     branch: String,
@@ -1331,7 +1330,7 @@ struct PrResume {
     pr_url: String,
 }
 
-/// CLAUDE-275: look up whether `job`'s issue already has an open PR recorded
+/// Look up whether `job`'s issue already has an open PR recorded
 /// against it and, if so, confirm it is still open before resuming its branch.
 ///
 /// Returns `Ok(None)` on every path that should fall back to opening a fresh
@@ -1368,7 +1367,7 @@ async fn resolve_pr_resume(
     };
     if let Some(pr) = open.iter().find(|p| p.number as i64 == rec.pr_number) {
         info!(key = %job.key, pr = rec.pr_number, branch = %rec.head_branch, "CLAUDE-275: resuming the recorded open PR's branch");
-        // CLAUDE-308: prefer the listed PR's own URL, which is correct for any
+        // Prefer the listed PR's own URL, which is correct for any
         // backend (GitHub's `/pull/<n>` vs Forgejo's `/pulls/<n>`); the `format!`
         // is only a fallback for a listing that carries no `html_url`.
         let pr_url = if pr.html_url.is_empty() {
@@ -1394,7 +1393,7 @@ async fn resolve_pr_resume(
     Ok(None)
 }
 
-/// CLAUDE-275: record a freshly opened PR against its issue in the
+/// Record a freshly opened PR against its issue in the
 /// `agent_pull_requests` store, so a later re-queue of the same issue can
 /// resume its branch instead of opening a second PR. Best-effort: a write
 /// failure is logged at `error`, surfaced as a `run_events` row via
@@ -1452,7 +1451,7 @@ impl Blocker {
     }
 }
 
-/// The pre-clone dependency gate's verdict (CLAUDE-161).
+/// The pre-clone dependency gate's verdict.
 enum GateDecision {
     /// No unmet dependency: pickup proceeds exactly as before.
     Proceed,
@@ -1513,7 +1512,7 @@ fn blocked_comment(blockers: &[Blocker]) -> String {
     s
 }
 
-/// The dependency gate (CLAUDE-161). Returns [`GateDecision::Proceed`] when the
+/// The dependency gate. Returns [`GateDecision::Proceed`] when the
 /// issue has no unmet dependency (clear, none, or its backoff just re-evaluated
 /// clean), else [`GateDecision::Blocked`]. Side effects on the blocked path: post
 /// the blocker comment (idempotently), and persist the re-check backoff
@@ -1521,22 +1520,22 @@ fn blocked_comment(blockers: &[Blocker]) -> String {
 /// open the issue is not re-evaluated at all (no `yt` read, no comment); the
 /// persisted signature reconstructs the blocker list for the outcome.
 ///
-/// CLAUDE-182: invoked in two places, and the backoff makes the pair cheap. The
+/// Invoked in two places, and the backoff makes the pair cheap. The
 /// gather-time pass ([`filter_eligible`]) runs it BEFORE the KeyGate to drop a
 /// blocked issue so it never holds the project's per-poll slot; [`process_job`]
 /// re-runs it after winning the key as the authoritative pre-clone re-check. A
 /// workable issue persists no state, so the second read is a plain re-read; a
 /// blocked issue is dropped at gather and never reaches `process_job`.
 ///
-/// CLAUDE-195: `bypass_backoff` forces the live `issue_links` read even inside an
+/// `bypass_backoff` forces the live `issue_links` read even inside an
 /// open backoff window. It is set for human-initiated runs (`claude-run trigger`,
 /// direct `claude-run run`), where the operator expects an evaluation against the
 /// live tracker, not a replay of the cached signature. The scheduler's periodic
-/// pickup passes `false`, keeping CLAUDE-182's throttle. Every other side effect
+/// pickup passes `false`, keeping the throttle above. Every other side effect
 /// (signature/`blocked_until` persistence, row clear, changed-set comment) is
 /// unchanged; bypass only skips the window short-circuit.
 ///
-/// CLAUDE-225: every blocked return logs how long the issue has been held, at
+/// Every blocked return logs how long the issue has been held, at
 /// `warn` once past [`state::STALE_GATE_AFTER_MS`]. A gate that stops resuming is
 /// otherwise silent at every layer: the issue stays Queued with no field change,
 /// a poll whose candidates are all blocked returns before `run_begin` so no run
@@ -1605,7 +1604,7 @@ async fn dependency_gate(
     let blocked_until = now_ms + recheck.as_millis() as i64;
     state::dependency_gate_upsert(pool, action, key, blocked_until, &signature).await?;
 
-    // CLAUDE-225: an unchanged row keeps its original stamp, so this measures the
+    // An unchanged row keeps its original stamp, so this measures the
     // whole block, not this evaluation.
     let blocked_since = prev.map(|p| p.blocked_since_ms).unwrap_or(now_ms);
     log_held(action, key, &signature, blocked_since, now_ms);
@@ -1615,7 +1614,7 @@ async fn dependency_gate(
     })
 }
 
-/// CLAUDE-225: log how long the gate has held this issue, escalating to `warn`
+/// Log how long the gate has held this issue, escalating to `warn`
 /// past [`state::STALE_GATE_AFTER_MS`]. The gate's own comment promises automatic
 /// re-evaluation, so a block that outlives the threshold is either a dependency
 /// nobody is working or a re-evaluation that stopped happening; both are worth an
@@ -1644,7 +1643,7 @@ fn run_pre(
     src: &YoutrackSource,
     job: &YoutrackJob,
     workdir: &Path,
-    // CLAUDE-275: the recorded PR's head branch to resume, or `None` for the
+    // The recorded PR's head branch to resume, or `None` for the
     // default-branch clone this always used to be.
     resume_branch: Option<&str>,
 ) -> std::result::Result<(), String> {
@@ -1654,7 +1653,7 @@ fn run_pre(
     backend
         .set_state(&job.key, &src.states.in_progress)
         .map_err(|e| format!("set State={}: {e}", src.states.in_progress))?;
-    // CLAUDE-131: optionally assign the issue before cloning, so an assignee
+    // Optionally assign the issue before cloning, so an assignee
     // failure aborts pickup before any repo work (same contract as the field /
     // state writes above). Unset leaves the Assignee untouched.
     if let Some(login) = &src.assignee {
@@ -1668,7 +1667,7 @@ fn run_pre(
     Ok(())
 }
 
-/// CLAUDE-120: install the repo's git pre-commit hook on a fresh clone so a
+/// Install the repo's git pre-commit hook on a fresh clone so a
 /// commit that fails the repo's local checks is blocked locally instead of only
 /// being caught by CI (the gap that produced A8N-69). Detects a `just
 /// install-hooks` recipe and, when present, runs it; the recipe is idempotent
@@ -1716,7 +1715,7 @@ fn install_hooks(workdir: &Path) {
 
 /// The URL to clone this job's repo from.
 ///
-/// CLAUDE-252: prefer the token-bearing URL the forge builds from its own key
+/// Prefer the token-bearing URL the forge builds from its own key
 /// store, the same one the comment webhook already uses.
 /// `job.clone_url` comes from the YouTrack VCS integration and carries no
 /// credential, so on a host with no git credential of its own (the container,
@@ -1757,17 +1756,17 @@ fn clone_repo(clone_url: &str, workdir: &Path, branch: Option<&str>) -> Result<(
     provider::shallow_clone(clone_url, branch, workdir, 50)
 }
 
-/// The built-in YouTrack agent prompt as a placeholder template (CLAUDE-125).
+/// The built-in YouTrack agent prompt as a placeholder template.
 /// Returns the default instruction text - local-only code work (no push, no PR)
-/// plus the bounded tracker writes CLAUDE-214 permits - with the documented
+/// plus the bounded tracker writes it permits - with the documented
 /// `{{...}}` placeholders that [`render_prompt_template`] substitutes per job.
 /// Exposed crate-wide so the web form can prefill the prompt editor with the
 /// live default.
 ///
-/// CLAUDE-214 replaced the blanket YouTrack ban with an explicit permission
+/// This replaces a blanket YouTrack ban with an explicit permission
 /// block, because the `No orphan notes` directive requires a run that discovers
 /// a gap to file it as a tracked, linked issue rather than mention it in prose.
-/// CLAUDE-297 split that permission into two cases: a descoped piece of the
+/// That permission splits into two cases: a descoped piece of the
 /// triggering issue is filed in `write_projects` and linked `subtask of`; a
 /// bug found outside the triggering issue's scope is filed in the project
 /// whose VCS integration binds the buggy repo (falling back to
@@ -1844,7 +1843,7 @@ pub(crate) fn preset_prompt(p: PromptPreset) -> String {
 }
 
 /// The unrendered prompt template for an action: the `native.youtrack.prompt`
-/// override (CLAUDE-125) when set, otherwise the `prompt_preset` built-in.
+/// override when set, otherwise the `prompt_preset` built-in.
 pub(crate) fn prompt_template(src: &YoutrackSource) -> String {
     match &src.prompt {
         Some(p) => p.clone(),
@@ -1864,7 +1863,7 @@ fn build_prompt(
     render_prompt_template(&template, job, workdir, &write_projects(src, job), resume)
 }
 
-/// The project list `{{write_projects}}` renders to (CLAUDE-214): the configured
+/// The project list `{{write_projects}}` renders to: the configured
 /// `native.youtrack.write_projects`, or the triggering issue's own project when
 /// that list is empty, so filing a deferred item works with no site-specific
 /// configuration and none is baked into the binary.
@@ -1878,9 +1877,9 @@ fn write_projects(src: &YoutrackSource, job: &YoutrackJob) -> String {
 
 /// Substitute the documented `{{...}}` placeholders in `template` with this
 /// job's values. An unknown `{{name}}` is left literal and logged at warn
-/// (forgiving per CLAUDE-125), as is an unterminated `{{`.
+/// (forgiving by design), as is an unterminated `{{`.
 ///
-/// CLAUDE-275: `existing_pr_url` / `existing_branch` render empty when `resume`
+/// `existing_pr_url` / `existing_branch` render empty when `resume`
 /// is `None` (a fresh pickup); when it is `Some`, they carry the recorded PR's
 /// URL and head branch, which is already checked out in `workdir`.
 fn render_prompt_template(
@@ -1940,7 +1939,7 @@ fn render_prompt_template(
 enum Finalized {
     /// Blocker: agent parked the job; AI Agent=Needs Review, no PR.
     NeedsReview,
-    /// CLAUDE-214: a successful run that deliberately produced tracker output
+    /// A successful run that deliberately produced tracker output
     /// rather than code and left `.claude-run-no-code-change`. No PR, the marker
     /// text is commented, AI Agent=`states.no_code` (default the `done` label),
     /// State untouched.
@@ -1948,7 +1947,7 @@ enum Finalized {
     /// Success: PR opened; AI Agent=Code Review.
     CodeReview {
         pr_url: String,
-        /// CLAUDE-275: the PR's identity, so the caller (`process_job`, which
+        /// The PR's identity, so the caller (`process_job`, which
         /// alone has the pool and can await) records it in the
         /// `agent_pull_requests` store once this synchronous state machine
         /// returns; `finalize`'s own unit tests run with no tokio runtime, so
@@ -1960,7 +1959,7 @@ enum Finalized {
     /// Hard failure (claude error, pre failure, or PR-create failure);
     /// AI Agent=Failed, no PR (or a failed PR).
     Failed,
-    /// CLAUDE-52: claude hit the wall-clock limit (exit 124). The work may be
+    /// Claude hit the wall-clock limit (exit 124). The work may be
     /// complete, partial, or absent, so the issue is NOT marked Failed: a
     /// timeout-specific comment is posted and the AI Agent field is advanced to
     /// Needs Review only when still Working (a human/agent-advanced state is left
@@ -1984,7 +1983,7 @@ impl Finalized {
 /// the single finalize `post` step in `actions/youtrack.yml`: the comment is
 /// best-effort (a comment failure cannot strand the AI Agent field on Working),
 /// and the AI Agent write is the authoritative, last operation. State stays In
-/// Progress until a human merges the PR. CLAUDE-278: finalize itself never
+/// Progress until a human merges the PR. Finalize itself never
 /// merges or waits for CI any more, even with automerge enabled; that happens
 /// later, driven by a `success`/`recover` Action-run webhook event calling
 /// [`complete_automerge`] on this PR.
@@ -2014,12 +2013,12 @@ fn finalize(
         comment_then_field(backend, src, &job.key, &reason, &src.states.needs_review)?;
         Ok(Finalized::NeedsReview)
     } else if claude_result.ok && no_code.exists() {
-        // CLAUDE-214: the run deliberately produced tracker output rather than
+        // The run deliberately produced tracker output rather than
         // code, so there are no commits and nothing to open a PR from. Skip the
         // forge entirely, post the marker text verbatim, and finish on the
         // no-code label. State is left alone, so the issue stays In Progress
         // until a human closes it. Without the marker a zero-commit run keeps
-        // the CLAUDE-212 behavior below: the ahead check fails and AI Agent goes
+        // the behavior below: the ahead check fails and AI Agent goes
         // to Failed.
         let summary = std::fs::read_to_string(&no_code)?.trim().to_string();
         let label = src.states.no_code_label().to_string();
@@ -2028,7 +2027,7 @@ fn finalize(
         Ok(Finalized::NoCodeChange)
     } else if claude_result.ok {
         // Success: open the PR from the agent's local commits via the resolved
-        // Forge (CLAUDE-50: `fj` agit+autofill for Forgejo hosts, the GitHub
+        // Forge (`fj` agit+autofill for Forgejo hosts, the GitHub
         // backend for GitHub hosts), then report it. Both derive the title/body
         // from the commit messages, which already carry the bare #<KEY>-N
         // reference.
@@ -2039,7 +2038,7 @@ fn finalize(
                 let body = success_comment(claude_result, &url);
                 let body = append_compaction_note(&body, stream_log, &job.key);
                 comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
-                // CLAUDE-278: finalize no longer waits for CI itself. When
+                // Finalize no longer waits for CI itself. When
                 // `automerge.enabled`, the merge happens later, driven by a
                 // `success`/`recover` Action-run webhook event on this PR (see
                 // `crate::web::webhooks`), not by a poll here. The issue simply
@@ -2051,10 +2050,10 @@ fn finalize(
                 })
             }
             Err(e) => {
-                // CLAUDE-102: the error reaches the journal here (the run loop
-                // only records `outcome: Failed`). CLAUDE-193: the comment names
-                // where the work actually is (preserved workdir, or the remote
-                // branch the push already landed), never "nothing to preserve".
+                // The error reaches the journal here (the run loop only records
+                // `outcome: Failed`). The comment names where the work actually
+                // is (preserved workdir, or the remote branch the push already
+                // landed), never "nothing to preserve".
                 warn!(key = %job.key, error = %e, "PR creation failed; finalizing as Failed");
                 let body = pr_failure_comment(claude_result, &e, &work_location(workdir));
                 comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
@@ -2062,7 +2061,7 @@ fn finalize(
             }
         }
     } else if claude_result.timed_out {
-        // CLAUDE-52: timeout (exit 124). Ambiguous outcome: the agent may have
+        // Timeout (exit 124). Ambiguous outcome: the agent may have
         // finished the work yet a lingering background task held the process
         // open past the limit. Do NOT mark Failed. Comment with the situation,
         // and advance AI Agent to Needs Review only when it is still Working;
@@ -2089,7 +2088,7 @@ fn finalize(
     }
 }
 
-/// CLAUDE-304: a run whose context was compacted mid-run may have rebuilt
+/// A run whose context was compacted mid-run may have rebuilt
 /// finding write-ups (or other filed content) from the compacted summary
 /// instead of re-reading it, which is what let an earlier audit run file nine issues
 /// with citations that did not exist. Appended only to the success and
@@ -2117,14 +2116,14 @@ fn append_compaction_note(body: &str, stream_log: Option<&Path>, key: &str) -> S
     }
 }
 
-/// CLAUDE-278: complete automerge on a PR whose checks a `success`/`recover`
-/// Action-run webhook event has already confirmed are green and mergeable.
-/// Called from `crate::web::webhooks`'s success-event handler, not from
-/// `finalize` (which no longer waits for CI itself). Merges as a merge-commit,
-/// then posts a best-effort comment: a comment failure is logged at `error`
-/// and never fails the merge result, since the merge already succeeded on its
-/// own terms. CLAUDE-327: no `State` or `AI Agent` write here - both stay at
-/// Code Review after a runner merge, and the YouTrack workflow
+/// Complete automerge on a PR whose checks a `success`/`recover` Action-run
+/// webhook event has already confirmed are green and mergeable. Called from
+/// `crate::web::webhooks`'s success-event handler, not from `finalize` (which
+/// no longer waits for CI itself). Merges as a merge-commit, then posts a
+/// best-effort comment: a comment failure is logged at `error` and never
+/// fails the merge result, since the merge already succeeded on its own
+/// terms. No `State` or `AI Agent` write here - both stay at Code Review
+/// after a runner merge, and the YouTrack workflow
 /// (`docs/yt-workflow-resolve-on-pr-merge.js`) resolves the issue once it sees
 /// the merge.
 pub(crate) fn complete_automerge(
@@ -2153,7 +2152,7 @@ fn merged_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
-/// CLAUDE-309: the PR's checks went green but Forgejo reports it as not
+/// The PR's checks went green but Forgejo reports it as not
 /// mergeable (a conflict, still being checked, or a WIP PR) - unrelated to
 /// whether it is behind its base, which is decided separately by
 /// `behind_base` before this comment is ever reached. Comments and leaves the
@@ -2171,7 +2170,7 @@ pub(crate) fn automerge_not_mergeable_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
-/// CLAUDE-309: the PR's checks went green and its branch is behind its base
+/// The PR's checks went green and its branch is behind its base
 /// (`behind_base: true`). The runner updated it through Forgejo's Update-branch
 /// endpoint, which retriggers CI; a later `success` event re-evaluates and
 /// merges once that run goes green.
@@ -2187,7 +2186,7 @@ pub(crate) fn automerge_branch_updated_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
-/// CLAUDE-309: the branch was behind its base, and updating it against the
+/// The branch was behind its base, and updating it against the
 /// base failed (for example a 409 conflict). Left at Code Review for a human
 /// to resolve; `error` carries Forgejo's own reason when `fj` reports one.
 pub(crate) fn automerge_update_failed_comment(pr_url: &str, error: &str) -> String {
@@ -2203,7 +2202,7 @@ pub(crate) fn automerge_update_failed_comment(pr_url: &str, error: &str) -> Stri
     .join("\n")
 }
 
-/// CLAUDE-309: `fj pr status` did not report `behind_base` at all, meaning the
+/// `fj pr status` did not report `behind_base` at all, meaning the
 /// runtime's `fj` predates FJ-99. Automerge cannot tell whether the branch is
 /// up to date, so it takes no merge action and leaves the issue at Code
 /// Review for a human to check.
@@ -2222,7 +2221,7 @@ pub(crate) fn automerge_behind_base_missing_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
-/// CLAUDE-309: the merge itself was refused by Forgejo (for example a
+/// The merge itself was refused by Forgejo (for example a
 /// protected base blocking an outdated branch with a 405). Left at Code
 /// Review for a human to resolve; `error` carries Forgejo's own refusal
 /// reason when `fj` reports one (FJ-99).
@@ -2239,13 +2238,13 @@ pub(crate) fn automerge_merge_failed_comment(pr_url: &str, error: &str) -> Strin
     .join("\n")
 }
 
-/// CLAUDE-301: an issue at the per-key attempt cap leaves the queue instead of
+/// An issue at the per-key attempt cap leaves the queue instead of
 /// being skipped again on every poll. Comments the cap event (best-effort)
 /// then sets AI Agent to Needs Review, the same label the needs-review marker
 /// and the timeout path use for "parked pending a human". Unlike
 /// [`comment_then_field`], a failed write here must not abort the caller (the
 /// cap was still hit and `ProcessedJob::CapHit` must still be returned so the
-/// CLAUDE-232 banner keeps showing the key), so each write is attempted
+/// stale-attempts banner keeps showing the key), so each write is attempted
 /// independently and a failure of either logs at `error` naming the key and
 /// the cause.
 fn report_cap_reached(
@@ -2334,9 +2333,9 @@ fn success_comment(r: &ClaudeResult, pr_url: &str) -> String {
 }
 
 fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> String {
-    // CLAUDE-102 / CLAUDE-193: name where the work actually is. Under the branch
-    // PR strategy the push happens before the PR call, so a PR-only failure
-    // leaves the work on the remote, not in a preserved workdir.
+    // Name where the work actually is. Under the branch PR strategy the push
+    // happens before the PR call, so a PR-only failure leaves the work on the
+    // remote, not in a preserved workdir.
     let location_line = match work {
         WorkLocation::PreservedWorkdir(p) => format!(
             "The committed branch is PRESERVED on the daemon host at: `{}` (push it manually or re-run after the PR path is fixed).",
@@ -2368,7 +2367,7 @@ fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> Str
     body
 }
 
-/// CLAUDE-52: timeout-specific comment. Surfaces the ambiguity (the work may be
+/// Timeout-specific comment. Surfaces the ambiguity (the work may be
 /// complete despite the kill, e.g. a backgrounded command held the process open
 /// past the limit), states the runner did NOT mark the issue Failed, and points
 /// a human at the branch/PR and the run log (`r.error` carries the log path).
@@ -2458,7 +2457,7 @@ fn cleanup_workdir(workdir: &Path) {
     crate::workdir::force_remove(workdir);
 }
 
-/// CLAUDE-105 / CLAUDE-281 / CLAUDE-284: true when [`crate::workdir::local_only_work`]
+/// True when [`crate::workdir::local_only_work`]
 /// finds anything a delete would destroy: a local branch tip the remote does
 /// not have under its own name, a dirty tracked/untracked tree, or a stash.
 /// Any git or network failure errs toward `true`: preserving costs disk, a
@@ -2471,7 +2470,7 @@ pub(crate) fn has_local_only_work(workdir: &Path) -> bool {
     }
 }
 
-/// CLAUDE-193 / CLAUDE-281: where a failed-PR run's work actually is, for the
+/// Where a failed-PR run's work actually is, for the
 /// comment a human reads. Computed from the same
 /// [`crate::workdir::local_only_work`] query that decides preserve-or-delete,
 /// so the comment can never contradict [`cleanup_or_preserve`].
@@ -2518,18 +2517,17 @@ fn work_location(workdir: &Path) -> WorkLocation {
     }
 }
 
-/// CLAUDE-102 / CLAUDE-281: delete the workdir unless
-/// [`crate::workdir::local_only_work`] finds unpushed commits, a dirty tree,
-/// or a stash. The preserve branch is the data-loss guard from the CLAUDE-101
-/// incident, where a failed `create_pr` plus an unconditional cleanup
-/// destroyed the run's only copy of the committed work; CLAUDE-281 extended it
-/// past committed-but-unpushed branches to the uncommitted and stashed work
-/// the old branch-only check never looked at.
+/// Delete the workdir unless [`crate::workdir::local_only_work`] finds
+/// unpushed commits, a dirty tree, or a stash. The preserve branch is a
+/// data-loss guard: an earlier incident had a failed `create_pr` plus an
+/// unconditional cleanup destroy a run's only copy of the committed work, and
+/// the guard was later extended past committed-but-unpushed branches to the
+/// uncommitted and stashed work a branch-only check would miss.
 fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
     crate::workdir::cleanup_or_preserve(workdir, action, key);
 }
 
-/// CLAUDE-102: move a leftover (preserved) workdir out of the way of a fresh
+/// Move a leftover (preserved) workdir out of the way of a fresh
 /// attempt's clone, to the first free `<dir>.kept-<n>` sibling. An empty
 /// leftover directory is left in place (the clone tolerates it).
 fn preserve_aside(workdir: &Path) {
@@ -2571,7 +2569,7 @@ mod tests {
     use serde_json::Value;
     use std::sync::Arc;
 
-    /// CLAUDE-252: the pre step clones the URL the FORGE resolves from its key
+    /// The pre step clones the URL the FORGE resolves from its key
     /// store, not the unauthenticated one the YouTrack VCS integration reports.
     /// A container has no git credential of its own, so the plain URL failed
     /// every job with `could not read Username`.
@@ -2616,7 +2614,7 @@ mod tests {
         assert!(!rendered.contains("oauth2:"), "{rendered}");
     }
 
-    /// CLAUDE-269 acceptance criterion 3: a job whose invocation hits the
+    /// A job whose invocation hits the
     /// authentication failure spends no attempt against
     /// `max_attempts_per_key` and runs no finalize, through the native
     /// YouTrack `process_job` pipeline (not merely the generic scripted one in
@@ -2742,7 +2740,7 @@ mod tests {
         // response"; reaching this point proves finalize never ran.
     }
 
-    /// CLAUDE-301 acceptance criterion 1: a queued issue whose key is at the
+    /// A queued issue whose key is at the
     /// cap gets exactly one comment naming the attempt count and the cap, and
     /// its AI Agent field moves to the configured Needs Review label, through
     /// the full `process_job` pipeline (the cap check runs before any other
@@ -2833,7 +2831,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-301 acceptance criterion 2: a failed comment or field write at
+    /// A failed comment or field write at
     /// the cap still returns `CapHit` (the banner must keep showing the key)
     /// rather than propagating the write error out of `process_job`.
     #[tokio::test]
@@ -2954,7 +2952,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-56: a failure with a populated `raw` event leads with the friendly
+    /// A failure with a populated `raw` event leads with the friendly
     /// summary, preserves the first-line error and Cost line, and appends the
     /// pretty-printed event in a collapsed `<details>` block.
     #[test]
@@ -2981,7 +2979,7 @@ mod tests {
         assert!(body.contains("\"api_error_status\": \"529\""));
     }
 
-    /// CLAUDE-56: a synthesized failure (empty `raw`) omits the `<details>` block.
+    /// A synthesized failure (empty `raw`) omits the `<details>` block.
     #[test]
     fn failure_comment_omits_details_for_synthesized_raw() {
         let r = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "pre step failed");
@@ -2991,7 +2989,7 @@ mod tests {
         assert!(!body.contains("<details>"));
     }
 
-    /// CLAUDE-304: a run with no `compact_boundary` event in its stream log
+    /// A run with no `compact_boundary` event in its stream log
     /// leaves the outcome comment untouched.
     #[test]
     fn append_compaction_note_leaves_body_unchanged_without_a_boundary() {
@@ -3002,7 +3000,7 @@ mod tests {
         assert_eq!(body, "The PR is ready.");
     }
 
-    /// CLAUDE-304: an earlier audit run's shape - a `compact_boundary` event in the run's
+    /// an earlier audit run's shape - a `compact_boundary` event in the run's
     /// stream log - appends the one-line warning to whatever outcome comment
     /// (success or needs-review) it is given.
     #[test]
@@ -3021,7 +3019,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-304: a `None` stream log (claude never ran) leaves the comment
+    /// A `None` stream log (claude never ran) leaves the comment
     /// unchanged rather than erroring.
     #[test]
     fn append_compaction_note_leaves_body_unchanged_with_no_stream_log() {
@@ -3029,7 +3027,7 @@ mod tests {
         assert_eq!(body, "Parked for review.");
     }
 
-    /// CLAUDE-304: an unreadable stream log must not stop the outcome comment
+    /// An unreadable stream log must not stop the outcome comment
     /// from posting; it just posts without the compaction line.
     #[test]
     fn append_compaction_note_leaves_body_unchanged_on_a_read_failure() {
@@ -3041,8 +3039,8 @@ mod tests {
 
     #[test]
     fn build_prompt_default_substitutes_job_fields() {
-        // CLAUDE-125 regression: the built-in default renders every placeholder
-        // and leaves no `{{...}}` behind, preserving the CLAUDE-24 contract lines.
+        // The built-in default renders every placeholder
+        // and leaves no `{{...}}` behind, preserving the runner-creates-PR contract lines.
         let wd = std::path::Path::new("/tmp/wd");
         let p = build_prompt(&src(), &job(), wd, None);
         assert!(p.starts_with(
@@ -3057,9 +3055,9 @@ mod tests {
         assert!(p.contains("/tmp/wd/.claude-run-needs-review"));
         assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"));
         assert!(!p.contains("{{"), "unresolved placeholder:\n{p}");
-        // CLAUDE-165: step 3 is self-contained and no longer delegates the git
+        // Step 3 is self-contained and no longer delegates the git
         // steps to CLAUDE.md; it instructs staying on the feature branch and
-        // never switching to `main` (the leak that stranded FJ-51's work).
+        // never switching to `main` (an earlier leak stranded work that way).
         assert!(
             !p.contains("per the Git workflow in CLAUDE.md"),
             "step 3 must not delegate to the Git workflow in CLAUDE.md:\n{p}"
@@ -3070,7 +3068,7 @@ mod tests {
 
     #[test]
     fn build_prompt_uses_override_when_set() {
-        // CLAUDE-125: a set prompt fully replaces the default and still gets its
+        // A set prompt fully replaces the default and still gets its
         // placeholders substituted.
         let mut s = src();
         s.prompt = Some("Do {{key}}: {{summary}} in {{workdir}}".to_string());
@@ -3198,7 +3196,7 @@ mod tests {
 
     #[test]
     fn render_substitutes_resume_placeholders_when_set() {
-        // CLAUDE-275: a resumed job's placeholders carry the recorded PR's URL
+        // A resumed job's placeholders carry the recorded PR's URL
         // and branch instead of rendering empty.
         let t = "{{existing_pr_url}}|{{existing_branch}}";
         let resume = PrResume {
@@ -3214,7 +3212,7 @@ mod tests {
 
     #[test]
     fn render_leaves_unknown_and_unterminated_literal() {
-        // CLAUDE-125: an unknown placeholder and an unterminated `{{` survive
+        // An unknown placeholder and an unterminated `{{` survive
         // verbatim; known ones still substitute.
         let p = render_prompt_template(
             "{{key}} {{bogus}} {{oops",
@@ -3226,7 +3224,7 @@ mod tests {
         assert_eq!(p, "MK-16 {{bogus}} {{oops");
     }
 
-    /// CLAUDE-214: an empty `write_projects` resolves to the triggering issue's
+    /// An empty `write_projects` resolves to the triggering issue's
     /// own project, so filing a deferred item works with no site-specific
     /// configuration; a configured list replaces it verbatim.
     #[test]
@@ -3239,7 +3237,7 @@ mod tests {
         assert_eq!(write_projects(&s, &job()), "AUD, DEV");
     }
 
-    /// CLAUDE-214: the built-in prompt permits the bounded tracker writes the
+    /// The built-in prompt permits the bounded tracker writes the
     /// `No orphan notes` directive needs, and states the bans that make them
     /// safe. The `AI Agent` ban is the load-bearing one: an agent that could set
     /// it could queue further agent runs.
@@ -3290,7 +3288,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-214: the no-code path is advertised in the prompt, with the marker
+    /// The no-code path is advertised in the prompt, with the marker
     /// path rendered, and is fenced off from the blocker path.
     #[test]
     fn build_prompt_default_documents_the_no_code_path() {
@@ -3335,7 +3333,7 @@ mod tests {
             head_branch: None,
         };
         assert_eq!(pr_url(&j, &no_num), "fallback line");
-        // CLAUDE-50: a real HTTP URL (the GitHub backend's html_url) is used
+        // A real HTTP URL (the GitHub backend's html_url) is used
         // verbatim rather than rebuilt against the Forgejo `pulls` path.
         let gh = PullRequest {
             number: Some(11),
@@ -3375,7 +3373,7 @@ mod tests {
             jobs[0].clone_url,
             "https://dev.a8n.run/contoso/claude-run.git"
         );
-        // CLAUDE-147: the empty-VCS drop is recorded as an info event so the
+        // The empty-VCS drop is recorded as an info event so the
         // skipped project is visible in the web UI.
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, "info");
@@ -3384,7 +3382,7 @@ mod tests {
 
     #[test]
     fn gather_skips_project_whose_vcs_probe_errors() {
-        // CLAUDE-124: a probe tool error (e.g. `yt` exit 2) is not the same as
+        // A probe tool error (e.g. `yt` exit 2) is not the same as
         // "no integration". The issue is skipped this poll, but via the
         // provider-CLI-error path rather than the silent drop path. The good
         // project's issue is unaffected.
@@ -3416,13 +3414,13 @@ mod tests {
         } = gather(&backend, &src().query, None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, "MK-16");
-        // CLAUDE-147: the probe failure is recorded as a warn event (not the
+        // The probe failure is recorded as a warn event (not the
         // silent no-integration drop) so it surfaces in the web UI.
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, "warn");
         assert_eq!(events[0].context.as_deref(), Some("ZZ"));
         assert!(events[0].message.contains("VCS probe failed"));
-        // CLAUDE-225: the candidate set is what the QUERY matched, so a project
+        // The candidate set is what the QUERY matched, so a project
         // skipped this poll keeps its dependency-gate row instead of having it
         // pruned (and re-commented) every time a probe or a grant is flaky.
         assert_eq!(
@@ -3431,7 +3429,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-194: a [`RepoAccess`] double that records every probe and either
+    /// A [`RepoAccess`] double that records every probe and either
     /// passes or denies with a canned message.
     struct StubAccess {
         deny: Option<String>,
@@ -3464,7 +3462,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-194: two queued issues in one project, whose VCS resolves to one
+    /// Two queued issues in one project, whose VCS resolves to one
     /// repo. `yt` canned responses are shared, so the same runner can serve
     /// several polls.
     fn access_runner() -> StubRunner {
@@ -3483,13 +3481,13 @@ mod tests {
 
     #[test]
     fn gather_keeps_issues_when_forge_can_read_the_repo_and_probes_once() {
-        // CLAUDE-194: a readable repo proceeds unchanged, and the probe runs ONCE
+        // A readable repo proceeds unchanged, and the probe runs ONCE
         // per repo per poll, not once per issue.
         let backend = CliBackend::new(Arc::new(access_runner()));
         let access = StubAccess::allow();
         let Gathered { jobs, events, .. } = gather(&backend, &src().query, Some(&access)).unwrap();
         assert_eq!(jobs.len(), 2);
-        // CLAUDE-216: a pass emits only the recovery marker, once per repo. It is
+        // A pass emits only the recovery marker, once per repo. It is
         // dropped before recording unless it clears an open failure
         // (`access::retain_access_recoveries`), so a healthy poll logs nothing.
         assert_eq!(events.len(), 1, "{events:?}");
@@ -3507,7 +3505,7 @@ mod tests {
 
     #[test]
     fn gather_drops_issues_when_forge_cannot_read_the_repo() {
-        // CLAUDE-194: an unreadable repo drops every issue of that repo before any
+        // An unreadable repo drops every issue of that repo before any
         // job is built, records one warn event naming host, repo, and cause, and
         // writes NO YouTrack field (the issues stay Queued), so the next poll
         // after the permission grant picks them up with no manual field change.
@@ -3551,7 +3549,7 @@ mod tests {
         let granted = StubAccess::allow();
         let Gathered { jobs, events, .. } = gather(&backend, &src().query, Some(&granted)).unwrap();
         assert_eq!(jobs.len(), 2);
-        // CLAUDE-216: and the poll that recovers records the marker that clears
+        // The poll that recovers records the marker that clears
         // the dashboard's access banner for this repo.
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(
@@ -3563,7 +3561,7 @@ mod tests {
 
     #[test]
     fn forge_access_check_is_skipped_without_a_forge_token_ref() {
-        // CLAUDE-194: with no `token_ref`, `fj` / `gh` read the OPERATOR store, so
+        // With no `token_ref`, `fj` / `gh` read the OPERATOR store, so
         // a probe would test the wrong identity. No checker is built at all.
         let runner: Arc<dyn CommandRunner> = Arc::new(StubRunner::new());
         let gh = crate::action::GithubTarget::default();
@@ -3586,7 +3584,7 @@ mod tests {
 
     #[test]
     fn forge_access_check_skips_a_host_it_has_no_token_for() {
-        // CLAUDE-194: a run carrying only a GitHub PAT probes GitHub hosts but
+        // A run carrying only a GitHub PAT probes GitHub hosts but
         // leaves a Forgejo repo alone (that would test the operator store), and
         // issues no CLI call for it.
         let runner = Arc::new(StubRunner::new());
@@ -3606,7 +3604,7 @@ mod tests {
         assert!(runner.calls.lock().unwrap().is_empty());
     }
 
-    /// CLAUDE-209: two overlapping polls of one action gather concurrently. Each
+    /// Two overlapping polls of one action gather concurrently. Each
     /// gets its own credential directory, so the first guard's `Drop` (which
     /// `remove_dir_all`s the directory) cannot scrub the still-running poll's
     /// `yt` config. With the old `gather-{pid}` name both polls shared a path and
@@ -3640,7 +3638,7 @@ mod tests {
         assert!(second_cfg.exists(), "{second_cfg:?} was scrubbed");
     }
 
-    /// CLAUDE-209: the CLAUDE-194 preflight carries the same uniqueness. Two
+    /// The preflight carries the same uniqueness. Two
     /// probes of the SAME host and repo (the overlapping-poll case) run against
     /// separate credential stores, visible as distinct `XDG_DATA_HOME` values.
     #[test]
@@ -3704,7 +3702,7 @@ mod tests {
         assert_eq!(stores[2], stores[3]);
     }
 
-    /// CLAUDE-131: a configured assignee is written via `yt issue update
+    /// A configured assignee is written via `yt issue update
     /// <key> --assignee <login>` during the pre step, after the field / state
     /// writes and before the clone. The clone targets a bogus local path so it
     /// fails fast offline; the pre-clone YouTrack writes are still recorded.
@@ -3746,7 +3744,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-131: with no assignee configured (the default), pickup issues no
+    /// With no assignee configured (the default), pickup issues no
     /// `yt issue update ... --assignee` write at all.
     #[test]
     fn run_pre_skips_assignee_when_unset() {
@@ -3775,7 +3773,7 @@ mod tests {
         assert!(!calls.iter().any(|c| c.contains("--assignee")), "{calls:?}");
     }
 
-    /// CLAUDE-131: an assignee write failure aborts pickup with a failure reason,
+    /// An assignee write failure aborts pickup with a failure reason,
     /// consistent with the existing set_field / set_state failure handling.
     #[test]
     fn run_pre_assignee_failure_aborts_pickup() {
@@ -3811,7 +3809,7 @@ mod tests {
         assert!(!wd.exists(), "clone must not run after an assignee failure");
     }
 
-    /// CLAUDE-275: with a resume branch set, `run_pre` clones THAT branch rather
+    /// With a resume branch set, `run_pre` clones THAT branch rather
     /// than the repo's default, so the agent lands on the recorded PR's work.
     #[test]
     fn run_pre_clones_the_resume_branch_when_set() {
@@ -3892,7 +3890,7 @@ mod tests {
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 
-    /// CLAUDE-214: a successful run that deliberately produced tracker output
+    /// A successful run that deliberately produced tracker output
     /// rather than code leaves `.claude-run-no-code-change`. Finalize skips the
     /// PR entirely, posts the marker text verbatim as the issue comment, and
     /// sets AI Agent to the no-code label (defaulting to the `done` label).
@@ -3954,7 +3952,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-214: `states.no_code` is configurable per action and overrides the
+    /// `states.no_code` is configurable per action and overrides the
     /// `done` default.
     #[test]
     fn finalize_no_code_marker_honours_configured_label() {
@@ -3990,7 +3988,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-214: the blocker marker still wins over the no-code marker. A run
+    /// The blocker marker still wins over the no-code marker. A run
     /// that parks itself must land on Needs Review, never on the success-shaped
     /// no-code outcome, even if it wrote both files.
     #[test]
@@ -4021,10 +4019,10 @@ mod tests {
 
     #[test]
     fn finalize_success_branch_strategy_creates_pr_and_sets_code_review() {
-        // CLAUDE-103 default: the branch strategy pushes a real server branch and
+        // By default, the branch strategy pushes a real server branch and
         // opens the PR via the API; `-aA` is never invoked.
         let dir = tempfile::tempdir().unwrap();
-        // CLAUDE-305: `find_or_create_pr` resolves the clone's git directory
+        // `find_or_create_pr` resolves the clone's git directory
         // before writing the PR body scratch file there.
         let git_dir = dir.path().join(".git");
         let body_path = git_dir
@@ -4032,7 +4030,7 @@ mod tests {
             .join(".claude-run-pr-body.md")
             .to_string_lossy()
             .to_string();
-        // CLAUDE-166: the branch strategy resolves the feature branch by name
+        // The branch strategy resolves the feature branch by name
         // (origin/HEAD base, for-each-ref listing, rev-list ahead check) before
         // pushing `<branch>:<branch>` and opening the PR with an explicit --head.
         let runner = Arc::new(
@@ -4048,7 +4046,7 @@ mod tests {
                     "main\nfeat/x",
                 )
                 .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
-                // CLAUDE-170: idempotency plumbing before the push. Remote branch
+                // Idempotency plumbing before the push. Remote branch
                 // absent, no open PR -> unchanged push + create happy path.
                 .ok(
                     "git",
@@ -4151,7 +4149,7 @@ mod tests {
 
     #[test]
     fn finalize_success_agit_strategy_creates_pr_and_sets_code_review() {
-        // CLAUDE-103 opt-in: the AGit strategy invokes `fj pr create -aA`.
+        // Opt-in: the AGit strategy invokes `fj pr create -aA`.
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(with_one_branch_ahead(
             StubRunner::new()
@@ -4206,7 +4204,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-102: workdir preservation -------------------------------
+    // ---- workdir preservation -------------------------------
 
     fn git_in(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
@@ -4222,7 +4220,7 @@ mod tests {
         );
     }
 
-    // CLAUDE-113: set a local git identity. `git clone` does not copy the
+    // Set a local git identity. `git clone` does not copy the
     // origin's local `user.*`, and CI's container has no global or
     // auto-detectable identity, so every repo that commits must set its own or
     // `git commit` fails with "Author identity unknown".
@@ -4231,7 +4229,7 @@ mod tests {
         git_in(dir, &["config", "user.name", "test"]);
     }
 
-    /// CLAUDE-212: the ahead check runs for every PR strategy, so a finalize
+    /// The ahead check runs for every PR strategy, so a finalize
     /// test that expects PR creation to happen must register the branch
     /// resolution plumbing: `origin/HEAD`, the local branch list, and one
     /// `rev-list <base>..<branch>` per non-base branch. Here `feat/x` is the
@@ -4271,7 +4269,7 @@ mod tests {
     #[test]
     fn clean_clone_is_still_removed() {
         // A clone whose HEAD is covered by remote-tracking refs holds nothing
-        // unpushed; cleanup proceeds exactly as before CLAUDE-102.
+        // unpushed; cleanup proceeds exactly as before.
         let base = tempfile::tempdir().unwrap();
         let origin = base.path().join("origin");
         std::fs::create_dir_all(&origin).unwrap();
@@ -4291,7 +4289,7 @@ mod tests {
 
     #[test]
     fn dirty_tree_with_no_unpushed_branch_counts_as_local_only_work() {
-        // CLAUDE-284: a workdir on a branch fully pushed under its own name
+        // A workdir on a branch fully pushed under its own name
         // (so no unpushed commit exists) but with an uncommitted change must
         // still be reported as local-only work, since `crate::gc`'s age-based
         // sweep uses exactly this predicate to decide whether a workdir past
@@ -4318,7 +4316,7 @@ mod tests {
 
     #[test]
     fn stash_with_no_unpushed_branch_counts_as_local_only_work() {
-        // CLAUDE-284: same shape as the dirty-tree case above, but for a
+        // Same shape as the dirty-tree case above, but for a
         // stash with no corresponding unpushed branch.
         let base = tempfile::tempdir().unwrap();
         let origin = base.path().join("origin");
@@ -4341,7 +4339,7 @@ mod tests {
         assert!(clone.exists(), "a stash must survive cleanup");
     }
 
-    // ---- CLAUDE-120: post-clone pre-commit hook install -----------------
+    // ---- post-clone pre-commit hook install -----------------
 
     fn just_available() -> bool {
         Command::new("just")
@@ -4413,7 +4411,7 @@ mod tests {
         assert!(dir.path().join(".git/hooks/pre-commit").exists());
     }
 
-    // CLAUDE-105: build an origin + single-branch clone, mimicking the shallow
+    // Build an origin + single-branch clone, mimicking the shallow
     // (`--depth` => `--single-branch`) clone the runner makes. Returns the
     // clone path.
     fn origin_and_single_branch_clone(base: &Path) -> std::path::PathBuf {
@@ -4430,7 +4428,7 @@ mod tests {
                 clone.to_str().unwrap(),
             ],
         );
-        // CLAUDE-113: the clone inherits none of the origin's local `user.*`, so
+        // The clone inherits none of the origin's local `user.*`, so
         // tests that commit in the clone need their own identity.
         set_identity(&clone);
         clone
@@ -4438,7 +4436,7 @@ mod tests {
 
     #[test]
     fn feature_branch_tip_on_remote_is_deleted() {
-        // GAMMA-174 shape: the agent checked a branch out but left its tip at a
+        // The agent checked a branch out but left its tip at a
         // commit already on the remote. The old `--not --remotes` heuristic
         // false-positived (only `origin/main` is tracked); the live-remote
         // check sees the tip present and deletes.
@@ -4453,7 +4451,7 @@ mod tests {
 
     #[test]
     fn feature_branch_commit_absent_from_remote_is_preserved() {
-        // GAMMA-258 shape: the agent committed work that never reached the remote.
+        // The agent committed work that never reached the remote.
         let base = tempfile::tempdir().unwrap();
         let clone = origin_and_single_branch_clone(base.path());
         git_in(&clone, &["checkout", "-b", "feat/y"]);
@@ -4465,7 +4463,7 @@ mod tests {
         assert!(clone.exists(), "an unpushed commit must survive cleanup");
     }
 
-    // ---- CLAUDE-193: the PR-failure comment names where the work is --------
+    // ---- the PR-failure comment names where the work is --------
 
     fn pr_error() -> Error {
         Error::Other(anyhow::anyhow!("fj pr create failed: 404 Not Found"))
@@ -4512,7 +4510,7 @@ mod tests {
 
     #[test]
     fn pr_failure_comment_names_the_preserved_workdir_when_unpushed() {
-        // Unchanged CLAUDE-102 path: an unpushed commit keeps the workdir, and
+        // Unchanged path: an unpushed commit keeps the workdir, and
         // the comment is the recovery pointer to it.
         let base = tempfile::tempdir().unwrap();
         let clone = origin_and_single_branch_clone(base.path());
@@ -4545,7 +4543,7 @@ mod tests {
 
     #[test]
     fn pr_failure_comment_names_uncommitted_changes_not_safe_on_remote() {
-        // Run 10822 shape (CLAUDE-281): a brand-new branch left at `main`'s tip
+        // A brand-new branch left at `main`'s tip
         // (no commits of its own) with a dirty working tree. The old SHA-
         // membership check called this branch "on the remote" and the comment
         // claimed the work was SAFE there; it must now be reported as
@@ -4634,14 +4632,13 @@ mod tests {
 
     #[test]
     fn finalize_pr_failure_preserves_and_names_the_workdir() {
-        // The CLAUDE-101 incident shape: claude succeeded, the selected (branch)
-        // strategy fails; finalize must mark Failed, error loudly with the
-        // underlying git-push error, and point at the preserved workdir in the
-        // comment instead of letting the commits be destroyed. CLAUDE-103: no
-        // silent fallback to AGit.
+        // Claude succeeded, the selected (branch) strategy fails; finalize must
+        // mark Failed, error loudly with the underlying git-push error, and
+        // point at the preserved workdir in the comment instead of letting the
+        // commits be destroyed. No silent fallback to AGit.
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
-        // CLAUDE-166: branch resolution succeeds (feat/x is ahead of base); the
+        // Branch resolution succeeds (feat/x is ahead of base); the
         // push of the resolved branch is what fails, and that error must reach
         // the preserved-workdir comment.
         let runner = Arc::new(
@@ -4657,7 +4654,7 @@ mod tests {
                     "main\nfeat/x",
                 )
                 .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
-                // CLAUDE-170: idempotency plumbing before the push. Remote branch
+                // Idempotency plumbing before the push. Remote branch
                 // absent, so the push is attempted (and fails as before).
                 .ok(
                     "git",
@@ -4715,12 +4712,12 @@ mod tests {
 
     #[test]
     fn finalize_agit_with_no_commits_fails_instead_of_code_review() {
-        // CLAUDE-212: claude "succeeded" but produced no branch ahead of base.
+        // Claude "succeeded" but produced no branch ahead of base.
         // Under the AGit strategy this used to open an empty autofilled PR and
         // move the issue to Code Review. The hoisted ahead check now fails the
         // finalize: AI Agent=Failed, no PR link commented, `fj` never invoked.
         //
-        // CLAUDE-214 must not relax this: only the explicit
+        // The no-code path must not relax this: only the explicit
         // `.claude-run-no-code-change` marker buys a zero-commit run a
         // non-failure outcome, and this run writes no marker.
         let dir = tempfile::tempdir().unwrap();
@@ -4781,7 +4778,7 @@ mod tests {
 
     #[test]
     fn finalize_github_job_opens_pr_via_forge_and_sets_code_review() {
-        // CLAUDE-50: a GitHub job finalizes through the GitHub `Forge`. The PR's
+        // A GitHub job finalizes through the GitHub `Forge`. The PR's
         // real html_url is linked exactly as the Forgejo path links its PR, and
         // AI Agent transitions to Code Review.
         use crate::provider::{GithubForge, McpTransport};
@@ -5009,7 +5006,7 @@ mod tests {
 
     #[test]
     fn finalize_timeout_sets_needs_review_when_still_working() {
-        // CLAUDE-52: a timeout (exit 124) with AI Agent still on Working advances
+        // A timeout (exit 124) with AI Agent still on Working advances
         // the field to Needs Review and posts the timeout comment - never Failed.
         let dir = tempfile::tempdir().unwrap();
         let runner = Arc::new(
@@ -5057,7 +5054,7 @@ mod tests {
 
     #[test]
     fn finalize_timeout_leaves_field_when_already_advanced() {
-        // CLAUDE-52: a timeout whose AI Agent has already moved off Working (e.g.
+        // A timeout whose AI Agent has already moved off Working (e.g.
         // a human/agent set Done) leaves the field untouched - only the comment
         // is posted. No set-field write at all.
         let dir = tempfile::tempdir().unwrap();
@@ -5091,7 +5088,7 @@ mod tests {
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 
-    // ---- CLAUDE-278: automerge no longer polls from finalize -------------
+    // ---- automerge no longer polls from finalize -------------
 
     /// A YoutrackSource with automerge enabled.
     fn src_automerge() -> YoutrackSource {
@@ -5106,7 +5103,7 @@ mod tests {
 
     #[test]
     fn finalize_never_polls_or_merges_even_with_automerge_enabled() {
-        // CLAUDE-278: finalize stops at Code Review exactly as when automerge is
+        // Finalize stops at Code Review exactly as when automerge is
         // disabled; the CI wait + merge is now driven entirely by the
         // run-succeeded webhook (see `complete_automerge` and
         // `crate::web::webhooks`), never by finalize itself.
@@ -5158,7 +5155,7 @@ mod tests {
 
     #[test]
     fn complete_automerge_merges_and_comments_with_no_state_or_field_write() {
-        // CLAUDE-327: the shared merge sequence the webhook success handler
+        // The shared merge sequence the webhook success handler
         // calls once it has confirmed a recorded agent PR's checks are green
         // and mergeable: merge as a merge-commit, then a best-effort comment.
         // No `State` and no `AI Agent` write - the YouTrack workflow resolves
@@ -5211,7 +5208,7 @@ mod tests {
         assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
     }
 
-    // ---- CLAUDE-161 pre-clone dependency gate ----
+    // ---- pre-clone dependency gate ----
 
     async fn mem_pool() -> DbPool {
         crate::db::test_pool().await
@@ -5231,7 +5228,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-161: the blocking rule (pure). `depends on` (Depend INWARD) and
+    /// The blocking rule (pure). `depends on` (Depend INWARD) and
     /// `parent for` (Subtask OUTWARD) with an unresolved target block; the reverse
     /// verbs `is required for` / `subtask of` never block; a resolved target is
     /// met. The result is sorted, so its signature is order-independent.
@@ -5258,7 +5255,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-295: scoped to its own project, the gate ignores targets anywhere
+    /// Scoped to its own project, the gate ignores targets anywhere
     /// else, so an `AUDIT` Epic does not wait on the `GAMMA` findings it filed.
     #[test]
     fn unmet_blockers_skips_other_projects_when_scoped() {
@@ -5278,7 +5275,7 @@ mod tests {
         assert_eq!(ids(Some("AUDIT")), vec!["AUDIT-7"]);
     }
 
-    /// CLAUDE-295: `block_cross_project` reaches the gate. An Epic whose only open
+    /// `block_cross_project` reaches the gate. An Epic whose only open
     /// child is in another project is blocked by default and proceeds when false.
     #[tokio::test]
     async fn dependency_gate_scopes_to_own_project_when_configured() {
@@ -5309,7 +5306,7 @@ mod tests {
         assert!(matches!(d, GateDecision::Proceed), "scoped gate proceeds");
     }
 
-    /// CLAUDE-161: a blocked issue is left Queued, a blocker comment is posted
+    /// A blocked issue is left Queued, a blocker comment is posted
     /// once, and a backoff row is persisted. A re-eval inside the backoff window
     /// does no `yt` read and no comment; after the window expires an unchanged
     /// blocker set re-reads but does not re-comment (idempotency).
@@ -5386,7 +5383,7 @@ mod tests {
         assert_eq!(comments(), 1, "unchanged blocker set must not re-comment");
     }
 
-    /// CLAUDE-225: a re-evaluation that finds the blocker still open re-arms the
+    /// A re-evaluation that finds the blocker still open re-arms the
     /// window but keeps the original first-blocked stamp, so the age reported to
     /// the operator is the age of the whole block and not of the last poll. This
     /// is what makes a long-held gate surface at all: the gate re-evaluates every
@@ -5450,7 +5447,7 @@ mod tests {
         assert!(stale[0].blocked_for_ms >= 3 * 3_600_000);
     }
 
-    /// CLAUDE-161: `enabled: false` makes the gate a no-op: it proceeds without
+    /// `enabled: false` makes the gate a no-op: it proceeds without
     /// any `yt` read or DB touch (the stub has no inspect response, so a read
     /// would error).
     #[tokio::test]
@@ -5470,7 +5467,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-161: when all dependencies are met (or absent), the gate proceeds
+    /// When all dependencies are met (or absent), the gate proceeds
     /// and clears any stale backoff row so a previously-blocked issue resumes.
     #[tokio::test]
     async fn dependency_gate_met_proceeds_and_clears_state() {
@@ -5503,9 +5500,9 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-195 manual-trigger backoff bypass ----
+    // ---- manual-trigger backoff bypass ----
 
-    /// CLAUDE-195: a manual trigger (`bypass_backoff = true`) inside an open
+    /// A manual trigger (`bypass_backoff = true`) inside an open
     /// backoff window reads links live rather than replaying the cached signature.
     /// With the blocker now resolved, the gate proceeds in the same run and clears
     /// the persisted row, without waiting for the window to expire.
@@ -5554,7 +5551,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-195: a manual trigger inside an open window still reads live, and
+    /// A manual trigger inside an open window still reads live, and
     /// when the blocker is still open it stays Blocked and re-arms `blocked_until`.
     /// The unchanged blocker set is not re-commented.
     #[tokio::test]
@@ -5611,9 +5608,9 @@ mod tests {
         );
     }
 
-    /// CLAUDE-195: the scheduler (`bypass_backoff = false`) inside an open window
-    /// replays the cached signature with no live read, exactly as CLAUDE-182. The
-    /// stub has no inspect response, so any read would error.
+    /// The scheduler (`bypass_backoff = false`) inside an open window
+    /// replays the cached signature with no live read, exactly as the gather-time
+    /// eligibility pass below. The stub has no inspect response, so any read would error.
     #[tokio::test]
     async fn dependency_gate_scheduler_replays_cached_signature_no_read() {
         let pool = mem_pool().await;
@@ -5645,9 +5642,9 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-182 gather-time eligibility pass ----
+    // ---- gather-time eligibility pass ----
 
-    /// CLAUDE-182: the gather-time eligibility pass drops a dependency-blocked
+    /// The gather-time eligibility pass drops a dependency-blocked
     /// issue so a workable same-project sibling is the sole candidate for the
     /// project's concurrency key. Reproduces the TOOL-33 / TOOL-34 starvation:
     /// TOOL-34 depends on the still-open TOOL-33, TOOL-33 is workable. Gather
@@ -5712,7 +5709,7 @@ mod tests {
             "blocked TOOL-34 dropped before the executor; TOOL-33 is the sole candidate"
         );
 
-        // The blocked issue kept its CLAUDE-161 side effects: comment + backoff.
+        // The blocked issue kept its side effects: comment + backoff.
         {
             let calls = runner.calls.lock().unwrap();
             assert!(
@@ -5738,7 +5735,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-182: an issue no longer `Queued` at gather (an overlapping run moved
+    /// An issue no longer `Queued` at gather (an overlapping run moved
     /// it to Working) is dropped by the eligibility pass and likewise does not
     /// occupy the project's per-poll slot; a still-Queued sibling survives.
     #[tokio::test]
@@ -5788,7 +5785,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-275: resume a recorded open PR's branch on re-queue ----
+    // ---- resume a recorded open PR's branch on re-queue ----
 
     fn open_pr(number: u64, head_ref: &str) -> provider::ForgePullRequest {
         provider::ForgePullRequest {
@@ -5803,7 +5800,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-275: a recorded, still-open PR resolves to a resume target
+    /// A recorded, still-open PR resolves to a resume target
     /// carrying its branch and URL, so `run_pre` clones that branch and the
     /// prompt's `existing_*` placeholders are populated.
     #[tokio::test]
@@ -5856,7 +5853,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-275: a recorded PR that no longer shows up in the open-PR list is
+    /// A recorded PR that no longer shows up in the open-PR list is
     /// marked `closed` and the caller starts from the default branch.
     #[tokio::test]
     async fn resolve_pr_resume_marks_closed_when_absent_from_open_list() {
@@ -5902,7 +5899,7 @@ mod tests {
         assert_eq!(rec.state, "closed");
     }
 
-    /// CLAUDE-275: the AGit strategy has no server branch to continue on, so an
+    /// The AGit strategy has no server branch to continue on, so an
     /// open recorded PR is never resumed for it - a new PR is opened as before.
     /// Asserting on a `StubRunner` with no registered `fj` call proves the
     /// open-PR lookup is never even attempted.
@@ -5935,7 +5932,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-275: a fresh (non-resumed) success records the PR in the store.
+    /// A fresh (non-resumed) success records the PR in the store.
     #[tokio::test]
     async fn record_new_pr_writes_one_agent_pull_requests_row() {
         let pool = mem_pool().await;
@@ -5954,7 +5951,7 @@ mod tests {
         assert_eq!(rec.state, "open");
     }
 
-    /// CLAUDE-275: a resumed job's PR is already recorded, so `record_new_pr`
+    /// A resumed job's PR is already recorded, so `record_new_pr`
     /// must never run for it - proven end-to-end here by attempting the exact
     /// second insert `process_job` would skip and observing the store's
     /// `UNIQUE(host, repo, pr_number)` reject it, which is why the resume branch

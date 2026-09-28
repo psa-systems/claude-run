@@ -9,7 +9,7 @@
 //! | State (logs) | `$XDG_STATE_HOME/claude-run/` | `CLAUDE_RUN_STATE_DIR` |
 //! | Runtime (pid, socket) | `$XDG_RUNTIME_DIR/claude-run/` | `CLAUDE_RUN_RUNTIME_DIR` |
 //!
-//! CLAUDE-250: `state.db` is the DEFAULT state store, not the only one. A
+//! `state.db` is the DEFAULT state store, not the only one. A
 //! `[database] url` (or `CLAUDE_RUN_DATABASE_URL`, or the file named by
 //! `CLAUDE_RUN_DATABASE_URL_FILE`) points the daemon at PostgreSQL instead, in
 //! which case nothing but `workdirs/` lives under the data dir. See
@@ -25,9 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
-/// DEV-707's per-run usage record, directly under `logs/`. Shared with
-/// `crate::gc` so the writer's path and the sweep's target cannot drift apart
-/// (CLAUDE-268).
+/// The per-run usage record, directly under `logs/`. Shared with
+/// `crate::gc` so the writer's path and the sweep's target cannot drift apart.
 pub const USAGE_LOG: &str = "usage.jsonl";
 
 /// Resolved on-disk locations. Computed once at startup.
@@ -82,7 +81,7 @@ impl Paths {
         self.state_dir.join("webhook-logs")
     }
 
-    /// DEV-707: the newline-delimited per-run usage record, one line per run,
+    /// The newline-delimited per-run usage record, one line per run,
     /// so runs are comparable over time without a provider console.
     pub fn usage_log(&self) -> PathBuf {
         self.logs_dir().join(USAGE_LOG)
@@ -114,21 +113,21 @@ pub fn expand_path(raw: &str) -> String {
 pub struct OnDiskConfig {
     pub web: WebConfig,
     pub daemon: DaemonConfig,
-    /// CLAUDE-43: Forgejo webhook listener settings (HMAC secret reference,
+    /// Forgejo webhook listener settings (HMAC secret reference,
     /// repo allow-list, replay window, rate limit).
     pub webhook: WebhookConfig,
-    /// CLAUDE-46: triage-driven issue-mint settings (repo-to-project map,
+    /// Triage-driven issue-mint settings (repo-to-project map,
     /// fallback project, loop-safety bot logins, bucket-2 assignee).
     pub mint: MintConfig,
-    /// CLAUDE-55: `version` self-update settings (release/latest train default
+    /// `version` self-update settings (release/latest train default
     /// and the name of the secret holding the registry token).
     pub update: UpdateConfig,
-    /// CLAUDE-250: which database backend holds the runtime state. Bootstrap,
+    /// Which database backend holds the runtime state. Bootstrap,
     /// not a DB-backed setting: it has to be known before the DB is open.
     pub database: DatabaseConfig,
 }
 
-/// CLAUDE-250: backend selection for the runtime state store.
+/// Backend selection for the runtime state store.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DatabaseConfig {
@@ -151,12 +150,12 @@ pub struct DatabaseConfig {
 pub struct WebConfig {
     pub bind: String,
     pub port: u16,
-    /// Phase 5 (CLAUDE-48): name of the stored secret (CLAUDE-26) holding the
+    /// Name of the stored secret holding the
     /// bearer token that gates the web UI and `/api/*` when the bind is
     /// non-loopback. Unset is fine for a loopback bind; required (else the TCP
     /// listener fails closed) for any exposed bind.
     pub auth_token_ref: Option<String>,
-    /// Phase 5 (CLAUDE-48): require the bearer token even on a loopback bind.
+    /// Require the bearer token even on a loopback bind.
     /// Off by default so local development stays unauthenticated; set true to
     /// exercise the gate locally.
     pub require_auth_on_loopback: bool,
@@ -181,15 +180,15 @@ impl Default for WebConfig {
     }
 }
 
-/// CLAUDE-43 / CLAUDE-87: Forgejo webhook listener config. Lives in `config.toml`
+/// Forgejo webhook listener config. Lives in `config.toml`
 /// because the daemon needs it before it binds the TCP listener.
 ///
-/// CLAUDE-87 makes the listener multi-source: each `[webhook.sources.<name>]`
+/// The listener is multi-source: each `[webhook.sources.<name>]`
 /// table is one webhook endpoint at `POST /webhooks/forgejo/<name>` with its own
 /// HMAC secret, allow-list, and rate-limit bucket. The replay window is shared
 /// across sources (`X-Forgejo-Delivery` ids are globally unique). An empty
 /// `sources` map disables the listener entirely (the old "no `secret_ref`"
-/// behaviour). The pre-CLAUDE-87 top-level `secret_ref` / `allowed_repos` /
+/// behaviour). The old top-level `secret_ref` / `allowed_repos` /
 /// `rate_limit_per_min` keys are gone; `deny_unknown_fields` makes a config still
 /// carrying them fail to parse at serve start, naming the offending key, which is
 /// the intended migration signal.
@@ -218,35 +217,35 @@ pub struct WebhookConfig {
     /// names with other characters are warned about at load. An empty map
     /// disables the listener (no endpoints, fail-closed like an unset secret).
     pub sources: BTreeMap<String, WebhookSource>,
-    /// CLAUDE-153/CLAUDE-273: webhook-scoped auto-fix switch. It no longer
+    /// Webhook-scoped auto-fix switch. It no longer
     /// decides whether an issue is minted at all (every code failure is filed,
     /// so `No orphan notes` holds even with this off): `false` (the default,
     /// opt-in) still creates a `code_fix` / `auto_fix` issue but leaves it with
     /// no `AI Agent` write, so no corrective fixup PR is queued and a red PR
-    /// check stays reported on the original PR for its author to fix in place
-    /// (the CLAUDE-152 behavior); `true` sets `AI Agent = Queued` on that issue
+    /// check stays reported on the original PR for its author to fix in place;
+    /// `true` sets `AI Agent = Queued` on that issue
     /// as before. A `human_action` failure is unaffected either way. This gates
     /// only the webhook fixup queuing; it is independent of the framework-wide
-    /// `[mint].auto_fix.enabled` detector switch and of the CLAUDE-149 open-PR
+    /// `[mint].auto_fix.enabled` detector switch and of the open-PR
     /// suppression. Being on `WebhookConfig` it is DB-backed (`config.webhook`)
     /// and edited live on the Settings page / via `PUT /api/settings/webhook`
     /// with no restart.
     pub auto_fix: bool,
-    /// CLAUDE-274: timeout (seconds) for the at-ingest [`crate::triage::AnalysisClassifier`]
+    /// Timeout (seconds) for the at-ingest [`crate::triage::AnalysisClassifier`]
     /// session, which runs `Read,Grep,Bash` over the complete log and the
     /// failing workflow YAML. Default 600 (the retired scheduled analysis
     /// action's timeout), well past the old tool-less classifier's 120s.
     pub analysis_timeout_secs: u64,
-    /// CLAUDE-274: how many events [`crate::web::webhooks::consume_events`]
+    /// How many events [`crate::web::webhooks::consume_events`]
     /// analyzes concurrently, each behind its own `analysis_timeout_secs`
     /// session. Must be at least 1 (validated in `src/settings.rs`); default 2.
     pub analysis_concurrency: usize,
-    /// CLAUDE-276: how many CI failures on the agent's own open PR are routed
+    /// How many CI failures on the agent's own open PR are routed
     /// back to its issue (comment + `AI Agent = Queued`) before the issue is
     /// flagged `Needs Review` instead. Matched against
     /// `agent_pull_requests.fix_attempts`. Default 3.
     pub agent_pr_fix_attempts: u32,
-    /// CLAUDE-323: daily run cap of the synthetic `webhook-forgejo` action's
+    /// Daily run cap of the synthetic `webhook-forgejo` action's
     /// ledger, read per event so a Settings save applies to the next one.
     /// Must be at least 1 (validated in `src/settings.rs`); default 20.
     pub max_runs_per_day: u32,
@@ -268,11 +267,11 @@ impl Default for WebhookConfig {
 }
 
 /// True when `repo` (an `owner/repo` full name) matches one of the allow-list
-/// patterns (CLAUDE-79): exact `owner/repo`, per-owner `owner/*`, or the global
+/// patterns: exact `owner/repo`, per-owner `owner/*`, or the global
 /// `*`. Only these three literal forms - no general globbing - so a typo cannot
 /// silently widen what a consumer acts on. Matching is case-sensitive; an empty
 /// list matches nothing (fail closed). Shared by the webhook allow-list, the
-/// reconciler's `repos`, and the CLAUDE-200 per-repo log-token mapping so all
+/// reconciler's `repos`, and the per-repo log-token mapping so all
 /// three read a pattern the same way.
 pub fn repo_matches(patterns: &[String], repo: &str) -> bool {
     patterns.iter().any(|pat| match pat.as_str() {
@@ -296,7 +295,7 @@ fn source_name_is_clean(name: &str) -> bool {
 }
 
 impl WebhookConfig {
-    /// CLAUDE-87: warn at load for any source name that is not lowercase
+    /// Warn at load for any source name that is not lowercase
     /// `[a-z0-9_-]`. The name is the `/webhooks/forgejo/<name>` path segment, so
     /// an unusual name needs URL escaping in the Forgejo webhook URL and is a
     /// likely typo; the source still loads (the map key is honored) but the
@@ -313,11 +312,11 @@ impl WebhookConfig {
     }
 }
 
-/// CLAUDE-87: one webhook source. Each source is an independent endpoint with its
+/// One webhook source. Each source is an independent endpoint with its
 /// own HMAC secret and allow-list, so a leaked org secret can authenticate only
 /// that org's allow-listed payloads and one org's failure storm rate-starves only
 /// its own bucket. The HMAC secret itself is never inlined here; `secret_ref`
-/// names a credential in the CLAUDE-26 `secrets` table, resolved (and decrypted)
+/// names a credential in the `secrets` table, resolved (and decrypted)
 /// at request time.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -329,7 +328,7 @@ pub struct WebhookSource {
     /// Allow-list of repo patterns for this source. Only `action_run_failure`
     /// events from a matching repo produce a verified-failure event; every other
     /// authenticated request is acked (2xx) and dropped so Forgejo does not
-    /// retry. Three pattern forms (CLAUDE-79): exact `owner/repo`, per-owner
+    /// retry. Three pattern forms: exact `owner/repo`, per-owner
     /// `owner/*`, and the global `*`. Matching is case-sensitive; an empty list
     /// denies all (fail closed).
     pub allowed_repos: Vec<String>,
@@ -337,14 +336,14 @@ pub struct WebhookSource {
     /// Excess requests get 429 before any crypto work. Per-source, so one source
     /// exhausting its budget never 429s another.
     pub rate_limit_per_min: u32,
-    /// CLAUDE-96/204: name of the secret (in the `secrets` table) holding a
+    /// Name of the secret (in the `secrets` table) holding a
     /// Forgejo PAT (`read:repository` scope) that authorizes this source's
     /// `fj actions logs` reads. It reaches the `fj` child in a temp single-host
     /// `keys.json` carrying that one secret and nothing else. Unset, the fetch
     /// runs unauthenticated, which serves a public repo; a private failure then
-    /// mints a human-action issue with no log attached (the CLAUDE-92 outcome).
+    /// mints a human-action issue with no log attached.
     pub log_token_ref: Option<String>,
-    /// CLAUDE-276: name of the secret (in the `secrets` table) holding a
+    /// Name of the secret (in the `secrets` table) holding a
     /// Forgejo PAT that authorizes commenting on this source's pull requests
     /// (routing a CI failure on an open PR back to its issue, or onto the
     /// human author's PR). Reaches `fj` the same way `log_token_ref` does: a
@@ -367,7 +366,7 @@ impl Default for WebhookSource {
     }
 }
 
-/// CLAUDE-220: `/claude <instruction>` pull-request comment commands. A SECOND,
+/// `/claude <instruction>` pull-request comment commands. A SECOND,
 /// independent listener from [`WebhookConfig`]: its token pushes branches, while a
 /// CI-failure source's tokens only read logs and comment, so a push-capable token
 /// never shares a config block with them.
@@ -396,7 +395,7 @@ pub struct CommentWebhookConfig {
     /// way [`WebhookConfig::sources`] keys are. An empty map disables the
     /// listener (no endpoints, fail closed).
     pub sources: BTreeMap<String, CommentWebhookSource>,
-    /// CLAUDE-323: daily run cap of the synthetic `webhook-forgejo-comment`
+    /// Daily run cap of the synthetic `webhook-forgejo-comment`
     /// action's ledger, read per command so a Settings save applies to the next
     /// one. Must be at least 1 (validated in `src/settings.rs`); default 20.
     pub max_runs_per_day: u32,
@@ -416,8 +415,8 @@ impl Default for CommentWebhookConfig {
 
 /// Default git commit identity used wherever the runner authors a commit and
 /// nothing more specific is configured: the comment-webhook's own corrective
-/// commits ([`CommentWebhookSource::bot_author`] / `bot_email`) and, per
-/// CLAUDE-358, [`AuthConfig::git_author_name`] / `git_author_email` when unset.
+/// commits ([`CommentWebhookSource::bot_author`] / `bot_email`) and
+/// [`AuthConfig::git_author_name`] / `git_author_email` when unset.
 pub const DEFAULT_GIT_AUTHOR_NAME: &str = "claude-run";
 /// See [`DEFAULT_GIT_AUTHOR_NAME`].
 pub const DEFAULT_GIT_AUTHOR_EMAIL: &str = "claude-run@a8n.run";
@@ -438,7 +437,7 @@ impl CommentWebhookConfig {
     }
 }
 
-/// CLAUDE-220: one comment-webhook source. Same isolation model as
+/// One comment-webhook source. Same isolation model as
 /// [`WebhookSource`] (own HMAC secret, own allow-list, own rate bucket) plus the
 /// write-scoped PAT and the authorization / decision-gate knobs the comment
 /// pipeline needs.
@@ -493,18 +492,18 @@ impl Default for CommentWebhookSource {
     }
 }
 
-/// CLAUDE-46: settings for minting (or updating) a YouTrack issue from a triaged
+/// Settings for minting (or updating) a YouTrack issue from a triaged
 /// failure. Lives in `config.toml` because the daemon's webhook consumer needs it
-/// at startup. Routing (CLAUDE-86) sends an issue to the project whose enabled VCS
+/// at startup. Routing sends an issue to the project whose enabled VCS
 /// integration claims the failing repo; `repo_project_map` is an optional override
-/// consulted first, and `fallback_project` (CLAUDE) catches any unclaimed repo.
+/// consulted first, and `fallback_project` catches any unclaimed repo.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MintConfig {
     /// Optional override map of `owner/repo` full name to the YouTrack project
     /// short name the minted issue should land in, e.g.
     /// `fabrikam/forgejo-cli` -> `FJ`. Consulted *before* the VCS-integration
-    /// lookup (CLAUDE-86); leave empty to let each project's VCS settings drive
+    /// lookup; leave empty to let each project's VCS settings drive
     /// routing. A repo claimed by neither falls back to
     /// [`MintConfig::fallback_project`].
     pub repo_project_map: BTreeMap<String, String>,
@@ -520,7 +519,7 @@ pub struct MintConfig {
     pub human_assignee: Option<String>,
     /// `State` value set on a freshly minted issue. Default `To do`.
     pub target_state: String,
-    /// CLAUDE-327: the `State` value a YouTrack workflow (see
+    /// The `State` value a YouTrack workflow (see
     /// `docs/yt-workflow-resolve-on-pr-merge.js`) sets on an issue when its own
     /// PR merges, resolving the issue. The runner never writes this value: it
     /// only READS it at match time, at CI-failure dispatch, to tell an issue
@@ -533,8 +532,8 @@ pub struct MintConfig {
     /// `AI Agent` value set on a bucket-1 (code-fix) issue so the `youtrack`
     /// action's pickup logic opens the fix PR. Default `Queued`.
     pub queued_value: String,
-    /// CLAUDE-104: auto-fix framework settings. A nested `[mint]` subsection (so
-    /// it rides the existing DB-backed mint section per CLAUDE-101 rather than
+    /// Auto-fix framework settings. A nested `[mint]` subsection (so
+    /// it rides the existing DB-backed mint section rather than
     /// adding a whole new settings section). When enabled, mechanically-fixable
     /// CI failures (cargo fmt, a failing checks workflow) are routed
     /// deterministically to the auto-fix bucket (queued for a corrective PR)
@@ -558,7 +557,7 @@ impl Default for MintConfig {
     }
 }
 
-/// CLAUDE-104: auto-fix framework configuration, nested under [`MintConfig`].
+/// Auto-fix framework configuration, nested under [`MintConfig`].
 ///
 /// Detectors in [`crate::autofix`] turn a verification-only CI failure into a
 /// deterministic auto-fix verdict (no LLM call). The `cargo-fmt` detector is
@@ -587,10 +586,10 @@ impl Default for AutoFixConfig {
     }
 }
 
-/// CLAUDE-55: settings for the `version` self-update command. Lives in
+/// Settings for the `version` self-update command. Lives in
 /// `config.toml` so an operator can pin a default channel (and reference a
 /// registry token) without passing flags every time. The token itself is never
-/// inlined here; `token_ref` names a credential in the CLAUDE-26 `secrets`
+/// inlined here; `token_ref` names a credential in the `secrets`
 /// table, resolved (and decrypted) at run time and used for the registry list /
 /// asset requests when private packages require auth. The `train` string is
 /// validated into [`crate::update::UpdateTrain`] when the command runs.
@@ -616,9 +615,9 @@ impl Default for UpdateConfig {
     }
 }
 
-/// CLAUDE-106: time-based GC sweeper for preserved / aside workdirs. A
+/// Time-based GC sweeper for preserved / aside workdirs. A
 /// DB-backed runtime setting (settings key `config.workdir_gc`, editable on the
-/// web Settings page) per the CLAUDE-101 bootstrap-vs-runtime split, so it is
+/// web Settings page) per the bootstrap-vs-runtime split, so it is
 /// NOT a `config.toml` key. The sweeper ([`crate::gc`]) runs on `serve` start
 /// and on a periodic tick, deleting workdirs under `$CLAUDE_RUN_DATA_DIR/
 /// workdirs/<source>/<key>` (including `.kept-<n>` aside dirs) older than
@@ -634,11 +633,11 @@ pub struct WorkdirGcConfig {
     pub enabled: bool,
     /// Age, in days, past which a preserved / aside workdir is deleted. Measured
     /// from the directory's last-modified time. Conservative default of 14 days
-    /// (revise if operational data shows otherwise, per the issue).
+    /// (revise if operational data shows otherwise).
     pub retention_days: u64,
     /// Longer age, in days, past which even a workdir that still holds
-    /// local-only work (unpushed commits, a dirty tree, or a stash -
-    /// CLAUDE-284) is deleted. Between `retention_days` and this cap such a
+    /// local-only work (unpushed commits, a dirty tree, or a stash) is
+    /// deleted. Between `retention_days` and this cap such a
     /// workdir is kept; beyond it the disk cost wins. Assumed 60 days; revise
     /// if validation shows otherwise. Must exceed `retention_days` to have
     /// any effect (a smaller value just deletes such dirs at the normal
@@ -658,15 +657,15 @@ impl Default for WorkdirGcConfig {
 
 /// Retention and size ceilings for everything the runner writes under
 /// `$CLAUDE_RUN_STATE_DIR/logs/`. A DB-backed runtime setting (settings key
-/// `config.stream_log_gc`, editable on the web Settings page) per the CLAUDE-101
+/// `config.stream_log_gc`, editable on the web Settings page) per the
 /// bootstrap-vs-runtime split, so it is NOT a `config.toml` key. The sweeps
 /// ([`crate::gc::sweep_stream_logs`] and [`crate::gc::sweep_oversized_logs`])
 /// run on `serve` start and on a periodic tick.
 ///
-/// CLAUDE-245 covered the per-attempt stream logs under
+/// This section originally covered only the per-attempt stream logs under
 /// `logs/<action>/streams/`: nothing deleted those before, the directory had
 /// only ever grown, and filling the log partition is what truncated the stream
-/// logs diagnosed in CLAUDE-233. CLAUDE-257 extended the same section to the two
+/// logs in a past production incident. It was later extended to the two
 /// writers under `logs/` it left unbounded, `daemon.log` and the per-action
 /// `output.file`. The settings key keeps its original `stream_log_gc` name (and
 /// the `Stream log GC` card title) rather than being renamed to match the wider
@@ -681,12 +680,11 @@ pub struct StreamLogGcConfig {
     pub enabled: bool,
     /// Age, in days, past which a stream log is deleted, measured from its
     /// last-modified time. Default 30 days: long enough that a failure reported
-    /// weeks after the fact still has its transcript (the CLAUDE-233 incident
-    /// windows were days apart), and at the ~800 MB/month observed on host-a
+    /// weeks after the fact still has its transcript, and at the ~800 MB/month observed on host-a
     /// it bounds the directory near 1 GB instead of the 2.8 GB it reached. A log
     /// whose run is still in flight is kept regardless of age.
     pub retention_days: u64,
-    /// CLAUDE-257: size ceiling, in bytes, for `logs/daemon.log`. An age window
+    /// Size ceiling, in bytes, for `logs/daemon.log`. An age window
     /// does not apply to it: `serve --detach` opens ONE file in append mode and
     /// keeps every tracing line the daemon ever emits in it, so what bounds it
     /// is size. Past the ceiling the file is rolled to `daemon.log.1` and
@@ -694,7 +692,7 @@ pub struct StreamLogGcConfig {
     /// holds the fd open; a rename alone would leave it writing into the
     /// predecessor). `0` disables the ceiling and leaves the file unbounded.
     pub daemon_log_max_bytes: u64,
-    /// CLAUDE-257: size ceiling, in bytes, for each `logs/<action>/<output.file>`
+    /// Size ceiling, in bytes, for each `logs/<action>/<output.file>`
     /// (the opt-in per-job JSONL sink an action's `output.file` field turns on).
     ///
     /// Decision: this file is bounded by SIZE and never deleted by age, unlike
@@ -706,7 +704,7 @@ pub struct StreamLogGcConfig {
     /// without bound. `0` disables the ceiling for operators who want the sink
     /// kept whole and rotate it themselves.
     pub output_file_max_bytes: u64,
-    /// CLAUDE-268: size ceiling, in bytes, for `logs/usage.jsonl` (DEV-707's
+    /// Size ceiling, in bytes, for `logs/usage.jsonl` (the
     /// per-run token and cost record, one line per run).
     ///
     /// Bounded by SIZE like the two files above rather than by age: it is one
@@ -716,7 +714,7 @@ pub struct StreamLogGcConfig {
     /// line, so this still holds far more history than anyone reads back. `0`
     /// disables the ceiling and leaves the file unbounded.
     pub usage_log_max_bytes: u64,
-    /// CLAUDE-262: age, in days, past which a `snippets/<action>/<job_key>/`
+    /// Age, in days, past which a `snippets/<action>/<job_key>/`
     /// directory is deleted, measured from its last-modified time. One per job
     /// per scripted step (`filter` / `pre` / `prompt` / `post`), holding the
     /// rendered snippet plus one `binding-<name>.json` per `$`-binding
@@ -726,7 +724,7 @@ pub struct StreamLogGcConfig {
     /// same guard [`crate::gc::sweep_stream_logs`] applies to a live run's
     /// stream log.
     pub snippet_retention_days: u64,
-    /// CLAUDE-262: age, in days, past which a file directly under
+    /// Age, in days, past which a file directly under
     /// `webhook-logs/` (the redacted, concatenated CI job logs
     /// [`crate::forge_log::fetch_run_log`] writes per triaged run) is deleted,
     /// measured from its last-modified time. The `webhook-logs/triage/` working
@@ -746,7 +744,7 @@ impl Default for StreamLogGcConfig {
             // rounding error next to the stream logs' ~1 GB window.
             daemon_log_max_bytes: 50 * 1024 * 1024,
             output_file_max_bytes: 50 * 1024 * 1024,
-            // CLAUDE-268: 8 MiB. At the ~300 bytes a usage record runs to that
+            // 8 MiB. At the ~300 bytes a usage record runs to that
             // is on the order of 25,000 runs of history, far past what is read
             // back, and a fraction of the two 50 MiB ceilings above.
             usage_log_max_bytes: 8 * 1024 * 1024,
@@ -759,13 +757,13 @@ impl Default for StreamLogGcConfig {
     }
 }
 
-/// CLAUDE-175: DB-backed retention for the unbounded history tables (settings
+/// DB-backed retention for the unbounded history tables (settings
 /// key `config.db_retention`, editable on the web Settings page), Phase 6 of the
 /// roadmap. NOT a `config.toml` key. The daemon sweep ([`crate::retention`]) runs
 /// on `serve` start and on a periodic tick, deleting rows from every table in
 /// [`crate::retention::RETENTION_TABLES`] whose `ts` is older than
-/// `retention_days`. `job_outcomes` is the driver (this issue); `run_events`
-/// (CLAUDE-172) shares the same config, helper, and loop rather than a divergent
+/// `retention_days`. `job_outcomes` is the driver; `run_events`
+/// shares the same config, helper, and loop rather than a divergent
 /// implementation.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -790,7 +788,7 @@ impl Default for DbRetentionConfig {
     }
 }
 
-/// CLAUDE-154: global display preferences. A single-operator daemon has no
+/// Global display preferences. A single-operator daemon has no
 /// `users` table, so this is one global section (settings key
 /// `config.preferences`, editable on the web Settings page) rather than
 /// per-user rows. It drives how every stored RFC3339 UTC timestamp is rendered
@@ -800,7 +798,7 @@ impl Default for DbRetentionConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PreferencesConfig {
-    /// BCP-47 locale (e.g. `en-US`). CLAUDE-155: mapped to a [`chrono::Locale`]
+    /// BCP-47 locale (e.g. `en-US`). Mapped to a [`chrono::Locale`]
     /// (hyphen normalized to underscore) and passed to `format_localized`, so
     /// name-emitting specifiers (`%A`, `%a`, `%B`, `%b`, `%p`) render in this
     /// locale. Validated on save; an unknown locale is rejected.
@@ -826,9 +824,9 @@ impl Default for PreferencesConfig {
     }
 }
 
-/// CLAUDE-239: global defaults for the `claude` CLI invocation. A DB-backed
+/// Global defaults for the `claude` CLI invocation. A DB-backed
 /// runtime section (settings key `config.claude`, editable on the web Settings
-/// page and via `GET`/`PUT /api/settings/claude`) per the CLAUDE-101
+/// page and via `GET`/`PUT /api/settings/claude`) per the
 /// bootstrap-vs-runtime split, so it is NOT a `config.toml` key (a brand-new
 /// section, so there is no file fallback: the DB value or the default).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -840,7 +838,7 @@ pub struct ClaudeConfig {
     /// runner never validates the value: the CLI is the source of truth for
     /// which models exist.
     pub model: Option<String>,
-    /// CLAUDE-259: instance-wide default effort level, passed through to
+    /// Instance-wide default effort level, passed through to
     /// `--effort` untouched. An action's own `claude.effort` wins over it; when
     /// neither is set no `--effort` flag is passed and the `claude` CLI's own
     /// default applies. A value outside
@@ -848,7 +846,7 @@ pub struct ClaudeConfig {
     /// the set is advisory, so a level Anthropic adds later works with no runner
     /// release.
     pub effort: Option<String>,
-    /// DEV-706: instance-wide default compaction window, passed through to
+    /// Instance-wide default compaction window, passed through to
     /// `--autocompact` untouched (`auto`, or 100k-1M tokens). An action's own
     /// `claude.autocompact` wins over it; when neither is set the runner passes
     /// [`crate::claude::DEFAULT_AUTOCOMPACT`], because the CLI's own `auto`
@@ -857,17 +855,17 @@ pub struct ClaudeConfig {
     pub autocompact: Option<String>,
 }
 
-/// CLAUDE-239: live handle to the global [`ClaudeConfig`], shared between
+/// Live handle to the global [`ClaudeConfig`], shared between
 /// [`crate::settings::LiveSettings`] (which swaps it on save) and
 /// [`crate::claude::ClaudeInvoker`] (which reads it per invocation). A
 /// `std::sync::RwLock` rather than a tokio one because the read happens inside
 /// the synchronous `invoke`, which has no `await`.
 pub type ClaudeConfigHandle = std::sync::Arc<std::sync::RwLock<ClaudeConfig>>;
 
-/// CLAUDE-162: daemon-wide concurrency + continuous-pickup settings. A DB-backed
+/// Daemon-wide concurrency + continuous-pickup settings. A DB-backed
 /// runtime section (settings key `config.concurrency`, editable on the web
 /// Settings page and via `GET`/`PUT /api/settings/concurrency`) per the
-/// CLAUDE-101 bootstrap-vs-runtime split, so it is NOT a `config.toml` key (a
+/// bootstrap-vs-runtime split, so it is NOT a `config.toml` key (a
 /// brand-new section, so there is no file fallback: the DB value or the default).
 ///
 /// `max_parallel_global` caps total concurrent jobs across ALL actions; the
@@ -956,7 +954,7 @@ pub struct DaemonConfig {
     pub nu_binary: Option<String>,
     /// Optional override for the claude binary. Default: "claude".
     pub claude_binary: Option<String>,
-    /// CLAUDE-165: where the spawned `claude` agent reads its user-level config
+    /// Where the spawned `claude` agent reads its user-level config
     /// (`CLAUDE.md`, `.credentials.json`, `settings.json`) from, via the
     /// `CLAUDE_CONFIG_DIR` env var. A path the daemon needs before it can spawn
     /// the agent, so it is a bootstrap `config.toml` key (not a DB-backed runtime
@@ -965,19 +963,19 @@ pub struct DaemonConfig {
     /// daemon seeds this dir with the slim bot `CLAUDE.md` and links the host
     /// login, so the agent never loads the operator's global `~/.claude/CLAUDE.md`.
     pub claude_config_dir: Option<String>,
-    /// CLAUDE-62: persistent log filter, a tracing `EnvFilter` directive string
+    /// Persistent log filter, a tracing `EnvFilter` directive string
     /// (e.g. `info,claude_run=debug,sqlx=warn`). Applied after config load via a
     /// reload layer. Precedence: `CLAUDE_RUN_LOG` > this field > the built-in
     /// default (`info,claude_run=info,sqlx=warn`); set `CLAUDE_RUN_LOG` for
     /// one-shot debugging without editing the file. Directive syntax:
     /// <https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives>.
     /// Known limitation: the few startup lines emitted before config load (e.g.
-    /// the CLAUDE-57 config-source line) are governed by the initial filter, not
+    /// the config-source line) are governed by the initial filter, not
     /// this one; use `CLAUDE_RUN_LOG` when those specific lines are needed at debug.
     pub log_filter: Option<String>,
 }
 
-/// CLAUDE-62: precedence decision for the post-config-load log-filter swap,
+/// Precedence decision for the post-config-load log-filter swap,
 /// extracted as a pure function so the `CLAUDE_RUN_LOG` > `[daemon].log_filter`
 /// > default ordering is unit-testable without a live tracing subscriber.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -991,7 +989,7 @@ pub enum LogFilterChoice {
     ApplyFile(String),
 }
 
-/// Pure precedence logic for CLAUDE-62. `env_set` is whether `CLAUDE_RUN_LOG` is
+/// Pure precedence logic. `env_set` is whether `CLAUDE_RUN_LOG` is
 /// present in the environment; `file_filter` is `[daemon].log_filter`.
 pub fn log_filter_choice(env_set: bool, file_filter: Option<&str>) -> LogFilterChoice {
     if env_set {
@@ -1004,7 +1002,7 @@ pub fn log_filter_choice(env_set: bool, file_filter: Option<&str>) -> LogFilterC
     }
 }
 
-/// CLAUDE-57: where the effective [`OnDiskConfig`] came from, so `serve` can
+/// Where the effective [`OnDiskConfig`] came from, so `serve` can
 /// log one startup line answering "was my config actually read?". The silent
 /// default-fallback under systemd (a different resolved config dir than the
 /// shell, so the file "does not exist" there and defaults win) is exactly the
@@ -1020,7 +1018,7 @@ pub enum ConfigSource {
 impl ConfigSource {
     /// Emit the single config-source startup line. `info` when a file backed the
     /// config, `warn` when defaults silently won: a missing file under systemd
-    /// while the shell shows one is the silent failure CLAUDE-57 is about.
+    /// while the shell shows one is exactly the silent failure this guards against.
     pub fn log(&self) {
         match self {
             ConfigSource::Loaded(path) => {
@@ -1053,7 +1051,7 @@ impl OnDiskConfig {
     }
 }
 
-/// CLAUDE-250: the resolved state-store backend, produced once at startup and
+/// The resolved state-store backend, produced once at startup and
 /// handed to `db::open`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatabaseTarget {
@@ -1130,7 +1128,7 @@ mod tests {
         assert!(out.starts_with('/'));
     }
 
-    /// CLAUDE-307: a `config.auth` document stored before `github_host` /
+    /// A `config.auth` document stored before `github_host` /
     /// `github_token_ref` existed must still deserialize, with both new fields
     /// defaulting to `None`.
     #[test]
@@ -1175,7 +1173,7 @@ mod tests {
         assert_eq!(parsed.update.token_ref.as_deref(), Some("registry-token"));
     }
 
-    // CLAUDE-62: the new `[daemon].log_filter` parses when present and is `None`
+    // The new `[daemon].log_filter` parses when present and is `None`
     // when absent (the field must stay optional so existing files keep loading).
     #[test]
     fn daemon_log_filter_parses_and_defaults_to_none() {
@@ -1197,7 +1195,7 @@ mod tests {
         );
     }
 
-    // CLAUDE-62: the precedence function covers all four input combinations of
+    // The precedence function covers all four input combinations of
     // (env set?) x (file set?). Env always wins; otherwise the file applies when
     // present, else the default is kept.
     #[test]
@@ -1217,7 +1215,7 @@ mod tests {
         assert_eq!(log_filter_choice(false, None), LogFilterChoice::KeepDefault);
     }
 
-    // CLAUDE-62: an invalid directive must be rejected at parse time so the apply
+    // An invalid directive must be rejected at parse time so the apply
     // path can keep the active filter instead of aborting the daemon.
     #[test]
     fn invalid_log_filter_directive_fails_to_parse() {
@@ -1228,7 +1226,7 @@ mod tests {
         assert!(EnvFilter::try_new("info,claude_run=debug,sqlx=warn").is_ok());
     }
 
-    // ---- CLAUDE-87: multi-source webhook config ---------------------------
+    // ---- Multi-source webhook config ---------------------------
 
     #[test]
     fn webhook_sources_map_parses() {
@@ -1280,7 +1278,7 @@ mod tests {
 
     #[test]
     fn old_top_level_webhook_keys_fail_to_parse() {
-        // CLAUDE-87 is a BREAKING config change: the pre-CLAUDE-87 top-level keys
+        // This was a BREAKING config change: the old top-level keys
         // are gone, and `deny_unknown_fields` makes a config still carrying them
         // fail to parse, naming the offending key as the migration signal.
         for key in ["secret_ref", "allowed_repos", "rate_limit_per_min"] {
@@ -1308,7 +1306,7 @@ mod tests {
         assert!(err.to_string().contains("secret"));
     }
 
-    // ---- CLAUDE-220: comment webhook section is DB-only --------------------
+    // ---- Comment webhook section is DB-only --------------------
 
     #[test]
     fn comment_webhook_section_cannot_be_declared_in_config_toml() {
@@ -1375,7 +1373,7 @@ mod tests {
         assert!(!source_name_is_clean(""));
     }
 
-    // CLAUDE-250: one test rather than four, because the three inputs are
+    // One test rather than four, because the three inputs are
     // process-wide environment variables and `cargo test` runs in parallel.
     #[test]
     fn database_url_precedence_is_file_then_env_then_config() {
@@ -1448,9 +1446,9 @@ mod tests {
         std::env::remove_var("CLAUDE_RUN_DATABASE_URL");
     }
 
-    // CLAUDE-57: `load` reports whether `config.toml` was present so `serve` can
-    // log the source. A missing file falls back to defaults (the silent case
-    // this issue surfaces); a present file is parsed.
+    // `load` reports whether `config.toml` was present so `serve` can
+    // log the source. A missing file falls back to defaults (the silent
+    // case this guards against); a present file is parsed.
     #[test]
     fn load_reports_config_source() {
         let tmp = tempfile::tempdir().unwrap();

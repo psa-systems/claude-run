@@ -62,7 +62,7 @@
       {% call m::textfield("In progress (State field)", "state_in_progress", form.state_in_progress, "In Progress") %}
       {% call m::textfield("Done", "state_done", form.state_done, "Done") %}
     </div>
-    <p class="hint dim">These are AI Agent labels except "In progress", which is the State field written at pickup. There is no State-on-merge field here: the runner never writes State on merge (CLAUDE-327). A YouTrack workflow (see <code>docs/yt-workflow-resolve-on-pr-merge.js</code>) resolves the issue once its own PR merges.</p>
+    <p class="hint dim">These are AI Agent labels except "In progress", which is the State field written at pickup. There is no State-on-merge field here: the runner never writes State on merge. A YouTrack workflow (see <code>docs/yt-workflow-resolve-on-pr-merge.js</code>) resolves the issue once its own PR merges.</p>
   </div>
 
   <div class="card">

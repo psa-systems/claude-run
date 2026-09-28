@@ -1,4 +1,4 @@
-//! CLAUDE-101: runtime-tunable configuration stored in the DB instead of
+//! Runtime-tunable configuration stored in the DB instead of
 //! `config.toml`.
 //!
 //! Every runtime-tunable section lives as one JSON document in the existing
@@ -14,7 +14,7 @@
 //! `[daemon]` binary overrides). On serve start [`migrate_config_file`] imports
 //! any MOVED section still present in the file (once), then a later start that
 //! finds one in BOTH the file and the DB refuses to run, naming the section -
-//! the CLAUDE-87-style breaking-migration signal that prevents two sources of
+//! a breaking-migration signal that prevents two sources of
 //! truth.
 //!
 //! [`LiveSettings`] holds the runtime copy behind `RwLock`s shared with the
@@ -47,20 +47,20 @@ pub enum Section {
     Update,
     Webhook,
     LogFilter,
-    /// CLAUDE-106: preserved / aside workdir GC retention windows.
+    /// Preserved / aside workdir GC retention windows.
     WorkdirGc,
-    /// CLAUDE-245: per-attempt stream-log retention window.
+    /// Per-attempt stream-log retention window.
     StreamLogGc,
-    /// CLAUDE-154: global display preferences (locale, timezone, date format).
+    /// Global display preferences (locale, timezone, date format).
     Preferences,
-    /// CLAUDE-162: daemon-wide concurrency caps + continuous-pickup cadence.
+    /// Daemon-wide concurrency caps + continuous-pickup cadence.
     Concurrency,
-    /// CLAUDE-175: DB history-table retention window (Phase 6).
+    /// DB history-table retention window (Phase 6).
     DbRetention,
-    /// CLAUDE-220: `/claude` pull-request comment listener. DB-only from day one
+    /// `/claude` pull-request comment listener. DB-only from day one
     /// (never a `config.toml` section, so `migrate_config_file` never touches it).
     WebhookComment,
-    /// CLAUDE-239: global defaults for the `claude` CLI invocation (the default
+    /// Global defaults for the `claude` CLI invocation (the default
     /// model an action inherits when it pins none).
     Claude,
     /// The daemon's own service logins (Claude API key, YouTrack, Forgejo).
@@ -174,7 +174,7 @@ pub struct LogFilterDoc {
     pub filter: Option<String>,
 }
 
-// ---- CLAUDE-154: preferences snapshot + date formatting -------------------
+// ---- preferences snapshot + date formatting -------------------
 
 /// Process-global snapshot of the live [`PreferencesConfig`]. Askama filters are
 /// free functions with no request state, so the `datetime` filter reads the
@@ -202,7 +202,7 @@ pub fn current_preferences() -> PreferencesConfig {
         .clone()
 }
 
-/// CLAUDE-155: map the preferences BCP-47 `locale` string (e.g. `en-US`) to a
+/// Map the preferences BCP-47 `locale` string (e.g. `en-US`) to a
 /// [`chrono::Locale`]. chrono's locale identifiers use an underscore separator
 /// (`en_US`), so the hyphen is normalized before parsing. Returns `Err` with the
 /// offending value for an unknown locale so callers can reject it on save.
@@ -242,7 +242,7 @@ fn strftime_has_error(fmt: &str) -> bool {
 /// to the preferences' `timezone`, and format with the `datetime_format`
 /// strftime pattern in the preferences' `locale`. Name-emitting specifiers
 /// (`%A`, `%a`, `%B`, `%b`, `%p`) render in that locale via chrono's
-/// `format_localized` (CLAUDE-155). On ANY failure (unparseable input, bad
+/// `format_localized`. On ANY failure (unparseable input, bad
 /// timezone, bad locale, bad format) it returns the input unchanged, so
 /// sentinels like `running` / `never` / empty pass through and a malformed value
 /// is never blanked or panicked on.
@@ -291,12 +291,12 @@ pub async fn set_raw(pool: &DbPool, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// CLAUDE-171: `settings` key holding the wall-clock start of the CURRENT serve.
+/// `settings` key holding the wall-clock start of the CURRENT serve.
 /// Not a `config.*` section: it is daemon lifetime state, not a tunable, so it
 /// never appears on the Settings page.
 const SERVE_STARTED_AT_KEY: &str = "daemon.started_at";
 
-/// CLAUDE-171: stamp the start of this serve. Written once per `serve` start
+/// Stamp the start of this serve. Written once per `serve` start
 /// (overwriting the previous lifetime's value), in the same
 /// [`crate::state::now_iso`] RFC3339-UTC-seconds format every `run_events.ts` is
 /// written in, so the web layer can bound events to this lifetime with a
@@ -307,7 +307,7 @@ pub async fn record_serve_start(pool: &DbPool) -> Result<String> {
     Ok(now)
 }
 
-/// CLAUDE-171: the current serve's start stamp, or `None` when no serve has
+/// The current serve's start stamp, or `None` when no serve has
 /// recorded one yet (a CLI invocation against a never-served DB). Callers that
 /// filter by it treat `None` as "no lower bound" rather than "no rows".
 pub async fn serve_started_at(pool: &DbPool) -> Result<Option<String>> {
@@ -340,27 +340,27 @@ pub struct EffectiveRuntime {
     pub update: UpdateConfig,
     pub webhook: WebhookConfig,
     pub log_filter: Option<String>,
-    /// CLAUDE-106: preserved / aside workdir GC windows. Brand-new section (never
+    /// Preserved / aside workdir GC windows. Brand-new section (never
     /// in `config.toml`), so there is no file fallback: the DB value or the
     /// built-in default.
     pub workdir_gc: WorkdirGcConfig,
-    /// CLAUDE-245: stream-log retention window. Brand-new section (never in
+    /// Stream-log retention window. Brand-new section (never in
     /// `config.toml`), so there is no file fallback: the DB value or the
     /// built-in default (30 days).
     pub stream_log_gc: StreamLogGcConfig,
-    /// CLAUDE-154: global display preferences. Brand-new section (never in
+    /// Global display preferences. Brand-new section (never in
     /// `config.toml`), so the DB value or the built-in default (UTC / ISO).
     pub preferences: PreferencesConfig,
-    /// CLAUDE-162: daemon-wide concurrency caps + continuous-pickup cadence.
+    /// Daemon-wide concurrency caps + continuous-pickup cadence.
     /// Brand-new section (never in `config.toml`), so the DB value or the default.
     pub concurrency: ConcurrencyConfig,
-    /// CLAUDE-175: DB history-table retention window. Brand-new section (never in
+    /// DB history-table retention window. Brand-new section (never in
     /// `config.toml`), so the DB value or the built-in default (180 days).
     pub db_retention: DbRetentionConfig,
-    /// CLAUDE-220: `/claude` comment-command listener. DB-only from day one, so
+    /// `/claude` comment-command listener. DB-only from day one, so
     /// there is no file fallback: the DB value or the built-in default.
     pub webhook_comment: CommentWebhookConfig,
-    /// CLAUDE-239: global `claude` invocation defaults. DB-only from day one, so
+    /// Global `claude` invocation defaults. DB-only from day one, so
     /// there is no file fallback: the DB value or the built-in default (no
     /// model, i.e. the CLI's own default).
     pub claude: ClaudeConfig,
@@ -426,7 +426,7 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
     })
 }
 
-/// CLAUDE-162: validate a [`ConcurrencyConfig`] before it is persisted. The
+/// Validate a [`ConcurrencyConfig`] before it is persisted. The
 /// cadence must be at least one second (a zero interval would fire an overlapping
 /// run every tick). `max_parallel_global` needs no bound: `0` means auto and any
 /// positive value is a valid explicit cap. Returns a human message on failure.
@@ -442,7 +442,7 @@ pub fn validate_concurrency(cfg: &ConcurrencyConfig) -> std::result::Result<(), 
 /// would silently truncate the bounded reports, so a save is rejected below it.
 pub const MIN_DB_RETENTION_DAYS: u64 = 90;
 
-/// CLAUDE-175: validate a [`DbRetentionConfig`] before it is persisted. The
+/// Validate a [`DbRetentionConfig`] before it is persisted. The
 /// window must stay `>=` the longest reporting range so a prune never silently
 /// truncates the 30d / 90d reports. Returns a human message on failure.
 pub fn validate_db_retention(cfg: &DbRetentionConfig) -> std::result::Result<(), String> {
@@ -462,7 +462,7 @@ pub async fn effective_update(pool: &DbPool, file: &OnDiskConfig) -> Result<Upda
         .unwrap_or_else(|| file.update.clone()))
 }
 
-/// CLAUDE-200: resolve the effective [`WebhookConfig`] for a consumer that holds
+/// Resolve the effective [`WebhookConfig`] for a consumer that holds
 /// no parsed `config.toml` (the native CI-failure handlers, which reach the
 /// webhook sources only for their per-repo log-token fallback). Same order as
 /// [`effective`]: the DB document, else the on-disk file, else the default.
@@ -473,7 +473,7 @@ pub async fn effective_webhook(pool: &DbPool, paths: &Paths) -> Result<WebhookCo
     }
 }
 
-/// CLAUDE-239: resolve the effective [`ClaudeConfig`] for a caller that holds no
+/// Resolve the effective [`ClaudeConfig`] for a caller that holds no
 /// [`LiveSettings`] (the daemonless `claude-run run`). DB-only from birth, so
 /// there is no file fallback: the stored document or the built-in default.
 pub async fn effective_claude(pool: &DbPool) -> Result<ClaudeConfig> {
@@ -484,7 +484,7 @@ pub async fn effective_claude(pool: &DbPool) -> Result<ClaudeConfig> {
 
 // ---- one-time import + breaking migration --------------------------------
 
-/// CLAUDE-101 migration. Parse `config.toml` raw and, for every moved section
+/// Parse `config.toml` raw and, for every moved section
 /// still present in the file, either import it into the DB (when the DB does not
 /// yet hold it) or refuse to start (when the DB already holds it). A missing file
 /// or a file with no moved sections is a clean no-op. Bootstrap keys (`[web]`,
@@ -588,7 +588,7 @@ fn stale_section_error(section: Section, label: &str, path: &str) -> crate::erro
 
 // ---- live runtime settings -----------------------------------------------
 
-/// Closure that swaps the live tracing `EnvFilter` (the CLAUDE-62 reload handle),
+/// Closure that swaps the live tracing `EnvFilter` (the reload handle),
 /// returning the directive error string on a bad filter. `None` when
 /// `CLAUDE_RUN_LOG` is set (the env var wins, so a saved filter persists but is
 /// not applied) or when no reload handle is available.
@@ -635,11 +635,11 @@ pub struct LiveSettings {
     preferences: Arc<RwLock<PreferencesConfig>>,
     concurrency: Arc<RwLock<ConcurrencyConfig>>,
     db_retention: Arc<RwLock<DbRetentionConfig>>,
-    /// CLAUDE-220: live comment-webhook config + its own per-source limiter map,
+    /// Live comment-webhook config + its own per-source limiter map,
     /// rebuilt in lock-step on save exactly like the `webhook` section.
     webhook_comment: Arc<RwLock<CommentWebhookConfig>>,
     webhook_comment_rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
-    /// CLAUDE-239: global `claude` invocation defaults. A `std::sync::RwLock`
+    /// Global `claude` invocation defaults. A `std::sync::RwLock`
     /// (not the tokio one every other section uses) because the reader is
     /// `ClaudeInvoker::invoke`, which is synchronous and cannot await.
     claude: ClaudeConfigHandle,
@@ -656,7 +656,7 @@ impl LiveSettings {
     pub fn new(pool: DbPool, eff: EffectiveRuntime, log_apply: Option<LogFilterApply>) -> Self {
         let webhook_rate = build_rate_map(&eff.webhook);
         let webhook_comment_rate = comment_rate_map(&eff.webhook_comment);
-        // CLAUDE-154: seed the process-global snapshot the Askama `datetime`
+        // Seed the process-global snapshot the Askama `datetime`
         // filter reads, so display formatting is live from startup.
         set_preferences_snapshot(eff.preferences.clone());
         let s = Self {
@@ -709,43 +709,43 @@ impl LiveSettings {
         self.webhook_rate.clone()
     }
 
-    /// CLAUDE-220: shared handle to the live comment-webhook config, read per
+    /// Shared handle to the live comment-webhook config, read per
     /// request by the comment listener so a Settings save routes immediately.
     pub fn webhook_comment_handle(&self) -> Arc<RwLock<CommentWebhookConfig>> {
         self.webhook_comment.clone()
     }
 
-    /// CLAUDE-220: shared handle to the live comment per-source limiter map.
+    /// Shared handle to the live comment per-source limiter map.
     pub fn webhook_comment_rate_handle(&self) -> Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>> {
         self.webhook_comment_rate.clone()
     }
 
-    /// CLAUDE-106: shared handle to the live workdir-GC config, read by the
+    /// Shared handle to the live workdir-GC config, read by the
     /// sweeper on each tick so a Settings save applies on the next sweep.
     pub fn workdir_gc_handle(&self) -> Arc<RwLock<WorkdirGcConfig>> {
         self.workdir_gc.clone()
     }
 
-    /// CLAUDE-245: shared handle to the live stream-log GC config, read by the
+    /// Shared handle to the live stream-log GC config, read by the
     /// sweeper on each tick so a Settings save applies on the next sweep.
     pub fn stream_log_gc_handle(&self) -> Arc<RwLock<StreamLogGcConfig>> {
         self.stream_log_gc.clone()
     }
 
-    /// CLAUDE-162: shared handle to the live concurrency config, read by the
+    /// Shared handle to the live concurrency config, read by the
     /// scheduler each tick (global cap + regather cadence) so a Settings save
     /// applies on the next tick.
     pub fn concurrency_handle(&self) -> Arc<RwLock<ConcurrencyConfig>> {
         self.concurrency.clone()
     }
 
-    /// CLAUDE-175: shared handle to the live DB-retention config, read by the
+    /// Shared handle to the live DB-retention config, read by the
     /// retention sweep on each tick so a Settings save applies on the next sweep.
     pub fn db_retention_handle(&self) -> Arc<RwLock<DbRetentionConfig>> {
         self.db_retention.clone()
     }
 
-    /// CLAUDE-239: shared handle to the live `claude` invocation defaults, read
+    /// Shared handle to the live `claude` invocation defaults, read
     /// by [`crate::claude::ClaudeInvoker`] on each invocation so a Settings save
     /// applies to the next one without a daemon restart.
     /// Live handle to the daemon's own service logins.
@@ -762,7 +762,7 @@ impl LiveSettings {
         self.claude.clone()
     }
 
-    /// CLAUDE-129: a snapshot of the live update config (train + token_ref), read
+    /// A snapshot of the live update config (train + token_ref), read
     /// by the About page handlers to drive the on-demand check / apply.
     pub async fn update_config(&self) -> UpdateConfig {
         self.update.read().await.clone()
@@ -881,8 +881,8 @@ impl LiveSettings {
             Section::Claude => {
                 let v: ClaudeConfig = parse(json)?;
                 // No model-name validation: the `claude` CLI is the source of
-                // truth for which models exist (CLAUDE-239). No effort-level
-                // validation either (CLAUDE-259): an unknown level is warned
+                // truth for which models exist. No effort-level
+                // validation either: an unknown level is warned
                 // about at invocation time, never rejected on save, so a level
                 // added after this release is still settable.
                 set_json(&self.pool, section.key(), &v).await?;
@@ -898,7 +898,7 @@ impl LiveSettings {
     }
 }
 
-/// CLAUDE-239: read the shared [`ClaudeConfig`] handle, recovering the value a
+/// Read the shared [`ClaudeConfig`] handle, recovering the value a
 /// panicking writer poisoned rather than propagating the panic: a stale-but-real
 /// default is better than killing the run that is reading it. The poisoning is
 /// logged so the panic that caused it is never silent.
@@ -917,19 +917,19 @@ fn write_claude(handle: &ClaudeConfigHandle) -> std::sync::RwLockWriteGuard<'_, 
     })
 }
 
-/// CLAUDE-220: per-source limiter map for the comment listener, built through the
+/// Per-source limiter map for the comment listener, built through the
 /// SHARED [`rate_map_from`] so both listeners keep identical bucket semantics.
 fn comment_rate_map(cfg: &CommentWebhookConfig) -> HashMap<String, Mutex<RateLimiter>> {
     rate_map_from(cfg.sources.iter().map(|(n, s)| (n, s.rate_limit_per_min)))
 }
 
-/// CLAUDE-220: validate a [`CommentWebhookConfig`] before it is persisted. An
+/// Validate a [`CommentWebhookConfig`] before it is persisted. An
 /// empty trigger would match every comment and a zero instruction cap would
 /// refuse every command, so both are rejected rather than stored.
-/// CLAUDE-274: `analysis_concurrency` must be at least 1 - a `0` would leave
+/// `analysis_concurrency` must be at least 1 - a `0` would leave
 /// [`crate::web::webhooks::consume_events`]'s worker-pool semaphore permanently
 /// starved, so no event would ever be analyzed.
-/// CLAUDE-276: `agent_pr_fix_attempts` must be at least 1 - a `0` would flag
+/// `agent_pr_fix_attempts` must be at least 1 - a `0` would flag
 /// the agent's own PR `Needs Review` on its very first failure, never giving
 /// it a chance to fix its own regression.
 /// CLAUDE-360: `enabled: true` is rejected unless every configured source
@@ -1155,7 +1155,7 @@ mod tests {
         assert!(rate.read().await.contains_key("ng"));
     }
 
-    // ---- CLAUDE-220: comment webhook section ------------------------------
+    // ---- comment webhook section ------------------------------
 
     #[tokio::test]
     async fn comment_webhook_save_swaps_config_and_rebuilds_limiters() {
@@ -1321,7 +1321,7 @@ mod tests {
         assert!(get_raw(&pool, Section::Mint.key()).await.unwrap().is_none());
     }
 
-    // ---- CLAUDE-175: DB-retention section save + window validation ---------
+    // ---- DB-retention section save + window validation ---------
 
     #[tokio::test]
     async fn db_retention_saves_and_rejects_too_short_window() {
@@ -1369,7 +1369,7 @@ mod tests {
         .expect("a disabled config bypasses the window floor");
     }
 
-    // ---- CLAUDE-245: stream-log GC section ---------------------------------
+    // ---- stream-log GC section ---------------------------------
 
     #[tokio::test]
     async fn stream_log_gc_section_round_trips() {
@@ -1405,7 +1405,7 @@ mod tests {
         assert_eq!(stored.retention_days, 7);
         assert_eq!(live.stream_log_gc_handle().read().await.retention_days, 7);
 
-        // CLAUDE-257: the two size ceilings ride the same document, so they
+        // The two size ceilings ride the same document, so they
         // round-trip through `GET` / `PUT /api/settings/stream_log_gc` and apply
         // on the handle the daemon's log GC pass reads.
         live.save_section(
@@ -1446,11 +1446,11 @@ mod tests {
         assert_eq!(unchanged.retention_days, 7);
     }
 
-    /// CLAUDE-262: `snippet_retention_days` and `webhook_log_retention_days`
+    /// `snippet_retention_days` and `webhook_log_retention_days`
     /// ride the same `config.stream_log_gc` document, so they round-trip
     /// through `GET` / `PUT /api/settings/stream_log_gc` and apply live on the
-    /// handle the daemon's sweep loop reads, exactly like the two CLAUDE-257
-    /// size ceilings above.
+    /// handle the daemon's sweep loop reads, exactly like the two size ceilings
+    /// above.
     #[tokio::test]
     async fn stream_log_gc_section_round_trips_the_snippet_and_webhook_log_windows() {
         let pool = pool().await;
@@ -1486,7 +1486,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-239: global claude invocation defaults ---------------------
+    // ---- global claude invocation defaults ---------------------
 
     #[tokio::test]
     async fn claude_section_round_trips_on_the_shared_handle() {
@@ -1520,7 +1520,7 @@ mod tests {
             Some("claude-sonnet-4-5-20250929")
         );
 
-        // CLAUDE-259: effort lives in the same document and round-trips beside
+        // Effort lives in the same document and round-trips beside
         // the model, including a level outside the documented set (the runner
         // warns about that and passes it through; nothing rejects it here).
         assert_eq!(read_claude(&handle).effort, None);
@@ -1591,7 +1591,7 @@ mod tests {
             .is_none());
     }
 
-    // ---- CLAUDE-154: preferences formatting + validation -------------------
+    // ---- preferences formatting + validation -------------------
 
     #[test]
     fn format_datetime_defaults_reproduce_utc_iso() {
@@ -1633,7 +1633,7 @@ mod tests {
 
     #[test]
     fn format_datetime_localizes_names() {
-        // CLAUDE-155: name-emitting specifiers render in the configured locale.
+        // Name-emitting specifiers render in the configured locale.
         // 2026-07-01 is a Wednesday in July at 13:05 (PM).
         let fr = PreferencesConfig {
             locale: "fr-FR".to_string(),
@@ -1732,7 +1732,7 @@ mod tests {
         // Assert on this instance's own live copy, not the process-global
         // `current_preferences()` snapshot: that global is single-writer in
         // production but is rewritten by every parallel test's
-        // `LiveSettings::new`, so reading it here races (CLAUDE-154).
+        // `LiveSettings::new`, so reading it here races.
         assert_eq!(live.preferences.read().await.timezone, "Europe/Paris");
 
         // Invalid timezone is rejected, nothing overwritten.
@@ -1761,7 +1761,7 @@ mod tests {
             other => panic!("expected Invalid, got {other}"),
         }
 
-        // CLAUDE-155: an unknown locale is rejected on save with the value named.
+        // An unknown locale is rejected on save with the value named.
         let err = live
             .save_section(
                 Section::Preferences,
@@ -1782,7 +1782,7 @@ mod tests {
         assert_eq!(stored.timezone, "Europe/Paris");
     }
 
-    // CLAUDE-162: the concurrency section round-trips, defaults to auto global
+    // The concurrency section round-trips, defaults to auto global
     // (0) + 60s cadence, and rejects a zero cadence without overwriting.
     #[tokio::test]
     async fn concurrency_section_round_trips_and_validates() {

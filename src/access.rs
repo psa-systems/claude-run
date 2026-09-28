@@ -1,4 +1,4 @@
-//! CLAUDE-216: on-demand access check.
+//! On-demand access check.
 //!
 //! Answers, without queueing a job, whether the runner has the access it needs:
 //! every configured credential's identity and validity, and whether a NAMED repo
@@ -786,7 +786,7 @@ fn query_remediation(detail: &str, project: Option<&str>) -> String {
     }
 }
 
-/// CLAUDE-216: drop the poll's recovery markers for repos that were not failing,
+/// Drop the poll's recovery markers for repos that were not failing,
 /// so the success marker is recorded only on a fail -> pass transition. Without
 /// this every poll would append one info row per repo forever; with it, the
 /// dashboard banner still clears (the marker supersedes the open failure) and
@@ -950,7 +950,7 @@ mod tests {
     #[test]
     fn scope_short_repo_probe_carries_the_remediation() {
         let dir = tempfile::tempdir().unwrap();
-        // Repository read passes, pull-request read 403s: the CLAUDE-207 case a
+        // Repository read passes, pull-request read 403s: a case a
         // repository-only probe would call healthy.
         let runner = happy_yt("CLAUDE")
             .ok(
@@ -1041,7 +1041,7 @@ mod tests {
                 1,
                 invalid_query,
             )
-            // The failing VCS probe runs the CLAUDE-148 identity diagnostic.
+            // The failing VCS probe runs the identity diagnostic.
             .ok("yt", &["user", "me"], "claude-run")
             .ok("yt", &["project", "list", "--json"], "[]");
         let req = AccessRequest {

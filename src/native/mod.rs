@@ -1,10 +1,9 @@
-//! Native action dispatch seam (CLAUDE-30).
+//! Native action dispatch seam.
 //!
 //! Scripted actions run the generic nu-snippet pipeline in [`crate::job`].
 //! Native actions route here instead: each native [`ActionKind`] maps to a
-//! built-in Rust [`NativeHandler`] via the [`handler_for`] registry. CLAUDE-30
-//! shipped the seam with a stub; CLAUDE-32 (Phase 3) lands the real YouTrack
-//! handler in [`youtrack`].
+//! built-in Rust [`NativeHandler`] via the [`handler_for`] registry, which
+//! carries the real YouTrack handler in [`youtrack`].
 //!
 //! Unlike a scripted action (whose run accounting lives in
 //! [`crate::daemon::run_action_inner`]), a native handler owns its whole run:
@@ -40,26 +39,26 @@ pub struct NativeContext<'a> {
     pub paths: &'a Paths,
     pub pool: &'a DbPool,
     /// `Arc` (not `&`) so the native handler can clone it into the per-job
-    /// tasks spawned by the CLAUDE-28 keyed executor.
+    /// tasks spawned by the keyed executor.
     pub snippet: Arc<SnippetRunner>,
     pub claude: Arc<ClaudeInvoker>,
     pub triggered_by: &'a str,
     pub registry: Option<&'a RunRegistry>,
-    /// CLAUDE-28: daemon-wide per-key gate, used by the handler's executor.
+    /// Daemon-wide per-key gate, used by the handler's executor.
     pub keygate: KeyGate,
-    /// CLAUDE-162: daemon-wide concurrency limiter (global + per-action caps),
+    /// Daemon-wide concurrency limiter (global + per-action caps),
     /// used by the handler's executor so caps hold across overlapping runs.
     pub limiter: Limiter,
-    /// CLAUDE-223: daemon-wide global-pause reader. Each handler derives a
+    /// Daemon-wide global-pause reader. Each handler derives a
     /// run-scoped [`crate::pause::RunPause`] after `run_begin` and consults it
     /// at its per-job checkpoints, so a pause taken mid-run stops the next
     /// pickup and the run finishes with `exit::PAUSED`.
     pub pause: crate::pause::PauseGate,
-    /// CLAUDE-228: daemon-wide per-action gather marker. Each handler holds it
+    /// Daemon-wide per-action gather marker. Each handler holds it
     /// across its gather step (the `yt list` that opens the run) so the
     /// scheduler does not stack another pickup on a gather still in flight.
     pub gather: crate::concurrency::GatherGate,
-    /// DEV-705 / DEV-707: this run's spend ledger and frozen ceiling, built by
+    /// This run's spend ledger and frozen ceiling, built by
     /// [`crate::daemon::run_action_inner`] from the action's limits BEFORE the
     /// handler starts. A handler bills every `claude` invocation against it,
     /// checks it before each pickup, and finalizes it with its run's exit code.

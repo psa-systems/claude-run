@@ -1,4 +1,4 @@
-//! Forgejo webhook listener (CLAUDE-43, multi-source CLAUDE-87).
+//! Forgejo webhook listener.
 //!
 //! `POST /webhooks/forgejo/{source}` routes on the daemon's TCP app receive
 //! Forgejo Action-run webhook deliveries. Each `{source}` names a configured
@@ -9,7 +9,7 @@
 //! 0. Resolve `{source}` from the config sources map; an unknown source -> 404.
 //! 1. Per-source rate limit (fixed window, before any crypto) -> 429 when
 //!    exceeded. One source's storm never starves another's bucket.
-//! 2. Resolve that source's HMAC secret (CLAUDE-26 `secrets` table); a missing
+//! 2. Resolve that source's HMAC secret (`secrets` table); a missing
 //!    `secret_ref` or unresolvable secret fails closed -> 401.
 //! 3. Verify the HMAC-SHA256 over the raw body against `X-Forgejo-Signature`
 //!    with a constant-time compare -> 401 on mismatch / missing signature. The
@@ -26,13 +26,12 @@
 //! Every per-request log line carries the `source` field so a rejection or ack
 //! is always attributable to its endpoint.
 //!
-//! CLAUDE-47 wires the fast-path end-to-end: [`consume_events`] composes the
-//! sibling subtasks - log fetch + redaction (CLAUDE-44), the hybrid triage
-//! engine (CLAUDE-45), and the triage-driven issue mint + dedupe + loop safety
-//! (CLAUDE-46) - so a verified failure turns into a minted issue (bucket 1 ->
+//! [`consume_events`] composes the sibling subtasks (log fetch + redaction, the
+//! hybrid triage engine, and the triage-driven issue mint + dedupe + loop safety)
+//! so a verified failure turns into a minted issue (bucket 1 ->
 //! `AI Agent=Queued`, picked up by the `youtrack` action, bucket 2 -> a
 //! human-assigned issue) or nothing (bucket 3, transient). Nothing polls for
-//! CI failures (CLAUDE-279), so a delivery this module drops is not recovered.
+//! CI failures, so a delivery this module drops is not recovered.
 //!
 //! TLS / reverse proxy and service authentication are out of scope here per the
 //! epic decision (handled by the external proxy / the linked auth issue).
@@ -67,24 +66,24 @@ use crate::secrets::{self, SecretsKey};
 use crate::state;
 use crate::triage::{self, FailureClassifier, TriageInput};
 
-/// Synthetic action name the Forgejo webhook records its DEV-335 caps under
+/// Synthetic action name the Forgejo webhook records its caps under
 /// (per-key attempt counter + daily run ledger in [`crate::state`]), so the
 /// event-driven mint throttles on the same accounting shape as the scheduled
-/// actions instead of re-deriving its own. CLAUDE-153 renamed this from the
-/// former `webhook-fast-path`; a startup data migration (migration `0013` plus
+/// actions instead of re-deriving its own. Renamed from the former
+/// `webhook-fast-path`; a startup data migration (migration `0013` plus
 /// the log-dir rename in [`crate::daemon`]) carries existing history across.
 pub const WEBHOOK_MINT_ACTION: &str = "webhook-forgejo";
 
-/// CLAUDE-153 / CLAUDE-223: the pause gate both webhook listeners take, once
+/// The pause gate both webhook listeners take, once
 /// signature / replay / rate-limit have passed. True means "accept the delivery
 /// and drop it": return 2xx without parsing, minting, or emitting anything.
 ///
 /// Three ways it returns true, all logged:
 ///
-/// - the GLOBAL pause is set (CLAUDE-223), which until now only the scheduler
+/// - the GLOBAL pause is set, which until now only the scheduler
 ///   and dispatcher honoured, so a webhook could still start work on a paused
 ///   daemon;
-/// - the listener's own synthetic action (`action`) is paused (CLAUDE-153);
+/// - the listener's own synthetic action (`action`) is paused;
 /// - either read failed, in which case we fail safe and drop rather than start
 ///   work against a pause we could not read.
 ///
@@ -131,7 +130,7 @@ pub(crate) async fn paused_accept_and_drop(
     }
 }
 
-/// CLAUDE-332 / CLAUDE-335: true when a timer- or queue-driven path of the
+/// True when a timer- or queue-driven path of the
 /// synthetic action `action` must not act: the daemon is globally paused,
 /// `action` is paused, or a
 /// pause flag could not be read (fail safe: a writer must never act against a
@@ -161,7 +160,7 @@ pub(crate) async fn webhook_action_paused(pool: &DbPool, action: &str, what: &st
     }
 }
 
-/// CLAUDE-269: right after the pause check, accept-and-drop a delivery while
+/// Right after the pause check, accept-and-drop a delivery while
 /// the Claude login needs renewing. 2xx for the same reason as a pause: a
 /// retry cannot help (the delivery id is already in the replay store), and
 /// nothing recovers the delivery once signed in again. Unlike a pause, this ALSO records a
@@ -193,7 +192,7 @@ async fn login_required_accept_and_drop(st: &WebhookState, source: &str, deliver
 }
 
 /// `runs.triggered_by` value for the event-driven webhook, alongside
-/// the existing `scheduler` / `trigger` / `cli` sources (CLAUDE-61). Each
+/// the existing `scheduler` / `trigger` / `cli` sources. Each
 /// consumed verified failure becomes one run recorded under this source so the
 /// dashboard / action-detail surfaces show webhook activity like any action.
 pub const WEBHOOK_TRIGGERED_BY: &str = "webhook";
@@ -202,7 +201,7 @@ pub const WEBHOOK_TRIGGERED_BY: &str = "webhook";
 pub const SIGNATURE_HEADER: &str = "X-Forgejo-Signature";
 /// Per-delivery unique id, used for replay protection.
 pub const DELIVERY_HEADER: &str = "X-Forgejo-Delivery";
-/// CLAUDE-277: the delivery's event type, mirroring Gitea's `X-Gitea-Event`
+/// The delivery's event type, mirroring Gitea's `X-Gitea-Event`
 /// (Forgejo forked Gitea's webhook notifier and kept its header naming,
 /// rebranded to `X-Forgejo-*` the same way it renamed the signature and
 /// delivery headers above). Its value for an Action-run delivery is
@@ -225,7 +224,7 @@ const ACTION_RUN_EVENT_PREFIX: &str = "action_run_";
 /// nothing to reconcile until the PR is terminal.
 const PR_ACTION_CLOSED: &str = "closed";
 
-/// CLAUDE-277: the subset of Forgejo's `pull_request` webhook payload the
+/// The subset of Forgejo's `pull_request` webhook payload the
 /// merge-close path consumes. Extra fields are ignored (no
 /// `deny_unknown_fields`), matching [`ActionPayload`]'s tolerance of a Forgejo
 /// upgrade that adds keys.
@@ -266,7 +265,7 @@ pub struct VerifiedPullRequestEvent {
     pub head_sha: String,
     pub head_ref: String,
     pub html_url: String,
-    /// CLAUDE-96-style: the webhook source this event arrived through, so the
+    /// The webhook source this event arrived through, so the
     /// consumer can resolve the source's `log_token_ref`.
     pub source: String,
 }
@@ -284,7 +283,7 @@ pub struct ActionPayload {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActionRun {
     /// The run's per-repo index, which is the number `fj actions logs` takes and
-    /// the one the `/actions/runs/<N>` web URL uses. CLAUDE-204: the run's global
+    /// the one the `/actions/runs/<N>` web URL uses. The run's global
     /// id is no longer read - `fj` resolves the run itself - so it is not parsed.
     pub index_in_repo: i64,
     pub commit_sha: String,
@@ -324,8 +323,8 @@ impl TryFrom<ActionUserRaw> for ActionUser {
 pub struct Repository {
     /// `owner/repo`, matched against the configured allow-list.
     pub full_name: String,
-    /// CLAUDE-92: visibility from the payload (`modules/structs/repo.go:57`).
-    /// CLAUDE-204: no longer gates the log fetch, which is one `fj actions logs`
+    /// Visibility from the payload (`modules/structs/repo.go:57`).
+    /// No longer gates the log fetch, which is one `fj actions logs`
     /// path for both visibilities; retained as context carried onto the mint.
     /// Serde default keeps older/foreign payloads on the public reading.
     #[serde(default)]
@@ -342,7 +341,7 @@ pub struct VerifiedFailureEvent {
     pub workflow_id: String,
     pub trigger_user: String,
     pub html_url: String,
-    /// CLAUDE-85: the run's own status from the payload. Forgejo's notifier
+    /// The run's own status from the payload. Forgejo's notifier
     /// (`services/webhook/notifier.go` `ActionRunNowDone`, v14.0.2) fires
     /// `action_run_failure` with `action: "failure"` for EVERY non-success done
     /// status - `failure`, `cancelled`, and `skipped` (`DoneStatuses()` in
@@ -350,15 +349,15 @@ pub struct VerifiedFailureEvent {
     /// whether anything actually failed. The consumer processes only
     /// [`RUN_STATUS_FAILURE`] and acks-and-skips the rest.
     pub status: String,
-    /// CLAUDE-92: `repository.private` from the payload; gates the log fetch
+    /// `repository.private` from the payload; gates the log fetch
     /// (see [`Repository::private`]).
     pub private: bool,
-    /// CLAUDE-96: the webhook source (config block name) this event arrived
+    /// The webhook source (config block name) this event arrived
     /// through, so the consumer can resolve the source's `log_token_ref`.
     pub source: String,
 }
 
-/// CLAUDE-278: the typed event emitted downstream for a verified, allow-listed
+/// The typed event emitted downstream for a verified, allow-listed
 /// `success` or `recover` Action-run delivery - an agent PR's checks may have
 /// just gone green. Deliberately thin: which PR (if any) this run belongs to,
 /// whether its action has automerge enabled, and its CI/mergeable state are
@@ -369,11 +368,11 @@ pub struct VerifiedActionSuccessEvent {
     pub repo: String,
     pub commit_sha: String,
     pub html_url: String,
-    /// CLAUDE-96-style: the webhook source this event arrived through.
+    /// The webhook source this event arrived through.
     pub source: String,
 }
 
-/// CLAUDE-85: the one `run.status` the pipeline acts on. Forgejo's status enum
+/// The one `run.status` the pipeline acts on. Forgejo's status enum
 /// (`models/actions/status.go`) is `unknown, success, failure, cancelled,
 /// skipped, waiting, running, blocked`; of the done statuses that reach the
 /// `action_run_failure` event (`failure`, `cancelled`, `skipped`), only a real
@@ -384,25 +383,25 @@ pub const RUN_STATUS_FAILURE: &str = "failure";
 
 /// State injected into the webhook handler. Cheap to clone (`DbPool` and
 /// `Sender` are `Arc`-shaped; the config and the rate-limiter map are
-/// `Arc`-wrapped). CLAUDE-87: one [`RateLimiter`] per source (built once at
+/// `Arc`-wrapped). One [`RateLimiter`] per source (built once at
 /// startup, keyed by source name) and a single shared [`SeenDeliveries`] replay
 /// store across all sources.
 #[derive(Clone)]
 pub struct WebhookState {
     pool: DbPool,
-    /// CLAUDE-101: live webhook config, shared with [`crate::settings::LiveSettings`]
+    /// Live webhook config, shared with [`crate::settings::LiveSettings`]
     /// so a Settings save (new/edited source, allow-list, rate limit, secret refs)
     /// is routable on the next request without a restart.
     config: Arc<RwLock<WebhookConfig>>,
     events: mpsc::Sender<VerifiedFailureEvent>,
     seen: Arc<Mutex<SeenDeliveries>>,
-    /// CLAUDE-101: live per-source limiter map, rebuilt by `LiveSettings` on save.
+    /// Live per-source limiter map, rebuilt by `LiveSettings` on save.
     rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
-    /// CLAUDE-269: `None` outside the daemon (tests, standalone callers).
+    /// `None` outside the daemon (tests, standalone callers).
     /// When set, a login-required delivery is accepted and dropped exactly
     /// like a pause, and the drop is recorded as a `run_events` row.
     readiness: Option<crate::readiness::ReadinessGate>,
-    /// CLAUDE-277: `None` outside the daemon and in every pre-existing test
+    /// `None` outside the daemon and in every pre-existing test
     /// (a separate `with_pr_events` builder, not a constructor parameter, so
     /// `WebhookState::new`'s call sites - including
     /// `comment_webhooks`'s cross-listener replay-store test - stay
@@ -410,13 +409,13 @@ pub struct WebhookState {
     /// is acked and dropped with a log, exactly like a delivery arriving while
     /// the daemon has no usable provider backend.
     pr_events: Option<mpsc::Sender<VerifiedPullRequestEvent>>,
-    /// CLAUDE-278: same source-compatibility shape as `pr_events`, for a
+    /// Same source-compatibility shape as `pr_events`, for a
     /// verified `success`/`recover` Action-run delivery. `None` (no daemon
     /// wiring, every pre-existing test) acks and drops with a log.
     success_events: Option<mpsc::Sender<VerifiedActionSuccessEvent>>,
 }
 
-/// CLAUDE-87/101: build one fixed-window rate limiter per source, so exhausting
+/// Build one fixed-window rate limiter per source, so exhausting
 /// one source's budget never 429s another. Shared by [`WebhookState`] startup and
 /// the live-apply rebuild in [`crate::settings::LiveSettings`], keeping the
 /// limiter map and the routed source map in lock-step.
@@ -429,7 +428,7 @@ pub fn build_rate_map(config: &WebhookConfig) -> HashMap<String, Mutex<RateLimit
     )
 }
 
-/// CLAUDE-220: the source-name-to-limiter build itself, over any `(name, limit)`
+/// The source-name-to-limiter build itself, over any `(name, limit)`
 /// pairs. The comment listener ([`super::comment_webhooks`]) has its own source
 /// map with the same per-source bucket semantics, so it shares this builder (and
 /// the [`RateLimiter`] type) rather than forking a parallel implementation.
@@ -468,7 +467,7 @@ impl WebhookState {
         }
     }
 
-    /// CLAUDE-101: build from handles shared with [`crate::settings::LiveSettings`]
+    /// Build from handles shared with [`crate::settings::LiveSettings`]
     /// so a save swaps the routed config + limiters live. The replay store is
     /// built once here from `replay_window_secs` (restart-only by design).
     pub fn from_shared(
@@ -491,7 +490,7 @@ impl WebhookState {
         }
     }
 
-    /// CLAUDE-269: attach the daemon's readiness gate, so a login-required
+    /// Attach the daemon's readiness gate, so a login-required
     /// delivery is accepted and dropped like a pause. A builder so every
     /// existing constructor call site stays source-compatible.
     pub fn with_readiness(mut self, gate: crate::readiness::ReadinessGate) -> Self {
@@ -499,7 +498,7 @@ impl WebhookState {
         self
     }
 
-    /// CLAUDE-277: attach the channel a verified `pull_request` delivery is
+    /// Attach the channel a verified `pull_request` delivery is
     /// dispatched onto. A builder for the same source-compatibility reason as
     /// [`Self::with_readiness`].
     pub fn with_pr_events(mut self, events: mpsc::Sender<VerifiedPullRequestEvent>) -> Self {
@@ -507,7 +506,7 @@ impl WebhookState {
         self
     }
 
-    /// CLAUDE-278: attach the channel a verified `success`/`recover`
+    /// Attach the channel a verified `success`/`recover`
     /// Action-run delivery is dispatched onto. A builder for the same
     /// source-compatibility reason as [`Self::with_readiness`].
     pub fn with_success_events(mut self, events: mpsc::Sender<VerifiedActionSuccessEvent>) -> Self {
@@ -515,7 +514,7 @@ impl WebhookState {
         self
     }
 
-    /// CLAUDE-220: the SHARED replay store handle. The comment listener records
+    /// The SHARED replay store handle. The comment listener records
     /// its deliveries in this same instance, so one `X-Forgejo-Delivery` id
     /// fanned out to both endpoints is still caught as a replay.
     pub fn seen_handle(&self) -> Arc<Mutex<SeenDeliveries>> {
@@ -525,7 +524,7 @@ impl WebhookState {
 
 /// Router carrying the per-source webhook route, merged into the daemon's TCP
 /// app. `{source}` is an axum path param resolved against the configured sources
-/// map (CLAUDE-87).
+/// map.
 pub fn router(state: WebhookState) -> Router {
     Router::new()
         .route("/webhooks/forgejo/:source", post(forgejo_webhook))
@@ -534,16 +533,16 @@ pub fn router(state: WebhookState) -> Router {
 
 /// Everything [`consume_events`] needs to triage a verified failure and mint
 /// (or decline to mint) a YouTrack issue from it. Built once at daemon start
-/// from the resolved provider backend (CLAUDE-46 `IssueTracker` + `Forge`), the
+/// from the resolved provider backend (`IssueTracker` + `Forge`), the
 /// on-disk mint config, and the shared `claude` invoker behind a
 /// [`FailureClassifier`]. When the daemon cannot build one (no usable `yt`/`fj`
 /// backend) it passes `None` and the consumer falls back to log-only behaviour.
-/// CLAUDE-277: `Clone` so the daemon can hand the same context to both
+/// `Clone` so the daemon can hand the same context to both
 /// [`consume_events`] and [`consume_pr_events`] - every field is already
 /// `Arc`-shaped or cheap to clone.
 #[derive(Clone)]
 pub struct MintContext {
-    /// State DB, for the reused DEV-335 caps ledger.
+    /// State DB, for the reused caps ledger.
     pub pool: DbPool,
     /// The LLM pass for the residue the deterministic rules cannot label.
     pub classifier: Arc<dyn FailureClassifier>,
@@ -551,21 +550,21 @@ pub struct MintContext {
     /// `Forge` the `has_open_pr` signal is read from.
     pub backend: Arc<dyn Backend>,
     /// Repo-to-project routing, loop-safety bot logins, bucket-2 assignee, etc.
-    /// CLAUDE-101: a live handle shared with [`crate::settings::LiveSettings`],
+    /// A live handle shared with [`crate::settings::LiveSettings`],
     /// read per event so a Settings save is honored by the next mint without a
     /// restart.
     pub mint_cfg: Arc<RwLock<MintConfig>>,
     /// Caps applied to the event-driven mint (per-key attempts + daily runs).
     pub defaults: RunnerDefaults,
-    /// CLAUDE-86: TTL-cached inverse VCS routing map (repo -> project), built
+    /// TTL-cached inverse VCS routing map (repo -> project), built
     /// from YouTrack project VCS integrations and shared across mints.
     pub route_cache: Arc<VcsRouteCache>,
-    /// CLAUDE-276: resolved on-disk locations, so a PR comment's write-scoped
+    /// Resolved on-disk locations, so a PR comment's write-scoped
     /// backend can materialize its temp single-host `keys.json` under the
-    /// daemon's own runtime dir (the same CLAUDE-26 mechanism
+    /// daemon's own runtime dir (the same mechanism
     /// `comment_webhooks::build_env` uses).
     pub paths: Paths,
-    /// CLAUDE-276: the [`CommandRunner`] the PR-comment backend's `fj` child
+    /// The [`CommandRunner`] the PR-comment backend's `fj` child
     /// runs through. Real [`ProcessRunner`] in production; injectable so a test
     /// can exercise a PR-comment routing decision against a canned `fj`
     /// response with no real subprocess or network call.
@@ -573,9 +572,9 @@ pub struct MintContext {
 }
 
 /// Drain emitted events. For each verified failure this fetches the run's logs
-/// through `fj actions logs`, redacts secrets, and writes a redacted artifact
-/// (CLAUDE-44 / CLAUDE-204); then, when a [`MintContext`] is configured, triages
-/// the failure (CLAUDE-45) and mints / declines a YouTrack issue (CLAUDE-46).
+/// through `fj actions logs`, redacts secrets, and writes a redacted artifact;
+/// then, when a [`MintContext`] is configured, triages
+/// the failure and mints / declines a YouTrack issue.
 /// The fetch is best-effort: a not-ready / pruned log is a transient miss, not a
 /// fault. A miss does not strand the consumer - it feeds triage as a bucket-3
 /// signal (the rules pass routes an unavailable log to transient).
@@ -588,7 +587,7 @@ pub async fn consume_events(
     webhook_cfg: Arc<RwLock<WebhookConfig>>,
     keygate: crate::concurrency::KeyGate,
 ) {
-    // CLAUDE-274: bound the number of events processed concurrently, so a
+    // Bound the number of events processed concurrently, so a
     // burst of failures does not start one 600s analysis session per event at
     // once (`config.webhook.analysis_concurrency`, default 2). The snapshot is
     // taken once at start: resizing the pool live is not required by this
@@ -599,17 +598,17 @@ pub async fn consume_events(
     // Built once so every spawned event shares one classifier/backend/route
     // cache, exactly as the old inline loop did.
     let mint = mint.map(Arc::new);
-    // CLAUDE-274: joined once the channel closes, so a caller awaiting
+    // Joined once the channel closes, so a caller awaiting
     // `consume_events` (every existing test, and the daemon's own shutdown)
     // observes every spawned event's completed side effects, not just that
     // they were scheduled.
     let mut tasks = Vec::new();
     while let Some(ev) = rx.recv().await {
-        // CLAUDE-101: snapshot the live webhook config for this event so a
+        // Snapshot the live webhook config for this event so a
         // Settings save (e.g. a source's `log_token_ref`) is picked up by the
         // next event without a restart.
         let webhook_cfg_snapshot = webhook_cfg.read().await.clone();
-        // CLAUDE-274: acquire a permit before spawning, so the loop itself
+        // Acquire a permit before spawning, so the loop itself
         // (not the spawned task) is what bounds how many events are ever
         // in flight; a saturated pool simply leaves later events queued in
         // the channel until one finishes.
@@ -639,9 +638,8 @@ pub async fn consume_events(
     }
 }
 
-/// One verified failure's whole pipeline (CLAUDE-61/CLAUDE-44/CLAUDE-45/
-/// CLAUDE-46/CLAUDE-273/CLAUDE-274): fetch the run's logs, redact, and (when a
-/// [`MintContext`] is configured) triage and mint. Spawned as its own task by
+/// One verified failure's whole pipeline: fetch the run's logs, redact, and
+/// (when a [`MintContext`] is configured) triage and mint. Spawned as its own task by
 /// [`consume_events`]'s worker pool so a slow analysis for one event never
 /// delays another's.
 async fn process_event(
@@ -653,7 +651,7 @@ async fn process_event(
     webhook_cfg: WebhookConfig,
     keygate: crate::concurrency::KeyGate,
 ) {
-    // CLAUDE-335: an event accepted before a pause was set must not act after it.
+    // An event accepted before a pause was set must not act after it.
     if webhook_action_paused(&pool, WEBHOOK_MINT_ACTION, "action-run failure event").await {
         return;
     }
@@ -670,14 +668,14 @@ async fn process_event(
             "verified action_run_failure received"
         );
 
-        // CLAUDE-61: open a run row for every consumed event (user decision:
+        // Open a run row for every consumed event (user decision:
         // full observability including skips) so the web UI surfaces webhook
         // activity. `run_id` is `None` only if `run_begin` itself failed; the
         // pipeline still runs, it just goes unrecorded.
         let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
         let run_id = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
 
-        // CLAUDE-85: Forgejo fires `action_run_failure` for every non-success
+        // Forgejo fires `action_run_failure` for every non-success
         // done status (`failure`, `cancelled`, `skipped`; bare `else` in
         // `webhookNotifier.ActionRunNowDone`), so the run status, not the event
         // type, says whether anything failed. Only a real failure gets the
@@ -701,14 +699,14 @@ async fn process_event(
             return;
         }
 
-        // CLAUDE-204: ONE fetch path for public and private repos. `fj actions
+        // ONE fetch path for public and private repos. `fj actions
         // logs` takes the per-repo run number the payload already carries, and
         // the source's `log_token_ref` (when configured) authorizes a private
         // repo's read; a public repo reads without one. A miss still surfaces:
         // the no-log triage rule routes it to a human (bucket 2) rather than
         // silently dropping it as transient.
         let token = source_log_token(&pool, &webhook_cfg, &ev.source).await;
-        // CLAUDE-274: kept for the analysis classifier's own workflow-YAML fetch
+        // Kept for the analysis classifier's own workflow-YAML fetch
         // (it authorizes the log fetch below, then travels via `TriageInput`).
         let log_token = token.clone();
         let Some(target) =
@@ -756,7 +754,7 @@ async fn process_event(
         // Normalise the fetch result into the triage inputs. A `TransientMiss`,
         // an auth denial, a fetch error, and a panicked task all collapse to
         // "no log" with the reason preserved; the no-log triage rule
-        // (CLAUDE-92) routes those to a human rather than dropping them.
+        // routes those to a human rather than dropping them.
         let (log_text, log_available, log_artifact, log_unavailable_reason, jobs) = match outcome {
             Ok(Ok(LogOutcome::Fetched(log))) => {
                 if let Some(reason) = crate::forge_log::logs_permanently_missing(&log.jobs) {
@@ -844,14 +842,14 @@ async fn process_event(
             }
         };
 
-        // CLAUDE-208: the guard above reads the RUN-level status, which is
+        // The guard above reads the RUN-level status, which is
         // `failure` even when every job was merely cancelled (a newer push
         // superseded the run). Nothing failed, so triage would classify a log
         // with no failure in it and mint noise. Skip only the all-`{cancelled,
         // skipped}` case; any other status set still mints and logs what was
         // observed, and an unresolved job list mints as before so a log-token
-        // 401 (CLAUDE-200) fails open. The jobs ride along with the log since
-        // CLAUDE-204 collapsed the two fetches into one `fj actions logs` call,
+        // 401 fails open. The jobs ride along with the log since the two
+        // fetches were collapsed into one `fj actions logs` call,
         // so the saving here is the triage `claude` call and the issue.
         let jobs_verdict =
             crate::forge_log::JobsVerdict::resolve(log_unavailable_reason.as_deref(), &jobs);
@@ -908,7 +906,7 @@ async fn process_event(
             return;
         };
         let artifact = log_artifact.clone();
-        // DEV-707/CLAUDE-337: one ledger for this delivery, so the triage
+        // One ledger for this delivery, so the triage
         // classification's cost lands on this run's outcome row and daily
         // ledger instead of only `logs/usage.jsonl` with no run id.
         let spend = crate::usage::RunSpend::new(
@@ -919,7 +917,7 @@ async fn process_event(
             ),
             Some(ctx.paths.usage_log()),
         );
-        // CLAUDE-190/204: the failing job's name comes from the jobs `fj` already
+        // The failing job's name comes from the jobs `fj` already
         // returned with the log, so the root-cause dedupe key is job-scoped with
         // no extra request. A logless failure degrades to a job-agnostic key,
         // which still collapses the storm. The branch and the failure signature
@@ -963,11 +961,11 @@ async fn process_event(
     }
 }
 
-/// CLAUDE-80: live stage labels for the webhook pipeline, surfaced on
+/// Live stage labels for the webhook pipeline, surfaced on
 /// the run-detail page (Stage row + the running job's LIVE column) via
 /// `runs.stage`. `run_finish` clears the column, so no label outlives its run.
 pub const STAGE_FETCHING_LOGS: &str = "fetching action logs";
-/// CLAUDE-92/204: shown when the log token was rejected, so the run-detail page
+/// Shown when the log token was rejected, so the run-detail page
 /// names the actionable cause; the lasting record is the triage analysis and
 /// journal line, since `run_finish` clears the stage.
 pub const STAGE_LOG_UNAUTHORIZED: &str = "log fetch: unauthorized";
@@ -975,17 +973,17 @@ pub const STAGE_TRIAGING: &str = "triaging";
 pub const STAGE_CLASSIFYING: &str = "classifying with claude";
 pub const STAGE_MINTING: &str = "minting issue";
 
-/// CLAUDE-96: decrypt the named log token from the secrets store (same age-key
+/// Decrypt the named log token from the secrets store (same age-key
 /// mechanism as the HMAC refs).
 async fn resolve_log_token(pool: &DbPool, name: &str) -> crate::error::Result<String> {
     let key = SecretsKey::load()?;
-    // CLAUDE-146: trim the decrypted token. A stored trailing space or CR
+    // Trim the decrypted token. A stored trailing space or CR
     // survives as a valid header character and yields a spurious HTTP 401.
     let token = secrets::resolve_secret(pool, &key, name).await?;
     Ok(token.trim().to_string())
 }
 
-/// CLAUDE-190/204: the source's `log_token_ref` decrypted, or `None` when the
+/// The source's `log_token_ref` decrypted, or `None` when the
 /// source has no token configured or it cannot be resolved. Authorizes the
 /// `fj actions logs` read; a public repo's run reads without one.
 async fn source_log_token(
@@ -1006,16 +1004,16 @@ async fn source_log_token(
     }
 }
 
-/// CLAUDE-61: open the `runs` row for one webhook event and stamp its
-/// single planned job key. CLAUDE-80: also registers the job in-flight (so the
+/// Open the `runs` row for one webhook event and stamp its
+/// single planned job key. Also registers the job in-flight (so the
 /// run-detail badge reads `running`, not `queued`, for the whole pipeline) and
-/// sets the initial stage. CLAUDE-93: stores the event's `html_url` as the
+/// sets the initial stage. Stores the event's `html_url` as the
 /// job's outbound link so the run-detail tables link the key straight to the
 /// Forgejo Actions run. Returns the run id, or `None` when `run_begin` failed
 /// (the pipeline still runs, just unrecorded). Failures are logged, not
 /// propagated: a DB hiccup must never strand the event consumer.
 ///
-/// CLAUDE-220: `action` is a parameter so the comment listener records its runs
+/// `action` is a parameter so the comment listener records its runs
 /// through this same accounting rather than a forked copy.
 pub(crate) async fn begin_webhook_run(
     pool: &DbPool,
@@ -1035,7 +1033,7 @@ pub(crate) async fn begin_webhook_run(
             if let Err(e) = state::run_set_job_links(pool, id, &links).await {
                 warn!(error = %e, "recording webhook run job link failed");
             }
-            // CLAUDE-163: one job per webhook event, so the concurrency key
+            // One job per webhook event, so the concurrency key
             // equals the job key here.
             if let Err(e) = state::run_inflight_add(pool, id, job_key, job_key).await {
                 warn!(error = %e, "registering webhook job in flight failed");
@@ -1052,14 +1050,14 @@ pub(crate) async fn begin_webhook_run(
     }
 }
 
-/// CLAUDE-61: close a webhook run. Writes one `job_outcomes` row
+/// Close a webhook run. Writes one `job_outcomes` row
 /// carrying the human-readable `summary` (triage bucket + mint result, plus the
 /// redacted-log artifact path when present) and finalizes the run. `spend` is
-/// this delivery's own ledger (CLAUDE-337): `None` for a path that never reached
+/// this delivery's own ledger: `None` for a path that never reached
 /// triage (nothing to bill), `Some` for every path that did, so `claude_ran` /
 /// `claude_ok` / `claude_cost_usd` reflect what the classification actually
 /// spent instead of always reading false/zero. `attempt_counted = false`: the
-/// DEV-335 caps ledger is advanced separately inside [`triage_and_mint`] and
+/// caps ledger is advanced separately inside [`triage_and_mint`] and
 /// must not be double counted here. A no-op when `run_id` is `None`, except
 /// that a real `spend` must still be finished so its usage record is not lost.
 async fn finish_webhook_run(
@@ -1087,7 +1085,7 @@ async fn finish_webhook_run(
         job_key,
         attempt: 1,
         ok,
-        // DEV-707/CLAUDE-337: the triage classification's own cost, read back
+        // The triage classification's own cost, read back
         // off the caller's per-delivery ledger.
         claude_ran: spend.is_some_and(|s| s.claude_ran()),
         claude_ok: spend.is_some_and(|s| s.claude_ok()),
@@ -1106,7 +1104,7 @@ async fn finish_webhook_run(
     } else {
         crate::exit::UNEXPECTED
     };
-    // DEV-705: an over-budget stop overrides only an otherwise-clean outcome.
+    // An over-budget stop overrides only an otherwise-clean outcome.
     let exit_code = spend.map_or(base_exit_code, |s| s.exit_code(base_exit_code));
     if let Err(e) = state::run_finish(pool, run_id, exit_code, 1).await {
         warn!(error = %e, "finalizing webhook run failed");
@@ -1116,7 +1114,7 @@ async fn finish_webhook_run(
     }
 }
 
-/// CLAUDE-61: the run-record summary for one webhook event. `text` is
+/// The run-record summary for one webhook event. `text` is
 /// the human-readable outcome (triage bucket + mint result, or an error), and
 /// `ok` is whether the pipeline completed: a decided outcome (mint or any skip)
 /// is `ok`, a triage/mint fault is not.
@@ -1133,7 +1131,7 @@ impl WebhookRunSummary {
         }
     }
 
-    /// CLAUDE-273: a decision the `ci_failure` store made without ever calling
+    /// A decision the `ci_failure` store made without ever calling
     /// `mint::mint` (an attach, a reopen, or a legacy adoption).
     fn store_decided(outcome: &StoreOutcome) -> Self {
         Self {
@@ -1150,7 +1148,7 @@ impl WebhookRunSummary {
     }
 }
 
-/// CLAUDE-273: the outcomes the `ci_failure` store drives directly, with no
+/// The outcomes the `ci_failure` store drives directly, with no
 /// `mint::mint` call (and, for [`StoreOutcome::Attached`], no `claude` call
 /// either).
 enum StoreOutcome {
@@ -1165,7 +1163,7 @@ enum StoreOutcome {
     Adopted { key: String },
 }
 
-/// CLAUDE-273: what [`decide_mint`] decided, inside the blocking task, before
+/// What [`decide_mint`] decided, inside the blocking task, before
 /// any of its async store bookkeeping runs.
 enum DecideOutcome {
     /// No store row, but the legacy YouTrack marker search adopted an issue
@@ -1186,7 +1184,7 @@ fn mint_summary(outcome: &MintOutcome) -> String {
     }
 }
 
-/// CLAUDE-273: one-line description of the store-driven outcomes that never
+/// One-line description of the store-driven outcomes that never
 /// reach [`mint::mint`] at all: an attach onto an already-tracked failure, or a
 /// reopen of a resolved one.
 fn store_outcome_summary(outcome: &StoreOutcome) -> String {
@@ -1197,7 +1195,7 @@ fn store_outcome_summary(outcome: &StoreOutcome) -> String {
     }
 }
 
-/// CLAUDE-273: fingerprint the log and look it up in the `ci_failure` store
+/// Fingerprint the log and look it up in the `ci_failure` store
 /// BEFORE triage. A store read failure fails the run rather than falling
 /// through to a mint, which would recreate the duplicate this issue removes.
 /// `open` attaches with no triage and no `claude` call; `resolved` reopens and
@@ -1221,15 +1219,15 @@ async fn triage_and_mint(
     webhook_cfg: &WebhookConfig,
     spend: &crate::usage::RunSpend,
 ) -> WebhookRunSummary {
-    // CLAUDE-274: the store lookup, analysis and mint for one event run under a
+    // The store lookup, analysis and mint for one event run under a
     // key gate on (repo, workflow_id, job_name), so two concurrent failures of
     // the same job never both run an analysis: the second waits here and then
     // finds the first one's store row, attaching instead of re-analyzing.
     let key = format!("{}#{}#{}", ev.repo, ev.workflow_id, job_name);
     let _key_guard = keygate.acquire(&key).await;
 
-    // CLAUDE-190: derive the deterministic failure signature and the branch
-    // from the redacted log up front (pure string work); CLAUDE-273 fingerprint
+    // Derive the deterministic failure signature and the branch
+    // from the redacted log up front (pure string work); the fingerprint
     // is the failing-test overlap key the store matches on.
     let failure_signature = crate::mint::failure_signature(&log_text);
     let branch = crate::forge_log::resolve_branch(None, &log_text).unwrap_or_default();
@@ -1266,7 +1264,7 @@ async fn triage_and_mint(
         None
     };
 
-    // CLAUDE-276: resolve whether the failing commit itself is on an open PR
+    // Resolve whether the failing commit itself is on an open PR
     // BEFORE the store-match dispatch, not as a fallback from it: an agent's
     // own PR must intercept before the ordinary open/resolved handling runs,
     // and a human's PR always needs a PR comment, including one that shares a
@@ -1297,8 +1295,8 @@ async fn triage_and_mint(
     };
 
     let Some(pr) = pr else {
-        // No open PR for this commit: the pre-CLAUDE-276 store dispatch, run
-        // exactly as before this issue.
+        // No open PR for this commit: the store dispatch, run
+        // exactly as before.
         if let Some(m) = store_match {
             if m.state == "open" {
                 if let Some(key) = m.issue_key.clone() {
@@ -1439,7 +1437,7 @@ async fn triage_and_mint(
     }
 }
 
-/// CLAUDE-273: the comment posted when a failure attaches to an already-open
+/// The comment posted when a failure attaches to an already-open
 /// `ci_failures` row. No triage ran, so this names the run and the
 /// overlapping failing tests rather than an analysis.
 fn attach_comment_body(ev: &VerifiedFailureEvent, branch: &str, test_ids: &[String]) -> String {
@@ -1455,7 +1453,7 @@ fn attach_comment_body(ev: &VerifiedFailureEvent, branch: &str, test_ids: &[Stri
     )
 }
 
-/// CLAUDE-327: read `key`'s live YouTrack `State` and report whether it
+/// Read `key`'s live YouTrack `State` and report whether it
 /// already equals `resolved_state` (case-insensitive). The store's own
 /// `open`/`resolved` column no longer changes on merge (the runner writes no
 /// `State` there itself: `docs/yt-workflow-resolve-on-pr-merge.js` does), so
@@ -1479,7 +1477,7 @@ async fn issue_state_is_resolved(
     }
 }
 
-/// CLAUDE-273: attach `ev` to the already-tracked, still-`open` failure `m`
+/// Attach `ev` to the already-tracked, still-`open` failure `m`
 /// matched. No triage, no mint, no `claude` call: the failure is already
 /// filed and this run is just another sighting of it.
 async fn attach_to_open_failure(
@@ -1530,7 +1528,7 @@ async fn attach_to_open_failure(
     WebhookRunSummary::store_decided(&StoreOutcome::Attached { key })
 }
 
-/// CLAUDE-273: the comment posted immediately on reopening a resolved
+/// The comment posted immediately on reopening a resolved
 /// `ci_failures` row, before the triage analysis is posted separately.
 fn regression_comment_body(ev: &VerifiedFailureEvent, branch: &str, test_ids: &[String]) -> String {
     let tests = if test_ids.is_empty() {
@@ -1544,7 +1542,7 @@ fn regression_comment_body(ev: &VerifiedFailureEvent, branch: &str, test_ids: &[
     )
 }
 
-/// CLAUDE-273: reopen the resolved failure `m` matched: `set_state` back to
+/// Reopen the resolved failure `m` matched: `set_state` back to
 /// `target_state`, comment the regression, mark the store row `open` and
 /// attach this run, then triage (for the analysis comment) and set `AI Agent`
 /// exactly as a freshly created issue of that bucket would be.
@@ -1639,7 +1637,7 @@ async fn reopen_resolved_failure(
     WebhookRunSummary::store_decided(&StoreOutcome::Reopened { key })
 }
 
-/// CLAUDE-273: record a brand-new `ci_failures` row for `issue_key` (either
+/// Record a brand-new `ci_failures` row for `issue_key` (either
 /// freshly minted, or a legacy issue this delivery adopted), and the tests /
 /// run this delivery already carries.
 async fn record_new_store_row(
@@ -1677,7 +1675,7 @@ async fn record_new_store_row(
     Ok(())
 }
 
-/// CLAUDE-276: best-effort record a `run_events` row for something that went
+/// Best-effort record a `run_events` row for something that went
 /// wrong outside the ordinary per-job accounting (an open-PR lookup failure, a
 /// missing `write_token_ref`): attaches to the run when one exists, else a
 /// standalone row (never backfilled, but still visible on the action's event
@@ -1718,8 +1716,8 @@ fn pr_matching_commit<'a>(
     })
 }
 
-/// CLAUDE-276: find the open PR (if any) whose head matches the failing
-/// commit. Replaces the old CLAUDE-149 `resolve_has_open_pr` for the routing
+/// Find the open PR (if any) whose head matches the failing
+/// commit. Replaces the old `resolve_has_open_pr` for the routing
 /// decision: that helper degraded a forge error or an underivable host to
 /// `false` ("no PR"), which is safe only as advisory context for the triage
 /// classifier. For routing it is not safe - it would send the agent's own
@@ -1741,7 +1739,7 @@ fn resolve_open_pr(
     Ok(pr_matching_commit(&prs, &ev.commit_sha).cloned())
 }
 
-/// CLAUDE-276: on-disk root for a PR-comment backend's temp single-host
+/// On-disk root for a PR-comment backend's temp single-host
 /// `keys.json`, alongside `comment_webhooks::creds_root`'s own `comment-creds`
 /// sibling.
 fn pr_creds_root(paths: &Paths) -> PathBuf {
@@ -1756,7 +1754,7 @@ struct PrCommentEnv {
     _creds: secrets::JobCredentials,
 }
 
-/// CLAUDE-276: where a PR comment's body is staged before posting: a
+/// Where a PR comment's body is staged before posting: a
 /// deterministic path (not the ephemeral, randomly-suffixed credential
 /// directory `PrCommentEnv` holds), so a repeated comment on the same PR
 /// simply overwrites its own scratch file rather than accumulating one per
@@ -1768,8 +1766,8 @@ fn pr_comment_body_path(paths: &Paths, repo: &str, pr_number: u64) -> PathBuf {
     ))
 }
 
-/// CLAUDE-276: resolve `source`'s `write_token_ref` and build a forge backend
-/// carrying it in a temp single-host `keys.json` (the CLAUDE-26 mechanism
+/// Resolve `source`'s `write_token_ref` and build a forge backend
+/// carrying it in a temp single-host `keys.json` (the same mechanism
 /// `comment_webhooks::build_env` also uses), so a PR-comment token never
 /// appears in YAML, env, a process argument, or a settings response. A source
 /// with no `write_token_ref` configured is a hard failure: it must never be
@@ -1814,7 +1812,7 @@ async fn build_pr_comment_backend(
     })
 }
 
-/// CLAUDE-276: [`build_pr_comment_backend`], with the missing-token failure
+/// [`build_pr_comment_backend`], with the missing-token failure
 /// already logged and recorded as a `run_events` row - the shape every PR-
 /// commenting caller in this module needs.
 async fn require_pr_comment_backend(
@@ -1915,7 +1913,7 @@ async fn analyze_and_comment_pr(
 /// spelled directly rather than threaded through another config section.
 const NEEDS_REVIEW_VALUE: &str = "Needs Review";
 
-/// CLAUDE-276: `ev` failed on an open PR the agent itself opened (an `open`
+/// `ev` failed on an open PR the agent itself opened (an `open`
 /// `agent_pull_requests` row). Below `webhook_cfg.agent_pr_fix_attempts`,
 /// comment the recorded issue with the run, the failing tests and the
 /// analysis, bump the attempt counter, and re-queue it (`AI Agent = Queued`);
@@ -2089,7 +2087,7 @@ async fn route_agent_pr_failure(
     }
 }
 
-/// CLAUDE-276: `ev` failed on an open PR that is NOT the agent's own. Routes by
+/// `ev` failed on an open PR that is NOT the agent's own. Routes by
 /// whether its failing tests overlap an already-tracked failure.
 #[allow(clippy::too_many_arguments)]
 async fn route_human_pr_failure(
@@ -2231,7 +2229,7 @@ async fn route_human_pr_failure(
     }
 }
 
-/// CLAUDE-276: `ev`'s failing tests overlap an `open` `ci_failures` row (that
+/// `ev`'s failing tests overlap an `open` `ci_failures` row (that
 /// row may or may not itself be on a PR). Attach the run, comment the PR
 /// naming the issue, and run no analysis: the failure is already filed.
 #[allow(clippy::too_many_arguments)]
@@ -2302,7 +2300,7 @@ async fn route_pr_matches_open_failure(
     WebhookRunSummary::store_decided(&StoreOutcome::Attached { key })
 }
 
-/// CLAUDE-276: `ev`'s failing tests overlap a `pr_only` row: a prior sighting
+/// `ev`'s failing tests overlap a `pr_only` row: a prior sighting
 /// on some open PR (possibly this same one). If the attach brings the row's
 /// distinct branches to 2 or more, the failure belongs to `main`: mint a real
 /// issue and comment its link onto every PR it was sighted on. Otherwise this
@@ -2410,8 +2408,8 @@ async fn route_pr_matches_pr_only_failure(
     }
 }
 
-/// CLAUDE-276: a `pr_only` failure's tests just appeared on a second distinct
-/// branch: promote it to a real issue (triage + mint, DEV-335 caps applied and
+/// A `pr_only` failure's tests just appeared on a second distinct
+/// branch: promote it to a real issue (triage + mint, caps applied and
 /// advanced exactly like a fresh mint), point the existing store row at it
 /// instead of inserting a duplicate, and comment the issue link onto every
 /// open PR the failure was sighted on.
@@ -2582,7 +2580,7 @@ async fn mint_for_two_branch_pr_only_failure(
     WebhookRunSummary::decided(bucket, &outcome)
 }
 
-/// CLAUDE-276: `ev`'s failing tests matched no store row at all, on an open PR
+/// `ev`'s failing tests matched no store row at all, on an open PR
 /// that is not the agent's own: the first sighting of this failure. Run the
 /// analysis, comment it on the PR (always), and record a `pr_only` row - no
 /// issue yet.
@@ -2673,7 +2671,7 @@ async fn route_new_pr_only_failure(
     }
 }
 
-/// CLAUDE-273: the classify + mint path for a failure the `ci_failure` store
+/// The classify + mint path for a failure the `ci_failure` store
 /// does not yet track (`none`) or that is on an open PR (`pr_only`, treated as
 /// `none` here; the PR-routing issue owns that case). One legacy adoption
 /// lookup runs first (an issue minted before the store existed); on a miss,
@@ -2698,7 +2696,7 @@ async fn classify_and_mint(
     max_runs_per_day: u32,
     spend: &crate::usage::RunSpend,
 ) -> WebhookRunSummary {
-    // DEV-335 caps, reused (not re-derived): the per-key counter is keyed by the
+    // Caps, reused (not re-derived): the per-key counter is keyed by the
     // run's (repo, index); the daily ledger is per synthetic action. The
     // read-then-increment below is race-free because `consume_events` drains the
     // channel serially - one event is fully processed (this `.await` completes)
@@ -2717,7 +2715,7 @@ async fn classify_and_mint(
         max_runs_per_day,
     };
 
-    // CLAUDE-80: surface what the blocking pipeline is doing. The blocking
+    // Surface what the blocking pipeline is doing. The blocking
     // thread cannot await the pool, so stage labels travel over an unbounded
     // channel to a drainer task that performs the `runs.stage` UPDATEs. The
     // sender drops with the closure when the blocking task ends, closing the
@@ -2738,12 +2736,12 @@ async fn classify_and_mint(
 
     let backend = ctx.backend.clone();
     let classifier = ctx.classifier.clone();
-    // CLAUDE-234: this delivery's own issue-write ledger. The backend is
+    // This delivery's own issue-write ledger. The backend is
     // daemon-lifetime and shared by every delivery, so the ledger is built per
     // run here rather than held on the backend: that is what keeps the ceiling
     // and the `run_id` on each write line belonging to THIS run.
     let audit = crate::provider::IssueWriteAudit::new(run_id, ctx.defaults.max_issues_per_run);
-    // CLAUDE-101: snapshot the live mint config for this event; the next event
+    // Snapshot the live mint config for this event; the next event
     // re-reads, so a Settings save in between is honored without a restart.
     let mint_cfg = ctx.mint_cfg.read().await.clone();
     let route_cache = ctx.route_cache.clone();
@@ -2852,7 +2850,7 @@ async fn classify_and_mint(
     }
 }
 
-/// CLAUDE-273: one legacy adoption lookup, then the ordinary triage + mint
+/// One legacy adoption lookup, then the ordinary triage + mint
 /// pipeline. Factored out from [`classify_and_mint`] so the blocking work (the
 /// legacy search, triage, and mint all shell out) stays inside one
 /// `spawn_blocking` task. Returns [`DecideOutcome::LegacyAdopted`] on a legacy
@@ -2879,7 +2877,7 @@ fn decide_with_legacy_adoption(
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
     spend: &crate::usage::RunSpend,
 ) -> crate::error::Result<DecideOutcome> {
-    // CLAUDE-273: before spending a `claude` classification, check whether this
+    // Before spending a `claude` classification, check whether this
     // exact collapse key already has an issue minted before the `ci_failure`
     // store existed (the caller already established this is a store miss).
     let collapse = mint::legacy_collapse_key(
@@ -2918,7 +2916,7 @@ fn decide_with_legacy_adoption(
 /// already resolved. Factored out so the bucket routing is unit tested against
 /// a stub classifier / tracker with no forge, DB, or process spawn. Builds the
 /// [`TriageInput`], runs the hybrid [`triage::triage`], then [`mint::mint`] on
-/// the result. CLAUDE-273: dedupe by failing-test overlap is decided by the
+/// the result. Dedupe by failing-test overlap is decided by the
 /// caller against the `ci_failure` store before this is ever reached, so this
 /// function itself issues no dedupe search.
 #[allow(clippy::too_many_arguments)]
@@ -2940,14 +2938,14 @@ fn decide_mint(
     report_stage: &(dyn Fn(&'static str) + Send + Sync),
     spend: &crate::usage::RunSpend,
 ) -> crate::error::Result<(triage::TriageBucket, MintOutcome)> {
-    // CLAUDE-190: derive the deterministic failure signature and the branch from
+    // Derive the deterministic failure signature and the branch from
     // the redacted log before it is moved into the triage input. The branch's
     // run-detail source is `None` here: the deployed Forgejo returns
     // `head_branch: null`, so the log's environment dump is the reliable source
     // (`resolve_branch` keeps the run-detail arm for instances that populate it).
     let failure_signature = crate::mint::failure_signature(&log_text);
     let branch = crate::forge_log::resolve_branch(None, &log_text).unwrap_or_default();
-    // CLAUDE-264: the infrastructure detector reads the SAME full redacted log,
+    // The infrastructure detector reads the SAME full redacted log,
     // not the bounded copy the classifier prompt gets, because a capacity abort
     // is post-steps and is exactly what the bound cuts.
     let infra = crate::infra_failure::detect(&log_text);
@@ -2971,7 +2969,7 @@ fn decide_mint(
         has_open_pr,
         log_token,
     };
-    // CLAUDE-80: the classify stage only exists when the deterministic rules
+    // The classify stage only exists when the deterministic rules
     // abstain, so the label is reported from inside the classifier call rather
     // than unconditionally - a rules short-circuit never shows it.
     let reporting = ReportingClassifier {
@@ -3001,7 +2999,7 @@ fn decide_mint(
     Ok((verdict.bucket, outcome))
 }
 
-/// CLAUDE-80: classifier decorator that reports the "classifying with claude"
+/// Classifier decorator that reports the "classifying with claude"
 /// stage right before delegating, so the label appears exactly when (and only
 /// when) the LLM pass actually runs - the deterministic rules short-circuit
 /// never consults the classifier and therefore never shows it.
@@ -3090,7 +3088,7 @@ async fn forgejo_webhook(
 ) -> Response {
     let now = Instant::now();
 
-    // Resolve the source from the live config (CLAUDE-101). An unknown source
+    // Resolve the source from the live config. An unknown source
     // 404s (it is not a configured endpoint), logged so a misdirected webhook is
     // diagnosable. Clone the source out so no read guard is held across the
     // secret-decrypt / channel-send awaits below.
@@ -3112,7 +3110,7 @@ async fn forgejo_webhook(
     // Per-source rate limit first: cheapest check, shields the HMAC +
     // secret-decrypt work from a request flood, and one source's storm never
     // starves another's bucket. The limiter map is rebuilt in lock-step with the
-    // sources map (CLAUDE-101), so a resolved source always has a limiter; a
+    // sources map, so a resolved source always has a limiter; a
     // missing one is a bug.
     {
         let rate = st.rate.read().await;
@@ -3198,7 +3196,7 @@ async fn forgejo_webhook(
         return StatusCode::OK.into_response();
     }
 
-    // CLAUDE-277: dispatch on the event-type header before parsing. A
+    // Dispatch on the event-type header before parsing. A
     // pull-request delivery takes its own path; an empty/missing header or an
     // Action-run header keeps the pre-existing path below; anything else is an
     // event type this endpoint does not handle, acked and dropped.
@@ -3229,7 +3227,7 @@ async fn forgejo_webhook(
         }
     };
 
-    // CLAUDE-278: a `success` or `recover` action is routed to the automerge
+    // A `success` or `recover` action is routed to the automerge
     // success-event pipeline instead of `verified_failure_event`, which only
     // ever keeps `failure`.
     if payload.action == "success" || payload.action == "recover" {
@@ -3266,7 +3264,7 @@ async fn forgejo_webhook(
     }
 }
 
-/// CLAUDE-278: parse and route an authenticated, de-duplicated `success` or
+/// Parse and route an authenticated, de-duplicated `success` or
 /// `recover` Action-run delivery: an agent PR's checks may have just gone
 /// green. Repo-allow-listed only; which PR (if any) this belongs to, and
 /// whether automerge is even enabled for it, are resolved downstream in
@@ -3311,7 +3309,7 @@ async fn handle_action_success(
     StatusCode::ACCEPTED.into_response()
 }
 
-/// CLAUDE-277: parse and route an authenticated, de-duplicated `pull_request`
+/// Parse and route an authenticated, de-duplicated `pull_request`
 /// delivery. Only a terminal `closed` action does anything; every other
 /// action (`opened`, `edited`, `synchronized`, ...) and a repo outside the
 /// source's allow-list is acked and dropped, exactly like the Action-run
@@ -3377,7 +3375,7 @@ async fn handle_pull_request_delivery(
     StatusCode::ACCEPTED.into_response()
 }
 
-/// CLAUDE-277: drain verified `pull_request` deliveries for the lifetime of
+/// Drain verified `pull_request` deliveries for the lifetime of
 /// the daemon, mirroring [`consume_events`]'s shape. `mint` carries the
 /// backend + store access every close/left-open/mark-merged decision needs;
 /// `None` (no usable provider backend) drops every event with a log, the same
@@ -3406,7 +3404,7 @@ pub async fn consume_pr_events(
     }
 }
 
-/// CLAUDE-277: one merged-or-closed PR's whole handling: mark its
+/// One merged-or-closed PR's whole handling: mark its
 /// `agent_pull_requests` row (merged / closed), and on a merge, close or leave
 /// open every open store failure the PR references.
 async fn process_pr_event(
@@ -3415,7 +3413,7 @@ async fn process_pr_event(
     mint: Option<Arc<MintContext>>,
     keygate: crate::concurrency::KeyGate,
 ) {
-    // CLAUDE-335: an event accepted before a pause was set must not act after it.
+    // An event accepted before a pause was set must not act after it.
     if webhook_action_paused(&pool, WEBHOOK_MINT_ACTION, "pull-request event").await {
         return;
     }
@@ -3428,7 +3426,7 @@ async fn process_pr_event(
         return;
     }
 
-    // CLAUDE-274-style: one key per (repo, PR), so two deliveries of the same
+    // One key per (repo, PR), so two deliveries of the same
     // PR (a retried delivery, or closed-then-reopened-then-merged in quick
     // succession) never race each other's store/issue writes.
     let key = format!("{}#{}", ev.repo, ev.number);
@@ -3458,7 +3456,7 @@ async fn process_pr_event(
     finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None, None).await;
 }
 
-/// CLAUDE-277: a PR closed WITHOUT merging. The only action is marking the
+/// A PR closed WITHOUT merging. The only action is marking the
 /// agent's own PR record `closed` when one exists; a human's PR (no record)
 /// changes nothing.
 async fn handle_closed_unmerged_pr(
@@ -3485,7 +3483,7 @@ async fn handle_closed_unmerged_pr(
     ))
 }
 
-/// CLAUDE-277/CLAUDE-327: a merged PR. Marks the agent's own PR record
+/// A merged PR. Marks the agent's own PR record
 /// `merged` when one exists; makes no tracker call and no forge run-list
 /// call. A YouTrack workflow (`docs/yt-workflow-resolve-on-pr-merge.js`)
 /// resolves whichever issue the merged PR claims, for any issue, not only one
@@ -3515,7 +3513,7 @@ async fn handle_merged_pr(
     ))
 }
 
-/// CLAUDE-278: drain verified `success`/`recover` Action-run deliveries for the
+/// Drain verified `success`/`recover` Action-run deliveries for the
 /// lifetime of the daemon, mirroring [`consume_pr_events`]'s shape. `mint`
 /// carries the backend every routing decision needs; `None` (no usable
 /// provider backend) drops every event with a log, the same degrade-to-log-only
@@ -3544,7 +3542,7 @@ pub async fn consume_action_success_events(
     }
 }
 
-/// CLAUDE-278: one success event's whole handling. Finds the open PR matching
+/// One success event's whole handling. Finds the open PR matching
 /// the run's commit, looks it up in `agent_pull_requests`, and (only when it
 /// is a recorded, still-open agent PR whose action has automerge enabled)
 /// reads the PR's CI status and merges it, comments that it needs a branch
@@ -3565,12 +3563,12 @@ async fn process_action_success_event(
         return;
     };
 
-    // CLAUDE-332: an event accepted before a pause was set must not act after it.
+    // An event accepted before a pause was set must not act after it.
     if webhook_action_paused(&pool, WEBHOOK_MINT_ACTION, "action-run success event").await {
         return;
     }
 
-    // CLAUDE-328: neither of the next two steps knows yet which (if any)
+    // Neither of the next two steps knows yet which (if any)
     // recorded agent PR this event concerns - that is only resolved once the
     // commit is matched to a PR below - so a failure here cannot itself name
     // an issue. Rather than dropping it as pure noise, `notify_agent_prs_of_repo_fault`
@@ -3584,7 +3582,7 @@ async fn process_action_success_event(
         return;
     };
 
-    // CLAUDE-357: no recorded agent PR (and so no action / `github.hosts`) is
+    // No recorded agent PR (and so no action / `github.hosts`) is
     // known yet at this point - the PR is only found below, by matching the
     // commit against this very listing. `is_github_host(host, &[])` (i.e.
     // `host.eq_ignore_ascii_case("github.com")`) is a deliberate, narrower
@@ -3627,7 +3625,7 @@ async fn process_action_success_event(
     let pr_number = pr.number;
     let pr_url = pr.html_url.clone();
 
-    // CLAUDE-274-style: one key per (repo, PR), so two success deliveries for
+    // One key per (repo, PR), so two success deliveries for
     // the same PR never race each other's merge / comment.
     let key = format!("{}#{}", ev.repo, pr_number);
     let _key_guard = keygate.acquire(&key).await;
@@ -3648,7 +3646,7 @@ async fn process_action_success_event(
     finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None, None).await;
 }
 
-/// CLAUDE-328: a fault that happened before the failing commit could be
+/// A fault that happened before the failing commit could be
 /// matched to a specific PR (host derivation, `list_open_prs`) still concerns
 /// this repo, and any currently-open, automerge-enabled agent PR recorded for
 /// it could be the one that just went green and now silently will not
@@ -3731,13 +3729,13 @@ fn agent_pr_url(host: &str, repo: &str, pr_number: i64) -> String {
     format!("https://{host}/{repo}/pulls/{pr_number}")
 }
 
-/// CLAUDE-278: the per-PR decision once a success event's PR is known. Looks
+/// The per-PR decision once a success event's PR is known. Looks
 /// up the `agent_pull_requests` row and, once found and open, delegates the
 /// rest of the decision to [`apply_automerge_decision`] - the same function
-/// [`reconcile_automerge`] (CLAUDE-328) calls for a PR it already has the row
+/// [`reconcile_automerge`] calls for a PR it already has the row
 /// for, so the two entry points never diverge on the behind_base / mergeable /
 /// `complete_automerge` logic, which merges the PR and comments; it makes no
-/// `State` or `AI Agent` write (CLAUDE-327), since the YouTrack workflow
+/// `State` or `AI Agent` write, since the YouTrack workflow
 /// resolves the issue once it observes the merge.
 async fn handle_action_success_for_pr(
     mint: &MintContext,
@@ -3771,11 +3769,11 @@ async fn handle_action_success_for_pr(
     apply_automerge_decision(mint, pool, host, repo, pr_number, pr_url, &row).await
 }
 
-/// CLAUDE-357: route a forge operation through [`GithubForge`] when `host` is
+/// Route a forge operation through [`GithubForge`] when `host` is
 /// a GitHub host, mirroring the per-job dispatch at
 /// `src/native/youtrack.rs:421-435`; every other host reuses `mint.backend`
 /// (`fj`) unchanged. Token is always `None`: `GithubForge` falls back to the
-/// daemon's stored `gh` login (CLAUDE-307) when constructed with no token,
+/// daemon's stored `gh` login when constructed with no token,
 /// matching the per-job path's own behavior when an action sets no
 /// `github.token_ref`.
 fn resolve_automerge_forge(
@@ -3795,14 +3793,14 @@ fn resolve_automerge_forge(
     }
 }
 
-/// CLAUDE-328: the shared decision body both [`handle_action_success_for_pr`]
+/// The shared decision body both [`handle_action_success_for_pr`]
 /// (the webhook's low-latency trigger) and [`reconcile_automerge`] (the
 /// tick-driven backstop for a missed webhook) call once a recorded, open
 /// `agent_pull_requests` row is already in hand: load the row's action to
 /// check `automerge.enabled`, read the PR's live CI status, and on
 /// green+mergeable call [`crate::native::youtrack::complete_automerge`] - the
-/// same merge + comment sequence the old CLAUDE-126 poll loop made, with no
-/// `State` or `AI Agent` write (CLAUDE-327), since the YouTrack workflow
+/// same merge + comment sequence the old poll loop made, with no
+/// `State` or `AI Agent` write, since the YouTrack workflow
 /// resolves the issue once it observes the merge. An action-load failure and
 /// a `pr_status` failure both concern this
 /// already-known, recorded, automerge-eligible PR, so unlike the caller's own
@@ -3862,7 +3860,7 @@ async fn apply_automerge_decision(
         info!(repo = %repo, pr = pr_number, action = %row.action_name, "action-run success: automerge disabled for this action; no action");
         return Ok("automerge disabled for this action; no action".to_string());
     }
-    // CLAUDE-357: a GitHub-hosted PR must route through `GithubForge`, not
+    // A GitHub-hosted PR must route through `GithubForge`, not
     // `mint.backend` (always `fj`, which 410s against GitHub's API).
     let forge = resolve_automerge_forge(mint, host, &github_cfg.hosts, &github_cfg.mcp_endpoint);
 
@@ -3876,7 +3874,7 @@ async fn apply_automerge_decision(
     let status = match status {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
-            // CLAUDE-333: the message names the PR so the previous `run_events`
+            // The message names the PR so the previous `run_events`
             // row for THIS PR can be found; an unchanged fault (the reconciler
             // re-hits it every tick) is logged and recorded each time but
             // commented on the issue only once.
@@ -3917,13 +3915,13 @@ async fn apply_automerge_decision(
 
     match status.state.trim() {
         "success" => match status.behind_base {
-            // CLAUDE-309: `mergeable` alone cannot tell whether the branch is
+            // `mergeable` alone cannot tell whether the branch is
             // behind base (Forgejo's `mergeable` ignores that entirely), so an
             // `fj` that does not report `behind_base` at all (predates FJ-99)
             // takes no merge action rather than guessing.
             None => {
                 let msg = format!(
-                    "PR #{pr_number}: fj pr status did not report behind_base; the runtime's fj must include FJ-99"
+                    "PR #{pr_number}: fj pr status did not report behind_base; the runtime's fj is too old to support this check"
                 );
                 let body = crate::native::youtrack::automerge_behind_base_missing_comment(pr_url);
                 post_issue_comment(
@@ -4061,7 +4059,7 @@ async fn apply_automerge_decision(
     }
 }
 
-/// CLAUDE-331: record a recorded agent PR as merged so neither the webhook nor
+/// Record a recorded agent PR as merged so neither the webhook nor
 /// the reconciler walks it again. A store failure is logged at `error`, written
 /// as a `run_events` row, and returned: an unrecorded merge would be re-walked
 /// on every tick.
@@ -4082,7 +4080,7 @@ async fn mark_agent_pr_merged(
     }
 }
 
-/// CLAUDE-328: the reconciler backstop for a missed, dropped, or too-early
+/// The reconciler backstop for a missed, dropped, or too-early
 /// Action Run success webhook. Runs on its own tick (`daemon::automerge_reconciler_loop`),
 /// independent of any webhook delivery: lists every `agent_pull_requests` row
 /// still `open` and, for each, calls the exact same [`apply_automerge_decision`]
@@ -4098,7 +4096,7 @@ pub(crate) async fn reconcile_automerge(
     mint: &MintContext,
     keygate: &crate::concurrency::KeyGate,
 ) {
-    // CLAUDE-332: the reconciler writes to the forge and tracker, so it honours
+    // The reconciler writes to the forge and tracker, so it honours
     // the same pauses the webhook ingest does.
     if webhook_action_paused(pool, WEBHOOK_MINT_ACTION, "automerge reconciler").await {
         return;
@@ -4113,7 +4111,7 @@ pub(crate) async fn reconcile_automerge(
         }
     };
 
-    // CLAUDE-334: one open-PR listing per (host, repo). A row whose PR is not
+    // One open-PR listing per (host, repo). A row whose PR is not
     // listed is retired instead of asking `pr_status` about it, which fails
     // for a PR closed without merge (`fj`: "no commits in pr").
     let mut open_by_repo: std::collections::HashMap<(String, String), Option<Vec<u64>>> =
@@ -4175,7 +4173,7 @@ pub(crate) async fn reconcile_automerge(
     }
 }
 
-/// CLAUDE-334: the numbers of the PRs the forge lists as open for `repo`, or
+/// The numbers of the PRs the forge lists as open for `repo`, or
 /// `None` when the listing failed (logged at `error` and written to
 /// `run_events`), so the caller leaves that repo's rows alone rather than
 /// reading an unknown as "closed".
@@ -4185,7 +4183,7 @@ async fn list_open_pr_numbers(
     host: &str,
     repo: &str,
 ) -> Option<Vec<u64>> {
-    // CLAUDE-357: called per `(host, repo)`, grouped across rows, before any
+    // Called per `(host, repo)`, grouped across rows, before any
     // row's action is loaded - so no `github.hosts` is available here.
     // `is_github_host(host, &[])` (i.e. `host.eq_ignore_ascii_case("github.com")`)
     // is a deliberate, narrower default: it correctly routes the reported
@@ -4211,7 +4209,7 @@ async fn list_open_pr_numbers(
     None
 }
 
-/// Post a best-effort issue comment on a CLAUDE-309 automerge decision path. A
+/// Post a best-effort issue comment on an automerge decision path. A
 /// failed comment (write error, or the blocking task itself panicking) logs at
 /// `error` naming the issue and the cause; it never replaces the caller's own
 /// `Result`, since the underlying decision (branch updated, merge refused, ...)
@@ -4265,9 +4263,9 @@ pub fn verify_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
 }
 
 /// True when `repo` (an `owner/repo` full name) matches one of the allow-list
-/// patterns (CLAUDE-79). The three literal forms and the case-sensitive,
+/// patterns. The three literal forms and the case-sensitive,
 /// empty-denies-all semantics live in [`crate::config::repo_matches`], shared with
-/// the reconciler's `repos` and the per-repo log-token mapping (CLAUDE-200).
+/// the reconciler's `repos` and the per-repo log-token mapping.
 pub(crate) fn repo_allowed(allowed: &[String], repo: &str) -> bool {
     crate::config::repo_matches(allowed, repo)
 }
@@ -4445,7 +4443,7 @@ mod tests {
         assert!(verified_failure_event(&payload, &allowed, "test-source").is_none());
     }
 
-    // ---- CLAUDE-79: allow-list patterns (`*`, `owner/*`, exact) ------------
+    // ---- Allow-list patterns (`*`, `owner/*`, exact) ------------
 
     #[test]
     fn repo_allowed_star_matches_every_repo() {
@@ -4587,7 +4585,7 @@ mod tests {
         assert!(rl.allow(next));
     }
 
-    // ---- CLAUDE-47: triage + mint composition -----------------------------
+    // ---- Triage + mint composition -----------------------------
 
     use crate::triage::{ClassifiedBy, Triage, TriageBucket};
     use std::path::Path;
@@ -4625,7 +4623,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-337: a classifier that records a real invocation cost onto the
+    /// A classifier that records a real invocation cost onto the
     /// caller's ledger, the way `AnalysisClassifier` does, so a test can assert
     /// the cost reaches the webhook run's outcome row and daily ledger.
     struct CostingClassifier {
@@ -4751,38 +4749,38 @@ mod tests {
         }
     }
 
-    // ---- CLAUDE-273: `ci_failure` store dedupe through the full pipeline ---
+    // ---- `ci_failure` store dedupe through the full pipeline ---
 
     /// A [`Backend`] (IssueTracker + Forge) driving `consume_events` end to
     /// end for the store-dedupe tests: `create_issue` hands out incrementing
     /// keys, every mutation is recorded, and there is never an open PR (the
-    /// Forge surface the CLAUDE-149 `has_open_pr` signal reads).
+    /// Forge surface the `has_open_pr` signal reads).
     struct StoreBackend {
         next_key: StdMutex<u32>,
         calls: StdMutex<Vec<String>>,
         /// When set, `list_queued` returns this issue for any query: the
         /// legacy-adoption lookup's canned hit.
         legacy_match: StdMutex<Option<String>>,
-        /// CLAUDE-276: canned `list_open_prs` result, so a test can put the
+        /// Canned `list_open_prs` result, so a test can put the
         /// failing commit on an open PR.
         open_prs: StdMutex<Vec<ForgePullRequest>>,
-        /// CLAUDE-276: when set, `list_open_prs` fails with this message.
+        /// When set, `list_open_prs` fails with this message.
         open_prs_error: StdMutex<Option<String>>,
-        /// CLAUDE-278: canned `pr_status` result for the automerge success-event
+        /// Canned `pr_status` result for the automerge success-event
         /// tests. `None` (the default) errors, matching every pre-existing test
         /// that never reaches the automerge path.
         pr_status: StdMutex<Option<crate::provider::PrStatus>>,
-        /// CLAUDE-309: when set, `update_pr_branch` fails with this message.
+        /// When set, `update_pr_branch` fails with this message.
         update_pr_branch_error: StdMutex<Option<String>>,
-        /// CLAUDE-309: when set, `merge_pr` fails with this message.
+        /// When set, `merge_pr` fails with this message.
         merge_pr_error: StdMutex<Option<String>>,
-        /// CLAUDE-327: canned `get_field` result for the match-time YouTrack
+        /// Canned `get_field` result for the match-time YouTrack
         /// `State` read. Defaults to a value that never equals a test's
         /// `resolved_state` ("Done"), so every pre-existing test that reaches
         /// an `open`-match dispatch keeps taking the non-regression path with
         /// no change.
         state_field: StdMutex<Option<String>>,
-        /// CLAUDE-327: when set, `get_field` fails with this message.
+        /// When set, `get_field` fails with this message.
         state_field_error: StdMutex<Option<String>>,
     }
 
@@ -4813,7 +4811,7 @@ mod tests {
             *self.open_prs_error.lock().unwrap() = Some(message.to_string());
             self
         }
-        /// CLAUDE-309: `behind_base` defaults to `Some(false)` (not behind), so
+        /// `behind_base` defaults to `Some(false)` (not behind), so
         /// every pre-existing call site keeps its original meaning without
         /// having to name a value it never tested.
         fn with_pr_status(self, state: &str, mergeable: bool) -> Self {
@@ -4840,12 +4838,12 @@ mod tests {
             *self.merge_pr_error.lock().unwrap() = Some(message.to_string());
             self
         }
-        /// CLAUDE-327: make the match-time `State` read return `state`.
+        /// Make the match-time `State` read return `state`.
         fn with_state_field(self, state: &str) -> Self {
             *self.state_field.lock().unwrap() = Some(state.to_string());
             self
         }
-        /// CLAUDE-327: make the match-time `State` read fail with `message`.
+        /// Make the match-time `State` read fail with `message`.
         fn with_state_field_error(self, message: &str) -> Self {
             *self.state_field_error.lock().unwrap() = Some(message.to_string());
             self
@@ -5179,7 +5177,7 @@ mod tests {
 
     #[tokio::test]
     async fn worked_example_dedupes_by_failing_test_overlap_and_classifies_once() {
-        // CLAUDE-273 acceptance criterion 1: runs 5845, 5850, 5859 and 5871 on
+        // Runs 5845, 5850, 5859 and 5871 on
         // four branches, each failing `invitation_team_id::create_refuses_a_
         // foreign_tenant_team` plus other tests, produce one `Created` and
         // three attachments; the classifier runs exactly once (for the first,
@@ -5241,7 +5239,7 @@ mod tests {
         assert_eq!(counting.call_count(), 1, "the classifier ran exactly once");
     }
 
-    /// CLAUDE-337: a mint run's triage classification cost is not thrown away.
+    /// A mint run's triage classification cost is not thrown away.
     /// It lands on the run's own `job_outcomes` row, advances the
     /// `webhook-forgejo` daily ledger, and the `logs/usage.jsonl` record for the
     /// delivery carries the run's own id rather than `null`.
@@ -5316,7 +5314,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-337: the deterministic rules pass (no classifier call at all)
+    /// The deterministic rules pass (no classifier call at all)
     /// still records zero cost rather than leaving the outcome row stale.
     #[tokio::test]
     async fn deterministic_autofix_short_circuit_records_zero_cost() {
@@ -5361,7 +5359,7 @@ mod tests {
         assert_eq!(daily, 0.0, "the daily ledger must not move with no spend");
     }
 
-    /// CLAUDE-337: a mint run whose classification alone exceeds the action's
+    /// A mint run whose classification alone exceeds the action's
     /// daily budget stops with `exit::OVER_BUDGET`, not the generic
     /// `exit::UNEXPECTED` every other failure used to share.
     #[tokio::test]
@@ -5463,7 +5461,7 @@ mod tests {
     }
 
     /// Two events for two DIFFERENT jobs (distinct `workflow_id`, so the
-    /// CLAUDE-274 key gate never serializes them against each other), sent
+    /// key gate never serializes them against each other), sent
     /// through one `consume_events` call. Returns the peak observed
     /// concurrent classification count for the given `analysis_concurrency`.
     async fn run_two_distinct_jobs_at_concurrency(analysis_concurrency: usize) -> usize {
@@ -5503,7 +5501,7 @@ mod tests {
         slow.peak()
     }
 
-    /// CLAUDE-335: a queued failure event does no fetch, triage, or tracker
+    /// A queued failure event does no fetch, triage, or tracker
     /// call while globally paused or while `webhook-forgejo` is paused, and is
     /// processed again once neither is set.
     #[tokio::test]
@@ -5625,7 +5623,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_sharing_a_test_with_a_resolved_issue_reopens_it() {
-        // CLAUDE-273 acceptance criterion 2: a shared test with a RESOLVED
+        // A shared test with a RESOLVED
         // issue reopens it (a state write plus a comment) and creates none.
         let pool = crate::db::test_pool().await;
         let now = "2026-09-01T00:00:00Z";
@@ -5706,9 +5704,9 @@ mod tests {
         assert_eq!(failure.state, "open");
     }
 
-    /// CLAUDE-327 acceptance criterion: an `open` store row whose issue's live
+    /// An `open` store row whose issue's live
     /// YouTrack `State` is NOT the workflow's resolved state attaches exactly
-    /// as it did before this issue.
+    /// as it did before.
     #[tokio::test]
     async fn open_match_still_at_an_unresolved_state_attaches() {
         let pool = crate::db::test_pool().await;
@@ -5772,7 +5770,7 @@ mod tests {
         assert_eq!(failure.state, "open");
     }
 
-    /// CLAUDE-327 acceptance criterion: an `open` store row whose issue's live
+    /// An `open` store row whose issue's live
     /// YouTrack `State` already equals the workflow's resolved state (the
     /// `docs/yt-workflow-resolve-on-pr-merge.js` workflow already closed it on
     /// merge) is a regression: reopen instead of attaching.
@@ -5841,7 +5839,7 @@ mod tests {
         assert_eq!(failure.state, "open");
     }
 
-    /// CLAUDE-327 acceptance criterion: a failed live-`State` read never
+    /// A failed live-`State` read never
     /// silently attaches; it fails the run and leaves no comment behind.
     #[tokio::test]
     async fn open_match_state_read_failure_fails_the_run_with_no_comment() {
@@ -5907,7 +5905,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_with_no_shared_test_creates_a_second_issue() {
-        // CLAUDE-273 acceptance criterion 3: a failure on the same job with no
+        // A failure on the same job with no
         // shared test creates a second issue.
         let pool = crate::db::test_pool().await;
         let now = "2026-09-01T00:00:00Z";
@@ -5962,7 +5960,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_legacy_issue_found_by_marker_search_is_adopted_not_duplicated() {
-        // CLAUDE-273 acceptance criterion 4: an open legacy issue found by the
+        // An open legacy issue found by the
         // marker search, with no store row, is adopted and not duplicated.
         let pool = crate::db::test_pool().await;
         let backend = Arc::new(StoreBackend::new().with_legacy_match("CLAUDE-70"));
@@ -6099,7 +6097,7 @@ mod tests {
 
     #[test]
     fn unavailable_log_mints_a_human_action_issue_without_the_classifier() {
-        // CLAUDE-92: log_available = false -> the deterministic rules route to
+        // log_available = false -> the deterministic rules route to
         // bucket 2 (a real failure must surface even without a log), the LLM
         // classifier never runs, and an issue IS minted with the reason in the
         // analysis.
@@ -6175,8 +6173,8 @@ mod tests {
     #[test]
     fn code_fix_classification_mints_and_queues() {
         // A non-transient log + a code_fix verdict with NO open PR -> issue in the
-        // mapped project, queued for the fix bot, no human assignee. (CLAUDE-276:
-        // an open PR no longer suppresses this route inside `decide_mint`; see
+        // mapped project, queued for the fix bot, no human assignee. (An open PR
+        // no longer suppresses this route inside `decide_mint`; see
         // `decide_mint_applies_no_open_pr_suppression_of_its_own`. Open-PR
         // routing is decided by the caller before `decide_mint` is reached.)
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
@@ -6265,7 +6263,7 @@ mod tests {
 
     #[test]
     fn cargo_fmt_push_to_main_routes_to_auto_fix_and_queues_without_the_llm() {
-        // CLAUDE-104 end-to-end through decide_mint: a check.yml run with NO open
+        // An end-to-end test through decide_mint: a check.yml run with NO open
         // PR (push to main) failing on `cargo fmt --check` is routed
         // deterministically to the auto-fix bucket - queued for the runner, no
         // human assignee - and the LLM classifier (which would say human_action)
@@ -6324,10 +6322,10 @@ mod tests {
 
     #[test]
     fn decide_mint_applies_no_open_pr_suppression_of_its_own() {
-        // CLAUDE-276: the open-PR routing decision (agent PR re-queue / human PR
-        // comment) is now made by the caller BEFORE `decide_mint` is ever
+        // The open-PR routing decision (agent PR re-queue / human PR
+        // comment) is made by the caller BEFORE `decide_mint` is ever
         // reached; `decide_mint` (and `mint::mint` underneath it) no longer
-        // suppresses a code-fix mint for `has_open_pr: true` the way CLAUDE-149's
+        // suppresses a code-fix mint for `has_open_pr: true` the way the old
         // `SkippedOpenPr` used to.
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
@@ -6363,7 +6361,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-264/CLAUDE-273: the collapse key the legacy adoption lookup
+    /// The collapse key the legacy adoption lookup
     /// searches, i.e. the `#Unresolved` full-text query
     /// `decide_with_legacy_adoption` issues before falling through to triage.
     fn collapse_query(log: &str) -> String {
@@ -6402,7 +6400,7 @@ mod tests {
 
     #[test]
     fn an_infra_failure_collapses_across_branches_but_a_code_failure_does_not() {
-        // CLAUDE-264/CLAUDE-273: `infra_kind` is resolved from the same full
+        // `infra_kind` is resolved from the same full
         // redacted log as `failure_signature`, and switches the legacy
         // adoption lookup's collapse search onto the branch-agnostic key. Two
         // runs of one job on two different PR branches: with a host condition
@@ -6428,10 +6426,10 @@ mod tests {
 
     #[test]
     fn auto_fix_off_code_fix_still_creates_but_leaves_it_on_the_pr() {
-        // CLAUDE-153/CLAUDE-273 end-to-end through decide_mint: with the webhook
+        // An end-to-end test through decide_mint: with the webhook
         // auto-fix toggle OFF, a code_fix failure (even with no open PR) still
         // creates an issue, but queues no fixup PR (no `AI Agent` write), so the
-        // red check stays reported on the PR (CLAUDE-152).
+        // red check stays reported on the PR.
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let (bucket, out) = decide_mint(
@@ -6500,7 +6498,7 @@ mod tests {
         assert_eq!(forge_host_from_url("").as_deref(), None);
     }
 
-    // ---- CLAUDE-61: webhook runs are recorded ----------------------------
+    // ---- Webhook runs are recorded ----------------------------
 
     /// Canned [`ActionLogClient`] returning one failing job, so the fetch is
     /// `Fetched` on the first attempt and the backoff loop never sleeps.
@@ -6526,7 +6524,7 @@ mod tests {
         crate::db::test_pool().await
     }
 
-    /// CLAUDE-85: a client that fails the test on any call, proving the
+    /// A client that fails the test on any call, proving the
     /// skipped-run short-circuit never attempts a log fetch.
     struct PanicLogs;
     impl crate::forge_log::ActionLogClient for PanicLogs {
@@ -6543,7 +6541,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_failure_statuses_finish_without_a_log_fetch() {
-        // CLAUDE-85: Forgejo fires action_run_failure for every non-success
+        // Forgejo fires action_run_failure for every non-success
         // done status (bare `else` in ActionRunNowDone), so `skipped` (server-
         // side skip, no log will ever exist) and `cancelled` (deliberately
         // stopped) must both bypass the fetch + triage instead of burning the
@@ -6594,7 +6592,7 @@ mod tests {
 
     #[test]
     fn verified_failure_event_carries_the_run_status() {
-        // CLAUDE-85: a delivery with action=failure but a non-failure run
+        // A delivery with action=failure but a non-failure run
         // status (cancelled / skipped flavors) surfaces that status on the
         // event so the consumer can route on it.
         let body = failure_payload("contoso/claude-run")
@@ -6607,7 +6605,7 @@ mod tests {
 
     #[test]
     fn verified_failure_event_carries_repo_visibility() {
-        // CLAUDE-92: `repository.private` rides the payload onto the event; a
+        // `repository.private` rides the payload onto the event; a
         // payload without the field (older/foreign forge) defaults to public.
         let body = failure_payload("contoso/claude-run").replace(
             r#""repository":{"full_name":"contoso/claude-run"}"#,
@@ -6627,7 +6625,7 @@ mod tests {
     /// One recorded `run_logs` call: `(host, repo, run_number, token)`.
     type LoggedCall = (String, String, i64, Option<String>);
 
-    /// CLAUDE-204: a scripted `fj actions logs` client recording every call's
+    /// A scripted `fj actions logs` client recording every call's
     /// arguments, so the tests assert the run number, the token scoping, and the
     /// call count without spawning a process.
     struct ScriptedLogs {
@@ -6701,7 +6699,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_and_private_repos_share_one_fetch_path() {
-        // CLAUDE-204: the public/private split is gone. Both visibilities reach
+        // The public/private split is gone. Both visibilities reach
         // `fj actions logs` with the same arguments, addressed by the per-repo
         // run number, and the source's `log_token_ref` scopes both.
         for private in [false, true] {
@@ -6756,7 +6754,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_log_token_degrades_to_a_no_log_outcome() {
-        // CLAUDE-204: an auth denial is terminal after ONE call (no retry burn)
+        // An auth denial is terminal after ONE call (no retry burn)
         // and the failure still surfaces through the no-log path.
         let _env = crate::secrets::key_file_env_lock().await;
         let tmp = tempfile::tempdir().unwrap();
@@ -6792,7 +6790,7 @@ mod tests {
         assert!(summary.contains("log unavailable"), "{summary}");
     }
 
-    /// A `Fetched` outcome whose jobs carry `log_state` in run order (FJ-79).
+    /// A `Fetched` outcome whose jobs carry `log_state` in run order.
     fn jobs_with_log_states(states: &[&str]) -> crate::forge_log::RunLogsOutcome {
         crate::forge_log::RunLogsOutcome::Fetched(
             states
@@ -6819,8 +6817,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_permanently_missing_log_degrades_to_a_no_log_outcome() {
-        // CLAUDE-242: FJ-79's every-job `log_state: "missing"` must be read the
-        // same way an unfetchable log is, so the CLAUDE-92 human-action route
+        // An every-job `log_state: "missing"` must be read the
+        // same way an unfetchable log is, so the human-action route
         // still fires instead of triaging an empty-but-"available" log.
         let pool = memory_pool().await;
         let out_dir = tempfile::tempdir().unwrap();
@@ -6855,8 +6853,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_partially_readable_log_still_mints_as_available() {
-        // CLAUDE-242 AC: at least one job carrying a readable log must be
-        // unaffected by the FJ-79 predicate, even alongside a missing one.
+        // At least one job carrying a readable log must be
+        // unaffected by the missing-log predicate, even alongside a missing one.
         let pool = memory_pool().await;
         let out_dir = tempfile::tempdir().unwrap();
         let logs = Arc::new(ScriptedLogs::new(jobs_with_log_states(&[
@@ -6890,7 +6888,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pre_fj79_log_with_no_log_state_still_mints_as_available() {
-        // CLAUDE-242 AC: an `fj` predating FJ-79 emits no `log_state` field at
+        // An `fj` predating the log-state field emits no `log_state` field at
         // all, which deserializes to `""` on every job, never `"missing"`; that
         // absence must never be read as "gone".
         let pool = memory_pool().await;
@@ -6939,7 +6937,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stopped_run_finishes_without_triage_or_mint() {
-        // CLAUDE-208: run-level status is `failure` (so the CLAUDE-85 guard lets
+        // Run-level status is `failure` (so the earlier status guard lets
         // it through) but every job was cancelled or skipped, which is what a
         // superseding push produces. Nothing failed, so the consumer closes the
         // run naming the statuses and never reaches triage or mint.
@@ -6989,7 +6987,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_that_is_not_stopped_still_reaches_the_mint_branch() {
-        // CLAUDE-208: only the all-`{cancelled, skipped}` set short-circuits. A
+        // Only the all-`{cancelled, skipped}` set short-circuits. A
         // failing job, an every-job-success run under a run-level failure, and a
         // run whose job list did not resolve all continue into triage / mint
         // (here log-only, since no mint context is configured).
@@ -7053,7 +7051,7 @@ mod tests {
         .await;
 
         // One finished run, recorded under the synthetic action + webhook source.
-        // CLAUDE-80: the finished run carries no stage (cleared by run_finish)
+        // The finished run carries no stage (cleared by run_finish)
         // and no stale in-flight marker.
         let (action, triggered, jobs, exit, stage): (
             String,
@@ -7082,7 +7080,7 @@ mod tests {
         .unwrap();
         assert_eq!(inflight, 0, "in-flight marker cleared on finish");
 
-        // CLAUDE-93: the event's html_url is recorded as the job's outbound
+        // The event's html_url is recorded as the job's outbound
         // link so the run-detail tables can link the key to the Forgejo run.
         let run_id: i64 = sqlx::query_scalar(&crate::db::q(&pool, "SELECT id FROM runs"))
             .fetch_one(&pool)
@@ -7112,7 +7110,7 @@ mod tests {
 
     #[test]
     fn decide_mint_reports_stages_in_order_for_an_llm_classification() {
-        // CLAUDE-80: a non-transient log goes rules -> LLM -> mint, so the
+        // A non-transient log goes rules -> LLM -> mint, so the
         // reporter sees the classify stage between triage and mint.
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
@@ -7145,7 +7143,7 @@ mod tests {
 
     #[test]
     fn decide_mint_skips_the_classify_stage_on_a_rules_short_circuit() {
-        // CLAUDE-80: a rules-bucketed event (transient signature) never runs
+        // A rules-bucketed event (transient signature) never runs
         // the LLM, so "classifying with claude" must never be reported.
         let classifier = StubClassifier::new(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
@@ -7196,7 +7194,7 @@ mod tests {
         assert!(!WebhookRunSummary::error("boom".to_string()).ok);
     }
 
-    // ---- CLAUDE-276: route a CI failure on an open PR by who opened it ----
+    // ---- Route a CI failure on an open PR by who opened it ----
 
     fn pr(number: u64, head_sha: &str) -> ForgePullRequest {
         ForgePullRequest {
@@ -7244,7 +7242,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_pr_lookup_error_fails_the_run_and_mints_nothing() {
-        // CLAUDE-276 acceptance criterion: an open-PR lookup error fails the run
+        // An open-PR lookup error fails the run
         // with `ok = false` and an `error` log, and nothing is minted or
         // commented - never silently read as "no PR".
         let pool = crate::db::test_pool().await;
@@ -7288,7 +7286,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_pr_under_limit_requeues_its_issue_and_bumps_fix_attempts() {
-        // CLAUDE-276 acceptance criterion: a failure recorded in
+        // A failure recorded in
         // `agent_pull_requests` with `fix_attempts` below the ceiling comments
         // its issue, bumps `fix_attempts`, and sets `AI Agent = Queued` - no PR
         // comment, no new issue.
@@ -7355,7 +7353,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_pr_at_limit_flags_needs_review_listing_every_attempt() {
-        // CLAUDE-276 acceptance criterion: at the fix-attempt ceiling, the next
+        // At the fix-attempt ceiling, the next
         // failure sets `AI Agent = Needs Review` with every attempt's run
         // listed, instead of re-queuing again.
         let pool = crate::db::test_pool().await;
@@ -7427,7 +7425,7 @@ mod tests {
 
     #[tokio::test]
     async fn human_pr_no_match_comments_the_pr_and_records_a_pr_only_row() {
-        // CLAUDE-276 acceptance criterion: a human PR with no store match gets
+        // A human PR with no store match gets
         // one PR comment carrying the analysis, a `pr_only` store row, and no
         // issue.
         let _env = crate::secrets::key_file_env_lock().await;
@@ -7511,7 +7509,7 @@ mod tests {
 
     #[tokio::test]
     async fn human_pr_sharing_an_open_failure_comments_and_attaches_with_no_analysis() {
-        // CLAUDE-276 acceptance criterion: a human PR sharing a failing test
+        // A human PR sharing a failing test
         // with an open failure gets a PR comment naming the issue, the run is
         // attached, and no analysis runs.
         let _env = crate::secrets::key_file_env_lock().await;
@@ -7601,7 +7599,7 @@ mod tests {
         assert!(body.contains("CLAUDE-42"), "{body}");
     }
 
-    /// CLAUDE-327 acceptance criterion: on a human PR, an `open` store row
+    /// On a human PR, an `open` store row
     /// whose issue's live `State` already equals the workflow's resolved
     /// state is a regression: reopen instead of a PR-only attach comment.
     #[tokio::test]
@@ -7675,7 +7673,7 @@ mod tests {
         assert_eq!(failure.state, "open");
     }
 
-    /// CLAUDE-327 acceptance criterion: on a human PR, a failed live-`State`
+    /// On a human PR, a failed live-`State`
     /// read never silently attaches; it fails the run with no PR comment.
     #[tokio::test]
     async fn human_pr_sharing_an_open_match_state_read_failure_fails_the_run() {
@@ -7747,7 +7745,7 @@ mod tests {
 
     #[tokio::test]
     async fn human_pr_on_a_second_branch_mints_one_issue_and_comments_both_prs() {
-        // CLAUDE-276 acceptance criterion: the same failing tests on a second
+        // The same failing tests on a second
         // branch's PR create one issue, and both PRs get the issue link.
         let _env = crate::secrets::key_file_env_lock().await;
         let tmp = tempfile::tempdir().unwrap();
@@ -7861,7 +7859,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_write_token_ref_fails_the_run_and_records_a_run_event() {
-        // CLAUDE-276 acceptance criterion: a source without `write_token_ref`
+        // A source without `write_token_ref`
         // logs at `error`, writes a `run_events` row, and fails the run.
         let pool = crate::db::test_pool().await;
         let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(23, "commit-7108")]));
@@ -7896,7 +7894,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-277: merge-close - PR merges with the failing workflow green ----
+    // ---- Merge-close: PR merges with the failing workflow green ----
     mod merge_close {
         use super::*;
 
@@ -7921,7 +7919,7 @@ mod tests {
 
         #[tokio::test]
         async fn merged_agent_pr_is_marked_merged_and_makes_no_tracker_call() {
-            // CLAUDE-327 acceptance criterion: the merged-PR handler still
+            // The merged-PR handler still
             // sets `agent_pull_requests.state = merged` and makes no tracker
             // call at all - the YouTrack workflow resolves the issue, not the
             // runner.
@@ -7969,7 +7967,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_queued_pr_event_is_skipped_while_paused() {
-            // CLAUDE-335: neither the store row nor the tracker is touched.
+            // Neither the store row nor the tracker is touched.
             let pool = crate::db::test_pool().await;
             ci_failure_store::record_agent_pr(
                 &pool,
@@ -8081,11 +8079,11 @@ mod tests {
         }
     }
 
-    // ---- CLAUDE-64 / CLAUDE-87: every auth-rejection branch is reachable ----
+    // ---- Every auth-rejection branch is reachable ----
     //
     // Drive `forgejo_webhook` directly so each rejection branch (and the
     // accepted path that emits the debug line) is exercised at the status-code
-    // level. CLAUDE-87 adds per-source secret isolation, unknown-source 404,
+    // level, including per-source secret isolation, unknown-source 404,
     // and per-source rate buckets. These set the process-global key-file env, so
     // they take the shared lock with the secrets-UI test in `web::mod`.
     mod handler_auth {
@@ -8093,8 +8091,8 @@ mod tests {
         use age::secrecy::ExposeSecret;
         use axum::http::HeaderValue;
 
-        // Two sources, each with its own secret and allow-list, exercise the
-        // CLAUDE-87 per-source isolation.
+        // Two sources, each with its own secret and allow-list, exercise
+        // per-source isolation.
         const SOURCE_A: &str = "contoso";
         const SECRET_A: &str = "hmac-value-for-contoso";
         const SOURCE_B: &str = "fabrikam";
@@ -8261,7 +8259,7 @@ mod tests {
 
         #[tokio::test]
         async fn cross_source_signature_is_401() {
-            // CLAUDE-87: a payload validly signed with source A's secret must NOT
+            // A payload validly signed with source A's secret must NOT
             // authenticate on source B's path. Source B verifies against its own
             // secret only, so the otherwise-valid signature mismatches -> 401.
             let _env = crate::secrets::key_file_env_lock().await;
@@ -8283,7 +8281,7 @@ mod tests {
 
         #[tokio::test]
         async fn unset_secret_ref_fails_closed_401() {
-            // CLAUDE-87: a source whose secret_ref is unset cannot authenticate;
+            // A source whose secret_ref is unset cannot authenticate;
             // it must fail closed with 401, not accept.
             let _env = crate::secrets::key_file_env_lock().await;
             let tmp = tempfile::tempdir().unwrap();
@@ -8363,7 +8361,7 @@ mod tests {
 
         #[tokio::test]
         async fn paused_action_accepts_and_drops_without_emitting() {
-            // CLAUDE-153: with the synthetic `webhook-forgejo` action paused, an
+            // With the synthetic `webhook-forgejo` action paused, an
             // otherwise-valid authenticated delivery is acked with 2xx (so Forgejo
             // does not retry) but no event is emitted (no mint/queue). The
             // signature/replay/rate-limit checks still ran to get here.
@@ -8391,7 +8389,7 @@ mod tests {
             );
         }
 
-        /// CLAUDE-269: while the Claude login needs renewing, a delivery is
+        /// While the Claude login needs renewing, a delivery is
         /// accepted and dropped exactly like a pause (2xx, no classifier, no
         /// mint), AND a `run_events` row records why, so the drop is visible
         /// on the action page and not only in the daemon log.
@@ -8437,7 +8435,7 @@ mod tests {
             );
         }
 
-        /// CLAUDE-223: the GLOBAL pause gets the same accept-and-drop treatment
+        /// The GLOBAL pause gets the same accept-and-drop treatment
         /// as the per-action one. Before this the listener only checked the
         /// synthetic action, so a globally-paused daemon still minted from a
         /// webhook. Resuming restores the emit.
@@ -8482,7 +8480,7 @@ mod tests {
 
         #[tokio::test]
         async fn resumed_action_emits_again() {
-            // CLAUDE-153: clearing the pause row restores the accepted+emit path,
+            // Clearing the pause row restores the accepted+emit path,
             // proving the pause is a live toggle, not a permanent disable.
             let _env = crate::secrets::key_file_env_lock().await;
             let tmp = tempfile::tempdir().unwrap();
@@ -8508,7 +8506,7 @@ mod tests {
 
         #[tokio::test]
         async fn each_source_authenticates_on_its_own_path() {
-            // CLAUDE-87: both sources accept a delivery signed with their own
+            // Both sources accept a delivery signed with their own
             // secret and allow-listed for their own repos, proving four (here two)
             // endpoints work independently off one daemon.
             let _env = crate::secrets::key_file_env_lock().await;
@@ -8543,7 +8541,7 @@ mod tests {
 
         #[tokio::test]
         async fn rate_limit_is_per_source() {
-            // CLAUDE-87: exhausting source A's budget (rate=1) must not 429
+            // Exhausting source A's budget (rate=1) must not 429
             // source B. A's second delivery is 429; B's first still 202.
             let _env = crate::secrets::key_file_env_lock().await;
             let tmp = tempfile::tempdir().unwrap();
@@ -8589,7 +8587,7 @@ mod tests {
 
         #[tokio::test]
         async fn replay_store_is_shared_across_sources() {
-            // CLAUDE-87: delivery ids are globally unique, so a replay of one
+            // Delivery ids are globally unique, so a replay of one
             // source's delivery id on another source is rejected (409) by the
             // shared store. The first delivery to A authenticates and records the
             // id; the same id delivered to B (validly signed for B) is a replay.
@@ -8643,7 +8641,7 @@ mod tests {
 
         #[tokio::test]
         async fn unlisted_repo_is_acked_and_dropped() {
-            // CLAUDE-87: source A's allow-list is `contoso/claude-run` only, so
+            // Source A's allow-list is `contoso/claude-run` only, so
             // a validly signed delivery for a different repo is acked + dropped.
             let _env = crate::secrets::key_file_env_lock().await;
             let tmp = tempfile::tempdir().unwrap();
@@ -8662,7 +8660,7 @@ mod tests {
             assert!(rx.try_recv().is_err());
         }
 
-        // CLAUDE-277: the pull-request event-type dispatch and its gates.
+        // The pull-request event-type dispatch and its gates.
 
         fn headers_with_event(
             signature: Option<&str>,
@@ -8874,7 +8872,7 @@ mod tests {
         }
     }
 
-    // ---- CLAUDE-278: event-driven automerge on a success/recover event -----
+    // ---- Event-driven automerge on a success/recover event -----
     mod automerge_success {
         use super::*;
 
@@ -8911,7 +8909,7 @@ mod tests {
 
         #[tokio::test]
         async fn success_and_mergeable_merges_and_comments_with_no_state_or_field_write() {
-            // CLAUDE-327: a success event on a recorded agent PR, with
+            // A success event on a recorded agent PR, with
             // automerge enabled and pr_status success+mergeable, merges the PR
             // and comments, but writes no State or AI Agent field: a YouTrack
             // workflow resolves the issue once the merge lands.
@@ -9092,7 +9090,7 @@ mod tests {
 
         #[tokio::test]
         async fn merged_pr_with_unknown_mergeable_takes_no_action() {
-            // CLAUDE-330: fj reports `mergeable: null` for a merged PR; CLAUDE-331 marks the row merged.
+            // fj reports `mergeable: null` for a merged PR; the row still gets marked merged.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
@@ -9135,7 +9133,7 @@ mod tests {
                     || c.starts_with("update_pr_branch")),
                 "{calls:?}"
             );
-            // CLAUDE-331: an observed merge retires the row.
+            // An observed merge retires the row.
             let row = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 7)
                 .await
                 .unwrap()
@@ -9194,7 +9192,7 @@ mod tests {
 
         #[tokio::test]
         async fn behind_base_updates_branch_and_leaves_code_review() {
-            // CLAUDE-309: success and behind_base=true updates the branch
+            // Success and behind_base=true updates the branch
             // instead of merging, comments, and does not touch State/AI Agent.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
@@ -9244,7 +9242,7 @@ mod tests {
 
         #[tokio::test]
         async fn behind_base_update_failure_comments_error_and_fails_run() {
-            // CLAUDE-309: an update_pr_branch failure (e.g. a 409 conflict)
+            // An update_pr_branch failure (e.g. a 409 conflict)
             // comments the error and fails the run; State/AI Agent unchanged.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
@@ -9306,7 +9304,7 @@ mod tests {
 
         #[tokio::test]
         async fn behind_base_null_comments_and_fails_run() {
-            // CLAUDE-309: `behind_base: null` (an `fj` predating FJ-99) takes no
+            // `behind_base: null` (an `fj` predating the field's introduction) takes no
             // merge action, comments, and fails the run so the gap is visible.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
@@ -9357,7 +9355,7 @@ mod tests {
 
         #[tokio::test]
         async fn merge_error_comments_error_and_fails_run() {
-            // CLAUDE-309: a merge failure (e.g. Forgejo's 405 refusal) comments
+            // A merge failure (e.g. Forgejo's 405 refusal) comments
             // the error and fails the run; State/AI Agent unchanged.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
@@ -9406,7 +9404,7 @@ mod tests {
         }
     }
 
-    // ---- CLAUDE-328: the reconciler backstop, its fault visibility, and its
+    // ---- The reconciler backstop, its fault visibility, and its
     // agreement with the webhook entry point on the shared decision function ---
     mod automerge_reconciler {
         use super::automerge_success::write_youtrack_action;
@@ -9429,7 +9427,7 @@ mod tests {
 
         /// One (state, mergeable, behind_base) combination, driven through both
         /// [`handle_action_success_for_pr`] (the webhook entry point) and
-        /// [`reconcile_automerge`] (the CLAUDE-328 tick-driven entry point),
+        /// [`reconcile_automerge`] (the tick-driven entry point),
         /// against two otherwise-identical setups, asserting the two entry
         /// points make IDENTICAL backend calls: this is the "one shared decision
         /// function" acceptance criterion.
@@ -9539,7 +9537,7 @@ mod tests {
 
             let calls = backend.calls();
             assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
-            // CLAUDE-327: the reconciler makes no `State` or `AI Agent` write; a
+            // The reconciler makes no `State` or `AI Agent` write; a
             // YouTrack workflow resolves the issue once it observes the merge.
             assert!(!calls.iter().any(|c| c.contains("set_state")), "{calls:?}");
         }
@@ -9632,7 +9630,7 @@ mod tests {
 
         #[tokio::test]
         async fn reconciler_marks_merged_pr_merged_and_never_walks_it_again() {
-            // CLAUDE-331: `pr_status` reporting `merged` must retire the row.
+            // `pr_status` reporting `merged` must retire the row.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
@@ -9659,7 +9657,7 @@ mod tests {
 
         #[tokio::test]
         async fn runner_merge_marks_the_row_merged() {
-            // CLAUDE-331: the runner's own successful merge records it too.
+            // The runner's own successful merge records it too.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
@@ -9679,7 +9677,7 @@ mod tests {
 
         #[tokio::test]
         async fn reconciler_retires_row_for_pr_no_longer_listed_open() {
-            // CLAUDE-334: a PR closed without merge is absent from the open
+            // A PR closed without merge is absent from the open
             // listing; it is marked closed with no `pr_status` call.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
@@ -9700,7 +9698,7 @@ mod tests {
 
         #[tokio::test]
         async fn reconciler_leaves_rows_open_when_the_listing_fails() {
-            // CLAUDE-334: an unknown is never read as "closed".
+            // An unknown is never read as "closed".
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
@@ -9716,7 +9714,6 @@ mod tests {
 
         #[tokio::test]
         async fn reconciler_does_nothing_while_globally_paused() {
-            // CLAUDE-332
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
@@ -9733,7 +9730,6 @@ mod tests {
 
         #[tokio::test]
         async fn reconciler_does_nothing_while_webhook_action_paused() {
-            // CLAUDE-332
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
             write_youtrack_action(dir.path(), "yt", true);
@@ -9785,7 +9781,7 @@ mod tests {
 
         #[tokio::test]
         async fn identical_pr_status_failure_comments_once_but_records_every_pass() {
-            // CLAUDE-333: an unchanged fault is recorded each tick, commented once;
+            // An unchanged fault is recorded each tick, commented once;
             // a changed message comments again.
             let pool = crate::db::test_pool().await;
             let dir = tempfile::tempdir().unwrap();
@@ -10003,9 +9999,8 @@ mod tests {
             );
         }
 
-        // ---- CLAUDE-357: GitHub-hosted PRs must route through `GithubForge`,
-        // never `mint.backend` (`fj`, which 410s against GitHub's API), the
-        // `octo/widget` bug this issue fixes.
+        // ---- GitHub-hosted PRs must route through `GithubForge`,
+        // never `mint.backend` (`fj`, which 410s against GitHub's API).
         mod github_hosted {
             use super::*;
 

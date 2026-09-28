@@ -38,19 +38,19 @@ use crate::error::Result;
 const CANCEL_GRACE: Duration = Duration::from_millis(2000);
 /// How often the cancellable wait loop polls the child and the token.
 const CANCEL_POLL: Duration = Duration::from_millis(100);
-/// CLAUDE-53: once claude emits its terminal `result` event the turn is
+/// Once claude emits its terminal `result` event the turn is
 /// functionally done. Give a well-behaved claude this long to flush and exit on
 /// its own; if it doesn't (a leftover background task is holding it open), the
 /// runner terminates the group and finalizes from the captured result rather
 /// than waiting out the full `timeout`. A plain constant for now; expose via
 /// config only if real runs show a legitimate longer tail.
 const RESULT_EXIT_GRACE: Duration = Duration::from_secs(30);
-/// CLAUDE-259: the `--effort` levels the `claude` CLI documents. ADVISORY only:
+/// The `--effort` levels the `claude` CLI documents. ADVISORY only:
 /// a resolved value outside this set is warned about and then passed through, so
 /// a level Anthropic adds later needs no runner release. Nothing here rejects or
 /// substitutes a value.
 pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-/// DEV-706: the compaction window every invocation runs with when neither the
+/// The compaction window every invocation runs with when neither the
 /// action's `claude.autocompact` nor the global default sets one. The `claude`
 /// CLI accepts `auto` or 100k-1M tokens; `auto` scales to the model's whole
 /// context window, which on a 1M-context model means a long session never
@@ -64,33 +64,33 @@ pub struct ClaudeResult {
     pub ok: bool,
     pub summary: String,
     pub cost: f64,
-    /// DEV-707: tokens by category, per-tool attribution and context growth,
+    /// Tokens by category, per-tool attribution and context growth,
     /// recovered from this invocation's stream log. Empty when the log could not
     /// be read; accounting never decides a run's outcome.
     pub usage: crate::usage::StreamUsage,
     pub raw: Value,
     pub error: String,
     pub transient: bool,
-    /// CLAUDE-52: the `timeout <N>s claude` wrapper SIGKILLed the run (exit 124).
+    /// The `timeout <N>s claude` wrapper SIGKILLed the run (exit 124).
     /// A timeout is distinct from a hard failure: the agent may have completed
     /// all, some, or none of the work before being killed, so the handler
     /// surfaces it as a "Timed Out" outcome rather than "Failed". Always paired
     /// with `ok = false`.
     pub timed_out: bool,
-    /// CLAUDE-269: the CLI reported a structured `authentication_failed`, on
+    /// The CLI reported a structured `authentication_failed`, on
     /// this invocation's own terminal event or via three-or-more
     /// `system`/`api_retry` events. Always paired with `transient = true` (so
     /// no attempt is spent) and `ok = false`. Callers that want to react
     /// specifically (rather than just retry later, the generic transient path)
     /// branch on this field.
     pub login_required: bool,
-    /// CLAUDE-326: exit code 137 (SIGKILL) was observed with no captured
+    /// Exit code 137 (SIGKILL) was observed with no captured
     /// terminal result, i.e. an out-of-memory kill or a forced external kill
     /// rather than a claude-side failure. Always paired with `ok = false`.
     /// Mutually exclusive with `timed_out` in practice (the two exit codes
     /// differ), but never assumed so by callers.
     pub killed: bool,
-    /// CLAUDE-315: the `timeout(1)`-wrapped child's exit code, when this
+    /// The `timeout(1)`-wrapped child's exit code, when this
     /// result came from one actually exiting. `None` on a result synthesized
     /// before or without a child process (a login-required short-circuit, a
     /// stream-log I/O failure caught before the process outcome could be
@@ -118,17 +118,17 @@ impl ClaudeResult {
 
 pub struct ClaudeInvoker {
     pub binary: String,
-    /// CLAUDE-53: how long to wait for claude to exit on its own after its
+    /// How long to wait for claude to exit on its own after its
     /// terminal `result` event before force-terminating the group. Defaults to
     /// `RESULT_EXIT_GRACE`; tests override it to keep the hang case fast.
     result_exit_grace: Duration,
-    /// CLAUDE-165: when set, spawned `claude` children get
+    /// When set, spawned `claude` children get
     /// `CLAUDE_CONFIG_DIR=<dir>` so they read the slim bot `CLAUDE.md` and the
     /// linked host credentials instead of the operator's global `~/.claude`.
     /// `HOME` is left inherited so git/ssh keep working. `None` (the default and
     /// every test) inherits the ambient environment unchanged.
     config_dir: Option<PathBuf>,
-    /// CLAUDE-239: live handle to the global `config.claude` defaults, shared
+    /// Live handle to the global `config.claude` defaults, shared
     /// with `LiveSettings` so a Settings save applies to the next invocation.
     /// `None` (the default) means no global default: the action's own
     /// `claude.model` decides, and with neither set no `--model` flag is passed.
@@ -137,7 +137,7 @@ pub struct ClaudeInvoker {
     /// `ANTHROPIC_API_KEY`. `None` (the default and every test) leaves the
     /// child's auth to whatever its config dir holds.
     api_key: Option<crate::service_auth::ApiKeyHandle>,
-    /// CLAUDE-269: tripped when the CLI itself reports an authentication
+    /// Tripped when the CLI itself reports an authentication
     /// failure, so the scheduler/dispatcher/webhooks stop starting new Claude
     /// work until a fresh sign-in. `None` (the default and every test that does
     /// not build one) means detection is a no-op: `invoke` still reports
@@ -157,14 +157,14 @@ impl ClaudeInvoker {
         }
     }
 
-    /// CLAUDE-165: route spawned children at `dir` via `CLAUDE_CONFIG_DIR`.
+    /// Route spawned children at `dir` via `CLAUDE_CONFIG_DIR`.
     /// A builder so `new` stays source-compatible with existing callers/tests.
     pub fn with_config_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.config_dir = dir;
         self
     }
 
-    /// CLAUDE-239: take the live global `config.claude` defaults from
+    /// Take the live global `config.claude` defaults from
     /// [`crate::settings::LiveSettings::claude_handle`]. A builder for the same
     /// reason `with_config_dir` is one: existing callers/tests stay unchanged.
     pub fn with_default_claude(mut self, handle: ClaudeConfigHandle) -> Self {
@@ -181,7 +181,7 @@ impl ClaudeInvoker {
         self
     }
 
-    /// CLAUDE-269: the readiness gate this invoker trips when the CLI reports
+    /// The readiness gate this invoker trips when the CLI reports
     /// an authentication failure. A builder for the same reason `with_api_key`
     /// is one: existing callers/tests stay unchanged with detection a no-op.
     pub fn with_readiness(mut self, gate: crate::readiness::ReadinessGate) -> Self {
@@ -189,7 +189,7 @@ impl ClaudeInvoker {
         self
     }
 
-    /// CLAUDE-239: the model this invocation runs with: the action's own
+    /// The model this invocation runs with: the action's own
     /// `claude.model`, else the live global default, else `None` (no `--model`
     /// flag, so the `claude` CLI's own default applies). The value is passed
     /// through untouched; the CLI validates it.
@@ -200,7 +200,7 @@ impl ClaudeInvoker {
         })
     }
 
-    /// CLAUDE-259: the effort level this invocation runs with, resolved exactly
+    /// The effort level this invocation runs with, resolved exactly
     /// like the model: the action's own `claude.effort`, else the live global
     /// default, else `None` (no `--effort` flag).
     ///
@@ -230,7 +230,7 @@ impl ClaudeInvoker {
         Some(effort)
     }
 
-    /// DEV-706: the compaction window this invocation runs with. Resolved like
+    /// The compaction window this invocation runs with. Resolved like
     /// the model and the effort level (action, then the live global default),
     /// falling back to [`DEFAULT_AUTOCOMPACT`] rather than to the CLI's own
     /// `auto`, so the bound holds for every action with no per-action config.
@@ -256,18 +256,18 @@ impl ClaudeInvoker {
     /// Spawn claude, relay its stdout to `stream_log` stamping each JSON event
     /// line with an arrival-time `ts` (stderr is a direct, unstamped redirect to
     /// the same file), wait, then scan the stream for the terminal `result`
-    /// event by type (CLAUDE-107: not by line position).
+    /// event by type, not by line position.
     ///
-    /// CLAUDE-9: the child is spawned in its own process group and the wait is
+    /// The child is spawned in its own process group and the wait is
     /// cancellable. When `cancel` trips, the whole group (the `timeout`
     /// wrapper, `claude`, and anything they spawned) is terminated with
     /// SIGTERM, a short grace period, then SIGKILL. The caller (`job.rs`)
     /// detects the tripped token and synthesizes a cancelled `$claude_result`
     /// so the action's `post` phase still runs.
-    /// DEV-705: `budget_usd` is what the run has left to spend. It is passed to
+    /// `budget_usd` is what the run has left to spend. It is passed to
     /// the child as `--max-budget-usd`, so ONE runaway session cannot overshoot
     /// the run's ceiling between the runner's own between-invocation checks.
-    /// `None` leaves the child uncapped (the pre-DEV-705 command line).
+    /// `None` leaves the child uncapped (no flag passed at all).
     #[allow(clippy::too_many_arguments)]
     pub fn invoke(
         &self,
@@ -299,7 +299,7 @@ impl ClaudeInvoker {
             .clone()
             .unwrap_or_else(|| "acceptEdits".to_string());
 
-        // CLAUDE-63: the relay thread (below) owns `log_file` and writes
+        // The relay thread (below) owns `log_file` and writes
         // per-event-stamped stdout lines to it; stderr keeps a direct fd
         // redirect via a `try_clone`. Both clones share the same open file
         // description (and therefore a single append cursor), so stamped stdout
@@ -314,7 +314,7 @@ impl ClaudeInvoker {
         // equals the child's pid, so cancellation can signal the whole tree at
         // once.
         //
-        // CLAUDE-63: stdout is piped (not a direct fd redirect) so a relay
+        // Stdout is piped (not a direct fd redirect) so a relay
         // thread can stamp each JSON event line with its arrival time before it
         // lands in the stream log. stderr stays a direct redirect: claude's
         // stderr is incidental non-JSON noise and is left unstamped by design.
@@ -322,8 +322,8 @@ impl ClaudeInvoker {
         // Tradeoff: the old direct fd redirect let the child keep writing even
         // if the runner died; the pipe relay means a dead runner blocks the
         // child's stdout pipe. Accepted because the runner already owns the
-        // child's lifecycle (timeout kill, CLAUDE-52 / CLAUDE-53), so a dead
-        // runner already implies a dead run.
+        // child's lifecycle (timeout kill, force-terminate-on-hung-result), so a
+        // dead runner already implies a dead run.
         let mut command = Command::new("timeout");
         command
             .arg(format!("{}s", timeout.as_secs()))
@@ -333,27 +333,27 @@ impl ClaudeInvoker {
             .arg("--output-format=stream-json")
             .arg(format!("--permission-mode={}", permission_mode))
             .arg(format!("--allowed-tools={}", allowed_tools));
-        // CLAUDE-239: the resolved model, if any. Added before the trailing
-        // prompt positional; omitted entirely when nothing resolves, which is
-        // the pre-CLAUDE-239 command line.
+        // The resolved model, if any. Added before the trailing
+        // prompt positional; omitted entirely when nothing resolves, so the
+        // CLI's own default applies.
         if let Some(model) = self.resolve_model(claude_cfg) {
             command.arg(format!("--model={}", model));
         }
-        // CLAUDE-259: the resolved effort level, on the same terms as the model.
+        // The resolved effort level, on the same terms as the model.
         if let Some(effort) = self.resolve_effort(claude_cfg) {
             command.arg(format!("--effort={}", effort));
         }
-        // DEV-706: bound what one turn resends, so a long tool-heavy session
+        // Bound what one turn resends, so a long tool-heavy session
         // compacts instead of carrying every completed operation's payloads.
         command.arg(format!(
             "--autocompact={}",
             self.resolve_autocompact(claude_cfg)
         ));
-        // DEV-705: the run's remaining ceiling, enforced inside the session.
+        // The run's remaining ceiling, enforced inside the session.
         if let Some(budget) = budget_usd {
             command.arg(format!("--max-budget-usd={:.4}", budget.max(0.0)));
         }
-        // CLAUDE-280: a session run under `claude --print` is over the moment its
+        // A session run under `claude --print` is over the moment its
         // turn ends, so nothing is left to wait on. `Monitor` and `ScheduleWakeup`
         // let a session end its turn while still expecting to resume, and
         // background tasks (`run_in_background`) let it end while work is still
@@ -369,7 +369,7 @@ impl ClaudeInvoker {
             .stderr(Stdio::from(log_err))
             .process_group(0)
             .env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
-        // CLAUDE-165: point the agent at its dedicated user-level config dir
+        // Point the agent at its dedicated user-level config dir
         // (slim bot CLAUDE.md + linked host credentials). HOME is left inherited.
         if let Some(dir) = &self.config_dir {
             command.env("CLAUDE_CONFIG_DIR", dir);
@@ -390,7 +390,7 @@ impl ClaudeInvoker {
                 }
             }
         }
-        // CLAUDE-228: the agent session runs for up to `claude_timeout_seconds`
+        // The agent session runs for up to `claude_timeout_seconds`
         // (3600 in the shipped actions) and the wait below is a poll loop, so
         // this whole region hands the worker's core back to the runtime. Left
         // inline it pinned one tokio worker per concurrent job for the entire
@@ -414,7 +414,7 @@ impl ClaudeInvoker {
 
                 // Drain the relay: the child group has exited, so the stdout pipe is
                 // at EOF and the thread has flushed every line it read up to the kill.
-                // CLAUDE-233: both ways the relay can stop early (an I/O error and a
+                // Both ways the relay can stop early (an I/O error and a
                 // panic) surface as a reason string the caller reports; neither is
                 // dropped, because either one truncates the stream log.
                 let relay_error = match relay.map(|relay| relay.join()) {
@@ -425,7 +425,7 @@ impl ClaudeInvoker {
                 Ok((outcome, relay_error))
             })?;
 
-        // CLAUDE-269: the wait loop terminated the group after repeated
+        // The wait loop terminated the group after repeated
         // authentication-retry events, well below `claude_timeout_seconds`.
         // Finalize directly from that rather than the signal-induced exit
         // code, and trip the readiness gate so nothing else starts new Claude
@@ -440,7 +440,7 @@ impl ClaudeInvoker {
         let status = outcome.status;
 
         let exit_code = status.code().unwrap_or(-1);
-        // CLAUDE-256: a stream log the runner cannot READ decides nothing, so it
+        // A stream log the runner cannot READ decides nothing, so it
         // is reported as the runner's own fault and never as "claude produced no
         // result event", which is a non-transient failure that spends one of the
         // job's `max_attempts_per_key`. A relay error that preceded it is named
@@ -463,13 +463,13 @@ impl ClaudeInvoker {
             }
         };
         let have_result = final_event.get("type").and_then(|v| v.as_str()) == Some("result");
-        // DEV-707: the stream log is readable here, so replay it once for this
+        // The stream log is readable here, so replay it once for this
         // invocation's tokens, per-tool attribution and context growth. Every
         // outcome below carries it, including the failure ones: a run that
         // failed still spent what it spent.
         let usage = crate::usage::parse_stream_usage(stream_log);
 
-        // CLAUDE-315: one line per invocation that reaches this point, so plan
+        // One line per invocation that reaches this point, so plan
         // usage is visible without opening the stream log or waiting for the
         // Reports chart. `warn!` (not `info!`) when the plan itself is
         // unhappy: a non-"allowed" status, or either window at or past 90%
@@ -526,7 +526,7 @@ impl ClaudeInvoker {
             ),
         }
 
-        // CLAUDE-233: the relay is the stream log's only writer, so a relay that
+        // The relay is the stream log's only writer, so a relay that
         // stopped early means the log is missing every event after that point.
         // With the terminal `result` already captured the run is still decidable
         // and we finalize from it below, noting the gap. Without it the outcome
@@ -553,14 +553,14 @@ impl ClaudeInvoker {
             }
         }
 
-        // CLAUDE-53: when we force-terminated a hung-but-done group after its
+        // When we force-terminated a hung-but-done group after its
         // terminal `result` event, the wrapper exits non-zero (SIGTERM 143 /
         // SIGKILL 137). The captured result event is the authoritative outcome,
         // so skip the exit-code failure branch and build from the result below.
         // The exit-code / timeout path is reserved for runs where NO terminal
         // result was ever observed (a genuine hang or crash).
         if exit_code != 0 && !outcome.finalized_on_result {
-            // CLAUDE-269: a structured `authentication_failed`, anywhere in the
+            // A structured `authentication_failed`, anywhere in the
             // stream (the terminal `result` event or an `assistant` event that
             // preceded it), means the CLI itself is reporting the login is
             // dead. Trip the gate and finalize as transient (no attempt spent)
@@ -585,10 +585,10 @@ impl ClaudeInvoker {
                 raw: final_event.clone(),
                 error: format!("claude exited {}, see {}", exit_code, stream_log.display()),
                 transient: classify_transient(exit_code, &final_event),
-                // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
+                // Exit 124 is the `timeout(1)` wrapper's SIGKILL code.
                 timed_out: exit_code == 124,
                 login_required: false,
-                // CLAUDE-326: exit 137 is SIGKILL, typically an OOM kill.
+                // Exit 137 is SIGKILL, typically an OOM kill.
                 killed: exit_code == 137,
                 exit_code: Some(exit_code),
             });
@@ -616,16 +616,16 @@ impl ClaudeInvoker {
             });
         }
 
-        // CLAUDE-280 backstop: step 6 of the prompt and the flags above are the
-        // primary defense against a session that leaves work in the background,
-        // but neither stops a session already running before this change, or a
+        // Backstop: step 6 of the prompt and the flags above are the primary
+        // defense against a session that leaves work in the background, but
+        // neither stops a session already running before this change, or a
         // future CLI that still lets `Bash` background a command despite the
         // env var. `wait_or_cancel` kills a leftover background task, which
         // appears in the stream log as a `system`/`task_updated` event with
         // `patch.status: killed` AFTER the terminal `result` - a shape that
-        // `parse_final_result` deliberately ignores (CLAUDE-107) when picking the
-        // result event itself, but that is exactly the signal that the "success"
-        // it reported was never really final.
+        // `parse_final_result` deliberately ignores when picking the result
+        // event itself, but that is exactly the signal that the "success" it
+        // reported was never really final.
         match killed_tasks_after_result(stream_log) {
             Ok(ids) if !ids.is_empty() => {
                 let ids = ids.join(", ");
@@ -702,12 +702,12 @@ impl ClaudeInvoker {
 /// Outcome of the cancellable wait loop.
 struct WaitOutcome {
     status: ExitStatus,
-    /// CLAUDE-53: true when claude emitted its terminal `result` event but did
+    /// True when claude emitted its terminal `result` event but did
     /// not exit within the grace window, so the loop force-terminated the (hung)
     /// group. The caller must build the outcome from the captured result event,
     /// not from the signal-induced exit code.
     finalized_on_result: bool,
-    /// CLAUDE-269: set when the loop force-terminated the group after seeing
+    /// Set when the loop force-terminated the group after seeing
     /// [`AUTH_RETRY_LIMIT`] `system`/`api_retry` events carrying
     /// `"error":"authentication_failed"`, far below `claude_timeout_seconds`.
     /// The caller finalizes directly from this rather than the exit code.
@@ -719,7 +719,7 @@ struct WaitOutcome {
 /// child's process group and returns the status of the terminated `timeout`
 /// wrapper.
 ///
-/// CLAUDE-53: additionally watches the stream log for claude's terminal `result`
+/// Additionally watches the stream log for claude's terminal `result`
 /// event. Once that event appears the turn is functionally done; the child gets
 /// `result_exit_grace` to exit on its own, after which the loop terminates the
 /// group and flags `finalized_on_result` so the caller finalizes from the
@@ -739,7 +739,7 @@ fn wait_or_cancel(
     // Set once claude's terminal `result` event is first observed; the child is
     // force-terminated if it is still alive at this instant.
     let mut result_deadline: Option<Instant> = None;
-    // CLAUDE-256: this loop polls the log every 100ms, so a persistently
+    // This loop polls the log every 100ms, so a persistently
     // unreadable log is reported once rather than a hundred times a second.
     let mut read_error_logged = false;
     loop {
@@ -763,7 +763,7 @@ fn wait_or_cancel(
             None => match stream_has_terminal_result(stream_log) {
                 Ok(true) => result_deadline = Some(Instant::now() + result_exit_grace),
                 Ok(false) => {}
-                // CLAUDE-256: an unreadable log is not "no result yet". The
+                // An unreadable log is not "no result yet". The
                 // grace timer cannot arm from a file we cannot read, so the
                 // child runs to its own exit or the `timeout(1)` wrapper; the
                 // reason is logged instead of discarded, and `invoke` finalizes
@@ -796,7 +796,7 @@ fn wait_or_cancel(
                 }
             }
         }
-        // CLAUDE-269: no terminal result yet (the branch above only arms the
+        // No terminal result yet (the branch above only arms the
         // grace timer once one lands), so also watch for repeated
         // authentication-retry events. Three is assumed low enough that a
         // single retry during a token-refresh race never trips this, while a
@@ -829,7 +829,7 @@ fn wait_or_cancel(
     }
 }
 
-/// CLAUDE-269: the number of `system`/`api_retry` events carrying
+/// The number of `system`/`api_retry` events carrying
 /// `"error":"authentication_failed"` observed before the child is
 /// force-terminated rather than left to exhaust `claude_timeout_seconds`. A
 /// single retry during a token-refresh race is not evidence of a dead login;
@@ -855,7 +855,7 @@ fn count_auth_retry_events(stream_log: &Path) -> std::io::Result<usize> {
         .count())
 }
 
-/// CLAUDE-269: scan the whole stream log for the first event (of any type)
+/// Scan the whole stream log for the first event (of any type)
 /// whose top-level `error` is `authentication_failed`, and pull a
 /// human-readable message out of it for the operator-facing banner: the
 /// `result` string if present, else the concatenated text of an `assistant`
@@ -897,15 +897,15 @@ fn find_authentication_failure(stream_log: &Path) -> std::io::Result<Option<Stri
     Ok(None)
 }
 
-/// Whether the stream log contains a terminal `result` event. CLAUDE-107:
+/// Whether the stream log contains a terminal `result` event.
 /// `parse_final_result` selects the result event by `type` regardless of
 /// position, so a result event followed by trailing `system` events still reads
 /// as "terminal result observed" here. A partial trailing write fails to parse
 /// and is skipped, so the grace timer only starts once a full `result` event has
 /// landed.
 ///
-/// CLAUDE-256: a read failure is carried out rather than read as "no result
-/// yet", so the caller can say why the grace timer never armed.
+/// A read failure is carried out rather than read as "no result yet", so the
+/// caller can say why the grace timer never armed.
 fn stream_has_terminal_result(stream_log: &Path) -> std::io::Result<bool> {
     Ok(parse_final_result(stream_log)?.is_some())
 }
@@ -953,13 +953,13 @@ fn classify_transient(exit_code: i32, final_event: &Value) -> bool {
         || event_err.contains("usage limit")
 }
 
-/// CLAUDE-63: relay the child's piped stdout to `sink`, stamping each line that
+/// Relay the child's piped stdout to `sink`, stamping each line that
 /// parses as a JSON object with a top-level RFC 3339 `ts` (arrival time). Lines
 /// that do not parse as a JSON object pass through byte-identically (defensive:
 /// never lose output). Flush per line so the SSE tail and the terminal-result
 /// poller see events promptly.
 ///
-/// CLAUDE-233: an I/O error is returned, never swallowed. This relay is the
+/// An I/O error is returned, never swallowed. This relay is the
 /// stream log's only writer, so stopping early silently discards every event
 /// claude emits afterwards, including the terminal `result`, and the run then
 /// reads as "claude produced no result" when in fact the runner stopped
@@ -1012,7 +1012,7 @@ fn stamp_line(raw: &[u8]) -> Vec<u8> {
     }
 }
 
-/// CLAUDE-107: select the authoritative terminal `result` event by event type,
+/// Select the authoritative terminal `result` event by event type,
 /// not by line position. Claude Code may emit trailing `system` events
 /// (`task_updated`, `task_notification`, or any future post-result event) after
 /// the `result` event, so the last non-empty line is not reliably the result.
@@ -1022,12 +1022,12 @@ fn stamp_line(raw: &[u8]) -> Vec<u8> {
 /// `result` event anywhere (the genuine no-terminal-result case the `!have_result`
 /// guard catches).
 ///
-/// CLAUDE-256: a read FAILURE comes back as `Err`, never as that same `None`.
+/// A read FAILURE comes back as `Err`, never as that same `None`.
 /// The two are different facts - the runner could not read the file, versus
 /// claude never wrote a result - and collapsing them blamed the agent for a log
 /// the runner could not open. `read_to_string` fails with `InvalidData` on a
-/// file ending inside a multi-byte UTF-8 sequence, which is exactly what the
-/// CLAUDE-233 disk-full truncation produced.
+/// file ending inside a multi-byte UTF-8 sequence, which is exactly what a
+/// disk-full truncation produces.
 fn parse_final_result(stream_log: &Path) -> std::io::Result<Option<Value>> {
     let raw = std::fs::read_to_string(stream_log)?;
     Ok(raw
@@ -1037,14 +1037,14 @@ fn parse_final_result(stream_log: &Path) -> std::io::Result<Option<Value>> {
         .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("result")))
 }
 
-/// CLAUDE-280: task ids for every `system`/`task_updated` event with
+/// Task ids for every `system`/`task_updated` event with
 /// `patch.status: killed` that appears AFTER the terminal `result` event in the
 /// stream log. Empty when the log holds no `result` event (that case is handled
 /// elsewhere) or no such trailing event.
 ///
-/// Shape observed in run 10822's log (a `task_updated` event with
-/// `patch.status: killed` following a successful `result`) and in the CLI
-/// verification in CLAUDE-280; revise if a CLI release renames these fields.
+/// Shape observed in a real run's log (a `task_updated` event with
+/// `patch.status: killed` following a successful `result`) and confirmed
+/// against the CLI directly; revise if a CLI release renames these fields.
 fn killed_tasks_after_result(stream_log: &Path) -> std::io::Result<Vec<String>> {
     let raw = std::fs::read_to_string(stream_log)?;
     let lines: Vec<&str> = raw.lines().collect();
@@ -1076,7 +1076,7 @@ fn killed_tasks_after_result(stream_log: &Path) -> std::io::Result<Vec<String>> 
         .collect())
 }
 
-/// CLAUDE-304: the number of `compact_boundary` events in a run's stream log,
+/// The number of `compact_boundary` events in a run's stream log,
 /// each marking a point where the CLI replaced earlier conversation with a
 /// summary (`claude.autocompact`, default [`DEFAULT_AUTOCOMPACT`]). A non-zero
 /// count is what let an earlier audit run rebuild finding write-ups from a summary
@@ -1099,7 +1099,7 @@ fn read_tail(p: &Path, max: usize) -> std::io::Result<String> {
     if raw.len() <= max {
         Ok(raw)
     } else {
-        // CLAUDE-263: `raw.len() - max` can land inside a multi-byte UTF-8
+        // `raw.len() - max` can land inside a multi-byte UTF-8
         // character; advance to the next char boundary so the slice never
         // panics. The tail then comes back up to three bytes shorter than
         // `max`, which is the cost of staying inside `max` bytes.
@@ -1111,7 +1111,7 @@ fn read_tail(p: &Path, max: usize) -> std::io::Result<String> {
     }
 }
 
-/// CLAUDE-56: Extract a short, human-readable failure summary from the stream
+/// Extract a short, human-readable failure summary from the stream
 /// log instead of pasting the raw NDJSON tail into failure comments. Preference
 /// order:
 /// 1. A terminal `result` event's `result` text (the message claude composed,
@@ -1136,7 +1136,7 @@ fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -> String {
             return error.to_string();
         }
     }
-    // CLAUDE-256: both remaining sources read the same file, so a read failure
+    // Both remaining sources read the same file, so a read failure
     // ends the search here. It used to produce an empty summary
     // (`unwrap_or_default`), which is indistinguishable from an empty log and
     // leaves the operator looking at nothing with no explanation.
@@ -1151,7 +1151,7 @@ fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -> String {
     }
 }
 
-/// CLAUDE-326: a one-sentence plain-language explanation of a recognized
+/// A one-sentence plain-language explanation of a recognized
 /// failure exit code, for callers that want to surface it alongside the raw
 /// `claude.error` / `claude.summary` text. `timed_out` takes precedence over
 /// `killed` (the two are expected to be mutually exclusive in practice, since
@@ -1172,7 +1172,7 @@ pub fn failure_hint(timed_out: bool, killed: bool) -> Option<&'static str> {
     }
 }
 
-/// CLAUDE-256: the operator-facing summary for a stream log that could not be
+/// The operator-facing summary for a stream log that could not be
 /// read. Never empty, and it names the path so the file can be inspected.
 fn unreadable_log_summary(stream_log: &Path, err: &std::io::Error) -> String {
     warn!(
@@ -1188,7 +1188,7 @@ fn unreadable_log_summary(stream_log: &Path, err: &std::io::Error) -> String {
     )
 }
 
-/// CLAUDE-233: the outcome reported when the runner's own stream-log relay died
+/// The outcome reported when the runner's own stream-log relay died
 /// before claude's terminal `result` event. The summary has to say three things,
 /// because the operator reading it on the issue would otherwise draw the wrong
 /// conclusion: the fault is the runner's, the agent's real outcome is unknown
@@ -1197,7 +1197,7 @@ fn unreadable_log_summary(stream_log: &Path, err: &std::io::Error) -> String {
 ///
 /// `transient` is the load-bearing field: it is what keeps a runner-side I/O
 /// fault from spending one of the job's `max_attempts_per_key`.
-/// CLAUDE-269: the outcome reported when the CLI itself reported an
+/// The outcome reported when the CLI itself reported an
 /// authentication failure (a structured `authentication_failed`, on the
 /// terminal result, an `assistant` event, or repeated `api_retry` events).
 /// `transient` is the load-bearing field: it is what keeps a dead login from
@@ -1247,16 +1247,16 @@ fn relay_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Clau
             reason
         ),
         transient: true,
-        // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
+        // Exit 124 is the `timeout(1)` wrapper's SIGKILL code.
         timed_out: exit_code == 124,
         login_required: false,
-        // CLAUDE-326: exit 137 is SIGKILL, typically an OOM kill.
+        // Exit 137 is SIGKILL, typically an OOM kill.
         killed: exit_code == 137,
         exit_code: Some(exit_code),
     }
 }
 
-/// CLAUDE-256: the outcome reported when the runner could not READ the stream
+/// The outcome reported when the runner could not READ the stream
 /// log it just wrote. Same shape and same reasoning as `relay_failure_result`:
 /// the fault is the runner's, claude's real outcome is unknown rather than bad,
 /// and `transient` is what stops a file the runner could not read from spending
@@ -1283,19 +1283,19 @@ fn read_failure_result(reason: &str, stream_log: &Path, exit_code: i32) -> Claud
             reason
         ),
         transient: true,
-        // CLAUDE-52: exit 124 is the `timeout(1)` wrapper's SIGKILL code.
+        // Exit 124 is the `timeout(1)` wrapper's SIGKILL code.
         timed_out: exit_code == 124,
         login_required: false,
-        // CLAUDE-326: exit 137 is SIGKILL, typically an OOM kill.
+        // Exit 137 is SIGKILL, typically an OOM kill.
         killed: exit_code == 137,
         exit_code: Some(exit_code),
     }
 }
 
 /// Scan the stream log backwards for the last `assistant` message event and
-/// concatenate the `text` of its text content blocks. CLAUDE-256: `Ok(None)`
-/// means the log was read and holds no assistant message; a read failure is
-/// `Err`, so the caller can say so instead of silently degrading the summary.
+/// concatenate the `text` of its text content blocks. `Ok(None)` means the log
+/// was read and holds no assistant message; a read failure is `Err`, so the
+/// caller can say so instead of silently degrading the summary.
 fn last_assistant_text(stream_log: &Path) -> std::io::Result<Option<String>> {
     let raw = std::fs::read_to_string(stream_log)?;
     for line in raw.lines().rev() {
@@ -1327,7 +1327,7 @@ fn last_assistant_text(stream_log: &Path) -> std::io::Result<Option<String>> {
     Ok(None)
 }
 
-/// CLAUDE-56: render the final result event as a collapsed, pretty-printed JSON
+/// Render the final result event as a collapsed, pretty-printed JSON
 /// block for failure comments (YouTrack and Forgejo both render Markdown + the
 /// `<details>` HTML element). Returns an empty string for synthesized results
 /// (`Value::Null` or an empty object) so callers can append it unconditionally.
@@ -1388,7 +1388,7 @@ mod tests {
         ));
     }
 
-    /// CLAUDE-52: a `claude` that outlives the wall-clock budget is SIGKILLed by
+    /// A `claude` that outlives the wall-clock budget is SIGKILLed by
     /// the `timeout(1)` wrapper (exit 124). The result carries `timed_out = true`
     /// alongside `ok = false`, distinguishing a timeout from a hard failure.
     /// Ensure a coreutils-faithful `timeout` is first on PATH for the test
@@ -1402,9 +1402,8 @@ mod tests {
     /// once, so the exit-code contract is exercised deterministically regardless
     /// of which `timeout` the host happens to ship. For non-timeout runs the shim
     /// forwards the child's own exit status, so other `invoke` tests are
-    /// unaffected; CLAUDE-285 is what makes that true (the watchdog `sleep` is
-    /// killed on every exit path instead of surviving as an orphan for the rest
-    /// of its duration).
+    /// unaffected: the watchdog `sleep` is killed on every exit path instead of
+    /// surviving as an orphan for the rest of its duration.
     fn ensure_coreutils_timeout_on_path() {
         use std::sync::OnceLock;
 
@@ -1420,7 +1419,7 @@ mod tests {
             // child's own exit status. This reproduces coreutils' contract that
             // the only `invoke` test asserting on it (`invoke_timeout_sets_timed_out`)
             // depends on.
-            // CLAUDE-285: the watcher's own `sleep "$secs"` must be killable
+            // The watcher's own `sleep "$secs"` must be killable
             // directly. Killing only the watcher subshell (the old shape) does
             // NOT kill a child that subshell already forked: `sleep` survives
             // as an orphan, reparented to init, and keeps running for the rest
@@ -1511,7 +1510,7 @@ exit "$code"
         assert!(!res.transient, "a timeout is never transient");
     }
 
-    /// CLAUDE-285: a run that finishes well inside its budget must not block on
+    /// A run that finishes well inside its budget must not block on
     /// the shim's own watchdog `sleep`. Before the fix, killing the watcher
     /// subshell left its already-forked `sleep "$secs"` running as an orphan
     /// that kept the invocation's stdout pipe open, so `invoke` (which reads
@@ -1557,7 +1556,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-269 acceptance criterion 1: a stub that emits an `assistant`
+    /// A stub that emits an `assistant`
     /// event with `"error":"authentication_failed"` and a terminal `result`
     /// with `is_error: true`, exiting 1, makes `invoke` return `transient: true`
     /// with `login_required` flagged, and trips the gate.
@@ -1603,7 +1602,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-269 acceptance criterion 2: a stub that emits repeated
+    /// A stub that emits repeated
     /// `system`/`api_retry` events with `"error":"authentication_failed"` and
     /// never exits is terminated after the third such event, far below its
     /// configured timeout.
@@ -1654,7 +1653,7 @@ exit "$code"
 
     const RESULT_LINE: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.42}"#;
 
-    /// CLAUDE-165: when the invoker carries a `config_dir`, the spawned child
+    /// When the invoker carries a `config_dir`, the spawned child
     /// gets `CLAUDE_CONFIG_DIR=<dir>` and still inherits `HOME` unchanged. The
     /// stub records both env vars as seen by the child so the assertion checks
     /// the real spawn path, not a rebuilt Command.
@@ -1705,7 +1704,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-53: claude emits its terminal result event and then exits on its
+    /// Claude emits its terminal result event and then exits on its
     /// own within the grace window. Behavior is unchanged from today: the result
     /// event is parsed for the success outcome, and nothing is force-terminated.
     #[test]
@@ -1745,7 +1744,7 @@ exit "$code"
         assert!(!res.timed_out, "a clean exit is not a timeout");
     }
 
-    /// CLAUDE-280: a `result` event followed by a `system`/`task_updated` event
+    /// A `result` event followed by a `system`/`task_updated` event
     /// reporting `patch.status: killed` (the shape `wait_or_cancel` produces when
     /// it terminates a leftover background task) must never finalize as success,
     /// even though the result event itself claimed success. This is the exact
@@ -1792,7 +1791,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-53: claude emits its terminal result event but does NOT exit (a
+    /// Claude emits its terminal result event but does NOT exit (a
     /// leftover background task holds it open). The runner force-terminates the
     /// group after the grace window and finalizes from the captured result, so a
     /// success result is preserved as success - not reported as a timeout - and
@@ -1847,11 +1846,12 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-107: claude emits its terminal `result/success` event and then
+    /// Claude emits its terminal `result/success` event and then
     /// trailing `system` events (`task_updated`, `task_notification`) before
-    /// exiting 0 - the real GAMMA-258 stream shape. The run must classify as a
-    /// success (`ok = true`) by selecting the result event by type, not by line
-    /// position, so a successful run is not misread as a failure.
+    /// exiting 0 - a real observed production stream shape. The run must
+    /// classify as a success (`ok = true`) by selecting the result event by
+    /// type, not by line position, so a successful run is not misread as a
+    /// failure.
     #[test]
     fn invoke_result_then_trailing_system_events_succeeds() {
         let dir = tempfile::tempdir().unwrap();
@@ -1898,7 +1898,7 @@ exit "$code"
         assert!(res.error.is_empty(), "no error on a success run");
     }
 
-    /// CLAUDE-9: tripping the token mid-run terminates the child's process
+    /// Tripping the token mid-run terminates the child's process
     /// group, so `invoke` returns long before the (30s) stub/timeout would.
     #[test]
     fn invoke_cancellation_terminates_promptly() {
@@ -1940,7 +1940,7 @@ exit "$code"
         );
     }
 
-    // ---- CLAUDE-239: model selection ---------------------------------------
+    // ---- model selection -----------------------------------------------
 
     /// Run a stub that records the exact argv it was spawned with, and return
     /// those arguments one per line. Asserts on the real spawn path rather than
@@ -1949,7 +1949,7 @@ exit "$code"
         spawn_and_capture_args_with_budget(invoker, cfg, dir, None)
     }
 
-    /// DEV-705: the same helper with an explicit remaining-budget argument.
+    /// The same helper with an explicit remaining-budget argument.
     fn spawn_and_capture_args_with_budget(
         invoker: &ClaudeInvoker,
         cfg: &ClaudeBlock,
@@ -1997,7 +1997,7 @@ exit "$code"
         }))
     }
 
-    /// CLAUDE-259: the same handle with a global default effort level.
+    /// The same handle with a global default effort level.
     fn effort_defaults(effort: Option<&str>) -> crate::config::ClaudeConfigHandle {
         std::sync::Arc::new(std::sync::RwLock::new(crate::config::ClaudeConfig {
             model: None,
@@ -2007,7 +2007,7 @@ exit "$code"
     }
 
     /// Neither the action nor the global default names a model: no `--model`
-    /// flag is passed at all, which is the pre-CLAUDE-239 command line.
+    /// flag is passed at all.
     #[test]
     fn invoke_omits_model_flag_when_nothing_is_set() {
         let dir = tempfile::tempdir().unwrap();
@@ -2021,7 +2021,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-280: every invocation disallows `Monitor` and `ScheduleWakeup` and
+    /// Every invocation disallows `Monitor` and `ScheduleWakeup` and
     /// disables background tasks, unconditionally - there is no action setting
     /// that turns this off. A session run under `claude --print` is over the
     /// moment its turn ends, so nothing it starts can be waited on afterwards.
@@ -2097,7 +2097,7 @@ exit "$code"
         assert_eq!(argv.lines().last(), Some("hi"), "argv:\n{argv}");
     }
 
-    /// DEV-706: with nothing configured the invocation still runs with a
+    /// With nothing configured the invocation still runs with a
     /// BOUNDED compaction window, so a tool-heavy session cannot resend every
     /// completed operation's payloads on every turn.
     #[test]
@@ -2113,7 +2113,7 @@ exit "$code"
         );
     }
 
-    /// DEV-706: the action's window wins over the global default, and both win
+    /// The action's window wins over the global default, and both win
     /// over the runner default. Values pass through untouched.
     #[test]
     fn invoke_autocompact_resolves_action_then_global_then_default() {
@@ -2145,9 +2145,9 @@ exit "$code"
         );
     }
 
-    /// DEV-705: the run's remaining ceiling reaches the child, so one session
+    /// The run's remaining ceiling reaches the child, so one session
     /// cannot overshoot it between the runner's own between-invocation checks.
-    /// `None` (the pre-DEV-705 command line) passes no flag at all.
+    /// `None` passes no flag at all.
     #[test]
     fn invoke_passes_the_remaining_budget_as_max_budget_usd() {
         let dir = tempfile::tempdir().unwrap();
@@ -2194,7 +2194,7 @@ exit "$code"
         );
     }
 
-    // ---- CLAUDE-259: effort selection --------------------------------------
+    // ---- effort selection ------------------------------------------------
 
     /// Collects the log lines emitted while a closure runs, so the warn path can
     /// be asserted on rather than assumed.
@@ -2230,7 +2230,7 @@ exit "$code"
     }
 
     /// Neither the action nor the global default names an effort: no `--effort`
-    /// flag at all, which is the pre-CLAUDE-259 command line.
+    /// flag at all.
     #[test]
     fn invoke_omits_effort_flag_when_nothing_is_set() {
         let dir = tempfile::tempdir().unwrap();
@@ -2324,7 +2324,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-56: a terminal `result` event yields its human-readable `result`
+    /// A terminal `result` event yields its human-readable `result`
     /// text as the friendly summary.
     #[test]
     fn friendly_summary_prefers_result_text() {
@@ -2343,7 +2343,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-56: a `result` event with an empty `result` falls back to `error`.
+    /// A `result` event with an empty `result` falls back to `error`.
     #[test]
     fn friendly_summary_falls_back_to_result_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -2360,7 +2360,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-56: with no terminal `result` event, the concatenated text blocks
+    /// With no terminal `result` event, the concatenated text blocks
     /// of the last `assistant` message become the summary.
     #[test]
     fn friendly_summary_uses_last_assistant_text() {
@@ -2372,7 +2372,7 @@ exit "$code"
              {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"API Error: \"},{\"type\":\"text\",\"text\":\"529 Overloaded.\"}]}}\n",
         )
         .unwrap();
-        // CLAUDE-107: no result event in the stream, so `parse_final_result`
+        // No result event in the stream, so `parse_final_result`
         // returns None and the caller falls back to `Value::Null` (mirrors the
         // production call at the `invoke` site).
         let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
@@ -2382,14 +2382,14 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-56: neither a result event nor an assistant message - fall back to
+    /// Neither a result event nor an assistant message - fall back to
     /// the bounded raw tail.
     #[test]
     fn friendly_summary_falls_back_to_tail() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("stream.jsonl");
         std::fs::write(&log, "{\"type\":\"system\",\"subtype\":\"init\"}\n").unwrap();
-        // CLAUDE-107: no result event, so the caller falls back to `Value::Null`.
+        // No result event, so the caller falls back to `Value::Null`.
         let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
         assert_eq!(
             friendly_failure_summary(&final_event, &log),
@@ -2397,7 +2397,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-263: the tail fallback used to slice the raw log at a fixed byte
+    /// The tail fallback used to slice the raw log at a fixed byte
     /// offset from the end, which panics when that offset lands inside a
     /// multi-byte character. This log is over the 2000-byte cap with a euro
     /// sign (3 bytes) straddling the cut point, so a fix that just clamped
@@ -2411,13 +2411,13 @@ exit "$code"
         let raw = format!("a€{}", "a".repeat(1999));
         assert_eq!(raw.len(), 2003);
         std::fs::write(&log, &raw).unwrap();
-        // CLAUDE-107: no result event, so the caller falls back to `Value::Null`.
+        // No result event, so the caller falls back to `Value::Null`.
         let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
         let summary = friendly_failure_summary(&final_event, &log);
         assert_eq!(summary, "a".repeat(1999));
     }
 
-    /// CLAUDE-56: a non-zero exit whose stream ends with a `result` event makes
+    /// A non-zero exit whose stream ends with a `result` event makes
     /// `summary` the friendly result text, not the raw JSON line.
     #[test]
     fn invoke_failure_summary_is_friendly_result_text() {
@@ -2467,7 +2467,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-63: a JSON object line is augmented with a top-level `ts` that
+    /// A JSON object line is augmented with a top-level `ts` that
     /// parses as RFC 3339, every original key is preserved, and the trailing
     /// newline is kept.
     #[test]
@@ -2483,7 +2483,7 @@ exit "$code"
         chrono::DateTime::parse_from_rfc3339(ts).expect("ts is RFC 3339");
     }
 
-    /// CLAUDE-63: a non-JSON line (and a non-object JSON value) passes through
+    /// A non-JSON line (and a non-object JSON value) passes through
     /// byte-identically - we never lose or rewrite output we can't stamp.
     #[test]
     fn stamp_line_passes_non_object_through_unchanged() {
@@ -2498,7 +2498,7 @@ exit "$code"
         }
     }
 
-    /// CLAUDE-63: a JSON object line without a trailing newline still gets a
+    /// A JSON object line without a trailing newline still gets a
     /// `ts` and stays newline-free (no spurious newline is appended).
     #[test]
     fn stamp_line_no_trailing_newline() {
@@ -2510,7 +2510,7 @@ exit "$code"
         assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("result"));
     }
 
-    /// CLAUDE-63: `parse_final_result` still finds the terminal result event in a
+    /// `parse_final_result` still finds the terminal result event in a
     /// stamped log (the added `ts` key does not disturb the `type` lookup).
     #[test]
     fn parse_final_result_finds_result_in_stamped_log() {
@@ -2529,7 +2529,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-107: Claude Code emits trailing `system` events (`task_updated`,
+    /// Claude Code emits trailing `system` events (`task_updated`,
     /// `task_notification`) after the terminal `result` event. The result event
     /// must be selected by `type`, not by line position, so these trailing lines
     /// cannot flip a successful run into a recorded failure.
@@ -2561,7 +2561,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-107: a stream with no `result` event anywhere yields `None`, so the
+    /// A stream with no `result` event anywhere yields `None`, so the
     /// genuine no-terminal-result case keeps its existing failure handling.
     #[test]
     fn parse_final_result_none_without_result_event() {
@@ -2580,7 +2580,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-233: a sink that accepts `remaining` bytes and then fails,
+    /// A sink that accepts `remaining` bytes and then fails,
     /// modelling the log partition filling mid-run. The real kernel behaviour it
     /// stands in for is a short buffered write that lands on a page boundary and
     /// then returns `ENOSPC`, which is what every truncated stream log on
@@ -2611,7 +2611,7 @@ exit "$code"
                                 {\"type\":\"assistant\",\"message\":{\"content\":[]}}\n\
                                 {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}\n";
 
-    /// CLAUDE-233: the relay reports a write failure instead of stopping
+    /// The relay reports a write failure instead of stopping
     /// silently. The old `if sink.write_all(..).is_err() { break }` discarded the
     /// error, so a full disk truncated the stream log with no log line anywhere
     /// and the run was failed for "no result event" that the runner had simply
@@ -2627,7 +2627,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-233: the same for a read failure on the child's stdout. Both of the
+    /// The same for a read failure on the child's stdout. Both of the
     /// relay's `break`-on-error arms discarded the cause.
     #[test]
     fn relay_reports_a_read_failure_instead_of_truncating_silently() {
@@ -2645,7 +2645,7 @@ exit "$code"
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
-    /// CLAUDE-233: the success path is unchanged: drain to EOF, write every
+    /// The success path is unchanged: drain to EOF, write every
     /// stamped line, report `Ok`.
     #[test]
     fn relay_reports_ok_when_it_drains_to_eof() {
@@ -2659,7 +2659,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-233: a relay failure is reported as the runner's own I/O fault and
+    /// A relay failure is reported as the runner's own I/O fault and
     /// is transient, so it does NOT spend one of the job's
     /// `max_attempts_per_key`. The three 2026-08-11 ALPHA runs each burned an
     /// attempt and were moved to `Failed` for this condition; `transient` is what
@@ -2700,16 +2700,16 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-233: a relay failure that happens to coincide with the `timeout(1)`
+    /// A relay failure that happens to coincide with the `timeout(1)`
     /// wrapper's SIGKILL still reports as a timeout, so the "Timed Out" outcome
-    /// (CLAUDE-52) is not silently reclassified.
+    /// is not silently reclassified.
     #[test]
     fn relay_failure_preserves_the_timeout_flag() {
         let result = relay_failure_result("write failed", Path::new("/logs/s.jsonl"), 124);
         assert!(result.timed_out, "exit 124 is still surfaced as a timeout");
     }
 
-    /// CLAUDE-256: a stream log ending inside a multi-byte UTF-8 sequence (what a
+    /// A stream log ending inside a multi-byte UTF-8 sequence (what a
     /// disk-full short write at a page boundary leaves behind) fails to read.
     /// That failure must not produce the same value as a log that was read end to
     /// end and holds no `result` event.
@@ -2733,7 +2733,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-304: a stream log with no `compact_boundary` event counts zero.
+    /// A stream log with no `compact_boundary` event counts zero.
     #[test]
     fn count_compact_boundaries_none_in_clean_log() {
         let dir = tempfile::tempdir().unwrap();
@@ -2746,7 +2746,7 @@ exit "$code"
         assert_eq!(count_compact_boundaries(&log).unwrap(), 0);
     }
 
-    /// CLAUDE-304: the shape of an earlier audit run - one `compact_boundary` event partway
+    /// The an earlier audit run shape - one `compact_boundary` event partway
     /// through the run - counts as one, whether it appears before or after the
     /// terminal `result` (unlike `killed_tasks_after_result`, compaction can
     /// happen mid-run and still matter, so no result-relative filtering here).
@@ -2775,8 +2775,8 @@ exit "$code"
         assert_eq!(count_compact_boundaries(&two).unwrap(), 2);
     }
 
-    /// CLAUDE-304: an unreadable stream log is an `Err`, mirroring
-    /// `parse_final_result`'s CLAUDE-256 read-failure contract, so a caller can
+    /// An unreadable stream log is an `Err`, mirroring
+    /// `parse_final_result`'s read-failure contract, so a caller can
     /// tell "could not check" apart from "checked, found none".
     #[test]
     fn count_compact_boundaries_reports_a_read_failure() {
@@ -2785,7 +2785,7 @@ exit "$code"
         assert!(count_compact_boundaries(&missing).is_err());
     }
 
-    /// CLAUDE-256: the end-to-end outcome. A run whose stream log cannot be read
+    /// The end-to-end outcome. A run whose stream log cannot be read
     /// finalizes as a runner-side read failure - transient, so it spends none of
     /// the job's `max_attempts_per_key` - and NOT as the non-transient "claude
     /// stream did not end with a result event", which blamed the agent for a file
@@ -2795,7 +2795,7 @@ exit "$code"
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("claude-stub.sh");
         // Emit one clean event, then a line cut inside a multi-byte character, so
-        // the log on disk is exactly the shape CLAUDE-233 found on host-a.
+        // the log on disk is exactly the truncation shape a full disk produces.
         write_stub(
             &stub,
             "#!/bin/sh\n\
@@ -2857,7 +2857,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-256: the same reasoning as `relay_failure_is_transient...`, for the
+    /// The same reasoning as `relay_failure_is_transient...`, for the
     /// read side. `transient` is the load-bearing field, so it is asserted
     /// explicitly rather than inferred, and the timeout flag survives.
     #[test]
@@ -2890,7 +2890,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-256: the last-resort summary path. `read_tail(..).unwrap_or_default()`
+    /// The last-resort summary path. `read_tail(..).unwrap_or_default()`
     /// returned an empty string for an unreadable log, which the operator sees as
     /// a run that said nothing at all. It now says the log was unreadable and
     /// names it, at `warn`.
@@ -2913,7 +2913,7 @@ exit "$code"
         );
     }
 
-    /// CLAUDE-63 (smoke): a run through a stub claude that emits several JSON
+    /// Smoke test: a run through a stub claude that emits several JSON
     /// events produces a stream file where every JSON line carries a `ts` and
     /// the timestamps are monotonically non-decreasing.
     #[test]
@@ -2975,7 +2975,7 @@ exit "$code"
         assert_eq!(json_lines, 3, "all three emitted events are stamped");
     }
 
-    /// CLAUDE-56: a populated event renders a collapsed, pretty-printed JSON
+    /// A populated event renders a collapsed, pretty-printed JSON
     /// block; a synthesized (null / empty) event renders nothing.
     #[test]
     fn raw_event_details_collapses_or_omits() {

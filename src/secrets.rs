@@ -1,4 +1,4 @@
-//! Encrypted action secrets (CLAUDE-26).
+//! Encrypted action secrets.
 //!
 //! Actions reference a credential by name (`token_ref`) instead of carrying a
 //! raw token in their YAML. The named secret lives encrypted at rest in the
@@ -8,7 +8,7 @@
 //! at run time, and the plaintext is materialized into per-job credential files
 //! the `yt` / `fj` CLIs read, scoped to one job's lifetime.
 //!
-//! Auth model: this extends CLAUDE-25's host-auth design (the CLIs read their
+//! Auth model: this extends the host-auth design (the CLIs read their
 //! own stores) so an action can carry its own credentials. When no block sets a
 //! `token_ref`, nothing is materialized and the CLIs fall back to host auth
 //! exactly as before.
@@ -312,7 +312,7 @@ pub struct ResolvedCredentials {
     /// Decrypted forge token, when `forgejo.token_ref` is set. The forge host is
     /// supplied per job (it comes from the issue's resolved VCS integration).
     pub fj_token: Option<String>,
-    /// Decrypted GitHub PAT, when `github.token_ref` is set (CLAUDE-50). Used as
+    /// Decrypted GitHub PAT, when `github.token_ref` is set. Used as
     /// the bearer for the MCP call, the `gh` child's `GH_TOKEN`, and the
     /// authenticated push. `None` falls back to host `gh` auth / `GH_TOKEN`.
     pub github_token: Option<String>,
@@ -370,7 +370,7 @@ pub struct JobCredentials {
     /// Temp `keys.json` path, so `Forge::clone_url` reads the same store the
     /// `fj` child does.
     pub fj_keys_path: Option<PathBuf>,
-    /// Decrypted GitHub PAT (CLAUDE-50), passed to the GitHub `Forge` for the MCP
+    /// Decrypted GitHub PAT, passed to the GitHub `Forge` for the MCP
     /// bearer, the `gh` child's `GH_TOKEN`, and the authenticated push. Not
     /// written to a file (an env var leaves no on-disk plaintext to scrub); it is
     /// dropped with this guard when the job ends. `None` leaves host `gh` auth.
@@ -439,8 +439,8 @@ impl Drop for JobCredentials {
 
 /// Write a `forgejo-cli/keys.json` under `xdg_data_home` carrying `host` ->
 /// `token` and NOTHING else, and return its path. The directory is `0700` and
-/// the file `0600`. Shared by the per-job credential store (CLAUDE-26) and the
-/// per-call Action-log store (CLAUDE-204), so both stay on one schema.
+/// the file `0600`. Shared by the per-job credential store and the
+/// per-call Action-log store, so both stay on one schema.
 ///
 /// CLAUDE-123: the current `fj` (`forgejo-cli`) deserializes each host entry
 /// with required `type`/`name` fields, so a `token`-only entry fails to parse
