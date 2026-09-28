@@ -1,4 +1,4 @@
-{# Shared widgets for the structured action editors (CLAUDE-211). Imported by
+{# Shared widgets for the structured action editors. Imported by
    every per-kind editor template, so a field type or a shared block (schedule,
    limits, output, claude) is defined once. Askama macros have no access to the
    caller's context, so every value a macro renders is a parameter. #}
@@ -50,7 +50,7 @@
 </label>
 {% endmacro %}
 
-{# Dropdown of stored secret *names* (values are never rendered; CLAUDE-26). #}
+{# Dropdown of stored secret *names* (values are never rendered). #}
 {% macro tokenfield(label, fname, value, secrets) %}
 <label class="fld">
   <span>{{ label }}</span>
@@ -128,7 +128,7 @@
     {% call textfield("Model", "claude_model", model, "blank = the config.claude default") %}
     <label class="fld">
       <span>Effort</span>
-      {# CLAUDE-259: a stored value outside the documented set (hand-written YAML
+      {# A stored value outside the documented set (hand-written YAML
          or the API) renders as its own selected option, so saving this form can
          never drop or rewrite it. #}
       <select name="claude_effort">
@@ -143,7 +143,7 @@
         {% endif %}
       </select>
     </label>
-    {# DEV-706: free text, not a select: the CLI accepts `auto` or any window
+    {# Free text, not a select: the CLI accepts `auto` or any window
        between 100k and 1M tokens, and the runner passes the value through. #}
     {% call textfield("Autocompact window", "claude_autocompact", autocompact, "auto, or 100000-1000000 (blank = the runner default)") %}
   </div>
@@ -167,7 +167,7 @@
     {% call numfield("Max runs per day", "limit_max_runs_per_day", max_runs_per_day, "unset = no cap", "1") %}
     {% call numfield("Claude timeout (seconds)", "limit_claude_timeout_seconds", claude_timeout_seconds, "unset = no timeout", "1") %}
     {% call numfield("Daily budget (USD)", "limit_daily_budget_usd", daily_budget_usd, "unset = no budget", "0.01") %}
-    {# DEV-705: the per-run ceiling. Read before the run starts; a run that
+    {# The per-run ceiling. Read before the run starts; a run that
        reaches it stops and exits non-zero, and is never offered a raise. #}
     {% call numfield("Per-run budget (USD)", "limit_run_budget_usd", run_budget_usd, "unset = the daily budget", "0.01") %}
     {% call numfield("Budget warning fraction", "limit_budget_warn_fraction", budget_warn_fraction, "unset = 0.8", "0.05") %}
@@ -176,7 +176,7 @@
 </div>
 {% endmacro %}
 
-{# `log_token_ref` in both accepted shapes (CLAUDE-200): unset (derived from
+{# `log_token_ref` in both accepted shapes: unset (derived from
    config.webhook.sources), one secret for every repo, or ordered per-repo rows.
    Blank rows are dropped on save; save and reopen the form for more rows. #}
 {% macro log_token_block(mode, global, rows, secrets) %}

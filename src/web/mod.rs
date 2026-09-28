@@ -5,7 +5,7 @@
 //!   the binary via `include_bytes!` so the binary stays self-contained).
 //! - Live log streaming: Server-Sent Events.
 //! - Auth: loopback binds are unauthenticated by default; a non-loopback bind
-//!   gates the web UI and `/api/*` behind a bearer token (CLAUDE-48, Phase 5).
+//!   gates the web UI and `/api/*` behind a bearer token (Phase 5).
 //!   The token layer is applied to the TCP router in `daemon.rs` via
 //!   `crate::auth::protect`; the `/webhooks/` prefix stays exempt.
 
@@ -39,7 +39,7 @@ pub mod comment_webhooks;
 pub mod native_forms;
 pub mod webhooks;
 
-/// CLAUDE-154: custom Askama filters. `{{ ts | datetime }}` renders a stored
+/// Custom Askama filters. `{{ ts | datetime }}` renders a stored
 /// RFC3339 UTC timestamp string through the live display preferences (timezone +
 /// strftime format). Askama filters are free functions, so the preferences come
 /// from the process-global snapshot kept current by `LiveSettings`. Malformed
@@ -54,7 +54,7 @@ mod filters {
 }
 
 const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
-// CLAUDE-139: idiomorph + its htmx extension, vendored so the live poll can
+// idiomorph + its htmx extension, vendored so the live poll can
 // morph the DOM in place instead of replacing it (preserves selection/scroll).
 const IDIOMORPH_JS: &[u8] = include_bytes!("../../assets/idiomorph-ext.min.js");
 
@@ -68,7 +68,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
     let st = WebState { api, paths };
     Router::new()
         .route("/", get(dashboard))
-        // CLAUDE-211: the new-action page is a kind picker; raw YAML is the
+        // The new-action page is a kind picker; raw YAML is the
         // explicit escape hatch at `/actions/new/raw` rather than the default.
         .route("/actions/new", get(action_new_page))
         .route("/actions/new/raw", get(action_new_raw_page))
@@ -87,7 +87,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/actions", post(action_create))
         .route("/actions/:name", get(action_detail))
         .route("/actions/:name/durations", get(action_durations))
-        // CLAUDE-235: the log page is global and lives at `/logs`. This route is
+        // The log page is global and lives at `/logs`. This route is
         // kept as a permanent redirect that carries the action into the Action
         // filter, so existing links and bookmarks keep working.
         .route("/actions/:name/events", get(action_events_redirect))
@@ -95,7 +95,7 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
             "/actions/:name/edit",
             get(action_edit_page).post(action_edit_save),
         )
-        // CLAUDE-211: dispatches to the structured editor for the action's own
+        // Dispatches to the structured editor for the action's own
         // native kind (raw editor for `scripted`).
         .route(
             "/actions/:name/form",
@@ -103,28 +103,28 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         )
         .route("/actions/:name/export", get(action_export))
         .route("/actions/:name/delete", post(action_delete))
-        // CLAUDE-235: the one diagnostics screen. Every `run_events` row, for
+        // The one diagnostics screen. Every `run_events` row, for
         // every action, undeduplicated and filterable; `?action=` narrows it.
         .route("/logs", get(logs))
         .route("/secrets", get(secrets_page).post(secret_create))
         .route("/secrets/:name/rotate", post(secret_rotate))
         .route("/secrets/:name/delete", post(secret_delete))
-        // CLAUDE-216: on-demand access check. GET renders the page (no probing);
+        // On-demand access check. GET renders the page (no probing);
         // POST runs the check and swaps the result table in. The per-secret
         // Check button on /secrets lands on the same page with that credential's
         // identity probe already run.
         .route("/access", get(access_page))
         .route("/access/check", post(access_check))
         .route("/secrets/:name/check", post(secret_check))
-        // CLAUDE-101: runtime settings page. GET renders all sections; POST saves
+        // Runtime settings page. GET renders all sections; POST saves
         // one section (re-rendering inline serde errors on rejection). Behind the
-        // CLAUDE-48 auth gate like every other TCP route.
+        // same auth gate as every other TCP route.
         .route("/settings", get(settings_page))
         .route("/settings/auth/claude", post(auth_save_claude))
         .route("/settings/auth/claude/login", post(auth_login_start))
         .route("/settings/auth/claude/code", post(auth_login_code))
         .route("/settings/auth/claude/cancel", post(auth_login_cancel))
-        // CLAUDE-269: the shared not-ready banner fragment, polled from every
+        // The shared not-ready banner fragment, polled from every
         // page's base template.
         .route("/settings/auth/claude/banner", get(auth_claude_banner))
         .route("/settings/auth/youtrack", post(auth_save_youtrack))
@@ -132,17 +132,17 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/settings/auth/github", post(auth_save_github))
         .route("/settings/auth/git", post(auth_save_git))
         .route("/settings/:section", post(settings_save))
-        // CLAUDE-117: historical reporting page (spend / runs / time-of-day /
+        // Historical reporting page (spend / runs / time-of-day /
         // day-of-week). Global by default; `action` + `range` query params narrow
         // it. The shared aggregations live in `crate::report`.
         .route("/reports", get(reports_page))
-        // CLAUDE-129: About page (version + build info) with on-demand update
-        // check / apply. The POST actions ride the existing CLAUDE-48 auth gate
+        // About page (version + build info) with on-demand update
+        // check / apply. The POST actions ride the existing auth gate
         // like every other TCP route; they never restart the daemon.
         .route("/about", get(about_page))
         .route("/about/check", post(about_check))
         .route("/about/update", post(about_update))
-        // CLAUDE-223: the Activity card's live quiet indicator polls this
+        // The Activity card's live quiet indicator polls this
         // fragment every 2s. Its own route (rather than an `hx-select` off
         // `/about`) so the busy / idle / unknown states are rendered by one
         // handler and an activity-query failure cannot be mistaken for idle.
@@ -178,9 +178,9 @@ struct ActionView {
     parse_error: Option<String>,
     last_run_started: Option<String>,
     paused: Option<PauseInfo>,
-    /// CLAUDE-61: a synthetic, read-only, event-driven action (the
+    /// A synthetic, read-only, event-driven action (the
     /// `webhook-forgejo` entry). The templates label it event-driven and hide
-    /// the edit / delete / trigger controls, which do not apply. CLAUDE-153: the
+    /// the edit / delete / trigger controls, which do not apply. The
     /// Pause / Resume controls DO apply and are shown (a paused webhook accepts
     /// and drops deliveries).
     synthetic: bool,
@@ -195,21 +195,21 @@ struct RunRow {
     exit_code: Option<i64>,
     jobs_processed: i64,
     triggered_by: String,
-    /// CLAUDE-14: key of the job currently being processed, or NULL when no job
+    /// Key of the job currently being processed, or NULL when no job
     /// is in flight (run finished, or a legacy run predating the column).
     current_job_key: Option<String>,
-    /// CLAUDE-80: live pipeline stage of an in-flight run (webhook:
+    /// Live pipeline stage of an in-flight run (webhook:
     /// download / triage / classify / mint), or NULL when the run records no
     /// stage info (scheduled runs, finished runs).
     stage: Option<String>,
-    /// CLAUDE-22: count of distinct jobs whose LATEST attempt failed (`ok = 0`),
+    /// Count of distinct jobs whose LATEST attempt failed (`ok = 0`),
     /// matching the per-job `fail` badges on run-detail. A job that failed an
     /// earlier attempt but passed its latest does not count.
     failed_jobs: i64,
 }
 
 impl RunRow {
-    /// CLAUDE-20: human-readable run duration. A finished or cancelled run shows
+    /// Human-readable run duration. A finished or cancelled run shows
     /// the final span (`ended_at - started_at`); an in-flight run (NULL
     /// `ended_at`) shows elapsed-so-far against now, which advances on each poll
     /// refresh. Returns "-" if a timestamp fails to parse.
@@ -227,7 +227,7 @@ impl RunRow {
         format_duration_ms(end_ms - start.timestamp_millis())
     }
 
-    /// CLAUDE-21: completed-run span in milliseconds for the duration chart, or
+    /// Completed-run span in milliseconds for the duration chart, or
     /// `None` when the run is in flight (NULL `ended_at`) or either timestamp
     /// fails to parse. Unlike [`RunRow::duration`] this never charts a moving
     /// value: an unfinished run is excluded rather than measured against now.
@@ -248,20 +248,20 @@ struct JobOutcomeRow {
     claude_ok: bool,
     claude_cost_usd: f64,
     attempt_counted: bool,
-    /// CLAUDE-20: full per-job pipeline elapsed; NULL for jobs predating the
+    /// Full per-job pipeline elapsed; NULL for jobs predating the
     /// column (migration 0005).
     duration_ms: Option<i64>,
-    /// CLAUDE-52: the job's claude run hit the wall-clock limit (exit 124).
+    /// The job's claude run hit the wall-clock limit (exit 124).
     /// Rendered with a distinct "timed out" badge instead of "fail", and
     /// excluded from the run's failed-job count.
     timed_out: bool,
-    /// CLAUDE-61: free-text outcome summary. Webhook fast-path runs have no
+    /// Free-text outcome summary. Webhook fast-path runs have no
     /// stream log, so this carries the triage bucket + mint result + redacted
     /// log artifact reference; rendered on the run-detail outcomes table.
     summary: Option<String>,
 }
 
-// CLAUDE-250: by hand rather than derived, because `ok` / `claude_ran` /
+// By hand rather than derived, because `ok` / `claude_ran` /
 // `claude_ok` / `attempt_counted` / `timed_out` are integer 0/1 columns on both
 // backends. See `crate::db::flag`.
 impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobOutcomeRow {
@@ -284,7 +284,7 @@ impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobOutcomeRow {
 }
 
 impl JobOutcomeRow {
-    /// CLAUDE-20: human-readable per-job duration, or "-" for jobs predating the
+    /// Human-readable per-job duration, or "-" for jobs predating the
     /// `duration_ms` column.
     fn duration(&self) -> String {
         match self.duration_ms {
@@ -293,7 +293,7 @@ impl JobOutcomeRow {
         }
     }
 
-    /// CLAUDE-89: full summary rendered from Markdown to HTML for the
+    /// Full summary rendered from Markdown to HTML for the
     /// view-details dialog on the run-detail page. The template injects this
     /// with `|safe`, so the output must be trusted; see
     /// [`render_summary_markdown`] for the raw-HTML escaping that makes it so.
@@ -302,7 +302,7 @@ impl JobOutcomeRow {
     }
 }
 
-/// CLAUDE-89: convert a job-outcome summary from Markdown to HTML. Raw HTML
+/// Convert a job-outcome summary from Markdown to HTML. Raw HTML
 /// events in the source are demoted to text (which `push_html` escapes), never
 /// passed through: summaries are model output and must not inject markup into
 /// the page.
@@ -317,7 +317,7 @@ fn render_summary_markdown(md: &str) -> String {
     out
 }
 
-/// CLAUDE-20: render a millisecond span human-readably (`820ms`, `4s`,
+/// Render a millisecond span human-readably (`820ms`, `4s`,
 /// `1m 17s`, `2h 3m`) rather than as raw milliseconds. Shared by the run-span
 /// and per-job duration columns. Negative inputs clamp to zero.
 fn format_duration_ms(ms: i64) -> String {
@@ -338,7 +338,7 @@ fn format_duration_ms(ms: i64) -> String {
     }
 }
 
-// ---- duration chart (CLAUDE-21) -------------------------------------------
+// ---- duration chart --------------------------------------------------------
 
 /// SVG canvas and plot-area geometry for the per-action duration chart. The
 /// plot rectangle is inset by the padding constants to leave room for axis
@@ -458,7 +458,7 @@ fn build_duration_chart(series: &[(String, i64)]) -> DurationChart {
     }
 }
 
-// ---- claude usage chart (CLAUDE-315) ---------------------------------------
+// ---- claude usage chart -----------------------------------------------------
 
 /// One plotted utilization reading: pixel position plus a `<title>` tooltip.
 /// `timed_out` / `ok` decide the marker's CSS class so a stalled or failed
@@ -605,7 +605,7 @@ fn build_usage_chart(points: &[crate::report::ClaudeUsagePoint]) -> UsageChart {
     }
 }
 
-/// CLAUDE-289: whether each event-driven listener has at least one configured
+/// Whether each event-driven listener has at least one configured
 /// source, read live off the shared settings handles rather than a startup
 /// snapshot. Saving the first source (or removing the last one) for either
 /// section is reflected on the next page load with no restart.
@@ -658,14 +658,14 @@ async fn enriched_actions(
             synthetic: false,
         });
     }
-    // CLAUDE-61: surface the event-driven webhook as a synthetic
+    // Surface the event-driven webhook as a synthetic
     // read-only action when it is configured, so its runs get the same
     // dashboard / action-detail surfaces other actions have. It has no backing
     // YAML and is never indexed in the `actions` table; it lives only here.
     if webhook_enabled {
         out.push(synthetic_action_view(pool, webhooks::WEBHOOK_MINT_ACTION).await?);
     }
-    // CLAUDE-220: the same treatment for the `/claude` comment listener, so both
+    // The same treatment for the `/claude` comment listener, so both
     // event-driven listeners surface (and pause) like any other action.
     if comment_webhook_enabled {
         out.push(synthetic_action_view(pool, comment_webhooks::WEBHOOK_COMMENT_ACTION).await?);
@@ -673,12 +673,12 @@ async fn enriched_actions(
     Ok(out)
 }
 
-/// CLAUDE-61: build the synthetic `webhook-forgejo` action view. Read-only and
+/// Build the synthetic `webhook-forgejo` action view. Read-only and
 /// event-driven: no schedule, no file, always "enabled" (it fires on webhook
 /// deliveries, not a timer). Its `last_run_started` comes from the recorded
 /// webhook runs so the dashboard shows recency like any other action.
 ///
-/// CLAUDE-153: unlike edit/export/delete (which stay rejected), this action
+/// Unlike edit/export/delete (which stay rejected), this action
 /// participates in Pause. Its `paused` state is read from the shared
 /// `paused_actions` row like every other action, so the dashboard shows a
 /// Paused badge and the Pause/Resume controls act on it; a paused delivery is
@@ -707,13 +707,13 @@ async fn synthetic_action_view(pool: &DbPool, name: &str) -> Result<ActionView, 
     })
 }
 
-/// CLAUDE-61: true for the reserved synthetic action name. Mutating endpoints
+/// True for the reserved synthetic action name. Mutating endpoints
 /// (edit / export / delete) reject it: it has no backing YAML to operate on.
 pub fn is_synthetic_action(name: &str) -> bool {
     SYNTHETIC_ACTIONS.contains(&name)
 }
 
-/// CLAUDE-61 / CLAUDE-220: every reserved synthetic action name, in ONE place.
+/// Every reserved synthetic action name, in ONE place.
 /// The daemon's scan guard, the API's trigger / delete rejections, and the web
 /// layer's edit / export / delete rejections all read this set, so a new
 /// event-driven listener is reserved everywhere by adding one entry here.
@@ -722,7 +722,7 @@ pub const SYNTHETIC_ACTIONS: &[&str] = &[
     comment_webhooks::WEBHOOK_COMMENT_ACTION,
 ];
 
-/// CLAUDE-220: true when `name` is a synthetic action whose listener is actually
+/// True when `name` is a synthetic action whose listener is actually
 /// configured this run, so the action-detail / durations pages render it instead
 /// of 404ing. An unconfigured listener keeps its historical runs queryable but
 /// has no live entry.
@@ -735,7 +735,7 @@ async fn synthetic_enabled(s: &WebState, name: &str) -> bool {
     }
 }
 
-/// CLAUDE-61: a 403 response rejecting a mutating operation on the synthetic
+/// A 403 response rejecting a mutating operation on the synthetic
 /// action, or `None` when `name` is a normal action.
 fn reject_synthetic(name: &str) -> Option<Response> {
     is_synthetic_action(name).then(|| {
@@ -749,7 +749,7 @@ fn reject_synthetic(name: &str) -> Option<Response> {
     })
 }
 
-/// CLAUDE-230: the one definition of "the latest attempt of each job in this
+/// The one definition of "the latest attempt of each job in this
 /// run", parameterised by an outcome predicate on the `o` alias. Every
 /// `failed_jobs` count and the Jobs-column outcome filter are built from it, so
 /// the rows the filter selects and the `(N failed)` marker a row renders can
@@ -761,7 +761,7 @@ fn latest_job_attempts(pred: &str) -> String {
     )
 }
 
-/// A hard-failed job. Excludes timeouts, which CLAUDE-52 badges separately and
+/// A hard-failed job. Excludes timeouts, which get a separate badge and
 /// which the displayed failed count has always left out.
 const JOB_FAILED: &str = "o.ok = 0 AND o.timed_out = 0";
 /// A job whose `claude` hit the wall-clock limit and was SIGKILLed.
@@ -776,22 +776,22 @@ fn run_row_columns() -> String {
     )
 }
 
-/// CLAUDE-230: `EXISTS` predicate for a run holding at least one job matching
+/// `EXISTS` predicate for a run holding at least one job matching
 /// `pred` on its latest attempt, for the Jobs-column outcome filter.
 fn has_job_matching(pred: &str) -> String {
     format!("EXISTS (SELECT 1 {})", latest_job_attempts(pred))
 }
 
-/// CLAUDE-35: when `show_empty` is false, finished runs that processed zero jobs
+/// When `show_empty` is false, finished runs that processed zero jobs
 /// are hidden. In-progress runs (`exit_code IS NULL`) are always kept so a
 /// just-started run never momentarily vanishes (it can legitimately sit at
 /// `jobs_processed = 0` before its first job lands). The filter applies before
 /// the `LIMIT`/`OFFSET`, so up to `limit` matching runs are returned per page,
 /// not `limit` minus the hidden rows.
 ///
-/// CLAUDE-142: `limit`/`offset` drive `?page=` pagination on the dashboard.
+/// `limit`/`offset` drive `?page=` pagination on the dashboard.
 ///
-/// CLAUDE-141: `view` carries the whitelisted sort + filter selection. Its
+/// `view` carries the whitelisted sort + filter selection. Its
 /// `ORDER BY` is built from a fixed column allow-list (no raw input reaches the
 /// clause) and its filter values are passed as bound parameters.
 async fn fetch_recent_runs(
@@ -816,7 +816,7 @@ async fn fetch_recent_runs(
     Ok(rows)
 }
 
-/// CLAUDE-142 / CLAUDE-141: total number of dashboard runs under the active
+/// Total number of dashboard runs under the active
 /// `show_empty` toggle and sort/filter `view`, used to render the "X-Y of N"
 /// indicator and the last-page boundary. Uses the same `WHERE` (and the same
 /// bound filter values) as the listing so the count matches the paged rows.
@@ -836,7 +836,7 @@ async fn count_recent_runs(
     Ok(total)
 }
 
-/// CLAUDE-141: distinct `action_name` values that appear in the `runs` table,
+/// Distinct `action_name` values that appear in the `runs` table,
 /// alphabetically. Drives the dashboard Action filter dropdown so it only offers
 /// actions that actually have runs (not every indexed action), and serves as the
 /// allow-list that whitelists the incoming `?action=` value.
@@ -850,7 +850,7 @@ async fn distinct_run_actions(pool: &DbPool) -> Result<Vec<String>, WebError> {
     Ok(rows)
 }
 
-/// CLAUDE-141: distinct `triggered_by` values present in the `runs` table,
+/// Distinct `triggered_by` values present in the `runs` table,
 /// alphabetically. Drives the dashboard Triggered filter dropdown and whitelists
 /// the incoming `?triggered=` value.
 async fn distinct_triggered_by(pool: &DbPool) -> Result<Vec<String>, WebError> {
@@ -863,7 +863,7 @@ async fn distinct_triggered_by(pool: &DbPool) -> Result<Vec<String>, WebError> {
     Ok(rows)
 }
 
-// ---- run search (CLAUDE-143) ----------------------------------------------
+// ---- run search --------------------------------------------------------------
 //
 // The Runs screen search finds jobs by content. The `summary` is always
 // searched (cheap, indexed-free LIKE/instr over `job_outcomes`). When the
@@ -872,13 +872,13 @@ async fn distinct_triggered_by(pool: &DbPool) -> Result<Vec<String>, WebError> {
 // (the motivating "No space left on device" case) is findable. Matching is a
 // case-insensitive ASCII substring for both, per the issue assumptions.
 
-/// CLAUDE-143: cap on how many summary matches the search returns.
+/// Cap on how many summary matches the search returns.
 const SEARCH_SUMMARY_LIMIT: i64 = 200;
-/// CLAUDE-143: max stream `.jsonl` files grepped when stream search is enabled.
+/// Max stream `.jsonl` files grepped when stream search is enabled.
 /// Bounds the opt-in scan: only the most recent failed-job attempts (which carry
 /// a `stream_log_path`) are searched, newest first, up to this many files.
 const SEARCH_STREAM_MAX_FILES: usize = 200;
-/// CLAUDE-143: max bytes read from a single stream file before giving up, so one
+/// Max bytes read from a single stream file before giving up, so one
 /// pathologically large log cannot stall the whole search.
 const SEARCH_STREAM_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -895,7 +895,7 @@ struct JobSearchRow {
     stream_log_path: Option<String>,
 }
 
-// CLAUDE-250: by hand rather than derived; `ok` and `timed_out` are integer 0/1
+// By hand rather than derived; `ok` and `timed_out` are integer 0/1
 // columns on both backends. See `crate::db::flag`.
 impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobSearchRow {
     fn from_row(row: &sqlx::any::AnyRow) -> sqlx::Result<Self> {
@@ -914,7 +914,7 @@ impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobSearchRow {
     }
 }
 
-/// CLAUDE-143: one matching job attempt in the search results. Keyed in the
+/// One matching job attempt in the search results. Keyed in the
 /// builder by `(run_id, job_key, attempt)` so a job matched in both its summary
 /// and its stream collapses to a single row carrying both badges.
 #[derive(Serialize)]
@@ -932,7 +932,7 @@ struct JobSearchHit {
     snippet: String,
 }
 
-/// CLAUDE-143: rendered search state threaded into the dashboard template.
+/// Rendered search state threaded into the dashboard template.
 #[derive(Serialize)]
 struct SearchView {
     q: String,
@@ -944,7 +944,7 @@ struct SearchView {
     /// Number of stream files actually opened and grepped end to end (missing
     /// and unreadable files are not counted).
     files_searched: usize,
-    /// CLAUDE-246: stream logs that opened but failed mid-read, so the search
+    /// Stream logs that opened but failed mid-read, so the search
     /// could not answer for those runs. Rendered separately: an unreadable log
     /// is not a clean "no match".
     unreadable: Vec<UnreadableStream>,
@@ -952,7 +952,7 @@ struct SearchView {
     max_files: usize,
 }
 
-/// CLAUDE-246: one stream log the search opened and then failed to read.
+/// One stream log the search opened and then failed to read.
 #[derive(Serialize)]
 struct UnreadableStream {
     run_id: i64,
@@ -963,13 +963,13 @@ struct UnreadableStream {
     error: String,
 }
 
-/// CLAUDE-143: outcome of grepping a single stream log file.
+/// Outcome of grepping a single stream log file.
 #[derive(Debug)]
 enum StreamGrep {
     /// File absent or could not be opened (path recorded but rotated/deleted) -
     /// skipped, not counted toward `files_searched`.
     Missing,
-    /// CLAUDE-246: the file opened but a read failed partway through (truncated,
+    /// The file opened but a read failed partway through (truncated,
     /// corrupt, or an I/O error). Distinct from `Searched(None)`: only part of
     /// the file was scanned, so "no match" would be an answer the search never
     /// established.
@@ -979,12 +979,12 @@ enum StreamGrep {
     Searched(Option<String>),
 }
 
-/// CLAUDE-143: read a stream `.jsonl` log line-by-line (as `job_stream_sse`
+/// Read a stream `.jsonl` log line-by-line (as `job_stream_sse`
 /// does) looking for the first line containing `needle` (already ASCII
 /// lowercased). Reads at most `max_bytes` before giving up so a huge log cannot
 /// stall the search. A file that cannot be opened returns
 /// [`StreamGrep::Missing`]; one that fails mid-read returns
-/// [`StreamGrep::Unreadable`] (CLAUDE-246).
+/// [`StreamGrep::Unreadable`].
 async fn stream_match_snippet(path: &std::path::Path, needle: &str, max_bytes: u64) -> StreamGrep {
     let Ok(file) = tokio::fs::File::open(path).await else {
         return StreamGrep::Missing;
@@ -1015,7 +1015,7 @@ async fn stream_match_snippet(path: &std::path::Path, needle: &str, max_bytes: u
     }
 }
 
-/// CLAUDE-143: a short, single-line context window around the first
+/// A short, single-line context window around the first
 /// case-insensitive (ASCII) match of `needle` in `haystack`. `needle` is already
 /// ASCII-lowercased. Control characters are flattened to spaces so a snippet
 /// from a JSON log line stays on one row. Falls back to the leading chars when
@@ -1052,7 +1052,7 @@ fn match_snippet(haystack: &str, needle: &str) -> String {
     out
 }
 
-/// CLAUDE-143: first `max` chars of `s`, with a trailing ellipsis when truncated.
+/// First `max` chars of `s`, with a trailing ellipsis when truncated.
 fn truncate_chars(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     if s.chars().count() > max {
@@ -1061,12 +1061,12 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
-/// CLAUDE-143: find jobs whose `summary` (always) - and, when `in_stream`, whose
+/// Find jobs whose `summary` (always) - and, when `in_stream`, whose
 /// per-attempt stream `.jsonl` log - contains `q` (case-insensitive ASCII
 /// substring). Stream search is bounded to the most recent failed-job attempts
 /// (`SEARCH_STREAM_MAX_FILES`, reading at most `SEARCH_STREAM_MAX_BYTES` each);
 /// missing/rotated files are skipped without error, a file that fails mid-read
-/// is reported in `unreadable` rather than counted as a non-match (CLAUDE-246),
+/// is reported in `unreadable` rather than counted as a non-match,
 /// and `capped` reports when the file cap was reached so the UI never silently
 /// truncates.
 async fn search_jobs(
@@ -1215,7 +1215,7 @@ async fn search_jobs(
     })
 }
 
-// ---- templates ------------------------------------------------------------
+// ---- templates ---------------------------------------------------------------
 
 #[derive(Template)]
 #[template(path = "dashboard.html")]
@@ -1227,51 +1227,51 @@ struct DashboardTpl {
     today_cost: f64,
     actions: Vec<ActionView>,
     recent_runs: Vec<RunRow>,
-    /// CLAUDE-35: current state of the "Show empty runs" toggle. Threaded into
+    /// Current state of the "Show empty runs" toggle. Threaded into
     /// the poll-region `hx-get` so the choice survives the 5s self-refresh.
     show_empty: bool,
-    /// CLAUDE-143: current search text, echoed into the search box so it
+    /// Current search text, echoed into the search box so it
     /// survives the morph poll. Empty when no search is active.
     search_q: String,
-    /// CLAUDE-143: current state of the "grep stream logs" toggle, echoed back
+    /// Current state of the "grep stream logs" toggle, echoed back
     /// into the checkbox.
     in_stream: bool,
-    /// CLAUDE-143: `Some` when a search is active; the template then renders the
+    /// `Some` when a search is active; the template then renders the
     /// matching jobs in place of the Recent runs table.
     search: Option<SearchView>,
-    /// CLAUDE-142: pagination state for the Recent runs table (page number,
+    /// Pagination state for the Recent runs table (page number,
     /// bounds, and the "X-Y of N" indicator). Computed even while a search is
     /// active so the hidden `page` input keeps the morph poll on the right page.
     page: PageNav,
-    /// CLAUDE-235: `warn`/`error` events in the last 24h. Zero renders no
+    /// `warn`/`error` events in the last 24h. Zero renders no
     /// banner; the rows themselves live on `/logs`.
     events_24h: i64,
-    /// CLAUDE-216 / CLAUDE-235: the repo-access subset of `events_24h` that no
+    /// The repo-access subset of `events_24h` that no
     /// later successful preflight superseded, named separately in the banner
     /// because its remedy is the access check. Zero once a recovery lands.
     access_failure_events: i64,
     /// Distinct `(action, context, message)` access failures behind
     /// `access_failure_events`.
     access_failure_groups: usize,
-    /// CLAUDE-225: dependency gates that have held an issue longer than
+    /// Dependency gates that have held an issue longer than
     /// [`state::STALE_GATE_AFTER_MS`]. Empty renders no banner.
     stale_gates: Vec<StaleGateRow>,
-    /// CLAUDE-232: keys parked at their action's per-key attempt cap. Empty
+    /// Keys parked at their action's per-key attempt cap. Empty
     /// renders no banner.
     attempt_cap_hits: Vec<state::CappedKey>,
-    /// CLAUDE-141: whitelisted sort + filter selection, echoed into the header
+    /// Whitelisted sort + filter selection, echoed into the header
     /// sort links, filter dropdowns, poll URL, and pagination links so the
     /// chosen view survives the morph poll.
     view: RunsView,
-    /// CLAUDE-141: distinct `action_name` values present in `runs`, for the
+    /// Distinct `action_name` values present in `runs`, for the
     /// Action filter dropdown options.
     action_options: Vec<String>,
-    /// CLAUDE-141: distinct `triggered_by` values present in `runs`, for the
+    /// Distinct `triggered_by` values present in `runs`, for the
     /// Triggered filter dropdown options.
     triggered_options: Vec<String>,
 }
 
-/// CLAUDE-225: one stale dependency gate, with its ages pre-rendered for the
+/// One stale dependency gate, with its ages pre-rendered for the
 /// dashboard banner.
 struct StaleGateRow {
     gate: state::StaleGate,
@@ -1312,7 +1312,7 @@ impl StaleGateRow {
     }
 }
 
-/// CLAUDE-142: rendered pagination state for the dashboard Recent runs table.
+/// Rendered pagination state for the dashboard Recent runs table.
 struct PageNav {
     /// Current 1-based page (already clamped to `[1, total_pages]`).
     page: i64,
@@ -1329,7 +1329,7 @@ struct PageNav {
     has_next: bool,
 }
 
-/// CLAUDE-141: whitelisted sort + filter selection for the dashboard recent-runs
+/// Whitelisted sort + filter selection for the dashboard recent-runs
 /// table. Every field is validated in [`dashboard`] before it lands here:
 /// `sort`/`dir`/`exit`/`outcome` against fixed allow-lists, `action`/`triggered` against
 /// the actual distinct DB values. So nothing user-controlled reaches the SQL
@@ -1350,7 +1350,7 @@ struct RunsView {
     /// Derived exit/outcome filter: `success`/`failed`/`cancelled`/`running`,
     /// or empty for all. This is the RUN's own exit code.
     exit: String,
-    /// CLAUDE-230: job-level outcome filter, independent of `exit`:
+    /// Job-level outcome filter, independent of `exit`:
     /// `failed`/`timedout`, or empty for all. Named `outcome` and not `jobs`
     /// because the sort key `jobs` already means `jobs_processed`.
     outcome: String,
@@ -1358,7 +1358,7 @@ struct RunsView {
 
 impl RunsView {
     /// SQL `ORDER BY` built from the whitelisted `sort`/`dir`. Defaults to
-    /// `started_at DESC` (the pre-CLAUDE-141 order) when no column is selected.
+    /// `started_at DESC` (the original order) when no column is selected.
     /// A trailing `id DESC` tiebreaker keeps paging stable when the primary key
     /// has ties. The column is chosen from a fixed `match`, so no user input
     /// ever reaches the clause text.
@@ -1370,7 +1370,7 @@ impl RunsView {
             // No duration column; derive it from the timestamps.
             "duration" => "elapsed_seconds(started_at, ended_at)",
             "jobs" => "jobs_processed",
-            // CLAUDE-230: the derived count aliased by `run_row_columns`.
+            // The derived count aliased by `run_row_columns`.
             "failed" => "failed_jobs",
             "exit" => "exit_code",
             // "started" and any unknown/empty value fall back to the default.
@@ -1386,7 +1386,7 @@ impl RunsView {
 
     /// SQL `WHERE` clause (empty or leading ` WHERE ...`) shared by the listing
     /// and its `COUNT(*)`, with `?` placeholders for the value filters, plus the
-    /// ordered bind values. `show_empty=false` keeps the CLAUDE-35 hide-empty
+    /// ordered bind values. `show_empty=false` keeps the hide-empty
     /// rule and composes with the new filters via `AND`.
     fn where_clause(&self, show_empty: bool) -> (String, Vec<String>) {
         let mut conds: Vec<String> = Vec::new();
@@ -1403,7 +1403,7 @@ impl RunsView {
             binds.push(self.triggered.clone());
         }
         // Derived outcome states, mirroring the Exit-column badges: 0 = success,
-        // 1 = stopped by the global pause (CLAUDE-223), 130 = cancelled, any
+        // 1 = stopped by the global pause, 130 = cancelled, any
         // other non-NULL = failed, NULL = still running. A paused run is
         // excluded from "failed": it did not fail, it was told to stop.
         match self.exit.as_str() {
@@ -1416,7 +1416,7 @@ impl RunsView {
             "running" => conds.push("exit_code IS NULL".to_string()),
             _ => {}
         }
-        // CLAUDE-230: job-level outcome, a different axis from the run's exit
+        // Job-level outcome, a different axis from the run's exit
         // code (a run whose every job failed still finishes 0). Built from the
         // same fragment as the displayed `(N failed)` count so the two agree.
         match self.outcome.as_str() {
@@ -1450,7 +1450,7 @@ impl RunsView {
     /// Full sort/filter query string for the live poll and pagination links, so
     /// each morph refresh and Prev/Next re-requests the current view. The
     /// search/show-empty params are carried separately via `hx-include` of the
-    /// search form, and `page` via `hx-vals`; this carries only the CLAUDE-141
+    /// search form, and `page` via `hx-vals`; this carries only the sort/filter
     /// params. Values are pre-whitelisted; askama escapes the `&` joiners.
     fn poll_query(&self) -> String {
         self.query_with(&self.sort, &self.dir)
@@ -1489,45 +1489,45 @@ impl RunsView {
     }
 }
 
-/// CLAUDE-35: query params for the dashboard. `show_empty` defaults to `false`
+/// Query params for the dashboard. `show_empty` defaults to `false`
 /// when the param is absent, so the page loads with 0-job finished runs hidden.
 #[derive(Deserialize, Default)]
 struct DashboardQuery {
     #[serde(default)]
     show_empty: bool,
-    /// CLAUDE-141: whitelisted sort column key for the Recent runs table.
+    /// Whitelisted sort column key for the Recent runs table.
     #[serde(default)]
     sort: String,
-    /// CLAUDE-141: sort direction (`asc`/`desc`).
+    /// Sort direction (`asc`/`desc`).
     #[serde(default)]
     dir: String,
-    /// CLAUDE-141: Action filter (exact `action_name`), empty for all.
+    /// Action filter (exact `action_name`), empty for all.
     #[serde(default)]
     action: String,
-    /// CLAUDE-141: Triggered filter (exact `triggered_by`), empty for all.
+    /// Triggered filter (exact `triggered_by`), empty for all.
     #[serde(default)]
     triggered: String,
-    /// CLAUDE-141: derived Exit/outcome filter, empty for all.
+    /// Derived Exit/outcome filter, empty for all.
     #[serde(default)]
     exit: String,
-    /// CLAUDE-230: job-level outcome filter (`failed`/`timedout`), empty for
+    /// Job-level outcome filter (`failed`/`timedout`), empty for
     /// all.
     #[serde(default)]
     outcome: String,
-    /// CLAUDE-143: search text. Empty/absent leaves the normal runs view.
+    /// Search text. Empty/absent leaves the normal runs view.
     #[serde(default)]
     q: String,
-    /// CLAUDE-143: also grep the per-attempt stream logs (opt-in checkbox).
+    /// Also grep the per-attempt stream logs (opt-in checkbox).
     #[serde(default)]
     in_stream: bool,
-    /// CLAUDE-142: 1-based page for the Recent runs table. Absent/invalid falls
+    /// 1-based page for the Recent runs table. Absent/invalid falls
     /// back to page 1, preserving the pre-pagination first-page behavior. The
     /// value is clamped to the valid range in the handler.
     #[serde(default)]
     page: Option<i64>,
 }
 
-/// CLAUDE-142: rows per page on the dashboard Recent runs table. Matches the
+/// Rows per page on the dashboard Recent runs table. Matches the
 /// previous hardcoded `LIMIT 20` so page 1 shows exactly the rows it did before.
 const DASHBOARD_PAGE_SIZE: i64 = 20;
 
@@ -1545,7 +1545,7 @@ async fn dashboard(
     let (webhook_enabled, comment_webhook_enabled) = listeners_enabled(&s).await;
     let actions = enriched_actions(pool, webhook_enabled, comment_webhook_enabled).await?;
 
-    // CLAUDE-141: whitelist the sort/filter selections before they reach SQL or
+    // Whitelist the sort/filter selections before they reach SQL or
     // the page. `sort`/`dir`/`exit`/`outcome` are checked against fixed allow-lists; the
     // Action/Triggered values are kept only when they match an actual distinct
     // value in `runs` (the same lists that populate the dropdowns), so a stale
@@ -1569,8 +1569,8 @@ async fn dashboard(
         outcome: whitelisted(&q.outcome, &["failed", "timedout"]),
     };
 
-    // CLAUDE-142: page the Recent runs table. `total` is a COUNT over the same
-    // `WHERE` (CLAUDE-141 sort/filter included) as the listing, so the page
+    // Page the Recent runs table. `total` is a COUNT over the same
+    // `WHERE` (sort/filter included) as the listing, so the page
     // bounds and the "X-Y of N" indicator line up with the rows actually
     // returned. The page is clamped to the valid range so a stale/oversized
     // `?page=` lands on the last page rather than an empty one.
@@ -1594,7 +1594,7 @@ async fn dashboard(
         has_next: page < total_pages,
     };
 
-    // CLAUDE-143: run the content search when the box is non-empty. The result
+    // Run the content search when the box is non-empty. The result
     // region morph-swaps in place (poll-region) so the search composes with the
     // live refresh and the "Show empty runs" toggle without a refresh-wipe.
     let search_q = q.q.trim().to_string();
@@ -1625,17 +1625,17 @@ async fn dashboard(
 
     let (today_runs, today_cost) = totals.unwrap_or((0, 0.0));
 
-    // CLAUDE-216: the poll-time repo-access preflight leaves its issues Queued
+    // The poll-time repo-access preflight leaves its issues Queued
     // with no field change, so without this banner the only symptom is issues
     // that never move. 24h window; a later passing preflight for the same repo
     // clears it (`state::access_failures_recent`).
-    // CLAUDE-235: a count, not a table. The messages are on `/logs`; the
+    // A count, not a table. The messages are on `/logs`; the
     // dashboard says how many there are and which of them the access check fixes.
     let since = events_window_start();
     let access_failures = state::access_failures_recent(pool, &since, None).await?;
     let events_24h = state::run_events_count_since(pool, &since).await?;
 
-    // CLAUDE-225: a dependency-blocked issue stays Queued with no field change,
+    // A dependency-blocked issue stays Queued with no field change,
     // and a poll whose candidates are all blocked returns before `run_begin`, so
     // nothing reaches the run history either. Read the live gate table so a block
     // that outlives its promised re-evaluation is on screen instead of waiting
@@ -1647,7 +1647,7 @@ async fn dashboard(
             .map(|gate| StaleGateRow { gate })
             .collect();
 
-    // CLAUDE-232: the sibling silent no-dispatch condition. A key at its
+    // The sibling silent no-dispatch condition. A key at its
     // action's `max_attempts_per_key` is skipped on every poll with no outcome
     // row, no run event, and no field change, so the counter table is the only
     // live record that the queue has stopped moving. The cap is per action, so
@@ -1695,18 +1695,18 @@ struct ActionDetailTpl {
     action: ActionView,
     paused: Option<PauseInfo>,
     runs: Vec<RunRow>,
-    /// CLAUDE-147: input/poll-phase diagnostics for this action (probe failures,
+    /// Input/poll-phase diagnostics for this action (probe failures,
     /// no-VCS drops), which skip a project's issues before any job exists and so
     /// never reach the per-run outcomes.
-    /// CLAUDE-235: a count, not a dump: how many were recorded since this serve
+    /// A count, not a dump: how many were recorded since this serve
     /// started. Zero renders no region; the rows are on `/logs?action=<name>`.
     event_count: i64,
-    /// CLAUDE-42: current state of the "Show empty runs" toggle. Threaded into
+    /// Current state of the "Show empty runs" toggle. Threaded into
     /// the poll-region `hx-get` so the choice survives the 5s self-refresh.
     show_empty: bool,
 }
 
-/// CLAUDE-42: query params for the action detail page. Mirrors `DashboardQuery`:
+/// Query params for the action detail page. Mirrors `DashboardQuery`:
 /// `show_empty` defaults to `false` when the param is absent, so the Recent runs
 /// table loads with 0-job finished runs hidden.
 #[derive(Deserialize, Default)]
@@ -1732,7 +1732,7 @@ async fn action_detail(
             paused_at: at,
             reason: r,
         });
-    // CLAUDE-42: mirror the dashboard's "Show empty runs" toggle. When
+    // Mirror the dashboard's "Show empty runs" toggle. When
     // `show_empty` is false, finished runs that processed zero jobs are hidden;
     // in-progress runs (`exit_code IS NULL`) stay visible. The filter applies
     // before the `LIMIT`, exactly as in `fetch_recent_runs`.
@@ -1749,10 +1749,10 @@ async fn action_detail(
         .bind(&name)
         .fetch_all(pool)
         .await?;
-    // CLAUDE-147: input/poll-phase diagnostics (VCS probe failures, no-VCS
+    // Input/poll-phase diagnostics (VCS probe failures, no-VCS
     // drops) recorded by `gather()`. Queried by action name independent of any
     // run row, so a zero-job poll's events are surfaced too.
-    // CLAUDE-235: counted, not dumped. A diagnostic that re-fires every poll used
+    // Counted, not dumped. A diagnostic that re-fires every poll used
     // to fill the whole region with byte-identical rows; the page now states how
     // many there are and links to the one log screen for the rows themselves.
     let started_at = crate::settings::serve_started_at(pool).await?;
@@ -1769,7 +1769,7 @@ async fn action_detail(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-// ---- duration chart view (CLAUDE-21) --------------------------------------
+// ---- duration chart view -------------------------------------------------
 
 #[derive(Template)]
 #[template(path = "action_chart.html")]
@@ -1786,7 +1786,7 @@ async fn action_durations(
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
     // 404 unknown actions cleanly; only names the daemon has indexed resolve.
-    // CLAUDE-61: the synthetic webhook action is not indexed but charts its
+    // The synthetic webhook action is not indexed but charts its
     // recorded runs like any action, so accept it when webhook is configured.
     let known_synthetic = synthetic_enabled(&s, &name).await;
     if !known_synthetic && indexed_action_path(pool, &name).await?.is_none() {
@@ -1820,25 +1820,25 @@ async fn action_durations(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-// ---- logs page (CLAUDE-171, made global in CLAUDE-235) ---------------------
+// ---- logs page (global across all actions) ---------------------------------
 //
 // The one diagnostics screen. It lists every `run_events` row with no dedup,
 // filtered by whitelisted Level / Action / Context selections, a parameterized
 // message substring search, and a since-this-serve / last-24h / all-time window,
 // sorted by time and paginated. The dashboard and the action page only count;
 // this page is the record. The filter/whitelist/HTMX shape is the dashboard's
-// (`RunsView`, CLAUDE-141/142): every user-supplied value is validated
+// (`RunsView`): every user-supplied value is validated
 // server-side before it reaches SQL, and every control morph-swaps the table
 // region in place.
 
-/// CLAUDE-171: rows per page on the log table.
+/// Rows per page on the log table.
 const EVENTS_PAGE_SIZE: i64 = 50;
 
-/// CLAUDE-235: rows per grouped summary card on the logs page. A card is a
+/// Rows per grouped summary card on the logs page. A card is a
 /// signal, not a second log; the table below carries the rest.
 const EVENTS_SUMMARY_LIMIT: i64 = 10;
 
-/// CLAUDE-216 / CLAUDE-235: start of the 24h diagnostics window shared by the
+/// Start of the 24h diagnostics window shared by the
 /// dashboard banner, the logs summary cards, and the logs page's `since=24h`
 /// selection, so the three never disagree about what "last 24h" means.
 fn events_window_start() -> String {
@@ -1846,7 +1846,7 @@ fn events_window_start() -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// CLAUDE-171: distinct `level` values present in `run_events`, alphabetically.
+/// Distinct `level` values present in `run_events`, alphabetically.
 /// Drives the Level dropdown and whitelists the incoming `?level=`.
 async fn distinct_event_levels(pool: &DbPool) -> Result<Vec<String>, WebError> {
     let rows = sqlx::query_scalar::<_, String>(&crate::db::q(
@@ -1858,7 +1858,7 @@ async fn distinct_event_levels(pool: &DbPool) -> Result<Vec<String>, WebError> {
     Ok(rows)
 }
 
-/// CLAUDE-171: distinct `action_name` values present in `run_events`,
+/// Distinct `action_name` values present in `run_events`,
 /// alphabetically. Drives the Action dropdown and whitelists `?action=`. Note
 /// this is the events table's own action column, not `runs`': an action can have
 /// diagnostics without ever having produced a run row.
@@ -1872,7 +1872,7 @@ async fn distinct_event_actions(pool: &DbPool) -> Result<Vec<String>, WebError> 
     Ok(rows)
 }
 
-/// CLAUDE-171: distinct non-null `context` values present in `run_events`,
+/// Distinct non-null `context` values present in `run_events`,
 /// alphabetically. Drives the Context dropdown and whitelists `?context=`.
 /// `context` is free-form (a project key, or `config-collision`) and nullable;
 /// NULL/empty is not a selectable value, so it is excluded from the list.
@@ -1885,7 +1885,7 @@ async fn distinct_event_contexts(pool: &DbPool) -> Result<Vec<String>, WebError>
     Ok(rows)
 }
 
-/// CLAUDE-171: whitelisted filter + sort selection for the error-log table. The
+/// Whitelisted filter + sort selection for the error-log table. The
 /// `RunsView` sibling: every field is validated in [`logs`] before it
 /// lands here (`dir`/`since` against fixed allow-lists, `level`/`action`/
 /// `context` against the actual distinct DB values), so nothing user-controlled
@@ -1916,7 +1916,7 @@ impl EventsView {
         self.since == "all"
     }
 
-    /// CLAUDE-235: whether the last-24h window is selected. It is what the
+    /// Whether the last-24h window is selected. It is what the
     /// summary cards and the dashboard banner link to, so a count and the rows
     /// behind it cover the same window.
     fn last_24h(&self) -> bool {
@@ -1952,14 +1952,14 @@ impl EventsView {
             binds.push(self.context.clone());
         }
         if !self.q.is_empty() {
-            // Same plain substring test as the CLAUDE-143 run search:
+            // Same plain substring test as the run search:
             // `strpos` over a lowercased needle, so LIKE metacharacters (% _)
             // in the query text need no escaping. `lower()` is ASCII-only on
             // SQLite, matching the ASCII needle.
             conds.push("strpos(lower(message), ?) > 0".to_string());
             binds.push(self.q.to_ascii_lowercase());
         }
-        // CLAUDE-235: three windows, one bound. `all` leaves it off, `24h` uses
+        // Three windows, one bound. `all` leaves it off, `24h` uses
         // the shared 24h start, and the default follows the current serve (an
         // unstamped DB leaves it unbounded rather than hiding every row).
         if self.last_24h() {
@@ -2034,7 +2034,7 @@ impl EventsView {
     }
 }
 
-/// CLAUDE-171: total `run_events` rows matching the active filter, for the page
+/// Total `run_events` rows matching the active filter, for the page
 /// bounds and the "X-Y of N" indicator. Counts over the same `WHERE` as
 /// [`fetch_run_events`], so the two never disagree.
 async fn count_run_events(
@@ -2052,7 +2052,7 @@ async fn count_run_events(
     Ok(q.fetch_one(pool).await?)
 }
 
-/// CLAUDE-171: one page of `run_events` rows under the active filter. Every row
+/// One page of `run_events` rows under the active filter. Every row
 /// is returned as recorded: no dedup here, unlike the action-detail summary.
 async fn fetch_run_events(
     pool: &DbPool,
@@ -2087,15 +2087,15 @@ struct LogsTpl {
     /// The current serve's start, for the since-toggle label. `None` renders the
     /// all-time-only degraded state (no serve has stamped this DB).
     started_at: Option<String>,
-    /// CLAUDE-235: last-24h `warn`/`error` counts grouped by `context`, busiest
+    /// Last-24h `warn`/`error` counts grouped by `context`, busiest
     /// first. Independent of the active filter: it is the way in to a filter,
     /// not a summary of one.
     by_context: Vec<state::RunEventCount>,
-    /// CLAUDE-235: the same 24h counts grouped by `action_name`.
+    /// The same 24h counts grouped by `action_name`.
     by_action: Vec<state::RunEventCount>,
 }
 
-/// CLAUDE-171: query params for the logs page. CLAUDE-235: `action` stays
+/// Query params for the logs page. `action` stays
 /// `Option` for symmetry with the other filters, but an absent param now means
 /// every action (the page is global); an explicit `?action=<name>` narrows it,
 /// which is what the redirect from `/actions/<name>/events` and the links from
@@ -2117,7 +2117,7 @@ struct LogsQuery {
     page: Option<i64>,
 }
 
-/// CLAUDE-235: the log page moved from `/actions/:name/events` to the global
+/// The log page moved from `/actions/:name/events` to the global
 /// `/logs`. The old route stays as a permanent redirect that carries the action
 /// into the Action filter, so links, bookmarks and old READMEs still land on the
 /// same rows.
@@ -2136,7 +2136,7 @@ async fn logs(State(s): State<WebState>, Query(q): Query<LogsQuery>) -> Result<R
     let level_options = distinct_event_levels(pool).await?;
     let context_options = distinct_event_contexts(pool).await?;
     let mut action_options = distinct_event_actions(pool).await?;
-    // CLAUDE-235: an action the daemon has indexed (or the synthetic webhook
+    // An action the daemon has indexed (or the synthetic webhook
     // action) is a legitimate filter even with no events yet, since the action
     // page links here unconditionally. Anything else drops to "all" rather than
     // being echoed back into the page.
@@ -2159,7 +2159,7 @@ async fn logs(State(s): State<WebState>, Query(q): Query<LogsQuery>) -> Result<R
         q: q.q.clone(),
     };
 
-    // CLAUDE-235: the summary cards, over a fixed 24h window at warn/error. They
+    // The summary cards, over a fixed 24h window at warn/error. They
     // are the entry point the dashboard banner sends the operator to, so they do
     // not narrow with the table's filter.
     let window = events_window_start();
@@ -2199,7 +2199,7 @@ async fn logs(State(s): State<WebState>, Query(q): Query<LogsQuery>) -> Result<R
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-// ---- reports page (CLAUDE-117) --------------------------------------------
+// ---- reports page -----------------------------------------------------------
 //
 // Historical spend / runs / time-of-day / day-of-week, rendered off the shared
 // `crate::report` aggregations. Spend is the primary metric and renders first.
@@ -2419,9 +2419,9 @@ async fn reports_page(
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
 
-// ---- action editor / import / export (CLAUDE-7) ---------------------------
+// ---- action editor / import / export ---------------------------------------
 
-/// CLAUDE-211: new-action kind picker.
+/// New-action kind picker.
 #[derive(Template)]
 #[template(path = "action_new.html")]
 struct ActionNewTpl {
@@ -2535,9 +2535,9 @@ async fn action_edit_page(
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
     let yaml = std::fs::read_to_string(&path).map_err(WebError::from)?;
-    // CLAUDE-211: offer the structured editor for any parseable native kind (the
-    // form route dispatches to that kind's editor). `scripted` has none, so it
-    // stays on raw YAML.
+    // Offer the structured editor for any parseable native kind (the form route
+    // dispatches to that kind's editor). `scripted` has none, so it stays on raw
+    // YAML.
     let form_url = match crate::action::validate_str(&yaml, &path) {
         Ok(loaded) if loaded.action.native.is_some() => Some(format!("/actions/{name}/form")),
         _ => None,
@@ -2573,14 +2573,14 @@ async fn action_edit_save(
     }
     std::fs::write(&path, form.yaml.as_bytes()).map_err(WebError::from)?;
     // Re-index synchronously so the redirect reflects the edit immediately,
-    // instead of waiting for the daemon's next periodic scan (CLAUDE-39).
+    // instead of waiting for the daemon's next periodic scan.
     crate::daemon::scan_actions(&s.api.pool, &s.paths.actions_dir())
         .await
         .map_err(WebError::from)?;
     Ok(Redirect::to(&format!("/actions/{name}")).into_response())
 }
 
-/// CLAUDE-211: the new-action page lists every [`ActionKind`] with a one-line
+/// The new-action page lists every [`ActionKind`] with a one-line
 /// description and a link to its editor. Raw-YAML paste is an explicit
 /// alternative (`/actions/new/raw`), not the default.
 async fn action_new_page(State(s): State<WebState>) -> Result<Html<String>, WebError> {
@@ -2670,7 +2670,7 @@ async fn action_create(
     std::fs::create_dir_all(&actions_dir).map_err(WebError::from)?;
     std::fs::write(&dest, form.yaml.as_bytes()).map_err(WebError::from)?;
     // Index the new action synchronously so the redirect target resolves now,
-    // rather than 404ing until the daemon's next periodic scan (CLAUDE-39).
+    // rather than 404ing until the daemon's next periodic scan.
     crate::daemon::scan_actions(&s.api.pool, &actions_dir)
         .await
         .map_err(WebError::from)?;
@@ -2699,7 +2699,7 @@ async fn action_export(
     Ok(resp)
 }
 
-/// CLAUDE-40: delete an action from the web UI. Mirrors `secret_delete`: 404s
+/// Delete an action from the web UI. Mirrors `secret_delete`: 404s
 /// an unknown action, renders a 409 when a run for it is in flight, otherwise
 /// removes the YAML file + purges the derived index/control state (keeping run
 /// history) and redirects to the dashboard, which no longer lists it.
@@ -2731,7 +2731,7 @@ async fn action_delete(
     Ok(Redirect::to("/").into_response())
 }
 
-// ---- structured YouTrack action editor (CLAUDE-27) ------------------------
+// ---- structured YouTrack action editor -------------------------------------
 //
 // A field-based form for the native `kind: youtrack` action, an alternative to
 // the raw-YAML textarea above. The form owns the native config (youtrack source
@@ -2739,7 +2739,7 @@ async fn action_delete(
 // link_template, schedule, claude, limits, concurrency, enabled); every other
 // key the file carries (output, dedup_key, ...) is left untouched on save.
 // `token_ref` fields are dropdowns of stored secret *names* - a value is never
-// rendered (CLAUDE-26). Submissions round-trip through the same
+// rendered. Submissions round-trip through the same
 // `crate::action::validate_str` the raw editor uses, so a bad config is rejected
 // inline with the entered values preserved.
 
@@ -2780,10 +2780,10 @@ struct YoutrackEditForm {
     yt_token_ref: String,
     yt_query: String,
     yt_custom_field: String,
-    /// Optional Assignee set on the issue at pickup (CLAUDE-131). Empty string
+    /// Optional Assignee set on the issue at pickup. Empty string
     /// maps to `None` (Assignee left untouched). A login, `me`, or `unassigned`.
     yt_assignee: String,
-    /// Full-replacement agent prompt (CLAUDE-125). Prefilled with the saved
+    /// Full-replacement agent prompt. Prefilled with the saved
     /// override or, when none, the built-in default template (placeholders
     /// literal). Cleared or left equal to the default -> no `prompt` key saved.
     yt_prompt: String,
@@ -2793,15 +2793,15 @@ struct YoutrackEditForm {
     state_needs_review: String,
     state_failed: String,
     state_in_progress: String,
-    /// AI Agent `done` label written after a successful automerge (CLAUDE-126).
+    /// AI Agent `done` label written after a successful automerge.
     state_done: String,
-    /// Present ("on") when the automerge checkbox is checked (CLAUDE-126).
+    /// Present ("on") when the automerge checkbox is checked.
     automerge_enabled: Option<String>,
     fj_base_url: String,
     fj_token_ref: String,
-    /// PR-creation strategy (CLAUDE-103): `"branch"` (default) or `"agit"`.
+    /// PR-creation strategy: `"branch"` (default) or `"agit"`.
     fj_pr_strategy: String,
-    /// GitHub PAT secret name (CLAUDE-54). The form exposes only `token_ref`;
+    /// GitHub PAT secret name. The form exposes only `token_ref`;
     /// `github.hosts` / `github.mcp_endpoint` stay raw-YAML-only and are
     /// preserved on save.
     github_token_ref: String,
@@ -2813,24 +2813,24 @@ struct YoutrackEditForm {
     claude_cwd: String,
     claude_allowed_tools: String,
     claude_permission_mode: String,
-    /// CLAUDE-239: per-action `--model`; blank inherits the global
+    /// Per-action `--model`; blank inherits the global
     /// `config.claude.model`.
     claude_model: String,
-    /// CLAUDE-259: per-action `--effort`; blank inherits the global
+    /// Per-action `--effort`; blank inherits the global
     /// `config.claude.effort`.
     claude_effort: String,
-    /// DEV-706: per-action `--autocompact`; blank inherits the global
+    /// Per-action `--autocompact`; blank inherits the global
     /// `config.claude.autocompact`, then the runner's bounded default.
     claude_autocompact: String,
     limit_max_attempts_per_key: String,
     limit_max_runs_per_day: String,
     limit_claude_timeout_seconds: String,
     limit_daily_budget_usd: String,
-    /// DEV-705: dollars ONE run may spend; blank inherits the daily budget.
+    /// Dollars ONE run may spend; blank inherits the daily budget.
     limit_run_budget_usd: String,
-    /// DEV-705: fraction of the per-run budget at which the run warns once.
+    /// Fraction of the per-run budget at which the run warns once.
     limit_budget_warn_fraction: String,
-    /// CLAUDE-234: issues one run may create in the tracker.
+    /// Issues one run may create in the tracker.
     limit_max_issues_per_run: String,
     /// Per-run parallelism cap (number-as-text, like the `limit_*` fields).
     concurrency_max_parallel: String,
@@ -2838,23 +2838,23 @@ struct YoutrackEditForm {
     concurrency_key: String,
     /// Present ("on") when the enabled checkbox is checked, absent otherwise.
     enabled: Option<String>,
-    /// CLAUDE-298: comma-separated project keys the agent may create issues in
+    /// Comma-separated project keys the agent may create issues in
     /// (`native.youtrack.write_projects`). Empty resolves to the triggering
     /// issue's own project.
     yt_write_projects: String,
-    /// CLAUDE-298: pre-clone dependency gate master switch
+    /// Pre-clone dependency gate master switch
     /// (`dependencies.enabled`). Present ("on") when checked.
     deps_enabled: Option<String>,
-    /// CLAUDE-298: humantime backoff before a blocked issue is re-evaluated
+    /// Humantime backoff before a blocked issue is re-evaluated
     /// (`dependencies.recheck_timeout`). Blank falls back to the default (`5m`).
     deps_recheck_timeout: String,
-    /// CLAUDE-298: comma-separated link verbs that block pickup
+    /// Comma-separated link verbs that block pickup
     /// (`dependencies.block_on`). Blank falls back to the default.
     deps_block_on: String,
-    /// CLAUDE-298: whether a link to another project blocks pickup
+    /// Whether a link to another project blocks pickup
     /// (`dependencies.block_cross_project`). Present ("on") when checked.
     deps_block_cross_project: Option<String>,
-    /// CLAUDE-298: AI Agent label for a deliberate zero-commit run
+    /// AI Agent label for a deliberate zero-commit run
     /// (`states.no_code`). Blank inherits the `done` label.
     state_no_code: String,
 }
@@ -2866,19 +2866,19 @@ impl YoutrackEditForm {
         self.enabled.is_some()
     }
 
-    /// Whether the automerge checkbox was ticked (CLAUDE-126). Like
+    /// Whether the automerge checkbox was ticked. Like
     /// [`Self::is_enabled`], absence means the box was unchecked.
     fn is_automerge_enabled(&self) -> bool {
         self.automerge_enabled.is_some()
     }
 
-    /// Whether the dependency-gate checkbox was ticked (CLAUDE-298). Like
+    /// Whether the dependency-gate checkbox was ticked. Like
     /// [`Self::is_enabled`], absence means the box was unchecked.
     fn is_deps_enabled(&self) -> bool {
         self.deps_enabled.is_some()
     }
 
-    /// Whether the cross-project block checkbox was ticked (CLAUDE-298). Like
+    /// Whether the cross-project block checkbox was ticked. Like
     /// [`Self::is_enabled`], absence means the box was unchecked.
     fn is_deps_block_cross_project(&self) -> bool {
         self.deps_block_cross_project.is_some()
@@ -3063,7 +3063,7 @@ fn youtrack_form_to_yaml(
     if let Some(c) = opt(&form.yt_custom_field) {
         youtrack.custom_field = c;
     }
-    // CLAUDE-131: blank Assignee box -> no `assignee` key (Assignee untouched);
+    // Blank Assignee box -> no `assignee` key (Assignee untouched);
     // any value is persisted as a literal `yt` assignee argument.
     youtrack.assignee = opt(&form.yt_assignee);
     // No preset picker in the form: carry `prompt_preset` forward. An invalid value is an
@@ -3077,7 +3077,7 @@ fn youtrack_form_to_yaml(
             .map_err(|e| format!("native.youtrack.prompt_preset is invalid: {e}"))?,
         None => crate::action::PromptPreset::default(),
     };
-    // CLAUDE-125: text equal to the action's preset (CRLF-normalized, trimmed) or an empty
+    // Text equal to the action's preset (CRLF-normalized, trimmed) or an empty
     // box stores no override, so preset improvements still apply.
     let prompt_norm = form.yt_prompt.replace("\r\n", "\n");
     let prompt_trim = prompt_norm.trim();
@@ -3103,23 +3103,23 @@ fn youtrack_form_to_yaml(
     if let Some(v) = opt(&form.state_in_progress) {
         states.in_progress = v;
     }
-    // CLAUDE-133: the form owns the `done` label and the automerge block; a
-    // blank label falls back to its default. CLAUDE-327: the form no longer
+    // The form owns the `done` label and the automerge block; a
+    // blank label falls back to its default. The form no longer
     // exposes `states.state_done` (deprecated and ignored), so saving always
     // resets it to the default, clearing the load-time deprecation warning
     // for an action that still carries a non-default value from before.
     if let Some(v) = opt(&form.state_done) {
         states.done = v;
     }
-    // CLAUDE-293: automerge is now just the checkbox. Saving the form always
+    // Automerge is now just the checkbox. Saving the form always
     // resets the (deprecated, ignored) timing fields to their defaults, which
     // is what clears the load-time deprecation warning for an action that
-    // still carries non-default values from before CLAUDE-278.
+    // still carries non-default values from an older format.
     youtrack.automerge = Automerge {
         enabled: form.is_automerge_enabled(),
         ..Automerge::default()
     };
-    // CLAUDE-298: projects the agent may create issues in. Comma-separated,
+    // Projects the agent may create issues in. Comma-separated,
     // trimmed, empties dropped; blank -> no `write_projects` key (resolves to
     // the triggering issue's own project).
     youtrack.write_projects = form
@@ -3129,7 +3129,7 @@ fn youtrack_form_to_yaml(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    // CLAUDE-298: pre-clone dependency gate. A blank recheck timeout falls back
+    // Pre-clone dependency gate. A blank recheck timeout falls back
     // to the default like the other required fields; a non-empty value that
     // does not parse as a humantime duration is rejected, matching the
     // numeric-limit fields, and no file is written.
@@ -3163,15 +3163,15 @@ fn youtrack_form_to_yaml(
         block_on,
         block_cross_project: form.is_deps_block_cross_project(),
     };
-    // CLAUDE-298: AI Agent label for a deliberate zero-commit run. Blank -> no
+    // AI Agent label for a deliberate zero-commit run. Blank -> no
     // `no_code` key (resolves to the `done` label).
     youtrack.states.no_code = opt(&form.state_no_code);
-    // CLAUDE-54: preserve a hand-written `github` block. The form exposes only
+    // Preserve a hand-written `github` block. The form exposes only
     // `token_ref`, so read the existing `native.github` sub-block off the parsed
     // on-disk action (before we overwrite the `native` key below) to carry its
     // `hosts` / `mcp_endpoint` forward, then overlay `token_ref` from the form.
     // Missing block -> defaults; `prune_yaml` still drops an all-default github
-    // block so Forgejo-only actions write no `github`. CLAUDE-300: an unparsable
+    // block so Forgejo-only actions write no `github`. An unparsable
     // block is a form error, matching the numeric-limit fields below, rather
     // than a silent reset that drops `hosts` / `mcp_endpoint`.
     let mut github = match map.get("native").and_then(|n| n.get("github")).cloned() {
@@ -3443,7 +3443,7 @@ async fn render_youtrack_editor(
     Ok((status, Html(tpl.render().map_err(WebError::from)?)).into_response())
 }
 
-/// CLAUDE-211: `/actions/:name/form` for any kind. Renders the structured
+/// `/actions/:name/form` for any kind. Renders the structured
 /// editor matching the action's own native config; an action with no structured
 /// editor (`scripted`, or a file that no longer parses) falls back to the raw
 /// editor.
@@ -3533,7 +3533,7 @@ async fn youtrack_edit_page(
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
     let yaml = std::fs::read_to_string(&path).map_err(WebError::from)?;
-    // CLAUDE-300: a file that no longer parses names why and links to the raw
+    // A file that no longer parses names why and links to the raw
     // editor (422) instead of redirecting there with no explanation. A file
     // that validates but is not a youtrack action still redirects: it simply
     // has no structured form.
@@ -3549,7 +3549,7 @@ async fn youtrack_edit_page(
     render_youtrack_editor(&s, StatusCode::OK, Some(name), form, None, prompt).await
 }
 
-/// CLAUDE-300: shared 422 response for a structured-editor route that could not
+/// Shared 422 response for a structured-editor route that could not
 /// load the action file at all (read failure or a `validate_str` rejection),
 /// naming the reason instead of silently falling back to the raw editor.
 async fn action_load_error_response(
@@ -3637,7 +3637,7 @@ async fn youtrack_edit_save(
     };
     std::fs::write(&path, yaml.as_bytes()).map_err(WebError::from)?;
     // Re-index synchronously so the redirect reflects the edit immediately,
-    // instead of waiting for the daemon's next periodic scan (CLAUDE-39).
+    // instead of waiting for the daemon's next periodic scan.
     crate::daemon::scan_actions(&s.api.pool, &s.paths.actions_dir())
         .await
         .map_err(WebError::from)?;
@@ -3711,14 +3711,14 @@ async fn youtrack_create(
     std::fs::create_dir_all(&actions_dir).map_err(WebError::from)?;
     std::fs::write(&dest, yaml.as_bytes()).map_err(WebError::from)?;
     // Index the new action synchronously so the redirect target resolves now,
-    // rather than 404ing until the daemon's next periodic scan (CLAUDE-39).
+    // rather than 404ing until the daemon's next periodic scan.
     crate::daemon::scan_actions(&s.api.pool, &actions_dir)
         .await
         .map_err(WebError::from)?;
     Ok(Redirect::to(&format!("/actions/{}", loaded.action.name)).into_response())
 }
 
-// ---- secrets management (CLAUDE-26) ---------------------------------------
+// ---- secrets management -----------------------------------------------
 //
 // Values are write-only: the create / rotate forms accept a value, but the
 // listing only ever shows a secret's name + timestamps. A stored value is never
@@ -3885,7 +3885,7 @@ async fn secret_delete(
     Ok(Redirect::to("/secrets").into_response())
 }
 
-// ---- CLAUDE-216: access check --------------------------------------------
+// ---- Access check -----------------------------------------------------
 //
 // One service (`crate::access`) backs this page, `POST /api/access/check`, and
 // `claude-run access check`. A row names the secret, the probe, and the failure
@@ -3963,7 +3963,7 @@ async fn secret_check(
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
 }
 
-// ---- CLAUDE-101: Settings page -------------------------------------------
+// ---- Settings page ----------------------------------------------------
 
 #[derive(Template)]
 #[template(path = "settings.html")]
@@ -3992,9 +3992,9 @@ struct AuthCardView {
     /// config dir, a stored API key, or the env). This is what gates the
     /// scheduler, so the card says so plainly.
     claude_ready: bool,
-    /// CLAUDE-269: a credential exists but the CLI itself reported an
-    /// authentication failure (an expired/revoked login), distinct from never
-    /// having signed in at all. Takes the badge over `claude_ready`.
+    /// A credential exists but the CLI itself reported an authentication
+    /// failure (an expired/revoked login), distinct from never having signed
+    /// in at all. Takes the badge over `claude_ready`.
     claude_login_expired: bool,
     /// The CLI's own message when `claude_login_expired` is set.
     claude_login_message: Option<String>,
@@ -4094,12 +4094,12 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "sources",
                 badge: "live",
-                note: "a saved source puts webhook-forgejo on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref, write_token_ref (WRITE scope, CLAUDE-276: required to comment on a PR).",
+                note: "a saved source puts webhook-forgejo on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, log_token_ref, write_token_ref (WRITE scope, required to comment on a PR).",
             },
             FieldDoc {
                 name: "auto_fix",
                 badge: "next event",
-                note: "queuing only (CLAUDE-273): every code failure still mints; off just leaves AI Agent unset.",
+                note: "queuing only: every code failure still mints; off just leaves AI Agent unset.",
             },
             FieldDoc {
                 name: "analysis_timeout_secs",
@@ -4114,12 +4114,12 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "agent_pr_fix_attempts",
                 badge: "next event",
-                note: "CLAUDE-276: fix attempts on the agent's own open PR before its issue is flagged Needs Review instead of re-queued.",
+                note: "fix attempts on the agent's own open PR before its issue is flagged Needs Review instead of re-queued.",
             },
             FieldDoc {
                 name: "max_runs_per_day",
                 badge: "next event",
-                note: "CLAUDE-323: daily run cap of the webhook-forgejo ledger (default 20, at least 1).",
+                note: "daily run cap of the webhook-forgejo ledger (default 20, at least 1).",
             },
         ],
         WebhookComment => vec![
@@ -4136,7 +4136,7 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
             FieldDoc {
                 name: "max_runs_per_day",
                 badge: "next event",
-                note: "CLAUDE-323: daily run cap of the webhook-forgejo-comment ledger (default 20, at least 1).",
+                note: "daily run cap of the webhook-forgejo-comment ledger (default 20, at least 1).",
             },
             FieldDoc {
                 name: "sources",
@@ -4319,9 +4319,9 @@ async fn render_settings_full(
         saved,
         auth: AuthCardView {
             claude_ready: readiness_check.as_ref().map(|r| r.ready).unwrap_or(true),
-            // CLAUDE-269: distinct from "never signed in" so the badge and the
-            // card above the sign-in control read "login expired" (with the
-            // CLI's own message) rather than the plain "required" state.
+            // Distinct from "never signed in" so the badge and the card above
+            // the sign-in control read "login expired" (with the CLI's own
+            // message) rather than the plain "required" state.
             claude_login_expired: readiness_check
                 .as_ref()
                 .and_then(|r| r.kind)
@@ -4526,8 +4526,8 @@ async fn auth_save_claude(
         return render_settings_with(&s, StatusCode::UNPROCESSABLE_ENTITY, None, None, Some(e))
             .await;
     }
-    // CLAUDE-269: an API key save is one of the ways login-required clears
-    // with no restart, alongside a brokered sign-in and the status probe.
+    // An API key save is one of the ways login-required clears with no
+    // restart, alongside a brokered sign-in and the status probe.
     if let Some(gate) = &s.api.readiness {
         gate.clear_login_required();
     }
@@ -4676,7 +4676,7 @@ async fn auth_save_github(
 }
 
 /// POST `/settings/auth/git`: sets the git commit identity the agent's
-/// commits are authored as (CLAUDE-358). Not a credential (no secret store
+/// commits are authored as. Not a credential (no secret store
 /// entry), so an empty field clears it back to the `"claude-run"` /
 /// `"claude-run@a8n.run"` default that `service_auth::materialize` falls back
 /// to, rather than being rejected as required input.
@@ -4717,8 +4717,7 @@ async fn auth_login_start(State(s): State<WebState>) -> Result<Response, WebErro
     };
     let binary = s.api.claude_binary.clone();
     let dir = s.api.agent_config_dir.clone().unwrap_or_default();
-    // Spawning and reading the URL blocks; keep it off the async worker
-    // (CLAUDE-228).
+    // Spawning and reading the URL blocks; keep it off the async worker.
     let started = crate::blocking::in_place(move || broker.start(&binary, &dir));
     match started {
         Ok(_) => Ok(Redirect::to("/settings#section-auth").into_response()),
@@ -4766,10 +4765,10 @@ async fn auth_login_code(
     match outcome {
         Ok(crate::claude_login::CodeOutcome::LoggedIn) => {
             tracing::info!("claude sign-in completed from the web UI");
-            // CLAUDE-269: clear login-required immediately, rather than
-            // waiting for the next status probe tick, so the banner and the
-            // Auth card badge drop right away and the next scheduler tick
-            // dispatches normally.
+            // Clear login-required immediately, rather than waiting for the
+            // next status probe tick, so the banner and the Auth card badge
+            // drop right away and the next scheduler tick dispatches
+            // normally.
             if let Some(gate) = &s.api.readiness {
                 gate.clear_login_required();
             }
@@ -4811,8 +4810,8 @@ async fn auth_login_cancel(State(s): State<WebState>) -> Result<Response, WebErr
     Ok(Redirect::to("/settings#section-auth").into_response())
 }
 
-/// CLAUDE-269: the shared not-ready banner fragment, polled from every page via
-/// `templates/base.html`. Behind the same CLAUDE-48 auth gate as the rest of
+/// The shared not-ready banner fragment, polled from every page via
+/// `templates/base.html`. Behind the same auth gate as the rest of
 /// `/settings` (mounted on the same router); `templates/login.html` and
 /// `templates/setup.html` do not extend `base.html`, so the poll never runs
 /// unauthenticated.
@@ -4836,7 +4835,7 @@ async fn auth_claude_banner(State(s): State<WebState>) -> Result<Html<String>, W
     Ok(Html(tpl.render()?))
 }
 
-// ---- About page (CLAUDE-129) ----------------------------------------------
+// ---- About page -------------------------------------------------------
 //
 // Version / build info plus an on-demand "Check for updates" and "Update now"
 // driven through the shared non-interactive cores in `crate::update`. The apply
@@ -4893,9 +4892,9 @@ impl CheckView {
     }
 }
 
-/// CLAUDE-223: the Activity card's live indicator, in exactly one of three
-/// states. `Unknown` exists because the alternative (rendering an empty list as
-/// idle) would tell an operator it is safe to reboot BECAUSE the query failed.
+/// The Activity card's live indicator, in exactly one of three states.
+/// `Unknown` exists because the alternative (rendering an empty list as idle)
+/// would tell an operator it is safe to reboot BECAUSE the query failed.
 #[derive(Serialize)]
 enum ActivityView {
     /// Nothing is live: no dispatched run, no open `runs` row. Safe to restart.
@@ -4951,8 +4950,8 @@ struct ActiveRunView {
     started_at: String,
 }
 
-/// CLAUDE-223: resolve the current activity for the Activity card. A failed
-/// query is logged at `error` here and converted to [`ActivityView::Unknown`],
+/// Resolve the current activity for the Activity card. A failed query is
+/// logged at `error` here and converted to [`ActivityView::Unknown`],
 /// so the failure reaches both the log and the operator's screen instead of
 /// being collapsed into an empty (idle-looking) list.
 async fn activity_view(s: &WebState) -> ActivityView {
@@ -4992,9 +4991,9 @@ async fn activity_view(s: &WebState) -> ActivityView {
     }
 }
 
-/// CLAUDE-223: the polled Activity fragment (`GET /about/activity`). Rendered
-/// standalone every 2s and included in the full About page, so both surfaces
-/// agree by construction.
+/// The polled Activity fragment (`GET /about/activity`). Rendered standalone
+/// every 2s and included in the full About page, so both surfaces agree by
+/// construction.
 #[derive(Template)]
 #[template(path = "activity.html")]
 struct ActivityTpl {
@@ -5012,11 +5011,11 @@ async fn about_activity(State(s): State<WebState>) -> Result<Response, WebError>
 #[template(path = "about.html")]
 struct AboutTpl {
     version: &'static str,
-    /// CLAUDE-223: the global pause, so the Activity card offers Pause when
-    /// running and Resume (with since / reason) when paused.
+    /// The global pause, so the Activity card offers Pause when running and
+    /// Resume (with since / reason) when paused.
     global_pause: Option<PauseInfo>,
-    /// CLAUDE-223: the first render of the live indicator; the 2s poll then
-    /// replaces it from `/about/activity`.
+    /// The first render of the live indicator; the 2s poll then replaces it
+    /// from `/about/activity`.
     activity: ActivityView,
     /// Configured update train (`release` / `latest`), changed on Settings.
     train: String,
@@ -5032,10 +5031,10 @@ struct AboutTpl {
     error: Option<String>,
 }
 
-/// Build a lazy resolver for the registry token named by `[update].token_ref`
-/// (CLAUDE-55). `None` when no `token_ref` is set (the anonymous-first path).
-/// Mirrors the CLI's `configured_update_token` (CLAUDE-158): nothing is decrypted
-/// here; the secret is resolved only on registry escalation.
+/// Build a lazy resolver for the registry token named by `[update].token_ref`.
+/// `None` when no `token_ref` is set (the anonymous-first path). Mirrors the
+/// CLI's `configured_update_token`: nothing is decrypted here; the secret is
+/// resolved only on registry escalation.
 fn configured_update_token(
     pool: &DbPool,
     cfg: &crate::config::UpdateConfig,
@@ -5133,7 +5132,7 @@ pub struct PlannedJob {
 /// Stream logs are written live by `ClaudeInvoker::invoke` to
 /// `<logs>/<action>/streams/<key>-attempt-<n>.jsonl`, so the presence of one
 /// without a matching `job_outcomes` record means that job is in flight. This
-/// is the on-disk fallback for the CLAUDE-9 per-run in-flight registry.
+/// is the on-disk fallback for the per-run in-flight registry.
 fn latest_attempt_on_disk(logs_dir: &std::path::Path, action: &str, key: &str) -> Option<u32> {
     let dir = logs_dir.join(action).join("streams");
     let prefix = format!("{key}-attempt-");
@@ -5163,32 +5162,32 @@ struct RunDetailTpl {
     version: &'static str,
     run: RunRow,
     outcomes: Vec<JobOutcomeRow>,
-    /// CLAUDE-1: jobs planned at run-start; populated as soon as
-    /// `input.command` returns. Pre-existing runs have NULL `run.job_keys`
-    /// and this stays empty.
+    /// Jobs planned at run-start; populated as soon as `input.command`
+    /// returns. Pre-existing runs have NULL `run.job_keys` and this stays
+    /// empty.
     planned_jobs: Vec<PlannedJob>,
     /// Per-job href builder for the outcomes table. Empty string when the
     /// action declares no `link_template`.
     link_template: Option<String>,
-    /// CLAUDE-93: per-job outbound links recorded on the run (webhook
-    /// fast-path stores the event's `html_url` here). Wins over
-    /// `link_template`; empty for legacy rows and scheduled actions.
+    /// Per-job outbound links recorded on the run (webhook fast-path stores
+    /// the event's `html_url` here). Wins over `link_template`; empty for
+    /// legacy rows and scheduled actions.
     job_links: std::collections::BTreeMap<String, String>,
-    /// CLAUDE-140: sanitized sort/filter selections, echoed back into the
-    /// poll URL and the header controls so the chosen view survives the 2s
-    /// morph poll. Each field is already whitelisted in the handler, so the
-    /// template can interpolate them into query strings verbatim.
+    /// Sanitized sort/filter selections, echoed back into the poll URL and
+    /// the header controls so the chosen view survives the 2s morph poll.
+    /// Each field is already whitelisted in the handler, so the template can
+    /// interpolate them into query strings verbatim.
     sort: RunDetailSort,
-    /// CLAUDE-140: whether the run has any planned jobs / outcomes at all,
-    /// captured before the filters run. Lets an over-tight filter render an
-    /// empty table whose dropdowns stay reachable, instead of hiding the
-    /// whole section (which would strip the controls needed to reset it).
+    /// Whether the run has any planned jobs / outcomes at all, captured
+    /// before the filters run. Lets an over-tight filter render an empty
+    /// table whose dropdowns stay reachable, instead of hiding the whole
+    /// section (which would strip the controls needed to reset it).
     has_planned: bool,
     has_outcomes: bool,
 }
 
-/// CLAUDE-140: whitelisted sort/filter state for the two run-detail tables.
-/// Every value is validated against a fixed allow-list in [`run_detail`]
+/// Whitelisted sort/filter state for the two run-detail tables. Every value
+/// is validated against a fixed allow-list in [`run_detail`]
 /// before it lands here, so nothing user-controlled reaches a SQL `ORDER BY`
 /// (the sort/filter run in-memory) or gets echoed unescaped into the page.
 #[derive(Default)]
@@ -5289,7 +5288,7 @@ impl RunDetailSort {
 }
 
 /// Up/down triangle for the column `col` given the active `sort`/`dir`, or the
-/// empty string when `col` is not the sorted column (CLAUDE-140).
+/// empty string when `col` is not the sorted column.
 fn arrow(sort: &str, dir: &str, col: &str) -> &'static str {
     if sort != col {
         ""
@@ -5300,9 +5299,9 @@ fn arrow(sort: &str, dir: &str, col: &str) -> &'static str {
     }
 }
 
-/// CLAUDE-140: keep `v` only when it is in `allowed`, else return the empty
-/// string (the "no selection" sentinel). This is the whitelist that stops raw
-/// query input from reaching the in-memory `ORDER BY`/`WHERE` equivalents.
+/// Keep `v` only when it is in `allowed`, else return the empty string (the
+/// "no selection" sentinel). This is the whitelist that stops raw query
+/// input from reaching the in-memory `ORDER BY`/`WHERE` equivalents.
 fn whitelisted(v: &str, allowed: &[&str]) -> String {
     if allowed.contains(&v) {
         v.to_string()
@@ -5311,7 +5310,7 @@ fn whitelisted(v: &str, allowed: &[&str]) -> String {
     }
 }
 
-/// CLAUDE-141: keep `v` only when it appears in `allowed` (an owned allow-list
+/// Keep `v` only when it appears in `allowed` (an owned allow-list
 /// built from actual DB values, e.g. the distinct action / triggered_by sets),
 /// else the empty "no selection" sentinel. The `&[String]` sibling of
 /// [`whitelisted`] for filters whose legal values come from the data.
@@ -5323,8 +5322,8 @@ fn whitelist_member(v: &str, allowed: &[String]) -> String {
     }
 }
 
-/// CLAUDE-140: claude-column rank used to sort the Job-outcomes "Claude"
-/// column: did-not-run < ran-and-failed < ran-and-ok.
+/// Claude-column rank used to sort the Job-outcomes "Claude" column:
+/// did-not-run < ran-and-failed < ran-and-ok.
 fn claude_rank(o: &JobOutcomeRow) -> u8 {
     if !o.claude_ran {
         0
@@ -5335,8 +5334,8 @@ fn claude_rank(o: &JobOutcomeRow) -> u8 {
     }
 }
 
-/// CLAUDE-140: compare two outcomes by a whitelisted column. Unknown columns
-/// compare equal (the caller only sorts when the column passed the whitelist).
+/// Compare two outcomes by a whitelisted column. Unknown columns compare
+/// equal (the caller only sorts when the column passed the whitelist).
 fn out_cmp(a: &JobOutcomeRow, b: &JobOutcomeRow, col: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match col {
@@ -5358,10 +5357,9 @@ fn out_cmp(a: &JobOutcomeRow, b: &JobOutcomeRow, col: &str) -> std::cmp::Orderin
     }
 }
 
-/// CLAUDE-140: query params for the run-detail page. The two tables are
-/// namespaced (`jobs_*` vs `out_*`) so they sort/filter independently. Every
-/// field defaults to empty (the page's pre-CLAUDE-140 behavior) and is
-/// whitelisted in the handler before use.
+/// Query params for the run-detail page. The two tables are namespaced
+/// (`jobs_*` vs `out_*`) so they sort/filter independently. Every field
+/// defaults to empty and is whitelisted in the handler before use.
 #[derive(Deserialize, Default)]
 struct RunDetailQuery {
     #[serde(default)]
@@ -5437,16 +5435,16 @@ async fn run_detail(
     let link_template = effective_link_template(declared, keys_are_youtrack, base.as_deref());
 
     let planned_keys = state::run_job_keys(pool, run.id).await.unwrap_or_default();
-    // CLAUDE-93: per-job links recorded on the run (the webhook
-    // stores the event's `html_url`). A map entry beats the action's
-    // link_template; scheduled actions have no entries and render as before.
+    // Per-job links recorded on the run (the webhook stores the event's
+    // `html_url`). A map entry beats the action's link_template; scheduled
+    // actions have no entries and render as before.
     let job_links = state::run_job_links(pool, run.id).await.unwrap_or_default();
     // Build a quick lookup: key -> overall ok flag from job_outcomes (latest
     // attempt wins, since outcomes are inserted in order).
     let mut outcome_by_key: std::collections::HashMap<&str, bool> =
         std::collections::HashMap::new();
-    // CLAUDE-52: keys whose latest outcome timed out, badged distinctly from a
-    // plain failure in the planned-jobs table.
+    // Keys whose latest outcome timed out, badged distinctly from a plain
+    // failure in the planned-jobs table.
     let mut timed_out_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for o in &outcomes {
         outcome_by_key.insert(o.job_key.as_str(), o.ok);
@@ -5456,9 +5454,9 @@ async fn run_detail(
             timed_out_keys.remove(o.job_key.as_str());
         }
     }
-    // CLAUDE-14 / CLAUDE-28: a run with a NULL `ended_at` is still active; only
-    // then can jobs be in flight. CLAUDE-28 runs distinct-key jobs in parallel,
-    // so several jobs can be in flight at once: `run_inflight_jobs` holds that
+    // A run with a NULL `ended_at` is still active; only then can jobs be in
+    // flight. Distinct-key jobs run in parallel, so several jobs can be in
+    // flight at once: `run_inflight_jobs` holds that
     // set, and any planned job whose key is in it is "running". Every other
     // no-outcome job is queued. Once the run ends, the in-flight set is empty
     // and a no-outcome job never finished (filtered / capped / skipped / not
@@ -5502,7 +5500,7 @@ async fn run_detail(
         })
         .collect();
 
-    // CLAUDE-140: whitelist the sort/filter selections, then apply them
+    // Whitelist the sort/filter selections, then apply them
     // in-memory. The two tables share this handler but are namespaced
     // (`jobs_*` vs `out_*`) so they sort/filter independently. Sorting and
     // filtering happen on the already-loaded Vecs, never as interpolated SQL,
@@ -5591,7 +5589,7 @@ struct JobStreamTpl {
     version: &'static str,
     run_id: i64,
     /// Parent action, resolved alongside the stream-log path. Feeds the
-    /// breadcrumb's link back to the action (CLAUDE-19).
+    /// breadcrumb's link back to the action.
     action_name: String,
     job_key: String,
     attempt: u32,
@@ -5625,7 +5623,7 @@ async fn job_stream_page(
 
 // ---- SSE ------------------------------------------------------------------
 
-/// CLAUDE-154: add a preference-formatted `ts_fmt` alongside a stream event's
+/// Add a preference-formatted `ts_fmt` alongside a stream event's
 /// raw `ts` so the live log renders the same timezone + format as every other
 /// date, while the client keeps the raw `ts` for its hover tooltip. Lines that
 /// are not JSON objects, or carry no string `ts`, pass through unchanged.
@@ -5658,13 +5656,13 @@ async fn job_stream_sse(
     .await?;
     let (action_name, ended_at) =
         run.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
-    // CLAUDE-245: a finished run's log will never appear, so an absent file is a
-    // permanent answer (swept by the retention sweep, or never written), not the
-    // "the agent has not started writing" one the wait below reports.
+    // A finished run's log will never appear, so an absent file is a
+    // permanent answer (swept by the retention sweep, or never written), not
+    // the "the agent has not started writing" one the wait below reports.
     let run_ended = ended_at.is_some();
     let path = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
 
-    // CLAUDE-154: snapshot the display preferences for this connection so each
+    // Snapshot the display preferences for this connection so each
     // event's `ts` is formatted server-side (chrono strftime can't run in JS),
     // keeping the live log on the same timezone + format as every other date.
     let prefs = crate::settings::current_preferences();
@@ -5698,8 +5696,8 @@ async fn job_stream_sse(
             waited += 1;
         }
         if !path.exists() {
-            // CLAUDE-245: the two absences are different facts and the operator
-            // must be able to tell them apart. "Not written yet" is a live run
+            // The two absences are different facts and the operator must be
+            // able to tell them apart. "Not written yet" is a live run
             // spinning up; a finished run's missing log is gone for good, most
             // often deleted by the stream-log retention sweep.
             let subtype = if run_ended { "stream-log-gone" } else { "no-stream-yet" };
@@ -5868,7 +5866,7 @@ mod tests {
         render_summary_markdown,
     };
 
-    // ---- summary markdown rendering (CLAUDE-89) ----------------------------
+    // ---- summary markdown rendering ----------------------------------------
 
     /// Markdown structure in a summary renders as HTML elements.
     #[test]
@@ -5905,7 +5903,7 @@ mod tests {
         );
     }
 
-    // ---- run-detail modal heading link (CLAUDE-108) -----------------------
+    // ---- run-detail modal heading link -------------------------------------
 
     /// The summary/details modal heading links the job key when the run has a
     /// populated `job_links` map, with `- attempt N` left outside the anchor and
@@ -5965,7 +5963,7 @@ mod tests {
         );
     }
 
-    // ---- run-detail link_template links (CLAUDE-222) ----------------------
+    // ---- run-detail link_template links -------------------------------------
 
     /// The shipped actions declare no `link_template`; the fallback builds
     /// `{base}/issue/{key}` from the configured base URL.
@@ -6063,7 +6061,7 @@ mod tests {
         );
     }
 
-    // ---- run-detail sort/filter (CLAUDE-140) ------------------------------
+    // ---- run-detail sort/filter ---------------------------------------------
 
     /// Unknown sort columns and filter values are rejected by the whitelist,
     /// so nothing user-controlled reaches the in-memory `ORDER BY`/`WHERE`.
@@ -6166,7 +6164,7 @@ mod tests {
         );
     }
 
-    // ---- dashboard sort/filter (CLAUDE-141) -------------------------------
+    // ---- dashboard sort/filter -----------------------------------------------
 
     /// `order_by` maps each whitelisted column to its SQL expression, defaults
     /// unknown/empty `sort` to `started_at DESC`, and never interpolates raw
@@ -6188,14 +6186,14 @@ mod tests {
             v("duration", "asc").order_by(),
             "ORDER BY elapsed_seconds(started_at, ended_at) ASC, id DESC"
         );
-        // Empty / unknown sort falls back to the pre-CLAUDE-141 default.
+        // Empty / unknown sort falls back to the default.
         assert_eq!(v("", "").order_by(), "ORDER BY started_at DESC, id DESC");
         assert_eq!(
             v("bogus; DROP", "asc").order_by(),
             "ORDER BY started_at ASC, id DESC"
         );
-        // CLAUDE-230: the derived failed-job count is sortable worst-first and
-        // keeps the `id DESC` tiebreaker.
+        // The derived failed-job count is sortable worst-first and keeps the
+        // `id DESC` tiebreaker.
         assert_eq!(
             v("failed", "desc").order_by(),
             "ORDER BY failed_jobs DESC, id DESC"
@@ -6206,7 +6204,7 @@ mod tests {
         );
     }
 
-    /// `where_clause` composes the CLAUDE-35 hide-empty rule with the Action /
+    /// `where_clause` composes the hide-empty rule with the Action /
     /// Triggered / Exit filters, emitting `?` placeholders and ordered binds for
     /// the value filters (so nothing user-controlled is interpolated).
     #[test]
@@ -6245,7 +6243,7 @@ mod tests {
         assert_eq!(running.where_clause(true).0, " WHERE exit_code IS NULL");
     }
 
-    /// CLAUDE-230: the job-level `outcome` filter is its own axis. It maps to an
+    /// The job-level `outcome` filter is its own axis. It maps to an
     /// `EXISTS` over the SHARED latest-attempt fragment (so it can never drift
     /// from the displayed `(N failed)` count), composes with the other filters
     /// via `AND` without adding binds, and ignores an unrecognised value.
@@ -6297,7 +6295,7 @@ mod tests {
         assert_eq!(b, vec!["YouTrack".to_string(), "schedule".to_string()]);
     }
 
-    /// CLAUDE-230: `outcome` rides in the poll/pagination query string and in
+    /// `outcome` rides in the poll/pagination query string and in
     /// `query_without` for every other dropdown, so it survives the 2s refresh,
     /// a page change, and a change to any sibling filter.
     #[test]
@@ -6434,7 +6432,7 @@ mod tests {
             html.contains("value=\"running\" selected"),
             "active Exit filter option not selected: {html}"
         );
-        // CLAUDE-230: the job-outcome dropdown under the Jobs header, with its
+        // The job-outcome dropdown under the Jobs header, with its
         // active option selected, and the failed-count sort link beside it.
         assert!(
             html.contains("name=\"outcome\""),
@@ -6460,7 +6458,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-225: a gate held past the threshold renders the dashboard banner
+    /// A gate held past the threshold renders the dashboard banner
     /// with its issue, age, blockers, and whether its own re-check is overdue.
     /// With no stale gate the banner is absent entirely.
     #[test]
@@ -6534,7 +6532,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-232: a key at its action's attempt cap renders the dashboard
+    /// A key at its action's attempt cap renders the dashboard
     /// banner with its action, key, count against the cap, and last attempt,
     /// and the banner is absent entirely when nothing is parked.
     #[test]
@@ -6610,7 +6608,7 @@ mod tests {
             html.contains("AI Agent"),
             "banner must say what releases the job: {html}"
         );
-        // CLAUDE-238: each row carries a Reset control posting to the
+        // Each row carries a Reset control posting to the
         // per-key reset endpoint.
         assert!(
             html.contains("/api/actions/youtrack/attempts/CLAUDE-9/reset"),
@@ -6619,7 +6617,7 @@ mod tests {
         assert!(html.contains(">Reset<"), "reset button missing: {html}");
     }
 
-    // ---- job-outcome filter, DB-backed (CLAUDE-230) -----------------------
+    // ---- job-outcome filter, DB-backed --------------------------------------
     mod outcome_filter {
         use super::super::{count_recent_runs, fetch_recent_runs, RunsView};
         use crate::db::DbPool;
@@ -6738,7 +6736,7 @@ mod tests {
         }
     }
 
-    // ---- action editor handlers (CLAUDE-34) -------------------------------
+    // ---- action editor handlers ---------------------------------------------
     //
     // The editor is kind-agnostic: `action_edit_save` / `action_create` route
     // every submission through the kind-aware `crate::action::validate_str`, so
@@ -6809,7 +6807,7 @@ mod tests {
             WebState { api, paths }
         }
 
-        /// CLAUDE-269: [`web_state`] with a real readiness gate attached, so a
+        /// [`web_state`] with a real readiness gate attached, so a
         /// test can trip / clear login-required and observe it through the
         /// banner fragment, the settings page, and the auth-save handlers.
         async fn web_state_with_readiness(
@@ -6858,11 +6856,11 @@ mod tests {
 
         #[tokio::test]
         async fn action_detail_renders_input_events_region() {
-            // CLAUDE-147: a recorded probe-failure event is surfaced on the
+            // A recorded probe-failure event is surfaced on the
             // action-detail page, so the poll/input-phase error that has no
             // per-job outcome row is not invisible. Covers the zero-job-poll
             // case: the event has a NULL run_id and still counts.
-            // CLAUDE-235: the region is one counted line linking to the Logs
+            // The region is one counted line linking to the Logs
             // screen; the message text itself is no longer rendered here.
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
@@ -6899,7 +6897,7 @@ mod tests {
             assert!(body.contains("Input errors / warnings"));
             assert!(body.contains("1 poll/input-phase diagnostics"));
             assert!(body.contains(r#"href="/logs?action=youtrack""#));
-            // The wall of message text is what CLAUDE-235 removed: the rows live
+            // The wall of message text was removed: the rows live
             // on the Logs screen, which the line above links to.
             assert!(!body.contains("VCS probe failed"));
         }
@@ -6932,11 +6930,10 @@ mod tests {
 
         #[tokio::test]
         async fn action_detail_counts_repeated_events_instead_of_listing_them() {
-            // CLAUDE-171 / CLAUDE-235: the motivating case. The CLAUDE-164
-            // config-collision warn is recorded on every 5s poll; the region used
-            // to render one byte-identical row per poll, burying every other
-            // diagnostic. It is now a single counted line, and no message text
-            // reaches the page at all.
+            // The motivating case: a config-collision warn is recorded on every
+            // 5s poll; the region used to render one byte-identical row per
+            // poll, burying every other diagnostic. It is now a single counted
+            // line, and no message text reaches the page at all.
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             let actions = s.paths.actions_dir();
@@ -6990,7 +6987,7 @@ mod tests {
 
         #[tokio::test]
         async fn action_detail_count_is_bounded_to_this_serve() {
-            // CLAUDE-171 / CLAUDE-235: events from a previous daemon lifetime
+            // Events from a previous daemon lifetime
             // (ts < started_at) are out of the window, so the count is what this
             // serve has recorded and not the whole retained history.
             let tmp = tempfile::tempdir().unwrap();
@@ -7039,10 +7036,10 @@ mod tests {
 
         #[tokio::test]
         async fn action_events_page_lists_every_event_undeduplicated() {
-            // CLAUDE-171: the log page is the counters' opposite: the same four
+            // The log page is the counters' opposite: the same four
             // identical rows the action page states as a count must all appear
             // here, with their owning action rendered in the Action column.
-            // CLAUDE-235: served by `/logs`, with no action in the path.
+            // Served by `/logs`, with no action in the path.
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             let actions = s.paths.actions_dir();
@@ -7084,7 +7081,7 @@ mod tests {
 
         #[tokio::test]
         async fn action_events_route_permanently_redirects_to_logs() {
-            // CLAUDE-235: the old per-action route keeps working, landing on the
+            // The old per-action route keeps working, landing on the
             // global page with the action already selected in the Action filter.
             // Driven through the router, so the registration is proven too.
             use tower::ServiceExt;
@@ -7119,7 +7116,7 @@ mod tests {
 
         #[tokio::test]
         async fn logs_route_serves_the_page() {
-            // CLAUDE-235: `/logs` is registered and needs no action in the path.
+            // `/logs` is registered and needs no action in the path.
             use tower::ServiceExt;
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
@@ -7147,7 +7144,7 @@ mod tests {
 
         #[tokio::test]
         async fn logs_page_unknown_action_param_widens_to_all_actions() {
-            // CLAUDE-235: the page is global, so an action that is not a distinct
+            // The page is global, so an action that is not a distinct
             // value in `run_events` drops to "all" (the whitelist) instead of the
             // 404 the per-action route used to return.
             let tmp = tempfile::tempdir().unwrap();
@@ -7181,7 +7178,7 @@ mod tests {
 
         #[tokio::test]
         async fn logs_page_summarises_the_last_24h_by_context_and_action() {
-            // CLAUDE-235: the two summary cards count `warn`/`error` events in
+            // The two summary cards count `warn`/`error` events in
             // the last 24h and link each row back to the same page with that
             // filter applied. `info` rows are markers, not signals, and stay out.
             let tmp = tempfile::tempdir().unwrap();
@@ -7239,9 +7236,9 @@ mod tests {
 
         #[tokio::test]
         async fn action_events_filters_are_whitelisted_and_applied() {
-            // CLAUDE-171: every filter narrows the list, and a value that is not
+            // Every filter narrows the list, and a value that is not
             // an actual distinct DB value drops to "all" instead of reaching SQL
-            // or being echoed back into the page. CLAUDE-235: the default is now
+            // or being echoed back into the page. The default is now
             // every action, and `since=24h` is a third window.
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
@@ -7421,11 +7418,11 @@ mod tests {
 
         #[tokio::test]
         async fn dashboard_banner_counts_events_and_names_the_access_subset() {
-            // CLAUDE-235: the dashboard states how many diagnostics there are and
-            // links to the Logs screen; it renders none of the message text that
-            // used to fill the first screen. CLAUDE-216: the repo-access subset
-            // is named separately (its remedy is the access check) and clears
-            // itself once a later poll records the recovery marker.
+            // The dashboard states how many diagnostics there are and links to
+            // the Logs screen; it renders none of the message text that used to
+            // fill the first screen. The repo-access subset is named separately
+            // (its remedy is the access check) and clears itself once a later
+            // poll records the recovery marker.
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             let failure = format!(
@@ -7504,8 +7501,8 @@ mod tests {
 
         #[test]
         fn events_view_binds_every_filter_value_as_a_parameter() {
-            // CLAUDE-171: the clause text is built from fixed fragments only;
-            // every value travels as a `?` bind, in clause order.
+            // The clause text is built from fixed fragments only; every value
+            // travels as a `?` bind, in clause order.
             let view = EventsView {
                 dir: "asc".to_string(),
                 level: "warn".to_string(),
@@ -7681,7 +7678,7 @@ mod tests {
             assert_eq!(body_string(resp).await, content);
         }
 
-        // ---- delete (CLAUDE-40) -------------------------------------------
+        // ---- delete ---------------------------------------------------------
 
         #[tokio::test]
         async fn action_delete_404s_unknown_409s_in_flight_then_removes() {
@@ -7756,7 +7753,7 @@ mod tests {
             assert_eq!(runs, 1, "run history survives the delete");
         }
 
-        // ---- structured YouTrack editor (CLAUDE-27) -----------------------
+        // ---- structured YouTrack editor -------------------------------------
 
         /// A populated form, covering native config + the generic blocks.
         fn filled_form() -> YoutrackEditForm {
@@ -7800,10 +7797,10 @@ mod tests {
             assert_eq!(a.limits.max_runs_per_day, Some(24));
             assert_eq!(a.limits.daily_budget_usd, Some(1.5));
             assert_eq!(a.claude.permission_mode.as_deref(), Some("acceptEdits"));
-            // CLAUDE-239: the editor carries the per-action model, so saving an
-            // action through the form does not drop a pinned `model:`.
+            // The editor carries the per-action model, so saving an action
+            // through the form does not drop a pinned `model:`.
             assert_eq!(a.claude.model.as_deref(), Some("opus"));
-            // CLAUDE-259: same for a pinned `effort:`.
+            // Same for a pinned `effort:`.
             assert_eq!(a.claude.effort.as_deref(), Some("xhigh"));
             let sched = a.schedule.unwrap();
             assert_eq!(sched.kind, crate::action::ScheduleKind::Interval);
@@ -7836,8 +7833,8 @@ mod tests {
 
         #[test]
         fn form_assignee_round_trips_and_clears() {
-            // CLAUDE-131: a filled Assignee box serializes to `assignee` and
-            // loads back; a blank box emits no `assignee` key (field cleared).
+            // A filled Assignee box serializes to `assignee` and loads back; a
+            // blank box emits no `assignee` key (field cleared).
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             f.yt_assignee = "octocat".to_string();
@@ -7957,8 +7954,8 @@ mod tests {
 
         #[test]
         fn github_token_ref_prefills() {
-            // CLAUDE-54: a loaded action with native.github.token_ref populates
-            // the form field.
+            // A loaded action with native.github.token_ref populates the form
+            // field.
             let yaml = "name: yt\nkind: youtrack\nnative:\n  github:\n    token_ref: gh-prod\n";
             let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
             let form = action_to_youtrack_form(&loaded.action).unwrap();
@@ -7967,9 +7964,8 @@ mod tests {
 
         #[test]
         fn github_token_ref_set_and_clear_round_trip() {
-            // CLAUDE-54: setting github_token_ref writes native.github.token_ref;
-            // clearing it drops the key and prunes an otherwise-default github
-            // block.
+            // Setting github_token_ref writes native.github.token_ref; clearing
+            // it drops the key and prunes an otherwise-default github block.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             f.github_token_ref = "gh-prod".to_string();
@@ -7994,8 +7990,8 @@ mod tests {
 
         #[test]
         fn github_block_preserved_on_save() {
-            // CLAUDE-54 no-wipe regression: an action whose YAML carries a full
-            // github block survives a structured-form save with hosts and
+            // No-wipe regression: an action whose YAML carries a full github
+            // block survives a structured-form save with hosts and
             // mcp_endpoint intact; only token_ref is touched by the form.
             let base: serde_yaml::Value = serde_yaml::from_str(
                 "name: yt\nkind: youtrack\nnative:\n  github:\n    token_ref: gh-old\n    hosts:\n      - ghe.example.com\n    mcp_endpoint: https://ghe.example.com/mcp/\n",
@@ -8016,10 +8012,10 @@ mod tests {
 
         #[test]
         fn github_block_unparsable_is_a_form_error_not_a_silent_reset() {
-            // CLAUDE-300: an unparsable native.github block must not be replaced
-            // with defaults on save (which would silently drop hosts /
-            // mcp_endpoint); it is a form error naming native.github, matching
-            // the numeric-limit fields' error shape.
+            // An unparsable native.github block must not be replaced with
+            // defaults on save (which would silently drop hosts / mcp_endpoint);
+            // it is a form error naming native.github, matching the
+            // numeric-limit fields' error shape.
             let base: serde_yaml::Value = serde_yaml::from_str(
                 "name: yt\nkind: youtrack\nnative:\n  github:\n    hosts: not-a-list\n",
             )
@@ -8035,8 +8031,8 @@ mod tests {
 
         #[test]
         fn dependency_gate_form_round_trips() {
-            // CLAUDE-298: saving the form's dependency-gate inputs writes them,
-            // and the saved file loads back with those exact values.
+            // Saving the form's dependency-gate inputs writes them, and the
+            // saved file loads back with those exact values.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             f.deps_enabled = None;
@@ -8095,8 +8091,8 @@ mod tests {
 
         #[test]
         fn write_projects_and_no_code_label_form_round_trip() {
-            // CLAUDE-298: saving `write_projects` and the no-code label writes
-            // them, and the saved file loads back with those exact values.
+            // Saving `write_projects` and the no-code label writes them, and
+            // the saved file loads back with those exact values.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             f.yt_write_projects = "BUNYIP, MAPPS".to_string();
@@ -8155,10 +8151,10 @@ mod tests {
 
         #[test]
         fn automerge_form_save_resets_deprecated_timings() {
-            // CLAUDE-293: automerge is event-driven now (CLAUDE-278), so the form
-            // no longer exposes the timing fields at all. Editing an action that
-            // still carries non-default timings (from before CLAUDE-278) through
-            // the form, with automerge ticked, resets both to their defaults.
+            // Automerge is event-driven now, so the form no longer exposes the
+            // timing fields at all. Editing an action that still carries
+            // non-default timings (from before that change) through the form,
+            // with automerge ticked, resets both to their defaults.
             let yaml = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    automerge:\n      enabled: true\n      wait_seconds: 600\n      check_interval_seconds: 15\n";
             let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
             let mut form = action_to_youtrack_form(&loaded.action).unwrap();
@@ -8177,8 +8173,8 @@ mod tests {
 
         #[test]
         fn automerge_editor_has_no_timing_inputs() {
-            // CLAUDE-293: the structured editor renders only the automerge
-            // checkbox; the timing inputs are gone from the markup entirely.
+            // The structured editor renders only the automerge checkbox; the
+            // timing inputs are gone from the markup entirely.
             use askama::Template as _;
             let tpl = super::super::YoutrackEditorTpl {
                 version: "test",
@@ -8205,9 +8201,8 @@ mod tests {
 
         #[test]
         fn automerge_default_omits_block() {
-            // CLAUDE-133: a form left at automerge defaults (disabled, default
-            // timings) writes no `automerge` block, so untouched actions are
-            // unchanged.
+            // A form left at automerge defaults (disabled, default timings)
+            // writes no `automerge` block, so untouched actions are unchanged.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
@@ -8216,8 +8211,8 @@ mod tests {
 
         #[test]
         fn done_label_round_trips_from_form() {
-            // CLAUDE-133: the done label is owned by the form; a non-default
-            // value serializes and reloads.
+            // The done label is owned by the form; a non-default value
+            // serializes and reloads.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             f.state_done = "Merged".to_string();
@@ -8228,8 +8223,8 @@ mod tests {
                 panic!("expected youtrack native config");
             };
             assert_eq!(yt.youtrack.states.done, "Merged");
-            // CLAUDE-327: `states.state_done` is deprecated, absent from the
-            // form, and always resolves to its default on save.
+            // `states.state_done` is deprecated, absent from the form, and
+            // always resolves to its default on save.
             assert_eq!(yt.youtrack.states.state_done, "Done");
 
             let form = action_to_youtrack_form(&loaded.action).unwrap();
@@ -8238,9 +8233,9 @@ mod tests {
 
         #[test]
         fn prompt_default_writes_no_override() {
-            // CLAUDE-125: a prompt left equal to the built-in default (the value
-            // the form prefills) stores no `prompt` key, so the action keeps
-            // tracking the built-in default.
+            // A prompt left equal to the built-in default (the value the form
+            // prefills) stores no `prompt` key, so the action keeps tracking
+            // the built-in default.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
@@ -8254,9 +8249,8 @@ mod tests {
 
         #[test]
         fn prompt_override_persists_verbatim() {
-            // CLAUDE-125: an edited prompt is stored as a full-replacement
-            // override; browser CRLF is normalized and surrounding whitespace
-            // trimmed.
+            // An edited prompt is stored as a full-replacement override; browser
+            // CRLF is normalized and surrounding whitespace trimmed.
             let mut f = super::super::youtrack_form_defaults();
             f.name = "yt".to_string();
             f.yt_prompt = "  Work {{key}}: {{summary}}\r\nin {{workdir}}.  ".to_string();
@@ -8273,8 +8267,8 @@ mod tests {
 
         #[test]
         fn prompt_prefills_from_saved_override() {
-            // CLAUDE-125: a loaded action with a prompt override prefills the form
-            // textarea with that override, not the default.
+            // A loaded action with a prompt override prefills the form textarea
+            // with that override, not the default.
             let yaml =
                 "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    prompt: custom {{key}}\n";
             let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
@@ -8284,8 +8278,8 @@ mod tests {
 
         #[test]
         fn prompt_prefills_default_when_unset() {
-            // CLAUDE-125: with no override, the form shows the built-in default so
-            // the operator edits the real prompt rather than a blank box.
+            // With no override, the form shows the built-in default so the
+            // operator edits the real prompt rather than a blank box.
             let yaml = "name: yt\nkind: youtrack\nnative: {}\n";
             let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
             let form = action_to_youtrack_form(&loaded.action).unwrap();
@@ -8434,9 +8428,9 @@ mod tests {
             assert!(written.contains("-Resolved AI Agent: Ready"));
         }
 
-        /// CLAUDE-300: saving over an action whose `native.github` block does not
-        /// parse is refused (422, naming `native.github`) and the file on disk is
-        /// left exactly as it was, not silently rewritten with defaults.
+        /// Saving over an action whose `native.github` block does not parse is
+        /// refused (422, naming `native.github`) and the file on disk is left
+        /// exactly as it was, not silently rewritten with defaults.
         #[tokio::test]
         async fn youtrack_edit_save_rejects_unparsable_github_block() {
             let tmp = tempfile::tempdir().unwrap();
@@ -8507,9 +8501,9 @@ mod tests {
 
         #[tokio::test]
         async fn youtrack_create_indexes_action_immediately() {
-            // CLAUDE-39: create re-indexes synchronously, so the action the
-            // redirect points at is in the index the instant create returns -
-            // no transient `unknown action` 404 while the daemon scan catches up.
+            // Create re-indexes synchronously, so the action the redirect points
+            // at is in the index the instant create returns: no transient
+            // `unknown action` 404 while the daemon scan catches up.
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
 
@@ -8589,9 +8583,9 @@ mod tests {
             assert!(body.contains("value=\"interval\" selected"));
         }
 
-        /// CLAUDE-259: the Effort select preselects the stored level, and a level
-        /// outside the documented set renders as its own selected option instead
-        /// of falling back to blank, so saving the form cannot silently drop or
+        /// The Effort select preselects the stored level, and a level outside
+        /// the documented set renders as its own selected option instead of
+        /// falling back to blank, so saving the form cannot silently drop or
         /// rewrite a value written by hand or through the API.
         #[tokio::test]
         async fn youtrack_edit_page_preselects_the_stored_effort() {
@@ -8654,8 +8648,8 @@ mod tests {
             );
         }
 
-        /// CLAUDE-300: a file that fails `validate_str` names why and links to
-        /// the raw editor (422), instead of a bare redirect that hides the reason.
+        /// A file that fails `validate_str` names why and links to the raw
+        /// editor (422), instead of a bare redirect that hides the reason.
         #[tokio::test]
         async fn youtrack_edit_page_shows_422_for_a_file_that_fails_to_validate() {
             let tmp = tempfile::tempdir().unwrap();
@@ -8678,8 +8672,8 @@ mod tests {
             assert!(body.contains("/actions/broken/edit"));
         }
 
-        /// CLAUDE-300: the same treatment via the real `/actions/:name/form`
-        /// route, which is where the browser actually lands.
+        /// The same treatment via the real `/actions/:name/form` route, which
+        /// is where the browser actually lands.
         #[tokio::test]
         async fn action_form_page_shows_422_for_a_file_that_fails_to_validate() {
             let tmp = tempfile::tempdir().unwrap();
@@ -8700,7 +8694,7 @@ mod tests {
             assert!(body.contains("/actions/broken/edit"));
         }
 
-        // ---- synthetic webhook action (CLAUDE-61) -------------------------
+        // ---- synthetic webhook action ---------------------------------------
 
         #[tokio::test]
         async fn action_list_includes_synthetic_only_when_webhook_enabled() {
@@ -8730,7 +8724,7 @@ mod tests {
             assert!(entry.schedule_kind.is_none(), "event-driven: no schedule");
         }
 
-        // ---- CLAUDE-289: listener visibility is live, no restart -----------
+        // ---- listener visibility is live, no restart ------------------------
 
         #[tokio::test]
         async fn dashboard_shows_webhook_listener_as_soon_as_a_source_is_saved() {
@@ -8883,8 +8877,8 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
 
-            // CLAUDE-220: export, edit, and delete all 403 EVERY reserved
-            // synthetic name (no YAML backs any of them).
+            // Export, edit, and delete all 403 EVERY reserved synthetic name
+            // (no YAML backs any of them).
             for synthetic in crate::web::SYNTHETIC_ACTIONS {
                 let export = action_export(State(s.clone()), AxumPath(synthetic.to_string()))
                     .await
@@ -8901,9 +8895,9 @@ mod tests {
             }
         }
 
-        /// CLAUDE-257: the two log size ceilings render on `/settings` in the
-        /// `Stream log GC` card and a POST to `/settings/stream_log_gc` applies
-        /// them live on the handle the daemon's log GC pass reads.
+        /// The two log size ceilings render on `/settings` in the `Stream log
+        /// GC` card and a POST to `/settings/stream_log_gc` applies them live
+        /// on the handle the daemon's log GC pass reads.
         #[tokio::test]
         async fn settings_page_renders_and_saves_the_log_size_ceilings() {
             let tmp = tempfile::tempdir().unwrap();
@@ -8947,10 +8941,9 @@ mod tests {
             assert_eq!(applied.output_file_max_bytes, 8192);
         }
 
-        /// CLAUDE-262: the two new retention windows (`snippets/` and
-        /// `webhook-logs/`) render on `/settings` in the same `Stream log GC`
-        /// card and round-trip through a save on the handle the daemon's sweep
-        /// loop reads.
+        /// The two retention windows (`snippets/` and `webhook-logs/`) render
+        /// on `/settings` in the same `Stream log GC` card and round-trip
+        /// through a save on the handle the daemon's sweep loop reads.
         #[tokio::test]
         async fn settings_page_renders_and_saves_the_snippet_and_webhook_log_windows() {
             let tmp = tempfile::tempdir().unwrap();
@@ -8991,9 +8984,9 @@ mod tests {
             assert_eq!(applied.webhook_log_retention_days, 14);
         }
 
-        /// CLAUDE-220: the `Comment webhook` section renders on `/settings` and a
-        /// POST to `/settings/webhook_comment` saves it, so the section is editable
-        /// in the app (the JSON API round-trip is covered in `api.rs`).
+        /// The `Comment webhook` section renders on `/settings` and a POST to
+        /// `/settings/webhook_comment` saves it, so the section is editable in
+        /// the app (the JSON API round-trip is covered in `api.rs`).
         #[tokio::test]
         async fn settings_page_renders_and_saves_the_comment_webhook_section() {
             let tmp = tempfile::tempdir().unwrap();
@@ -9063,8 +9056,8 @@ mod tests {
                 .contains_key("ng"));
         }
 
-        /// CLAUDE-239: the `Claude invocation` section renders on `/settings`, and
-        /// a POST to `/settings/claude` sets and clears the global default model
+        /// The `Claude invocation` section renders on `/settings`, and a POST
+        /// to `/settings/claude` sets and clears the global default model
         /// through the same live handle `ClaudeInvoker` reads per invocation.
         #[tokio::test]
         async fn settings_page_renders_and_saves_the_claude_section() {
@@ -9088,8 +9081,8 @@ mod tests {
             );
             assert!(html.contains("/settings/claude"), "with its form");
             assert!(html.contains("model"), "and its field reference");
-            // CLAUDE-259: the effort field reference plus the level picker that
-            // rewrites the `effort` key in the JSON editor, clear button included.
+            // The effort field reference plus the level picker that rewrites
+            // the `effort` key in the JSON editor, clear button included.
             assert!(html.contains("effort"), "the effort field reference");
             for level in crate::claude::EFFORT_LEVELS {
                 assert!(
@@ -9121,8 +9114,8 @@ mod tests {
                 Some("opus")
             );
 
-            // CLAUDE-259: the effort level saves and clears through the same
-            // document, on the same handle.
+            // The effort level saves and clears through the same document,
+            // on the same handle.
             assert_eq!(crate::settings::read_claude(&handle).effort, None);
             let saved = settings_save(
                 State(s.clone()),
@@ -9177,8 +9170,8 @@ mod tests {
             assert_eq!(crate::settings::read_claude(&handle).model, None);
         }
 
-        /// CLAUDE-269: while login-required, the Auth card badge reads "login
-        /// expired" (not "authenticated" or "required") and shows the CLI's own
+        /// While login-required, the Auth card badge reads "login expired"
+        /// (not "authenticated" or "required") and shows the CLI's own
         /// message above the sign-in control.
         #[tokio::test]
         async fn settings_page_shows_login_expired_while_login_required() {
@@ -9205,8 +9198,8 @@ mod tests {
             );
         }
 
-        /// CLAUDE-269: an Anthropic API key save clears login-required with no
-        /// restart, alongside a brokered sign-in and the status probe.
+        /// An Anthropic API key save clears login-required with no restart,
+        /// alongside a brokered sign-in and the status probe.
         #[tokio::test]
         async fn saving_an_api_key_clears_login_required() {
             use age::secrecy::ExposeSecret;
@@ -9243,8 +9236,8 @@ mod tests {
             std::env::remove_var(crate::secrets::KEY_FILE_ENV);
         }
 
-        /// CLAUDE-269: a completed brokered sign-in clears login-required with
-        /// no restart, the same as an API-key save.
+        /// A completed brokered sign-in clears login-required with no
+        /// restart, the same as an API-key save.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_completed_sign_in_clears_login_required() {
             let tmp = tempfile::tempdir().unwrap();
@@ -9294,8 +9287,8 @@ mod tests {
             );
         }
 
-        /// CLAUDE-269: the shared banner fragment renders nothing when ready,
-        /// the setup-incomplete wording with no credential, and the
+        /// The shared banner fragment renders nothing when ready, the
+        /// setup-incomplete wording with no credential, and the
         /// login-required wording (with the CLI's message) when tripped.
         #[tokio::test]
         async fn claude_banner_fragment_covers_both_not_ready_kinds_and_ready() {
@@ -9342,9 +9335,9 @@ mod tests {
             assert!(html.trim().is_empty(), "{html}");
         }
 
-        /// CLAUDE-269: the dashboard no longer renders its own setup banner;
-        /// the shared `base.html` poll region is what every page (dashboard
-        /// included) carries instead.
+        /// The dashboard no longer renders its own setup banner; the shared
+        /// `base.html` poll region is what every page (dashboard included)
+        /// carries instead.
         #[tokio::test]
         async fn dashboard_carries_the_shared_banner_poll_and_not_its_own() {
             let tmp = tempfile::tempdir().unwrap();
@@ -9363,9 +9356,9 @@ mod tests {
             );
         }
 
-        /// CLAUDE-220: the comment listener gets its own synthetic entry, injected
-        /// on the same rule (at least one configured source) and independent of
-        /// the CI-failure listener's.
+        /// The comment listener gets its own synthetic entry, injected on the
+        /// same rule (at least one configured source) and independent of the
+        /// CI-failure listener's.
         #[tokio::test]
         async fn comment_listener_has_its_own_synthetic_entry() {
             let tmp = tempfile::tempdir().unwrap();
@@ -9403,8 +9396,8 @@ mod tests {
             assert!(both.iter().any(|a| a.name == failure));
         }
 
-        /// CLAUDE-220: Pause / Resume works on the comment listener exactly like
-        /// on the CI-failure one (the shared `paused_actions` row drives both the
+        /// Pause / Resume works on the comment listener exactly like on the
+        /// CI-failure one (the shared `paused_actions` row drives both the
         /// badge here and the accept-and-drop in the endpoint).
         #[tokio::test]
         async fn comment_synthetic_action_reflects_pause_state() {
@@ -9438,9 +9431,9 @@ mod tests {
 
         #[tokio::test]
         async fn synthetic_action_reflects_pause_state() {
-            // CLAUDE-153: the synthetic webhook action participates in Pause. Its
-            // `paused` field is read from the shared `paused_actions` row, so a
-            // pause set on its name shows up on the dashboard (and Resume clears).
+            // The synthetic webhook action participates in Pause. Its `paused`
+            // field is read from the shared `paused_actions` row, so a pause
+            // set on its name shows up on the dashboard (and Resume clears).
             let tmp = tempfile::tempdir().unwrap();
             let s = web_state(tmp.path()).await;
             let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION;
@@ -9503,7 +9496,7 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
         }
 
-        // ---- structured editors for every native kind (CLAUDE-211) --------
+        // ---- structured editors for every native kind ----------------------
         //
         // `/actions/new` is a kind picker, every native kind has a form at
         // `/actions/new/<kind>`, and `/actions/:name/form` dispatches to the
@@ -9764,8 +9757,8 @@ mod tests {
             assert_eq!(cfg.custom_field, "Reporter");
         }
 
-        /// CLAUDE-300: same shape as `youtrack_edit_save`'s own base-parse guard.
-        /// An unparsable on-disk file must not be treated as an empty base: that
+        /// Same shape as `youtrack_edit_save`'s own base-parse guard: an
+        /// unparsable on-disk file must not be treated as an empty base, that
         /// would silently drop every key the closed-issue-summary form does not
         /// show. Calls the handler directly (`action_form_save` already refuses
         /// an unparsable file earlier via `indexed_action`) to exercise the
@@ -9859,7 +9852,7 @@ mod tests {
         }
     }
 
-    // ---- access check UI (CLAUDE-216) -------------------------------------
+    // ---- access check UI ---------------------------------------------------
 
     mod access_ui {
         use super::super::{access_page, AccessRowsTpl, AccessTpl};
@@ -9938,7 +9931,7 @@ mod tests {
             assert!(body.contains("<a href=\"/access\">Access</a>"), "{body}");
         }
 
-        /// CLAUDE-216: `/secrets` offers a per-secret identity probe.
+        /// `/secrets` offers a per-secret identity probe.
         #[tokio::test]
         async fn secrets_page_offers_a_per_secret_check() {
             let tmp = tempfile::tempdir().unwrap();
@@ -9969,7 +9962,7 @@ mod tests {
         }
     }
 
-    // ---- secrets UI (CLAUDE-26) -------------------------------------------
+    // ---- secrets UI ---------------------------------------------------------
     //
     // One test owns the `CLAUDE_RUN_SECRETS_KEY_FILE` env (no other test reads
     // it), so create -> list -> rotate -> delete runs against a stable key
@@ -10243,8 +10236,8 @@ mod tests {
             std::env::remove_var(crate::secrets::KEY_FILE_ENV);
         }
 
-        /// CLAUDE-358: saving a git identity records both fields verbatim and
-        /// the resolved values (not the `"claude-run"` default) show on the
+        /// Saving a git identity records both fields verbatim and the
+        /// resolved values (not the `"claude-run"` default) show on the
         /// page; leaving a field blank clears it back to the default rather
         /// than being refused as required input.
         #[tokio::test]
@@ -10359,7 +10352,7 @@ mod tests {
         #[tokio::test]
         async fn create_list_rotate_delete_is_write_only() {
             // Serialize against the webhook auth-log tests, which also set the
-            // process-global key-file env (CLAUDE-64).
+            // process-global key-file env.
             let _env = crate::secrets::key_file_env_lock().await;
             let tmp = tempfile::tempdir().unwrap();
             // Generate an age key and point the env at it for this test only.
@@ -10623,7 +10616,7 @@ mod tests {
         assert_eq!(latest_attempt_on_disk(logs, "act", "CLAUDE-9"), None);
     }
 
-    // ---- About page handlers (CLAUDE-129) ---------------------------------
+    // ---- About page handlers -----------------------------------------------
     //
     // The GET renders version + configured train; the check / apply POSTs route
     // through `crate::update`'s non-interactive cores. Network paths are covered
@@ -10691,9 +10684,8 @@ mod tests {
             assert!(body.contains("/about/update"), "{body}");
         }
 
-        /// CLAUDE-223: the Activity card carries the global Pause control and
-        /// the live indicator, and flips to Resume (with since / reason) once
-        /// paused.
+        /// The Activity card carries the global Pause control and the live
+        /// indicator, and flips to Resume (with since / reason) once paused.
         #[tokio::test]
         async fn activity_card_offers_pause_then_resume() {
             let s = web_state().await;
@@ -10713,9 +10705,9 @@ mod tests {
             assert!(!body.contains("Pause all activity"), "{body}");
         }
 
-        /// CLAUDE-223: the indicator's three states. Idle says it is safe to
-        /// restart; an open run row lists the run and links it; and a failed
-        /// activity query renders UNKNOWN, never idle.
+        /// The indicator's three states. Idle says it is safe to restart; an
+        /// open run row lists the run and links it; and a failed activity
+        /// query renders UNKNOWN, never idle.
         #[tokio::test]
         async fn activity_indicator_renders_idle_busy_and_unknown() {
             let s = web_state().await;
@@ -10773,7 +10765,7 @@ mod tests {
         }
     }
 
-    // ---- runs search (CLAUDE-143) -----------------------------------------
+    // ---- runs search ---------------------------------------------------------
 
     /// `search_jobs` finds jobs by summary (always) and, opt-in, by grepping the
     /// per-attempt stream `.jsonl` logs. The motivating case is a failure whose
@@ -10979,8 +10971,8 @@ mod tests {
             assert!(view.unreadable.is_empty());
         }
 
-        /// CLAUDE-246: a log that opens and then fails to read (invalid UTF-8 is
-        /// the cheapest real read error) is `Unreadable`, never the `Searched`
+        /// A log that opens and then fails to read (invalid UTF-8 is the
+        /// cheapest real read error) is `Unreadable`, never the `Searched`
         /// no-match value a whole-file scan would produce.
         #[tokio::test]
         async fn read_failure_is_not_a_clean_no_match() {

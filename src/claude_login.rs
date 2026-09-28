@@ -62,7 +62,7 @@ struct Pending {
     /// Only what the child wrote to stderr. A refused code is the CLI's own
     /// `Invalid code...` on stderr, while stdout carries the banner and the
     /// re-armed prompt; keeping them apart is what stops ordinary stdout
-    /// chatter from reading as a refusal (CLAUDE-267).
+    /// chatter from reading as a refusal.
     errors: Arc<Mutex<String>>,
 }
 
@@ -101,7 +101,7 @@ impl LoginBroker {
     /// Replaces any existing session: the operator pressing the button again
     /// means the old URL is stale, and leaving the old child running would leak
     /// a process. Blocking (spawn plus a bounded read), so callers on an async
-    /// task must wrap it per CLAUDE-228.
+    /// task must wrap it.
     pub fn start(&self, binary: &str, config_dir: &PathBuf) -> Result<String> {
         self.cancel();
 
@@ -146,7 +146,7 @@ impl LoginBroker {
                     // as it receives the URL, and `submit_code` marks the output
                     // length it has already seen; announcing first lets this line
                     // land after that mark, where it reads as the CLI answering
-                    // the code (CLAUDE-267).
+                    // the code.
                     append(&output, &line);
                     if !sent {
                         if let Some(url) = extract_url(&line) {
@@ -210,7 +210,7 @@ impl LoginBroker {
         };
 
         // Mark stderr, not the combined buffer: only the CLI's own error output
-        // answers a submitted code (CLAUDE-267).
+        // answers a submitted code.
         let mark = pending
             .errors
             .lock()
@@ -262,8 +262,8 @@ impl LoginBroker {
             if !fresh.is_empty() {
                 // An exit outranks late output: closing the pipes flushes the
                 // unterminated prompt as one last line, and reporting that as a
-                // refusal would fail a login that actually succeeded
-                // (CLAUDE-267). Re-check before believing the text.
+                // refusal would fail a login that actually succeeded.
+                // Re-check before believing the text.
                 if let Ok(Some(status)) = pending.child.try_wait() {
                     let seen = pending.output.lock().map(|o| o.clone()).unwrap_or_default();
                     let _ = pending.child.wait();
@@ -395,7 +395,7 @@ mod tests {
     fn a_login_round_trips_through_the_broker() {
         let tmp = tempfile::tempdir().unwrap();
         let stub = tmp.path().join("claude-stub");
-        // CLAUDE-255: written by an external `sh`, so this process never holds a
+        // Written by an external `sh`, so this process never holds a
         // writable descriptor a sibling test thread's fork could carry into the
         // exec below (`ETXTBSY`). See `crate::testutil::write_stub`.
         write_stub(
@@ -444,7 +444,7 @@ mod tests {
         assert!(err.to_string().contains("start one first"), "{err}");
     }
 
-    /// CLAUDE-267: banner lines the child prints after its authorize URL are not
+    /// Banner lines the child prints after its authorize URL are not
     /// the CLI answering a code, and must never be reported as a refusal.
     ///
     /// The stub emits the URL, then a slow trickle of further banner lines, so
@@ -480,8 +480,8 @@ mod tests {
         assert!(broker.view().is_none(), "a completed login holds nothing");
     }
 
-    /// The refusal path still reports the CLI's own wording, so fixing
-    /// CLAUDE-267 did not turn every refusal into a success.
+    /// The refusal path still reports the CLI's own wording, so a banner line
+    /// being misread never turns every refusal into a success.
     #[test]
     fn a_refused_code_still_reports_the_clis_wording() {
         let tmp = tempfile::tempdir().unwrap();

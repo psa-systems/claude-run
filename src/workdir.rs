@@ -35,7 +35,7 @@ pub fn job_workdir(base: &Path, action_name: &str, job_key: &str) -> PathBuf {
     base.join(action_name).join(job_key)
 }
 
-// ---- CLAUDE-281: the one local-only-work check every workdir deletion uses --
+// ---- The one local-only-work check every workdir deletion uses --
 
 /// One local branch tip and whether the live remote advertises it under its
 /// own name at the same SHA, or the tip equals the remote default branch's
@@ -140,7 +140,7 @@ pub fn uncommitted_or_stashed(workdir: &Path) -> Result<DirtyState, WorkCheckErr
     Ok(DirtyState { paths, stashes })
 }
 
-/// CLAUDE-281: the one check every workdir deletion site runs before
+/// The one check every workdir deletion site runs before
 /// deleting. "Local-only" means any of: commits on a local branch the remote
 /// does not have under that branch name (excluding a branch whose tip equals
 /// the remote default branch's tip, which has no commits of its own);
@@ -232,7 +232,7 @@ pub fn local_only_work(workdir: &Path) -> Result<LocalWork, WorkCheckError> {
     })
 }
 
-/// CLAUDE-105: remove gitignored build artifacts from a workdir about to be
+/// Remove gitignored build artifacts from a workdir about to be
 /// preserved. `git clean -fdX` deletes only ignored files and directories; a
 /// failure is logged and tolerated (the directory is still preserved).
 fn prune_ignored_artifacts(workdir: &Path) {
@@ -266,7 +266,7 @@ pub fn force_remove(workdir: &Path) {
     }
 }
 
-/// CLAUDE-102 / CLAUDE-281: the one guarded delete every runner uses. Deletes
+/// The one guarded delete every runner uses. Deletes
 /// only when [`local_only_work`] proves nothing exists solely in `workdir`;
 /// any local-only work, or a failed check, preserves instead (pruning
 /// gitignored build artifacts first) and logs what was found.
@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(p, PathBuf::from("/base/youtrack/MK-16"));
     }
 
-    // ---- CLAUDE-281: local_only_work / cleanup_or_preserve fixtures --------
+    // ---- local_only_work / cleanup_or_preserve fixtures --------
 
     fn git_in(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
@@ -363,7 +363,7 @@ mod tests {
         git_in(dir, &["commit", "-m", "feat: x"]);
     }
 
-    /// CLAUDE-105 shape: a `--single-branch` clone, mimicking the shallow
+    /// A `--single-branch` clone, mimicking the shallow
     /// clone the runner makes. Returns the clone path.
     fn origin_and_single_branch_clone(base: &Path) -> PathBuf {
         let origin = base.join("origin");

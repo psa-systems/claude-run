@@ -5,17 +5,17 @@
 
 {# Run detail polls faster (2s) than the dashboard because a run in progress
    should feel live. The polling div re-fetches this same URL and swaps just
-   its own subtree via hx-select. CLAUDE-89: the poll is suppressed while a
+   its own subtree via hx-select. The poll is suppressed while a
    summary dialog is open, because the swap would destroy it mid-read;
    refreshNow stays unconditional (user-initiated via the cancel button). #}
 <div id="poll-region"
-     {# CLAUDE-140: carry the current sort/filter selections through the poll so
+     {# Carry the current sort/filter selections through the poll so
         each 2s morph refresh re-renders the chosen view instead of resetting to
         the default ordering. #}
      hx-get="/runs/{{ run.id }}?{{ sort.poll_query() }}"
      hx-trigger="every 2s [!document.querySelector('dialog[open]')], refreshNow from:body"
      hx-select="#poll-region"
-     {# CLAUDE-139: morph in place (idiomorph) instead of replacing the subtree,
+     {# Morph in place (idiomorph) instead of replacing the subtree,
         so the poll does not wipe text selection / scroll / focus. #}
      hx-swap="morph:outerHTML">
 
@@ -26,7 +26,7 @@
     <dt>Started</dt>       <dd>{{ run.started_at|datetime }}</dd>
     <dt>Ended</dt>         <dd>{{ run.ended_at.as_deref().unwrap_or("running")|datetime }}</dd>
     <dt>Duration</dt>      <dd>{{ run.duration() }}</dd>
-    {# CLAUDE-80: live pipeline stage, present only while an in-flight run
+    {# Live pipeline stage, present only while an in-flight run
        reports one (webhook-forgejo). Updates ride the 2s poll. #}
     {% if run.ended_at.is_none() %}
       {% if let Some(st) = run.stage %}
@@ -39,7 +39,7 @@
     <dd>
       {% match run.exit_code %}
         {% when Some(0) %}<span class="badge ok">0</span>
-        {# CLAUDE-223: stopped by the global pause, distinct from cancelled. #}
+        {# Stopped by the global pause, distinct from cancelled. #}
         {% when Some(1) %}<span class="badge pause">paused</span>
         {% when Some(130) %}<span class="badge cancel">cancelled</span>
         {% when Some(c) %}<span class="badge bad">{{ c }}</span>
@@ -57,7 +57,7 @@
   </dl>
 </div>
 
-{# CLAUDE-1 / CLAUDE-12: planned jobs from input.command, populated at
+{# Planned jobs from input.command, populated at
    run-start. Each key links out via the action's link_template when set.
    Status is derived from job_outcomes plus the on-disk stream log: "running"
    = in flight (stream log present, run still active) and carries a watch-live
@@ -67,7 +67,7 @@
   <h2>Jobs in this batch</h2>
   <div class="card">
     <table>
-      {# CLAUDE-140: Job and State headers sort server-side (toggling asc/desc),
+      {# Job and State headers sort server-side (toggling asc/desc),
          and State carries a filter dropdown over the runner's actual job-state
          set. Each control re-requests this region with the sort/filter encoded
          in namespaced query params and morph-swaps it in place. #}
@@ -127,7 +127,7 @@
               {% if let Some(a) = p.watch_attempt %}
                 <a href="/runs/{{ run.id }}/jobs/{{ p.key }}/attempt/{{ a }}">watch live</a>
               {% else if p.status == "running" %}
-                {# CLAUDE-80: no stream to watch (webhook-forgejo), but the
+                {# No stream to watch (webhook-forgejo), but the
                    run's live stage says what the pipeline is doing right now. #}
                 {% if let Some(st) = run.stage %}
                   <span class="dim">{{ st }}</span>
@@ -149,7 +149,7 @@
 {% if !has_outcomes %}
   <div class="card"><span class="dim">No jobs yet.</span></div>
 {% else %}
-  {# CLAUDE-140: every header sorts server-side (toggling asc/desc); OK, Claude
+  {# Every header sorts server-side (toggling asc/desc); OK, Claude
      and Counted also carry filter dropdowns. Controls re-request this region
      with the selection encoded in `out_*` query params and morph-swap in
      place, so the choice survives the 2s poll. #}
@@ -226,7 +226,7 @@
       {% for o in outcomes %}
         <tr>
           <td class="mono">
-            {# CLAUDE-93: a per-job link recorded on the run (webhook html_url)
+            {# A per-job link recorded on the run (webhook html_url)
                wins over the action's link_template. #}
             {% if let Some(u) = job_links.get(o.job_key.as_str()) %}
               <a href="{{ u }}" target="_blank" rel="noopener">{{ o.job_key }}</a>
@@ -262,7 +262,7 @@
               <a href="/runs/{{ run.id }}/jobs/{{ o.job_key }}/attempt/{{ o.attempt }}">view stream</a>
             {% else %}<span class="dim">-</span>{% endif %}
           </td>
-          {# CLAUDE-89: clamp the summary to two lines in the cell; the full
+          {# Clamp the summary to two lines in the cell; the full
              text opens in a native <dialog> rendered from Markdown to HTML
              server-side (raw HTML escaped, see render_summary_markdown). #}
           <td class="summary-cell">
@@ -271,7 +271,7 @@
               <a href="#" onclick="this.nextElementSibling.showModal(); return false;">view details</a>
               <dialog class="summary-dialog">
                 <div class="summary-dialog-head">
-                  {# CLAUDE-108: link the job key in the modal heading, reusing
+                  {# Link the job key in the modal heading, reusing
                      the outcomes-table precedence: job_links > link_template >
                      plain text. Only the key is wrapped; "- attempt N" stays
                      outside the anchor. #}

@@ -1,6 +1,6 @@
-//! Forgejo Action log fetch with retry and secret redaction (CLAUDE-44).
+//! Forgejo Action log fetch with retry and secret redaction.
 //!
-//! A run's logs are read through the `fj` CLI (CLAUDE-204):
+//! A run's logs are read through the `fj` CLI:
 //!
 //! ```text
 //! fj --host <host> actions logs --repo <owner>/<repo> --json <run_number>
@@ -20,7 +20,7 @@
 //! text is run through [`redact`] so CI tokens (a failed publish step can echo
 //! one) do not land in storage or a YouTrack attachment.
 //!
-//! ## Auth (CLAUDE-92 / CLAUDE-96 / CLAUDE-200)
+//! ## Auth
 //!
 //! A private repo's read is authorized by the `log_token_ref` mapped to that
 //! repo. The resolved PAT reaches the `fj` child through a temp single-host
@@ -30,11 +30,11 @@
 //! `read:repository` is the only scope needed: the three endpoints `fj` calls
 //! all sit in Forgejo's repository group behind `reqRepoReader(unit.TypeActions)`.
 //!
-//! ## Every forge read goes through `fj` (CLAUDE-205)
+//! ## Every forge read goes through `fj`
 //!
 //! The runs list and the raw workflow YAML were the last two hand-rolled REST
-//! calls; they now shell out to `fj actions runs` (FJ-66) and `fj repo file`
-//! (FJ-67). The three read seams ([`ActionLogClient`], [`ActionRunsClient`],
+//! calls; they now shell out to `fj actions runs` and `fj repo file`.
+//! The three read seams ([`ActionLogClient`], [`ActionRunsClient`],
 //! [`RepoFileClient`]) are collected in [`ForgeReads`] so a caller holds ONE
 //! client, and this module builds no HTTP request at all.
 
@@ -86,21 +86,21 @@ pub struct JobLog {
     /// that 404 to an empty log); an empty log is NOT a fetch miss.
     #[serde(default)]
     pub log: String,
-    /// FJ-79: what `fj` says about this log: `available`, `missing` (gone for
+    /// What `fj` says about this log: `available`, `missing` (gone for
     /// good, so re-asking can never help) or `unavailable` (it could not be read
     /// this time). Empty from an `fj` predating FJ-79, which is why it defaults:
     /// its absence means "nothing known", never "gone".
     #[serde(default)]
     pub log_state: String,
-    /// FJ-79: the forge's own reason [`JobLog::log`] is empty, when it is.
+    /// The forge's own reason [`JobLog::log`] is empty, when it is.
     #[serde(default)]
     pub log_reason: Option<String>,
 }
 
-/// FJ-79's [`JobLog::log_state`] value that means the log is gone for good.
+/// The [`JobLog::log_state`] value that means the log is gone for good.
 pub const LOG_STATE_MISSING: &str = "missing";
 
-/// CLAUDE-240: `Some(reason)` when `fj` reports EVERY job's log as permanently
+/// `Some(reason)` when `fj` reports EVERY job's log as permanently
 /// missing (the FJ-79 signal), so the run has no log to analyze and never will.
 /// `None` when any job carries a log, when the run has no jobs, or when the `fj`
 /// that answered predates FJ-79 and says nothing about the state: this may only
@@ -162,7 +162,7 @@ pub trait ActionLogClient: Send + Sync {
     ) -> RunLogsOutcome;
 }
 
-/// CLAUDE-205: seam over `fj actions runs`, implemented by
+/// Seam over `fj actions runs`, implemented by
 /// [`crate::provider::cli::FjForgeReads`]. The implementation owns the paging,
 /// so a caller asks once for up to `max_pages` pages worth of runs.
 pub trait ActionRunsClient: Send + Sync {
@@ -177,7 +177,7 @@ pub trait ActionRunsClient: Send + Sync {
         token: Option<&str>,
     ) -> RunsListOutcome;
 
-    /// CLAUDE-236: read ONE run's forge-reported `started` / `stopped` through
+    /// Read ONE run's forge-reported `started` / `stopped` through
     /// `fj actions runs --json --run-number <n>` (one run, not a paged scan).
     /// `Err` carries a human-readable reason (an unreadable page, a page
     /// carrying no such run, a run reporting no times), so a best-effort caller
@@ -191,7 +191,7 @@ pub trait ActionRunsClient: Send + Sync {
     ) -> std::result::Result<RunTiming, String>;
 }
 
-/// CLAUDE-205: seam over `fj repo file`, implemented by
+/// Seam over `fj repo file`, implemented by
 /// [`crate::provider::cli::FjForgeReads`].
 pub trait RepoFileClient: Send + Sync {
     /// Read `path` in `repo` at `git_ref` on forge `host`, returning the file's
@@ -208,7 +208,7 @@ pub trait RepoFileClient: Send + Sync {
 }
 
 /// Every forge read the CI-failure actions make, so each holds ONE client
-/// instead of one per endpoint (CLAUDE-205).
+/// instead of one per endpoint.
 pub trait ForgeReads: ActionLogClient + ActionRunsClient + RepoFileClient {}
 
 impl<T: ActionLogClient + ActionRunsClient + RepoFileClient> ForgeReads for T {}
@@ -274,8 +274,8 @@ impl Default for LogFetchConfig {
 }
 
 impl LogFetchConfig {
-    /// One call, no backoff. For the polling actions (CLAUDE-189 / CLAUDE-191),
-    /// which read runs that finished long ago: a run `fj` cannot see there is
+    /// One call, no backoff. For the polling actions, which read runs that
+    /// finished long ago: a run `fj` cannot see there is
     /// pruned, not un-flushed, so waiting only burns the budget per issue. The
     /// webhook consumer keeps the retrying default, since its event arrives the
     /// moment the run finishes.
@@ -423,7 +423,7 @@ fn write_artifact(out_dir: &Path, target: &LogTarget, text: &str) -> Result<Path
     Ok(path)
 }
 
-/// CLAUDE-191: one run pulled from the runs-list JSON with the full set of fields
+/// One run pulled from the runs-list JSON with the full set of fields
 /// the auto-close reconciler needs to group and evaluate runs. The reconciler
 /// reduces these to the LATEST run per `(branch, workflow_id)` and reads each
 /// latest run's per-job status from the jobs `fj actions logs` returns.
@@ -443,7 +443,7 @@ pub struct RunEntry {
     pub status: String,
     /// The run web URL, used to derive the forge origin and link the close comment.
     pub html_url: String,
-    /// CLAUDE-240: when the run stopped, as the runs list reports it: `stopped`,
+    /// When the run stopped, as the runs list reports it: `stopped`,
     /// else `updated`, else `created`. Empty when the page carries none of the
     /// three, so a caller must read an empty value as "unknown", never as "long
     /// ago". The CI-failure age fallback reads the same value for ONE run
@@ -451,7 +451,7 @@ pub struct RunEntry {
     pub stopped: String,
 }
 
-/// CLAUDE-191: parse one `fj actions runs --json` page into [`RunEntry`]s,
+/// Parse one `fj actions runs --json` page into [`RunEntry`]s,
 /// tolerant of Forgejo's field naming. Runs missing an `id` are skipped. The
 /// branch is empty when the page carries no plain branch name (the reconciler
 /// then resolves it from the log).
@@ -515,7 +515,7 @@ fn run_index(run: &serde_json::Value) -> i64 {
         .unwrap_or(0)
 }
 
-/// CLAUDE-236: one run's forge-reported start / stop times. Handed to the
+/// One run's forge-reported start / stop times. Handed to the
 /// CI-failure analysis so it can tell a job that stopped emitting output and was
 /// killed (a long gap between the last log line and `stopped`) from a capture
 /// that lost data.
@@ -527,7 +527,7 @@ pub struct RunTiming {
     pub stopped: String,
 }
 
-/// CLAUDE-236: read `run_number`'s `started` / `stopped` out of a
+/// Read `run_number`'s `started` / `stopped` out of a
 /// `fj actions runs --json` page. `Err` names the reason (unparseable page, no
 /// such run, a run still in flight that reports no stop time), so the caller
 /// logs it and analyzes without the timing rather than inventing one.
@@ -552,7 +552,7 @@ pub fn parse_run_timing(stdout: &str, run_number: i64) -> std::result::Result<Ru
     Ok(RunTiming { started, stopped })
 }
 
-/// CLAUDE-205: keep a plain branch name, drop anything else. `fj`'s
+/// Keep a plain branch name, drop anything else. `fj`'s
 /// `head_branch` is Forgejo's `prettyref`, which is the branch name only for a
 /// branch push; verified against `dev.a8n.run`, a PR run reports `#<pr-number>`
 /// and a ref-deleted push reports the bare commit sha. A non-branch value is
@@ -573,7 +573,7 @@ fn branch_name(value: &str) -> String {
     }
 }
 
-/// CLAUDE-191: outcome of fetching the runs list. Auth-class / not-found responses
+/// Outcome of fetching the runs list. Auth-class / not-found responses
 /// on the FIRST page are terminal; a mid-paging error stops paging and returns the
 /// entries already collected (partial coverage is better than none for a poll).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -584,7 +584,7 @@ pub enum RunsListOutcome {
     Failed(String),
 }
 
-/// CLAUDE-189: candidate repo paths a failing workflow file may live under, tried
+/// Candidate repo paths a failing workflow file may live under, tried
 /// in order. `workflow_id` is the payload's workflow filename (e.g. `check.yml`).
 const WORKFLOW_DIRS: &[&str] = &[
     ".forgejo/workflows",
@@ -592,10 +592,10 @@ const WORKFLOW_DIRS: &[&str] = &[
     ".gitea/workflows",
 ];
 
-/// CLAUDE-189: read the failing workflow's YAML from the repo at the failing
+/// Read the failing workflow's YAML from the repo at the failing
 /// commit, read-only, so the analysis can map log position to workflow step
 /// order. Tries each known workflow directory through `fj repo file`
-/// (CLAUDE-205) and returns the first that resolves, redacted. `None` when none
+/// and returns the first that resolves, redacted. `None` when none
 /// resolve (the analysis proceeds over the log alone and says the YAML was
 /// unavailable). Never errors on a miss.
 pub fn read_workflow_yaml<C: RepoFileClient + ?Sized>(
@@ -654,7 +654,7 @@ impl RefEnv {
     }
 }
 
-/// CLAUDE-199: collect the ref fields from both forms a runner log uses: a
+/// Collect the ref fields from both forms a runner log uses: a
 /// line-leading `KEY=value` env dump, and the `setupEnv => map[K:V K:V ...]`
 /// Go map dump the deployed Forgejo runner prints (one whitespace-separated
 /// token per variable, key and value split at the first colon).
@@ -698,7 +698,7 @@ fn branch_from_ref(value: &str) -> Option<&str> {
     }
 }
 
-/// CLAUDE-190/199: parse the failing run's branch from a redacted job log's
+/// Parse the failing run's branch from a redacted job log's
 /// environment dump. The run-detail API returns `head_branch: null` on the
 /// deployed Forgejo, so the log is the reliable source.
 ///
@@ -728,7 +728,7 @@ pub fn parse_branch_from_log(log: &str) -> Option<String> {
     env.ref_name
 }
 
-/// CLAUDE-190: resolve the branch, preferring a non-empty run-detail `head_branch`
+/// Resolve the branch, preferring a non-empty run-detail `head_branch`
 /// and falling back to the log environment dump. On the deployed Forgejo run
 /// detail returns `head_branch: null`, so in practice this is the log parse; the
 /// run-detail arm keeps the resolver correct where the field IS populated.
@@ -739,7 +739,7 @@ pub fn resolve_branch(run_detail_branch: Option<&str>, log: &str) -> Option<Stri
     }
 }
 
-/// CLAUDE-190/204: the failing job of a run, selected from the jobs `fj actions
+/// The failing job of a run, selected from the jobs `fj actions
 /// logs` returned: the first job whose status denotes a failure, else the first
 /// job. `None` for a run with no jobs. The job's position in the slice is its
 /// job index in run order, so nothing has to assume index 0.
@@ -757,12 +757,12 @@ fn is_failure_status(s: &str) -> bool {
     )
 }
 
-/// CLAUDE-208: job statuses that mean the run was stopped rather than broken. A
+/// Job statuses that mean the run was stopped rather than broken. A
 /// push that supersedes an in-flight run leaves every job `cancelled`, and a
 /// server-side skipped job never ran; neither is a defect in the repository.
 const STOPPED_STATUSES: &[&str] = &["cancelled", "skipped"];
 
-/// CLAUDE-208: what a run's job list says about whether anything actually
+/// What a run's job list says about whether anything actually
 /// failed. Forgejo reports run-level `failure` for a run whose jobs were merely
 /// cancelled (a newer push superseded it), so the payload status alone cannot
 /// tell a broken build from a stopped one.
@@ -917,7 +917,7 @@ mod tests {
         }
     }
 
-    // ---- CLAUDE-204: `fj actions logs` fetch ------------------------------
+    // ---- `fj actions logs` fetch ------------------------------------------
 
     /// Scripted [`ActionLogClient`]: pops queued outcomes in order, defaulting
     /// to a not-found once drained so an "always missing" run is easy to set up.
@@ -970,7 +970,7 @@ mod tests {
         }
     }
 
-    /// A job whose log `fj` reports as permanently gone (FJ-79).
+    /// A job whose log `fj` reports as permanently gone.
     fn missing_job(name: &str, reason: &str) -> JobLog {
         JobLog {
             name: name.to_string(),
@@ -1145,7 +1145,7 @@ mod tests {
         assert!(parse_run_logs("not json").is_err());
     }
 
-    /// CLAUDE-240 AC: an `fj` predating FJ-79 emits no `log_state`, and its
+    /// An `fj` predating FJ-79 emits no `log_state`, and its
     /// output parses exactly as before, with nothing known about the state.
     #[test]
     fn parse_run_logs_still_reads_a_pre_fj79_document() {
@@ -1161,7 +1161,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-240 AC: the per-job state FJ-79 added is parsed, so a log that is
+    /// The per-job state FJ-79 added is parsed, so a log that is
     /// gone for good is distinguishable from a job that printed nothing. The
     /// document is the shape `fj actions logs --format json` emits: `log_state`
     /// is one of `available` / `missing` / `unavailable`, with `log_reason` null
@@ -1182,7 +1182,7 @@ mod tests {
         assert!(logs_permanently_missing(&jobs).is_none());
     }
 
-    /// CLAUDE-240 AC: a run whose EVERY job log is gone is reported as
+    /// A run whose EVERY job log is gone is reported as
     /// permanently missing, carrying the forge's own reason.
     #[test]
     fn every_job_missing_is_permanently_missing_with_the_reason() {
@@ -1228,7 +1228,7 @@ mod tests {
         assert!(LogTarget::for_run("", "contoso/claude-run", 7, None).is_none());
     }
 
-    /// CLAUDE-205 AC: this module builds no Forgejo HTTP request; every forge
+    /// This module builds no Forgejo HTTP request; every forge
     /// read shells out to `fj`. Fails if a hand-rolled REST path is
     /// reintroduced here. The needles are split so this test does not match
     /// itself.
@@ -1243,7 +1243,7 @@ mod tests {
         }
     }
 
-    // ---- CLAUDE-191 / CLAUDE-205: runs-list entries from `fj actions runs` --
+    // ---- runs-list entries from `fj actions runs` --------------------------
 
     const TEST_REPO: &str = "initech/chat";
 
@@ -1331,7 +1331,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-240 AC: a run entry carries the run's stop time, read from
+    /// A run entry carries the run's stop time, read from
     /// `stopped` with `updated` then `created` as fallbacks; all three absent is
     /// tolerated as an empty (unknown) value rather than a parse failure.
     #[test]
@@ -1359,7 +1359,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-236: one run's start / stop times ------------------------
+    // ---- one run's start / stop times --------------------------------------
 
     /// AC: the parse reads `started` / `stopped` off a real
     /// `fj actions runs --json` page, selecting the run by its per-repo number.
@@ -1399,7 +1399,7 @@ mod tests {
         assert_eq!(entries[0].index, 3);
     }
 
-    // ---- CLAUDE-189 / CLAUDE-205: workflow YAML through `fj repo file` -----
+    // ---- workflow YAML through `fj repo file` -------------------------------
 
     /// A [`RepoFileClient`] serving canned results keyed by path, recording every
     /// `(path, git_ref)` it was asked for.
@@ -1531,7 +1531,7 @@ mod tests {
         assert_eq!(out, "value is abc");
     }
 
-    // ---- CLAUDE-190: branch parse + resolve -------------------------------
+    // ---- branch parse + resolve ---------------------------------------------
 
     #[test]
     fn parse_branch_reads_the_checkout_ref() {
@@ -1560,7 +1560,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-199: both log forms crossed with both trigger types -------
+    // ---- both log forms crossed with both trigger types ---------------------
     //
     // The `*-map-*` fixtures are the `setupEnv => map[...]` lines captured
     // from stored runner logs (a PR run and a push run), with repo names and
@@ -1647,7 +1647,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-204: failing-job selection over the fj job list -----------
+    // ---- failing-job selection over the fj job list -------------------------
 
     #[test]
     fn resolve_failing_job_picks_the_failing_one() {
@@ -1677,7 +1677,7 @@ mod tests {
         }
     }
 
-    // ---- CLAUDE-208: run-level verdict over the job list ------------------
+    // ---- run-level verdict over the job list ---------------------------------
 
     #[test]
     fn jobs_verdict_all_cancelled_is_a_stopped_run() {

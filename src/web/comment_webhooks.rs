@@ -1,14 +1,14 @@
-//! Forgejo comment listener (CLAUDE-220, CLAUDE-221).
+//! Forgejo comment listener.
 //!
 //! `POST /webhooks/forgejo-comment/{source}` receives Forgejo `issue_comment`
 //! deliveries. A human comments `/claude <instruction>` and claude-run serves it
 //! on one of two routes, chosen by whether the comment's thread is a pull
 //! request:
 //!
-//! - PULL REQUEST (CLAUDE-220): clone that PR's head branch, run Claude Code
+//! - PULL REQUEST: clone that PR's head branch, run Claude Code
 //!   against the instruction, push a corrective commit within the decision-gate
 //!   caps, and reply on the PR with the outcome.
-//! - PLAIN ISSUE (CLAUDE-221): there is no head branch to clone or push, so
+//! - PLAIN ISSUE: there is no head branch to clone or push, so
 //!   nothing is run here. Mint a YouTrack issue carrying the instruction and a
 //!   link back to the Forgejo issue, in the project the repo routes to, set
 //!   `AI Agent = Queued` so the existing `youtrack` native action works it, and
@@ -80,7 +80,7 @@ use super::webhooks::{
     SeenDeliveries, DELIVERY_HEADER, SIGNATURE_HEADER,
 };
 
-/// Synthetic action name the comment listener records its runs and DEV-335 caps
+/// Synthetic action name the comment listener records its runs and caps
 /// under, alongside `webhook-forgejo`. Reserved: an on-disk YAML claiming it is
 /// refused at scan, and trigger / edit / export / delete are rejected for it.
 pub const WEBHOOK_COMMENT_ACTION: &str = "webhook-forgejo-comment";
@@ -108,7 +108,7 @@ const DENIAL_REPLY_WINDOW_SECS: u64 = 600;
 /// Live stage labels for the comment pipeline, surfaced on the run-detail page.
 const STAGE_AUTHORIZING: &str = "checking commenter permission";
 const STAGE_RUNNING: &str = "cloning the PR branch and running claude";
-/// CLAUDE-221: the plain-issue route's counterpart to [`STAGE_RUNNING`].
+/// The plain-issue route's counterpart to [`STAGE_RUNNING`].
 const STAGE_MINTING: &str = "minting a queued YouTrack issue";
 const STAGE_FINALIZING: &str = "finalizing (push / comment)";
 
@@ -142,7 +142,7 @@ pub struct Comment {
 pub struct Issue {
     pub number: u64,
     /// Present only on pull requests. Absent means a plain issue, which routes
-    /// to the CLAUDE-221 mint instead of the CLAUDE-220 clone-and-push run.
+    /// to the mint instead of the clone-and-push run.
     #[serde(default)]
     pub pull_request: Option<serde_json::Value>,
     #[serde(default)]
@@ -189,7 +189,7 @@ pub struct VerifiedCommentCommand {
     /// The thread's number: a PR number when `is_pull_request`, else a plain
     /// issue number.
     pub number: u64,
-    /// CLAUDE-221: whether the comment's thread is a pull request. Selects the
+    /// Whether the comment's thread is a pull request. Selects the
     /// route (clone-and-push vs mint) and which `fj` comment call replies.
     pub is_pull_request: bool,
     /// Forgejo comment id; part of the dedupe / attempt key.
@@ -206,16 +206,16 @@ pub struct VerifiedCommentCommand {
 impl VerifiedCommentCommand {
     /// The dedupe / attempt key: `hash(repo, number, comment_id)`. Hashed (not
     /// concatenated) so the key is a fixed-width, path-safe workdir and log-file
-    /// segment regardless of how long the repo path is. Unchanged by CLAUDE-221:
-    /// a Forgejo comment id is unique across a repo's issues and pull requests,
-    /// so both routes dedupe through this one key.
+    /// segment regardless of how long the repo path is. A Forgejo comment id is
+    /// unique across a repo's issues and pull requests, so both routes dedupe
+    /// through this one key.
     pub fn key(&self) -> String {
         command_key(&self.repo, self.number, self.comment_id)
     }
 
     /// The per-thread serialization key: at most one comment job per pull
     /// request, and per plain issue. The kind is part of the key because a repo
-    /// numbers issues and pull requests in ONE sequence per thread type is not
+    /// numbering issues and pull requests in ONE sequence per thread type is not
     /// guaranteed across forges; keeping them distinct means an issue can never
     /// block the like-numbered PR.
     fn pr_gate_key(&self) -> String {
@@ -503,8 +503,8 @@ async fn forgejo_comment_webhook(
     );
 
     // 5. Pause: accept-and-drop, matching every other action's "paused = does not
-    // run" and keeping Forgejo from retrying. CLAUDE-223: the GLOBAL pause is
-    // checked first, through the same shared gate the CI-failure listener takes.
+    // run" and keeping Forgejo from retrying. The GLOBAL pause is checked
+    // first, through the same shared gate the CI-failure listener takes.
     if crate::web::webhooks::paused_accept_and_drop(
         &st.pool,
         WEBHOOK_COMMENT_ACTION,
@@ -665,11 +665,11 @@ pub struct CommentContext {
     /// Live comment config, re-read per command so a Settings save applies
     /// without a restart.
     pub config: Arc<RwLock<CommentWebhookConfig>>,
-    /// CLAUDE-221: live mint config, shared with the CI-failure mint rather than
+    /// Live mint config, shared with the CI-failure mint rather than
     /// re-declared, so the plain-issue route reads the same routing overrides,
     /// fallback project, target state, and `AI Agent` field / queued value.
     pub mint_cfg: Arc<RwLock<MintConfig>>,
-    /// CLAUDE-221: the TTL-cached inverse VCS routing map, so the plain-issue
+    /// The TTL-cached inverse VCS routing map, so the plain-issue
     /// mint resolves the repo's YouTrack project the same way the webhook mint
     /// does (override, then VCS integration, then fallback).
     pub route_cache: Arc<crate::mint::VcsRouteCache>,
@@ -680,7 +680,7 @@ pub struct CommentContext {
     pub keygate: KeyGate,
     /// Per-(repo, login) denial-reply throttle.
     pub denials: Arc<DenialReplyLimiter>,
-    /// CLAUDE-269: `None` outside the daemon (tests). When set, a command is
+    /// `None` outside the daemon (tests). When set, a command is
     /// refused with a reply naming the reason instead of invoking `claude`,
     /// while the Claude login needs renewing.
     pub readiness: Option<crate::readiness::ReadinessGate>,
@@ -710,7 +710,7 @@ struct ServeEnv {
 
 /// Serve one accepted command end to end: authorize, then help / refuse / run.
 async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
-    // CLAUDE-335: a command accepted before a pause was set must not act after it.
+    // A command accepted before a pause was set must not act after it.
     if crate::web::webhooks::webhook_action_paused(
         &ctx.pool,
         WEBHOOK_COMMENT_ACTION,
@@ -810,7 +810,7 @@ pub fn counts_attempt(kind: &CommandKind) -> bool {
     matches!(kind, CommandKind::Run { .. })
 }
 
-/// Whether a command may run, given the reused DEV-335 counters.
+/// Whether a command may run, given the reused counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
     Run,
@@ -841,7 +841,7 @@ pub fn admit(
 }
 
 /// Resolve the source's `write_token_ref` and build a forge backend that carries
-/// it in a temp single-host `keys.json` (the CLAUDE-26 mechanism), so the token
+/// it in a temp single-host `keys.json`, so the token
 /// never appears in YAML, env, a process argument, or a settings response.
 async fn build_env(
     ctx: &CommentContext,
@@ -880,7 +880,7 @@ async fn build_env(
 }
 
 /// Post `body_file` on the thread the command came from: `fj pr comment` for a
-/// pull request, `fj issue comment` for a plain issue (CLAUDE-221). The one
+/// pull request, `fj issue comment` for a plain issue. The one
 /// place both reply paths dispatch, so no caller has to know which forge call
 /// applies.
 fn post_on_thread(
@@ -929,7 +929,7 @@ async fn reply(
 }
 
 /// Work a real instruction: caps + dedupe, run row, then the route's work (the
-/// PR clone / Claude / decision gate / push, or the CLAUDE-221 plain-issue
+/// PR clone / Claude / decision gate / push, or the plain-issue
 /// mint), with a reply on EVERY outcome path.
 async fn run_instruction(
     ctx: &CommentContext,
@@ -939,7 +939,7 @@ async fn run_instruction(
     src: &CommentWebhookSource,
     instruction: String,
 ) {
-    // CLAUDE-269: right after the pause check (already taken before this
+    // Right after the pause check (already taken before this
     // command was accepted), refuse before admission so no attempt counter is
     // advanced and no `claude` runs. Unlike the CI-triage webhook's silent
     // accept-and-drop, this route knows the thread, so it replies naming the
@@ -956,7 +956,7 @@ async fn run_instruction(
         }
     }
 
-    // Reused DEV-335 caps. The per-key counter also IS the redelivery guard: a
+    // Reused caps. The per-key counter also IS the redelivery guard: a
     // comment is a one-shot, so its effective cap is one attempt however high the
     // runner default is, and the counter is advanced BEFORE the work so a
     // redelivery arriving mid-run always sees it.
@@ -998,10 +998,10 @@ async fn run_instruction(
     let stream_log =
         ClaudeInvoker::stream_log_path(&ctx.paths.logs_dir(), WEBHOOK_COMMENT_ACTION, key, 1);
 
-    // The route: a pull-request comment runs the CLAUDE-220 clone / Claude /
+    // The route: a pull-request comment runs the clone / Claude /
     // push pipeline; a plain-issue comment mints a Queued YouTrack issue and
-    // starts no agent session (CLAUDE-221).
-    // DEV-705: one comment delivery is one run, so its ceiling is resolved from
+    // starts no agent session.
+    // One comment delivery is one run, so its ceiling is resolved from
     // the runner defaults before the agent starts and cannot be raised while it
     // works.
     let spend = crate::usage::RunSpend::new(
@@ -1046,7 +1046,7 @@ async fn run_instruction(
         let route_cache = ctx.route_cache.clone();
         let cmd = cmd.clone();
         let workdir = workdir.clone();
-        // CLAUDE-234: one ledger for this delivery's run, so the mint's writes
+        // One ledger for this delivery's run, so the mint's writes
         // are journalled with `run_id` and bounded by the run's ceiling.
         let audit = crate::provider::IssueWriteAudit::new(run_id, ctx.defaults.max_issues_per_run);
         tokio::task::block_in_place(move || {
@@ -1089,7 +1089,7 @@ struct RunOutcome {
     cost: f64,
     timed_out: bool,
     /// Whether real work was performed and so the daily run ledger advances. The
-    /// PR route sets it from `claude_ran`; the mint route (CLAUDE-221) sets it
+    /// PR route sets it from `claude_ran`; the mint route sets it
     /// once a YouTrack issue was created, so a flood of plain-issue commands is
     /// bounded by the same daily cap even though no agent ran.
     counts_run: bool,
@@ -1124,9 +1124,9 @@ fn serve_run(
     workdir: &FsPath,
     stream_log: &FsPath,
     timeout: Duration,
-    // DEV-705 / DEV-707: this delivery's ledger and frozen ceiling.
+    // This delivery's ledger and frozen ceiling.
     spend: &crate::usage::RunSpend,
-    // CLAUDE-315: where this invocation's `claude_invocations` row is written.
+    // Where this invocation's `claude_invocations` row is written.
     // `serve_run` is synchronous and always run inside
     // `tokio::task::block_in_place` (never `spawn_blocking`), which moves this
     // closure off the active async worker before it runs, so bridging into
@@ -1197,12 +1197,12 @@ fn serve_run(
                             workdir,
                             stream_log,
                             &cancel,
-                            // DEV-705: cap the child at this run's remaining ceiling.
+                            // Cap the child at this run's remaining ceiling.
                             Some(spend.remaining_usd()),
                         ) {
                             Ok(r) => {
                                 claude_ran = true;
-                                // DEV-707: bill the run with what the session spent.
+                                // Bill the run with what the session spent.
                                 spend.record(&r);
                                 r
                             }
@@ -1302,7 +1302,7 @@ fn serve_run(
     }
 }
 
-/// CLAUDE-221: the whole blocking half of one PLAIN-ISSUE instruction. There is
+/// The whole blocking half of one PLAIN-ISSUE instruction. There is
 /// no head branch to clone or push, so nothing is run here: resolve the repo's
 /// YouTrack project through the shared VCS route cache, create an issue carrying
 /// the instruction verbatim plus a link back to the Forgejo issue, set
@@ -1322,7 +1322,7 @@ fn serve_mint(
     let summary = mint_summary(cmd);
     let description = mint_description(cmd, instruction);
 
-    // CLAUDE-234: the tracker writes go through this delivery's ledger (the
+    // The tracker writes go through this delivery's ledger (the
     // backend is per-delivery but the ledger carries the run id and the
     // ceiling); the forge replies keep using `backend` directly.
     let key = match tracker.create_issue(&project, &summary, &description, None) {
@@ -1422,8 +1422,8 @@ fn mint_description(cmd: &VerifiedCommentCommand, instruction: &str) -> String {
 /// Resolve the PR's head and base branch from the forge's open-PR list (the
 /// same read the CI-fix scan uses; no new tooling and no raw REST). An empty
 /// `base_ref` is an error handled exactly like an empty `head_ref`: the base
-/// branch names what the agent is allowed to merge in to resolve conflicts
-/// (CLAUDE-303), so a PR whose base the forge did not report cannot be served.
+/// branch names what the agent is allowed to merge in to resolve conflicts,
+/// so a PR whose base the forge did not report cannot be served.
 fn pr_branches(
     backend: &dyn Backend,
     cmd: &VerifiedCommentCommand,
@@ -1449,7 +1449,7 @@ fn pr_branches(
     Ok((pr.head_ref, pr.base_ref))
 }
 
-/// Shallow-clone `branch` into `workdir`. CLAUDE-252: the shared helper reports
+/// Shallow-clone `branch` into `workdir`. The shared helper reports
 /// git's own reason for a failure with the token-bearing URL's credential
 /// redacted, instead of the bare exit code this used to carry.
 fn clone_branch(clone_url: &str, branch: &str, workdir: &FsPath) -> crate::error::Result<()> {
@@ -1537,7 +1537,7 @@ impl Decision {
 
 /// Classify a completed run into a [`Decision`]. Pure, so the gate is unit
 /// tested without a workdir. `commits` is the number of commits made since the
-/// cloned head (CLAUDE-303): a clean base merge with no other change is
+/// cloned head: a clean base merge with no other change is
 /// `commits >= 1, files == 0`, which is still a push.
 pub fn decide(
     summary: &str,
@@ -1561,7 +1561,7 @@ pub fn decide(
 }
 
 /// Runs right after a successful clone: sets the bot git identity (so an
-/// agent-made merge commit is authored and committed as the bot, CLAUDE-303)
+/// agent-made merge commit is authored and committed as the bot)
 /// and records the cloned head (what the change measurement diffs against). A
 /// failure of any part is a clone-stage failure: nothing about the checkout
 /// can yet be trusted.
@@ -1719,7 +1719,7 @@ fn numstat_files_and_lines(stdout: &str, files: &mut std::collections::HashSet<S
     lines
 }
 
-/// Push the PR branch. Push-only (CLAUDE-303): committing the leftovers now
+/// Push the PR branch. Push-only: committing the leftovers now
 /// happens in [`run_decision_gate`], before the change is measured.
 fn push_fix(
     backend: &dyn Backend,
@@ -1784,7 +1784,7 @@ fn git_push(workdir: &FsPath, url: &str, branch: &str) -> crate::error::Result<(
     if out.status.success() {
         Ok(())
     } else {
-        // CLAUDE-252: report git's own reason, with the URL credential masked.
+        // Report git's own reason, with the URL credential masked.
         Err(crate::provider::git_error("push", &out, Some(url)))
     }
 }
@@ -1863,7 +1863,7 @@ pub fn help_comment(trigger: &str, is_pull_request: bool) -> String {
     lines.join("\n")
 }
 
-/// CLAUDE-221: reply naming the YouTrack issue a plain-issue command minted.
+/// Reply naming the YouTrack issue a plain-issue command minted.
 pub fn minted_comment(key: &str, project: &str) -> String {
     [
         format!("**Filed as YouTrack issue `{key}`.**"),
@@ -1873,7 +1873,7 @@ pub fn minted_comment(key: &str, project: &str) -> String {
     .join("\n")
 }
 
-/// CLAUDE-221: reply when the issue was created but could not be queued. It
+/// Reply when the issue was created but could not be queued. It
 /// names the issue (so the work is not lost) and the field to set by hand.
 pub fn mint_not_queued_comment(key: &str, field: &str, value: &str, detail: &str) -> String {
     [
@@ -1928,7 +1928,7 @@ pub fn busy_comment(is_pull_request: bool) -> String {
     .join("\n")
 }
 
-/// CLAUDE-269: reply when the Claude login needs renewing, so the commenter
+/// Reply when the Claude login needs renewing, so the commenter
 /// is told why nothing ran instead of hearing silence.
 pub fn login_required_comment(reason: &str) -> String {
     [
@@ -2067,7 +2067,7 @@ async fn finish_comment_run(
     spend: &crate::usage::RunSpend,
 ) {
     let Some(run_id) = run_id else {
-        // DEV-707: no run row (the begin failed), but the spend was real, so the
+        // No run row (the begin failed), but the spend was real, so the
         // usage record still names the action.
         spend.finish(None, crate::exit::UNEXPECTED);
         return;
@@ -2093,7 +2093,7 @@ async fn finish_comment_run(
     if let Err(e) = state::job_outcome_insert(pool, &record).await {
         warn!(error = %e, "recording the comment run outcome failed");
     }
-    // DEV-705: an over-budget stop overrides only an otherwise-clean outcome.
+    // An over-budget stop overrides only an otherwise-clean outcome.
     let exit_code = spend.exit_code(if outcome.ok {
         crate::exit::OK
     } else {
@@ -2102,7 +2102,7 @@ async fn finish_comment_run(
     if let Err(e) = state::run_finish(pool, run_id, exit_code, 1).await {
         warn!(error = %e, "finalizing the comment run failed");
     }
-    // DEV-707: one summary line and one machine-readable record per run.
+    // One summary line and one machine-readable record per run.
     spend.finish(Some(run_id), exit_code);
 }
 
@@ -2285,7 +2285,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-221: a plain-issue comment is no longer dropped. It becomes a
+    /// A plain-issue comment is not dropped. It becomes a
     /// command flagged as NOT a pull request, which is what selects the mint
     /// route downstream.
     #[test]
@@ -2510,7 +2510,7 @@ mod tests {
         assert_eq!((files.len() as u64, lines), (2, 9));
     }
 
-    // ---- CLAUDE-302 / CLAUDE-303: change measurement and the merge gate ---
+    // ---- Change measurement and the merge gate -----------------------------
 
     /// A minimal git repo with one committed file, ready for a test to mutate
     /// the working tree and then call [`prepare_checkout`] / [`run_decision_gate`]
@@ -2520,7 +2520,7 @@ mod tests {
             vec!["init", "-q", "-b", "main"],
             vec!["config", "user.name", "tester"],
             vec!["config", "user.email", "tester@example.com"],
-            // CLAUDE-306: git 2.54's detached auto-maintenance repacks mid-test past ~100 loose objects.
+            // git 2.54's detached auto-maintenance repacks mid-test past ~100 loose objects.
             vec!["config", "maintenance.auto", "false"],
         ] {
             assert!(
@@ -2554,7 +2554,7 @@ mod tests {
         CommentWebhookSource::default()
     }
 
-    /// CLAUDE-305: a repository that already TRACKS a legacy
+    /// A repository that already TRACKS a legacy
     /// `.claude-run-instruction.md` is left exactly as it is. The runner no
     /// longer writes that path into the work tree at all (the commit-message
     /// file the gate itself writes now lives in the git-directory scratch
@@ -2599,7 +2599,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-305: the gate's own scratch write (the commit-message file) and
+    /// The gate's own scratch write (the commit-message file) and
     /// the instruction file a `serve_run` session would have written both live
     /// under the clone's git directory, so neither ever shows up in
     /// `git status`, tracked or ignored, and the instruction file does not
@@ -2992,7 +2992,7 @@ mod tests {
         assert!(busy_comment(true).contains("already running"));
     }
 
-    /// CLAUDE-326: a recognized failure exit code (124 = timeout, 137 =
+    /// A recognized failure exit code (124 = timeout, 137 =
     /// SIGKILL) gets one plain-language hint line in the FAILED comment; any
     /// other exit code leaves the comment byte-identical to before this issue.
     #[test]
@@ -3022,7 +3022,7 @@ mod tests {
         assert!(!with_hint.contains("SIGKILL"), "{with_hint}");
     }
 
-    /// CLAUDE-221: the plain-issue route's own reply bodies. Both outcomes name
+    /// The plain-issue route's own reply bodies. Both outcomes name
     /// the minted key, so a failed queue write never reads as a lost request.
     #[test]
     fn the_mint_route_replies_on_every_outcome() {
@@ -3087,7 +3087,7 @@ mod tests {
         assert!(!prompt.contains("pwned"), "{prompt}");
     }
 
-    // ---- CLAUDE-221: the plain-issue mint route ---------------------------
+    // ---- The plain-issue mint route ----------------------------------------
 
     fn issue_command(instruction: &str) -> VerifiedCommentCommand {
         command_of(&payload_json(
@@ -3383,7 +3383,7 @@ mod tests {
         assert_eq!(admit(attempts, 0, &d, d.max_runs_per_day), Admission::Run);
     }
 
-    /// CLAUDE-221: the mint route deduplicates through that SAME counter, so a
+    /// The mint route deduplicates through that SAME counter, so a
     /// redelivered issue comment never mints a second YouTrack issue.
     #[tokio::test]
     async fn a_redelivered_issue_comment_does_not_mint_twice() {
@@ -3443,7 +3443,7 @@ mod tests {
         let mut other_pr = cmd.clone();
         other_pr.number = 8;
         assert!(gate.try_acquire(&other_pr.pr_gate_key()).is_some());
-        // CLAUDE-221: the like-numbered plain ISSUE is a different thread, so it
+        // The like-numbered plain ISSUE is a different thread, so it
         // keeps its own gate and can never be blocked by the PR.
         let mut same_number_issue = cmd.clone();
         same_number_issue.is_pull_request = false;
@@ -3453,7 +3453,7 @@ mod tests {
         assert!(gate.try_acquire(&cmd.pr_gate_key()).is_some());
     }
 
-    // ---- CLAUDE-335: a queued command honours pause -----------------------
+    // ---- A queued command honours pause ------------------------------------
 
     #[tokio::test]
     async fn queued_command_pause_check_covers_global_and_own_action_only() {
@@ -3568,7 +3568,7 @@ mod tests {
         assert!(!dir.exists(), "the temp credential dir is removed on drop");
     }
 
-    /// CLAUDE-269: while the Claude login needs renewing, `run_instruction`
+    /// While the Claude login needs renewing, `run_instruction`
     /// replies naming the reason, invokes no `claude`, and advances no counter
     /// (checked before `admit`, so a redelivery still sees zero attempts once
     /// signed in again).
@@ -3865,7 +3865,7 @@ mod tests {
         let _env = crate::secrets::key_file_env_lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let (st, mut rx) = state_for(tmp.path()).await;
-        // CLAUDE-221: a plain-issue comment is NOT in this list any more; it is
+        // A plain-issue comment is NOT in this list; it is
         // an accepted command on the mint route, covered by its own test.
         let cases = [
             ("edited", REPO, "/claude fix it", "alice", true),
@@ -3913,7 +3913,7 @@ mod tests {
         assert!(rx.try_recv().is_ok());
     }
 
-    /// CLAUDE-223: the GLOBAL pause accepts-and-drops here too, through the
+    /// The GLOBAL pause accepts-and-drops here too, through the
     /// same shared gate the CI-failure listener takes, so neither endpoint can
     /// start work on a paused daemon.
     #[tokio::test]

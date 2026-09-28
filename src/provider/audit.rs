@@ -1,5 +1,5 @@
-//! CLAUDE-234: the per-run bound and the audit trail on the YouTrack issue
-//! writes a run performs.
+//! The per-run bound and the audit trail on the YouTrack issue writes a run
+//! performs.
 //!
 //! Two guardrails, both at the provider boundary rather than in a prompt (a
 //! prompt is guidance; these have to hold when the model ignores guidance,
@@ -155,8 +155,8 @@ impl IssueWriteAudit {
     }
 }
 
-/// An [`IssueTracker`] bounded and attributed by an [`IssueWriteAudit`]
-/// (CLAUDE-234). Reads pass straight through; creates are capped and logged,
+/// An [`IssueTracker`] bounded and attributed by an [`IssueWriteAudit`].
+/// Reads pass straight through; creates are capped and logged,
 /// updates are logged.
 pub struct AuditedTracker<'a> {
     inner: &'a dyn IssueTracker,
@@ -496,10 +496,9 @@ mod tests {
 
     #[test]
     fn no_delete_on_the_tracker_surface() {
-        // CLAUDE-234: deletes remain denied. The tracker trait exposes no
-        // delete and the CLI backend invokes no `yt issue delete`, so the guard
-        // is a scan of the two files that own that surface. It fails if either
-        // reappears.
+        // Deletes remain denied. The tracker trait exposes no delete and the
+        // CLI backend invokes no `yt issue delete`, so the guard is a scan of
+        // the two files that own that surface. It fails if either reappears.
         for (name, src) in [
             ("provider/mod.rs", include_str!("mod.rs")),
             ("provider/cli.rs", include_str!("cli.rs")),

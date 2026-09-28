@@ -24,7 +24,7 @@ struct PrSearchResponse {
     pull_requests: Vec<ForgePullRequest>,
 }
 
-/// CLAUDE-194: restate a `fj pr create` failure with the repo, the host, and the
+/// Restate a `fj pr create` failure with the repo, the host, and the
 /// permission hypothesis. The bare CLI text for a repo the token cannot see is
 /// `not found: The target couldn't be found.`, which names none of the three, and
 /// the push having succeeded (it authenticates with the host's git credentials,
@@ -42,7 +42,7 @@ fn pr_create_error(fj: &str, repo: &str, host: &str, head: Option<&str>, e: Erro
     ))
 }
 
-/// CLAUDE-206: does this `fj pr create` failure mean "an open PR for this head
+/// Does this `fj pr create` failure mean "an open PR for this head
 /// already exists"? Forgejo answers the create with 409 and the body message
 /// `pull request already exists for these targets [...]`
 /// (`ErrPullRequestAlreadyExists`), and `forgejo-api` renders a 409 from
@@ -52,7 +52,7 @@ fn is_pr_already_exists(e: &Error) -> bool {
     matches!(e, Error::CliFailed { stderr, .. } if stderr.to_lowercase().contains("already exists"))
 }
 
-/// CLAUDE-206: how a lookup attempt ended, for an error message that has to name
+/// How a lookup attempt ended, for an error message that has to name
 /// both causes. `None` is "the lookup ran and found no open PR".
 fn lookup_outcome(e: Option<&Error>) -> String {
     match e {
@@ -61,7 +61,7 @@ fn lookup_outcome(e: Option<&Error>) -> String {
     }
 }
 
-/// CLAUDE-206: a `pr create` failure where the open-PR lookup had ALSO failed.
+/// A `pr create` failure where the open-PR lookup had ALSO failed.
 /// [`pr_create_error`] alone reads as "PR creation failed" when the run really
 /// could not check whether a PR already existed, so the lookup cause is named
 /// alongside it.
@@ -84,7 +84,7 @@ fn pr_create_error_with_lookup(
     }
 }
 
-/// CLAUDE-136: derive a PR number from a forge PR URL's trailing
+/// Derive a PR number from a forge PR URL's trailing
 /// `/pulls/<n>` (Forgejo) or `/pull/<n>` (GitHub-style) segment. Used only as a
 /// fallback when `fj pr create --json` omits the `number` field.
 fn number_from_pr_url(url: &str) -> Option<u64> {
@@ -96,7 +96,7 @@ fn number_from_pr_url(url: &str) -> Option<u64> {
     digits.parse::<u64>().ok()
 }
 
-/// CLAUDE-170: derive the `owner/repo` path (the form `list_open_prs` expects)
+/// Derive the `owner/repo` path (the form `list_open_prs` expects)
 /// from an `origin` remote URL. Handles the HTTPS clone URLs this runner uses
 /// (`https://[creds@]host/owner/repo[.git]`) and the SSH form
 /// (`git@host:owner/repo[.git]`): strip a trailing `.git`, take the last two
@@ -117,7 +117,7 @@ fn repo_path_from_remote_url(url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-/// CLAUDE-160: if `s` is EXACTLY a bare `#<KEY>-N` reference and nothing else,
+/// If `s` is EXACTLY a bare `#<KEY>-N` reference and nothing else,
 /// return the key (`<KEY>-N`, no leading `#`); otherwise `None`. Callers pass an
 /// already-trimmed line, so any surrounding prose leaves trailing/leading bytes
 /// that make the match fail - which is precisely how a cross-link mention is
@@ -148,20 +148,20 @@ fn bare_issue_ref(s: &str) -> Option<String> {
     None
 }
 
-/// CLAUDE-319: does `trimmed` (already `trim_start`'d) open or close a fenced
+/// Does `trimmed` (already `trim_start`'d) open or close a fenced
 /// code block?
 fn is_fence_line(trimmed: &str) -> bool {
     trimmed.starts_with("```") || trimmed.starts_with("~~~")
 }
 
-/// CLAUDE-319: an ATX heading, `#` to `######` followed by a space.
+/// An ATX heading, `#` to `######` followed by a space.
 fn is_atx_heading(line: &str) -> bool {
     let t = line.trim_start();
     let hashes = t.chars().take_while(|&c| c == '#').count();
     (1..=6).contains(&hashes) && t.as_bytes().get(hashes) == Some(&b' ')
 }
 
-/// CLAUDE-319: a bullet (`- `, `* `, `+ `) or ordered (`1. ` style) list item,
+/// A bullet (`- `, `* `, `+ `) or ordered (`1. ` style) list item,
 /// optionally indented.
 fn is_list_item(line: &str) -> bool {
     let t = line.trim_start();
@@ -172,7 +172,7 @@ fn is_list_item(line: &str) -> bool {
     digits > 0 && t[digits..].starts_with(". ")
 }
 
-/// CLAUDE-319: a `Co-Authored-By:` / `Signed-off-by:` / `Reviewed-by:` trailer,
+/// A `Co-Authored-By:` / `Signed-off-by:` / `Reviewed-by:` trailer,
 /// unindented (a commit trailer never is).
 fn is_trailer_line(line: &str) -> bool {
     line.starts_with("Co-Authored-By:")
@@ -180,18 +180,18 @@ fn is_trailer_line(line: &str) -> bool {
         || line.starts_with("Reviewed-by:")
 }
 
-/// CLAUDE-319: does `line` end in an intentional Markdown hard break (two or
+/// Does `line` end in an intentional Markdown hard break (two or
 /// more trailing spaces, or a trailing backslash)?
 fn ends_with_hard_break(line: &str) -> bool {
     line.ends_with('\\') || line.len() - line.trim_end_matches(' ').len() >= 2
 }
 
-/// CLAUDE-319: is `line` a blockquote, optionally indented?
+/// Is `line` a blockquote, optionally indented?
 fn is_blockquote(line: &str) -> bool {
     line.trim_start().starts_with('>')
 }
 
-/// CLAUDE-319: does `line` start a new Markdown block, so it is never joined
+/// Does `line` start a new Markdown block, so it is never joined
 /// onto the previous line? Covers headings, list items, blockquotes, table
 /// rows, fence lines, the `Closes` line, a bare issue reference, and a commit
 /// trailer.
@@ -207,7 +207,7 @@ fn starts_new_block(line: &str) -> bool {
         || is_trailer_line(line)
 }
 
-/// CLAUDE-319: once `line` has been emitted (whether it started a new block or
+/// Once `line` has been emitted (whether it started a new block or
 /// was itself a joined continuation), can a following wrapped line join onto
 /// it? A list item or blockquote wraps like prose; a heading, table row,
 /// `Closes` line, bare issue reference, or trailer never takes a
@@ -224,7 +224,7 @@ fn accepts_continuation(line: &str) -> bool {
     !ends_with_hard_break(line)
 }
 
-/// CLAUDE-319: reflow hard-wrapped prose in a PR body so Forgejo renders it at
+/// Reflow hard-wrapped prose in a PR body so Forgejo renders it at
 /// full page width instead of a ragged column at the agent's commit-wrap
 /// width. Line by line: a fenced code block is copied untouched (including
 /// blank lines inside it); a blank line ends the current paragraph and is
@@ -286,7 +286,7 @@ pub struct CmdOutput {
 /// tests substitute a stub. The methods return [`Error::CliNotFound`] when
 /// `binary` is absent from `PATH`, so callers can probe availability.
 ///
-/// [`CommandRunner::run_in_env`] is the one required method (CLAUDE-26: it adds
+/// [`CommandRunner::run_in_env`] is the one required method (it adds
 /// per-child env injection so a job's decrypted credentials reach the `yt` / `fj`
 /// child only). `run` / `run_in` are thin wrappers, so existing call sites that
 /// need neither a working dir nor env are unchanged.
@@ -339,7 +339,7 @@ impl ProcessRunner {
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        // CLAUDE-228: every `yt` / `fj` call in the runner lands here, most of
+        // Every `yt` / `fj` call in the runner lands here, most of
         // them from an async job future. `yt list` has been observed taking
         // minutes under load, so the worker's core goes back to the runtime.
         let output = match crate::blocking::in_place(|| cmd.output()) {
@@ -381,17 +381,17 @@ pub struct CliBackend {
     yt: String,
     fj: String,
     /// Path to the forge CLI's key store (`forgejo-cli/keys.json`), read by
-    /// [`Forge::clone_url`]. Overridable for tests and for CLAUDE-26's per-job
+    /// [`Forge::clone_url`]. Overridable for tests and for the per-job
     /// temp credential store.
     keys_path: PathBuf,
-    /// CLAUDE-26: env (`(name, value)`) injected on the `yt` child only, e.g.
+    /// Env (`(name, value)`) injected on the `yt` child only, e.g.
     /// `YOUTRACK_CLI_CONFIG` pointing at a temp single-file config holding the
     /// decrypted token. Empty (the default) leaves the `yt` CLI on host auth.
     yt_env: Vec<(String, String)>,
-    /// CLAUDE-26: env injected on the `fj` child only, e.g. an `XDG_DATA_HOME`
+    /// Env injected on the `fj` child only, e.g. an `XDG_DATA_HOME`
     /// override pointing at a temp `forgejo-cli/keys.json`. Empty by default.
     fj_env: Vec<(String, String)>,
-    /// CLAUDE-206: operator-visible notices accumulated while serving the job
+    /// Operator-visible notices accumulated while serving the job
     /// (currently: an open-PR lookup that failed and was degraded to a create).
     /// Drained by [`Forge::take_notices`] and persisted as run events.
     notices: std::sync::Mutex<Vec<String>>,
@@ -417,7 +417,7 @@ struct VcsProcessor {
     path: String,
 }
 
-/// CLAUDE-216: `yt auth verify --json`, whose `user` object carries the
+/// `yt auth verify --json`, whose `user` object carries the
 /// authenticated login. Only the login is consumed; no token is present in the
 /// payload.
 #[derive(Debug, Deserialize)]
@@ -431,7 +431,7 @@ struct AuthUser {
     login: String,
 }
 
-/// CLAUDE-216: `yt project show <KEY> --json`. Only the display name is read.
+/// `yt project show <KEY> --json`. Only the display name is read.
 #[derive(Debug, Deserialize)]
 struct ProjectShow {
     #[serde(default)]
@@ -448,7 +448,7 @@ struct ProjectListEntry {
     archived: bool,
 }
 
-/// The `links` array of `yt issue inspect --json` (YT-40 / CLAUDE-161). Only the
+/// The `links` array of `yt issue inspect --json` (YT-40). Only the
 /// links are deserialized; the surrounding `issue` / `comments` / etc. objects
 /// are ignored.
 #[derive(Debug, Deserialize)]
@@ -457,7 +457,7 @@ struct InspectLinks {
     links: Vec<RawLink>,
 }
 
-/// CLAUDE-189: the `issue` + `comments` of `yt issue inspect --json`. Only the
+/// The `issue` + `comments` of `yt issue inspect --json`. Only the
 /// description and each comment's text are consumed; `links` and the rest are
 /// ignored here (parsed separately by [`InspectLinks`]).
 #[derive(Debug, Deserialize)]
@@ -538,14 +538,14 @@ impl CliBackend {
         self
     }
 
-    /// CLAUDE-26: inject env on the `yt` child only (decrypted-credential
+    /// Inject env on the `yt` child only (decrypted-credential
     /// `YOUTRACK_CLI_CONFIG`). Empty leaves host auth.
     pub fn with_yt_env(mut self, env: Vec<(String, String)>) -> Self {
         self.yt_env = env;
         self
     }
 
-    /// CLAUDE-26: inject env on the `fj` child only (an `XDG_DATA_HOME` override
+    /// Inject env on the `fj` child only (an `XDG_DATA_HOME` override
     /// pointing at a temp `keys.json`). Empty leaves host auth.
     pub fn with_fj_env(mut self, env: Vec<(String, String)>) -> Self {
         self.fj_env = env;
@@ -568,8 +568,8 @@ impl CliBackend {
             .collect()
     }
 
-    /// Parse `fj pr create --json` stdout into a [`PullRequest`]. CLAUDE-136:
-    /// the human `text` line carries only the PR URL (`.../pulls/<n>`) and no
+    /// Parse `fj pr create --json` stdout into a [`PullRequest`]. The human
+    /// `text` line carries only the PR URL (`.../pulls/<n>`) and no
     /// `#<n>` token, so the old `#`-splitting heuristic always lost the number
     /// (or split on the body's `#<KEY>-N` reference and read zero digits),
     /// which silently disabled automerge. `--json` returns the number and URL
@@ -596,13 +596,13 @@ impl CliBackend {
         Ok(PullRequest {
             number,
             url: created.html_url,
-            // CLAUDE-275: the caller (branch-backed create, or AGit) fills in
+            // The caller (branch-backed create, or AGit) fills in
             // `head_branch` when it has one; AGit has none.
             head_branch: None,
         })
     }
 
-    /// CLAUDE-166: resolve the feature branch by NAME, independent of the
+    /// Resolve the feature branch by NAME, independent of the
     /// current `HEAD`. The base (default) branch is whatever `origin/HEAD` points
     /// at (e.g. `origin/main`); the feature branch is the single LOCAL branch
     /// (other than the base) that has commits ahead of the base. This is also the
@@ -613,7 +613,7 @@ impl CliBackend {
     /// base". The workdir is named in the errors so the branch stays recoverable
     /// (the failure comment in `src/native/youtrack.rs` preserves it).
     ///
-    /// CLAUDE-212: called from [`Forge::create_pr`] BEFORE the strategy dispatch,
+    /// Called from [`Forge::create_pr`] BEFORE the strategy dispatch,
     /// so the ahead check guards AGit too. AGit discards the resolved name (`fj
     /// pr create -aA` pushes `HEAD`), it only needs the zero/multiple-candidate
     /// rejection.
@@ -657,7 +657,7 @@ impl CliBackend {
         match candidates.len() {
             1 => Ok(candidates.pop().unwrap()),
             0 => Err(Error::Other(anyhow::anyhow!(
-                // CLAUDE-193 / CLAUDE-281: state the condition, not an outcome
+                // State the condition, not an outcome
                 // the later `cleanup_or_preserve` decision can contradict: it
                 // is the one that checks the workdir and decides whether
                 // anything is preserved.
@@ -679,30 +679,30 @@ impl CliBackend {
         }
     }
 
-    /// Branch-backed PR creation (CLAUDE-103 default, originally the CLAUDE-102
-    /// fallback). Push the working branch with the git CLI (same-name remote
+    /// Branch-backed PR creation (the default strategy). Push the working branch
+    /// with the git CLI (same-name remote
     /// branch), then open the PR over the Forgejo API with `fj pr create`,
     /// deriving the title and body from the head commit exactly like AGit
     /// autofill would (the body carries the bare `#<KEY>-N` reference, so
     /// YouTrack still links the PR). The body travels via a file (fj convention
     /// for long bodies), written into the clone's git-directory scratch space
-    /// (CLAUDE-305) rather than the workdir, so it can never be staged or
+    /// rather than the workdir, so it can never be staged or
     /// committed; its removal failure is logged rather than swallowed. The head
     /// is `refs/heads/<branch>`, never `refs/pull/<N>/head`.
     ///
-    /// CLAUDE-166: the feature branch is resolved authoritatively by NAME, never
+    /// The feature branch is resolved authoritatively by NAME, never
     /// from the ambient `HEAD`. Everything (push, title/body, `fj --head`) binds
     /// to that resolved branch, so a stray `git checkout main`, a detached
     /// `HEAD`, or an agent bug can no longer strand the work and open a silent
     /// `main`-vs-`main` PR. The push, title, and body all target the resolved
     /// branch; `fj pr create` is invoked with an explicit `--head`, mirroring the
-    /// GitHub backend (`github.rs`). CLAUDE-212: `branch` is resolved by the
+    /// GitHub backend (`github.rs`). `branch` is resolved by the
     /// caller ([`Forge::create_pr`]) so both strategies share the ahead check.
     ///
-    /// CLAUDE-170: idempotent against a pre-existing `origin/<branch>`. The
+    /// Idempotent against a pre-existing `origin/<branch>`. The
     /// feature-branch name is chosen by the agent and not deterministic per issue
     /// key; a pre-existing remote branch of the same name is legitimate, not just
-    /// a collision, because CLAUDE-275's resume path clones a re-queued issue's
+    /// a collision, because the resume path for a re-queued issue clones its
     /// recorded PR branch by name and continues committing on it. Before pushing,
     /// the remote
     /// state of the branch is read (`git ls-remote`) and reconciled WITHOUT force:
@@ -712,7 +712,7 @@ impl CliBackend {
     /// fail loudly naming both SHAs and the workdir. No `--force` /
     /// `--force-with-lease` is ever issued.
     ///
-    /// CLAUDE-193 / CLAUDE-281: the error text states the retention CONDITION
+    /// The error text states the retention CONDITION
     /// ("preserved only if the cleanup check finds it there"), never a flat
     /// outcome, because `cleanup_or_preserve` makes the keep-or-delete
     /// decision later, from its own check of the workdir, and can legitimately
@@ -748,7 +748,7 @@ impl CliBackend {
                     self.push_branch(workdir, branch)?;
                     self.find_or_create_pr(workdir, host, &repo, branch)
                 } else {
-                    // CLAUDE-206: the lookup stays FATAL on this arm only. Here
+                    // The lookup stays FATAL on this arm only. Here
                     // its result decides between adopting and refusing, so an
                     // "assume none" would raise the refusal for the wrong
                     // reason; a failed search and a genuine "no open PR" are
@@ -778,7 +778,7 @@ impl CliBackend {
         }
     }
 
-    /// CLAUDE-170: the `owner/repo` path of the workdir's `origin` remote, for
+    /// The `owner/repo` path of the workdir's `origin` remote, for
     /// the open-PR lookup (`list_open_prs`). Errors loudly if the remote URL is
     /// unparseable so the caller never silently skips the idempotency reconcile.
     fn origin_repo_path(&self, workdir: &Path) -> Result<String> {
@@ -795,7 +795,7 @@ impl CliBackend {
         })
     }
 
-    /// CLAUDE-170: the commit SHA a git revision (e.g. a branch name) resolves to
+    /// The commit SHA a git revision (e.g. a branch name) resolves to
     /// in the workdir.
     fn rev_parse(&self, workdir: &Path, rev: &str) -> Result<String> {
         let args = ["rev-parse", rev];
@@ -803,7 +803,7 @@ impl CliBackend {
         Ok(Self::checked("git", out, &args)?.trim().to_string())
     }
 
-    /// CLAUDE-305: the run's scratch directory INSIDE the clone's own git
+    /// The run's scratch directory INSIDE the clone's own git
     /// directory (`git rev-parse --absolute-git-dir`, never a hard-coded
     /// `.git`, which is a FILE rather than a directory in a worktree or
     /// submodule checkout), joined with `claude-run` and created if missing.
@@ -818,7 +818,7 @@ impl CliBackend {
         Ok(dir)
     }
 
-    /// CLAUDE-170: the SHA of `origin/<branch>` if the branch exists on the
+    /// The SHA of `origin/<branch>` if the branch exists on the
     /// remote, else `None`. `git ls-remote --heads origin <branch>` prints one
     /// `"<sha>\t<ref>"` line per matching head and nothing (exit 0) when the
     /// branch is absent, so no branch existence is inferred from an exit code.
@@ -834,7 +834,7 @@ impl CliBackend {
             .map(|s| s.to_string()))
     }
 
-    /// CLAUDE-170: `true` iff `ancestor` is an ancestor of `descendant` (i.e. a
+    /// `true` iff `ancestor` is an ancestor of `descendant` (i.e. a
     /// fast-forward from `ancestor` to `descendant` is possible).
     /// `git merge-base --is-ancestor` signals the answer via exit status (0 =
     /// yes, 1 = no), so a bare `checked` would misread the legitimate "no" as an
@@ -850,7 +850,7 @@ impl CliBackend {
         }
     }
 
-    /// CLAUDE-170: push the resolved branch BY NAME (`<branch>:<branch>`), not
+    /// Push the resolved branch BY NAME (`<branch>:<branch>`), not
     /// `HEAD`, so the server branch carries the feature name regardless of the
     /// current checkout. Never forced: a rejected non-fast-forward push is a
     /// real-divergence signal the caller has already ruled out before calling.
@@ -864,7 +864,7 @@ impl CliBackend {
         Ok(())
     }
 
-    /// CLAUDE-170: an already-open PR whose head branch is `branch`, matched by
+    /// An already-open PR whose head branch is `branch`, matched by
     /// `head_ref` against `list_open_prs` (`fj pr search --repo <repo> --state
     /// open --json`). Returns the first match (a repo has at most one open PR per
     /// head branch) as an adoptable [`PullRequest`], else `None`.
@@ -880,12 +880,12 @@ impl CliBackend {
             }))
     }
 
-    /// CLAUDE-170: adopt an already-open PR for `branch` if one exists, else
+    /// Adopt an already-open PR for `branch` if one exists, else
     /// create it. The title/body derivation from the branch tip and the
     /// `fj pr create` call run ONLY on the create path, so adopting an existing
     /// PR issues no `pr create`.
     ///
-    /// CLAUDE-206: a FAILED lookup is not fatal here. The lookup is an
+    /// A FAILED lookup is not fatal here. The lookup is an
     /// optimization (`fj pr search` is an issue-category call, `pr create` a
     /// repository-category one, so they fail independently), and the create
     /// below is what delivers the work; a failure degrades to "unknown, assume
@@ -922,7 +922,7 @@ impl CliBackend {
         let body = unwrap_prose(Self::checked("git", out, &body_args)?.trim());
 
         const BODY_FILE: &str = ".claude-run-pr-body.md";
-        // CLAUDE-305: written into the clone's git-directory scratch space,
+        // Written into the clone's git-directory scratch space,
         // never its work tree, so it can never be staged or committed; an
         // absolute path is passed to `--body-file` since it no longer sits
         // under `workdir`, the `fj` child's own cwd.
@@ -955,13 +955,13 @@ impl CliBackend {
                 );
             }
         }
-        // CLAUDE-275: the branch-backed create just pushed this exact server
+        // The branch-backed create just pushed this exact server
         // branch (`self.push_branch` / the fast-forward arm above), so it is
         // always the resulting PR's head, whatever `fj pr create --json` itself
         // reports.
         let stdout = match res {
             Ok(stdout) => stdout,
-            // CLAUDE-206: the forge says a PR for this head already exists (a
+            // The forge says a PR for this head already exists (a
             // concurrent run, or one the degraded lookup could not see). Retry
             // the lookup exactly once and adopt what it returns.
             Err(e) if is_pr_already_exists(&e) => {
@@ -994,7 +994,7 @@ impl CliBackend {
         })
     }
 
-    /// CLAUDE-206: record a lookup failure that was degraded to a create, in the
+    /// Record a lookup failure that was degraded to a create, in the
     /// daemon journal and as a notice the run surfaces on the action page.
     fn note_degraded_lookup(&self, host: &str, repo: &str, branch: &str, e: &Error) {
         warn!(
@@ -1011,13 +1011,13 @@ impl CliBackend {
         ));
     }
 
-    /// CLAUDE-103 opt-in: AGit + autofill (`fj --host <host> pr create -aA`).
+    /// Opt-in AGit + autofill (`fj --host <host> pr create -aA`).
     /// fj pushes the local commits to `refs/for/<base>` and opens a branchless
     /// PR (head at `refs/pull/<N>/head`), deriving the title/body from the
     /// commit messages. No server branch is produced. A failure errors loudly;
     /// there is no silent switch to the branch path.
     ///
-    /// CLAUDE-212: reached only after [`Forge::create_pr`] resolved exactly one
+    /// Reached only after [`Forge::create_pr`] resolved exactly one
     /// branch ahead of base. Without that guard a run with no commits still
     /// succeeded here (`-aA` pushes the base tip and autofills from an unrelated
     /// commit), and the issue was moved to `AI Agent = Code Review`.
@@ -1027,7 +1027,7 @@ impl CliBackend {
             .runner
             .run_in_env(Some(workdir), &self.fj, &args, &self.fj_envs())
             .and_then(|out| Self::checked(&self.fj, out, &args))
-            // CLAUDE-194: same restatement as the branch path; the repo is read
+            // Same restatement as the branch path; the repo is read
             // from `origin` only on this failure path.
             .map_err(|e| {
                 let repo = self
@@ -1047,7 +1047,7 @@ impl CliBackend {
         Ok(())
     }
 
-    /// CLAUDE-148: the value of the injected `YOUTRACK_CLI_CONFIG`, if any. The
+    /// The value of the injected `YOUTRACK_CLI_CONFIG`, if any. The
     /// PATH only is returned, never the file contents (which hold the token).
     /// `None` means host-auth fallback (no injected config).
     fn yt_config_path(&self) -> Option<String> {
@@ -1068,7 +1068,7 @@ impl CliBackend {
             .filter(|v| !v.is_empty())
     }
 
-    /// CLAUDE-148: the YouTrack base URL the injected config targets, read from
+    /// The YouTrack base URL the injected config targets, read from
     /// the single-file `yt` config's `url:` line (see
     /// [`crate::secrets::JobCredentials::materialize`], which writes
     /// `url: <url>\ntoken: <token>\n`). The `token:` line is never read or
@@ -1087,7 +1087,7 @@ impl CliBackend {
     /// Run `yt args...`, returning trimmed stdout on success or
     /// [`Error::CliFailed`] on a non-zero exit.
     ///
-    /// CLAUDE-148: logs the non-secret execution context at `debug` for every
+    /// Logs the non-secret execution context at `debug` for every
     /// call (resolved binary, injected env KEY names, whether
     /// `YOUTRACK_CLI_CONFIG` is set vs host-auth fallback) and, on a non-zero
     /// exit, a `warn` carrying the config presence and the YouTrack base URL in
@@ -1128,7 +1128,7 @@ impl CliBackend {
         Self::checked(&self.yt, out, args)
     }
 
-    /// CLAUDE-148: one-shot identity probe run when a VCS probe (`yt project vcs
+    /// One-shot identity probe run when a VCS probe (`yt project vcs
     /// list <PROJECT>`) fails. Re-runs `yt` with the SAME injected env as the
     /// failing call to log the authenticated identity (`yt user me`, the
     /// current-user subcommand the installed `yt` exposes) and the project keys
@@ -1268,7 +1268,7 @@ impl IssueTracker for CliBackend {
 
     fn set_assignee(&self, key: &str, login: &str) -> Result<()> {
         // `yt issue update <key> --assignee <login>` is the purpose-built write
-        // for the user-type Assignee field (CLAUDE-131); `login` may be a login,
+        // for the user-type Assignee field; `login` may be a login,
         // `me`, or `unassigned`.
         self.yt_ok(&["issue", "update", key, "--assignee", login])?;
         Ok(())
@@ -1329,8 +1329,8 @@ impl IssueTracker for CliBackend {
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo> {
         // `vcs` is a command group; `list` is the subcommand that takes the
         // project short-name positional. Omitting it makes the project land in
-        // the `<COMMAND>` slot and `yt` exits 2 (CLAUDE-124).
-        // CLAUDE-148: on a probe tool failure (e.g. `project 'VS' not found`,
+        // the `<COMMAND>` slot and `yt` exits 2.
+        // On a probe tool failure (e.g. `project 'VS' not found`,
         // which YouTrack also returns for a project the token cannot READ), run
         // the one-shot identity probe before propagating, so the journal records
         // which yt user/instance the daemon used and whether the project was
@@ -1475,13 +1475,13 @@ impl Forge for CliBackend {
         strategy: crate::action::PrStrategy,
     ) -> Result<PullRequest> {
         use crate::action::PrStrategy;
-        // CLAUDE-212: the CLAUDE-166 ahead check runs BEFORE the dispatch, so
+        // The ahead check runs BEFORE the dispatch, so
         // both strategies reject a run that produced no commits (zero
         // candidates) or an ambiguous workdir (multiple candidates) with the
         // same loud, workdir-naming error, before `fj` is invoked.
         let branch = self.resolve_feature_branch(workdir)?;
         match strategy {
-            // CLAUDE-103 default: push a real server branch with the git CLI
+            // Default: push a real server branch with the git CLI
             // (proven https-capable, it performed the clone) and open the PR
             // over the API. The resulting head is `refs/heads/<branch>`, so
             // Forgejo can always "Update Branch" and the PR stays mergeable.
@@ -1504,7 +1504,7 @@ impl Forge for CliBackend {
         self.notices.lock().unwrap().push(message);
     }
 
-    /// CLAUDE-194 / CLAUDE-207: two probes, one per scope category the PR path
+    /// Two probes, one per scope category the PR path
     /// crosses (`actions/SCHEMA.md`, "Forgejo token scopes").
     ///
     /// 1. `fj --host <host> repo view <owner/repo> --json` (repository read). A
@@ -1549,7 +1549,7 @@ impl Forge for CliBackend {
         Ok(())
     }
 
-    /// CLAUDE-216: `fj --host <host> whoami`. `fj` wraps each name in Unicode
+    /// `fj --host <host> whoami`. `fj` wraps each name in Unicode
     /// bidi isolates (U+2066..U+2069), stripped so the row renders as plain text.
     fn identity(&self, host: &str) -> Result<String> {
         let args = ["--host", host, "whoami"];
@@ -1598,11 +1598,11 @@ impl Forge for CliBackend {
         struct Status {
             state: String,
             // Absent or `null` (a merged PR, or no verdict yet) is unknown and
-            // never merges: only `Some(true)` does (CLAUDE-330).
+            // never merges: only `Some(true)` does.
             #[serde(default)]
             mergeable: Option<bool>,
-            // Absent (an `fj` predating FJ-99) or explicit `null` both parse to
-            // `None`: unknown, never collapsed to `false` (CLAUDE-309).
+            // Absent (an `fj` predating this field) or explicit `null` both parse to
+            // `None`: unknown, never collapsed to `false`.
             #[serde(default)]
             behind_base: Option<bool>,
         }
@@ -1617,11 +1617,11 @@ impl Forge for CliBackend {
     fn merge_pr(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
         // Merge-commit (`--method merge`), never squash/rebase: every PR from
         // the native action is a single commit carrying the bare `#<KEY>`
-        // reference, and only a merge-commit preserves it in history (CLAUDE-126).
+        // reference, and only a merge-commit preserves it in history.
         let id = format!("{repo}#{pr_number}");
         // `--delete` removes the PR head branch after merge, matching the
         // Forgejo web UI's "Delete branch after merge" behavior so automerged
-        // PRs don't leave stale merged branches behind (CLAUDE-145). It is a
+        // PRs don't leave stale merged branches behind. It is a
         // no-op when the branch is already gone or is a protected base.
         let args = [
             "--host", host, "pr", "merge", &id, "--method", "merge", "--delete",
@@ -1634,11 +1634,11 @@ impl Forge for CliBackend {
     }
 
     fn update_pr_branch(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
-        // CLAUDE-309 (FJ-99): Forgejo's Update-branch endpoint. `--update-style
-        // merge` matches CLAUDE-126's merge-commit policy and never rewrites
-        // the agent's branch. CLAUDE-353 (FJ-107): renamed from `--style`,
-        // which collided with the global output-styling flag of the same
-        // name and caused a clap panic.
+        // Forgejo's Update-branch endpoint. `--update-style
+        // merge` matches the merge-commit policy above and never rewrites
+        // the agent's branch. Renamed from `--style` in a later Forgejo
+        // release, which collided with the global output-styling flag of the
+        // same name and caused a clap panic.
         let id = format!("{repo}#{pr_number}");
         let args = [
             "--host",
@@ -1657,7 +1657,7 @@ impl Forge for CliBackend {
     }
 
     fn repo_permission(&self, host: &str, repo: &str, username: &str) -> Result<String> {
-        // CLAUDE-220: `fj repo collaborator <owner>/<repo> permission <user>
+        // `fj repo collaborator <owner>/<repo> permission <user>
         // --format json` answers `{"username":..,"permission":..,"role_name":..}`.
         // Only `permission` is consumed; the finer-grained `role_name` is left
         // for a future allow-list without changing this call.
@@ -1713,7 +1713,7 @@ impl Forge for CliBackend {
         issue_number: u64,
         body_file: &Path,
     ) -> Result<()> {
-        // CLAUDE-221: `fj issue comment <repo>#<n> --body-file <path>`, the same
+        // `fj issue comment <repo>#<n> --body-file <path>`, the same
         // `owner/repo#n` addressing (no local checkout) and body-through-a-file
         // handling `pr_comment` uses.
         let id = format!("{repo}#{issue_number}");
@@ -1741,7 +1741,7 @@ impl Forge for CliBackend {
         pr_number: u64,
         labels: &[String],
     ) -> Result<()> {
-        // CLAUDE-149: `fj pr edit <repo>#<n> labels --add <label>`. fj's `--add`
+        // `fj pr edit <repo>#<n> labels --add <label>`. fj's `--add`
         // takes one label, so add each in its own call; addressing the PR as
         // `owner/repo#n` resolves the repo with no local checkout.
         let id = format!("{repo}#{pr_number}");
@@ -1784,18 +1784,18 @@ impl Backend for CliBackend {
     }
 }
 
-/// CLAUDE-204 / CLAUDE-205: every forge read the CI-failure actions make, all
+/// Every forge read the CI-failure actions make, all
 /// through `fj`, so each action holds ONE client:
 ///
 /// - [`ActionLogClient`] -> `fj actions logs`, the ONE path a run's logs are read
 ///   through for public and private repos alike: `fj` resolves the per-repo run
 ///   number to the internal run id, enumerates the run's jobs, and returns each
 ///   job's log, so nothing here guesses a job index.
-/// - [`crate::forge_log::ActionRunsClient`] -> `fj actions runs` (FJ-66), paged.
-/// - [`crate::forge_log::RepoFileClient`] -> `fj repo file` (FJ-67).
+/// - [`crate::forge_log::ActionRunsClient`] -> `fj actions runs`, paged.
+/// - [`crate::forge_log::RepoFileClient`] -> `fj repo file`.
 ///
 /// A resolved `log_token_ref` is injected the same way the per-job forge
-/// credentials are (CLAUDE-26): a temp `$XDG_DATA_HOME` holding a single-host
+/// credentials are: a temp `$XDG_DATA_HOME` holding a single-host
 /// `keys.json` that carries that one secret and nothing else, removed when the
 /// call returns. The token is never a process argument and never logged.
 pub struct FjForgeReads {
@@ -2096,14 +2096,14 @@ pub mod testutil {
     pub struct StubRunner {
         /// (binary, joined-args) -> outcome.
         responses: HashMap<String, CmdOutput>,
-        /// CLAUDE-206: (binary, joined-args) -> outcome consumed by the FIRST
+        /// (binary, joined-args) -> outcome consumed by the FIRST
         /// matching call only; later calls fall through to `responses`.
         once: Mutex<HashMap<String, CmdOutput>>,
         /// Binaries that should report as absent from PATH.
         missing: Vec<String>,
         /// Records every (binary, args) invocation for assertions.
         pub calls: Mutex<Vec<String>>,
-        /// CLAUDE-26: records the injected child env per invocation for assertions.
+        /// Records the injected child env per invocation for assertions.
         pub envs: Mutex<Vec<EnvCall>>,
     }
 
@@ -2144,7 +2144,7 @@ pub mod testutil {
             self
         }
 
-        /// CLAUDE-206: register a failing response consumed by the FIRST call to
+        /// Register a failing response consumed by the FIRST call to
         /// `binary args...` only, so a test can model a call that fails once and
         /// succeeds on the retry (pair it with `ok` for the standing response).
         pub fn fail_once(self, binary: &str, args: &[&str], exit_code: i32, stderr: &str) -> Self {
@@ -2231,7 +2231,7 @@ mod tests {
         assert_eq!(issues[0]["idReadable"], "MK-16");
     }
 
-    /// CLAUDE-161: `issue_links` flattens the `yt issue inspect --json` `links`
+    /// `issue_links` flattens the `yt issue inspect --json` `links`
     /// array into one row per linked target, carrying each entry's resolved
     /// `direction` / `verb` (YT-40) and each target's nullable `resolved`. A
     /// resolved target keeps its epoch-ms timestamp; an unresolved one (the key
@@ -2284,7 +2284,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-218: the link is source-first and the type is always passed
+    /// The link is source-first and the type is always passed
     /// explicitly, since `yt issue link` defaults `--type` to `relates`.
     #[test]
     fn link_issue_passes_the_type_explicitly() {
@@ -2378,7 +2378,7 @@ mod tests {
 
     #[test]
     fn resolve_vcs_failure_runs_identity_diagnostics() {
-        // CLAUDE-148: a VCS probe failure (the `project 'VS' not found` shape)
+        // A VCS probe failure (the `project 'VS' not found` shape)
         // triggers the one-shot identity probe: `yt user me` and `yt project
         // list --json`, both with the same injected env, so the journal can
         // separate a permissions gap from a wrong instance. The original
@@ -2442,7 +2442,7 @@ mod tests {
 
     #[test]
     fn identity_probe_reuses_injected_yt_env() {
-        // CLAUDE-148: the diagnostic sub-probes must carry the SAME injected env
+        // The diagnostic sub-probes must carry the SAME injected env
         // as the failing call, so the logged identity belongs to the daemon's
         // minted token, not host auth.
         let runner = Arc::new(
@@ -2476,7 +2476,7 @@ mod tests {
 
     #[test]
     fn yt_base_url_reads_url_never_token() {
-        // CLAUDE-148: base URL is extracted from the config's `url:` line only;
+        // Base URL is extracted from the config's `url:` line only;
         // the `token:` line is never read into the returned value, so the
         // failure-path log can carry the base URL without exposing the secret.
         let dir = tempfile::tempdir().unwrap();
@@ -2499,7 +2499,7 @@ mod tests {
         // reads the AMBIENT `YOUTRACK_CLI_CONFIG` env var (see
         // `yt_config_path`), which a host or container running the daemon's
         // own service login (`service_auth::export_yt_config_env`) may have
-        // set for the whole test process (CLAUDE-283), so save and restore it
+        // set for the whole test process, so save and restore it
         // around the assertion rather than trusting the ambient env is clean.
         let prior = std::env::var(crate::service_auth::YT_CONFIG_ENV).ok();
         std::env::remove_var(crate::service_auth::YT_CONFIG_ENV);
@@ -2514,7 +2514,7 @@ mod tests {
 
     #[test]
     fn vcs_repo_map_flattens_skips_archived_and_tolerates_a_failing_project() {
-        // CLAUDE-86: list projects, skip the archived one, flatten each live
+        // List projects, skip the archived one, flatten each live
         // project's enabled processors, and degrade a failing per-project `vcs`
         // call to a skip (not a hard error).
         let projects = r#"[
@@ -2570,8 +2570,8 @@ mod tests {
 
     #[test]
     fn create_pr_agit_strategy_parses_number() {
-        // CLAUDE-103: `pr_strategy: agit` invokes `fj pr create -aA` as before.
-        // CLAUDE-212: with exactly one branch ahead of base the guard passes and
+        // `pr_strategy: agit` invokes `fj pr create -aA` as before.
+        // With exactly one branch ahead of base the guard passes and
         // the AGit call is unchanged.
         let runner = Arc::new(with_branch_resolution(
             StubRunner::new().ok(
@@ -2603,7 +2603,7 @@ mod tests {
         );
     }
 
-    /// Register the git plumbing calls CLAUDE-166 resolve-by-name performs
+    /// Register the git plumbing calls the resolve-by-name step performs
     /// before the push: `origin/HEAD` -> base, `for-each-ref` lists local
     /// branches, and one `rev-list <base>..<branch>` per non-base branch. The
     /// caller passes the branch listing and, per branch, whether it is ahead.
@@ -2641,7 +2641,7 @@ mod tests {
         r
     }
 
-    /// CLAUDE-170: register the pre-push idempotency plumbing `create_pr_branch`
+    /// Register the pre-push idempotency plumbing `create_pr_branch`
     /// runs after resolving the branch: the origin remote URL (parsed to
     /// `owner/repo`), the local branch SHA, and the remote branch state.
     /// `ls_remote` is the `git ls-remote --heads` stdout to return (empty string
@@ -2681,7 +2681,7 @@ mod tests {
         "--json",
     ];
 
-    /// CLAUDE-170: the `fj pr search` open-PR lookup the branch path issues.
+    /// The `fj pr search` open-PR lookup the branch path issues.
     /// `prs_json` is the bare JSON array of PRs to return (`"[]"` = no open
     /// PRs); this wraps it in the `{"total_count", "pull_requests"}` envelope
     /// `fj` 0.17.1 actually emits.
@@ -2690,7 +2690,7 @@ mod tests {
         runner.ok("fj", &OPEN_PR_SEARCH, &wrapped)
     }
 
-    /// CLAUDE-206: the same lookup, failing the way a token without the issue
+    /// The same lookup, failing the way a token without the issue
     /// scope does (`fj pr search` 403s while `pr create` still works).
     fn with_failed_open_pr_search(runner: StubRunner) -> StubRunner {
         runner.fail(
@@ -2701,7 +2701,7 @@ mod tests {
         )
     }
 
-    /// CLAUDE-305: register the `git rev-parse --absolute-git-dir` lookup
+    /// Register the `git rev-parse --absolute-git-dir` lookup
     /// `find_or_create_pr` issues before writing the PR body scratch file, and
     /// return the scratch directory (`<git-dir>/claude-run`) the body file
     /// lands in, so a test can compute the exact `--body-file` argument and
@@ -2718,9 +2718,9 @@ mod tests {
 
     #[test]
     fn create_pr_branch_strategy_pushes_branch_and_creates_via_api() {
-        // CLAUDE-103 default: `pr_strategy: branch` pushes a real server branch
+        // Default strategy: `pr_strategy: branch` pushes a real server branch
         // with the git CLI and opens the PR over the API, deriving title/body
-        // from the head commit. `-aA` is never invoked. CLAUDE-166: the branch is
+        // from the head commit. `-aA` is never invoked. The branch is
         // resolved by name and pushed as `<branch>:<branch>` with an explicit
         // `--head`.
         let wd = tempfile::tempdir().unwrap();
@@ -2730,7 +2730,7 @@ mod tests {
             &["main", "feat/x"],
             &[("feat/x", "abc123\n")],
         );
-        // CLAUDE-170: remote branch absent -> unchanged happy path (push +
+        // Remote branch absent -> unchanged happy path (push +
         // create). No open PR yet, so find-or-create falls through to create.
         let runner = with_remote_state(runner, "feat/x", "abc123", "");
         let runner = with_open_pr_search(runner, "[]")
@@ -2799,7 +2799,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_resolves_by_name_when_head_is_on_main() {
-        // CLAUDE-166 / FJ-51: the agent committed on a feature branch but left
+        // The agent committed on a feature branch but left
         // `HEAD` on `main`. Resolution is by NAME (never `HEAD`), so the runner
         // still pushes the feature branch and opens feature -> base, rather than
         // attempting main-vs-main. The StubRunner keys on (binary, args) with no
@@ -2814,7 +2814,7 @@ mod tests {
             &["main", "fix/CLAUDE-166-work"],
             &[("fix/CLAUDE-166-work", "deadbeef\n")],
         );
-        // CLAUDE-170: remote branch absent, no open PR -> push + create.
+        // Remote branch absent, no open PR -> push + create.
         let runner = with_remote_state(runner, "fix/CLAUDE-166-work", "deadbeef", "");
         let runner = with_open_pr_search(runner, "[]")
             .ok(
@@ -2893,7 +2893,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_zero_candidates_is_distinct_actionable_error() {
-        // CLAUDE-166: the FJ-51 no-branch / no-commits case is made explicit. The
+        // The no-branch / no-commits case is made explicit. The
         // only local branch is the base itself, so there is no candidate; the
         // runner errors loudly (naming base and preserved workdir) instead of
         // delegating to `fj`'s opaque "no changes between head and base".
@@ -2927,7 +2927,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_multiple_candidates_names_them_and_refuses() {
-        // CLAUDE-166: more than one branch ahead of base -> refuse to guess,
+        // More than one branch ahead of base -> refuse to guess,
         // naming the candidates.
         let wd = tempfile::tempdir().unwrap();
         let runner = Arc::new(with_branch_resolution(
@@ -2958,7 +2958,7 @@ mod tests {
 
     #[test]
     fn create_pr_agit_zero_candidates_is_distinct_actionable_error() {
-        // CLAUDE-212: the guardrail is strategy-independent. With no branch ahead
+        // The guardrail is strategy-independent. With no branch ahead
         // of base, AGit gets the same loud, workdir-naming error the branch
         // strategy gives, and `fj` is never invoked (so no empty PR is opened
         // from the base tip and the run finalizes as Failed).
@@ -2992,7 +2992,7 @@ mod tests {
 
     #[test]
     fn create_pr_agit_multiple_candidates_names_them_and_refuses() {
-        // CLAUDE-212: two branches ahead of base would let `fj pr create -aA`
+        // Two branches ahead of base would let `fj pr create -aA`
         // silently pick whatever `HEAD` happens to be; refuse and name them.
         let wd = tempfile::tempdir().unwrap();
         let runner = Arc::new(with_branch_resolution(
@@ -3023,7 +3023,7 @@ mod tests {
 
     #[test]
     fn created_pr_falls_back_to_url_when_number_field_absent() {
-        // CLAUDE-136: a future fj that omits `number` from the JSON still yields
+        // A future fj that omits `number` from the JSON still yields
         // a number, derived from the URL's trailing `/pulls/<n>` segment, so
         // automerge keeps working rather than silently disabling.
         let b = CliBackend::new(Arc::new(StubRunner::new()));
@@ -3036,7 +3036,7 @@ mod tests {
 
     #[test]
     fn number_from_pr_url_handles_both_path_shapes() {
-        // CLAUDE-136: Forgejo emits `/pulls/<n>`, GitHub-style `/pull/<n>`.
+        // Forgejo emits `/pulls/<n>`, GitHub-style `/pull/<n>`.
         assert_eq!(
             number_from_pr_url("https://dev.a8n.run/n/c/pulls/52"),
             Some(52)
@@ -3047,7 +3047,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_strategy_errors_loudly_on_push_failure() {
-        // CLAUDE-103: a failure of the selected (branch) strategy surfaces the
+        // A failure of the selected (branch) strategy surfaces the
         // underlying CLI error directly. There is NO silent switch to AGit that
         // would emit a branchless PR.
         let wd = tempfile::tempdir().unwrap();
@@ -3057,7 +3057,7 @@ mod tests {
             &["main", "feat/x"],
             &[("feat/x", "abc\n")],
         );
-        // CLAUDE-170: remote branch absent, so the push is attempted (and fails).
+        // Remote branch absent, so the push is attempted (and fails).
         let runner = Arc::new(with_remote_state(runner, "feat/x", "abc", "").fail(
             "git",
             &["push", "--set-upstream", "origin", "feat/x:feat/x"],
@@ -3085,7 +3085,7 @@ mod tests {
 
     #[test]
     fn repo_path_from_remote_url_parses_https_and_ssh_and_creds() {
-        // CLAUDE-170: the open-PR lookup derives `owner/repo` from the origin
+        // The open-PR lookup derives `owner/repo` from the origin
         // remote. HTTPS (the runner's clone form), token-embedded HTTPS, and SSH
         // all reduce to the last two path segments with the host/creds dropped.
         assert_eq!(
@@ -3108,7 +3108,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_adopts_open_pr_when_remote_equals_local() {
-        // CLAUDE-170 (a): the remote branch already exists at the SAME commit as
+        // The remote branch already exists at the SAME commit as
         // the local tip (a re-run of already-delivered work). No push is needed;
         // the already-open PR for the branch is adopted. No `pr create` is issued.
         let wd = tempfile::tempdir().unwrap();
@@ -3146,7 +3146,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_fast_forwards_then_creates_when_local_ahead() {
-        // CLAUDE-170 (b): the remote branch exists and the local tip fast-forwards
+        // The remote branch exists and the local tip fast-forwards
         // it (remote is an ancestor of local). The push is an ordinary (never
         // forced) fast-forward; with no open PR yet, the PR is then created.
         let wd = tempfile::tempdir().unwrap();
@@ -3221,7 +3221,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_adopts_open_pr_when_diverged() {
-        // CLAUDE-170 (c) + the YOTUN-96 signature: the remote branch is present
+        // The YOTUN-96 signature: the remote branch is present
         // and NOT a fast-forward of the local tip (neither is an ancestor of the
         // other). Force is banned, so the runner adopts the already-open PR for
         // the branch: it returns the PR (finalize advances to Code Review, NOT
@@ -3274,7 +3274,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_diverged_with_no_pr_is_loud_error() {
-        // CLAUDE-170 (d): remote branch present and diverged with NO open PR. The
+        // Remote branch present and diverged with NO open PR. The
         // runner cannot force and has nothing to adopt: it returns a distinct,
         // actionable error naming the branch, both SHAs, and the preserved
         // workdir. The raw git "fetch first" hint never surfaces, no push is
@@ -3330,7 +3330,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_creates_when_open_pr_lookup_fails() {
-        // CLAUDE-206 (a): `fj pr search` 403s (an issue-category token gap) on
+        // `fj pr search` 403s (an issue-category token gap) on
         // the remote-absent arm. The lookup is an optimization, so the run
         // degrades to "assume no open PR", still pushes and creates the PR, and
         // records the CLI error as an operator-visible notice.
@@ -3410,7 +3410,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_retries_lookup_once_when_create_says_already_exists() {
-        // CLAUDE-206 (b): the race the degraded path exposes. The first lookup
+        // The race the degraded path exposes. The first lookup
         // fails, so the create runs and Forgejo rejects it with 409 "pull
         // request already exists". Exactly one lookup retry follows, and it now
         // succeeds, so the existing PR is adopted instead of the run failing.
@@ -3489,7 +3489,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_names_both_causes_when_lookup_and_create_fail() {
-        // CLAUDE-206: the create fails for its own reason after the lookup had
+        // The create fails for its own reason after the lookup had
         // already failed. The error names BOTH, so "could not check whether a PR
         // existed" is never reported as a bare "PR creation failed".
         let wd = tempfile::tempdir().unwrap();
@@ -3562,7 +3562,7 @@ mod tests {
 
     #[test]
     fn create_pr_branch_diverged_distinguishes_failed_lookup_from_no_pr() {
-        // CLAUDE-206: the diverged arm stays fatal (the lookup is the only
+        // The diverged arm stays fatal (the lookup is the only
         // alternative to a force-push there), but a FAILED search no longer
         // reads as "no open PR exists": the message says the answer is unknown
         // and names the CLI error. Still no push and no force.
@@ -3687,7 +3687,7 @@ mod tests {
 
     #[test]
     fn pr_status_extracts_state_and_mergeable() {
-        // CLAUDE-126: pr_status surfaces both the combined CI state and the
+        // pr_status surfaces both the combined CI state and the
         // mergeability verdict from the same `fj pr status --json`.
         let json = r#"{"pr":52,"head_sha":"abc","state":"success","statuses":[],"mergeable":true,"merged":false,"behind_base":true}"#;
         let b = backend(StubRunner::new().ok(
@@ -3712,7 +3712,7 @@ mod tests {
 
     #[test]
     fn pr_status_merged_pr_null_mergeable_parses_to_none() {
-        // CLAUDE-330: a merged PR reports `"mergeable": null` and no `behind_base`.
+        // A merged PR reports `"mergeable": null` and no `behind_base`.
         let json = r#"{"pr":336,"head_sha":null,"state":"merged","statuses":[],"mergeable":null,"merged":true}"#;
         let b = backend(StubRunner::new().ok(
             "fj",
@@ -3736,7 +3736,7 @@ mod tests {
 
     #[test]
     fn pr_status_behind_base_false_when_forge_reports_up_to_date() {
-        // CLAUDE-309: `behind_base: false` parses to `Some(false)`.
+        // `behind_base: false` parses to `Some(false)`.
         let json = r#"{"pr":52,"head_sha":"abc","state":"success","statuses":[],"mergeable":true,"merged":false,"behind_base":false}"#;
         let b = backend(StubRunner::new().ok(
             "fj",
@@ -3758,7 +3758,7 @@ mod tests {
 
     #[test]
     fn pr_status_behind_base_null_parses_to_none() {
-        // CLAUDE-309: an explicit `null` (Forgejo has not computed merge_base
+        // An explicit `null` (Forgejo has not computed merge_base
         // yet, or the PR is merged) must never collapse to `false`.
         let json = r#"{"pr":52,"head_sha":"abc","state":"success","statuses":[],"mergeable":true,"merged":false,"behind_base":null}"#;
         let b = backend(StubRunner::new().ok(
@@ -3781,7 +3781,7 @@ mod tests {
 
     #[test]
     fn pr_status_behind_base_absent_parses_to_none() {
-        // CLAUDE-309: an `fj` predating FJ-99 omits the field entirely, which
+        // An `fj` predating this field omits it entirely, which
         // must also read as unknown rather than `false`.
         let json = r#"{"pr":52,"head_sha":"abc","state":"success","statuses":[],"mergeable":true,"merged":false}"#;
         let b = backend(StubRunner::new().ok(
@@ -3804,8 +3804,8 @@ mod tests {
 
     #[test]
     fn merge_pr_invokes_fj_merge_with_merge_method_and_deletes_branch() {
-        // CLAUDE-126: merge-commit method, addressed as owner/repo#n.
-        // CLAUDE-145: `--delete` removes the PR head branch after merge.
+        // Merge-commit method, addressed as owner/repo#n.
+        // `--delete` removes the PR head branch after merge.
         let runner = std::sync::Arc::new(StubRunner::new().ok(
             "fj",
             &[
@@ -3835,10 +3835,10 @@ mod tests {
 
     #[test]
     fn update_pr_branch_invokes_fj_update_with_merge_style() {
-        // CLAUDE-309 (FJ-99): Forgejo's Update-branch endpoint, addressed as
+        // Forgejo's Update-branch endpoint, addressed as
         // owner/repo#n, always with `--update-style merge` (never rebase,
-        // matching CLAUDE-126's merge-commit policy). CLAUDE-353 (FJ-107):
-        // flag renamed from `--style`.
+        // matching the merge-commit policy above). Flag renamed from
+        // `--style` in a later Forgejo release.
         let runner = std::sync::Arc::new(StubRunner::new().ok(
             "fj",
             &[
@@ -3895,7 +3895,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-221: the plain-issue reply goes through `fj issue comment`, with
+    /// The plain-issue reply goes through `fj issue comment`, with
     /// the same `owner/repo#n` addressing and body-through-a-file handling as
     /// `pr_comment`. No raw REST anywhere on this path.
     #[test]
@@ -3929,7 +3929,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-220: the comment-command authorization gate reads the commenter's
+    /// The comment-command authorization gate reads the commenter's
     /// effective permission through `fj repo collaborator ... --format json` and
     /// nothing else (no raw REST). A failing lookup surfaces as an error so the
     /// caller can deny.
@@ -3993,7 +3993,7 @@ mod tests {
 
     #[test]
     fn pr_add_labels_edits_each_label_addressed_by_owner_repo_hash() {
-        // CLAUDE-149: `fj pr edit <repo>#<n> labels --add <label>`, one call per
+        // `fj pr edit <repo>#<n> labels --add <label>`, one call per
         // label.
         let runner = std::sync::Arc::new(
             StubRunner::new()
@@ -4051,7 +4051,7 @@ mod tests {
 
     #[test]
     fn injected_env_reaches_yt_and_fj_children_only() {
-        // CLAUDE-26: a credentialed backend injects YOUTRACK_CLI_CONFIG onto the
+        // A credentialed backend injects YOUTRACK_CLI_CONFIG onto the
         // yt child and an XDG_DATA_HOME override onto the fj child, each on its
         // own child only.
         let runner = Arc::new(with_branch_resolution(
@@ -4104,7 +4104,7 @@ mod tests {
         assert!(!fj.1.iter().any(|(k, _)| k == "YOUTRACK_CLI_CONFIG"));
     }
 
-    /// CLAUDE-207: the two preflight probes for `repo`, as StubRunner arg lists.
+    /// The two preflight probes for `repo`, as StubRunner arg lists.
     fn view_args(repo: &str) -> Vec<&str> {
         vec!["--host", "dev.a8n.run", "repo", "view", repo, "--json"]
     }
@@ -4125,7 +4125,7 @@ mod tests {
 
     #[test]
     fn repo_access_ok_when_both_probes_pass() {
-        // CLAUDE-194 / CLAUDE-207: the repository read AND the issue-category
+        // The repository read AND the issue-category
         // open-PR lookup both exit 0, and both inject the fj credential env so
         // they test the BOT identity, not the operator store. An empty search
         // result (a repo with no open PRs) is a pass.
@@ -4158,7 +4158,7 @@ mod tests {
 
     #[test]
     fn repo_access_fails_when_only_the_issue_probe_is_denied() {
-        // CLAUDE-207: this is the exact scope-short token the issue is about: a
+        // This is the exact scope-short token case: a
         // repository-scoped token reads the repo fine and 403s on `pr search`,
         // the first issue-category call the PR path makes. The error must name
         // the failing capability, the status, and the scope to add.
@@ -4192,7 +4192,7 @@ mod tests {
 
     #[test]
     fn repo_access_404_names_visibility_not_scope() {
-        // CLAUDE-194 / CLAUDE-207: an invisible private repo answers 404 on the
+        // An invisible private repo answers 404 on the
         // repository probe. The error must name the host, the `owner/repo`, and
         // the permission hypothesis (the bare CLI text names none), and must read
         // differently from the 403 above: adding a scope cannot reveal the repo.
@@ -4219,7 +4219,7 @@ mod tests {
 
     #[test]
     fn pr_create_failure_names_repo_host_and_permission_cause() {
-        // CLAUDE-194: permissions can change mid-run, past the gather-time
+        // Permissions can change mid-run, past the gather-time
         // preflight. The `fj pr create` 404 is then restated with the repo, the
         // host, and the possible cause instead of the bare CLI text.
         let wd = tempfile::tempdir().unwrap();
@@ -4276,7 +4276,7 @@ mod tests {
 
     #[test]
     fn agit_pr_create_failure_also_names_repo_host_and_cause() {
-        // CLAUDE-194: the AGit create path is the sibling of the branch path and
+        // The AGit create path is the sibling of the branch path and
         // gets the same restatement; the repo is read from `origin` on failure.
         let b = CliBackend::new(Arc::new(with_branch_resolution(
             StubRunner::new()
@@ -4313,7 +4313,7 @@ mod tests {
         assert!(b.clone_url("dev.a8n.run", "x/y").is_err());
     }
 
-    // ---- CLAUDE-204: `fj actions logs` ------------------------------------
+    // ---- `fj actions logs` ------------------------------------
 
     use crate::forge_log::{ActionLogClient, RunLogsOutcome};
 
@@ -4350,7 +4350,7 @@ mod tests {
 
     #[test]
     fn action_logs_injects_the_token_through_a_temp_single_host_keys_json() {
-        // CLAUDE-204: the resolved `log_token_ref` reaches the `fj` child only,
+        // The resolved `log_token_ref` reaches the `fj` child only,
         // through a temp `keys.json` carrying that one secret and nothing else.
         // It is never a process argument.
         let runner = Arc::new(StubRunner::new().ok("fj", LOGS_ARGS, LOGS_JSON));
@@ -4379,7 +4379,7 @@ mod tests {
     #[test]
     fn temp_fj_keys_carries_only_that_host_and_token() {
         // The store the log fetch writes has exactly one host entry, and its
-        // token is the per-call one (CLAUDE-123 shape: type / name / token).
+        // token is the per-call one (shape: type / name / token).
         let keys = crate::secrets::TempFjKeys::create("dev.a8n.run", "test-pat").unwrap();
         let path = std::path::PathBuf::from(keys.xdg_data_home())
             .join("forgejo-cli")
@@ -4467,7 +4467,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-205: `fj actions runs` (FJ-66) ----------------------------
+    // ---- `fj actions runs` ----------------------------
 
     use crate::forge_log::{ActionRunsClient, RepoFileClient, RunsListOutcome};
 
@@ -4629,7 +4629,7 @@ mod tests {
         assert!(env.is_empty(), "no env injected without a token: {env:?}");
     }
 
-    // ---- CLAUDE-236: `fj actions runs --run-number` (one run's timing) ----
+    // ---- `fj actions runs --run-number` (one run's timing) ----
 
     /// The argv for the single-run timing read, as the client builds it.
     const TIMING_ARGS: &[&str] = &[
@@ -4673,7 +4673,7 @@ mod tests {
         assert!(e.contains("404"), "the reason names the failure: {e}");
     }
 
-    // ---- CLAUDE-205: `fj repo file` (FJ-67) -------------------------------
+    // ---- `fj repo file` -------------------------------
 
     const FILE_ARGS: &[&str] = &[
         "--host",
@@ -4711,7 +4711,7 @@ mod tests {
 
     #[test]
     fn a_missing_path_is_an_error_the_caller_can_step_past() {
-        // FJ-67 maps the raw endpoint's 404 to a message naming path and ref.
+        // Maps the raw endpoint's 404 to a message naming path and ref.
         let runner = Arc::new(StubRunner::new().fail(
             "fj",
             FILE_ARGS,
@@ -4730,10 +4730,10 @@ mod tests {
         assert!(err.contains("check.yml"), "{err}");
     }
 
-    /// CLAUDE-311 regression (BUNYIP-726 shape): a resumed-PR clone pins the
+    /// Regression (BUNYIP-726 shape): a resumed-PR clone pins the
     /// feature branch, which `git clone --branch` turns into
-    /// `--single-branch`. Before CLAUDE-311's fix in `provider::shallow_clone`
-    /// that left no `origin/HEAD`, so `resolve_feature_branch`'s first command
+    /// `--single-branch`. That used to leave no `origin/HEAD` in
+    /// `provider::shallow_clone`, so `resolve_feature_branch`'s first command
     /// failed outright. With the fix, the pinned clone still carries
     /// `origin/HEAD`, and `resolve_feature_branch` finds the feature branch.
     #[test]
@@ -4777,7 +4777,7 @@ mod tests {
         assert_eq!(branch, "feat");
     }
 
-    // CLAUDE-319: `unwrap_prose` reflows hard-wrapped commit-body prose so the
+    // `unwrap_prose` reflows hard-wrapped commit-body prose so the
     // PR description Forgejo renders uses the full page width.
 
     #[test]
@@ -4861,7 +4861,7 @@ mod tests {
         assert_eq!(unwrap_prose(body), body);
     }
 
-    /// CLAUDE-319: a `CommandRunner` that forwards every call to `inner`, but
+    /// A `CommandRunner` that forwards every call to `inner`, but
     /// captures the `--body-file` scratch file's content the instant `fj pr
     /// create` runs, before `find_or_create_pr`'s own cleanup deletes it.
     struct BodyCapturingRunner {
