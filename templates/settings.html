@@ -148,6 +148,24 @@
     <input id="auth-gh-token" name="token" type="password" autocomplete="off" required>
     <button type="submit" style="margin-top: 8px;">Save GitHub login</button>
   </form>
+
+  <h4 style="margin: 20px 0 4px;">Git commit identity
+    <span class="badge ok">{{ auth.git_author_name }} &lt;{{ auth.git_author_email }}&gt;</span>
+  </h4>
+  <span class="dim">Author name and email for the commits the agent makes inside a job's clone.
+  Not a credential, so it is stored in the open. Defaults to
+  <code>claude-run &lt;claude-run@a8n.run&gt;</code> when unset, so a fresh deployment commits
+  successfully with no <code>docker compose exec</code> step. Leave a field blank to clear it back
+  to that default.</span>
+  <form method="post" action="/settings/auth/git" style="margin-top: 8px;">
+    <label for="auth-git-name">Name</label>
+    <input id="auth-git-name" name="name" type="text" placeholder="claude-run"
+           value="{{ auth.git_author_name }}">
+    <label for="auth-git-email" style="margin-top: 8px;">Email</label>
+    <input id="auth-git-email" name="email" type="email" placeholder="claude-run@a8n.run"
+           value="{{ auth.git_author_email }}">
+    <button type="submit" style="margin-top: 8px;">Save git identity</button>
+  </form>
 </div>
 
 {% for sec in sections %}

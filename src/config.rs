@@ -395,6 +395,14 @@ impl Default for CommentWebhookConfig {
     }
 }
 
+/// Default git commit identity used wherever the runner authors a commit and
+/// nothing more specific is configured: the comment-webhook's own corrective
+/// commits ([`CommentWebhookSource::bot_author`] / `bot_email`) and, per
+/// CLAUDE-358, [`AuthConfig::git_author_name`] / `git_author_email` when unset.
+pub const DEFAULT_GIT_AUTHOR_NAME: &str = "claude-run";
+/// See [`DEFAULT_GIT_AUTHOR_NAME`].
+pub const DEFAULT_GIT_AUTHOR_EMAIL: &str = "claude-run@a8n.run";
+
 impl CommentWebhookConfig {
     /// Warn at load for any source name needing URL escaping, exactly as
     /// [`WebhookConfig::warn_unusual_source_names`] does for the CI-failure
@@ -459,8 +467,8 @@ impl Default for CommentWebhookSource {
             allowed_permissions: vec!["write".to_string(), "admin".to_string()],
             max_files: 10,
             max_lines: 300,
-            bot_author: "claude-run".to_string(),
-            bot_email: "claude-run@a8n.run".to_string(),
+            bot_author: DEFAULT_GIT_AUTHOR_NAME.to_string(),
+            bot_email: DEFAULT_GIT_AUTHOR_EMAIL.to_string(),
             skip_marker: "[skip claude]".to_string(),
         }
     }
@@ -912,6 +920,14 @@ pub struct AuthConfig {
     pub github_host: Option<String>,
     /// Secret name holding the GitHub token.
     pub github_token_ref: Option<String>,
+    /// Git commit author name for commits the agent makes inside a job's clone.
+    /// Not a secret (a name is not a credential), so no `_ref` field; unset
+    /// falls back to the `"claude-run"` bot-identity default at materialize
+    /// time.
+    pub git_author_name: Option<String>,
+    /// Git commit author email, alongside [`AuthConfig::git_author_name`]. Unset
+    /// falls back to the `"claude-run@a8n.run"` bot-identity default.
+    pub git_author_email: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
