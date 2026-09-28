@@ -1,4 +1,4 @@
-//! CLAUDE-117: shared reporting aggregations over historical state.
+//! Shared reporting aggregations over historical state.
 //!
 //! Both the JSON API (`/api/report/*`, [`crate::api`]) and the `/reports` HTML
 //! page ([`crate::web`]) render these series, so the SQL lives here once rather
@@ -160,7 +160,7 @@ pub struct HourBucket {
     pub run_starts: i64,
 }
 
-/// CLAUDE-315: one `claude_invocations` row, oldest-to-newest, for the plan
+/// One `claude_invocations` row, oldest-to-newest, for the plan
 /// usage chart. `five_hour_utilization` / `seven_day_utilization` are `None`
 /// when the invocation's stream log had no `rate_limit_event` at all (an old
 /// CLI, or a session that made no API call reporting one): those points are
@@ -433,7 +433,7 @@ pub async fn summary(pool: &DbPool, range: Range, action: Option<&str>) -> Resul
     })
 }
 
-/// CLAUDE-315: the `claude_invocations` chart series plus the 20-most-recent
+/// The `claude_invocations` chart series plus the 20-most-recent
 /// table, both filtered by the same `range`/`action` the rest of the page
 /// uses. The chart reads every row in the window (oldest first, so the SVG
 /// draws left-to-right); the table re-queries the same window newest-first
@@ -572,7 +572,7 @@ mod tests {
         crate::db::test_pool().await
     }
 
-    /// CLAUDE-117: the core AC. A timestamp at 02:30 UTC on a Sunday lands on
+    /// The core AC. A timestamp at 02:30 UTC on a Sunday lands on
     /// Saturday 21:30 at UTC-5 and Sunday 11:30 at UTC+9, so the weekday/hour it
     /// buckets into depends on the timezone the conversion uses, proving the
     /// UTC->local conversion happens before extraction.
@@ -767,7 +767,7 @@ mod tests {
         .unwrap();
     }
 
-    /// CLAUDE-315: a populated window includes a timed-out invocation and a row
+    /// A populated window includes a timed-out invocation and a row
     /// with no rate-limit data at all; the gap count reflects only the latter.
     #[tokio::test]
     async fn claude_usage_reports_the_series_gaps_and_recent_table() {

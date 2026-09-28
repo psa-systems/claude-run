@@ -3,7 +3,7 @@
 {% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><span class="current">Reports</span>{% endblock %}
 {% block main %}
 
-{# CLAUDE-117: historical reporting. Spend is the primary metric and renders
+{# Historical reporting. Spend is the primary metric and renders
    first. Bars are server-computed CSS widths; the GET form drives the range +
    action filter (no HTMX needed, the page is a plain reload). #}
 
@@ -49,7 +49,7 @@
 </div>
 
 <h2>Claude plan usage</h2>
-{# CLAUDE-315: rate-limit utilization per `claude` invocation, from
+{# Rate-limit utilization per `claude` invocation, from
    `claude_invocations`. Inline SVG, same pattern as the per-action duration
    chart (templates/action_chart.html): no JS charting library. An invocation
    with no `rate_limit_event` at all (an old CLI, or a session that made no

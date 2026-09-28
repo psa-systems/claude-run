@@ -1,8 +1,8 @@
-//! Phase 5 (CLAUDE-48): bearer-token auth for the daemon's TCP-exposed HTTP
+//! Phase 5: bearer-token auth for the daemon's TCP-exposed HTTP
 //! surface.
 //!
-//! The daemon binds its axum router to loopback by default. CLAUDE-36 exposes
-//! that surface through the external reverse proxy so a `/webhooks/forgejo`
+//! The daemon binds its axum router to loopback by default. The external
+//! reverse proxy exposes that surface so a `/webhooks/forgejo`
 //! route is reachable, which also exposes the web UI and `/api/*`. This module
 //! gates that surface behind a bearer token whenever the effective bind is
 //! non-loopback (or auth is explicitly required on loopback for testing).
@@ -12,7 +12,7 @@
 //!
 //! Two credentials answer that gate, and they serve different callers:
 //!
-//! - `Authorization: Bearer <token>`, where the token is a CLAUDE-26 secret
+//! - `Authorization: Bearer <token>`, where the token is an encrypted secret
 //!   named by `web.auth_token_ref`, resolved once at daemon startup and never
 //!   read from the config file in plaintext. This is the API clients' path.
 //! - The browser login, which since the first-run setup page is the

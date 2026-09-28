@@ -1,5 +1,4 @@
-//! Failure triage engine (CLAUDE-45, part of the webhook epic
-//! CLAUDE-36).
+//! Failure triage engine.
 //!
 //! A verified `action_run_failure` event plus its redacted job log
 //! ([`crate::forge_log`]) is sorted into one of three buckets:
@@ -17,7 +16,7 @@
 //! LLM call. Only the residue it cannot label is handed to a [`FailureClassifier`]
 //! (the LLM pass), which separates bucket 1 from bucket 2 and writes the analysis
 //! string. The classifier is a trait so tests inject a stub and never shell out;
-//! the production [`AnalysisClassifier`] (CLAUDE-274) reuses the existing
+//! the production [`AnalysisClassifier`] reuses the existing
 //! [`ClaudeInvoker`] (`claude --print`) the runner already uses, running one
 //! tool-using session (`Read,Grep,Bash`) over the COMPLETE log plus the failing
 //! workflow YAML and ending with a fenced JSON verdict
@@ -64,9 +63,9 @@ pub enum TriageBucket {
     HumanAction,
     /// Bucket 3: transient / infra / flaky; a retry may simply succeed.
     Transient,
-    /// CLAUDE-104: a mechanically-fixable verification failure (cargo fmt, a
+    /// A mechanically-fixable verification failure (cargo fmt, a
     /// failing checks workflow). Routes like [`TriageBucket::CodeFix`] (mint a
-    /// queued issue so the runner opens a corrective PR). CLAUDE-115: applies
+    /// queued issue so the runner opens a corrective PR). Applies
     /// only when the failing branch has no open PR (the canonical case is a push
     /// to a protected/main branch); a failing check on an open, unmerged PR
     /// falls through to the classifier instead. Set only by the deterministic
@@ -125,7 +124,7 @@ pub struct Triage {
     pub analysis: String,
     /// Which pass produced the verdict.
     pub classified_by: ClassifiedBy,
-    /// CLAUDE-104: the auto-fix detail when `bucket == AutoFix`, carried through
+    /// The auto-fix detail when `bucket == AutoFix`, carried through
     /// to the mint so the issue summary / description name the concrete problem
     /// and fix command. `None` for every other bucket.
     #[serde(default)]
@@ -151,7 +150,7 @@ impl Triage {
         }
     }
 
-    /// CLAUDE-104: a deterministic auto-fix verdict carrying its detector detail.
+    /// A deterministic auto-fix verdict carrying its detector detail.
     /// The analysis mirrors the detector's problem statement so existing
     /// analysis renderers stay coherent.
     fn auto_fix(detail: AutoFix) -> Self {
@@ -178,17 +177,17 @@ pub struct TriageInput {
     pub html_url: String,
     /// Redacted log text (empty when unavailable; see `log_available`).
     pub log: String,
-    /// False when the log could not be fetched. CLAUDE-92: a real failure with
+    /// False when the log could not be fetched. A real failure with
     /// no obtainable log routes to a HUMAN (bucket 2) so it can never be
     /// silently dropped; `log_unavailable_reason` says why in the analysis.
     pub log_available: bool,
-    /// CLAUDE-92: why the log is missing (unauthorized private repo, exhausted
+    /// Why the log is missing (unauthorized private repo, exhausted
     /// flush retries, fetch error). `None` when `log_available` is true.
     pub log_unavailable_reason: Option<String>,
     /// Whether the failing branch has an open PR. Strong bucket-1-vs-2 signal
     /// passed to the classifier (bucket 1 needs a PR to fix).
     pub has_open_pr: bool,
-    /// CLAUDE-274: the resolved `log_token_ref` secret that authorized the log
+    /// The resolved `log_token_ref` secret that authorized the log
     /// fetch, carried through so [`AnalysisClassifier`] can fetch the failing
     /// workflow YAML with the same credential. `None` reads it unauthenticated
     /// (a public repo).
@@ -227,12 +226,12 @@ const TRANSIENT_SIGNATURES: &[&str] = &[
 /// failure (bucket 3), so the caller skips the LLM; `None` for everything else,
 /// which the caller hands to the [`FailureClassifier`].
 pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
-    // CLAUDE-92: a real failure whose log could not be obtained routes to a
+    // A real failure whose log could not be obtained routes to a
     // HUMAN, never to the silent transient bucket. The original rule treated
     // every miss as "not flushed yet, a retry will get it", which quietly
     // swallowed failures on private repos (whose logs are unreadable on this
     // Forgejo version) and any other permanently-unfetchable log. Non-failure
-    // statuses never reach triage at all (CLAUDE-85), so everything here IS a
+    // statuses never reach triage at all, so everything here IS a
     // failure someone should see.
     if !input.log_available {
         let why = input
@@ -262,7 +261,7 @@ pub fn triage_rules(input: &TriageInput) -> Option<Triage> {
         ));
     }
 
-    // CLAUDE-266: a runner that cannot reach its network is an operator concern
+    // A runner that cannot reach its network is an operator concern
     // no corrective PR can fix. It mints one grouped, branch-agnostic issue
     // (keyed on the infra kind) for a human instead of vanishing as transient.
     // This runs BEFORE the transient scan so the detector owns its phrases.
@@ -293,7 +292,7 @@ pub trait FailureClassifier: Send + Sync {
     /// Classify a non-transient failure (the rules abstained). Returning `Err`
     /// is allowed; [`triage`] degrades it to [`TriageBucket::HumanAction`].
     ///
-    /// `spend` is the caller's own per-delivery ledger (CLAUDE-337): an
+    /// `spend` is the caller's own per-delivery ledger: an
     /// implementation that shells out to `claude` records its cost onto it
     /// (and caps the child at `spend.remaining_usd()`) rather than owning a
     /// ledger of its own, since a classifier is a daemon-lifetime `Arc`
@@ -309,9 +308,9 @@ pub trait FailureClassifier: Send + Sync {
 /// degrades to [`TriageBucket::HumanAction`] (a human looks) rather than failing
 /// the pipeline.
 ///
-/// CLAUDE-104: the [`autofix`] detectors run AFTER the transient/no-log rules
+/// The [`autofix`] detectors run AFTER the transient/no-log rules
 /// (so a flaky run of a checks workflow is still classed transient, never
-/// auto-fixed) but BEFORE the LLM. CLAUDE-115: they run only when the failing
+/// auto-fixed) but BEFORE the LLM. They run only when the failing
 /// branch has no open PR (the canonical case is a push to a protected/main
 /// branch); a failing check on an open, unmerged PR skips auto-fix and falls
 /// through to the classifier, so the runner never opens a *new* corrective PR
@@ -327,7 +326,7 @@ pub fn triage(
     if let Some(verdict) = triage_rules(input) {
         return verdict;
     }
-    // CLAUDE-115: auto-fix only failures on a branch with no open PR. A failing
+    // Auto-fix only failures on a branch with no open PR. A failing
     // check on an open, unmerged PR is that PR's own concern; minting a queued
     // issue here would open a new corrective PR against the unmerged PR, which
     // causes more confusion than it fixes.
@@ -411,7 +410,7 @@ fn extract_last_json_object(s: &str) -> Option<Value> {
     serde_json::from_str(&s[start..=end]).ok()
 }
 
-/// CLAUDE-274: the four verdicts [`AnalysisClassifier`]'s prompt asks for, and
+/// The four verdicts [`AnalysisClassifier`]'s prompt asks for, and
 /// how each routes.
 const VERDICT_CODE_DEFECT: &str = "code_defect";
 const VERDICT_NEEDS_HUMAN: &str = "needs_human";
@@ -423,8 +422,8 @@ const VERDICT_INFRA: &str = "infra";
 /// asks for at the end): `{"verdict": "code_defect"|"needs_human"|"flaky"|
 /// "infra", "failing_tests": [...], "summary": "..."}`. `code_defect` maps to
 /// [`TriageBucket::CodeFix`], `needs_human` to [`TriageBucket::HumanAction`],
-/// and `flaky` / `infra` both to [`TriageBucket::Transient`] (CLAUDE-274 step
-/// 3: neither warrants a fix PR, and the existing dedupe/reopen machinery
+/// and `flaky` / `infra` both to [`TriageBucket::Transient`] (neither
+/// warrants a fix PR, and the existing dedupe/reopen machinery
 /// already handles a flake resurfacing). An unparseable or missing verdict
 /// degrades to [`TriageBucket::HumanAction`] and logs at `warn` with a reply
 /// excerpt - it must NEVER silently become `code_fix`. The full Markdown
@@ -464,13 +463,13 @@ pub fn parse_analysis_verdict(reply: &str) -> Triage {
     )
 }
 
-/// CLAUDE-274: production [`FailureClassifier`]: one tool-using `claude`
+/// Production [`FailureClassifier`]: one tool-using `claude`
 /// session per failure, over the COMPLETE log (not the bounded copy the old
 /// [`bound_log`]-based classifier used) plus the failing workflow YAML, ending
 /// with a fenced JSON verdict ([`parse_analysis_verdict`]) that routes the
 /// failure. Replaces the old two-pass split (a tool-less classifier at ingest,
-/// a separate scheduled deep-analysis action over the full log later, since
-/// retired in CLAUDE-279): the analysis and the routing decision now come from
+/// a separate scheduled deep-analysis action over the full log later): the
+/// analysis and the routing decision now come from
 /// the SAME session, so the
 /// deep, log-grounded report is available before the issue is even minted.
 /// Any non-completion reply degrades to human review, same as the old
@@ -481,11 +480,11 @@ pub struct AnalysisClassifier {
     timeout: Duration,
     /// `webhook-logs/analysis/`; each classification gets its own
     /// `<owner>_<repo>-run<N>/` subdirectory, removed when the classification
-    /// returns (CLAUDE-274 step 6).
+    /// returns.
     analysis_base_dir: PathBuf,
     logs_dir: PathBuf,
     fj: Arc<dyn ForgeReads>,
-    /// CLAUDE-315: where this classification's `claude_invocations` row is
+    /// Where this classification's `claude_invocations` row is
     /// written. `classify` is synchronous and always run inside
     /// `tokio::task::spawn_blocking` (never `block_in_place`), so bridging into
     /// the async write with `Handle::current().block_on` blocks only that
@@ -545,7 +544,7 @@ impl FailureClassifier for AnalysisClassifier {
             html_url: input.html_url.clone(),
         };
         let cwd = self.event_dir(&coords);
-        // CLAUDE-274 step 6: the directory is removed when the classification
+        // The directory is removed when the classification
         // returns, on every exit path (an early `?` included), so a failure
         // never leaks a live event's workdir. The redacted log artifact under
         // `webhook-logs/` (a sibling of `analysis/`, written by the caller
@@ -636,15 +635,15 @@ impl FailureClassifier for AnalysisClassifier {
             &cwd,
             &stream_log,
             &cancel,
-            // DEV-705: cap the child at the caller's remaining per-delivery ceiling.
+            // Cap the child at the caller's remaining per-delivery ceiling.
             Some(spend.remaining_usd()),
         )?;
-        // CLAUDE-337: fold this call's tokens and cost into the caller's own
+        // Fold this call's tokens and cost into the caller's own
         // ledger; the caller (the webhook mint consumer) owns the ledger and
         // finishes it exactly once, after `classify` returns, with the run's
         // real `run_id`.
         spend.record(&result);
-        // CLAUDE-315: this classification has neither a scheduled job key nor
+        // This classification has neither a scheduled job key nor
         // a run row, so both are `None`. `classify` runs inside
         // `spawn_blocking` (see the `pool` field doc), so blocking this thread
         // on the async write is safe.
@@ -657,7 +656,7 @@ impl FailureClassifier for AnalysisClassifier {
             &result,
         ));
         if !result.ok {
-            // CLAUDE-146: surface the reason claude actually reported
+            // Surface the reason claude actually reported
             // (`result.summary`, built by `friendly_failure_summary`) instead
             // of the opaque `claude exited N`, so the minted issue names the
             // real cause. Fall back to `result.error` only when the summary is
@@ -786,7 +785,7 @@ mod tests {
 
     #[test]
     fn rules_route_runner_unavailable_to_a_human() {
-        // CLAUDE-266: the detector's network conditions leave the transient
+        // The detector's network conditions leave the transient
         // bucket; a reset on a line naming a registry counts, a bare one does not.
         for log in [
             "could not resolve host: registry.example.com",
@@ -810,7 +809,7 @@ mod tests {
 
     #[test]
     fn rules_route_unavailable_log_to_a_human() {
-        // CLAUDE-92: a real failure with no obtainable log must surface to a
+        // A real failure with no obtainable log must surface to a
         // human (bucket 2), never silently drop as transient; the analysis
         // names the recorded reason.
         let mut input = input_with_log("");
@@ -844,7 +843,7 @@ mod tests {
 
     #[test]
     fn rules_classify_a_condition_skipped_job_as_transient() {
-        // CLAUDE-78: the live CLAUDE-73 mis-mint shape; the job never ran, the
+        // The job never ran; the
         // runner skipped it because the workflow `if` guard evaluated false.
         let log = "2026-06-07T03:21:19Z host-a(version:v12.6.4) received task 10721 of job create-release, be triggered by event: pull_request\n\
             workflow prepared\n\
@@ -915,7 +914,7 @@ mod tests {
         assert_eq!(stub.calls(), 0, "the classifier must NOT be consulted");
     }
 
-    // ---- CLAUDE-104: deterministic auto-fix routing -----------------------
+    // ---- Deterministic auto-fix routing -----------------------
 
     #[test]
     fn cargo_fmt_failure_on_push_to_main_routes_to_auto_fix_not_human() {
@@ -940,7 +939,7 @@ mod tests {
 
     #[test]
     fn check_yml_failure_routes_to_auto_fix_only_without_an_open_pr() {
-        // AC 3 + CLAUDE-115: the checks-workflow detector fires for a non-fmt
+        // AC 3: the checks-workflow detector fires for a non-fmt
         // check.yml failure, but ONLY when the failing branch has no open PR.
         // With an open PR the failure is that PR's own concern, so triage skips
         // auto-fix and hands it to the classifier instead of opening a new
@@ -974,7 +973,7 @@ mod tests {
 
     #[test]
     fn cargo_fmt_failure_on_an_open_pr_skips_auto_fix() {
-        // CLAUDE-115: even the signature-driven cargo-fmt detector is gated on
+        // Even the signature-driven cargo-fmt detector is gated on
         // has_open_pr. A fmt failure on an open, unmerged PR is left to that PR
         // (the classifier routes it), never auto-fixed via a new corrective PR.
         let stub = StubClassifier::new(Triage::llm(
@@ -1048,7 +1047,7 @@ mod tests {
         assert!(bounded.chars().count() > 0);
     }
 
-    // ---- CLAUDE-274 AC 2: analysis verdict mapping, all four values plus an
+    // ---- AC 2: analysis verdict mapping, all four values plus an
     // unparseable reply -----------------------------------------------------
 
     #[test]
@@ -1106,7 +1105,7 @@ mod tests {
         assert_eq!(verdict.bucket, TriageBucket::CodeFix);
     }
 
-    // ---- CLAUDE-274 AC 1: AnalysisClassifier session shape -----------------
+    // ---- AC 1: AnalysisClassifier session shape -----------------
 
     use crate::forge_log::{ActionLogClient, ActionRunsClient, RepoFileClient, RunLogsOutcome};
 
@@ -1215,7 +1214,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(verdict.bucket, TriageBucket::CodeFix);
-        // CLAUDE-337: the classifier records its cost onto the caller's own
+        // The classifier records its cost onto the caller's own
         // ledger instead of owning one, so the caller can attribute it to the
         // right run.
         assert_eq!(spend.cost_usd(), 0.1);

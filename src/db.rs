@@ -2,8 +2,8 @@
 //!
 //! Two backends, one code path. SQLite is the default and is what every host
 //! install and the container image use unless the operator sets a URL; a
-//! `postgres://` URL points the same daemon at a PostgreSQL server instead
-//! (CLAUDE-250). Both run through sqlx's `Any` driver, so the ~130 statements
+//! `postgres://` URL points the same daemon at a PostgreSQL server instead.
+//! Both run through sqlx's `Any` driver, so the ~130 statements
 //! across `src/` are written once and every module threads a single
 //! [`DbPool`].
 //!
@@ -413,16 +413,16 @@ async fn open_postgres(url: &str) -> Result<DbPool> {
     Ok(pool)
 }
 
-/// The CLAUDE-228 pool settings, applied to both backends.
+/// Pool settings, applied to both backends.
 fn pool_options(dialect: Dialect) -> AnyPoolOptions {
     let opts = AnyPoolOptions::new()
-        // CLAUDE-228: 8 left no headroom once the daemon runs several overlapping
+        // 8 left no headroom once the daemon runs several overlapping
         // runs plus the web UI's polling.
         .max_connections(16)
-        // CLAUDE-228: sqlx's default, stated so it is a decision and not an
+        // sqlx's default, stated so it is a decision and not an
         // inherited value. An acquire that waits this long is a real fault.
         .acquire_timeout(Duration::from_secs(30))
-        // CLAUDE-228: raised from the 2s default. With blocking work off the
+        // Raised from the 2s default. With blocking work off the
         // async runtime an acquire is sub-millisecond, so 5s flags a genuine
         // regression instead of logging routine contention.
         .acquire_slow_threshold(Duration::from_secs(5));

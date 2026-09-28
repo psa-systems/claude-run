@@ -1,4 +1,4 @@
-//! CLAUDE-9: in-flight run cancellation registry.
+//! In-flight run cancellation registry.
 //!
 //! The daemon dispatches each run on a detached task with no stored handle.
 //! To cancel a run on demand we keep a per-`run_id` [`CancellationToken`] in a
@@ -64,7 +64,7 @@ impl RunRegistry {
         }
     }
 
-    /// CLAUDE-11: trip every in-flight run's token at once, for graceful
+    /// Trip every in-flight run's token at once, for graceful
     /// shutdown. Returns the run ids that were signalled (arbitrary order).
     /// Each tripped run tears down through the same path as a single cancel:
     /// the claude child is terminated, `post` runs with a synthesized cancelled

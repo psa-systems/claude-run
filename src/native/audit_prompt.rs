@@ -133,7 +133,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-304: `Needs Review` is now a second permitted `AI Agent` value,
+    /// `Needs Review` is now a second permitted `AI Agent` value,
     /// but only on an issue the run created this run and found wrong; delete
     /// stays banned regardless.
     #[test]

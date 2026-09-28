@@ -1,4 +1,4 @@
-//! CLAUDE-49: `claude-run version` self-update.
+//! `claude-run version` self-update.
 //!
 //! `show` prints the build-stamped [`crate::VERSION`] banner. `check` resolves
 //! the newest `vX.Y.Z` build published to the Forgejo Generic Package registry
@@ -14,11 +14,11 @@
 //! the canonical capability rather than working around a missing one.
 //!
 //! Authentication is anonymous-first: on a 401/403 the caller may supply a
-//! registry token (CLAUDE-55: resolved from `[update].token_ref` in the secrets
+//! registry token (resolved from `[update].token_ref` in the secrets
 //! store) or an `fj` token for the host, otherwise the operation fails with an
 //! actionable message and never swaps the binary.
 //!
-//! CLAUDE-55 adds release trains. `release` (the default) keeps the original
+//! Release trains: `release` (the default) keeps the original
 //! behavior: the newest semver `vX.Y.Z` package, ignoring the moving `latest`
 //! tag. `latest` tracks the moving `latest` package; since that tag is non-semver
 //! and re-published on every push to main, "update available" is decided by
@@ -40,13 +40,13 @@ use crate::paint;
 const DEFAULT_BASE: &str = "https://dev.a8n.run";
 const DEFAULT_OWNER: &str = "psa-systems";
 const DEFAULT_PACKAGE: &str = "claude-run";
-/// Asset filename published per tag (and its sha256 sidecar, CLAUDE-49).
+/// Asset filename published per tag (and its sha256 sidecar).
 const ASSET: &str = "claude-run-linux-x86_64";
-/// The moving tag CI re-publishes on every push to main (CLAUDE-55 `latest`
+/// The moving tag CI re-publishes on every push to main (the `latest`
 /// train). Excluded from the `release` train's semver pick.
 pub const LATEST_TAG: &str = "latest";
 
-/// The self-update channel (CLAUDE-55), mirroring yotun's `UpdateTrain`.
+/// The self-update channel, mirroring yotun's `UpdateTrain`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum UpdateTrain {
     /// Newest semver `vX.Y.Z` package, excluding the moving `latest` tag.
@@ -180,7 +180,7 @@ pub enum UpdateStatus {
     Ahead,
 }
 
-/// CLAUDE-129: the resolved state of an on-demand check, covering both trains.
+/// The resolved state of an on-demand check, covering both trains.
 /// `Ahead` only arises on the `release` train (semver comparison); `NoneFound`
 /// covers an empty `release` registry or an absent `latest` build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,7 +193,7 @@ pub enum CheckState {
     NoneFound,
 }
 
-/// CLAUDE-129: structured, printing-free result of a registry check. Shared by
+/// Structured, printing-free result of a registry check. Shared by
 /// the CLI `version check` (which formats it for the terminal) and the web
 /// About page (which renders `current` / `available` / `state`). For the
 /// `release` train `current`/`available` are `vX.Y.Z` strings; for `latest`
@@ -272,7 +272,7 @@ impl Updater {
     /// token on 401/403. `authorize` is invoked ONLY when anonymous access is
     /// refused; its future resolves to `Ok(Some(token))` to retry, `Ok(None)` to
     /// give up, or `Err` when the escalation credential itself cannot be produced
-    /// (CLAUDE-158: e.g. the configured `token_ref` secret cannot be decrypted).
+    /// (e.g. the configured `token_ref` secret cannot be decrypted).
     /// Because the callback is async and lazy, any key-file load / secret decrypt
     /// happens only on the escalation path and never on the anonymous-first path.
     /// Returns the credential that worked (so a download can reuse it) and the
@@ -325,7 +325,7 @@ impl Updater {
         Ok(bytes.to_vec())
     }
 
-    /// Fetch just the SHA-256 sidecar text for `tag` (CLAUDE-55 `latest`-train
+    /// Fetch just the SHA-256 sidecar text for `tag` (the `latest`-train
     /// check, which compares digests without downloading the whole binary).
     pub async fn fetch_sidecar(&self, cred: &Cred, tag: &str) -> Result<String> {
         let bytes = self
@@ -425,7 +425,7 @@ pub fn current_exe_sha256() -> Result<String> {
 }
 
 /// Resolve the tag to install for `train` from the published `versions`. An
-/// exact `--version <tag>` pin overrides the train entirely (CLAUDE-55): it is
+/// exact `--version <tag>` pin overrides the train entirely: it is
 /// normalized to `vX.Y.Z` and must be published. With no pin, `release` picks
 /// the newest semver and `latest` picks the moving `latest` package.
 pub fn select_target(train: UpdateTrain, versions: &[String], pin: Option<&str>) -> Result<String> {
@@ -512,7 +512,7 @@ fn install_err(current: &Path, dir: &Path, e: std::io::Error) -> Error {
 }
 
 // ---------------------------------------------------------------------------
-// Non-interactive core (CLAUDE-129)
+// Non-interactive core
 //
 // These functions do no printing and no prompting, returning structured
 // results so both the CLI commands below and the web About handlers call the
@@ -612,13 +612,13 @@ pub async fn apply_core(
     Ok(target)
 }
 
-/// Lazily decrypts the configured `[update].token_ref` secret (CLAUDE-55) only
+/// Lazily decrypts the configured `[update].token_ref` secret only
 /// when the registry demands escalation. Holds the DB pool and the secret name;
 /// [`ConfiguredToken::resolve`] loads the age key file and decrypts the secret,
 /// and it runs ONLY inside the `list_versions` authorizer, i.e. only on a
 /// 401/403 and only when the configured-token branch is taken.
 ///
-/// CLAUDE-158: this keeps `version check` / `version update` anonymous-first. A
+/// This keeps `version check` / `version update` anonymous-first. A
 /// configured `token_ref` no longer forces `CLAUDE_RUN_SECRETS_KEY_FILE` to be
 /// present up front, so an anonymously-readable registry succeeds with no key
 /// file even when `token_ref` is set, and `--use-fj-token` can escalate without
@@ -638,7 +638,7 @@ impl ConfiguredToken {
     /// Decrypt the configured secret. Runs only on the registry escalation path.
     /// When the key file env var is unset, returns an actionable error naming
     /// both remedies rather than the bare `CLAUDE_RUN_SECRETS_KEY_FILE is not
-    /// set` (CLAUDE-158); other load failures (file missing / unparseable) pass
+    /// set`; other load failures (file missing / unparseable) pass
     /// through with their already-actionable messages.
     async fn resolve(&self) -> Result<String> {
         if std::env::var_os(crate::secrets::KEY_FILE_ENV).is_none() {
@@ -656,7 +656,7 @@ impl ConfiguredToken {
     }
 }
 
-/// CLAUDE-129: web entry for the on-demand check. Builds the updater from env,
+/// Web entry for the on-demand check. Builds the updater from env,
 /// lists versions anonymous-first (escalating only to the `configured` token),
 /// and returns the structured outcome. Used by `POST /about/check`.
 pub async fn web_check(
@@ -670,7 +670,7 @@ pub async fn web_check(
     check_core(train, &updater, &cred, &versions).await
 }
 
-/// CLAUDE-129: web entry for the apply action. Builds the updater from env,
+/// Web entry for the apply action. Builds the updater from env,
 /// lists versions anonymous-first (escalating only to the `configured` token),
 /// and applies the newest build on `train`. Returns the applied tag. Does NOT
 /// restart the daemon. Used by `POST /about/update`.
@@ -698,9 +698,9 @@ async fn resolve_configured(configured: Option<ConfiguredToken>) -> Result<Optio
 
 /// `claude-run version check [--train <release|latest>]`.
 ///
-/// `configured` lazily resolves `[update].token_ref` (CLAUDE-55) on escalation,
+/// `configured` lazily resolves `[update].token_ref` on escalation,
 /// or `None` when no `token_ref` is set. It is decrypted only if the registry
-/// answers 401/403 and the configured-token branch wins (CLAUDE-158).
+/// answers 401/403 and the configured-token branch wins.
 pub async fn check(
     train: UpdateTrain,
     use_fj_token: bool,
@@ -772,9 +772,9 @@ fn print_check_outcome(o: &CheckOutcome) {
 
 /// `claude-run version update [--train <release|latest>] [--version <tag>]`.
 ///
-/// `configured` lazily resolves `[update].token_ref` (CLAUDE-55) on escalation,
+/// `configured` lazily resolves `[update].token_ref` on escalation,
 /// or `None` when no `token_ref` is set. Shares the identical lazy-resolution
-/// path with [`check`] (CLAUDE-158).
+/// path with [`check`].
 pub async fn update(
     train: UpdateTrain,
     pin: Option<String>,
@@ -815,8 +815,8 @@ fn available_list(versions: &[String]) -> String {
 /// The `authorize` callback for [`Updater::list_versions`]: only consulted on a
 /// 401/403.
 ///
-/// Precedence (CLAUDE-158, unchanged from the eager path when the key file is
-/// present): a configured `token_ref` (CLAUDE-55) is preferred and is decrypted
+/// Precedence (unchanged from the eager path when the key file is
+/// present): a configured `token_ref` is preferred and is decrypted
 /// lazily here via [`ConfiguredToken::resolve`], so the age key file is loaded
 /// only at escalation time. When it resolves, it wins.
 ///
@@ -1052,7 +1052,7 @@ mod tests {
         (StatusCode::OK, Json(body))
     }
 
-    /// The asset bytes the stub serves for any tag (CLAUDE-129 apply path).
+    /// The asset bytes the stub serves for any tag (the apply path).
     const STUB_ASSET: &[u8] = b"fake-claude-run-binary";
     /// A well-formed but deliberately non-matching sha256 sidecar: it is neither
     /// the digest of [`STUB_ASSET`] nor of the running test binary, so the apply
@@ -1077,7 +1077,7 @@ mod tests {
         });
         let app = Router::new()
             .route("/api/v1/packages/Contoso", get(list_handler))
-            // Asset + sidecar for any tag (CLAUDE-129 check/apply cores). The
+            // Asset + sidecar for any tag (check/apply cores). The
             // `.sha256` route is registered first so it is not shadowed by the
             // bare-asset route's `:tag` capture for the sibling segment.
             .route(
@@ -1156,7 +1156,7 @@ mod tests {
         assert!(err.to_string().contains("rejected the fj token"));
     }
 
-    // ---- lazy configured-token resolution (CLAUDE-158) ---------------------
+    // ---- lazy configured-token resolution ----------------------------------
 
     async fn mem_pool() -> crate::db::DbPool {
         crate::db::test_pool().await
@@ -1197,7 +1197,7 @@ mod tests {
 
     /// AC4: with `token_ref` set, the key file present, and a 401 registry, the
     /// configured secret is decrypted lazily on escalation and used. Behavior
-    /// matches the pre-CLAUDE-158 eager path.
+    /// matches the original eager path.
     #[tokio::test]
     async fn escalation_uses_configured_token_when_key_file_present() {
         let _env = crate::secrets::key_file_env_lock().await;
@@ -1285,7 +1285,7 @@ mod tests {
         }
     }
 
-    // ---- non-interactive cores (CLAUDE-129) --------------------------------
+    // ---- non-interactive cores ----------------------------------------------
 
     /// `check_core` on the `release` train reports the newest published semver
     /// as `available` and the running build as `current`, with no printing.

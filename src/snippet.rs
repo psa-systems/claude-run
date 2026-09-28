@@ -109,7 +109,7 @@ impl SnippetRunner {
         };
         std::fs::write(&script_path, script)?;
 
-        // CLAUDE-228: a scripted action's nu snippet is arbitrary operator code
+        // A scripted action's nu snippet is arbitrary operator code
         // with no time bound; keep it off the async worker thread.
         let output = crate::blocking::in_place(|| {
             Command::new(interpreter)
@@ -133,7 +133,7 @@ impl SnippetRunner {
 /// Compute the per-job snippet directory:
 /// `<state_dir>/snippets/<action_name>/<job_key>/`.
 ///
-/// CLAUDE-262 decided this directory is bounded by a periodic AGE sweep
+/// This directory is bounded by a periodic AGE sweep
 /// ([`crate::gc::sweep_snippets`]), not deleted at the end of `process_job`
 /// beside the workdir: unlike the workdir, a snippet directory is small (one
 /// rendered script plus a JSON binding file per step) and is the only place a

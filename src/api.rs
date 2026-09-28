@@ -11,13 +11,13 @@
 //! | POST | `/actions/<name>/trigger` | queue an immediate run |
 //! | POST | `/actions/<name>/pause` | pause a single action |
 //! | POST | `/actions/<name>/resume` | resume a single action |
-//! | POST | `/actions/<name>/attempts/<key>/reset` | clear one key's attempt counter (CLAUDE-238) |
+//! | POST | `/actions/<name>/attempts/<key>/reset` | clear one key's attempt counter |
 //! | POST | `/actions/<name>/delete` | delete an action (file + index + control state) |
 //! | POST | `/runs/<id>/cancel` | cancel an in-flight run |
 //! | POST | `/pause` | global pause |
 //! | POST | `/resume` | global resume |
-//! | GET | `/report/{summary,daily,weekly,by-weekday,by-hour}` | historical aggregations (CLAUDE-117) |
-//! | POST | `/access/check` | on-demand credential / repo / project access check (CLAUDE-216) |
+//! | GET | `/report/{summary,daily,weekly,by-weekday,by-hour}` | historical aggregations |
+//! | POST | `/access/check` | on-demand credential / repo / project access check |
 //!
 //! `POST /actions/<name>/delete` removes the YAML file, the `actions` index
 //! row, and the action's control state (`paused_actions`, `attempt_counters`,
@@ -42,11 +42,11 @@ use tokio::sync::mpsc;
 use crate::cancel::RunRegistry;
 use crate::state;
 
-/// CLAUDE-40: the daemon's in-memory set of action names with a dispatched run.
+/// The daemon's in-memory set of action names with a dispatched run.
 /// Shared between the dispatcher (which bumps/drops a per-action refcount as runs
 /// start and finish) and the API delete handler (which consults it for the
 /// in-flight guard, authoritative for a job dispatched before its `runs` row is
-/// written). CLAUDE-162: a refcount rather than a set, since overlapping runs
+/// written). A refcount rather than a set, since overlapping runs
 /// mean several runs for one action can be dispatched-but-not-recorded at once; a
 /// positive count means "in flight".
 pub type InFlight = Arc<tokio::sync::Mutex<std::collections::HashMap<String, usize>>>;
@@ -61,16 +61,16 @@ pub struct AppState {
     /// to queue an out-of-cycle run for that action.
     pub trigger_tx: mpsc::Sender<String>,
     pub version: &'static str,
-    /// CLAUDE-9: per-run cancellation tokens. The cancel handler trips the
+    /// Per-run cancellation tokens. The cancel handler trips the
     /// token for a given run id; the dispatcher registers/unregisters them.
     pub runs: Arc<RunRegistry>,
-    /// CLAUDE-40: shared with the dispatcher so the delete handler can refuse a
+    /// Shared with the dispatcher so the delete handler can refuse a
     /// delete for an action whose run is dispatched but not yet in `runs`.
     pub in_flight: InFlight,
-    /// CLAUDE-101: live runtime settings (mint/update/webhook/log_filter) backing
+    /// Live runtime settings (mint/update/webhook/log_filter) backing
     /// the Settings page and the `/api/settings/<section>` endpoints.
     pub settings: Arc<crate::settings::LiveSettings>,
-    /// CLAUDE-216: resolved on-disk locations, so the access check can write its
+    /// Resolved on-disk locations, so the access check can write its
     /// throwaway credential files under the runtime dir the daemon already owns.
     pub paths: crate::config::Paths,
     /// Live Anthropic API key from the Settings Auth card, shared with the
@@ -113,14 +113,14 @@ pub fn router(state: AppState) -> Router {
         .route("/runs/:id/cancel", post(cancel_run))
         .route("/pause", post(global_pause_handler))
         .route("/resume", post(global_resume_handler))
-        // CLAUDE-101: JSON settings round-trip, one section per request. Mounted
-        // under `/api` over TCP (behind the CLAUDE-48 auth gate) and at root over
+        // JSON settings round-trip, one section per request. Mounted
+        // under `/api` over TCP (behind the token auth gate) and at root over
         // the unix socket. `<section>` is mint|update|webhook|log_filter.
         .route(
             "/settings/:section",
             get(get_settings_section).put(put_settings_section),
         )
-        // CLAUDE-117: reporting aggregations. Each accepts `range` (30d|90d|all,
+        // Reporting aggregations. Each accepts `range` (30d|90d|all,
         // default all) and an optional `action` filter, returning the series the
         // `/reports` page also renders. Mounted under `/api` over TCP.
         .route("/report/summary", get(report_summary))
@@ -128,7 +128,7 @@ pub fn router(state: AppState) -> Router {
         .route("/report/weekly", get(report_weekly))
         .route("/report/by-weekday", get(report_by_weekday))
         .route("/report/by-hour", get(report_by_hour))
-        // CLAUDE-216: on-demand access check. Same typed report the `/access`
+        // On-demand access check. Same typed report the `/access`
         // page renders and `claude-run access check` prints, so the three
         // surfaces cannot drift.
         .route("/access/check", post(access_check))
@@ -139,7 +139,7 @@ pub fn router(state: AppState) -> Router {
 struct StatusResponse {
     version: String,
     global_paused: Option<PauseInfo>,
-    /// CLAUDE-223: live-work snapshot, so an operator scripting a reboot polls
+    /// Live-work snapshot, so an operator scripting a reboot polls
     /// `/status` instead of scraping the About page.
     activity: Activity,
     /// Whether the daemon can run anything at all. `false` means setup is
@@ -147,27 +147,27 @@ struct StatusResponse {
     /// which otherwise looks identical to a daemon that has no work.
     ready: bool,
     /// Why not, when `ready` is false. Owned rather than `&'static str`
-    /// because CLAUDE-269's login-required reason carries the CLI's own
+    /// because the login-required reason carries the CLI's own
     /// message and a detection timestamp.
     not_ready_reason: Option<String>,
-    /// CLAUDE-269: which not-ready axis, if any: `no_credential` |
+    /// Which not-ready axis, if any: `no_credential` |
     /// `login_required` | `null` (ready).
     not_ready_kind: Option<&'static str>,
-    /// CLAUDE-269: when the login-required state was first observed, RFC 3339,
+    /// When the login-required state was first observed, RFC 3339,
     /// or `null` when not in that state.
     login_required_since: Option<String>,
-    /// CLAUDE-225: dependency gates holding an issue past the staleness
+    /// Dependency gates holding an issue past the staleness
     /// threshold, so an operator without the web UI sees the same signal the
     /// dashboard banner shows.
     stale_gates: Vec<state::StaleGate>,
-    /// CLAUDE-232: keys parked at their action's per-key attempt cap. They are
+    /// Keys parked at their action's per-key attempt cap. They are
     /// skipped on every poll with no outcome and no event row, so this is the
     /// only machine-readable report of a queue that has stopped moving.
     attempt_cap_hits: Vec<state::CappedKey>,
     actions: Vec<ActionStatus>,
 }
 
-/// CLAUDE-223: the daemon's live-work snapshot. One type behind `/api/status`,
+/// The daemon's live-work snapshot. One type behind `/api/status`,
 /// `claude-run status`, and the About page's quiet indicator, so the three
 /// surfaces cannot disagree about whether a restart is safe.
 #[derive(Debug, Serialize)]
@@ -184,7 +184,7 @@ pub struct Activity {
     pub dispatched_actions: Vec<String>,
 }
 
-/// CLAUDE-223: build the [`Activity`] snapshot. A DB failure propagates rather
+/// Build the [`Activity`] snapshot. A DB failure propagates rather
 /// than degrading to an empty list: reporting "idle, safe to restart" because
 /// the query failed is exactly the mistake this indicator exists to prevent.
 pub async fn activity(
@@ -234,7 +234,7 @@ async fn get_status(State(s): State<Arc<AppState>>) -> Result<Json<StatusRespons
             reason: r,
         });
     let actions = state::action_index_list(&s.pool).await?;
-    // CLAUDE-232: resolve each action's cap before the rows are consumed below.
+    // Resolve each action's cap before the rows are consumed below.
     // Reading the YAML touches disk, hence `in_place`.
     let defaults = crate::job::RunnerDefaults::default();
     let caps = crate::blocking::in_place(|| crate::job::attempt_caps(&actions, &defaults));
@@ -312,7 +312,7 @@ async fn trigger_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AckResponse>, AppError> {
-    // CLAUDE-61 / CLAUDE-220: a synthetic action is event-driven; it has no
+    // A synthetic action is event-driven; it has no
     // input/prompt and the scheduler never dispatches it, so a manual trigger is
     // meaningless. Reject it explicitly rather than 404 as "unknown". Both
     // reserved names come from the one shared predicate.
@@ -332,7 +332,7 @@ async fn trigger_action(
             message: format!("unknown action `{name}`"),
         });
     }
-    // CLAUDE-223: `Dispatcher::execute` drops a globally-paused run silently, so
+    // `Dispatcher::execute` drops a globally-paused run silently, so
     // queueing here would answer `{"ok":true,"message":"queued trigger"}` for
     // work that never runs. Refuse with 409 naming the pause instead; the read
     // error propagates as a 500 rather than being swallowed into a false accept.
@@ -400,7 +400,7 @@ async fn resume_action(
     }))
 }
 
-/// CLAUDE-238: clear one key's attempt counter so a job parked at the cap can
+/// Clear one key's attempt counter so a job parked at the cap can
 /// be retried. 404s a key with no counter row rather than a silent no-op on a
 /// mistyped key, and records the reset at `warn` (naming the discarded count)
 /// so it is not an invisible mutation.
@@ -433,7 +433,7 @@ async fn reset_attempts(
     }))
 }
 
-/// CLAUDE-40: delete an action from every surface. Refuses (409) when a run is
+/// Delete an action from every surface. Refuses (409) when a run is
 /// in flight, 404s an unknown action, otherwise removes the YAML file, the
 /// `actions` index row, and the control state (`paused_actions`,
 /// `attempt_counters`, `daily_ledger`) while keeping run history.
@@ -441,7 +441,7 @@ async fn delete_action(
     State(s): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AckResponse>, AppError> {
-    // CLAUDE-61 / CLAUDE-220: a synthetic action has no backing YAML to remove;
+    // A synthetic action has no backing YAML to remove;
     // refuse deletion explicitly, for every reserved name.
     if crate::web::is_synthetic_action(&name) {
         return Err(AppError {
@@ -473,7 +473,7 @@ async fn delete_action(
     }))
 }
 
-/// CLAUDE-40: remove an indexed action's YAML file (tolerating an already-gone
+/// Remove an indexed action's YAML file (tolerating an already-gone
 /// file) and purge its derived index + control state. Run history is kept.
 /// Returns `false` when `name` is not in the index (unknown action). Shared by
 /// the API, web, and CLI-direct delete paths; the in-flight guard is each
@@ -492,7 +492,7 @@ pub async fn delete_indexed_action(pool: &DbPool, name: &str) -> Result<bool, cr
     Ok(true)
 }
 
-/// CLAUDE-9: cancel an in-flight run. Tripping the token tears the run down:
+/// Cancel an in-flight run. Tripping the token tears the run down:
 /// the claude child is terminated, the in-flight job runs its `post` phase
 /// with a synthesized cancelled result, and the run finalizes with
 /// `exit::CANCELLED`. Cancelling a run that is not in flight (already finished,
@@ -515,7 +515,7 @@ async fn cancel_run(
     }
 }
 
-/// CLAUDE-223: the optional pause reason, from either encoding. The CLI and
+/// The optional pause reason, from either encoding. The CLI and
 /// API clients send `{"reason": "..."}`; the About page's Pause form posts
 /// `reason=...` urlencoded, which is what htmx serializes a form to without an
 /// extension. An unparseable body is logged at `warn` and pauses with no reason
@@ -566,7 +566,7 @@ async fn global_resume_handler(
     }))
 }
 
-/// CLAUDE-101: resolve the URL path segment into a settings section or 404.
+/// Resolve the URL path segment into a settings section or 404.
 fn parse_section(section: &str) -> Result<crate::settings::Section, AppError> {
     crate::settings::Section::from_path(section).ok_or_else(|| AppError {
         status: StatusCode::NOT_FOUND,
@@ -615,7 +615,7 @@ async fn put_settings_section(
     }
 }
 
-// ---- CLAUDE-117: reporting endpoints --------------------------------------
+// ---- reporting endpoints ---------------------------------------------------
 
 /// Query params shared by every `/api/report/*` endpoint. Both fields are
 /// optional: `range` defaults to all-time, an empty / absent `action` means
@@ -685,7 +685,7 @@ async fn report_by_hour(
     ))
 }
 
-// ---- CLAUDE-216: access check ---------------------------------------------
+// ---- access check -----------------------------------------------------------
 
 /// The credential base directory every access check materializes into: the same
 /// `credentials` tree the per-job path uses, under its own `access` namespace.
@@ -722,7 +722,7 @@ struct AppError {
 
 impl From<crate::error::Error> for AppError {
     fn from(e: crate::error::Error) -> Self {
-        // CLAUDE-40: an in-flight refusal maps to 409, not a 500.
+        // An in-flight refusal maps to 409, not a 500.
         let status = match &e {
             crate::error::Error::ActionInFlight { .. } => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -777,7 +777,7 @@ mod tests {
         (state, rx)
     }
 
-    /// CLAUDE-216: `POST /access/check` returns the typed report as JSON. With
+    /// `POST /access/check` returns the typed report as JSON. With
     /// no indexed action there is nothing to probe, and the endpoint says so as
     /// a failing row rather than an empty 200 that reads as "all good".
     #[tokio::test]
@@ -798,7 +798,7 @@ mod tests {
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
-    /// CLAUDE-238: clearing a key with a live counter succeeds, records a
+    /// Clearing a key with a live counter succeeds, records a
     /// `warn` run event naming the discarded count, and a second reset of the
     /// same key 404s since the row is already gone.
     #[tokio::test]
@@ -839,7 +839,7 @@ mod tests {
         assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
-    /// CLAUDE-101: an unknown section path 404s; a valid one round-trips JSON
+    /// An unknown section path 404s; a valid one round-trips JSON
     /// through the same `LiveSettings` save path the web page uses.
     #[tokio::test]
     async fn settings_section_get_and_put_round_trip() {
@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
-    /// CLAUDE-220: the comment-webhook section round-trips over the JSON API at
+    /// The comment-webhook section round-trips over the JSON API at
     /// `GET` / `PUT /api/settings/webhook_comment` and applies live on the handle
     /// the listener routes against, with no daemon restart.
     #[tokio::test]
@@ -918,7 +918,7 @@ mod tests {
         assert!(cfg.read().await.sources.contains_key("ng"));
     }
 
-    /// CLAUDE-61 / CLAUDE-220: no event-driven synthetic action can be
+    /// No event-driven synthetic action can be
     /// triggered, for EVERY reserved name.
     #[tokio::test]
     async fn trigger_rejects_every_synthetic_action() {
@@ -932,7 +932,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-223: while globally paused a trigger is refused with 409 naming
+    /// While globally paused a trigger is refused with 409 naming
     /// the pause, instead of the old "queued trigger" ack for a run that
     /// `Dispatcher::execute` would then drop on the floor. Resuming restores it.
     #[tokio::test]
@@ -979,7 +979,7 @@ mod tests {
         assert!(ack.ok);
     }
 
-    /// CLAUDE-269: while login-required, the trigger endpoint answers 409
+    /// While login-required, the trigger endpoint answers 409
     /// naming the reason, exactly like a global pause, and never lies with a
     /// "queued trigger" ack for work that would just be dropped.
     #[tokio::test]
@@ -1034,7 +1034,7 @@ mod tests {
         assert!(ack.ok);
     }
 
-    /// CLAUDE-223: quiet needs BOTH signals clear. An open `runs` row makes it
+    /// Quiet needs BOTH signals clear. An open `runs` row makes it
     /// false, and so does a non-empty in-flight map with no row yet written.
     #[tokio::test]
     async fn quiet_requires_both_signals_clear() {
@@ -1062,7 +1062,7 @@ mod tests {
         assert!(a.active_runs.is_empty());
     }
 
-    /// CLAUDE-223: `/status` carries the activity block, so `claude-run status`
+    /// `/status` carries the activity block, so `claude-run status`
     /// and a reboot script read the same snapshot the About page renders.
     #[tokio::test]
     async fn status_reports_the_activity_block() {
@@ -1076,7 +1076,7 @@ mod tests {
         assert_eq!(status.activity.active_runs[0].id, run);
     }
 
-    /// CLAUDE-269: `/status` carries `not_ready_kind` and `login_required_since`,
+    /// `/status` carries `not_ready_kind` and `login_required_since`,
     /// null while ready, `no_credential` with no gate reason, and
     /// `login_required` plus an RFC 3339 timestamp once tripped.
     #[tokio::test]
@@ -1109,7 +1109,7 @@ mod tests {
             .contains("OAuth session expired"));
     }
 
-    /// CLAUDE-225: `/status` carries the stale-gate block, so an operator with no
+    /// `/status` carries the stale-gate block, so an operator with no
     /// browser sees a gate that stopped resuming instead of an empty poll history.
     #[tokio::test]
     async fn status_reports_stale_dependency_gates() {
@@ -1142,7 +1142,7 @@ mod tests {
         assert!(status.stale_gates[0].recheck_overdue_ms > 0);
     }
 
-    /// CLAUDE-232: `/status` carries the parked-at-cap block. The skip writes no
+    /// `/status` carries the parked-at-cap block. The skip writes no
     /// outcome and no event row, so without this an operator scripting against
     /// the API cannot tell a stalled queue from an idle one.
     #[tokio::test]
@@ -1179,7 +1179,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-61 / CLAUDE-220: no synthetic action can be deleted (none has a
+    /// No synthetic action can be deleted (none has a
     /// backing YAML).
     #[tokio::test]
     async fn delete_rejects_every_synthetic_action() {
