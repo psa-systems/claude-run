@@ -60,7 +60,9 @@ use crate::config::{MintConfig, Paths, WebhookConfig, WebhookSource};
 use crate::forge_log::LogOutcome;
 use crate::job::RunnerDefaults;
 use crate::mint::{self, MintCaps, MintOutcome, MintRequest, VcsRouteCache};
-use crate::provider::{Backend, CliBackend, CommandRunner, ForgePullRequest};
+use crate::provider::{
+    is_github_host, Backend, CliBackend, CommandRunner, Forge, ForgePullRequest, GithubForge,
+};
 use crate::secrets::{self, SecretsKey};
 use crate::state;
 use crate::triage::{self, FailureClassifier, TriageInput};
@@ -3578,11 +3580,23 @@ async fn process_action_success_event(
         return;
     };
 
-    let backend = mint.backend.clone();
+    // CLAUDE-357: no recorded agent PR (and so no action / `github.hosts`) is
+    // known yet at this point - the PR is only found below, by matching the
+    // commit against this very listing. `is_github_host(host, &[])` (i.e.
+    // `host.eq_ignore_ascii_case("github.com")`) is a deliberate, narrower
+    // default: it correctly routes the common `github.com` case, and a GHE
+    // host configured only via an action's `github.hosts` is a known,
+    // narrower gap for a follow-up rather than an oversight here.
+    let forge = resolve_automerge_forge(
+        &mint,
+        &host,
+        &[],
+        &crate::action::default_github_mcp_endpoint(),
+    );
     let host_for_list = host.clone();
     let repo_for_list = ev.repo.clone();
     let prs = match tokio::task::spawn_blocking(move || {
-        backend.list_open_prs(&host_for_list, &repo_for_list)
+        forge.list_open_prs(&host_for_list, &repo_for_list)
     })
     .await
     {
@@ -3753,6 +3767,30 @@ async fn handle_action_success_for_pr(
     apply_automerge_decision(mint, pool, host, repo, pr_number, pr_url, &row).await
 }
 
+/// CLAUDE-357: route a forge operation through [`GithubForge`] when `host` is
+/// a GitHub host, mirroring the per-job dispatch at
+/// `src/native/youtrack.rs:421-435`; every other host reuses `mint.backend`
+/// (`fj`) unchanged. Token is always `None`: `GithubForge` falls back to the
+/// daemon's stored `gh` login (CLAUDE-307) when constructed with no token,
+/// matching the per-job path's own behavior when an action sets no
+/// `github.token_ref`.
+fn resolve_automerge_forge(
+    mint: &MintContext,
+    host: &str,
+    hosts: &[String],
+    mcp_endpoint: &str,
+) -> Arc<dyn Forge> {
+    if is_github_host(host, hosts) {
+        Arc::new(GithubForge::new(
+            mint.pr_comment_runner.clone(),
+            mcp_endpoint.to_string(),
+            None,
+        ))
+    } else {
+        mint.backend.clone() as Arc<dyn Forge>
+    }
+}
+
 /// CLAUDE-328: the shared decision body both [`handle_action_success_for_pr`]
 /// (the webhook's low-latency trigger) and [`reconcile_automerge`] (the
 /// tick-driven backstop for a missed webhook) call once a recorded, open
@@ -3806,8 +3844,8 @@ async fn apply_automerge_decision(
             return Err(msg);
         }
     };
-    let youtrack_cfg = match loaded.action.native {
-        Some(crate::action::NativeConfig::Youtrack(cfg)) => cfg.youtrack,
+    let (youtrack_cfg, github_cfg) = match loaded.action.native {
+        Some(crate::action::NativeConfig::Youtrack(cfg)) => (cfg.youtrack, cfg.github),
         _ => {
             info!(repo = %repo, pr = pr_number, action = %row.action_name, "action-run success: recorded action is not a youtrack action; no action");
             return Ok(format!(
@@ -3820,13 +3858,17 @@ async fn apply_automerge_decision(
         info!(repo = %repo, pr = pr_number, action = %row.action_name, "action-run success: automerge disabled for this action; no action");
         return Ok("automerge disabled for this action; no action".to_string());
     }
+    // CLAUDE-357: a GitHub-hosted PR must route through `GithubForge`, not
+    // `mint.backend` (always `fj`, which 410s against GitHub's API).
+    let forge = resolve_automerge_forge(mint, host, &github_cfg.hosts, &github_cfg.mcp_endpoint);
 
-    let backend = mint.backend.clone();
+    let forge_for_status = forge.clone();
     let host_owned = host.to_string();
     let repo_owned = repo.to_string();
-    let status =
-        tokio::task::spawn_blocking(move || backend.pr_status(&host_owned, &repo_owned, pr_number))
-            .await;
+    let status = tokio::task::spawn_blocking(move || {
+        forge_for_status.pr_status(&host_owned, &repo_owned, pr_number)
+    })
+    .await;
     let status = match status {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
@@ -3893,11 +3935,11 @@ async fn apply_automerge_decision(
                 Err(msg)
             }
             Some(true) => {
-                let backend = mint.backend.clone();
+                let forge_for_update = forge.clone();
                 let host_owned = host.to_string();
                 let repo_owned = repo.to_string();
                 let update_result = tokio::task::spawn_blocking(move || {
-                    backend.update_pr_branch(&host_owned, &repo_owned, pr_number)
+                    forge_for_update.update_pr_branch(&host_owned, &repo_owned, pr_number)
                 })
                 .await
                 .map_err(|e| format!("update_pr_branch task panicked: {e}"))?;
@@ -3954,6 +3996,7 @@ async fn apply_automerge_decision(
             }
             Some(false) => {
                 let backend = mint.backend.clone();
+                let forge_for_merge = forge.clone();
                 let host_owned = host.to_string();
                 let repo_owned = repo.to_string();
                 let issue_key = row.issue_key.clone();
@@ -3961,7 +4004,7 @@ async fn apply_automerge_decision(
                 let merge_result = tokio::task::spawn_blocking(move || {
                     crate::native::youtrack::complete_automerge(
                         backend.as_ref(),
-                        backend.as_ref(),
+                        forge_for_merge.as_ref(),
                         &issue_key,
                         &host_owned,
                         &repo_owned,
@@ -4138,10 +4181,22 @@ async fn list_open_pr_numbers(
     host: &str,
     repo: &str,
 ) -> Option<Vec<u64>> {
-    let backend = mint.backend.clone();
+    // CLAUDE-357: called per `(host, repo)`, grouped across rows, before any
+    // row's action is loaded - so no `github.hosts` is available here.
+    // `is_github_host(host, &[])` (i.e. `host.eq_ignore_ascii_case("github.com")`)
+    // is a deliberate, narrower default: it correctly routes the reported
+    // `github.com` case, and a GHE host configured only via an action's
+    // `github.hosts` remains a known, narrower gap for a follow-up rather
+    // than an oversight.
+    let forge = resolve_automerge_forge(
+        mint,
+        host,
+        &[],
+        &crate::action::default_github_mcp_endpoint(),
+    );
     let (host_owned, repo_owned) = (host.to_string(), repo.to_string());
     let outcome =
-        tokio::task::spawn_blocking(move || backend.list_open_prs(&host_owned, &repo_owned)).await;
+        tokio::task::spawn_blocking(move || forge.list_open_prs(&host_owned, &repo_owned)).await;
     let msg = match outcome {
         Ok(Ok(prs)) => return Some(prs.into_iter().map(|p| p.number).collect()),
         Ok(Err(e)) => format!("automerge reconciler: list_open_prs for {repo} failed: {e}"),
@@ -9914,6 +9969,129 @@ mod tests {
                     .any(|e| e.message.contains("list_open_prs failed")),
                 "{events:?}"
             );
+        }
+
+        // ---- CLAUDE-357: GitHub-hosted PRs must route through `GithubForge`,
+        // never `mint.backend` (`fj`, which 410s against GitHub's API), the
+        // `octo/widget` bug this issue fixes.
+        mod github_hosted {
+            use super::*;
+
+            fn gh_list_open_prs_args(repo: &str) -> Vec<&str> {
+                vec![
+                    "pr",
+                    "list",
+                    "--repo",
+                    repo,
+                    "--state",
+                    "open",
+                    "--limit",
+                    "1000",
+                    "--json",
+                    "number,title,headRefOid,headRefName,baseRefName,author,url",
+                ]
+            }
+
+            #[tokio::test]
+            async fn list_open_pr_numbers_routes_github_host_through_github_forge() {
+                // The exact shape of the reported bug: an `agent_pull_requests`
+                // row with `host = "github.com"`. `mint.backend` (`fj`) is
+                // configured to fail if it is ever reached, so a `Some` result
+                // here can only have come from `GithubForge`'s `gh pr list`.
+                let pool = crate::db::test_pool().await;
+                let backend = Arc::new(StoreBackend::new().with_open_prs_error("fj: 410 Gone"));
+                let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().ok(
+                    "gh",
+                    &gh_list_open_prs_args("octo/widget"),
+                    r#"[{"number":42,"title":"fix","headRefOid":"abc123","headRefName":"fix/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#,
+                ));
+                let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+                let dir = tempfile::tempdir().unwrap();
+                let ctx = store_mint_context_in(
+                    pool.clone(),
+                    backend.clone(),
+                    classifier,
+                    dir.path(),
+                    runner.clone(),
+                );
+
+                let result =
+                    list_open_pr_numbers(&pool, &ctx, "github.com", "octo/widget").await;
+
+                assert_eq!(result, Some(vec![42]));
+                assert!(
+                    runner
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|c| c.starts_with("gh pr list")),
+                    "{:?}",
+                    runner.calls.lock().unwrap()
+                );
+            }
+
+            #[tokio::test]
+            async fn apply_automerge_decision_routes_github_host_through_github_forge() {
+                // `mint.backend` (`fj`) is configured with a `pr_status` that
+                // would merge the PR if it were reached; the assertion is that
+                // it never is, because a `github.com` host must dispatch to
+                // `GithubForge` instead, whose `pr_status` is a documented
+                // follow-up (the default `Forge::pr_status` error) rather than
+                // the wrong backend's fj call.
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                ci_failure_store::record_agent_pr(
+                    &pool,
+                    "yt",
+                    "MK-16",
+                    "github.com",
+                    "octo/widget",
+                    42,
+                    "fix/x",
+                    "open",
+                    "2026-09-01T00:00:00Z",
+                )
+                .await
+                .unwrap();
+                let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
+                let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+                let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new());
+                let ctx = store_mint_context_in(
+                    pool.clone(),
+                    backend.clone(),
+                    classifier,
+                    dir.path(),
+                    runner,
+                );
+                let row = ci_failure_store::agent_pr(&pool, "github.com", "octo/widget", 42)
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                let result = apply_automerge_decision(
+                    &ctx,
+                    &pool,
+                    "github.com",
+                    "octo/widget",
+                    42,
+                    "https://github.com/octo/widget/pulls/42",
+                    &row,
+                )
+                .await;
+
+                let err = result.unwrap_err();
+                assert!(err.contains("not supported by this forge backend"), "{err}");
+                assert!(
+                    !backend
+                        .calls()
+                        .iter()
+                        .any(|c| c.starts_with("pr_status") || c.starts_with("merge_pr")),
+                    "fj must never be consulted for a GitHub host: {:?}",
+                    backend.calls()
+                );
+            }
         }
     }
 }
