@@ -1,5 +1,5 @@
-//! Structured editors for the native action kinds other than `youtrack`
-//! (CLAUDE-211): `closed-issue-summary`.
+//! Structured editors for the native action kinds other than `youtrack`:
+//! `closed-issue-summary`.
 //!
 //! Same shape as the YouTrack editor in the parent module: a route pair
 //! (`/actions/new/<kind>` to create, `/actions/:name/form` to edit), one
@@ -103,7 +103,7 @@ fn parse_opt_u32(label: &str, raw: &str) -> Result<Option<u32>, String> {
     }
 }
 
-/// DEV-705: the dollar / fraction analogue of [`parse_opt_u32`].
+/// The dollar / fraction analogue of [`parse_opt_u32`].
 fn parse_opt_f64(label: &str, raw: &str) -> Result<Option<f64>, String> {
     match raw.trim() {
         "" => Ok(None),
@@ -150,7 +150,7 @@ pub struct CommonForm {
     pub limit_run_budget_usd: String,
     /// DEV-705: fraction of the per-run budget at which the run warns once.
     pub limit_budget_warn_fraction: String,
-    /// CLAUDE-234: issues one run may create in the tracker.
+    /// Issues one run may create in the tracker.
     pub limit_max_issues_per_run: String,
 }
 
@@ -311,7 +311,7 @@ fn apply_common(
     Ok(())
 }
 
-/// Backing form for `kind: closed-issue-summary` (CLAUDE-218).
+/// Backing form for `kind: closed-issue-summary`.
 #[derive(Debug, Clone, Default)]
 pub struct ClosedIssueSummaryForm {
     pub common: CommonForm,

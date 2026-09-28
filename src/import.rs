@@ -1,6 +1,6 @@
-//! CLAUDE-251: copy an existing SQLite state store into the configured backend.
+//! Copy an existing SQLite state store into the configured backend.
 //!
-//! CLAUDE-250 made PostgreSQL selectable, but only for a new deployment: the
+//! Selecting PostgreSQL only opens an empty instance: the
 //! Postgres migration set is a squashed baseline and nothing moves rows, so an
 //! operator switching backends lost every run, attempt counter, daily ledger
 //! entry, setting, encrypted secret and web administrator. This is the copy.

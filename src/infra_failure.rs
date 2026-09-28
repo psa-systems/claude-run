@@ -1,8 +1,8 @@
-//! CLAUDE-264: deterministic infrastructure-failure detector.
+//! Deterministic infrastructure-failure detector.
 //!
 //! A CI failure caused by the RUNNER rather than the commit (a full disk, an
 //! OOM kill, an unreachable package registry) is identical on every branch and
-//! is not fixable on any of them. The CLAUDE-190 root-cause dedupe key contains
+//! is not fixable on any of them. The root-cause dedupe key contains
 //! `branch`, so one such host condition mints a fresh issue per PR branch and
 //! the duplicates never collapse. [`detect`] gives the mint a branch-agnostic
 //! `kind` id to key on instead (see [`crate::mint`]).
@@ -87,7 +87,7 @@ fn detect_out_of_memory(lower: &str) -> Option<InfraFailure> {
 /// [`crate::triage::triage_rules`] routes this kind to `HumanAction` before its
 /// transient-signature scan, so it reaches the mint and collapses onto one
 /// grouped issue. A bare `connection reset` with no registry marker is not
-/// matched here and stays transient. See CLAUDE-266.
+/// matched here and stays transient.
 fn detect_runner_unavailable(lower: &str) -> Option<InfraFailure> {
     const REGISTRY_MARKERS: &[&str] = &[
         "registry",

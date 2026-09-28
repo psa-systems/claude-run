@@ -4,34 +4,34 @@
 {% block main %}
 
 <div id="poll-region"
-     {# CLAUDE-141: carry the active sort/filter selection through the poll so the
+     {# Carry the active sort/filter selection through the poll so the
         5s morph refresh re-requests the current view instead of resetting to the
         default started-at-desc order. #}
      hx-get="/?{{ view.poll_query() }}"
-     {# CLAUDE-143: pull the live search state (q / in_stream / show_empty) from
+     {# Pull the live search state (q / in_stream / show_empty) from
         the search form so the 5s morph poll preserves an active search instead
         of wiping it back to the plain runs view. #}
      hx-include="#search-form"
-     {# CLAUDE-142: carry the current Recent-runs page through the poll. It is
+     {# Carry the current Recent-runs page through the poll. It is
         re-rendered on every morph swap, so paging via Prev/Next sticks instead
         of being reset to page 1 by the next 5s refresh. Kept out of the search
         form so it stays orthogonal to the search / filter params. #}
      hx-vals='{"page": {{ page.page }}}'
      hx-trigger="every 5s, refreshNow from:body"
      hx-select="#poll-region"
-     {# CLAUDE-139: morph in place (idiomorph) instead of replacing the subtree,
+     {# Morph in place (idiomorph) instead of replacing the subtree,
         so the poll does not wipe text selection / scroll / focus. #}
      hx-swap="morph:outerHTML">
 
-{# CLAUDE-216: poll-time diagnostics. The access preflight leaves the affected
+{# Poll-time diagnostics. The access preflight leaves the affected
    issues Queued with no field change, so this banner is the only place the
    operator is told rather than having to go looking.
-   CLAUDE-235: a count and a link, not the messages. One repeating failure used
+   A count and a link, not the messages. One repeating failure used
    to fill the first screen with byte-identical rows; the rows are on /logs, and
    the access subset is named separately because its remedy is the access
    check. It clears itself when a later poll records the recovery marker. #}
 {# Setup-incomplete / login-required banner moved to the shared, htmx-polled
-   fragment in base.html (CLAUDE-269): it now shows on every page, not just the
+   fragment in base.html: it now shows on every page, not just the
    dashboard, and covers the login-required state alongside the no-credential
    one. #}
 
@@ -47,7 +47,7 @@
   </div>
 {% endif %}
 
-{# CLAUDE-225: dependency gates that have held an issue past the staleness
+{# Dependency gates that have held an issue past the staleness
    threshold. The gate leaves the issue Queued with no field change and a poll
    whose candidates are all blocked writes no run row, so without this banner a
    gate that stops resuming is invisible until someone notices the issue by
@@ -83,11 +83,11 @@
   </div>
 {% endif %}
 
-{# CLAUDE-232: jobs parked at their action's per-key attempt cap, the sibling of
+{# Jobs parked at their action's per-key attempt cap, the sibling of
    the stale-gate banner above. The skip writes no outcome row, no run event and
    no field change, so the issue stays Queued, is skipped again on every poll,
    and nothing but this banner says so. Read straight off `attempt_counters`.
-   CLAUDE-238: each row carries a Reset control that clears the counter so the
+   Each row carries a Reset control that clears the counter so the
    key can be retried, and the banner clears itself once the row is gone. #}
 {% if !attempt_cap_hits.is_empty() %}
   <div class="card" style="border-color: var(--warn); margin-bottom: 16px;">
@@ -181,8 +181,8 @@
         last run: {% if let Some(t) = a.last_run_started %}{{ t }}{% else %}<span class="dim">never</span>{% endif %}
       </div>
       <div class="row-actions">
-        {# CLAUDE-61: no manual trigger for the synthetic webhook action (it is
-           event-driven and the scheduler never dispatches it). CLAUDE-153: it
+        {# No manual trigger for the synthetic webhook action (it is
+           event-driven and the scheduler never dispatches it). It
            still participates in Pause/Resume like every other action. #}
         {% if !a.synthetic %}
         <form hx-post="/api/actions/{{ a.name }}/trigger"
@@ -217,7 +217,7 @@
 
 <h2>{% if search.is_some() %}Search results{% else %}Recent runs{% endif %}</h2>
 
-{# CLAUDE-143: content search over job summaries, with an opt-in checkbox to
+{# Content search over job summaries, with an opt-in checkbox to
    also grep the per-attempt stream logs. Submitting morph-swaps the poll-region
    so the search composes with the live refresh and the show-empty toggle. #}
 <form id="search-form"
@@ -243,7 +243,7 @@
            hx-include="#search-form"
            hx-target="#poll-region"
            hx-select="#poll-region"
-           {# CLAUDE-139: morph the same poll-region in place so the toggle
+           {# Morph the same poll-region in place so the toggle
               shares the non-destructive swap path. #}
            hx-swap="morph:outerHTML"
            hx-trigger="change">
@@ -255,7 +255,7 @@
   {% if sr.in_stream %}
     <p class="meta">Searched summaries and the stream logs of {{ sr.files_searched }} failed-job attempt(s){% if sr.capped %}; capped at {{ sr.max_files }} files, older streams were not searched{% endif %}.</p>
   {% endif %}
-  {# CLAUDE-246: logs that opened and then failed to read. The search never
+  {# Logs that opened and then failed to read. The search never
      established whether these runs match, so they are named here instead of
      being folded into the no-match set. #}
   {% if !sr.unreadable.is_empty() %}
@@ -312,7 +312,7 @@
     <div class="card"><span class="dim">No runs yet.</span></div>
   {% else %}
     <table>
-      {# CLAUDE-141: sortable headers set ?sort=<col>&dir=<asc|desc> (whitelisted
+      {# Sortable headers set ?sort=<col>&dir=<asc|desc> (whitelisted
          server-side into an ORDER BY); Action / Triggered / Exit also carry a
          filter dropdown adding a bound WHERE clause. Every control re-requests
          the poll-region with the selection encoded in the URL and morph-swaps in
@@ -365,12 +365,12 @@
              hx-get="/?{{ view.sort_query("jobs") }}" hx-include="#search-form"
              hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
              >Jobs{{ view.arrow("jobs") }}</a>
-          {# CLAUDE-230: sort worst-first by the derived failed-job count. #}
+          {# Sort worst-first by the derived failed-job count. #}
           <a href="#" class="sort-link" style="color: var(--fg-dim);"
              hx-get="/?{{ view.sort_query("failed") }}" hx-include="#search-form"
              hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML"
              >failed{{ view.arrow("failed") }}</a>
-          {# CLAUDE-230: job-level outcome, independent of the run's Exit code. #}
+          {# Job-level outcome, independent of the run's Exit code. #}
           <select name="outcome" hx-trigger="change"
                   hx-get="/?{{ view.query_without("outcome") }}" hx-include="#search-form"
                   hx-target="#poll-region" hx-select="#poll-region" hx-swap="morph:outerHTML">
@@ -409,7 +409,7 @@
             <td class="mono">
               {% match r.exit_code %}
                 {% when Some(0) %}<span class="badge ok">0</span>
-                {# CLAUDE-223: a run the global pause stopped is neither a
+                {# A run the global pause stopped is neither a
                    failure nor an operator cancel; badge it as its own outcome. #}
                 {% when Some(1) %}<span class="badge pause">paused</span>
                 {% when Some(130) %}<span class="badge cancel">cancelled</span>
@@ -429,7 +429,7 @@
         {% endfor %}
       </tbody>
     </table>
-    {# CLAUDE-142: pagination controls. Prev/Next morph-swap the poll-region with
+    {# Pagination controls. Prev/Next morph-swap the poll-region with
        a new ?page=, overriding only `page` while hx-include carries the active
        search/filter params from the search form, so paging keeps them. Disabled
        edges render as inert spans. The "X-Y of N" indicator is computed from a

@@ -13,7 +13,7 @@
 //! - [`usage`]: per-run token / cost accounting and the per-run spend ceiling.
 //! - [`migrate`]: one-shot import of legacy state.json files.
 //! - [`import`]: copy an existing SQLite state store into the configured
-//!   backend (CLAUDE-251).
+//!   backend.
 //!
 //! See `actions/SCHEMA.md` for the user-facing schema, `README.md` for the
 //! runtime contract.
@@ -57,7 +57,7 @@ pub mod service_auth;
 pub mod settings;
 pub mod snippet;
 pub mod state;
-/// Test-only helpers shared across the unit tests (CLAUDE-255).
+/// Test-only helpers shared across the unit tests.
 #[cfg(test)]
 pub mod testutil;
 pub mod triage;
@@ -70,7 +70,7 @@ pub mod workdir;
 /// Build-stamped version string: semver + short git hash + build date, baked
 /// at compile time by `build.rs`. Example: `0.1.0 (1b66909c2a3f, 2026-05-24)`.
 /// Single source for `--version`, the `/api/status` `version` field, and the
-/// web footer (CLAUDE-2).
+/// web footer.
 pub const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
@@ -85,7 +85,7 @@ pub const VERSION: &str = concat!(
 pub mod exit {
     pub const OK: i32 = 0;
     /// Work was refused or stopped because of a pause. Used both by the
-    /// standalone `claude-run run` (refused up front) and, since CLAUDE-223, as
+    /// standalone `claude-run run` (refused up front) and as
     /// the `runs.exit_code` of a run that stopped picking up new jobs when the
     /// operator paused globally mid-run. Distinct from [`OK`] and [`CANCELLED`]
     /// so the run list can badge it separately.
@@ -93,16 +93,16 @@ pub mod exit {
     pub const LOCKED: i32 = 2;
     pub const CONFIG_ERROR: i32 = 3;
     pub const DAILY_CAP: i32 = 4;
-    /// CLAUDE-228: also the `runs.exit_code` of a run whose row was closed
+    /// Also the `runs.exit_code` of a run whose row was closed
     /// without its handler finalizing it, by [`crate::state::RunGuard`] on drop
     /// or by the startup reap in [`crate::state::reap_orphaned_runs`].
     pub const UNEXPECTED: i32 = 5;
     pub const OVER_BUDGET: i32 = 6;
-    /// CLAUDE-40: a mutating command was refused because it conflicts with live
+    /// A mutating command was refused because it conflicts with live
     /// state, e.g. `action delete` while a run for that action is in flight.
     /// The web UI / API map the same condition to HTTP 409.
     pub const CONFLICT: i32 = 7;
-    /// CLAUDE-269: a run stopped picking up new jobs because the Claude login
+    /// A run stopped picking up new jobs because the Claude login
     /// needs renewing (the CLI reported `authentication_failed`, or the status
     /// probe found `loggedIn: false`), distinct from [`PAUSED`] (an operator
     /// decision) and from [`OK`]. An operator cancel wins over both, and a
@@ -111,9 +111,9 @@ pub mod exit {
     pub const LOGIN_REQUIRED: i32 = 8;
     /// Sentinel exit_code for a run that was cancelled rather than finished,
     /// following the SIGINT convention (128 + SIGINT). Used both for live
-    /// cancel on demand (CLAUDE-9) and for the shutdown sweep of runs the
-    /// daemon stopped (CLAUDE-10); a row found open at STARTUP is
-    /// [`UNEXPECTED`] instead (CLAUDE-228). 130 does not collide with the codes above or
+    /// cancel on demand and for the shutdown sweep of runs the
+    /// daemon stopped; a row found open at STARTUP is
+    /// [`UNEXPECTED`] instead. 130 does not collide with the codes above or
     /// claude's own exits, so the web UI and CLI can map it to a distinct
     /// "cancelled" badge without a schema migration.
     pub const CANCELLED: i32 = 130;

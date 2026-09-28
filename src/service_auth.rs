@@ -162,7 +162,7 @@ pub async fn materialize(
     let mut status = AuthStatus::default();
     let mut api_key = None;
 
-    // CLAUDE-358: git identity is written unconditionally, defaulted rather
+    // Git identity is written unconditionally, defaulted rather
     // than gated on "something else is configured", so a fresh deployment
     // with nothing set in Settings -> Auth still produces a working commit
     // identity with no exec step.
@@ -240,7 +240,7 @@ pub async fn materialize(
     Ok((status, api_key))
 }
 
-/// CLAUDE-269: outcome of one `claude auth status --json` probe.
+/// Outcome of one `claude auth status --json` probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginProbeOutcome {
     /// `{"loggedIn": true, ...}`.
@@ -257,8 +257,7 @@ pub enum LoginProbeOutcome {
 /// `ANTHROPIC_API_KEY`, when one is stored), with a 30s wall-clock timeout via
 /// the same coreutils `timeout(1)` wrapper [`crate::claude::ClaudeInvoker`]
 /// uses. Blocking (a real subprocess spawn and wait): callers run this off the
-/// tokio worker (`crate::blocking::in_place` or `spawn_blocking`), per
-/// CLAUDE-228.
+/// tokio worker (`crate::blocking::in_place` or `spawn_blocking`).
 pub fn probe_claude_login(
     claude_binary: &str,
     config_dir: &Path,
@@ -307,7 +306,7 @@ fn shell_quote(s: &str) -> String {
 /// is set to `config_dir` so the login lands there rather than in whatever
 /// config `gh` would otherwise resolve. `--insecure-storage` because the
 /// container has no keyring. Blocking: callers run this off the tokio worker
-/// (`crate::blocking::in_place`), per CLAUDE-228.
+/// (`crate::blocking::in_place`).
 ///
 /// A non-zero exit is an error carrying the exit code and `gh`'s stderr, run
 /// through [`crate::forge_log::redact`] with the token as a known secret so it
@@ -456,7 +455,7 @@ mod tests {
         assert!(src.contains("pub fn default_fj_data_home"));
     }
 
-    /// CLAUDE-269: `loggedIn: true` / `loggedIn: false` are the two decisive
+    /// `loggedIn: true` / `loggedIn: false` are the two decisive
     /// outcomes; anything else (a spawn failure, a timeout, unparseable
     /// output) is `Indeterminate` and must never be collapsed into either.
     #[test]
@@ -545,7 +544,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-358: both fields configured are used verbatim; only one
+    /// Both fields configured are used verbatim; only one
     /// configured leaves the other defaulted; the materialized file is 0600.
     #[tokio::test]
     async fn git_identity_configured_fields_are_used_verbatim_and_unset_fields_default() {
@@ -592,7 +591,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-307: `gh_login` passes the documented flag set, points `GH_CONFIG_DIR`
+    /// `gh_login` passes the documented flag set, points `GH_CONFIG_DIR`
     /// at the given dir, and delivers the token on stdin rather than as an argv
     /// value (which would leak it into `ps`).
     #[test]

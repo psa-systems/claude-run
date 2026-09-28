@@ -17,17 +17,17 @@ pub fn now_iso() -> String {
 
 /// Current time as epoch milliseconds. Matches the unit `yt issue inspect --json`
 /// reports linked-issue `resolved` timestamps in, so the dependency gate's
-/// `blocked_until` backoff (CLAUDE-161) is directly comparable.
+/// `blocked_until` backoff is directly comparable.
 pub fn now_epoch_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-/// Persisted dependency-gate backoff state for one (action, issue) (CLAUDE-161).
+/// Persisted dependency-gate backoff state for one (action, issue).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyGateState {
     /// Epoch ms before which the gate does not re-evaluate the issue.
     pub blocked_until_ms: i64,
-    /// CLAUDE-225: epoch ms at which this block STARTED (the row's insert), kept
+    /// Epoch ms at which this block STARTED (the row's insert), kept
     /// across every re-arm so the age of a block is readable. The row is deleted
     /// once the blockers clear, so it measures one continuous block.
     pub blocked_since_ms: i64,
@@ -62,7 +62,7 @@ pub async fn dependency_gate_get(
 
 /// Record (or refresh) the dependency-gate backoff for `(action, key)`.
 ///
-/// CLAUDE-225: `blocked_since` is stamped with now on insert and deliberately
+/// `blocked_since` is stamped with now on insert and deliberately
 /// NOT touched by the conflict branch, so re-arming the backoff (or commenting a
 /// changed blocker set) never resets the age of an ongoing block.
 pub async fn dependency_gate_upsert(
@@ -96,7 +96,7 @@ pub async fn dependency_gate_upsert(
     Ok(())
 }
 
-/// CLAUDE-225: keep only the gate rows whose issue is still a candidate for
+/// Keep only the gate rows whose issue is still a candidate for
 /// `action`, dropping the rest. `keys` is the key set the action's query matched
 /// this poll (filters aside), so a row outside it holds nothing: the issue left
 /// the candidate set and its row is dead state that would otherwise sit in the
@@ -123,7 +123,7 @@ pub async fn dependency_gate_retain(pool: &DbPool, action: &str, keys: &[String]
     Ok(())
 }
 
-/// CLAUDE-225: how long a dependency gate may hold an issue before the daemon
+/// How long a dependency gate may hold an issue before the daemon
 /// says so out loud. The gate promises the issue "will be re-evaluated
 /// automatically", and that promise failing is silent: the issue simply stays
 /// Queued forever with nothing on the dashboard, in the run history, or in the
@@ -132,7 +132,7 @@ pub async fn dependency_gate_retain(pool: &DbPool, action: &str, keys: &[String]
 /// revise once the normal poll cadence is confirmed.
 pub const STALE_GATE_AFTER_MS: i64 = 60 * 60 * 1000;
 
-/// CLAUDE-225: one dependency gate that has held its issue longer than the
+/// One dependency gate that has held its issue longer than the
 /// staleness threshold, as the dashboard banner and `/api/status` report it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
 pub struct StaleGate {
@@ -150,7 +150,7 @@ pub struct StaleGate {
     pub updated_at: String,
 }
 
-/// CLAUDE-225: gates blocked for at least `threshold_ms`, longest-held first.
+/// Gates blocked for at least `threshold_ms`, longest-held first.
 /// Reads the live gate table rather than an event trail, so it needs no
 /// acknowledgement and clears itself: the gate deletes the row the moment the
 /// blockers resolve.
@@ -196,11 +196,11 @@ pub async fn dependency_gate_clear(pool: &DbPool, action: &str, key: &str) -> Re
     Ok(())
 }
 
-/// CLAUDE-232: how many rows the parked-at-cap read returns, matching the
+/// How many rows the parked-at-cap read returns, matching the
 /// stale-gate banner's window.
 pub const ATTEMPT_CAP_HITS_LIMIT: usize = 20;
 
-/// CLAUDE-232: one job parked at its action's per-key attempt cap, as the
+/// One job parked at its action's per-key attempt cap, as the
 /// dashboard banner and `/api/status` report it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CappedKey {
@@ -217,7 +217,7 @@ pub struct CappedKey {
     pub last_at: String,
 }
 
-/// CLAUDE-232: keys whose attempt counter has reached their action's cap, most
+/// Keys whose attempt counter has reached their action's cap, most
 /// attempts first. Every one of them is skipped on every poll with no
 /// `job_outcomes` row and no `run_events` row, so this live read off
 /// `attempt_counters` is the only thing that can report them.
@@ -302,7 +302,7 @@ pub async fn attempts_increment(pool: &DbPool, action: &str, key: &str) -> Resul
     attempts_get(pool, action, key).await
 }
 
-/// CLAUDE-238: clear one (action, key) counter so a job parked at the cap can
+/// Clear one (action, key) counter so a job parked at the cap can
 /// be retried under the same key. Returns whether a row was removed, so the
 /// caller (the API handler) can 404 an unknown counter instead of a silent
 /// no-op on a mistyped key.
@@ -399,7 +399,7 @@ pub async fn run_begin(pool: &DbPool, action: &str, triggered_by: &str) -> Resul
     Ok(id)
 }
 
-/// CLAUDE-1: record the planned job keys for a run as soon as input.command
+/// Record the planned job keys for a run as soon as input.command
 /// has produced them, so the web UI can show what's queued / in-flight
 /// before any outcome record exists. Stored as a JSON array of strings on
 /// the `runs.job_keys` column.
@@ -416,7 +416,7 @@ pub async fn run_set_job_keys(pool: &DbPool, run_id: i64, keys: &[String]) -> Re
     Ok(())
 }
 
-/// CLAUDE-93: record per-job outbound links for a run as a JSON object mapping
+/// Record per-job outbound links for a run as a JSON object mapping
 /// job key to URL (`runs.job_links`). The webhook stores the failure
 /// event's `html_url` so the run-detail tables can link the job key straight
 /// to the Forgejo Actions run.
@@ -437,7 +437,7 @@ pub async fn run_set_job_links(
     Ok(())
 }
 
-/// CLAUDE-93: the per-job link map for a run. Empty for legacy rows (NULL
+/// The per-job link map for a run. Empty for legacy rows (NULL
 /// column) and for runs that link via the action's `link_template` instead.
 pub async fn run_job_links(
     pool: &DbPool,
@@ -458,7 +458,7 @@ pub async fn run_job_links(
     }
 }
 
-/// CLAUDE-14: mark which planned job a run is currently processing, so the web
+/// Mark which planned job a run is currently processing, so the web
 /// UI can show exactly the one in-flight job as "running" instead of inferring
 /// it from gaps in `job_outcomes`. Pass `Some(key)` before processing a job;
 /// `run_finish` clears it back to NULL when the run ends.
@@ -474,7 +474,7 @@ pub async fn run_set_current_job(pool: &DbPool, run_id: i64, key: Option<&str>) 
     Ok(())
 }
 
-/// CLAUDE-80: set (or clear, with `None`) the live pipeline stage of a run, so
+/// Set (or clear, with `None`) the live pipeline stage of a run, so
 /// the run-detail page can show what an in-flight run is doing (the webhook
 /// fast-path advances it through download / triage / classify / mint).
 /// `run_finish` clears it together with `current_job_key`.
@@ -490,11 +490,11 @@ pub async fn run_stage_set(pool: &DbPool, run_id: i64, stage: Option<&str>) -> R
     Ok(())
 }
 
-/// CLAUDE-28: mark a job key as in flight for a run. Replaces the single
+/// Mark a job key as in flight for a run. Replaces the single
 /// `run_set_current_job` marker so a run with several jobs running in parallel
 /// badges all of them. Idempotent (`ON CONFLICT DO NOTHING`).
 ///
-/// CLAUDE-163: also records the job's `concurrency_key` so the admission dedup
+/// Also records the job's `concurrency_key` so the admission dedup
 /// can drop gathered jobs whose concurrency key (project / repo) is already in
 /// flight, not just those whose issue id is. For a path with one job per key
 /// (webhook) the concurrency key equals `key`.
@@ -517,7 +517,7 @@ pub async fn run_inflight_add(
     Ok(())
 }
 
-/// CLAUDE-28: clear one job's in-flight marker when it finishes.
+/// Clear one job's in-flight marker when it finishes.
 pub async fn run_inflight_remove(pool: &DbPool, run_id: i64, key: &str) -> Result<()> {
     sqlx::query(&crate::db::q(
         pool,
@@ -530,7 +530,7 @@ pub async fn run_inflight_remove(pool: &DbPool, run_id: i64, key: &str) -> Resul
     Ok(())
 }
 
-/// CLAUDE-28: the set of job keys currently in flight for a run.
+/// The set of job keys currently in flight for a run.
 pub async fn run_inflight_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(&crate::db::q(
         pool,
@@ -558,7 +558,7 @@ pub async fn run_job_keys(pool: &DbPool, run_id: i64) -> Result<Vec<String>> {
     }
 }
 
-/// CLAUDE-147: an input/poll-phase diagnostic emitted by `gather()` before any
+/// An input/poll-phase diagnostic emitted by `gather()` before any
 /// run row exists (e.g. a VCS probe failure, or a "no VCS integration" drop).
 /// Collected during gather and persisted to `run_events`, then surfaced in the
 /// web UI so the skipped issues and their reason are visible without reading the
@@ -572,7 +572,7 @@ pub struct InputEvent {
     pub message: String,
 }
 
-/// CLAUDE-147: one persisted `run_events` row, as read back for the web UI.
+/// One persisted `run_events` row, as read back for the web UI.
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct RunEventRecord {
     /// The run this event was attached to, or `None` for a poll whose events
@@ -584,7 +584,7 @@ pub struct RunEventRecord {
     pub message: String,
 }
 
-/// CLAUDE-171: one persisted `run_events` row as read back for the error-log
+/// One persisted `run_events` row as read back for the error-log
 /// page. The sibling of [`RunEventRecord`] that also carries `action_name`, so
 /// the log's Action column can render once the filter is widened past the action
 /// the page was entered from.
@@ -598,7 +598,7 @@ pub struct RunEventLogRecord {
     pub action_name: String,
 }
 
-/// CLAUDE-235: one row of the Logs page's grouped 24h summary: a `context` or an
+/// One row of the Logs page's grouped 24h summary: a `context` or an
 /// `action_name` and how many `warn`/`error` events carry it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
 pub struct RunEventCount {
@@ -608,7 +608,7 @@ pub struct RunEventCount {
     pub count: i64,
 }
 
-/// CLAUDE-147: persist this poll's input-phase events keyed by `action_name` +
+/// Persist this poll's input-phase events keyed by `action_name` +
 /// `poll_ts`, with a NULL `run_id` (the run row does not exist yet, since
 /// `gather()` runs before `run_begin`). [`run_events_attach`] backfills the run
 /// id once it is created. Called before `run_begin` so the events survive even
@@ -638,7 +638,7 @@ pub async fn run_events_record(
     Ok(())
 }
 
-/// CLAUDE-206: persist run-phase events that already know their run row (the
+/// Persist run-phase events that already know their run row (the
 /// forge notices a job accumulates, e.g. a degraded open-PR lookup). Unlike
 /// [`run_events_record`] these need no [`run_events_attach`] backfill, so a
 /// concurrent poll's NULL-`run_id` rows can never be attached by mistake.
@@ -669,7 +669,7 @@ pub async fn run_events_record_for_run(
     Ok(())
 }
 
-/// CLAUDE-147: backfill `run_id` onto this poll's still-unattached events once
+/// Backfill `run_id` onto this poll's still-unattached events once
 /// `run_begin` has created the run row, so the run-detail / action pages can tie
 /// them to the run. Matches on `action_name` + the poll `ts` used at record
 /// time; a zero-job poll that never reaches here keeps its events with a NULL
@@ -692,7 +692,7 @@ pub async fn run_events_attach(
     Ok(())
 }
 
-/// CLAUDE-147: the most recent input-phase events for an action, newest first,
+/// The most recent input-phase events for an action, newest first,
 /// for the action-detail "Input errors / warnings" region. Queried by
 /// `action_name` independent of any run row, so a zero-job poll's events (NULL
 /// `run_id`) are returned too. Bounds display with `limit`.
@@ -718,7 +718,7 @@ pub async fn run_events_for_action(
     Ok(rows)
 }
 
-/// CLAUDE-333: the newest message an action recorded that contains `needle`,
+/// The newest message an action recorded that contains `needle`,
 /// so a caller can tell whether a fault it is about to report repeats the one
 /// it reported last time.
 pub async fn run_events_last_message_containing(
@@ -737,7 +737,7 @@ pub async fn run_events_last_message_containing(
     Ok(row.map(|r| r.0))
 }
 
-/// CLAUDE-235: how many input-phase diagnostics an action has recorded since
+/// How many input-phase diagnostics an action has recorded since
 /// `started_at`, for the action-detail one-line summary. The rows themselves live
 /// on the Logs page; this is only the signal that there are some.
 ///
@@ -761,12 +761,12 @@ pub async fn run_events_count_for_action(
     Ok(count)
 }
 
-/// CLAUDE-235: levels the Logs summary and the dashboard banner count. `info`
-/// rows (the CLAUDE-216 access-recovery markers among them) are diagnostics of
+/// Levels the Logs summary and the dashboard banner count. `info`
+/// rows (the access-recovery markers among them) are diagnostics of
 /// record, not conditions to act on, so they stay out of the counts.
 const DIAGNOSTIC_LEVELS: &str = "('warn', 'error')";
 
-/// CLAUDE-235: total `warn`/`error` events recorded at or after `since`, for the
+/// Total `warn`/`error` events recorded at or after `since`, for the
 /// dashboard banner's headline count.
 pub async fn run_events_count_since(pool: &DbPool, since: &str) -> Result<i64> {
     let sql =
@@ -778,7 +778,7 @@ pub async fn run_events_count_since(pool: &DbPool, since: &str) -> Result<i64> {
     Ok(count)
 }
 
-/// CLAUDE-235: `warn`/`error` events at or after `since` grouped by `context`,
+/// `warn`/`error` events at or after `since` grouped by `context`,
 /// busiest first, for the Logs page's summary card. A NULL or empty `context`
 /// groups under the empty string rather than being dropped, so the rows account
 /// for every counted event.
@@ -790,7 +790,7 @@ pub async fn run_events_grouped_by_context(
     run_events_grouped_by(pool, "COALESCE(context, '')", since, limit).await
 }
 
-/// CLAUDE-235: `warn`/`error` events at or after `since` grouped by
+/// `warn`/`error` events at or after `since` grouped by
 /// `action_name`, busiest first, for the Logs page's summary card.
 pub async fn run_events_grouped_by_action(
     pool: &DbPool,
@@ -826,15 +826,15 @@ async fn run_events_grouped_by(
     Ok(rows)
 }
 
-/// CLAUDE-216: message prefix of the poll-time forge repo-access preflight
+/// Message prefix of the poll-time forge repo-access preflight
 /// failure (`src/native/youtrack.rs`). The dashboard banner and the recovery
 /// filter both key off it, so the two agree on what counts as an access event.
 pub const ACCESS_FAILURE_PREFIX: &str = "forge repo-access preflight failed";
-/// CLAUDE-216: message prefix of the recovery marker recorded when a repo that
+/// Message prefix of the recovery marker recorded when a repo that
 /// was failing passes the preflight again. It clears the banner.
 pub const ACCESS_RECOVERY_PREFIX: &str = "forge repo-access preflight passed";
 
-/// CLAUDE-216: one still-open access failure, as the dashboard banner shows it.
+/// One still-open access failure, as the dashboard banner shows it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
 pub struct AccessFailure {
     pub action_name: String,
@@ -846,7 +846,7 @@ pub struct AccessFailure {
     pub count: i64,
 }
 
-/// CLAUDE-216: poll-time access failures recorded at or after `since` that no
+/// Poll-time access failures recorded at or after `since` that no
 /// later successful preflight has superseded, newest first. A repo whose grant
 /// lands mid-window records a recovery marker, which drops its failures here, so
 /// the banner clears itself without an operator acknowledging anything.
@@ -895,7 +895,7 @@ pub async fn access_failures_recent(
     Ok(rows)
 }
 
-/// CLAUDE-216: true when the newest access event recorded for `(action,
+/// True when the newest access event recorded for `(action,
 /// context)` is a failure, i.e. a passing preflight now is a recovery worth
 /// recording. Keeps the success marker off the event log in the normal case,
 /// where every poll passes and nothing changed.
@@ -934,9 +934,9 @@ pub async fn run_finish(
     jobs_processed: u32,
 ) -> Result<()> {
     let now = now_iso();
-    // CLAUDE-14: clear current_job_key atomically with the end state. A finished
+    // Clear current_job_key atomically with the end state. A finished
     // run has no job in flight, so every break/finish path that reaches here
-    // also drops the stale "running" marker. CLAUDE-80: the live stage is
+    // also drops the stale "running" marker. The live stage is
     // cleared the same way so it never outlives its run.
     sqlx::query(&crate::db::q(
         pool,
@@ -952,7 +952,7 @@ pub async fn run_finish(
     .bind(run_id)
     .execute(pool)
     .await?;
-    // CLAUDE-28: a finished run has nothing in flight; drop any stale in-flight
+    // A finished run has nothing in flight; drop any stale in-flight
     // job markers alongside clearing the legacy single-job marker above.
     sqlx::query(&crate::db::q(
         pool,
@@ -964,7 +964,7 @@ pub async fn run_finish(
     Ok(())
 }
 
-/// CLAUDE-228: closes a `run_begin` row on EVERY exit path.
+/// Closes a `run_begin` row on EVERY exit path.
 ///
 /// Each runner used to open the row, then apply `?` to a dozen bookkeeping
 /// awaits before reaching [`run_finish`]. One transient failure (in the incident
@@ -1037,16 +1037,16 @@ impl Drop for RunGuard {
     }
 }
 
-/// CLAUDE-10: reconcile runs left open at daemon SHUTDOWN, after the cancel
+/// Reconcile runs left open at daemon SHUTDOWN, after the cancel
 /// grace elapsed. Those runs were stopped by this process, so they close as
-/// `exit::CANCELLED`, the same sentinel the live-cancel path (CLAUDE-9) uses.
+/// `exit::CANCELLED`, the same sentinel the live-cancel path uses.
 /// The startup sweep is [`reap_orphaned_runs`], which closes with a different
 /// code because nothing cancelled those rows. Returns the number reconciled.
 pub async fn cancel_orphaned_runs(pool: &DbPool) -> Result<u64> {
     close_open_runs(pool, crate::exit::CANCELLED).await
 }
 
-/// CLAUDE-228: the startup reap. A freshly started daemon holds the
+/// The startup reap. A freshly started daemon holds the
 /// single-instance lock, so no row still open can belong to a live run: each is
 /// a leftover from a process that died without finalizing, or a row stranded
 /// between `run_begin` and `run_finish` (the failure [`RunGuard`] now prevents).
@@ -1064,7 +1064,7 @@ pub async fn reap_orphaned_runs(pool: &DbPool) -> Result<u64> {
 /// run.
 async fn close_open_runs(pool: &DbPool, exit_code: i32) -> Result<u64> {
     let now = now_iso();
-    // CLAUDE-80: a dead process reports no stage; clear it with the end state.
+    // A dead process reports no stage; clear it with the end state.
     let result = sqlx::query(&crate::db::q(
         pool,
         "UPDATE runs SET ended_at = ?, exit_code = ?, stage = NULL WHERE ended_at IS NULL",
@@ -1073,7 +1073,7 @@ async fn close_open_runs(pool: &DbPool, exit_code: i32) -> Result<u64> {
     .bind(exit_code as i64)
     .execute(pool)
     .await?;
-    // CLAUDE-28: nothing of the dead process is in flight, so any in-flight job
+    // Nothing of the dead process is in flight, so any in-flight job
     // markers it left are leftovers. Clear them all.
     sqlx::query(&crate::db::q(pool, "DELETE FROM run_inflight_jobs"))
         .execute(pool)
@@ -1094,9 +1094,9 @@ pub struct JobOutcome<'a> {
     pub attempt_counted: bool,
     pub summary: Option<&'a str>,
     pub stream_log_path: Option<&'a str>,
-    /// CLAUDE-20: full per-job pipeline elapsed in milliseconds.
+    /// Full per-job pipeline elapsed in milliseconds.
     pub duration_ms: i64,
-    /// CLAUDE-52: the job's claude run hit the wall-clock limit (exit 124) and
+    /// The job's claude run hit the wall-clock limit (exit 124) and
     /// was SIGKILLed. Distinct from a hard failure (`ok = 0`, `timed_out = 0`):
     /// the UI badges it separately and the failed-job count excludes it.
     pub timed_out: bool,
@@ -1219,16 +1219,16 @@ pub struct ActionIndexRow {
     pub schedule_spec: Option<String>,
     pub last_seen_at: String,
     pub parse_error: Option<String>,
-    /// CLAUDE-1: optional URL template for rendering job keys as links.
+    /// Optional URL template for rendering job keys as links.
     pub link_template: Option<String>,
-    /// CLAUDE-162: the action's configured `concurrency.max_parallel`, cached in
+    /// The action's configured `concurrency.max_parallel`, cached in
     /// the index so the scheduler can resolve the `max_parallel_global` auto
     /// default without re-parsing every action's YAML each tick. Defaults to 1
     /// in the schema; the one query that reads this row always selects it.
     pub max_parallel: i64,
 }
 
-// CLAUDE-250: by hand rather than derived, because `enabled` is an integer 0/1
+// By hand rather than derived, because `enabled` is an integer 0/1
 // column on both backends. See `crate::db::flag`.
 impl sqlx::FromRow<'_, sqlx::any::AnyRow> for ActionIndexRow {
     fn from_row(row: &sqlx::any::AnyRow) -> sqlx::Result<Self> {
@@ -1303,7 +1303,7 @@ pub async fn action_last_run_started(pool: &DbPool, action: &str) -> Result<Opti
     Ok(row.map(|(s,)| s))
 }
 
-/// CLAUDE-40: delete the `actions` index row for `name`. Returns `false` when
+/// Delete the `actions` index row for `name`. Returns `false` when
 /// no row matched, mirroring [`secret_delete`]. Only touches the derived index;
 /// the caller is responsible for the on-disk YAML and the runtime purge.
 pub async fn action_index_delete(pool: &DbPool, name: &str) -> Result<bool> {
@@ -1314,7 +1314,7 @@ pub async fn action_index_delete(pool: &DbPool, name: &str) -> Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
-/// CLAUDE-40: purge an action's control state on delete: the `attempt_counters`
+/// Purge an action's control state on delete: the `attempt_counters`
 /// and `daily_ledger` rows keyed on `action_name`. The `paused_actions` row is
 /// cleared separately via [`action_pause_clear`]. Run history (`runs`,
 /// `job_outcomes`) and on-disk stream logs are intentionally left intact so a
@@ -1337,7 +1337,7 @@ pub async fn action_runtime_purge(pool: &DbPool, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// CLAUDE-40: purge an action's derived index + control state in one call:
+/// Purge an action's derived index + control state in one call:
 /// the `actions` index row, the `paused_actions` row, and the
 /// `attempt_counters` / `daily_ledger` rows. Returns the index row's prior
 /// existence (`true` = a row was deleted), so callers can distinguish a real
@@ -1349,7 +1349,7 @@ pub async fn action_purge_state(pool: &DbPool, name: &str) -> Result<bool> {
     Ok(existed)
 }
 
-/// CLAUDE-40: true when a run for `action` is still in flight in the DB (a
+/// True when a run for `action` is still in flight in the DB (a
 /// `runs` row with no `ended_at`). The delete flow refuses with a conflict when
 /// this holds. The daemon additionally consults its in-memory in-flight set for
 /// a job dispatched but not yet recorded as a run.
@@ -1364,7 +1364,7 @@ pub async fn action_has_active_run(pool: &DbPool, action: &str) -> Result<bool> 
     Ok(row.is_some())
 }
 
-/// CLAUDE-223: one still-open run, for the About page's quiet indicator and the
+/// One still-open run, for the About page's quiet indicator and the
 /// `/api/status` activity block.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ActiveRun {
@@ -1373,7 +1373,7 @@ pub struct ActiveRun {
     pub started_at: String,
 }
 
-/// CLAUDE-223: every run row with no `ended_at`, oldest first. Trustworthy as a
+/// Every run row with no `ended_at`, oldest first. Trustworthy as a
 /// liveness signal because [`reap_orphaned_runs`] closes every leftover row at
 /// daemon startup and [`RunGuard`] closes one whose handler errors mid-run, so
 /// an open row means a run really is executing. Returns the
@@ -1399,7 +1399,7 @@ pub async fn active_runs(pool: &DbPool) -> Result<Vec<ActiveRun>> {
         .collect())
 }
 
-/// CLAUDE-162: the set of job keys currently in flight across every still-open
+/// The set of job keys currently in flight across every still-open
 /// (not-yet-finished) run of `action`. A re-gather started while a prior run is
 /// working an issue dedups its gathered jobs against this set, so an overlapping
 /// pickup run never re-claims work another open run already holds. Joins
@@ -1420,7 +1420,7 @@ pub async fn action_inflight_keys(pool: &DbPool, action: &str) -> Result<Vec<Str
     Ok(rows.into_iter().map(|(k,)| k).collect())
 }
 
-/// CLAUDE-163: the set of CONCURRENCY keys currently in flight across every
+/// The set of CONCURRENCY keys currently in flight across every
 /// still-open run of `action`. A re-gather dedups its gathered jobs against this
 /// set (by each job's concurrency key), so an overlapping pickup run never
 /// gathers a second same-key job while that key is already in flight and could
@@ -1443,7 +1443,7 @@ pub async fn action_inflight_concurrency_keys(pool: &DbPool, action: &str) -> Re
     Ok(rows.into_iter().map(|(k,)| k).collect())
 }
 
-// ---- CLAUDE-26: encrypted secrets ---------------------------------------
+// ---- Encrypted secrets ---------------------------------------
 
 /// Metadata for one stored secret. The ciphertext is never carried in this
 /// view, so the listing the web UI renders can never leak a value.
@@ -1561,7 +1561,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_events_probe_failure_persists_and_web_read_returns_it() {
-        // CLAUDE-147: a VCS probe failure recorded by gather() is persisted via
+        // A VCS probe failure recorded by gather() is persisted via
         // run_events_record and returned by the web read path
         // (run_events_for_action), proving the error is no longer log-only.
         let pool = mem_pool().await;
@@ -1611,7 +1611,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_phase_event_attaches_to_its_run_and_reads_on_the_action_page() {
-        // CLAUDE-206: a degraded open-PR lookup is recorded mid-run, so it knows
+        // A degraded open-PR lookup is recorded mid-run, so it knows
         // its run row already and needs no attach backfill. It reads back on the
         // action page carrying that run id, and a concurrent poll's
         // NULL-run_id event is left alone.
@@ -1661,7 +1661,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_job_links_roundtrip_and_legacy_null() {
-        // CLAUDE-93: set + read the per-job link map; a legacy row (no write)
+        // Set + read the per-job link map; a legacy row (no write)
         // reads back as an empty map, not an error.
         let pool = mem_pool().await;
         let run = run_begin(&pool, "act", "webhook").await.unwrap();
@@ -1680,7 +1680,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_stage_roundtrips_and_clears_on_finish() {
-        // CLAUDE-80: set, overwrite, explicit clear, and the run_finish clear.
+        // Set, overwrite, explicit clear, and the run_finish clear.
         let pool = mem_pool().await;
         let run = run_begin(&pool, "act", "webhook").await.unwrap();
         assert_eq!(stage_of(&pool, run).await, None);
@@ -1728,7 +1728,7 @@ mod tests {
         .unwrap()
     }
 
-    /// CLAUDE-228: the happy path closes the row with the run's own exit code.
+    /// The happy path closes the row with the run's own exit code.
     #[tokio::test]
     async fn run_guard_finish_closes_the_row() {
         let pool = mem_pool().await;
@@ -1752,7 +1752,7 @@ mod tests {
         assert_eq!(processed, 4);
     }
 
-    /// CLAUDE-228: the regression. A handler that returns early (here, the
+    /// The regression. A handler that returns early (here, the
     /// `pool timed out` shape: an error between `run_begin` and `run_finish`)
     /// used to leave the row open forever, and the web UI rendered it as a
     /// running job for days. The guard closes it as `UNEXPECTED` on drop.
@@ -1840,7 +1840,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-228: the startup reap. A row still open when the daemon starts was
+    /// The startup reap. A row still open when the daemon starts was
     /// stranded by a process that died without finalizing, not cancelled by an
     /// operator, so it closes as `UNEXPECTED` and stays distinguishable from a
     /// `claude-run stop`. This is what cleared the 19 stranded rows a scheduled
@@ -1875,7 +1875,7 @@ mod tests {
         assert_eq!(reap_orphaned_runs(&pool).await.unwrap(), 0);
     }
 
-    /// CLAUDE-228: every runner that opens a run row pairs it with a
+    /// Every runner that opens a run row pairs it with a
     /// [`RunGuard`], which is what closes the row on an error return (proved by
     /// `run_guard_closes_the_row_when_the_handler_errors` above). Enumerated
     /// mechanically over the runner sources so a NEW runner, or a `run_begin`
@@ -1905,7 +1905,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-315: every `claude` invocation must leave a `claude_invocations`
+    /// Every `claude` invocation must leave a `claude_invocations`
     /// row, so plan usage is queryable history rather than only a log line. A
     /// call site that reaches `ClaudeInvoker::invoke` (or the trait method of
     /// the same name) without a matching `record_invocation` call in the same
@@ -1995,7 +1995,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_outcome_persists_and_is_excluded_from_failed_count() {
-        // CLAUDE-52: a timed-out outcome round-trips `timed_out = 1` (still
+        // A timed-out outcome round-trips `timed_out = 1` (still
         // `ok = 0`) and is NOT counted as a failed job, while a plain failure is.
         let pool = mem_pool().await;
         let run_id = run_begin(&pool, "act", "cli").await.unwrap();
@@ -2058,7 +2058,7 @@ mod tests {
         assert_eq!(failed, 1, "timed-out job excluded from failed count");
     }
 
-    // ---- CLAUDE-40: action delete ----------------------------------------
+    // ---- Action delete ----------------------------------------
 
     fn index_row(name: &str, path: &str) -> ActionIndexRow {
         ActionIndexRow {
@@ -2163,7 +2163,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-223: `active_runs` lists every open run (id, action, start) and
+    /// `active_runs` lists every open run (id, action, start) and
     /// empties as each finishes, so the quiet indicator can both decide and list.
     #[tokio::test]
     async fn active_runs_lists_open_runs_only() {
@@ -2187,7 +2187,7 @@ mod tests {
         assert!(active_runs(&pool).await.unwrap().is_empty());
     }
 
-    // CLAUDE-162: with two OVERLAPPING open runs for one action,
+    // With two OVERLAPPING open runs for one action,
     // `action_has_active_run` stays true until BOTH finish, and
     // `action_last_run_started` returns the most recently started of the two, so
     // the delete-conflict guard and the schedule bookkeeping both behave with
@@ -2215,7 +2215,7 @@ mod tests {
         assert!(!action_has_active_run(&pool, "act").await.unwrap());
     }
 
-    // CLAUDE-162: `action_inflight_keys` returns the union of in-flight job keys
+    // `action_inflight_keys` returns the union of in-flight job keys
     // across every OPEN run of the action, and excludes keys from finished runs,
     // so the overlapping-run admission check dedups against exactly the work
     // another live run currently holds.
@@ -2246,7 +2246,7 @@ mod tests {
         assert_eq!(keys, vec!["ISSUE-2".to_string()]);
     }
 
-    // CLAUDE-163: `action_inflight_concurrency_keys` returns the union of
+    // `action_inflight_concurrency_keys` returns the union of
     // in-flight CONCURRENCY keys across open runs of the action (distinct,
     // excluding other actions and finished runs), so the admission dedup drops a
     // gathered job whose project/repo is already in flight even if its issue id
@@ -2283,7 +2283,7 @@ mod tests {
         assert_eq!(keys, vec!["MAPPS".to_string()]);
     }
 
-    /// CLAUDE-216: the dashboard banner shows a poll-time access failure and
+    /// The dashboard banner shows a poll-time access failure and
     /// stops showing it once a later poll for the same repo passes.
     #[tokio::test]
     async fn access_failures_surface_until_a_later_pass_supersedes_them() {
@@ -2352,7 +2352,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-235: the Logs summary groups the window's `warn`/`error` events by
+    /// The Logs summary groups the window's `warn`/`error` events by
     /// context and by action, busiest first, and leaves `info` out of both.
     #[tokio::test]
     async fn run_event_summaries_group_diagnostics_and_skip_info() {
@@ -2454,7 +2454,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-225: re-arming the backoff (and re-commenting a changed blocker
+    /// Re-arming the backoff (and re-commenting a changed blocker
     /// set) must not reset `blocked_since`, or a gate re-evaluated every 5m would
     /// read as 5m old forever and never surface. Clearing the row and blocking
     /// again does start a new block.
@@ -2525,7 +2525,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-225: the poll-time prune keeps the gate rows of issues the query
+    /// The poll-time prune keeps the gate rows of issues the query
     /// still matches and drops the rest, so an issue that left the candidate set
     /// while blocked (resolved by hand, re-fielded) cannot sit in the stale-gate
     /// banner forever. Other actions' rows are untouched.
@@ -2587,7 +2587,7 @@ mod tests {
             .is_some());
     }
 
-    /// CLAUDE-225: the dashboard/API read returns only gates held past the
+    /// The dashboard/API read returns only gates held past the
     /// threshold, longest-held first, and reports how overdue each gate's own
     /// re-evaluation is. A gate whose blockers clear deletes its row, so the
     /// signal disappears without anyone acknowledging it.
@@ -2662,7 +2662,7 @@ mod tests {
             .is_empty());
     }
 
-    /// CLAUDE-232: the parked-at-cap read compares each key against ITS action's
+    /// The parked-at-cap read compares each key against ITS action's
     /// cap, not one global number, so an action that lowers `max_attempts_per_key`
     /// parks earlier and an action that raises it releases the key again.
     #[tokio::test]

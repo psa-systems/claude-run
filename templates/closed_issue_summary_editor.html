@@ -47,7 +47,7 @@
 
   <div class="card">
     <h3>Parents</h3>
-    {% call m::linesfield("Nominated parents", "parents", form.parents, "CLAUDE-100", "One issue id per line, typically the milestone being reported against. These are never field-written.") %}
+    {% call m::linesfield("Nominated parents", "parents", form.parents, "PROJ-123", "One issue id per line, typically the milestone being reported against. These are never field-written.") %}
     <div class="grid2" style="margin-top: 8px;">
       {% call m::textfield("Parent query", "query", form.query, "(none)") %}
       {% call m::textfield("Custom field", "custom_field", form.custom_field, "AI Agent") %}

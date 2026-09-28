@@ -71,7 +71,7 @@ impl DaemonClient {
         read_json(resp).await
     }
 
-    /// CLAUDE-40: POST that surfaces the HTTP status alongside the parsed JSON
+    /// POST that surfaces the HTTP status alongside the parsed JSON
     /// body, instead of collapsing every non-2xx into an opaque error. The CLI
     /// uses it to translate the delete handler's 404 / 409 into the matching
     /// `exit::CONFIG_ERROR` / `exit::CONFLICT` codes.

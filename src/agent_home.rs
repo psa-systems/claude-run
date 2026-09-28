@@ -1,4 +1,4 @@
-//! CLAUDE-165: route the spawned `claude` agent to a dedicated user-level config
+//! Route the spawned `claude` agent to a dedicated user-level config
 //! dir so it loads the slim bot memory (`deploy/bot-CLAUDE.md`) instead of the
 //! operator's interactive `~/.claude/CLAUDE.md`.
 //!
@@ -64,7 +64,7 @@ fn ensure_seeded(dir: &Path, home: &Path) -> Result<()> {
 /// child and the host share one credential file (a token refresh written by the
 /// child persists to the host login; a copy would silently diverge).
 ///
-/// CLAUDE-247: the container has no host login to share. The operator runs
+/// The container has no host login to share. The operator runs
 /// `claude auth login` inside it, and that file IS the agent's credential, so
 /// three cases never touch it: no host file at all, a real (non-symlink) file
 /// already in the agent dir, and an agent dir that resolves to `$HOME/.claude`
@@ -137,9 +137,9 @@ mod tests {
         // no Git workflow section.
         assert!(BOT_CLAUDE_MD.contains("claude-run bot agent memory"));
         assert!(BOT_CLAUDE_MD.contains("You perform NO external mutation"));
-        // CLAUDE-214: the bot file must match the relaxed prompt, so it carries
+        // The bot file must match the relaxed prompt, so it carries
         // the `No orphan notes` obligation and the `AI Agent` ban that keeps a
-        // filing agent from queueing further agent runs (CLAUDE-295: unless the
+        // filing agent from queueing further agent runs (unless the
         // job prompt names the exception).
         assert!(BOT_CLAUDE_MD.contains("No orphan notes"));
         assert!(BOT_CLAUDE_MD.contains("NEVER set the `AI Agent` field on any issue unless"));
@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(std::fs::read_link(&link).unwrap(), host_cred);
     }
 
-    // CLAUDE-247: the container carries no host login, so seeding must come up
+    // The container carries no host login, so seeding must come up
     // clean and must never destroy a credential written inside the container.
 
     #[cfg(target_os = "linux")]

@@ -1,4 +1,4 @@
-//! Native cross-project closed-issue reporter (CLAUDE-218).
+//! Native cross-project closed-issue reporter.
 //!
 //! Uses the automation as a reporting tool rather than an issue worker: count
 //! the issues closed in a rolling window across a named set of projects, write
@@ -146,7 +146,7 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
     let backend = provider::resolve(provider::DEFAULT_PRIORITY)?;
 
     // Resolve targets BEFORE run_begin so a gather failure is a no-op run.
-    // CLAUDE-228: hold the gather marker so the scheduler does not stack another
+    // Hold the gather marker so the scheduler does not stack another
     // pickup while this one is still resolving targets.
     let gather_guard = ctx.gather.try_acquire(&action.name);
     let (targets, from_query) = match crate::blocking::in_place(|| {
@@ -165,12 +165,12 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
 
     let window = Window::ending(Local::now().date_naive(), cfg.window_days);
 
-    // CLAUDE-228: the gather marker covers the whole pre-`run_begin` phase (the
+    // The gather marker covers the whole pre-`run_begin` phase (the
     // work a stacked pickup would redo); released here, so overlapping runs past
-    // this point stay allowed exactly as CLAUDE-162 intends.
+    // this point stay allowed by design.
     drop(gather_guard);
     let run_id = state::run_begin(pool, &action.name, ctx.triggered_by).await?;
-    // CLAUDE-228: from here the row MUST be closed on every exit path, including
+    // From here the row MUST be closed on every exit path, including
     // an early `?` out of the bookkeeping below.
     let run_guard = state::RunGuard::new(pool, run_id);
     let cancel = match ctx.registry {
@@ -185,7 +185,7 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
         warn!(run_id, error = %e, "recording planned keys failed (continuing)");
     }
 
-    // CLAUDE-234: every write from here on goes through the run's ledger, which
+    // Every write from here on goes through the run's ledger, which
     // stamps it with `run_id` and refuses a create past the run's ceiling. This
     // action is the bulk filer (one report per parent), so the ceiling is what
     // bounds a misfiring run.
@@ -193,7 +193,7 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
     let audit = IssueWriteAudit::new(Some(run_id), limits.max_issues_per_run);
     let tracker = AuditedTracker::new(backend.as_ref(), audit.clone());
 
-    // CLAUDE-223: run-scoped global-pause gate, checked alongside cancel at the
+    // Run-scoped global-pause gate, checked alongside cancel at the
     // per-parent pickup so a mid-run pause stops the next report.
     let run_pause = ctx.pause.for_action_run(&action.name);
     let mut filed: u32 = 0;
@@ -220,7 +220,7 @@ async fn run_closed_issue_summary(ctx: NativeContext<'_>) -> Result<()> {
         }
     }
 
-    // CLAUDE-234: a run stopped by its issue-creation ceiling must not read as a
+    // A run stopped by its issue-creation ceiling must not read as a
     // clean one, so the refusal lands on the action page as a run event, not
     // only in the daemon journal. Non-fatal bookkeeping.
     let notices = audit.take_notices();

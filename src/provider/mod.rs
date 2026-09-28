@@ -1,5 +1,4 @@
-//! Provider abstraction for the external services native handlers talk to
-//! (CLAUDE-31, part of the native-action epic CLAUDE-25).
+//! Provider abstraction for the external services native handlers talk to.
 //!
 //! Native handlers need a typed, testable interface over the host CLIs (`yt`,
 //! `fj`) instead of the raw nu snippets the scripted youtrack action uses. Two
@@ -22,7 +21,7 @@
 //! No raw REST anywhere; the CLI backend shells out to `yt` / `fj` only.
 //!
 //! The trait methods are synchronous (they shell out via [`std::process`], like
-//! [`crate::snippet`]). The async native handler (CLAUDE-32) wraps a backend
+//! [`crate::snippet`]). The async native handler wraps a backend
 //! call in `tokio::task::spawn_blocking`.
 
 pub mod audit;
@@ -40,7 +39,7 @@ pub use cli::{CliBackend, CmdOutput, CommandRunner, FjForgeReads, ProcessRunner}
 pub use github::{is_github_host, GithubForge, HttpMcpTransport, McpTransport};
 
 /// One project-to-repo binding flattened from a YouTrack project's enabled VCS
-/// integration, the row of the inverse routing map (CLAUDE-86). Each enabled
+/// integration, the row of the inverse routing map. Each enabled
 /// `GiteaChangesProcessor` on a non-archived project contributes one entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VcsMapEntry {
@@ -82,7 +81,7 @@ pub struct ForgePullRequest {
     pub head_ref: String,
     /// Base branch name (the branch the PR merges into), used by the comment
     /// webhook's PR route to let an agent bring the base branch in to resolve
-    /// merge conflicts (CLAUDE-303).
+    /// merge conflicts.
     #[serde(default)]
     pub base_ref: String,
     /// Author login, matched against the bot-author skip.
@@ -95,16 +94,16 @@ pub struct ForgePullRequest {
     pub updated_at: String,
 }
 
-/// The mergeability snapshot of a PR as `fj pr status --json` reports it
-/// (CLAUDE-126). `state` is the combined CI status (`"success"` / `"failure"` /
+/// The mergeability snapshot of a PR as `fj pr status --json` reports it.
+/// `state` is the combined CI status (`"success"` / `"failure"` /
 /// `"pending"`); `mergeable` is Forgejo's verdict that the PR has no conflict,
 /// is not still being checked, and is not a WIP PR - it says nothing about
-/// whether the branch is up to date with its base (CLAUDE-309: that used to be
+/// whether the branch is up to date with its base (that used to be
 /// the assumption here, and it is wrong - Forgejo's `mergeable` ignores being
 /// behind). `behind_base` answers that separately: `Some(true)` /
 /// `Some(false)` when both Forgejo's `merge_base` and `base.sha` are known,
 /// `None` when either is missing or the PR is merged, meaning unknown and
-/// never collapsed to `false` (FJ-99). Only the fields automerge consumes are
+/// never collapsed to `false`. Only the fields automerge consumes are
 /// modelled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrStatus {
@@ -116,7 +115,7 @@ pub struct PrStatus {
     #[serde(default)]
     pub mergeable: Option<bool>,
     /// Whether the PR's head is behind its base. `None` means unknown (an
-    /// `fj` predating FJ-99, or a value Forgejo has not computed yet).
+    /// `fj` predating that field, or a value Forgejo has not computed yet).
     #[serde(default)]
     pub behind_base: Option<bool>,
 }
@@ -124,12 +123,12 @@ pub struct PrStatus {
 /// A pull request opened by a [`Forge`] backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
-    /// PR number from the forge CLI's JSON envelope, when present (CLAUDE-136).
+    /// PR number from the forge CLI's JSON envelope, when present.
     pub number: Option<u64>,
     /// PR web URL as the forge CLI reported it (the `html_url` field of
     /// `fj pr create --json`).
     pub url: String,
-    /// CLAUDE-275: the server-side head branch this PR was opened from, when the
+    /// The server-side head branch this PR was opened from, when the
     /// strategy produced one (the Forgejo branch strategy, and GitHub, which is
     /// always branch-backed). `None` for the AGit strategy, which pushes to
     /// `refs/for/<base>` and never creates a server branch, so a re-queued issue
@@ -162,7 +161,7 @@ impl LinkDirection {
 }
 
 /// One directed link from an issue to a single linked target, flattened from the
-/// `links[].issues[]` shape of `yt issue inspect --json` (YT-40 / CLAUDE-161).
+/// `links[].issues[]` shape of `yt issue inspect --json` (YT-40).
 /// Each linked issue in a `links[]` entry becomes its own row so the dependency
 /// gate can filter by `verb` (the direction-resolved relationship) and test each
 /// target's `resolved` timestamp independently.
@@ -180,7 +179,7 @@ pub struct IssueLink {
     pub resolved: Option<i64>,
 }
 
-/// CLAUDE-189: an issue's body plus its comment texts, from
+/// An issue's body plus its comment texts, from
 /// `yt issue inspect --json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IssueInspect {
@@ -208,7 +207,7 @@ pub trait IssueTracker: Send + Sync {
 
     /// Set the issue Assignee, e.g. `("MK-16", "octocat")`. `login` is passed
     /// straight to the backend; `me` and `unassigned` are valid values. Backs the
-    /// optional assignee-on-pickup write (CLAUDE-131).
+    /// optional assignee-on-pickup write.
     fn set_assignee(&self, key: &str, login: &str) -> Result<()>;
 
     /// Add a comment to an issue.
@@ -216,12 +215,12 @@ pub trait IssueTracker: Send + Sync {
 
     /// The issue's directed links, flattened one row per linked target, with each
     /// link's resolved `direction` / `verb` and each target's nullable `resolved`
-    /// timestamp (YT-40). Backs the pre-clone dependency gate (CLAUDE-161), which
+    /// timestamp (YT-40). Backs the pre-clone dependency gate, which
     /// blocks a queued issue on any unmet dependency before it is cloned or handed
     /// to claude.
     fn issue_links(&self, key: &str) -> Result<Vec<IssueLink>>;
 
-    /// CLAUDE-189: read an issue's description and comment texts via
+    /// Read an issue's description and comment texts via
     /// `yt issue inspect --json`.
     fn inspect_issue(&self, key: &str) -> Result<IssueInspect>;
 
@@ -229,7 +228,7 @@ pub trait IssueTracker: Send + Sync {
     /// [`Error::NoVcsIntegration`] when the project has none.
     fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo>;
 
-    /// Build the inverse VCS routing map (repo -> project, CLAUDE-86): list every
+    /// Build the inverse VCS routing map (repo -> project): list every
     /// non-archived project and flatten each one's enabled VCS processors into
     /// `(server_url, path, project_key)` rows. A single project's `vcs` lookup
     /// failing is logged and skipped, not propagated, so one broken project never
@@ -239,9 +238,9 @@ pub trait IssueTracker: Send + Sync {
     /// Create a new issue in `project` (short name, e.g. `CLAUDE`) with `summary`
     /// and a Markdown `description`, optionally pre-assigning `assignee` (a login).
     /// Returns the new issue's `idReadable` (e.g. `CLAUDE-47`). Backs the
-    /// triage-driven issue mint (CLAUDE-46).
+    /// triage-driven issue mint.
     ///
-    /// CLAUDE-234: a run reaches this through [`AuditedTracker`], which spends
+    /// A run reaches this through [`AuditedTracker`], which spends
     /// one slot of the run's issue-creation ceiling per call and refuses once
     /// the ceiling is reached. Implementations do NOT count; the ledger is
     /// per-run, and a backend can outlive many runs.
@@ -254,10 +253,10 @@ pub trait IssueTracker: Send + Sync {
     ) -> Result<String>;
 
     /// Upload `file` as an attachment on issue `key`. Backs attaching the
-    /// redacted failing-job log to a minted issue (CLAUDE-46).
+    /// redacted failing-job log to a minted issue.
     fn attach_file(&self, key: &str, file: &std::path::Path) -> Result<()>;
 
-    /// CLAUDE-218: link `key` to `target` with `link_type`, read source-first
+    /// Link `key` to `target` with `link_type`, read source-first
     /// (`("CLAUDE-99", "subtask of", "CLAUDE-1")` makes CLAUDE-99 a subtask of
     /// CLAUDE-1). Backs hanging a filed report off its nominated parent.
     fn link_issue(&self, key: &str, link_type: &str, target: &str) -> Result<()> {
@@ -267,7 +266,7 @@ pub trait IssueTracker: Send + Sync {
         )))
     }
 
-    /// CLAUDE-216: verify the tracker token and return the authenticated login
+    /// Verify the tracker token and return the authenticated login
     /// (`yt auth verify`, GET /api/users/me). The single read-only answer to "is
     /// this token still valid". Never returns the token itself.
     fn auth_verify(&self) -> Result<String> {
@@ -276,7 +275,7 @@ pub trait IssueTracker: Send + Sync {
         )))
     }
 
-    /// CLAUDE-216: run an arbitrary issue query, bounded to `top` results. Backs
+    /// Run an arbitrary issue query, bounded to `top` results. Backs
     /// the access check's "does the action's query execute under this
     /// credential" probe, where only the exit status matters and the full result
     /// set would be wasted work.
@@ -287,7 +286,7 @@ pub trait IssueTracker: Send + Sync {
         )))
     }
 
-    /// CLAUDE-216: read a project's metadata by short name (`yt project show`),
+    /// Read a project's metadata by short name (`yt project show`),
     /// returning its full name. Errors when the project is absent OR unreadable
     /// by this token; YouTrack reports both the same way, so the caller renders
     /// the failure as a permission gap rather than a missing project.
@@ -299,7 +298,7 @@ pub trait IssueTracker: Send + Sync {
     }
 }
 
-/// CLAUDE-207: render a failed [`Forge::repo_access`] probe as an error an
+/// Render a failed [`Forge::repo_access`] probe as an error an
 /// operator can act on: which capability failed (`cmd`), the exit status, and
 /// the grant to add (`scope`). A 403 and a 404 need different grants, so they
 /// are told apart from the CLI's own text: `fj` says `unexpected status code
@@ -356,7 +355,7 @@ pub(crate) fn probe_denied(
 /// The Forgejo-side operations native handlers need.
 pub trait Forge: Send + Sync {
     /// Open a PR from the local commits in `workdir` against `host`. `strategy`
-    /// (CLAUDE-103) selects branch-backed (push a real server branch, open via
+    /// selects branch-backed (push a real server branch, open via
     /// the API) or AGit (`fj --host <host> pr create -aA`); the selected
     /// strategy is authoritative, with no silent cross-strategy fallback that
     /// changes whether a server branch is produced. Returns the parsed PR
@@ -368,7 +367,7 @@ pub trait Forge: Send + Sync {
         strategy: crate::action::PrStrategy,
     ) -> Result<PullRequest>;
 
-    /// CLAUDE-206: drain the operator-visible notices this backend accumulated
+    /// Drain the operator-visible notices this backend accumulated
     /// while serving the job, e.g. an open-PR lookup that failed and was
     /// degraded to a create. The caller persists them as `run_events` so they
     /// show on the action page, not only in the daemon journal. Backends with
@@ -377,7 +376,7 @@ pub trait Forge: Send + Sync {
         Vec::new()
     }
 
-    /// CLAUDE-275: record an operator-visible notice from OUTSIDE this backend
+    /// Record an operator-visible notice from OUTSIDE this backend
     /// (the native handler, which knows about the `agent_pull_requests` store
     /// this trait has no knowledge of), so a DB-write failure after a successful
     /// `create_pr` surfaces through the same [`Self::take_notices`] /
@@ -390,20 +389,20 @@ pub trait Forge: Send + Sync {
     /// `owner/name` path.
     fn clone_url(&self, host: &str, repo: &str) -> Result<String>;
 
-    /// CLAUDE-194: verify the FORGE identity can work `repo` (`owner/name`) on
+    /// Verify the FORGE identity can work `repo` (`owner/name`) on
     /// `host`. `git push` authenticates from the host's own git credentials, so a
     /// repo the forge token cannot see still clones and pushes and only fails at
     /// `pr create` time, after a whole Claude run is paid for. This is the
     /// preflight that catches it first; the error names the host and `owner/repo`.
     ///
-    /// CLAUDE-207: the probe covers BOTH capability categories the PR path uses,
+    /// The probe covers BOTH capability categories the PR path uses,
     /// a repository read and a pull-request read, because a token carrying only
     /// the repository category passes a repository-only probe and then 403s on
     /// the first open-PR lookup. Implementations report which probe failed and
     /// the scope label the operator has to add (see [`probe_denied`]).
     fn repo_access(&self, host: &str, repo: &str) -> Result<()>;
 
-    /// CLAUDE-216: the forge identity this backend authenticates as on `host`
+    /// The forge identity this backend authenticates as on `host`
     /// (`fj whoami`, or the GitHub identity read). Read-only, and it never
     /// returns the token. Backs the access check's "which account is this?" row.
     fn identity(&self, host: &str) -> Result<String> {
@@ -414,16 +413,16 @@ pub trait Forge: Send + Sync {
     }
 
     /// List open PRs for `repo` (`owner/name`) on `host`. Backs the CI-fix scan
-    /// (`fj pr search --repo <repo> --state open --json`, FJ-1).
+    /// (`fj pr search --repo <repo> --state open --json`).
     fn list_open_prs(&self, host: &str, repo: &str) -> Result<Vec<ForgePullRequest>>;
 
     /// Combined CI status of PR `pr_number` in `repo` on `host`, e.g.
-    /// `"success"` / `"failure"` / `"pending"` (`fj pr status <repo>#<n> --json`,
-    /// FJ-2). The PR is addressed as `owner/repo#n` so no local checkout is
+    /// `"success"` / `"failure"` / `"pending"` (`fj pr status <repo>#<n> --json`).
+    /// The PR is addressed as `owner/repo#n` so no local checkout is
     /// needed to resolve the repo.
     fn pr_ci_state(&self, host: &str, repo: &str, pr_number: u64) -> Result<String>;
 
-    /// CLAUDE-220: the commenter's EFFECTIVE repository permission on `repo` at
+    /// The commenter's EFFECTIVE repository permission on `repo` at
     /// `host`, read live from the forge
     /// (`fj repo collaborator <repo> permission <username> --format json`, whose
     /// `permission` field is returned verbatim, e.g. `read` / `write` / `admin`).
@@ -449,7 +448,7 @@ pub trait Forge: Send + Sync {
         body_file: &std::path::Path,
     ) -> Result<()>;
 
-    /// CLAUDE-221: post a comment on plain ISSUE `issue_number` in `repo` on
+    /// Post a comment on plain ISSUE `issue_number` in `repo` on
     /// `host`, body read from `body_file` (`fj issue comment <repo>#<n>
     /// --body-file <path>`). The issue-thread mirror of [`Forge::pr_comment`],
     /// used to reply to a `/claude` command left on an issue that has no pull
@@ -462,7 +461,7 @@ pub trait Forge: Send + Sync {
         body_file: &std::path::Path,
     ) -> Result<()>;
 
-    /// CLAUDE-126: combined CI status plus mergeability of PR `pr_number` in
+    /// Combined CI status plus mergeability of PR `pr_number` in
     /// `repo` on `host` (`fj pr status <repo>#<n> --json`). Backs the automerge
     /// poll, which needs both the CI verdict and whether the branch is up to
     /// date in a single query. The default errors so a backend that has not
@@ -475,7 +474,7 @@ pub trait Forge: Send + Sync {
         )))
     }
 
-    /// CLAUDE-126: merge PR `pr_number` in `repo` on `host` as a merge-commit
+    /// Merge PR `pr_number` in `repo` on `host` as a merge-commit
     /// (never squash/rebase, so the single commit's bare `#<KEY>` reference
     /// survives in history). The default errors for backends without automerge.
     fn merge_pr(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
@@ -485,10 +484,11 @@ pub trait Forge: Send + Sync {
         )))
     }
 
-    /// CLAUDE-309: bring PR `pr_number` in `repo` on `host` up to date with its
+    /// Bring PR `pr_number` in `repo` on `host` up to date with its
     /// base through Forgejo's Update-branch endpoint (`fj pr update <repo>#<n>
-    /// --update-style merge`, FJ-99; flag renamed by FJ-107 / CLAUDE-353),
-    /// retriggering CI. `--update-style merge` matches CLAUDE-126's
+    /// --update-style merge`; this flag was renamed in a later Forgejo release,
+    /// so an older doc or script may still name the old flag),
+    /// retriggering CI. `--update-style merge` matches [`Self::merge_pr`]'s
     /// merge-commit policy and never rewrites the agent's branch.
     /// The default errors for backends without automerge.
     fn update_pr_branch(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
@@ -498,7 +498,7 @@ pub trait Forge: Send + Sync {
         )))
     }
 
-    /// CLAUDE-149: add Forgejo labels to PR `pr_number` in `repo` on `host`
+    /// Add Forgejo labels to PR `pr_number` in `repo` on `host`
     /// (`fj pr edit <repo>#<n> labels --add <label>`). Used to flag a PR Needs
     /// Review when the per-PR auto-fix ceiling is reached. The default errors so
     /// a backend without label support reports clearly.
@@ -525,7 +525,7 @@ pub trait Backend: IssueTracker + Forge {
 
 /// Ordered backend preference. The YouTrack / Forgejo provider resolution
 /// ([`resolve`], [`resolve_runner`]) walks `[Cli]`. The GitHub `Forge`
-/// (CLAUDE-50) walks `[Mcp, Gh]`: prefer the remote MCP, fall back to the `gh`
+/// walks `[Mcp, Gh]`: prefer the remote MCP, fall back to the `gh`
 /// CLI. Variants are shared so one ordered priority type covers every backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -545,7 +545,7 @@ pub const DEFAULT_PRIORITY: &[BackendKind] = &[BackendKind::Cli];
 
 /// Shallow-clone `url` into `workdir`, pinning `branch` when given.
 ///
-/// CLAUDE-252: captures git's output instead of letting it inherit the daemon's
+/// Captures git's output instead of letting it inherit the daemon's
 /// stderr, so a failure reports WHY. Before this every clone site reported only
 /// `git clone exited 128`, which in a container is indistinguishable between a
 /// missing credential, an unknown host and a deleted branch, and diagnosing the
@@ -563,7 +563,7 @@ pub fn shallow_clone(
     depth: u32,
 ) -> Result<()> {
     let mut cmd = std::process::Command::new("git");
-    // CLAUDE-306: a detached auto-maintenance repack would race the push and the
+    // A detached auto-maintenance repack would race the push and the
     // workdir removal; an ephemeral clone never benefits from it.
     cmd.arg("clone")
         .arg("--config")
@@ -586,7 +586,7 @@ pub fn shallow_clone(
     Ok(())
 }
 
-/// CLAUDE-311: a pinned-branch clone (`--branch` implies `--single-branch`)
+/// A pinned-branch clone (`--branch` implies `--single-branch`)
 /// carries only `refs/remotes/origin/<pinned>`, so it has no
 /// `refs/remotes/origin/HEAD` and no `refs/remotes/origin/<default>`. That
 /// breaks every base-branch lookup a resumed-PR workdir needs
@@ -657,7 +657,7 @@ fn restore_default_branch_refs(
 /// The error for a failed git subprocess: the exit code plus the tail of git's
 /// own stderr, redacted.
 ///
-/// CLAUDE-252: every git call site used to report only an exit code, so `git
+/// Every git call site used to report only an exit code, so `git
 /// clone exited 128` and `git push exited 1` were the whole diagnosis for a
 /// missing credential, an unknown host, a deleted branch, a rejected
 /// non-fast-forward and a protected branch alike. `url` is the token-bearing URL
@@ -753,7 +753,7 @@ pub fn resolve_with(
 
 /// Resolve the [`CommandRunner`] of the first usable backend, walking `priority`
 /// and probing exactly as [`resolve`] does. Callers that need to build per-job
-/// [`CliBackend`]s with injected credentials (CLAUDE-26) use this to obtain a
+/// [`CliBackend`]s with injected credentials use this to obtain a
 /// shareable runner instead of an opaque `Box<dyn Backend>`. CLI-only today.
 pub fn resolve_runner(priority: &[BackendKind]) -> Result<Arc<dyn CommandRunner>> {
     resolve_runner_with(priority, Arc::new(ProcessRunner::new()))
@@ -785,7 +785,7 @@ mod tests {
     use super::*;
     use cli::testutil::StubRunner;
 
-    /// CLAUDE-252: a failed clone must say WHY. `git clone exited 128` alone is
+    /// A failed clone must say WHY. `git clone exited 128` alone is
     /// the same message for a missing credential, an unknown host and a deleted
     /// branch, and diagnosing the real one cost a hand-run clone in the
     /// container.
@@ -824,7 +824,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-306: the key must land in the clone's own config, so every later
+    /// The key must land in the clone's own config, so every later
     /// git command in the workdir (runner and agent) skips auto-maintenance.
     #[test]
     fn a_clone_disables_auto_maintenance() {
@@ -929,7 +929,7 @@ mod tests {
         assert!(msg.contains("yt"), "got {msg}");
     }
 
-    // ---- CLAUDE-311: a pinned clone still carries origin/HEAD -------------
+    // ---- a pinned clone still carries origin/HEAD -------------
 
     /// A real origin repo (over `file://`) whose default branch is
     /// `default_branch`, with one commit on it and a `feat` branch one commit

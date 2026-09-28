@@ -1,4 +1,4 @@
-//! GitHub `Forge` backend (CLAUDE-50).
+//! GitHub `Forge` backend.
 //!
 //! The native YouTrack handler opens PRs through the [`Forge`](super::Forge)
 //! trait. The CLI backend ([`super::CliBackend`]) speaks only the Forgejo/Gitea
@@ -14,13 +14,13 @@
 //! `gh` CLI when the MCP endpoint is unreachable. With neither usable it returns
 //! [`Error::NoBackend`] listing both attempts.
 //!
-//! Credentials follow the CLAUDE-26 `token_ref` pattern: an injected GitHub PAT
+//! Credentials follow the `token_ref` pattern: an injected GitHub PAT
 //! (`repo` + `pull_request` scope) is used as the MCP bearer, the `gh` child's
 //! `GH_TOKEN`, and the authenticated push URL. When unset, the push and `gh`
 //! fall back to host git / `gh` auth.
 //!
-//! The HTTP/TLS stack is `reqwest` + rustls (shared with CLAUDE-49; no second
-//! stack, keeping the static musl build OpenSSL-free). The `Forge` trait is
+//! The HTTP/TLS stack is `reqwest` + rustls (no second stack, keeping the
+//! static musl build OpenSSL-free). The `Forge` trait is
 //! synchronous, so [`HttpMcpTransport`] runs the blocking request on a dedicated
 //! thread to stay clear of the handler's async runtime.
 
@@ -184,7 +184,7 @@ pub struct GithubForge {
     transport: Arc<dyn McpTransport>,
     /// Remote MCP endpoint (e.g. `https://api.githubcopilot.com/mcp/`).
     endpoint: String,
-    /// Injected GitHub PAT (CLAUDE-26). `None` falls back to host git / `gh` auth.
+    /// Injected GitHub PAT. `None` falls back to host git / `gh` auth.
     token: Option<String>,
     /// Backend priority for opening the PR. Defaults to [`GITHUB_PRIORITY`].
     priority: Vec<BackendKind>,
@@ -399,7 +399,7 @@ impl Forge for GithubForge {
         _strategy: crate::action::PrStrategy,
     ) -> Result<PullRequest> {
         // GitHub has no AGit equivalent: PRs are always branch-backed, so the
-        // CLAUDE-103 strategy selector does not apply here and is ignored.
+        // branch-strategy selector does not apply here and is ignored.
         // Push the branch before opening the PR.
         let repo = parse_owner_repo(&self.git(workdir, &["remote", "get-url", "origin"])?)
             .ok_or_else(|| {
@@ -424,16 +424,15 @@ impl Forge for GithubForge {
                         .transport
                         .initialize(&self.endpoint, self.token.as_deref())
                     {
-                        // CLAUDE-194: a create failure names the repo, the host,
-                        // and the possible-permission cause; the push succeeding
+                        // A create failure names the repo, the host, and the
+                        // possible-permission cause; the push succeeding
                         // proves nothing about the API identity's access.
                         Ok(()) => {
                             return self
                                 .open_via_mcp(&repo, &branch, &base, &title, &body)
                                 .map(|mut pr| {
-                                    // CLAUDE-275: GitHub PRs are always
-                                    // branch-backed; this is the branch just
-                                    // pushed above.
+                                    // GitHub PRs are always branch-backed;
+                                    // this is the branch just pushed above.
                                     pr.head_branch = Some(branch.clone());
                                     pr
                                 })
@@ -471,9 +470,9 @@ impl Forge for GithubForge {
         }
     }
 
-    /// CLAUDE-194 / CLAUDE-207: two probes, run with the action's PAT as
-    /// `GH_TOKEN` exactly as `open_via_gh` does, so they test the identity that
-    /// will open the PR. The MCP transport exposes neither read, so this is
+    /// Two probes, run with the action's PAT as `GH_TOKEN` exactly as
+    /// `open_via_gh` does, so they test the identity that will open the PR.
+    /// The MCP transport exposes neither read, so this is
     /// `gh`-only; a host without `gh` reports that by name rather than silently
     /// passing.
     ///
@@ -520,8 +519,8 @@ impl Forge for GithubForge {
         Ok(())
     }
 
-    /// CLAUDE-216: `gh api user --jq .login`, run with the action's PAT as
-    /// `GH_TOKEN` so the row names the identity `repo_access` just probed with.
+    /// `gh api user --jq .login`, run with the action's PAT as `GH_TOKEN`
+    /// so the row names the identity `repo_access` just probed with.
     fn identity(&self, _host: &str) -> Result<String> {
         let envs: Vec<(&str, &str)> = match &self.token {
             Some(t) => vec![("GH_TOKEN", t.as_str())],
@@ -541,13 +540,13 @@ impl Forge for GithubForge {
     }
 
     // The remaining CI-fix-only operations are Forgejo-specific; `list_open_prs`
-    // is the one exception (CLAUDE-308), needed by CLAUDE-275's PR-resume lookup
-    // for every backend. A GitHub repo never enters the Forgejo-only CI-fix scan
-    // (auto-route-by-host), so the rest are unsupported on the GitHub backend;
-    // split the `Forge` trait later if a GitHub CI-fix handler is wanted.
+    // is the one exception, needed by the PR-resume lookup for every backend.
+    // A GitHub repo never enters the Forgejo-only CI-fix scan (auto-route-by-host),
+    // so the rest are unsupported on the GitHub backend; split the `Forge` trait
+    // later if a GitHub CI-fix handler is wanted.
     //
-    // CLAUDE-308: `gh pr list --json ...`, run with the action's PAT as
-    // `GH_TOKEN` exactly as `repo_access` does. `--limit 1000` bounds a single
+    // `gh pr list --json ...`, run with the action's PAT as `GH_TOKEN`
+    // exactly as `repo_access` does. `--limit 1000` bounds a single
     // page; exactly 1000 entries back means the listing may be truncated, so
     // that is reported as an error rather than answered from a partial list.
     fn list_open_prs(&self, _host: &str, repo: &str) -> Result<Vec<ForgePullRequest>> {
@@ -618,7 +617,7 @@ impl Forge for GithubForge {
     }
 }
 
-/// CLAUDE-194: restate a PR-create failure with the repo, the host, and the
+/// Restate a PR-create failure with the repo, the host, and the
 /// permission hypothesis (the `fj` counterpart lives in `cli.rs`). The push
 /// authenticates with the PAT-in-URL or host git auth, so a successful push does
 /// not prove the API identity can see the repo.
@@ -681,7 +680,7 @@ fn parse_pr_from_mcp(result: &Value) -> Result<PullRequest> {
             return Ok(PullRequest {
                 number,
                 url: url.unwrap_or_default().to_string(),
-                // CLAUDE-275: filled in by the caller, which knows the branch it
+                // Filled in by the caller, which knows the branch it
                 // pushed; the MCP result carries no head-branch field of its own.
                 head_branch: None,
             });
@@ -730,7 +729,7 @@ fn parse_pr_from_gh(stdout: &str) -> PullRequest {
     PullRequest {
         number,
         url,
-        // CLAUDE-275: filled in by the caller, which knows the branch it pushed.
+        // Filled in by the caller, which knows the branch it pushed.
         head_branch: None,
     }
 }
@@ -1012,7 +1011,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-207: the two GitHub preflight probes for `repo`, as arg lists.
+    /// The two GitHub preflight probes for `repo`, as arg lists.
     fn view_args(repo: &str) -> Vec<&str> {
         vec!["repo", "view", repo, "--json", "nameWithOwner"]
     }
@@ -1025,8 +1024,8 @@ mod tests {
 
     #[test]
     fn repo_access_probes_gh_with_the_pat_and_names_host_and_repo() {
-        // CLAUDE-194: both reads run `gh` with the action's PAT as GH_TOKEN, so
-        // they test the identity that will open the PR. CLAUDE-207: the second
+        // Both reads run `gh` with the action's PAT as GH_TOKEN, so
+        // they test the identity that will open the PR. The second
         // read exercises the pull-request capability a fine-grained PAT scopes
         // separately from repo metadata. A denial names the host and `owner/repo`.
         let ok_runner = Arc::new(
@@ -1077,7 +1076,7 @@ mod tests {
 
     #[test]
     fn repo_access_fails_when_only_the_pull_request_probe_is_denied() {
-        // CLAUDE-207: a PAT with repo metadata but no pull-request read passes
+        // A PAT with repo metadata but no pull-request read passes
         // `gh repo view` and is refused `gh pr list`. The error names the failing
         // capability, the status, and the `pull_request` scope to add.
         let forge = GithubForge::new(
@@ -1139,7 +1138,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-308: the args `list_open_prs` passes to `gh pr list`.
+    /// The args `list_open_prs` passes to `gh pr list`.
     fn list_open_prs_args(repo: &str) -> Vec<&str> {
         vec![
             "pr",
