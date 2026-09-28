@@ -582,7 +582,7 @@ mod tests {
         sqlx::query(&q(
             "INSERT INTO paused_actions (action_name, paused_at, reason) VALUES (?, ?, ?)",
         ))
-        .bind("webhook-forgejo")
+        .bind("webhook-triage")
         .bind("2026-09-01T00:00:00Z")
         .bind("noisy")
         .execute(pool)

@@ -622,7 +622,7 @@ impl FailureClassifier for AnalysisClassifier {
 
         let stream_log = ClaudeInvoker::stream_log_path(
             &self.logs_dir,
-            "webhook-forgejo-analysis",
+            "webhook-triage-analysis",
             &format!("{}#{}", coords.repo, coords.index_in_repo),
             1,
         );
