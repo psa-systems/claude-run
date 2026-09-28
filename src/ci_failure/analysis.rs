@@ -1,8 +1,8 @@
-//! CLAUDE-274: the reusable pieces of a deep, log-grounded CI-failure
+//! The reusable pieces of a deep, log-grounded CI-failure
 //! analysis, used by the at-ingest [`crate::triage::AnalysisClassifier`]:
 //! fetching the run log + workflow YAML, building the agentic prompt, and
 //! capping/formatting the analysis text for a comment. Originally shared with
-//! a scheduled analysis native handler, retired in CLAUDE-279.
+//! a scheduled analysis native handler that has since been retired.
 
 use std::path::PathBuf;
 
@@ -10,7 +10,7 @@ use crate::forge_log;
 
 /// Cap (bytes) on an analysis comment/description, so a runaway agent reply
 /// cannot blow the comment. Used by [`crate::mint::build_description`]
-/// (CLAUDE-274) to cap the [`crate::triage::AnalysisClassifier`]'s report.
+/// to cap the [`crate::triage::AnalysisClassifier`]'s report.
 pub(crate) const DEFAULT_MAX_ANALYSIS_BYTES: usize = 24 * 1024;
 
 /// The redacted-log + workflow-YAML inputs claude reads.

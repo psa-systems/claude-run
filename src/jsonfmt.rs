@@ -1,4 +1,4 @@
-//! Syntax-highlighted JSON for human-facing CLI output (CLAUDE-60).
+//! Syntax-highlighted JSON for human-facing CLI output.
 //!
 //! [`highlight`] takes the canonical [`serde_json::to_string_pretty`] string and
 //! wraps each token in an [`anstyle`] style, copying all other bytes (whitespace,

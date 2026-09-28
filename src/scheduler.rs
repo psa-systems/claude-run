@@ -86,7 +86,7 @@ pub fn next_fire_due(
     }
 }
 
-/// CLAUDE-162: the continuous-pickup cadence check. Replaces the CLAUDE-156
+/// The continuous-pickup cadence check. Replaces the old
 /// `should_fire` in-flight suppressor: overlapping runs are now allowed, so the
 /// scheduler no longer refuses to fire while a prior run is in flight. Instead an
 /// action is due for an overlapping pickup run when at least `interval`
@@ -95,7 +95,7 @@ pub fn next_fire_due(
 /// The cadence is tracked in-memory (the dispatcher's `last_fire` map), decoupled
 /// from the `runs.started_at` row on purpose: a re-gather that finds only
 /// already-in-flight work creates no run row (the admission check), so keying the
-/// cadence off run rows would re-fire every 5s tick (the CLAUDE-156 firing storm).
+/// cadence off run rows would re-fire every 5s tick (a firing storm).
 /// A never-fired action (`None`) is due immediately.
 pub fn regather_due(
     last_fire: Option<DateTime<Utc>>,
@@ -171,7 +171,7 @@ mod tests {
         }
     }
 
-    // CLAUDE-156: the reported case - `"5m"` means 5 minutes (300s), so the
+    // `"5m"` means 5 minutes (300s), so the
     // parser is not the bug. Guards against a regression that would mis-parse
     // the minutes suffix.
     #[test]
@@ -186,7 +186,7 @@ mod tests {
         }
     }
 
-    // CLAUDE-162: a never-fired action is due immediately for its first pickup
+    // A never-fired action is due immediately for its first pickup
     // run; after firing, it is not due again until the regather interval elapses.
     #[test]
     fn regather_first_fire_is_immediate_then_paced() {
@@ -208,10 +208,10 @@ mod tests {
         ));
     }
 
-    // CLAUDE-162: the cadence is governed by the last FIRE time, not by run rows,
+    // The cadence is governed by the last FIRE time, not by run rows,
     // so an action that has been firing every interval keeps a bounded cadence and
-    // does NOT re-fire on every 5s tick (the CLAUDE-156 firing-storm invariant,
-    // now enforced via the in-memory last-fire stamp rather than an in-flight
+    // does NOT re-fire on every 5s tick (the firing-storm invariant,
+    // enforced via the in-memory last-fire stamp rather than an in-flight
     // guard). Across 12 5s ticks after a fire, it is due exactly once (at 60s).
     #[test]
     fn regather_does_not_fire_every_tick() {

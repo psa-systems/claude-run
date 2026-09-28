@@ -1,18 +1,17 @@
-//! Per-run token / cost accounting (DEV-707) and the per-run spend ceiling
-//! (DEV-705).
+//! Per-run token / cost accounting and the per-run spend ceiling.
 //!
 //! Every `claude` invocation writes a `--output-format=stream-json` NDJSON log.
 //! [`parse_stream_usage`] replays that log to recover what the invocation spent:
 //! input / output / cache-read / cache-write tokens per turn, tool call counts,
 //! and which tool's result was in context when each turn was billed. That gives
-//! the per-tool attribution DEV-707 asks for without a provider console.
+//! the per-tool attribution without a provider console.
 //!
 //! [`RunSpend`] accumulates those figures across every invocation of ONE run and
 //! carries the run's spend ceiling. The ceiling is a [`RunBudget`] snapshotted
 //! from the action's configuration BEFORE the run starts and moved into the
 //! per-job tasks by value, so nothing mid-run can raise it: raising it means
 //! editing the action and starting a new run. There is no interactive path that
-//! offers to raise the limit, which is the behavior DEV-705 removes.
+//! offers to raise the limit.
 //!
 //! DEV-706: `peak_context_tokens` is the accounting side of the context-clearing
 //! fix. A conversation that never compacts resends every completed operation's
@@ -40,8 +39,8 @@ use crate::db::DbPool;
 /// opening turn and any pure-reasoning turn between operations.
 pub const NO_TOOL: &str = "(prompt)";
 
-/// Default fraction of the budget at which the run warns. DEV-705 fixes the
-/// default at 80 percent; an action overrides it with
+/// Default fraction of the budget at which the run warns. The default is 80
+/// percent; an action overrides it with
 /// `limits.budget_warn_fraction`.
 pub const DEFAULT_WARN_FRACTION: f64 = 0.80;
 
@@ -59,8 +58,8 @@ impl TokenUsage {
         self.input + self.output + self.cache_read + self.cache_write
     }
 
-    /// Input-side tokens: what the turn resent. This is the figure DEV-706 is
-    /// about, since output tokens do not accumulate across turns.
+    /// Input-side tokens: what the turn resent. This is the figure used for
+    /// context growth, since output tokens do not accumulate across turns.
     pub fn context(&self) -> u64 {
         self.input + self.cache_read + self.cache_write
     }
@@ -454,7 +453,7 @@ impl RunSpend {
         self.cost_usd() >= self.budget.budget_usd
     }
 
-    /// The reason string a stopped run reports. Names the budget, per DEV-705.
+    /// The reason string a stopped run reports. Names the budget.
     pub fn stop_reason(&self) -> String {
         format!(
             "run spend ${:.4} reached the per-run budget of ${:.2} (limits.run_budget_usd); the run stops here. Raise it by editing the action and starting a new run.",

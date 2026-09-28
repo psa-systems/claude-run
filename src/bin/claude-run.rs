@@ -21,7 +21,7 @@ use claude_run::{
 };
 
 /// `--color` choices. Maps to both `anstream` (our own output) and clap's
-/// help/error rendering so they color together (CLAUDE-60).
+/// help/error rendering so they color together.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum ColorWhen {
     /// Color only when stdout/stderr is a TTY; honors `NO_COLOR`.
@@ -34,7 +34,7 @@ enum ColorWhen {
 
 /// clap help/usage palette: headers bold yellow, literals (subcommand and flag
 /// names) bold green, placeholders cyan. Shades may be tuned in review; the
-/// structure stands (CLAUDE-60).
+/// structure stands.
 fn help_styles() -> clap::builder::Styles {
     use clap::builder::styling::AnsiColor;
     clap::builder::Styles::styled()
@@ -134,8 +134,8 @@ enum Cmd {
         #[arg(long)]
         from: Option<String>,
     },
-    /// Copy an existing SQLite state store into the configured database
-    /// (CLAUDE-251). The target is whatever `[database] url` /
+    /// Copy an existing SQLite state store into the configured database.
+    /// The target is whatever `[database] url` /
     /// `CLAUDE_RUN_DATABASE_URL` resolves to, so the import and the daemon
     /// cannot disagree about where the rows went; the source is opened
     /// read-only and is never modified.
@@ -351,7 +351,7 @@ fn clap_choice(color: ColorWhen) -> clap::ColorChoice {
 }
 
 /// Fork into the background with `logs/daemon.log` as the daemon's stdout and
-/// stderr. CLAUDE-257: nothing rotates that file here; the daemon's own log GC
+/// stderr. Nothing rotates that file here; the daemon's own log GC
 /// pass (`crate::gc::sweep_oversized_logs`, first tick at serve start) keeps it
 /// under `config.stream_log_gc.daemon_log_max_bytes` by truncating it in place,
 /// which the `O_APPEND` handle opened below follows to the new end of file.
@@ -379,8 +379,8 @@ fn detach_now() -> claude_run::error::Result<()> {
 }
 
 /// Build the tracing subscriber and return a reload handle for its `EnvFilter`.
-/// The initial filter is unchanged from before CLAUDE-62 (`CLAUDE_RUN_LOG` if
-/// set, else the built-in default), so every line emitted before config load
+/// The initial filter is `CLAUDE_RUN_LOG` if set, else the built-in default,
+/// so every line emitted before config load
 /// logs exactly as it did. Wrapping the filter in a `reload::Layer` lets
 /// `apply_config_log_filter` swap in `[daemon].log_filter` once the config is
 /// loaded, without a second (illegal) `set_global_default`.
@@ -395,7 +395,7 @@ fn init_tracing() -> reload::Handle<EnvFilter, Registry> {
     reload_handle
 }
 
-/// CLAUDE-62: apply `[daemon].log_filter` after config load, honoring the
+/// Apply `[daemon].log_filter` after config load, honoring the
 /// `CLAUDE_RUN_LOG` > file > default precedence (see [`cfg::log_filter_choice`]).
 /// An unparseable directive logs a warning and keeps the active filter rather
 /// than aborting the daemon.
@@ -434,7 +434,7 @@ async fn real_main(
     let paths = cfg::Paths::resolve()?;
     let (on_disk, config_source) = cfg::OnDiskConfig::load(&paths)?;
     apply_config_log_filter(&log_reload, on_disk.daemon.log_filter.as_deref());
-    // CLAUDE-250: which state store to open, resolved once so every subcommand
+    // Which state store to open, resolved once so every subcommand
     // and the daemon agree on the backend.
     let db_target = cfg::resolve_database(&paths, &on_disk.database)?;
 
@@ -526,7 +526,7 @@ async fn version_cmd(
             train,
             use_fj_token,
         } => {
-            // CLAUDE-101: the update config is DB-backed; read the effective value
+            // The update config is DB-backed; read the effective value
             // (DB wins, file is the fallback before any serve migrated it).
             let pool = db::open(db_target).await?;
             let update_cfg = settings::effective_update(&pool, on_disk).await?;
@@ -560,9 +560,9 @@ fn resolve_train(
     }
 }
 
-/// Build a lazy resolver for the registry token named by `[update].token_ref`
-/// (CLAUDE-55). `None` when no `token_ref` is configured (the anonymous-first
-/// path). CLAUDE-158: nothing is decrypted here; the age key file is loaded and
+/// Build a lazy resolver for the registry token named by `[update].token_ref`.
+/// `None` when no `token_ref` is configured (the anonymous-first
+/// path). Nothing is decrypted here; the age key file is loaded and
 /// the secret decrypted only if the registry demands escalation (401/403) and
 /// the configured-token branch is taken, so a configured `token_ref` no longer
 /// forces `CLAUDE_RUN_SECRETS_KEY_FILE` to be present up front.
@@ -614,7 +614,7 @@ async fn run_action(
     let snippet = Arc::new(snippet::SnippetRunner::new(
         on_disk.daemon.nu_binary.as_deref(),
     ));
-    // CLAUDE-165: like the daemon, a standalone `run` seeds and routes the agent
+    // Like the daemon, a standalone `run` seeds and routes the agent
     // to its dedicated CLAUDE_CONFIG_DIR so it loads the slim bot CLAUDE.md, not
     // the operator's global `~/.claude/CLAUDE.md`.
     let agent_config_dir = claude_run::agent_home::resolve_config_dir(
@@ -622,13 +622,13 @@ async fn run_action(
         on_disk.daemon.claude_config_dir.as_deref(),
     );
     claude_run::agent_home::ensure(&agent_config_dir)?;
-    // CLAUDE-239: no daemon here, so there is no `LiveSettings` to share a
+    // No daemon here, so there is no `LiveSettings` to share a
     // handle with; read the stored global `config.claude` once and hand the
     // invoker a handle over that snapshot.
     let claude_defaults = Arc::new(std::sync::RwLock::new(
         settings::effective_claude(&pool).await?,
     ));
-    // CLAUDE-269: a fresh, run-scoped gate. It has nothing to persist across
+    // A fresh, run-scoped gate. It has nothing to persist across
     // invocations of the CLI (there is no daemon), but it still stops a LATER
     // job in the SAME multi-job run once an earlier invocation trips it, via
     // the same `PauseGate`/`RunPause` wiring the daemon uses.
@@ -639,24 +639,24 @@ async fn run_action(
             .with_default_claude(claude_defaults)
             .with_readiness(readiness.clone()),
     );
-    // CLAUDE-28: a standalone `run` is a single process with no daemon, so it
+    // A standalone `run` is a single process with no daemon, so it
     // gets its own ephemeral key gate; the per-action lock already prevents it
     // from overlapping a daemon-driven run of the same action.
-    // CLAUDE-162: it also gets its own ephemeral limiter sized to the action's
+    // It also gets its own ephemeral limiter sized to the action's
     // own `max_parallel`, so the global cap never over-restricts a single
     // standalone run (there are no other actions to bound it against here).
     let keygate = claude_run::concurrency::KeyGate::new();
     let limiter = claude_run::concurrency::Limiter::new(
         loaded.action.concurrency.max_parallel.max(1) as usize,
     );
-    // CLAUDE-223: the standalone path takes the same live global-pause gate as
+    // The standalone path takes the same live global-pause gate as
     // the daemon, so a pause taken while it works stops it picking up new jobs
     // (the up-front check above only covers the moment the run started).
     let pause = claude_run::pause::PauseGate::new(pool.clone()).with_readiness(readiness);
-    // CLAUDE-228: the standalone path has no scheduler to defer, so its gather
+    // The standalone path has no scheduler to defer, so its gather
     // marker is a fresh one nothing else reads.
     let gather = claude_run::concurrency::GatherGate::new();
-    // DEV-705: the run's own exit code, so a standalone run that hit its spend
+    // The run's own exit code, so a standalone run that hit its spend
     // ceiling exits `exit::OVER_BUDGET` rather than reporting success.
     daemon::run_action_inner(
         &loaded, paths, &pool, snippet, claude, "cli", None, &keygate, &limiter, &pause, &gather,
@@ -672,16 +672,16 @@ async fn serve(
     config_source: cfg::ConfigSource,
     log_reload: reload::Handle<EnvFilter, Registry>,
 ) -> claude_run::error::Result<i32> {
-    // CLAUDE-57: one startup line recording which config file backed this run
+    // One startup line recording which config file backed this run
     // (or that defaults silently won), so `journalctl` alone answers why the
     // web UI bound where it did.
     config_source.log();
-    // CLAUDE-87: flag any webhook source name that needs URL escaping (likely a
+    // Flag any webhook source name that needs URL escaping (likely a
     // typo) before the listener binds, so the warning sits next to the config line.
     on_disk.webhook.warn_unusual_source_names();
-    // CLAUDE-101: hand the daemon a live log-filter reload hook so a Settings
-    // save applies immediately. When `CLAUDE_RUN_LOG` is set the env var wins
-    // (CLAUDE-62), so the hook is `None`: a saved filter persists but is not
+    // Hand the daemon a live log-filter reload hook so a Settings
+    // save applies immediately. When `CLAUDE_RUN_LOG` is set the env var wins,
+    // so the hook is `None`: a saved filter persists but is not
     // applied this run.
     let log_apply: Option<settings::LogFilterApply> =
         if std::env::var_os("CLAUDE_RUN_LOG").is_some() {
@@ -938,7 +938,7 @@ async fn status(
 }
 
 /// The report `status` prints with no daemon running. Split out of [`status`]
-/// (CLAUDE-232) so the blocks it must carry are testable without a live daemon
+/// so the blocks it must carry are testable without a live daemon
 /// or captured stdout.
 async fn daemonless_status(
     pool: &crate::db::DbPool,
@@ -946,17 +946,17 @@ async fn daemonless_status(
 ) -> claude_run::error::Result<serde_json::Value> {
     let global = state::global_pause_status(pool).await?;
     let actions = state::action_index_list(pool).await?;
-    // CLAUDE-223: the same activity block `/status` carries, so a reboot script
+    // The same activity block `/status` carries, so a reboot script
     // reads `quiet` whether or not the daemon is up. With no daemon there is no
     // in-flight map to consult, so the open `runs` rows are the whole signal.
     let active_runs = state::active_runs(pool).await?;
-    // CLAUDE-225: the same stale-gate block `/status` carries. The gate table is
+    // The same stale-gate block `/status` carries. The gate table is
     // the daemon's, but it is plain DB state, so a daemonless status reports a
     // stuck gate rather than the misleading silence of omitting it.
     let stale_gates =
         state::dependency_gates_stale(pool, state::now_epoch_ms(), state::STALE_GATE_AFTER_MS, 20)
             .await?;
-    // CLAUDE-232: likewise for the keys parked at their action's attempt cap.
+    // Likewise for the keys parked at their action's attempt cap.
     // Both counters and action YAML are plain on-disk state, so the daemonless
     // path reports the same block rather than omitting it and reading as clear.
     let defaults = claude_run::job::RunnerDefaults::default();
@@ -1062,7 +1062,7 @@ async fn action_cmd(
             }
         }
         ActionCmd::Delete { name } => {
-            // CLAUDE-40: delegate to the daemon when it is up (it owns the
+            // Delegate to the daemon when it is up (it owns the
             // authoritative in-flight set); otherwise delete directly against
             // the DB + filesystem after the same active-run guard.
             if reachable {
@@ -1104,7 +1104,7 @@ async fn action_cmd(
             paint::success(&format!("deleted `{name}`"));
         }
         ActionCmd::ResetAttempts { name, key } => {
-            // CLAUDE-238: delegate to the daemon when it is up (so the reset's
+            // Delegate to the daemon when it is up (so the reset's
             // `run_events` row is journaled through the same pool the daemon
             // itself writes through); otherwise clear directly against the DB,
             // matching the pause / resume / delete split above.
@@ -1153,7 +1153,7 @@ async fn action_cmd(
     Ok(exit::OK)
 }
 
-/// CLAUDE-216: `claude-run access check`. Delegates to the daemon over the unix
+/// `claude-run access check`. Delegates to the daemon over the unix
 /// socket when it is up (so the check runs as the daemon's identity, with its
 /// PATH and env) and runs the same service directly against the DB when it is
 /// not. Prints the typed report as JSON either way, and exits `CONFIG_ERROR`
@@ -1356,7 +1356,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-216: `access check` parses its targets, and each flag is optional
+    /// `access check` parses its targets, and each flag is optional
     /// (no flags at all is the aggregate check).
     #[test]
     fn access_check_parses_its_targets() {
@@ -1389,7 +1389,7 @@ mod tests {
         assert!(Cli::try_parse_from(["claude-run", "access", "check"]).is_ok());
     }
 
-    /// CLAUDE-251: `import` takes its source from `--from` (defaulting to the
+    /// `import` takes its source from `--from` (defaulting to the
     /// install's own `state.db`) and copies into a populated target only when
     /// told to.
     #[test]
@@ -1500,8 +1500,8 @@ mod tests {
         }
     }
 
-    /// CLAUDE-232: `claude-run status` with no daemon carries the parked-at-cap
-    /// block, like the CLAUDE-225 stale-gate block beside it. The counters are
+    /// `claude-run status` with no daemon carries the parked-at-cap
+    /// block, like the stale-gate block beside it. The counters are
     /// plain DB state, so omitting them here would read as "nothing is stuck"
     /// exactly when the daemon is down and nobody can check the web UI.
     #[tokio::test]

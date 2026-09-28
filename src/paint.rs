@@ -1,4 +1,4 @@
-//! Shared color palette and helpers for human-facing CLI messages (CLAUDE-60).
+//! Shared color palette and helpers for human-facing CLI messages.
 //!
 //! One place for the success / notice / error palette so the binary and
 //! [`crate::update`] style their output identically. Styles are emitted

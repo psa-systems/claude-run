@@ -64,7 +64,7 @@ impl From<&str> for Script {
     }
 }
 
-/// How an action is executed (CLAUDE-30 dispatch discriminator).
+/// How an action is executed (dispatch discriminator).
 ///
 /// `scripted` (the default, kept for back-compat) runs the generic nu-snippet
 /// pipeline `input.command` -> `filter` -> `pre` -> `prompt` -> `claude` ->
@@ -79,9 +79,9 @@ pub enum ActionKind {
     #[default]
     Scripted,
     /// Built-in YouTrack handler. Config lives in `native` as
-    /// [`NativeConfig::Youtrack`]; the real handler lands in CLAUDE-33.
+    /// [`NativeConfig::Youtrack`].
     Youtrack,
-    /// Built-in cross-project closed-issue reporter (CLAUDE-218): counts and
+    /// Built-in cross-project closed-issue reporter: counts and
     /// lists every issue closed in a rolling window across a configured project
     /// list, files the summary as a new issue, and hangs it off a nominated
     /// parent as a subtask. Config lives in `native` as
@@ -91,8 +91,8 @@ pub enum ActionKind {
 }
 
 impl ActionKind {
-    /// Every kind, in the order the web UI's new-action picker lists them
-    /// (CLAUDE-211). `scripted` last: it is deprecated and raw-YAML only.
+    /// Every kind, in the order the web UI's new-action picker lists them.
+    /// `scripted` last: it is deprecated and raw-YAML only.
     pub const ALL: [ActionKind; 3] = [
         ActionKind::Youtrack,
         ActionKind::ClosedIssueSummary,
@@ -125,12 +125,12 @@ impl ActionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum NativeConfig {
-    /// YouTrack built-in handler config. Boxed (CLAUDE-125): adding the optional
+    /// YouTrack built-in handler config. Boxed: adding the optional
     /// `prompt` override grew this variant past the other, so the box keeps the
     /// enum's variants size-balanced (`clippy::large_enum_variant`). `Box<T>` is
     /// serde- and `PartialEq`-transparent, and field access auto-derefs.
     Youtrack(Box<YoutrackConfig>),
-    /// Cross-project closed-issue reporter config (CLAUDE-218). Listed LAST, so
+    /// Cross-project closed-issue reporter config. Listed LAST, so
     /// the untagged probe reaches it only after the Youtrack variant has
     /// rejected the block; its `projects` / `window_days` keys are unknown to
     /// it, so a reporting config can never be mis-parsed as one.
@@ -158,9 +158,8 @@ impl NativeConfig {
     }
 }
 
-/// Config for the native YouTrack handler (CLAUDE-33, Phase 4 of the
-/// native-action epic CLAUDE-25). Supplied under the action's `native:` key when
-/// `kind: youtrack`.
+/// Config for the native YouTrack handler. Supplied under the action's
+/// `native:` key when `kind: youtrack`.
 ///
 /// The generic blocks (`workdir_base`, `link_template`, `limits`, `schedule`,
 /// `claude`, `output`) stay on [`Action`]; only the YouTrack- and Forge-specific
@@ -168,7 +167,7 @@ impl NativeConfig {
 /// and resolves to the same behavior the scripted action had.
 ///
 /// Credentials are referenced by name (`token_ref`), not embedded: see
-/// [`crate::secrets`] (CLAUDE-26). When neither block sets a `token_ref` the
+/// [`crate::secrets`]. When neither block sets a `token_ref` the
 /// CLIs use host auth, exactly as the scripted action did.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -177,7 +176,7 @@ pub struct YoutrackConfig {
     pub youtrack: YoutrackSource,
     /// Forgejo target: where the runner opens PRs from the agent's commits.
     pub forgejo: ForgejoTarget,
-    /// GitHub target (CLAUDE-50): where the runner opens PRs when a job's repo
+    /// GitHub target: where the runner opens PRs when a job's repo
     /// resolves to a GitHub host. All fields default, so existing actions are
     /// unchanged; routing is automatic by the resolved `repo_host`. Skipped on
     /// serialize when fully default (the default `mcp_endpoint` is a non-empty
@@ -193,9 +192,9 @@ pub struct YoutrackConfig {
 pub struct YoutrackSource {
     /// YouTrack base URL. `None` uses the host-configured `yt` CLI default; it
     /// is required when `token_ref` is set, since the injected `yt` config needs
-    /// a `url` (CLAUDE-26).
+    /// a `url`.
     pub base_url: Option<String>,
-    /// Name of the encrypted secret holding the YouTrack API token (CLAUDE-26).
+    /// Name of the encrypted secret holding the YouTrack API token.
     /// `None` uses host `yt` auth. The raw token is never stored here; it is
     /// resolved from the [`crate::secrets`] store and injected at run time.
     pub token_ref: Option<String>,
@@ -205,29 +204,29 @@ pub struct YoutrackSource {
     pub custom_field: String,
     /// Labels of the AI Agent / State machine the handler drives.
     pub states: YoutrackStates,
-    /// Full-replacement prompt override (CLAUDE-125). Resolution order: this text, else the
+    /// Full-replacement prompt override. Resolution order: this text, else the
     /// `prompt_preset` built-in; both render the `{{...}}` placeholders in `actions/SCHEMA.md`.
     pub prompt: Option<String>,
     /// Built-in prompt used when `prompt` is unset. Compiled into the binary, so
     /// an image upgrade updates it; omitted on serialize when `default`.
     #[serde(skip_serializing_if = "PromptPreset::is_default")]
     pub prompt_preset: PromptPreset,
-    /// Projects the agent may create issues in (CLAUDE-214), rendered into the
+    /// Projects the agent may create issues in, rendered into the
     /// prompt as `{{write_projects}}`. Empty (the default) resolves to the
     /// triggering issue's own project, so filing a deferred item needs no
     /// site-specific configuration and none is baked into the binary.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub write_projects: Vec<String>,
-    /// Optional CI-gated automerge of the opened PR (CLAUDE-126). Disabled by
+    /// Optional CI-gated automerge of the opened PR. Disabled by
     /// default, so finalize stops at Code Review exactly as before; when enabled
     /// the runner waits for the PR's checks to go green and merges it.
     #[serde(skip_serializing_if = "Automerge::is_default")]
     pub automerge: Automerge,
-    /// Optional Assignee to set on the issue during pickup (CLAUDE-131). A literal
+    /// Optional Assignee to set on the issue during pickup. A literal
     /// `yt` assignee argument (a login, `me`, or `unassigned`). `None` (the
     /// default) leaves the Assignee untouched, exactly as before.
     pub assignee: Option<String>,
-    /// Pre-clone dependency gate (CLAUDE-161): skip a queued issue whose blockers
+    /// Pre-clone dependency gate: skip a queued issue whose blockers
     /// are still open, leaving it Queued so it auto-resumes when they clear.
     /// Enabled by default; `enabled: false` makes the gate a no-op.
     #[serde(skip_serializing_if = "Dependencies::is_default")]
@@ -312,7 +311,7 @@ impl std::fmt::Display for PromptSource {
     }
 }
 
-/// Pre-clone dependency gate settings (CLAUDE-161). Before the clone and the
+/// Pre-clone dependency gate settings. Before the clone and the
 /// `claude --print` invocation, a queued issue with any unmet dependency link is
 /// left Queued (no transition to Working), consumes no attempt, and posts a
 /// blocker comment (idempotently). Blocking is by direction-resolved link `verb`
@@ -333,7 +332,7 @@ pub struct Dependencies {
     /// it has any link whose `verb` is listed here and whose target is
     /// unresolved.
     pub block_on: Vec<String>,
-    /// `false` ignores links to issues in other projects (CLAUDE-295): an audit
+    /// `false` ignores links to issues in other projects: an audit
     /// Epic must not wait on the product-project findings it filed as subtasks.
     pub block_cross_project: bool,
 }
@@ -366,7 +365,7 @@ fn default_block_on() -> Vec<String> {
 }
 
 /// Opt-in, CI-gated automerge of the PR the runner opens after a successful
-/// native YouTrack run (CLAUDE-126). CLAUDE-278: finalize no longer waits for
+/// native YouTrack run. Finalize no longer waits for
 /// the PR's checks itself; when `enabled`, a `success`/`recover` Action-run
 /// webhook event on the recorded agent PR is what triggers the check, and on
 /// green (with an up-to-date branch) merges the PR as a merge-commit and
@@ -378,11 +377,11 @@ pub struct Automerge {
     /// Master switch. `false` (the default) keeps finalize stopping at Code
     /// Review with no CI wait and no merge.
     pub enabled: bool,
-    /// CLAUDE-278: deprecated. The runner no longer polls, so this is parsed
+    /// Deprecated. The runner no longer polls, so this is parsed
     /// (existing action files keep loading) but otherwise ignored; setting it
     /// away from its default logs one deprecation warning at load.
     pub wait_seconds: u64,
-    /// CLAUDE-278: deprecated, same as `wait_seconds`.
+    /// Deprecated, same as `wait_seconds`.
     pub check_interval_seconds: u64,
 }
 
@@ -427,21 +426,20 @@ pub struct YoutrackStates {
     pub needs_review: String,
     /// AI Agent value set on a hard failure.
     pub failed: String,
-    /// AI Agent value set after the runner automerges the PR (CLAUDE-126).
+    /// AI Agent value set after the runner automerges the PR.
     /// Also the default for [`YoutrackStates::no_code_label`], the label used
     /// on a deliberate no-code run: no PR ever merges there, so the YouTrack
-    /// workflow that closes an issue on its own PR's merge cannot reach it
-    /// (CLAUDE-327).
+    /// workflow that closes an issue on its own PR's merge cannot reach it.
     pub done: String,
     /// AI Agent value set when a successful run deliberately produced no commits
-    /// and left the `.claude-run-no-code-change` marker (CLAUDE-214). `None` (the
+    /// and left the `.claude-run-no-code-change` marker. `None` (the
     /// default) resolves to `done`: there is no PR for a human to review. Read
     /// through [`YoutrackStates::no_code_label`], never directly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_code: Option<String>,
     /// Standard `State` field value set in the pre step.
     pub in_progress: String,
-    /// Deprecated and ignored (CLAUDE-327): the runner no longer writes
+    /// Deprecated and ignored: the runner no longer writes
     /// `State` when a PR merges. A YouTrack workflow
     /// (`docs/yt-workflow-resolve-on-pr-merge.js`) resolves an issue when its
     /// own PR merges instead. Kept only so an existing action file or stored
@@ -467,18 +465,18 @@ impl Default for YoutrackStates {
 }
 
 impl YoutrackStates {
-    /// AI Agent label for a deliberate no-code run (CLAUDE-214): the configured
+    /// AI Agent label for a deliberate no-code run: the configured
     /// `no_code` when set, otherwise the configured `done` label.
     pub fn no_code_label(&self) -> &str {
         self.no_code.as_deref().unwrap_or(&self.done)
     }
 }
 
-/// How the runner opens the PR for a worked Forgejo issue (CLAUDE-103).
+/// How the runner opens the PR for a worked Forgejo issue.
 ///
 /// `Branch` (the default) pushes a real server branch with the git CLI
 /// (`git push --set-upstream origin <branch>:<branch>`, where `<branch>` is
-/// resolved by name, not from the ambient `HEAD`; CLAUDE-166) and opens the PR
+/// resolved by name, not from the ambient `HEAD`) and opens the PR
 /// over the API with an explicit `--head`, so Forgejo can always offer "Update
 /// Branch" and the PR stays mergeable.
 /// `Agit` runs `fj pr create -aA`, which creates a branchless PR whose head
@@ -487,7 +485,7 @@ impl YoutrackStates {
 /// kept as an explicit opt-in, never a silent fallback (the selected strategy
 /// is authoritative).
 ///
-/// CLAUDE-212: both variants are gated by the same ahead check before PR
+/// Both variants are gated by the same ahead check before PR
 /// creation (exactly one local branch ahead of the base), so neither can open a
 /// PR for a run that produced no commits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -530,17 +528,17 @@ pub struct ForgejoTarget {
     /// Forgejo base URL. `None` derives the host from each issue's resolved VCS
     /// integration (the current behavior).
     pub base_url: Option<String>,
-    /// Name of the encrypted secret holding the Forgejo API token (CLAUDE-26).
+    /// Name of the encrypted secret holding the Forgejo API token.
     /// `None` uses host `fj` auth. The raw token is never stored here; it is
     /// resolved from the [`crate::secrets`] store and injected at run time.
     pub token_ref: Option<String>,
-    /// PR-creation strategy (CLAUDE-103). Omitted deserializes to
+    /// PR-creation strategy. Omitted deserializes to
     /// [`PrStrategy::Branch`], so existing action files get the safe,
     /// always-mergeable behavior with no migration.
     pub pr_strategy: PrStrategy,
 }
 
-/// GitHub-side settings for the native handler (CLAUDE-50). A job whose
+/// GitHub-side settings for the native handler. A job whose
 /// resolved `repo_host` is GitHub (`github.com` plus any host in `hosts`) opens
 /// its PR through the GitHub `Forge` backend instead of `fj`; every other host
 /// keeps using `fj` unchanged. Auto-routing means no per-action forge selector:
@@ -555,7 +553,7 @@ pub struct GithubTarget {
     /// Override for the remote GitHub MCP endpoint. Defaults to GitHub's hosted
     /// MCP server, which needs no local install.
     pub mcp_endpoint: String,
-    /// Name of the encrypted secret (CLAUDE-26) holding the GitHub PAT, used for
+    /// Name of the encrypted secret holding the GitHub PAT, used for
     /// the MCP call, the authenticated push, and `gh`. `None` falls back to host
     /// `gh` auth / `GH_TOKEN`. The raw token is never stored here; it is resolved
     /// from the [`crate::secrets`] store and injected at run time. The PAT needs
@@ -586,7 +584,7 @@ pub fn default_github_mcp_endpoint() -> String {
     "https://api.githubcopilot.com/mcp/".to_string()
 }
 
-/// Config for the native cross-project closed-issue reporter (CLAUDE-218).
+/// Config for the native cross-project closed-issue reporter.
 /// Supplied under the action's `native:` key when `kind: closed-issue-summary`.
 ///
 /// The run is a REPORT, not a code job: it clones no repository, starts no agent
@@ -679,7 +677,7 @@ impl Default for ClosedIssueSummaryConfig {
 pub struct Action {
     pub name: String,
 
-    /// Dispatch discriminator (CLAUDE-30). Defaults to `scripted`.
+    /// Dispatch discriminator. Defaults to `scripted`.
     #[serde(default)]
     pub kind: ActionKind,
 
@@ -722,7 +720,7 @@ pub struct Action {
     #[serde(default)]
     pub limits: Limits,
 
-    /// CLAUDE-28: keyed parallel execution. Defaults to strictly sequential
+    /// Keyed parallel execution. Defaults to strictly sequential
     /// (`max_parallel: 1`) so existing actions are unchanged.
     #[serde(default)]
     pub concurrency: Concurrency,
@@ -753,7 +751,7 @@ mod tests {
 
     #[test]
     fn action_kind_all_lists_every_variant() {
-        // CLAUDE-211: the web UI's new-action picker iterates `ALL`, so a kind
+        // The web UI's new-action picker iterates `ALL`, so a kind
         // missing from it would be uncreatable from the UI. The match below is
         // exhaustive, so adding a variant breaks this test until `ALL` grows.
         for kind in ActionKind::ALL {
@@ -883,16 +881,16 @@ post:
         assert_eq!(cfg.youtrack.states.needs_review, "Needs Review");
         assert_eq!(cfg.youtrack.states.failed, "Failed");
         assert_eq!(cfg.youtrack.states.in_progress, "In Progress");
-        // CLAUDE-125: no prompt override by default; the built-in prompt is used.
+        // No prompt override by default; the built-in prompt is used.
         assert!(cfg.youtrack.prompt.is_none());
         assert!(cfg.youtrack.base_url.is_none());
         assert!(cfg.youtrack.token_ref.is_none());
         assert!(cfg.forgejo.base_url.is_none());
         assert!(cfg.forgejo.token_ref.is_none());
-        // CLAUDE-103: an omitted pr_strategy deserializes to the safe,
+        // An omitted pr_strategy deserializes to the safe,
         // always-mergeable branch-backed strategy, so no migration is needed.
         assert_eq!(cfg.forgejo.pr_strategy, PrStrategy::Branch);
-        // CLAUDE-50: the github block defaults to the hosted MCP endpoint, no
+        // The github block defaults to the hosted MCP endpoint, no
         // extra hosts, and host gh auth (no token_ref).
         assert!(cfg.github.hosts.is_empty());
         assert_eq!(
@@ -902,8 +900,8 @@ post:
         assert!(cfg.github.token_ref.is_none());
     }
 
-    /// CLAUDE-161: the dependency gate defaults to on, a 5m re-check backoff, and
-    /// blocking on `depends on` / `parent for`, matching the issue spec. A bare
+    /// The dependency gate defaults to on, a 5m re-check backoff, and
+    /// blocking on `depends on` / `parent for`. A bare
     /// `native: {}` resolves them.
     #[test]
     fn native_config_dependency_gate_defaults() {
@@ -918,7 +916,7 @@ post:
         assert!(deps.block_cross_project);
     }
 
-    /// CLAUDE-161: an untouched `dependencies` block round-trips out of the
+    /// An untouched `dependencies` block round-trips out of the
     /// serialized YAML (`skip_serializing_if`), so saving an action through the
     /// web form does not write a redundant block.
     #[test]
@@ -931,7 +929,7 @@ post:
         );
     }
 
-    /// CLAUDE-161: a non-humantime `recheck_timeout` is rejected at load with a
+    /// A non-humantime `recheck_timeout` is rejected at load with a
     /// typed `ActionInvalidField`, so a bad value fails fast rather than silently
     /// falling back at gate time.
     #[test]
@@ -979,7 +977,7 @@ post:
         (out, logs)
     }
 
-    /// CLAUDE-278: an action file that still sets `wait_seconds` or
+    /// An action file that still sets `wait_seconds` or
     /// `check_interval_seconds` keeps loading (they are parsed, not rejected),
     /// with one deprecation warning naming them.
     #[test]
@@ -1013,7 +1011,7 @@ post:
         );
     }
 
-    /// CLAUDE-161: a valid humantime `recheck_timeout` and an `enabled: false`
+    /// A valid humantime `recheck_timeout` and an `enabled: false`
     /// override parse cleanly.
     #[test]
     fn native_config_parses_dependency_overrides() {
@@ -1030,7 +1028,7 @@ post:
 
     #[test]
     fn native_config_parses_forgejo_pr_strategy() {
-        // CLAUDE-103: an explicit `pr_strategy: agit` selects the AGit strategy;
+        // An explicit `pr_strategy: agit` selects the AGit strategy;
         // the kebab-case value matches the serde encoding, and an unknown value
         // is rejected by `deny_unknown_fields` semantics on the enum.
         let raw = "\
@@ -1055,7 +1053,7 @@ native:
 
     #[test]
     fn native_config_parses_youtrack_prompt_override() {
-        // CLAUDE-125: an explicit `prompt` is a full-replacement override that
+        // An explicit `prompt` is a full-replacement override that
         // round-trips through the loader (block scalar keeps its trailing
         // newline).
         let raw = "\
@@ -1162,7 +1160,7 @@ native:
 
     #[test]
     fn youtrack_automerge_defaults_to_disabled_when_absent() {
-        // CLAUDE-126: a youtrack config with no `automerge` block deserializes to
+        // A youtrack config with no `automerge` block deserializes to
         // the disabled defaults, so the existing finalize behavior is unchanged.
         let raw = "name: yt\nkind: youtrack\nnative:\n  youtrack: {}\n";
         let loaded = validate_str(raw, "<candidate>").unwrap();
@@ -1177,7 +1175,7 @@ native:
 
     #[test]
     fn youtrack_automerge_round_trips_through_yaml() {
-        // CLAUDE-126: an explicit `automerge` block parses its fields and survives
+        // An explicit `automerge` block parses its fields and survives
         // a serialize -> deserialize round-trip unchanged.
         let raw = "\
 name: yt
@@ -1213,7 +1211,7 @@ native:
 
     #[test]
     fn native_config_parses_github_block() {
-        // CLAUDE-50: the optional github block parses its hosts / mcp_endpoint /
+        // The optional github block parses its hosts / mcp_endpoint /
         // token_ref; unknown keys inside it are still rejected.
         let raw = "\
 name: yt
@@ -1311,7 +1309,7 @@ native:
         let Some(NativeConfig::Youtrack(cfg)) = &action.native else {
             panic!("expected youtrack native config");
         };
-        // CLAUDE-215: excludes audit runs (`AUDIT` tagged `Audit-*`), which `audit-run.yml` owns,
+        // Excludes audit runs (`AUDIT` tagged `Audit-*`), which `audit-run.yml` owns,
         // so it differs from the site-agnostic `default_query()`.
         assert_eq!(
             cfg.youtrack.query,
@@ -1341,7 +1339,7 @@ native:
         assert_eq!(reloaded.action.kind, action.kind);
     }
 
-    /// The shipped `actions/audit-run.yml` (CLAUDE-214, CLAUDE-295): audit query, audit prompt
+    /// The shipped `actions/audit-run.yml`: audit query, audit prompt
     /// preset, product write projects, same-project gate, automerge.
     #[test]
     fn shipped_audit_run_action_is_native_and_round_trips() {
@@ -1384,7 +1382,7 @@ native:
         // Audit pull requests must merge so the Epic resolves and the gated
         // daily parent runs.
         assert!(cfg.youtrack.automerge.enabled);
-        // CLAUDE-295: findings file into the product projects, and an Epic must
+        // Findings file into the product projects, and an Epic must
         // not wait on the findings it filed there as its subtasks.
         assert_eq!(
             cfg.youtrack.write_projects,
@@ -1403,7 +1401,7 @@ native:
         assert_eq!(reloaded.action.kind, action.kind);
     }
 
-    /// CLAUDE-215: the two youtrack-kind actions partition queued issues instead of racing for
+    /// The two youtrack-kind actions partition queued issues instead of racing for
     /// them. Static half only: audit selects `AUDIT` + `Audit-*`, the worker its exact complement.
     #[test]
     fn shipped_youtrack_actions_partition_audit_issues() {
@@ -1469,7 +1467,7 @@ native:
         }
     }
 
-    /// CLAUDE-207: the repo-access preflight now probes both scope categories the
+    /// The repo-access preflight now probes both scope categories the
     /// PR path uses, so the caveat that it tested repository read only (prose that
     /// stood in for the fix) must not come back in either the schema doc or the
     /// gather doc comment.
@@ -1488,7 +1486,7 @@ native:
         }
     }
 
-    // ---- CLAUDE-218: closed-issue-summary native config -------------------
+    // ---- closed-issue-summary native config -------------------
 
     #[test]
     fn closed_issue_summary_native_parses_and_defaults() {
@@ -1543,7 +1541,7 @@ native:
         assert!(validate_str(bad, "<candidate>").is_err());
     }
 
-    /// CLAUDE-239: an action may pin a model in its `claude:` block, and the
+    /// An action may pin a model in its `claude:` block, and the
     /// value round-trips unvalidated (any string the `claude` CLI accepts).
     #[test]
     fn claude_block_accepts_a_model() {
@@ -1562,7 +1560,7 @@ native:
             .is_none());
     }
 
-    /// CLAUDE-259: an action may pin an effort level the same way, and any
+    /// An action may pin an effort level the same way, and any
     /// string parses (a level added after this release must not fail the
     /// `deny_unknown_fields` loader).
     #[test]
@@ -1615,7 +1613,7 @@ native:
         assert_eq!(reloaded.action.kind, action.kind);
     }
 
-    /// CLAUDE-218 query partition: the reporting action and the worker action
+    /// Query partition: the reporting action and the worker action
     /// must never gather the same issue. The worker pins the single `AI Agent`
     /// value `Queued`; the reporter ships with no query at all, and its
     /// `parents` list is nominated by id, so no issue can match both. This is
@@ -1669,7 +1667,6 @@ native:
         let err = validate_str(raw, "<candidate>").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("forgejo-ci-fix"), "{msg}");
-        assert!(msg.contains("CLAUDE-270"), "{msg}");
         assert!(matches!(err, Error::ActionRetiredKind { .. }));
     }
 
@@ -1679,7 +1676,6 @@ native:
         let err = validate_str(raw, "<candidate>").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ci-failure-analysis"), "{msg}");
-        assert!(msg.contains("CLAUDE-270"), "{msg}");
         assert!(matches!(err, Error::ActionRetiredKind { .. }));
     }
 
@@ -1689,7 +1685,6 @@ native:
         let err = validate_str(raw, "<candidate>").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ci-failure-reconcile"), "{msg}");
-        assert!(msg.contains("CLAUDE-270"), "{msg}");
         assert!(matches!(err, Error::ActionRetiredKind { .. }));
     }
 
@@ -1718,17 +1713,17 @@ pub struct ClaudeBlock {
     pub cwd: Option<String>,
     pub allowed_tools: Option<String>,
     pub permission_mode: Option<String>,
-    /// CLAUDE-239: model this action pins, passed through to `--model`
+    /// Model this action pins, passed through to `--model`
     /// untouched (no validation here; the `claude` CLI owns that). Unset falls
     /// back to the global `config.claude.model`, then to the CLI's own default.
     pub model: Option<String>,
-    /// CLAUDE-259: effort level this action pins, passed through to `--effort`
+    /// Effort level this action pins, passed through to `--effort`
     /// untouched. Unset falls back to the global `config.claude.effort`, then to
     /// the CLI's own default. Deliberately a string, not an enum: a level
     /// Anthropic adds later must parse here without a runner release. The runner
     /// warns about a value outside the documented set but never rejects it.
     pub effort: Option<String>,
-    /// DEV-706: compaction window this action pins, passed through to
+    /// Compaction window this action pins, passed through to
     /// `--autocompact` untouched (`auto`, or 100k-1M tokens). Unset falls back
     /// to the global `config.claude.autocompact`, then to
     /// [`crate::claude::DEFAULT_AUTOCOMPACT`]. A bounded window is what stops a
@@ -1749,18 +1744,18 @@ pub struct Limits {
     pub max_runs_per_day: Option<u32>,
     pub claude_timeout_seconds: Option<u32>,
     pub daily_budget_usd: Option<f64>,
-    /// DEV-705: dollars ONE run may spend. `daily_budget_usd` bounds a whole
+    /// Dollars ONE run may spend. `daily_budget_usd` bounds a whole
     /// day across runs; this bounds a single firing, so one runaway run cannot
     /// eat the day. Read once before the run starts and never re-read, so it
     /// cannot be raised mid-run: raising it means editing this file and
     /// starting a new run. Unset falls back to the effective
     /// `daily_budget_usd`, which is why adding the ceiling loosens nothing.
     pub run_budget_usd: Option<f64>,
-    /// DEV-705: fraction of `run_budget_usd` at which the run warns once.
+    /// Fraction of `run_budget_usd` at which the run warns once.
     /// Unset (and any value outside `(0, 1]`) is
     /// [`crate::usage::DEFAULT_WARN_FRACTION`], 80 percent.
     pub budget_warn_fraction: Option<f64>,
-    /// CLAUDE-234: issues ONE run may create in the tracker. `max_runs_per_day`
+    /// Issues ONE run may create in the tracker. `max_runs_per_day`
     /// bounds how often an action fires; this bounds what a single firing can
     /// author, so a misfiring run opens a handful of issues rather than a
     /// hundred. Unset falls back to
@@ -1768,7 +1763,7 @@ pub struct Limits {
     pub max_issues_per_run: Option<u32>,
 }
 
-/// CLAUDE-28: per-action keyed parallel execution.
+/// Per-action keyed parallel execution.
 ///
 /// Within a run, jobs are partitioned by a *concurrency key* resolved from each
 /// job's fields ([`Concurrency::key`]). At most one job per resolved key runs at
@@ -1863,7 +1858,7 @@ pub fn load_from_path(path: &Path) -> Result<LoadedAction> {
 /// `path` is set to it but callers that persist should overwrite it with the
 /// real destination. Used by the web UI to reject broken YAML before it ever
 /// reaches `actions/<name>.yml`.
-/// Kinds retired in CLAUDE-270 / CLAUDE-279: `forgejo-ci-fix`, `ci-failure-analysis`
+/// Kinds retired: `forgejo-ci-fix`, `ci-failure-analysis`
 /// and `ci-failure-reconcile` no longer deserialize into [`ActionKind`] at all, so
 /// a plain serde error would read as an unknown-variant typo rather than telling
 /// an operator their deployment still carries a retired action file. Checked
@@ -1946,7 +1941,7 @@ pub fn validate_str(raw: &str, label: &str) -> Result<LoadedAction> {
         });
     }
 
-    // CLAUDE-30: `kind` selects which fields are required. Scripted actions
+    // `kind` selects which fields are required. Scripted actions
     // validate their script-bearing fields exactly as before; native kinds
     // ignore those and require a matching typed `NativeConfig` instead.
     if action.kind.is_native() {
@@ -2007,7 +2002,7 @@ fn validate_native(action: &Action, label: &str) -> Result<()> {
             path: label.to_string(),
         });
     }
-    // CLAUDE-161: reject a `dependencies.recheck_timeout` that is not a valid
+    // Reject a `dependencies.recheck_timeout` that is not a valid
     // humantime duration at load, so a bad value fails fast instead of at gate
     // time (where it would silently fall back to the default).
     if let NativeConfig::Youtrack(cfg) = native {
@@ -2020,7 +2015,7 @@ fn validate_native(action: &Action, label: &str) -> Result<()> {
                 path: label.to_string(),
             });
         }
-        // CLAUDE-278: `wait_seconds` / `check_interval_seconds` no longer do
+        // `wait_seconds` / `check_interval_seconds` no longer do
         // anything (finalize no longer polls), but an action file that still
         // sets them away from their default must keep loading rather than
         // failing `deny_unknown_fields`-style. One warning per load names them
@@ -2035,7 +2030,7 @@ fn validate_native(action: &Action, label: &str) -> Result<()> {
                 "automerge.wait_seconds / automerge.check_interval_seconds are deprecated and ignored: automerge is now triggered by the run-succeeded webhook instead of a polling wait. Remove both keys from the action file, or save the action's structured form, which resets them."
             );
         }
-        // CLAUDE-327: `states.state_done` no longer does anything (a YouTrack
+        // `states.state_done` no longer does anything (a YouTrack
         // workflow closes the issue when its own PR merges, not the runner),
         // but an action file that still sets it away from the default must
         // keep loading rather than failing `deny_unknown_fields`-style.

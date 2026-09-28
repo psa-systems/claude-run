@@ -41,9 +41,9 @@ pub struct RunnerDefaults {
     pub max_runs_per_day: u32,
     pub claude_timeout_seconds: u32,
     pub daily_budget_usd: f64,
-    /// DEV-705: fraction of the per-run budget at which a run warns once.
+    /// Fraction of the per-run budget at which a run warns once.
     pub budget_warn_fraction: f64,
-    /// CLAUDE-234: issues one run may create when the action sets no override.
+    /// Issues one run may create when the action sets no override.
     pub max_issues_per_run: u32,
 }
 
@@ -66,18 +66,18 @@ pub struct EffectiveLimits {
     pub max_runs_per_day: u32,
     pub claude_timeout: Duration,
     pub daily_budget_usd: f64,
-    /// DEV-705: this run's spend ceiling, resolved BEFORE the run starts.
+    /// This run's spend ceiling, resolved BEFORE the run starts.
     /// `EffectiveLimits` is `Copy` and is moved into each per-job task by value,
     /// so no job can raise the ceiling it runs under.
     pub run_budget_usd: f64,
     pub budget_warn_fraction: f64,
-    /// CLAUDE-234: this run's issue-creation ceiling, enforced at the provider
-    /// boundary by [`crate::provider::AuditedTracker`].
+    /// This run's issue-creation ceiling, enforced at the provider boundary by
+    /// [`crate::provider::AuditedTracker`].
     pub max_issues_per_run: u32,
 }
 
 impl EffectiveLimits {
-    /// DEV-705: the frozen ceiling this run bills against.
+    /// The frozen ceiling this run bills against.
     pub fn run_budget(&self) -> crate::usage::RunBudget {
         crate::usage::RunBudget::new(self.run_budget_usd, self.budget_warn_fraction)
     }
@@ -96,9 +96,9 @@ pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> Eff
                 .unwrap_or(defaults.claude_timeout_seconds) as u64,
         ),
         daily_budget_usd,
-        // DEV-705: an action that sets no per-run ceiling gets its own daily
-        // budget as one, so a single run can never spend more than the day
-        // allows and no shipped action changes behavior.
+        // An action that sets no per-run ceiling gets its own daily budget as
+        // one, so a single run can never spend more than the day allows and
+        // no shipped action changes behavior.
         run_budget_usd: l.run_budget_usd.unwrap_or(daily_budget_usd),
         budget_warn_fraction: l
             .budget_warn_fraction
@@ -107,7 +107,7 @@ pub fn effective_limits(defaults: &RunnerDefaults, action: &LoadedAction) -> Eff
     }
 }
 
-/// CLAUDE-232: the effective `max_attempts_per_key` per indexed action, for the
+/// The effective `max_attempts_per_key` per indexed action, for the
 /// operator surfaces that report which keys are parked at their cap. The index
 /// does not cache this limit, so each action's YAML is re-read; an action whose
 /// YAML already failed to parse is left out and reads as the default, since its
@@ -149,18 +149,18 @@ pub struct JobContext<'a> {
     pub claude: &'a ClaudeInvoker,
     pub pool: &'a DbPool,
     pub run_id: i64,
-    /// CLAUDE-9: tripped when an operator cancels this run. The claude
-    /// invocation watches it to terminate the child; this pipeline watches it
-    /// to synthesize a cancelled `$claude_result` (so `post` still runs) and
-    /// to skip attempt counting.
+    /// Tripped when an operator cancels this run. The claude invocation
+    /// watches it to terminate the child; this pipeline watches it to
+    /// synthesize a cancelled `$claude_result` (so `post` still runs) and to
+    /// skip attempt counting.
     pub cancel: CancellationToken,
-    /// CLAUDE-223: the run-scoped global-pause gate. Checked at the same
-    /// pre-claude point as `cancel`, so a pause taken after this job started
-    /// still stops it before it spends a `claude --print` call. The job's
-    /// attempt is not counted, exactly as on the cancel path.
+    /// The run-scoped global-pause gate. Checked at the same pre-claude point
+    /// as `cancel`, so a pause taken after this job started still stops it
+    /// before it spends a `claude --print` call. The job's attempt is not
+    /// counted, exactly as on the cancel path.
     pub pause: crate::pause::RunPause,
-    /// DEV-705 / DEV-707: the run's shared spend ledger. The invocation below
-    /// is capped at what the run has left, and its usage is billed here.
+    /// The run's shared spend ledger. The invocation below is capped at what
+    /// the run has left, and its usage is billed here.
     pub spend: crate::usage::RunSpend,
 }
 
@@ -177,7 +177,7 @@ pub fn job_key(action: &LoadedAction, job: &Value, idx: usize) -> String {
     }
 }
 
-/// CLAUDE-28: resolve a job's concurrency key from the action's
+/// Resolve a job's concurrency key from the action's
 /// `concurrency.key` fields. Same key serializes; distinct keys run in parallel.
 /// Field values are joined with a unit-separator so distinct tuples never
 /// collide. When none of the configured fields are present on the job (e.g. a
@@ -255,8 +255,8 @@ pub async fn gather_jobs(
 /// Process a single job. Returns the per-job outcome record that the runner
 /// will both write to the per-action JSONL and insert into `job_outcomes`.
 pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Result<ProcessedJob> {
-    // CLAUDE-20: measure the full per-job pipeline elapsed (filter / pre /
-    // prompt / claude / post) so the web UI can show a per-job duration. Started
+    // Measure the full per-job pipeline elapsed (filter / pre / prompt /
+    // claude / post) so the web UI can show a per-job duration. Started
     // before the attempt-cap check; only the `Done` path carries it into the
     // outcome record, so capped / filtered jobs (no outcome) never read it.
     let started = Instant::now();
@@ -264,7 +264,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     let key = job_key(ctx.action, job, idx);
     let attempts = state::attempts_get(ctx.pool, &action.name, &key).await?;
 
-    // CLAUDE-232: `warn`, not `info`: the job is parked for good (no outcome row,
+    // `warn`, not `info`: the job is parked for good (no outcome row,
     // no run event, the source still lists it), so every poll skips it again.
     if attempts >= ctx.limits.max_attempts_per_key && action.dedup_key.is_some() {
         warn!(
@@ -320,9 +320,9 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     }
 
     // ---- prompt + claude (skipped on pre failure; synthesize claude_result) ----
-    // CLAUDE-223: set when the global-pause gate stopped this job before claude
-    // started, so its attempt is not counted (the job is re-gathered on the
-    // first run after Resume).
+    // Set when the global-pause gate stopped this job before claude started,
+    // so its attempt is not counted (the job is re-gathered on the first run
+    // after Resume).
     let mut paused_before_claude = false;
     let (claude_result, claude_ran) = if let Some((step_idx, exit_code, stderr)) = pre_failed {
         (
@@ -376,13 +376,13 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                     false,
                 )
             } else if ctx.pause.stop().await {
-                // CLAUDE-223: globally paused after this job started but before
-                // it reached claude. Don't spend an API call; synthesize a
+                // Globally paused after this job started but before it
+                // reached claude. Don't spend an API call; synthesize a
                 // result so post still runs, and leave the attempt uncounted so
                 // the job is retried after Resume.
-                // CLAUDE-269: the same checkpoint also stops a run when the
-                // Claude login needs renewing (`RunPause` checks both), so the
-                // synthesized reason names whichever actually tripped it.
+                // The same checkpoint also stops a run when the Claude login
+                // needs renewing (`RunPause` checks both), so the synthesized
+                // reason names whichever actually tripped it.
                 paused_before_claude = true;
                 let (reason, summary) = if ctx.pause.login_tripped() {
                     (
@@ -412,15 +412,15 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
                     &workdir_path,
                     &stream_log,
                     &ctx.cancel,
-                    // DEV-705: cap the child at what the run has left, so one
-                    // session cannot overshoot the ceiling between checks.
+                    // Cap the child at what the run has left, so one session
+                    // cannot overshoot the ceiling between checks.
                     Some(ctx.spend.remaining_usd()),
                 )?;
-                // DEV-707: bill the run before any branch discards `r`, so a
-                // cancelled invocation still reports what it spent.
+                // Bill the run before any branch discards `r`, so a cancelled
+                // invocation still reports what it spent.
                 ctx.spend.record(&r);
-                // CLAUDE-315: persist this invocation's plan usage before any
-                // branch discards `r`, mirroring the billing call above.
+                // Persist this invocation's plan usage before any branch
+                // discards `r`, mirroring the billing call above.
                 crate::usage::record_invocation(
                     ctx.pool,
                     &action.name,
@@ -490,7 +490,7 @@ pub async fn process_job(ctx: &JobContext<'_>, job: &Value, idx: usize) -> Resul
     // ---- skip-attempt marker (parked / blocker outcomes) ----
     // A cancelled run also skips attempt counting: an operator cancel is not a
     // genuine attempt, so the job retries cleanly on the next firing.
-    // CLAUDE-223: a job the global pause stopped is not an attempt either.
+    // A job the global pause stopped is not an attempt either.
     let skip_marker = workdir_path.join(".claude-run-skip-attempt");
     let cancelled = ctx.cancel.is_cancelled();
     let skip_attempt = skip_marker.exists() || cancelled || paused_before_claude;
@@ -542,13 +542,13 @@ pub enum ProcessedJob {
     Filtered { key: String },
     /// Attempt cap reached for this job; job was skipped without invocation.
     CapHit { key: String },
-    /// CLAUDE-149: the per-PR fix-push ceiling was reached, so the job was
-    /// flagged Needs Review (PR comment + label, source issue updated) instead of
-    /// being auto-fixed again.
+    /// The per-PR fix-push ceiling was reached, so the job was flagged Needs
+    /// Review (PR comment + label, source issue updated) instead of being
+    /// auto-fixed again.
     NeedsReview { key: String },
     /// Transient claude error - job will be retried next firing.
     Transient { key: String },
-    /// CLAUDE-161: the pre-clone dependency gate found an unmet dependency, so the
+    /// The pre-clone dependency gate found an unmet dependency, so the
     /// issue was left Queued and never cloned or handed to claude. Consumes no
     /// attempt (like `Filtered` / `CapHit`, no `attempts_increment` runs on this
     /// path). `blockers` lists the unmet dependencies (`ID (verb)`), for logging.
@@ -564,10 +564,10 @@ pub enum ProcessedJob {
         attempt_counted: bool,
         summary: String,
         stream_log_path: Option<String>,
-        /// CLAUDE-20: full per-job pipeline elapsed in milliseconds.
+        /// Full per-job pipeline elapsed in milliseconds.
         duration_ms: i64,
-        /// CLAUDE-52: claude hit the wall-clock limit (exit 124). Carried into
-        /// the persisted outcome so a timeout renders distinctly from a failure.
+        /// Claude hit the wall-clock limit (exit 124). Carried into the
+        /// persisted outcome so a timeout renders distinctly from a failure.
         timed_out: bool,
     },
 }
@@ -587,7 +587,7 @@ impl ProcessedJob {
 /// Append a job-outcome record to the action's per-action JSONL log (the
 /// `output.file` field on the action). Best-effort; logs but does not fail.
 ///
-/// CLAUDE-257: this file is append-only and lives for the life of the install,
+/// This file is append-only and lives for the life of the install,
 /// so the daemon bounds it by SIZE (`config.stream_log_gc.output_file_max_bytes`,
 /// applied by [`crate::gc::sweep_oversized_logs`]). It is never deleted by age
 /// the way a stream log is: an operator turns `output.file` on to produce a data
@@ -671,7 +671,7 @@ mod tests {
         assert_eq!(r, "job-7");
     }
 
-    /// CLAUDE-234: the per-run issue-creation ceiling resolves like every other
+    /// The per-run issue-creation ceiling resolves like every other
     /// limit: the action's own value wins, and an unset one falls back to the
     /// default of 25. `0` is a real value (create nothing), not "unset".
     #[test]
@@ -693,7 +693,7 @@ mod tests {
         assert_eq!(effective_limits(&defaults, &action).max_issues_per_run, 0);
     }
 
-    /// CLAUDE-232: the cap the operator surfaces compare against is each
+    /// The cap the operator surfaces compare against is each
     /// action's own `limits.max_attempts_per_key`, falling back to the runner
     /// default. An action the index already flags as unparseable is skipped
     /// (its parse error is its own signal) rather than reported with a guess.
@@ -747,7 +747,7 @@ mod tests {
         );
     }
 
-    /// DEV-705: the per-run ceiling defaults to the action's OWN daily budget,
+    /// The per-run ceiling defaults to the action's OWN daily budget,
     /// so adding it loosens nothing and breaks no shipped action; an explicit
     /// value wins, and the warn fraction defaults to 80 percent.
     #[test]

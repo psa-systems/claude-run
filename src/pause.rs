@@ -1,4 +1,4 @@
-//! CLAUDE-223: the global-pause gate consulted from inside a running run.
+//! The global-pause gate consulted from inside a running run.
 //!
 //! `claude-run pause` (and the web Activity card) sets a one-row DB flag that
 //! the scheduler and the dispatcher already honour BEFORE starting anything.
@@ -40,7 +40,7 @@ pub struct PauseGate {
     /// When `paused` was last read from the DB; `None` means never.
     read_at: Arc<Mutex<Option<Instant>>>,
     ttl: Duration,
-    /// CLAUDE-269: carried into every [`RunPause`] this gate mints, so a run
+    /// Carried into every [`RunPause`] this gate mints, so a run
     /// already in flight stops picking up new jobs when the Claude login needs
     /// renewing, with no new call site at any of the existing per-job
     /// checkpoints. `None` where there is nothing to check (tests, the
@@ -59,7 +59,7 @@ impl PauseGate {
         }
     }
 
-    /// CLAUDE-269: attach the daemon's readiness gate, so [`RunPause::stop`] /
+    /// Attach the daemon's readiness gate, so [`RunPause::stop`] /
     /// [`RunPause::stop_cached`] also stop a run when the Claude login needs
     /// renewing. A builder so every existing `PauseGate::new` call site stays
     /// source-compatible.
@@ -151,7 +151,7 @@ impl PauseGate {
 pub struct RunPause {
     gate: PauseGate,
     tripped: Arc<AtomicBool>,
-    /// CLAUDE-269: set the first time this run was stopped because the Claude
+    /// Set the first time this run was stopped because the Claude
     /// login needs renewing, rather than by an operator pause. Kept separate
     /// from `tripped` so the run's exit code can tell the two apart.
     login_tripped: Arc<AtomicBool>,
@@ -166,7 +166,7 @@ impl RunPause {
     }
 
     /// True when the run must stop picking up new work: either the operator
-    /// paused globally, or (CLAUDE-269) the Claude login needs renewing.
+    /// paused globally, or the Claude login needs renewing.
     /// Records whichever tripped, so the run finalizes with the right exit
     /// code, and logs the reason once.
     pub async fn stop(&self) -> bool {
@@ -326,7 +326,7 @@ mod tests {
         assert!(gate.paused().await);
     }
 
-    /// CLAUDE-269: a login-required trip stops a run exactly like a global
+    /// A login-required trip stops a run exactly like a global
     /// pause does, and the run's exit code names it distinctly (`LOGIN_REQUIRED`
     /// rather than `PAUSED`), including against an operator cancel.
     #[tokio::test]

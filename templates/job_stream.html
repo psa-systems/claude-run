@@ -56,7 +56,7 @@
     return Math.floor(total / 60) + 'm ' + (total % 60) + 's';
   }
 
-  // CLAUDE-63 / CLAUDE-154: render one event row. When the event carries a `ts`
+  // Render one event row. When the event carries a `ts`
   // (RFC 3339 arrival time stamped by the runner), prefix the row with the
   // server-formatted stamp `tsFmt` (the runner applies the operator's timezone +
   // date/time format preferences; chrono strftime cannot run in JS, so the one
@@ -98,9 +98,9 @@
   }
 
   function render(j) {
-    // CLAUDE-63: j.ts (if present) is the runner-stamped arrival time; pass it
+    // j.ts (if present) is the runner-stamped arrival time; pass it
     // to every row this event produces so each carries the time prefix.
-    // CLAUDE-154: j.ts_fmt is the same instant already formatted server-side per
+    // j.ts_fmt is the same instant already formatted server-side per
     // the operator's preferences; it drives the visible stamp, j.ts the tooltip.
     const ts = j.ts;
     const tsFmt = j.ts_fmt;

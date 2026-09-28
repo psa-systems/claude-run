@@ -1,18 +1,17 @@
-//! Triage-driven YouTrack issue mint (CLAUDE-46, part of the webhook
-//! epic CLAUDE-36).
+//! Triage-driven YouTrack issue mint.
 //!
 //! Turns a triaged failure ([`crate::triage::Triage`]) plus its
 //! `action_run_failure` metadata and redacted job log into a YouTrack task
 //! issue, routed to the repo's own YouTrack project (with `CLAUDE` as the
-//! fallback per the 2026-05-31 decision). CLAUDE-273: dedupe by failing-test
+//! fallback per the 2026-05-31 decision). Dedupe by failing-test
 //! overlap now happens in the caller, against the `ci_failure` store, before
 //! `mint` is ever called for a failure the store already tracks; `mint` itself
 //! only creates:
 //!
 //! ```text
 //! route   -> bucket 3 (transient) mints nothing.
-//! guard   -> per-key attempt cap and daily cap (the DEV-335 caps, reused not
-//!            re-derived) gate the rest. CLAUDE-276: open-PR routing (the
+//! guard   -> per-key attempt cap and daily cap (reused, not
+//!            re-derived) gate the rest. Open-PR routing (the
 //!            agent's own PR re-queues its issue, a human's PR gets a PR
 //!            comment) is decided by the caller before `mint` is ever reached,
 //!            so it takes no bot-loop or open-PR guard of its own.
@@ -49,7 +48,7 @@ use crate::error::Result;
 use crate::provider::{IssueTracker, VcsMapEntry};
 use crate::triage::{Triage, TriageBucket};
 
-/// Default time-to-live for the cached inverse VCS routing map (CLAUDE-86): a
+/// Default time-to-live for the cached inverse VCS routing map: a
 /// just-added VCS integration is picked up within this window without a daemon
 /// restart, while steady-state mints reuse the cache and issue no extra `yt`
 /// calls. Refresh-on-miss shortens this for a genuinely new repo.
@@ -67,22 +66,22 @@ pub struct MintRequest<'a> {
     pub commit_sha: &'a str,
     /// Workflow filename, e.g. `ci.yml` (part of the secondary dedupe key).
     pub workflow_id: &'a str,
-    /// CLAUDE-190/199: the failing run's branch, resolved by the consumer from
+    /// The failing run's branch, resolved by the consumer from
     /// the log's environment dump (`GITHUB_HEAD_REF` on a PR run, else the
     /// `refs/heads/` short name), else the run detail. Empty when unresolvable
     /// (a logless failure). Part of the root-cause dedupe key.
     pub branch: &'a str,
-    /// CLAUDE-190: the failing job's name, resolved from the jobs endpoint.
+    /// The failing job's name, resolved from the jobs endpoint.
     /// Empty when unresolvable. Part of the root-cause dedupe key.
     pub job_name: &'a str,
-    /// CLAUDE-190: a deterministic, pure-string signature of the first
+    /// A deterministic, pure-string signature of the first
     /// diagnostic line in the redacted log (paths / numbers stripped), so the
     /// same root cause across commits yields the same key. `None` when no
     /// diagnostic line is derivable: the log stops before one was emitted,
     /// carries none, or the failure produced no log at all. The key then falls
     /// back to `(repo, branch, workflow, job)`.
     pub failure_signature: Option<&'a str>,
-    /// CLAUDE-264: the stable [`crate::infra_failure`] kind id when the full
+    /// The stable [`crate::infra_failure`] kind id when the full
     /// redacted log shows the failure is a property of the RUNNER (a full disk,
     /// an OOM kill, an unreachable registry) rather than of the commit. `Some`
     /// switches the cross-run collapse onto the branch-agnostic
@@ -97,18 +96,18 @@ pub struct MintRequest<'a> {
     pub triage: &'a Triage,
     /// Redacted job-log artifact to attach; `None` when no log was available.
     pub log_path: Option<&'a Path>,
-    /// CLAUDE-92 `repository.private`, from the payload. CLAUDE-190: no longer
+    /// `repository.private`, from the payload. No longer
     /// gates dedupe (the root-cause key collapses repeats for public and private
     /// repos alike); retained as context on the request.
     pub private: bool,
     /// Whether the failing run has an open PR for its branch, surfaced to the
-    /// triage classifier as bucket-1-vs-2 context. CLAUDE-276: `mint` is only
+    /// triage classifier as bucket-1-vs-2 context. `mint` is only
     /// ever reached for a failure with no open PR, or for the "same failure on
     /// two branches" case the PR-routing caller mints deliberately; either way
     /// this no longer gates the route (the caller decides PR routing before
-    /// `mint` runs, replacing the old CLAUDE-149 `SkippedOpenPr` suppression).
+    /// `mint` runs, replacing the old `SkippedOpenPr` suppression).
     pub has_open_pr: bool,
-    /// CLAUDE-153/CLAUDE-273: the webhook-scoped auto-fix toggle
+    /// The webhook-scoped auto-fix toggle
     /// (`[webhook].auto_fix`). It no longer decides whether an issue is
     /// minted (every code failure is filed): `false` still creates a
     /// `code_fix` / `auto_fix` issue but leaves `AI Agent` unset, so the
@@ -117,7 +116,7 @@ pub struct MintRequest<'a> {
     pub auto_fix_enabled: bool,
 }
 
-/// The DEV-335 caps, reused (not re-derived) from the runner's existing
+/// The caps, reused (not re-derived) from the runner's existing
 /// per-key attempt counter and daily run ledger ([`crate::state`]). The caller
 /// reads these from the DB and passes them in so the mint decision stays pure.
 #[derive(Debug, Clone, Copy)]
@@ -165,7 +164,7 @@ struct Route {
 /// `Some` for the two actionable buckets.
 fn route(bucket: TriageBucket) -> Option<Route> {
     match bucket {
-        // CLAUDE-104: an auto-fix routes exactly like a code-fix - queue for the
+        // An auto-fix routes exactly like a code-fix - queue for the
         // runner, no human assignee - but reaches this point even with no open
         // PR and on a push to main.
         TriageBucket::CodeFix | TriageBucket::AutoFix => Some(Route {
@@ -180,7 +179,7 @@ fn route(bucket: TriageBucket) -> Option<Route> {
     }
 }
 
-/// CLAUDE-273: whether `bucket` routes to the queue-for-fix path (`code_fix` /
+/// Whether `bucket` routes to the queue-for-fix path (`code_fix` /
 /// `auto_fix`), i.e. whether a freshly-created issue of this bucket would get
 /// `AI Agent` set (subject to the webhook `auto_fix` toggle). Exposed so the
 /// webhook consumer's reopen-on-regression path can set `AI Agent` exactly as
@@ -190,7 +189,7 @@ pub(crate) fn queues_for_fix(bucket: TriageBucket) -> bool {
 }
 
 /// How a mint's destination project was chosen, surfaced in the journal so a
-/// wrong destination is diagnosable (CLAUDE-86).
+/// wrong destination is diagnosable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteSource {
     /// An explicit `repo_project_map` entry (operator override).
@@ -230,7 +229,7 @@ fn forge_host(url: &str) -> String {
 /// The inverse VCS routing map: forge `(host, repo path)` -> project short name,
 /// built from every non-archived project's enabled VCS processors. Lookups are
 /// case-insensitive on both host and path and ignore trailing slashes on the
-/// host (CLAUDE-86).
+/// host.
 #[derive(Debug, Clone, Default)]
 pub struct VcsRouteMap {
     /// `(host_normalized, path_lowercased, project_key)`.
@@ -257,7 +256,7 @@ impl VcsRouteMap {
     /// The project that claims `repo` on `host`, or `None` when no enabled VCS
     /// integration matches. When several projects claim the same repo, the match
     /// is deterministic (first by project short name, ascending) and all
-    /// candidates are logged (CLAUDE-86 ambiguity rule).
+    /// candidates are logged (ambiguity rule).
     pub fn lookup(&self, host: &str, repo: &str) -> Option<String> {
         let host = norm_host(host);
         let repo = repo.to_ascii_lowercase();
@@ -286,8 +285,8 @@ impl VcsRouteMap {
     }
 }
 
-/// Lazily-built, TTL-cached inverse VCS routing map shared across mints
-/// (CLAUDE-86). The map is built on first use and rebuilt when older than the
+/// Lazily-built, TTL-cached inverse VCS routing map shared across mints.
+/// The map is built on first use and rebuilt when older than the
 /// TTL; a lookup miss triggers one immediate refresh before falling back, so a
 /// just-added VCS integration routes without waiting out the TTL. A rebuild
 /// failure keeps any prior map and degrades to the fallback rather than erroring.
@@ -404,7 +403,7 @@ fn secondary_marker(req: &MintRequest) -> String {
     marker(&[req.repo, req.commit_sha, req.workflow_id])
 }
 
-/// CLAUDE-190 root-cause dedupe marker: the cross-run collapsing key. Keyed on
+/// Root-cause dedupe marker: the cross-run collapsing key. Keyed on
 /// `(repo, branch, workflow_id, job_name, failure_signature)` so N commits that
 /// each fail the same job on the same branch with the same signature collapse
 /// onto ONE open issue, while a different signature (a different root cause)
@@ -413,7 +412,7 @@ fn secondary_marker(req: &MintRequest) -> String {
 /// all) the key falls back to
 /// `(repo, branch, workflow_id, job_name)`: this still collapses the
 /// "branch is broken" storm onto one issue, intentionally grouping two
-/// indistinguishable logless failures (the CLAUDE-189 analysis can later split a
+/// indistinguishable logless failures (a later analysis can split a
 /// mis-grouped issue).
 fn root_cause_marker(req: &MintRequest) -> String {
     match req.failure_signature {
@@ -422,7 +421,7 @@ fn root_cause_marker(req: &MintRequest) -> String {
     }
 }
 
-/// CLAUDE-264 infrastructure dedupe marker: the branch-agnostic collapsing key,
+/// Infrastructure dedupe marker: the branch-agnostic collapsing key,
 /// `(repo, workflow_id, job_name, infra_kind)`. `None` unless the consumer
 /// detected an infrastructure condition. It deliberately contains neither
 /// `branch` nor `commit_sha`, because a host condition (a full disk, an OOM
@@ -433,13 +432,13 @@ fn root_cause_marker(req: &MintRequest) -> String {
 /// identically however the message is worded or however many bytes free it
 /// reports. A code failure keeps the branch-scoped [`root_cause_marker`]: two
 /// unrelated bugs failing the same job on two branches must NOT merge, and the
-/// auto-fix route needs a single branch to deliver onto (CLAUDE-190).
+/// auto-fix route needs a single branch to deliver onto.
 fn infra_marker(req: &MintRequest) -> Option<String> {
     req.infra_kind
         .map(|kind| marker(&[req.repo, req.workflow_id, req.job_name, kind]))
 }
 
-/// CLAUDE-273: the same collapse key [`root_cause_marker`] / [`infra_marker`]
+/// The same collapse key [`root_cause_marker`] / [`infra_marker`]
 /// compute from a [`MintRequest`], but over plain arguments so the webhook
 /// consumer's legacy-adoption lookup (a `ci_failures` store miss, searched
 /// against YouTrack for an issue minted before the store existed) can build it
@@ -461,7 +460,7 @@ pub(crate) fn legacy_collapse_key(
     }
 }
 
-/// CLAUDE-190: extract a deterministic failure signature from a redacted log,
+/// Extract a deterministic failure signature from a redacted log,
 /// or `None` when the log carries no recognizable diagnostic line. Pure string
 /// work (no LLM, no I/O): the first diagnostic line, normalized so the same root
 /// cause across commits yields the same signature.
@@ -526,11 +525,11 @@ fn mask_digit_runs(s: &str) -> String {
 
 /// Mint (or decline to mint) a YouTrack issue from a triaged failure. Pure
 /// decision flow over the [`IssueTracker`] trait; see the module docs for the
-/// ordering (route -> caps -> create). CLAUDE-273: dedupe by failing-test
+/// ordering (route -> caps -> create). Dedupe by failing-test
 /// overlap now happens in the caller (`src/web/webhooks.rs`, against the
 /// `ci_failure` store) BEFORE this is ever called, so `mint` only creates; it
 /// no longer searches YouTrack or ever declines for a duplicate or a resolved
-/// issue. CLAUDE-276: the caller also now decides open-PR routing before this
+/// issue. The caller also now decides open-PR routing before this
 /// is ever called (the agent's own PR re-queues its issue directly, a human's
 /// PR gets a comment), so `mint` no longer takes a bot-loop or open-PR
 /// suppression decision either; every failure it is handed is one the caller
@@ -547,7 +546,7 @@ pub fn mint(
         return Ok(MintOutcome::SkippedTransient);
     };
 
-    // DEV-335 caps, reused: per-key attempt cap, then daily run cap.
+    // Caps, reused: per-key attempt cap, then daily run cap.
     if caps.attempts >= caps.max_attempts {
         return Ok(MintOutcome::SkippedAttemptCap);
     }
@@ -555,8 +554,8 @@ pub fn mint(
         return Ok(MintOutcome::SkippedDailyCap);
     }
 
-    // The markers below no longer drive a dedupe decision (CLAUDE-273 moved
-    // that to the `ci_failure` store), but `Dedupe-Key:` is still written into
+    // The markers below no longer drive a dedupe decision (moved
+    // to the `ci_failure` store), but `Dedupe-Key:` is still written into
     // the body because the legacy-adoption lookup searches YouTrack for it.
     let primary = primary_marker(req);
     let secondary = secondary_marker(req);
@@ -587,7 +586,7 @@ pub fn mint(
 
     // State first, then the authoritative AI Agent write last (bucket 1 only):
     // the `youtrack` action only picks the issue up once it is fully formed.
-    // CLAUDE-273: `auto_fix_enabled` now decides only this write, never
+    // `auto_fix_enabled` now decides only this write, never
     // whether the issue gets created at all.
     tracker.set_state(&key, &cfg.target_state)?;
     if route.queue_for_fix && req.auto_fix_enabled {
@@ -604,7 +603,7 @@ pub fn mint(
 
 /// First matching issue's `idReadable` for `query`, or `None` when the query
 /// matches nothing. Reuses the tracker's `yt list --query=<q> --json` surface.
-/// CLAUDE-273: kept `pub(crate)` for the webhook consumer's legacy adoption
+/// Kept `pub(crate)` for the webhook consumer's legacy adoption
 /// lookup (a `ci_failures` miss falls back to this one YouTrack full-text
 /// search, for an issue minted before the store existed).
 pub(crate) fn find_first(tracker: &dyn IssueTracker, query: &str) -> Result<Option<String>> {
@@ -616,7 +615,7 @@ pub(crate) fn find_first(tracker: &dyn IssueTracker, query: &str) -> Result<Opti
 }
 
 /// Short issue summary. The bare run metadata; the body carries the analysis.
-/// CLAUDE-104: an auto-fix failure gets a directive summary naming the concrete
+/// An auto-fix failure gets a directive summary naming the concrete
 /// problem (`Auto-fix: cargo fmt on ...`) instead of the generic `CI failure`.
 fn build_summary(req: &MintRequest) -> String {
     let short_sha = short_sha(req.commit_sha);
@@ -652,12 +651,12 @@ fn autofix_label<'a>(detail: &'a crate::autofix::AutoFix, workflow_id: &'a str) 
 
 /// Markdown issue body: the triage analysis, the run metadata, and the hidden
 /// `Dedupe-Key:` marker the legacy-adoption lookup searches for. `collapse` is
-/// the cross-run collapse key: the CLAUDE-190 root-cause key, or the CLAUDE-264
+/// the cross-run collapse key: the root-cause key, or the
 /// branch-agnostic infra key when an infrastructure condition was detected. It
 /// rides the `Dedupe-Key:` line, so a later run's `{collapse} #Unresolved`
 /// full-text search matches this issue.
 fn build_description(req: &MintRequest, primary: &str, secondary: &str, collapse: &str) -> String {
-    // CLAUDE-104: an auto-fix failure gets an implementation-spec body (concrete
+    // An auto-fix failure gets an implementation-spec body (concrete
     // problem, fix command, new-branch + PR-vs-main delivery instruction) with
     // no "human must commit directly to main" wording.
     if let Some(detail) = &req.triage.auto_fix {
@@ -675,7 +674,7 @@ fn build_description(req: &MintRequest, primary: &str, secondary: &str, collapse
             req.triage.bucket, req.triage.classified_by
         ),
         String::new(),
-        // CLAUDE-274: the analysis text now carries the AnalysisClassifier's
+        // The analysis text now carries the AnalysisClassifier's
         // full log-grounded report (not just a short classification
         // sentence), so it is capped here the same way the retired scheduled
         // analysis action capped its own comment.
@@ -699,7 +698,7 @@ fn build_description(req: &MintRequest, primary: &str, secondary: &str, collapse
     lines.join("\n")
 }
 
-/// CLAUDE-104: the implementation-spec body for an auto-fixable failure. Names
+/// The implementation-spec body for an auto-fixable failure. Names
 /// the concrete problem and the fix command(s), instructs the runner to deliver
 /// the fix on a fresh `chore/<kind>-<short-sha>` branch via a PR against `main`
 /// (never a direct push to main), and carries the same dedupe markers as the
@@ -944,7 +943,7 @@ mod tests {
         }
     }
 
-    /// CLAUDE-104: an auto-fix triage verdict carrying detector detail.
+    /// An auto-fix triage verdict carrying detector detail.
     fn auto_fix_triage(detail: crate::autofix::AutoFix) -> Triage {
         Triage {
             bucket: TriageBucket::AutoFix,
@@ -1002,7 +1001,7 @@ mod tests {
                 assign_human: true
             })
         );
-        // CLAUDE-104: an auto-fix routes like a code-fix (queued, no human).
+        // An auto-fix routes like a code-fix (queued, no human).
         assert_eq!(
             route(TriageBucket::AutoFix),
             Some(Route {
@@ -1013,7 +1012,7 @@ mod tests {
         assert_eq!(route(TriageBucket::Transient), None);
     }
 
-    // ---- CLAUDE-274: the description carries the (capped) analysis --------
+    // ---- the description carries the (capped) analysis --------
 
     #[test]
     fn build_description_carries_the_analysis_capped_at_the_shared_default() {
@@ -1044,7 +1043,7 @@ mod tests {
         assert!(description.contains(&t.analysis));
     }
 
-    // ---- CLAUDE-86: VCS-integration routing -------------------------------
+    // ---- VCS-integration routing -------------------------------
 
     #[test]
     fn route_order_override_beats_vcs_beats_fallback() {
@@ -1173,11 +1172,11 @@ mod tests {
         assert_eq!(p, primary_marker(&r));
     }
 
-    // ---- CLAUDE-204: no Run-Global-Id marker ------------------------------
+    // ---- no Run-Global-Id marker ------------------------------
 
     #[test]
     fn description_emits_no_run_global_id_marker() {
-        // CLAUDE-204: `fj actions logs` addresses a run by its per-repo number,
+        // `fj actions logs` addresses a run by its per-repo number,
         // so nothing reads a global id and the marker is gone from every body.
         let t = triage(TriageBucket::CodeFix);
         let r = req("owner/repo", &t, "alice");
@@ -1288,14 +1287,14 @@ mod tests {
         assert!(!calls.iter().any(|c| c.contains("AI Agent")), "{calls:?}");
     }
 
-    // ---- CLAUDE-276: open-PR routing is decided by the caller, not `mint` --
+    // ---- open-PR routing is decided by the caller, not `mint` --
 
     #[test]
     fn open_pr_no_longer_suppresses_the_auto_fix_mint() {
-        // CLAUDE-276: `mint` is only ever reached for a failure the caller has
+        // `mint` is only ever reached for a failure the caller has
         // already decided belongs to a fresh issue (no open PR, or the "same
         // failure on two branches" case), so `has_open_pr` alone no longer
-        // suppresses the queue-for-fix route the way CLAUDE-149's `SkippedOpenPr`
+        // suppresses the queue-for-fix route the way the old `SkippedOpenPr`
         // used to.
         let t = triage(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
@@ -1352,14 +1351,14 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-153: the webhook-scoped auto-fix toggle -------------------
+    // ---- the webhook-scoped auto-fix toggle -------------------
 
     #[test]
     fn auto_fix_off_still_creates_the_issue_but_leaves_ai_agent_unset() {
-        // CLAUDE-273: the webhook auto-fix toggle no longer decides whether an
+        // The webhook auto-fix toggle no longer decides whether an
         // issue is minted (every code failure is filed); off, a code-fix
         // failure still creates an issue but `AI Agent` is left unset, so no
-        // fixup PR is queued (CLAUDE-152: the failure stays on the PR).
+        // fixup PR is queued (the failure stays on the PR).
         let t = triage(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
         let mut r = req("fabrikam/forgejo-cli", &t, "alice");
@@ -1448,14 +1447,14 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-276: `mint` applies no bot-login guard of its own ----------
+    // ---- `mint` applies no bot-login guard of its own ----------
 
     #[test]
     fn mint_applies_no_bot_login_guard() {
-        // CLAUDE-149's `is_bot_loop` gate (matching `trigger_user` against
+        // The old `is_bot_loop` gate (matching `trigger_user` against
         // `bot_logins`) is gone from `mint`: the login mismatch that dropped run
-        // 5874 (`claude-run` vs the real `Claude-Run` login) is why CLAUDE-276
-        // replaced login matching with the `agent_pull_requests` store lookup,
+        // 5874 (`claude-run` vs the real `Claude-Run` login) is why login
+        // matching was replaced with the `agent_pull_requests` store lookup,
         // which intercepts the agent's own PR before `mint` is ever reached.
         let t = triage(TriageBucket::CodeFix);
         let tracker = StubTracker::new();
@@ -1490,7 +1489,7 @@ mod tests {
         assert!(tracker.calls().is_empty());
     }
 
-    // ---- AC 4: DEV-335 daily cap is enforced -------------------------------
+    // ---- AC 4: daily cap is enforced -------------------------------
 
     #[test]
     fn daily_cap_blocks_minting() {
@@ -1512,7 +1511,7 @@ mod tests {
         assert!(tracker.calls().is_empty());
     }
 
-    // ---- CLAUDE-273: mint no longer dedupes; it only creates --------------
+    // ---- `mint` no longer dedupes; it only creates --------------
 
     /// A request carrying a derived failure signature (the common case).
     fn req_with_sig<'a>(
@@ -1528,7 +1527,7 @@ mod tests {
 
     #[test]
     fn a_repeat_with_no_prior_yt_search_still_creates() {
-        // CLAUDE-273: dedupe by failing-test overlap now happens in the caller
+        // Dedupe by failing-test overlap now happens in the caller
         // against the `ci_failure` store, before `mint` is ever reached, so
         // `mint` issues no YouTrack search at all and always creates when the
         // gates above it (bucket, open-PR, bot-loop, caps) let it through.
@@ -1572,7 +1571,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-190: signature extraction + normalization -----------------
+    // ---- signature extraction + normalization -----------------
 
     #[test]
     fn signature_is_stable_across_commits_and_splits_on_cause() {
@@ -1612,7 +1611,7 @@ mod tests {
     #[test]
     fn description_embeds_the_dedupe_key_and_no_reconciler_markers() {
         // The root-cause key rides the Dedupe-Key line (searchable by the
-        // legacy-adoption lookup). CLAUDE-279: the reconciler-only
+        // legacy-adoption lookup). The reconciler-only
         // Root-Cause-Key / Branch / Job markers are no longer written.
         let t = triage(TriageBucket::CodeFix);
         let r = req_with_sig("owner/repo", &t, "alice", "boom");
@@ -1633,7 +1632,7 @@ mod tests {
         assert!(!body.contains("Infra-Kind:"), "{body}");
     }
 
-    // ---- CLAUDE-264: branch-agnostic infrastructure collapse --------------
+    // ---- branch-agnostic infrastructure collapse --------------
 
     /// A request carrying a detected infrastructure kind, on a named branch and
     /// commit (the two fields the infra key must ignore).
@@ -1676,7 +1675,7 @@ mod tests {
 
     #[test]
     fn two_branches_with_the_same_infra_kind_both_create_with_no_search() {
-        // CLAUDE-273: `mint` itself no longer collapses cross-branch infra
+        // `mint` itself no longer collapses cross-branch infra
         // repeats onto one issue via a YouTrack search (that dedupe now lives
         // in the caller, against the `ci_failure` store); each call here
         // creates independently and issues no dedupe search.
@@ -1701,7 +1700,7 @@ mod tests {
 
     #[test]
     fn two_branches_with_runner_unavailable_share_one_marker_and_create() {
-        // CLAUDE-266: `could not resolve host` now reaches the mint as a
+        // `could not resolve host` now reaches the mint as a
         // human-assigned issue keyed on the branch-agnostic infra kind.
         let t = triage(TriageBucket::HumanAction);
         let first = req_infra(&t, "runner-unavailable", "fix/a", "aaaa1111");
@@ -1726,7 +1725,7 @@ mod tests {
     fn infra_body_carries_the_infra_key_in_the_dedupe_line_only() {
         // The Dedupe-Key line's collapse segment holds the INFRA key, and no
         // Root-Cause-Key / Infra-Kind / Branch / Job marker lines are written
-        // (CLAUDE-279 removed the reconciler-only markers).
+        // (the reconciler-only markers were removed).
         let t = triage(TriageBucket::HumanAction);
         let r = req_infra(&t, "disk-full", "feat/x", "aaaa1111");
         let infra = infra_marker(&r).unwrap();
@@ -1759,7 +1758,7 @@ mod tests {
         );
     }
 
-    // ---- CLAUDE-104: auto-fix minting -------------------------------------
+    // ---- auto-fix minting -------------------------------------
 
     #[test]
     fn auto_fix_creates_a_queued_issue_with_no_human_assignee() {

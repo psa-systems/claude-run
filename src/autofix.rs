@@ -1,4 +1,4 @@
-//! CLAUDE-104: deterministic auto-fix detector layer.
+//! Deterministic auto-fix detector layer.
 //!
 //! A verification-only CI failure (the canonical case is `cargo fmt --check`;
 //! the general case is any failure of a configured checks workflow, default

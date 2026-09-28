@@ -21,11 +21,10 @@
 //! - An Anthropic API key is stored (Settings -> Auth).
 //! - `ANTHROPIC_API_KEY` is set in the daemon's environment.
 //!
-//! CLAUDE-269 adds a second, independent not-ready axis: a login that WAS
+//! There is a second, independent not-ready axis: a login that WAS
 //! present but has expired or been revoked. `.credentials.json` stays on disk in
 //! that case, so the credential check above keeps answering ready; nothing here
-//! reads the file's own expiry (see the CLAUDE-269 "Alternatives considered" for
-//! why). Instead, [`ReadinessGate::trip_login_required`] is called from every
+//! reads the file's own expiry. Instead, [`ReadinessGate::trip_login_required`] is called from every
 //! place that actually talks to the CLI and can observe the CLI say so:
 //! [`crate::claude::ClaudeInvoker::invoke`] (structured `authentication_failed`
 //! on the stream) and the `claude auth status --json` probe. The two axes are
@@ -121,7 +120,7 @@ pub struct ReadinessGate {
     /// CREDENTIAL axis only; the login-required axis logs independently (see
     /// [`Self::trip_login_required`]).
     last_ready: Arc<AtomicBool>,
-    /// CLAUDE-269: set when the CLI itself reported an authentication failure,
+    /// Set when the CLI itself reported an authentication failure,
     /// cleared on a successful sign-in / API key save / a probe reporting
     /// `loggedIn: true`. Not persisted: a restart re-derives it from the
     /// startup probe, and a re-trip after a restart costs nothing.
@@ -382,7 +381,7 @@ mod tests {
         assert!(gate.ready());
     }
 
-    /// CLAUDE-269: a credential file on disk stays ready from the OLD axis, but
+    /// A credential file on disk stays ready from the OLD axis, but
     /// a trip makes the gate answer not-ready with the login-required kind, the
     /// CLI's message, and a detection time. `.credentials.json` is untouched by
     /// this, matching the real CLI behavior an expired login leaves on disk.

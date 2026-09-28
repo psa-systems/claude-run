@@ -49,7 +49,7 @@
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); }
     th { color: var(--fg-dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
-    /* CLAUDE-140: clickable sort headers + per-column filter dropdowns on the run-detail tables. */
+    /* Clickable sort headers + per-column filter dropdowns on the run-detail tables. */
     a.sort-link { color: inherit; text-decoration: none; cursor: pointer; white-space: nowrap; }
     a.sort-link:hover { color: var(--fg); }
     th select { display: block; margin-top: 4px; background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; padding: 2px 4px; text-transform: none; letter-spacing: 0; font-weight: normal; }
@@ -71,7 +71,7 @@
     .activity { font-family: var(--mono); }
     .activity.stale { color: var(--bad); font-weight: bold; }
     .activity.live { color: var(--ok); }
-    /* CLAUDE-89: run-detail summary column clamp + view-details dialog. */
+    /* Run-detail summary column clamp + view-details dialog. */
     td.summary-cell { max-width: 360px; }
     .clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
     dialog.summary-dialog { background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 16px; max-width: 720px; width: 90vw; max-height: 80vh; overflow: auto; }
@@ -91,11 +91,11 @@
     footer { color: var(--fg-dim); font-size: 11px; padding: 24px; text-align: center; }
   </style>
   <script src="/static/htmx.min.js"></script>
-  <!-- CLAUDE-139: idiomorph htmx extension; registers the `morph` swap so the
+  <!-- idiomorph htmx extension; registers the `morph` swap so the
        live poll patches the DOM in place instead of replacing it. -->
   <script src="/static/idiomorph-ext.min.js"></script>
 </head>
-<!-- CLAUDE-139: enable the idiomorph `morph` swap extension for all descendants
+<!-- Enable the idiomorph `morph` swap extension for all descendants
      (poll regions opt in per-element via hx-swap="morph:..."). -->
 <body hx-ext="morph">
   <header>
@@ -115,14 +115,14 @@
     <nav class="breadcrumb" aria-label="Breadcrumb">
       {% block breadcrumb %}{% endblock %}
     </nav>
-    {# CLAUDE-269: shared not-ready banner (no Claude credential, or the CLI
+    {# Shared not-ready banner (no Claude credential, or the CLI
        reported the login expired/revoked), polled on every page so it is
        visible wherever the operator happens to be, not only the dashboard. #}
     <div id="claude-readiness-banner"
          hx-get="/settings/auth/claude/banner"
          hx-trigger="load, every 30s"
          hx-swap="innerHTML"></div>
-    {# CLAUDE-223: page-level failure banner for every hx-post control. Nearly all
+    {# Page-level failure banner for every hx-post control. Nearly all
        of them use hx-swap="none", which discards the response body, so before
        this a refused action (a 409 from a trigger on a paused daemon, a 500 from
        a pause write) looked exactly like a successful one. htmx does not swap a

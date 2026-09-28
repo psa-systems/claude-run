@@ -1,6 +1,6 @@
-//! CLAUDE-175: age-based retention prune for the unbounded history tables.
+//! Age-based retention prune for the unbounded history tables.
 //!
-//! `job_outcomes` (and, per CLAUDE-172, `run_events`) grow without bound: every
+//! `job_outcomes` (and `run_events`) grow without bound: every
 //! job outcome and every poll-phase diagnostic is appended and nothing ever
 //! deletes them. This module is the one shared mechanism that bounds them, so
 //! the two prunes are a single consistent subsystem rather than two divergent
@@ -34,18 +34,18 @@ pub struct RetentionTable {
     pub ts_col: &'static str,
 }
 
-/// The tables the daemon retention sweep prunes. `job_outcomes` is the driver
-/// (CLAUDE-175); `run_events` (CLAUDE-172) joins the same list, each with its
+/// The tables the daemon retention sweep prunes. `job_outcomes` is the driver;
+/// `run_events` joins the same list, each with its
 /// own single-column `ts` index (`idx_job_outcomes_ts` from migration 0017,
 /// `idx_run_events_ts` from migration 0018) so both share this exact helper,
 /// config, and loop.
-/// `ci_failure_runs` (CLAUDE-272) joins the same list: a run sighting is a
+/// `ci_failure_runs` joins the same list: a run sighting is a
 /// per-occurrence history row, pruned the same way. The other three
 /// CI-failure tables (`ci_failures`, `ci_failure_tests`,
 /// `agent_pull_requests`) are deliberately absent: a resolved failure or a
 /// merged PR must still match a regression months later, so only the
 /// per-sighting history is bounded.
-/// `claude_invocations` (CLAUDE-315) joins the same list for the same reason:
+/// `claude_invocations` joins the same list for the same reason:
 /// one row per `claude` invocation is per-occurrence history, not a lookup
 /// table another feature needs to match against indefinitely.
 pub const RETENTION_TABLES: &[RetentionTable] = &[
@@ -262,7 +262,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-172: the shared sweep prunes aged `run_events` rows and keeps the
+    /// The shared sweep prunes aged `run_events` rows and keeps the
     /// in-window ones, in the same pass as `job_outcomes`.
     #[tokio::test]
     async fn prunes_run_events_past_the_window_keeps_fresh() {
@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(survivor, "FRESH", "the in-window run_events row is kept");
     }
 
-    /// CLAUDE-172: a disabled sweep must not prune `run_events` either.
+    /// A disabled sweep must not prune `run_events` either.
     #[tokio::test]
     async fn disabled_sweep_keeps_run_events() {
         let pool = pool().await;
@@ -330,7 +330,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-172: guard that `run_events` is actually wired into the shared
+    /// Guard that `run_events` is actually wired into the shared
     /// retention list, so appending it cannot silently regress.
     #[test]
     fn run_events_is_in_retention_tables() {
@@ -352,7 +352,7 @@ mod tests {
         );
     }
 
-    /// CLAUDE-272: `ci_failure_runs` rows older than the window are pruned,
+    /// `ci_failure_runs` rows older than the window are pruned,
     /// like `job_outcomes` and `run_events`; the other three CI-failure tables
     /// (`ci_failures`, `ci_failure_tests`, `agent_pull_requests`) are never
     /// swept, because a resolved failure or a merged PR must still be
