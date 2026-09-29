@@ -4376,10 +4376,20 @@ async fn mark_agent_pr_merged(
 /// still routes to "no action" (or, for a PR that raced closed between the
 /// list and the status call, by the forge call itself failing, which is
 /// surfaced the same way any other `apply_automerge_decision` fault is).
+///
+/// `listing_failures` tracks, per `(host, repo)`, how many consecutive
+/// passes `list_open_pr_numbers` has failed for that pair. It is owned by the
+/// caller (`daemon::automerge_reconciler_loop`) and lives only in memory: a
+/// daemon restart starts empty, so a restart never produces a false
+/// "recovered", and a failure that predates a restart simply never gets a
+/// recovery line. The first later pass on which the listing succeeds removes
+/// the entry and writes a `recovered` `run_events` row naming the repo and
+/// how many passes failed.
 pub(crate) async fn reconcile_automerge(
     pool: &DbPool,
     mint: &MintContext,
     keygate: &crate::concurrency::KeyGate,
+    listing_failures: &mut std::collections::HashMap<(String, String), u32>,
 ) {
     // The reconciler writes to the forge and tracker, so it honours
     // the same pauses the webhook ingest does.
@@ -4405,6 +4415,21 @@ pub(crate) async fn reconcile_automerge(
         let repo_key = (row.host.clone(), row.repo.clone());
         if !open_by_repo.contains_key(&repo_key) {
             let listed = list_open_pr_numbers(pool, mint, &row.host, &row.repo).await;
+            match &listed {
+                Some(_) => {
+                    if let Some(failed_passes) = listing_failures.remove(&repo_key) {
+                        let msg = format!(
+                            "automerge reconciler: list_open_prs for {} recovered after {} failed pass(es)",
+                            row.repo, failed_passes
+                        );
+                        info!(repo = %row.repo, failed_passes, "{msg}");
+                        record_run_event(pool, None, WEBHOOK_MINT_ACTION, "info", msg).await;
+                    }
+                }
+                None => {
+                    *listing_failures.entry(repo_key.clone()).or_insert(0) += 1;
+                }
+            }
             open_by_repo.insert(repo_key.clone(), listed);
         }
         match &open_by_repo[&repo_key] {
@@ -10108,7 +10133,13 @@ mod tests {
                     .with_pr_status_behind(state, mergeable, behind_base),
             );
             let ctx_b = ctx_for(pool_b.clone(), backend_b.clone(), dir_b.path());
-            reconcile_automerge(&pool_b, &ctx_b, &crate::concurrency::KeyGate::new()).await;
+            reconcile_automerge(
+                &pool_b,
+                &ctx_b,
+                &crate::concurrency::KeyGate::new(),
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
 
             assert_eq!(
                 backend_a.calls(),
@@ -10153,7 +10184,13 @@ mod tests {
             );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
-            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+            reconcile_automerge(
+                &pool,
+                &ctx,
+                &crate::concurrency::KeyGate::new(),
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
 
             let calls = backend.calls();
             assert!(calls.iter().any(|c| c == "merge_pr 7"), "{calls:?}");
@@ -10188,7 +10225,13 @@ mod tests {
             );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
-            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+            reconcile_automerge(
+                &pool,
+                &ctx,
+                &crate::concurrency::KeyGate::new(),
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
 
             assert!(backend.calls().is_empty(), "{:?}", backend.calls());
         }
@@ -10219,7 +10262,13 @@ mod tests {
             );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
-            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+            reconcile_automerge(
+                &pool,
+                &ctx,
+                &crate::concurrency::KeyGate::new(),
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
 
             assert!(backend.calls().is_empty(), "{:?}", backend.calls());
         }
@@ -10263,7 +10312,7 @@ mod tests {
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
             let gate = crate::concurrency::KeyGate::new();
 
-            reconcile_automerge(&pool, &ctx, &gate).await;
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
             assert_eq!(row_state(&pool).await, "merged");
             assert!(ci_failure_store::open_agent_prs(&pool)
                 .await
@@ -10271,7 +10320,7 @@ mod tests {
                 .is_empty());
 
             let calls_after_first = backend.calls().len();
-            reconcile_automerge(&pool, &ctx, &gate).await;
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
             assert_eq!(backend.calls().len(), calls_after_first);
         }
 
@@ -10289,7 +10338,13 @@ mod tests {
             );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
-            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+            reconcile_automerge(
+                &pool,
+                &ctx,
+                &crate::concurrency::KeyGate::new(),
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
 
             assert!(backend.calls().iter().any(|c| c == "merge_pr 7"));
             assert_eq!(row_state(&pool).await, "merged");
@@ -10306,7 +10361,13 @@ mod tests {
             let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(99, "")]));
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
-            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+            reconcile_automerge(
+                &pool,
+                &ctx,
+                &crate::concurrency::KeyGate::new(),
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
 
             assert_eq!(row_state(&pool).await, "closed");
             assert!(backend.calls().is_empty(), "{:?}", backend.calls());
@@ -10326,10 +10387,105 @@ mod tests {
             let backend = Arc::new(StoreBackend::new().with_open_prs_error("fj: connection reset"));
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
-            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+            reconcile_automerge(
+                &pool,
+                &ctx,
+                &crate::concurrency::KeyGate::new(),
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
 
             assert_eq!(row_state(&pool).await, "open");
             assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+        }
+
+        async fn recovered_events(pool: &DbPool) -> Vec<String> {
+            state::run_events_for_action(pool, WEBHOOK_MINT_ACTION, 50)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.message.contains("recovered after"))
+                .map(|e| e.message.clone())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn listing_recovery_after_failure_is_recorded_once() {
+            // A failing listing then a succeeding one writes exactly one
+            // `recovered` row naming the repo and the failed-pass count.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(StoreBackend::new().with_open_prs_error("fj: connection reset"));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let gate = crate::concurrency::KeyGate::new();
+            let mut listing_failures = std::collections::HashMap::new();
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut listing_failures).await;
+            assert!(recovered_events(&pool).await.is_empty());
+
+            *backend.open_prs_error.lock().unwrap() = None;
+            *backend.open_prs.lock().unwrap() = vec![pr(7, "")];
+            reconcile_automerge(&pool, &ctx, &gate, &mut listing_failures).await;
+
+            let recovered = recovered_events(&pool).await;
+            assert_eq!(recovered.len(), 1, "{recovered:?}");
+            assert!(
+                recovered[0].contains("contoso/claude-run")
+                    && recovered[0].contains("1 failed pass"),
+                "{recovered:?}"
+            );
+
+            // A second consecutive success writes no second row.
+            reconcile_automerge(&pool, &ctx, &gate, &mut listing_failures).await;
+            assert_eq!(recovered_events(&pool).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn listing_failure_alone_writes_no_recovery_row() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(StoreBackend::new().with_open_prs_error("fj: connection reset"));
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let mut listing_failures = std::collections::HashMap::new();
+
+            reconcile_automerge(
+                &pool,
+                &ctx,
+                &crate::concurrency::KeyGate::new(),
+                &mut listing_failures,
+            )
+            .await;
+
+            assert!(recovered_events(&pool).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn listing_success_with_no_prior_failure_writes_no_recovery_row() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("pending", false),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let mut listing_failures = std::collections::HashMap::new();
+
+            reconcile_automerge(
+                &pool,
+                &ctx,
+                &crate::concurrency::KeyGate::new(),
+                &mut listing_failures,
+            )
+            .await;
+
+            assert!(recovered_events(&pool).await.is_empty());
         }
 
         #[tokio::test]
@@ -10342,7 +10498,13 @@ mod tests {
             let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
-            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+            reconcile_automerge(
+                &pool,
+                &ctx,
+                &crate::concurrency::KeyGate::new(),
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
 
             assert!(backend.calls().is_empty(), "{:?}", backend.calls());
             assert_eq!(row_state(&pool).await, "open");
@@ -10360,7 +10522,13 @@ mod tests {
             let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
-            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+            reconcile_automerge(
+                &pool,
+                &ctx,
+                &crate::concurrency::KeyGate::new(),
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
             assert!(backend.calls().is_empty(), "{:?}", backend.calls());
         }
 
@@ -10390,7 +10558,13 @@ mod tests {
             );
             let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
 
-            reconcile_automerge(&pool, &ctx, &crate::concurrency::KeyGate::new()).await;
+            reconcile_automerge(
+                &pool,
+                &ctx,
+                &crate::concurrency::KeyGate::new(),
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
 
             assert!(
                 !backend.calls().iter().any(|c| c.starts_with("merge_pr")),
@@ -10426,8 +10600,8 @@ mod tests {
                     .count()
             };
 
-            reconcile_automerge(&pool, &ctx, &gate).await;
-            reconcile_automerge(&pool, &ctx, &gate).await;
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
             assert_eq!(comments(&backend), 1, "{:?}", backend.calls());
             assert_eq!(events().await, 2);
 
@@ -10445,7 +10619,7 @@ mod tests {
             )
             .await
             .unwrap();
-            reconcile_automerge(&pool, &ctx, &gate).await;
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
             assert_eq!(comments(&backend), 2, "{:?}", backend.calls());
         }
 
