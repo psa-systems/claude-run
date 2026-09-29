@@ -409,6 +409,12 @@ pub struct CommentWebhookConfig {
     /// action's ledger, read per command so a Settings save applies to the next
     /// one. Must be at least 1 (validated in `src/settings.rs`); default 20.
     pub max_runs_per_day: u32,
+    /// Per-run `claude` session timeout in seconds for the `/claude` comment
+    /// listener, read live per command (CLAUDE-364, mirroring
+    /// `WebhookConfig::analysis_timeout_secs`) instead of the daemon-wide
+    /// `RunnerDefaults::claude_timeout_seconds`. Must be at least 1 (validated
+    /// in `src/settings.rs`); default 600 matches the prior hard-coded value.
+    pub claude_timeout_seconds: u32,
 }
 
 impl Default for CommentWebhookConfig {
@@ -419,6 +425,7 @@ impl Default for CommentWebhookConfig {
             max_instruction_chars: 4000,
             sources: BTreeMap::new(),
             max_runs_per_day: 20,
+            claude_timeout_seconds: 600,
         }
     }
 }
@@ -1349,6 +1356,7 @@ mod tests {
         let d = CommentWebhookConfig::default();
         assert_eq!(d.trigger, "/claude");
         assert_eq!(d.max_instruction_chars, 4000);
+        assert_eq!(d.claude_timeout_seconds, 600);
         assert!(d.sources.is_empty());
         let s = CommentWebhookSource::default();
         assert_eq!(s.allowed_permissions, vec!["write", "admin"]);
