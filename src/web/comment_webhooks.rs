@@ -1,8 +1,12 @@
 //! Comment-command webhook listener.
 //!
 //! `POST /webhooks/{provider}/comment/{source}` receives `issue_comment`
-//! deliveries from the forge named by `{provider}` ([`super::webhooks::WebhookProvider`];
-//! only `forgejo` is implemented today). A human comments `/claude <instruction>`
+//! deliveries from the forge named by `{provider}` ([`super::webhooks::WebhookProvider`]:
+//! `forgejo` or `github`, sharing every route below). GitHub's `issue_comment`
+//! event fires for a comment on a pull request too (PRs are issues under
+//! GitHub's data model), the same way Forgejo's single `issue_comment` event
+//! covers both, so [`CommentPayload`] needs no GitHub-specific shape. A human
+//! comments `/claude <instruction>`
 //! and claude-run serves it
 //! on one of two routes, chosen by whether the comment's thread is a pull
 //! request:
@@ -76,7 +80,7 @@ use crate::claude::{ClaudeInvoker, ClaudeResult};
 use crate::concurrency::KeyGate;
 use crate::config::{CommentWebhookConfig, CommentWebhookSource, MintConfig, Paths};
 use crate::job::RunnerDefaults;
-use crate::provider::{Backend, CliBackend, Forge, IssueTracker, ProcessRunner};
+use crate::provider::{Backend, CliBackend, Forge, GithubForge, IssueTracker, ProcessRunner};
 use crate::secrets::{self, SecretsKey};
 use crate::state;
 
@@ -869,8 +873,12 @@ pub fn admit(
 }
 
 /// Resolve the source's `write_token_ref` and build a forge backend that carries
-/// it in a temp single-host `keys.json`, so the token
-/// never appears in YAML, env, a process argument, or a settings response.
+/// it, so the token never appears in YAML, env, a process argument, or a
+/// settings response. A GitHub-provider source (`src.provider`, the config's
+/// own answer rather than a host guess) routes through [`GithubForge`]
+/// instead of the `fj`-based [`CliBackend`], mirroring
+/// `native::youtrack`'s per-job Forge pick and
+/// `webhooks::build_pr_comment_backend`'s identical branch.
 async fn build_env(
     ctx: &CommentContext,
     cmd: &VerifiedCommentCommand,
@@ -888,6 +896,25 @@ async fn build_env(
         .trim()
         .to_string();
     let dir = creds_root(&ctx.paths).join(secrets::unique_suffix());
+    if src.provider == WebhookProvider::Github {
+        let creds = secrets::JobCredentials::materialize(
+            &dir,
+            &secrets::ResolvedCredentials {
+                github_token: Some(token),
+                ..Default::default()
+            },
+            None,
+        )?;
+        let forge = GithubForge::new(
+            Arc::new(ProcessRunner::new()),
+            crate::action::default_github_mcp_endpoint(),
+            creds.github_token.clone(),
+        );
+        return Ok(ServeEnv {
+            backend: Box::new(forge),
+            _creds: creds,
+        });
+    }
     let creds = secrets::JobCredentials::materialize(
         &dir,
         &secrets::ResolvedCredentials {
@@ -3597,6 +3624,61 @@ mod tests {
         assert!(!dir.exists(), "the temp credential dir is removed on drop");
     }
 
+    /// A `Github`-provider source routes push/comment operations through
+    /// [`GithubForge`], never the `fj`-based [`CliBackend`], mirroring
+    /// `webhooks::build_pr_comment_backend`'s identical branch.
+    #[tokio::test]
+    async fn github_provider_source_routes_through_github_forge() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = setup_pool(tmp.path()).await;
+        let key = SecretsKey::load().unwrap();
+        let ciphertext = key.encrypt("super-secret-gh-pat").unwrap();
+        state::secret_create(&pool, "gh-write-pat", &ciphertext)
+            .await
+            .unwrap();
+
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let ctx = CommentContext {
+            pool,
+            paths,
+            claude: Arc::new(ClaudeInvoker::new(None)),
+            config: Arc::new(RwLock::new(config())),
+            mint_cfg: Arc::new(RwLock::new(MintConfig::default())),
+            route_cache: Arc::new(crate::mint::VcsRouteCache::new(
+                crate::mint::DEFAULT_VCS_MAP_TTL,
+            )),
+            defaults: RunnerDefaults::default(),
+            keygate: KeyGate::new(),
+            denials: Arc::new(DenialReplyLimiter::new()),
+            readiness: None,
+        };
+        let cmd = command_of(&payload_json(
+            "created",
+            REPO,
+            "/claude fix it",
+            "alice",
+            true,
+        ))
+        .unwrap();
+        let src = CommentWebhookSource {
+            write_token_ref: Some("gh-write-pat".to_string()),
+            provider: WebhookProvider::Github,
+            ..Default::default()
+        };
+        let env = build_env(&ctx, &cmd, &src).await.expect("env built");
+        assert_eq!(
+            env.backend.name(),
+            "github",
+            "a Github-provider source must never fall through to the fj-based CliBackend"
+        );
+    }
+
     /// While the Claude login needs renewing, `run_instruction`
     /// replies naming the reason, invokes no `claude`, and advances no counter
     /// (checked before `admit`, so a redelivery still sees zero attempts once
@@ -3821,7 +3903,7 @@ mod tests {
         let sig = sign(SECRET.as_bytes(), raw.as_bytes());
         let resp = forgejo_comment_webhook(
             State(st.clone()),
-            Path(("github".to_string(), SOURCE.to_string())),
+            Path(("gitlab".to_string(), SOURCE.to_string())),
             headers(Some(&sig), Some("d-provider")),
             Bytes::from(raw),
         )
@@ -3829,12 +3911,26 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    /// A [`WebhookProvider`] has exactly one variant today, so an actual
-    /// provider/source mismatch (a source configured for one provider, hit
-    /// through a URL naming another) cannot yet be constructed. This pins the
-    /// default-and-round-trip mechanics `provider == provider` depends on, so
-    /// the mismatch check in the handler stays meaningful once a second
-    /// variant exists.
+    /// `SOURCE` is configured with `provider: WebhookProvider::Forgejo`
+    /// (`config`'s default), so a request against the `github` URL segment
+    /// 404s on the source-vs-URL-provider mismatch rather than proceeding.
+    #[tokio::test]
+    async fn provider_source_mismatch_is_404() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _rx) = state_for(tmp.path()).await;
+        let raw = payload_json("created", REPO, "/claude fix it", "alice", true);
+        let sig = sign(SECRET.as_bytes(), raw.as_bytes());
+        let resp = forgejo_comment_webhook(
+            State(st.clone()),
+            Path(("github".to_string(), SOURCE.to_string())),
+            headers(Some(&sig), Some("d-provider-mismatch")),
+            Bytes::from(raw),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn comment_webhook_source_provider_defaults_to_forgejo_and_round_trips() {
         let src: CommentWebhookSource = serde_json::from_str(r#"{"secret_ref":"x"}"#).unwrap();

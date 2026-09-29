@@ -922,11 +922,13 @@ Auth (and every action `token_ref`) reads from an encrypted secrets store. Two t
 
    `auth_token_ref` is the **name** of a stored secret. It is not the token value and not the `age` public key.
 
-## Webhook (Forgejo)
+## Webhook (Forgejo or GitHub)
 
 **CLAUDE-361: the route carries an explicit `{provider}` segment.** The CI-failure listener now lives at
 `POST /webhooks/{provider}/triage/<source>` and the comment listener at `POST /webhooks/{provider}/comment/<source>`,
-with `{provider}` naming the sending forge (only `forgejo` is implemented today). This replaces the earlier
+with `{provider}` naming the sending forge: `forgejo` or `github` (CLAUDE-362 adds `github`). Each source's own
+`provider` config field, not the URL, is authoritative - a request against `/webhooks/github/<segment>` for a source
+configured `provider: forgejo` 404s the same way an unconfigured source does. This replaces the earlier
 `/webhooks/forgejo/<source>` and `/webhooks/forgejo-comment/<source>` paths, and the synthetic action names moved with
 them: `webhook-forgejo` is now `webhook-triage`, and `webhook-forgejo-comment` is now `webhook-comment`. The old
 routes 404; update every configured Forgejo webhook URL to the new paths (e.g.
@@ -1235,6 +1237,33 @@ migration signal. To switch from the single SITE-level system webhook to one ORG
 5. Verify: one failing run per org produces a `verified action_run_failure received` log line carrying the right`source`
    field. The old shared secret can be deleted after a burn-in period.
 
+### GitHub setup (CLAUDE-362)
+
+A source's `provider` field, not the URL, decides which signature scheme and event names the listener expects; set
+`provider: github` on the source and point the URL at `https://<daemon-host>/webhooks/github/triage/<source>` instead
+of `/webhooks/forgejo/...`. A Forgejo source and a GitHub source can share one `[webhook]` config, one daily run cap,
+and one Pause switch, each keyed by its own `sources.<name>` entry.
+
+1. Generate and store one secret: `printf %s '<distinct-random-value>' | claude-run secret set github-hmac-<org>`.
+2. In GitHub, on the repo or org's Settings -> Webhooks, add a webhook with Payload URL
+   `https://<daemon-host>/webhooks/github/triage/<source>`, Content type `application/json`, Secret set to that
+   stored value, and select the single **Workflow runs** event (`workflow_run`). GitHub folds `requested` /
+   `in_progress` / `completed` into that one event type rather than Forgejo's separate failure/success/recover
+   events, and the listener only acts on a `completed` delivery, reading the outcome from
+   `workflow_run.conclusion` rather than from the event name. If any `youtrack` action in this org has
+   `automerge.enabled: true`, no extra event selection is needed: the same `workflow_run` delivery covers a
+   successful conclusion too.
+3. Set `secret_ref` to the stored secret's name and `log_token_ref` (a token with the `actions:read` and
+   `contents:read` scopes) on the source.
+4. Verify: GitHub signs each delivery with `X-Hub-Signature-256: sha256=<hex hmac>` rather than Forgejo's bare-hex
+   `X-Forgejo-Signature`, and identifies the delivery with `X-GitHub-Delivery` / `X-GitHub-Event` rather than
+   `X-Forgejo-Delivery` / `X-Forgejo-Event`; the listener verifies and parses accordingly for a `github`-provider
+   source, so a failing workflow run should still produce a `verified action_run_failure received` log line
+   carrying the right `source` field.
+
+Fetching a GitHub-hosted run's own log (the text the triage classifier reads) is not yet implemented; see the
+`GitHub log fetch is out of scope for CLAUDE-362` note in `actions/SCHEMA.md`.
+
 ## Comment commands on a pull request or an issue (CLAUDE-220, CLAUDE-221)
 
 A second inbound listener turns a `/claude <instruction>` comment on a Forgejo thread into work. The endpoint is
@@ -1354,6 +1383,18 @@ repository, because Forgejo answers a permission read only for a site admin, a r
 queried (`GetRepoPermissions`, `routers/api/v1/repo/collaborators.go`); without it every command replies "could not
 verify permission". Store the write PAT first, e.g.
 `printf %s '<pat>' | claude-run secret set forgejo-write-<org>`, and name it in the source's `write_token_ref`.
+
+**GitHub setup.** Set `provider: github` on the source and use
+`https://<daemon-host>/webhooks/github/comment/<source>` as the Payload URL, Content type `application/json`,
+Secret set to the source's stored `secret_ref` value. GitHub has no separate pull-request-comment event: select the
+single **Issue comments** event (`issue_comment`), which fires for a comment on either a plain issue or a pull
+request, and the listener tells them apart the same way GitHub's own payload does, by whether `issue.pull_request`
+is present. Store the write PAT first, e.g. `printf %s '<pat>' | claude-run secret set github-write-<org>`, and name
+it in the source's `write_token_ref`; it needs `contents:write` (to push the branch), `pull_requests:write`, and
+`issues:write` scopes. Authorization is a live read of the commenter's permission via `GithubForge::repo_permission`
+(`gh api repos/<owner>/<repo>/collaborators/<username>/permission --jq .permission`), matched against the source's
+`allowed_permissions` the same way as the Forgejo route; the token used for that read needs read access to the
+repository's collaborators, which a token with `contents:write` on a repo the bot administers already has.
 
 ## Containerized deployment
 

@@ -29,8 +29,11 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use super::cli::CommandRunner;
-use super::{BackendKind, Forge, ForgePullRequest, PullRequest, GITHUB_PRIORITY};
+use super::cli::{CliBackend, CommandRunner};
+use super::{
+    Backend, BackendKind, Forge, ForgePullRequest, IssueInspect, IssueLink, IssueTracker,
+    PullRequest, VcsMapEntry, VcsRepo, GITHUB_PRIORITY,
+};
 use crate::error::{Error, Result};
 
 /// The canonical public GitHub host.
@@ -360,6 +363,37 @@ impl GithubForge {
         parse_pr_from_mcp(&result)
     }
 
+    /// Shared `gh <kind> comment <number> --repo <repo> --body-file <path>`
+    /// runner backing [`Forge::pr_comment`] / [`Forge::issue_comment`]. `kind`
+    /// is `"pr"` or `"issue"`; both subcommands take an identical shape.
+    fn gh_comment(&self, repo: &str, kind: &str, number: u64, body_file: &Path) -> Result<()> {
+        let envs: Vec<(&str, &str)> = match &self.token {
+            Some(t) => vec![("GH_TOKEN", t.as_str())],
+            None => Vec::new(),
+        };
+        let number_str = number.to_string();
+        let body_path = body_file.to_string_lossy().into_owned();
+        let args = [
+            kind,
+            "comment",
+            &number_str,
+            "--repo",
+            repo,
+            "--body-file",
+            &body_path,
+        ];
+        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        if !out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: args.join(" "),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Open the PR via `gh pr create`, parsing the printed PR URL.
     fn open_via_gh(
         &self,
@@ -596,24 +630,129 @@ impl Forge for GithubForge {
         Err(unsupported("pr_ci_state"))
     }
 
-    fn pr_comment(
-        &self,
-        _host: &str,
-        _repo: &str,
-        _pr_number: u64,
-        _body_file: &Path,
-    ) -> Result<()> {
-        Err(unsupported("pr_comment"))
+    /// `gh api repos/<repo>/collaborators/<username>/permission --jq
+    /// .permission`, run with the action's PAT as `GH_TOKEN` exactly as
+    /// `repo_access` does. GitHub's REST response's `permission` field is one
+    /// of `admin` / `write` / `read` / `none` (GitHub has no separate `owner`
+    /// level; `admin` already ranks highest against the comment
+    /// listener's `allowed_permissions` check), returned verbatim like the
+    /// Forgejo backend's own `permission` field.
+    fn repo_permission(&self, _host: &str, repo: &str, username: &str) -> Result<String> {
+        let envs: Vec<(&str, &str)> = match &self.token {
+            Some(t) => vec![("GH_TOKEN", t.as_str())],
+            None => Vec::new(),
+        };
+        let path = format!("repos/{repo}/collaborators/{username}/permission");
+        let args = ["api", &path, "--jq", ".permission"];
+        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        if !out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: args.join(" "),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(out.stdout.trim().to_string())
+    }
+
+    fn pr_comment(&self, _host: &str, repo: &str, pr_number: u64, body_file: &Path) -> Result<()> {
+        self.gh_comment(repo, "pr", pr_number, body_file)
     }
 
     fn issue_comment(
         &self,
         _host: &str,
-        _repo: &str,
-        _issue_number: u64,
-        _body_file: &Path,
+        repo: &str,
+        issue_number: u64,
+        body_file: &Path,
     ) -> Result<()> {
-        Err(unsupported("issue_comment"))
+        self.gh_comment(repo, "issue", issue_number, body_file)
+    }
+}
+
+/// Forward every [`IssueTracker`] operation to a fresh, cheap
+/// [`CliBackend`] (default `yt`/`fj` binaries, no per-call state, so a new one
+/// per call costs nothing). A YouTrack write needs no GitHub credential or
+/// state, only ambient `yt` auth exactly like the Forgejo path; this is what
+/// lets a GitHub-provider webhook source's `Box<dyn Backend>` mint and comment
+/// on YouTrack issues while its `Forge` half (`pr_comment` / `issue_comment` /
+/// `repo_permission` / `create_pr` / ...) talks to GitHub.
+impl IssueTracker for GithubForge {
+    fn list_queued(&self, query: &str) -> Result<Vec<serde_json::Value>> {
+        CliBackend::new(self.runner.clone()).list_queued(query)
+    }
+
+    fn get_field(&self, key: &str, field: &str) -> Result<String> {
+        CliBackend::new(self.runner.clone()).get_field(key, field)
+    }
+
+    fn set_field(&self, key: &str, field: &str, value: &str) -> Result<()> {
+        CliBackend::new(self.runner.clone()).set_field(key, field, value)
+    }
+
+    fn set_state(&self, key: &str, state: &str) -> Result<()> {
+        CliBackend::new(self.runner.clone()).set_state(key, state)
+    }
+
+    fn set_assignee(&self, key: &str, login: &str) -> Result<()> {
+        CliBackend::new(self.runner.clone()).set_assignee(key, login)
+    }
+
+    fn comment(&self, key: &str, body: &str) -> Result<()> {
+        CliBackend::new(self.runner.clone()).comment(key, body)
+    }
+
+    fn issue_links(&self, key: &str) -> Result<Vec<IssueLink>> {
+        CliBackend::new(self.runner.clone()).issue_links(key)
+    }
+
+    fn inspect_issue(&self, key: &str) -> Result<IssueInspect> {
+        CliBackend::new(self.runner.clone()).inspect_issue(key)
+    }
+
+    fn resolve_vcs(&self, project_key: &str) -> Result<VcsRepo> {
+        CliBackend::new(self.runner.clone()).resolve_vcs(project_key)
+    }
+
+    fn vcs_repo_map(&self) -> Result<Vec<VcsMapEntry>> {
+        CliBackend::new(self.runner.clone()).vcs_repo_map()
+    }
+
+    fn create_issue(
+        &self,
+        project: &str,
+        summary: &str,
+        description: &str,
+        assignee: Option<&str>,
+    ) -> Result<String> {
+        CliBackend::new(self.runner.clone()).create_issue(project, summary, description, assignee)
+    }
+
+    fn attach_file(&self, key: &str, file: &Path) -> Result<()> {
+        CliBackend::new(self.runner.clone()).attach_file(key, file)
+    }
+
+    fn link_issue(&self, key: &str, link_type: &str, target: &str) -> Result<()> {
+        CliBackend::new(self.runner.clone()).link_issue(key, link_type, target)
+    }
+
+    fn auth_verify(&self) -> Result<String> {
+        CliBackend::new(self.runner.clone()).auth_verify()
+    }
+
+    fn list_query_top(&self, query: &str, top: u32) -> Result<Vec<serde_json::Value>> {
+        CliBackend::new(self.runner.clone()).list_query_top(query, top)
+    }
+
+    fn project_show(&self, project_key: &str) -> Result<String> {
+        CliBackend::new(self.runner.clone()).project_show(project_key)
+    }
+}
+
+impl Backend for GithubForge {
+    fn name(&self) -> &'static str {
+        "github"
     }
 }
 
