@@ -9,9 +9,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Deserialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{Backend, Forge, ForgePullRequest, IssueTracker, PullRequest, VcsMapEntry, VcsRepo};
 use crate::error::{Error, Result};
@@ -22,6 +23,73 @@ use crate::error::{Error, Result};
 #[derive(Deserialize)]
 struct PrSearchResponse {
     pull_requests: Vec<ForgePullRequest>,
+}
+
+/// Wait before attempts 2, 3 and 4 of a retried read-only `fj` call
+/// (CLAUDE-366): the first retry runs immediately, then 2s, then 5s, for a
+/// worst-case added delay of 7s across four attempts total.
+const DEFAULT_FJ_READ_RETRY_WAITS: [Duration; 3] = [
+    Duration::from_secs(0),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+];
+
+/// The last non-empty line of `stderr`, for a retry log that names the failure
+/// without repeating the CLI's full (often multi-line) error text.
+fn stderr_tail(stderr: &str) -> &str {
+    stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no stderr")
+}
+
+/// Run a read-only `fj` invocation with up to four attempts total, waiting
+/// `waits[0]` / `waits[1]` / `waits[2]` before attempts 2, 3 and 4 (CLAUDE-366).
+/// A failed attempt is a runner `Ok(out)` with `!out.ok`: any non-zero exit is
+/// retried on the exit code alone, never by classifying `stderr`'s wording
+/// (forbidden by `tooling-gap-discipline`), because every read-only `fj` call is
+/// idempotent and a deterministic failure (404, 401) only costs the wait time. A
+/// runner `Err` (a spawn failure, `CliNotFound`) is not retried, since it cannot
+/// be transient. Only the last attempt's outcome is returned; the caller
+/// converts it to `Error::CliFailed` exactly as it did before this call could
+/// retry.
+fn run_fj_read_retrying(
+    runner: &dyn CommandRunner,
+    fj: &str,
+    dir: Option<&Path>,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    waits: &[Duration; 3],
+) -> Result<CmdOutput> {
+    let mut out = runner.run_in_env(dir, fj, args, envs)?;
+    for (idx, wait) in waits.iter().enumerate() {
+        if out.ok {
+            return Ok(out);
+        }
+        let attempt = idx as u32 + 1;
+        warn!(
+            binary = %fj,
+            args = %args.join(" "),
+            attempt,
+            stderr = %stderr_tail(&out.stderr),
+            "read-only fj call failed; retrying"
+        );
+        if !wait.is_zero() {
+            crate::blocking::in_place(|| std::thread::sleep(*wait));
+        }
+        out = runner.run_in_env(dir, fj, args, envs)?;
+        if out.ok {
+            info!(
+                binary = %fj,
+                args = %args.join(" "),
+                attempt = attempt + 1,
+                "read-only fj call succeeded after a retry"
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// Restate a `fj pr create` failure with the repo, the host, and the
@@ -395,6 +463,9 @@ pub struct CliBackend {
     /// (currently: an open-PR lookup that failed and was degraded to a create).
     /// Drained by [`Forge::take_notices`] and persisted as run events.
     notices: std::sync::Mutex<Vec<String>>,
+    /// Wait schedule for a retried read-only `fj` call (CLAUDE-366). Defaults to
+    /// [`DEFAULT_FJ_READ_RETRY_WAITS`]; overridable so tests run with no delay.
+    fj_read_retry_waits: [Duration; 3],
 }
 
 /// Shape of the forge CLI key store (`~/.local/share/forgejo-cli/keys.json`):
@@ -522,6 +593,7 @@ impl CliBackend {
             yt_env: Vec::new(),
             fj_env: Vec::new(),
             notices: std::sync::Mutex::new(Vec::new()),
+            fj_read_retry_waits: DEFAULT_FJ_READ_RETRY_WAITS,
         }
     }
 
@@ -550,6 +622,32 @@ impl CliBackend {
     pub fn with_fj_env(mut self, env: Vec<(String, String)>) -> Self {
         self.fj_env = env;
         self
+    }
+
+    /// Override the read-retry wait schedule (tests set this to all-zero so a
+    /// retried read runs with no delay).
+    pub fn with_fj_read_retry_waits(mut self, waits: [Duration; 3]) -> Self {
+        self.fj_read_retry_waits = waits;
+        self
+    }
+
+    /// Run a read-only `fj` invocation, retried up to four attempts total
+    /// (CLAUDE-366). Never used for a write: a write must fail on its first and
+    /// only attempt.
+    fn run_fj_read(
+        &self,
+        dir: Option<&Path>,
+        args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> Result<CmdOutput> {
+        run_fj_read_retrying(
+            self.runner.as_ref(),
+            &self.fj,
+            dir,
+            args,
+            envs,
+            &self.fj_read_retry_waits,
+        )
     }
 
     /// Borrow the `yt` child env as the `(&str, &str)` slice the runner takes.
@@ -1519,7 +1617,7 @@ impl Forge for CliBackend {
     fn repo_access(&self, host: &str, repo: &str) -> Result<()> {
         let envs = self.fj_envs();
         let args = ["--host", host, "repo", "view", repo, "--json"];
-        let out = self.runner.run_in_env(None, &self.fj, &args, &envs)?;
+        let out = self.run_fj_read(None, &args, &envs)?;
         if !out.ok {
             return Err(super::probe_denied(
                 "forge token",
@@ -1534,7 +1632,7 @@ impl Forge for CliBackend {
         let args = [
             "--host", host, "pr", "search", "--repo", repo, "--state", "open", "--json",
         ];
-        let out = self.runner.run_in_env(None, &self.fj, &args, &envs)?;
+        let out = self.run_fj_read(None, &args, &envs)?;
         if !out.ok {
             return Err(super::probe_denied(
                 "forge token",
@@ -1553,9 +1651,7 @@ impl Forge for CliBackend {
     /// bidi isolates (U+2066..U+2069), stripped so the row renders as plain text.
     fn identity(&self, host: &str) -> Result<String> {
         let args = ["--host", host, "whoami"];
-        let out = self
-            .runner
-            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        let out = self.run_fj_read(None, &args, &self.fj_envs())?;
         let stdout = Self::checked(&self.fj, out, &args)?;
         Ok(stdout
             .chars()
@@ -1569,9 +1665,7 @@ impl Forge for CliBackend {
         let args = [
             "--host", host, "pr", "search", "--repo", repo, "--state", "open", "--json",
         ];
-        let out = self
-            .runner
-            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        let out = self.run_fj_read(None, &args, &self.fj_envs())?;
         let stdout = Self::checked(&self.fj, out, &args)?;
         // `fj` 0.17.1 wraps the results in `{"total_count": N, "pull_requests":
         // [...]}` rather than emitting the bare array older versions did.
@@ -1590,9 +1684,7 @@ impl Forge for CliBackend {
         // local checkout (gather runs before any clone).
         let id = format!("{repo}#{pr_number}");
         let args = ["--host", host, "pr", "status", &id, "--json"];
-        let out = self
-            .runner
-            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        let out = self.run_fj_read(None, &args, &self.fj_envs())?;
         let stdout = Self::checked(&self.fj, out, &args)?;
         #[derive(Deserialize)]
         struct Status {
@@ -1672,9 +1764,7 @@ impl Forge for CliBackend {
             "--format",
             "json",
         ];
-        let out = self
-            .runner
-            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        let out = self.run_fj_read(None, &args, &self.fj_envs())?;
         let stdout = Self::checked(&self.fj, out, &args)?;
         #[derive(Deserialize)]
         struct Collaborator {
@@ -1801,6 +1891,9 @@ impl Backend for CliBackend {
 pub struct FjForgeReads {
     runner: Arc<dyn CommandRunner>,
     fj: String,
+    /// Wait schedule for a retried read (CLAUDE-366); see
+    /// [`DEFAULT_FJ_READ_RETRY_WAITS`].
+    fj_read_retry_waits: [Duration; 3],
 }
 
 impl FjForgeReads {
@@ -1809,6 +1902,7 @@ impl FjForgeReads {
         Self {
             runner,
             fj: "fj".to_string(),
+            fj_read_retry_waits: DEFAULT_FJ_READ_RETRY_WAITS,
         }
     }
 
@@ -1816,6 +1910,25 @@ impl FjForgeReads {
     pub fn with_binary(mut self, fj: impl Into<String>) -> Self {
         self.fj = fj.into();
         self
+    }
+
+    /// Override the read-retry wait schedule (tests set this to all-zero).
+    pub fn with_fj_read_retry_waits(mut self, waits: [Duration; 3]) -> Self {
+        self.fj_read_retry_waits = waits;
+        self
+    }
+
+    /// Every call this client makes is a read (CLAUDE-366): actions logs,
+    /// actions runs, and repo file fetches never change forge state.
+    fn run_fj_read(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<CmdOutput> {
+        run_fj_read_retrying(
+            self.runner.as_ref(),
+            &self.fj,
+            None,
+            args,
+            envs,
+            &self.fj_read_retry_waits,
+        )
     }
 }
 
@@ -1907,7 +2020,7 @@ impl crate::forge_log::ActionLogClient for FjForgeReads {
         let args = [
             "--host", host, "actions", "logs", "--repo", repo, "--json", &run,
         ];
-        match self.runner.run_in_env(None, &self.fj, &args, &creds.envs()) {
+        match self.run_fj_read(&args, &creds.envs()) {
             Ok(out) if out.ok => match crate::forge_log::parse_run_logs(&out.stdout) {
                 Ok(jobs) => RunLogsOutcome::Fetched(jobs),
                 Err(e) => RunLogsOutcome::Failed(format!("parsing fj actions logs --json: {e}")),
@@ -1977,7 +2090,7 @@ impl crate::forge_log::ActionRunsClient for FjForgeReads {
                 "--host", host, "actions", "runs", "--repo", repo, "--json", "--page", &page,
                 "--limit", &limit,
             ];
-            let out = match self.runner.run_in_env(None, &self.fj, &args, &envs) {
+            let out = match self.run_fj_read(&args, &envs) {
                 Ok(out) => out,
                 Err(e) => {
                     if !all.is_empty() {
@@ -2034,7 +2147,7 @@ impl crate::forge_log::ActionRunsClient for FjForgeReads {
             "--run-number",
             &run,
         ];
-        match self.runner.run_in_env(None, &self.fj, &args, &creds.envs()) {
+        match self.run_fj_read(&args, &creds.envs()) {
             Ok(out) if out.ok => crate::forge_log::parse_run_timing(&out.stdout, run_number),
             Ok(out) => Err(format!(
                 "fj actions runs exited {}: {}",
@@ -2065,7 +2178,7 @@ impl crate::forge_log::RepoFileClient for FjForgeReads {
         let args = [
             "--host", host, "repo", "file", path, "--ref", git_ref, "--repo", repo,
         ];
-        match self.runner.run_in_env(None, &self.fj, &args, &creds.envs()) {
+        match self.run_fj_read(&args, &creds.envs()) {
             Ok(out) if out.ok => Ok(out.stdout),
             Ok(out) => Err(format!(
                 "fj repo file exited {}: {}",
@@ -2086,7 +2199,7 @@ impl crate::forge_log::RepoFileClient for FjForgeReads {
 #[cfg(test)]
 pub mod testutil {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
 
     /// One recorded env injection: `(binary, [(name, value), ...])`.
@@ -2096,9 +2209,9 @@ pub mod testutil {
     pub struct StubRunner {
         /// (binary, joined-args) -> outcome.
         responses: HashMap<String, CmdOutput>,
-        /// (binary, joined-args) -> outcome consumed by the FIRST
-        /// matching call only; later calls fall through to `responses`.
-        once: Mutex<HashMap<String, CmdOutput>>,
+        /// (binary, joined-args) -> a queue of outcomes consumed in order, one
+        /// per matching call, before falling through to `responses`.
+        once: Mutex<HashMap<String, VecDeque<CmdOutput>>>,
         /// Binaries that should report as absent from PATH.
         missing: Vec<String>,
         /// Records every (binary, args) invocation for assertions.
@@ -2148,15 +2261,33 @@ pub mod testutil {
         /// `binary args...` only, so a test can model a call that fails once and
         /// succeeds on the retry (pair it with `ok` for the standing response).
         pub fn fail_once(self, binary: &str, args: &[&str], exit_code: i32, stderr: &str) -> Self {
-            self.once.lock().unwrap().insert(
-                Self::key(binary, args),
-                CmdOutput {
-                    ok: false,
-                    stdout: String::new(),
-                    stderr: stderr.to_string(),
-                    exit_code,
-                },
-            );
+            self.fail_times(binary, args, exit_code, stderr, 1)
+        }
+
+        /// Register a failing response consumed by the first `times` calls to
+        /// `binary args...`, so a test can model a call that fails N times before
+        /// succeeding on the retry that follows (pair it with `ok` for the
+        /// standing response).
+        pub fn fail_times(
+            self,
+            binary: &str,
+            args: &[&str],
+            exit_code: i32,
+            stderr: &str,
+            times: usize,
+        ) -> Self {
+            let out = CmdOutput {
+                ok: false,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+                exit_code,
+            };
+            self.once
+                .lock()
+                .unwrap()
+                .entry(Self::key(binary, args))
+                .or_default()
+                .extend(std::iter::repeat_n(out, times));
             self
         }
 
@@ -2173,7 +2304,13 @@ pub mod testutil {
                     binary: binary.to_string(),
                 });
             }
-            if let Some(out) = self.once.lock().unwrap().remove(&Self::key(binary, args)) {
+            if let Some(out) = self
+                .once
+                .lock()
+                .unwrap()
+                .get_mut(&Self::key(binary, args))
+                .and_then(VecDeque::pop_front)
+            {
                 return Ok(out);
             }
             self.responses
@@ -3385,7 +3522,7 @@ mod tests {
             r#"{"number":206,"html_url":"https://dev.a8n.run/n/c/pulls/206"}"#,
         );
         let runner = Arc::new(runner);
-        let b = CliBackend::new(runner.clone());
+        let b = CliBackend::new(runner.clone()).with_fj_read_retry_waits(NO_WAIT);
         let pr = b
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
             .unwrap();
@@ -3543,7 +3680,7 @@ mod tests {
             1,
             "Error: not found: The target couldn't be found.",
         );
-        let b = CliBackend::new(Arc::new(runner));
+        let b = CliBackend::new(Arc::new(runner)).with_fj_read_retry_waits(NO_WAIT);
         match b
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
             .unwrap_err()
@@ -3585,7 +3722,7 @@ mod tests {
             1,
             "",
         ));
-        let b = CliBackend::new(runner.clone());
+        let b = CliBackend::new(runner.clone()).with_fj_read_retry_waits(NO_WAIT);
         match b
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
             .unwrap_err()
@@ -3661,6 +3798,138 @@ mod tests {
         assert_eq!(prs[0].base_ref, "main");
         assert_eq!(prs[0].author, "David");
         assert_eq!(prs[0].updated_at, "2026-05-29T11:10:28Z");
+    }
+
+    #[test]
+    fn default_fj_read_retry_waits_are_0s_2s_5s() {
+        assert_eq!(
+            DEFAULT_FJ_READ_RETRY_WAITS,
+            [
+                Duration::from_secs(0),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+            ]
+        );
+    }
+
+    const NO_WAIT: [Duration; 3] = [Duration::ZERO, Duration::ZERO, Duration::ZERO];
+
+    #[test]
+    fn read_call_retries_once_and_succeeds_on_second_attempt() {
+        let args = [
+            "--host",
+            "dev.a8n.run",
+            "pr",
+            "search",
+            "--repo",
+            "contoso/claude-run",
+            "--state",
+            "open",
+            "--json",
+        ];
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_once("fj", &args, 1, "connect timeout")
+                .ok("fj", &args, r#"{"total_count":0,"pull_requests":[]}"#),
+        );
+        let b = CliBackend::new(runner.clone()).with_fj_read_retry_waits(NO_WAIT);
+        let prs = b
+            .list_open_prs("dev.a8n.run", "contoso/claude-run")
+            .unwrap();
+        assert!(prs.is_empty());
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn read_call_retries_three_times_and_succeeds_on_fourth_attempt() {
+        let args = [
+            "--host",
+            "dev.a8n.run",
+            "pr",
+            "search",
+            "--repo",
+            "contoso/claude-run",
+            "--state",
+            "open",
+            "--json",
+        ];
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_times("fj", &args, 1, "connect timeout", 3)
+                .ok("fj", &args, r#"{"total_count":0,"pull_requests":[]}"#),
+        );
+        let b = CliBackend::new(runner.clone()).with_fj_read_retry_waits(NO_WAIT);
+        let prs = b
+            .list_open_prs("dev.a8n.run", "contoso/claude-run")
+            .unwrap();
+        assert!(prs.is_empty());
+        assert_eq!(runner.calls.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn read_call_failing_all_four_attempts_returns_the_last_failure() {
+        let args = [
+            "--host",
+            "dev.a8n.run",
+            "pr",
+            "search",
+            "--repo",
+            "contoso/claude-run",
+            "--state",
+            "open",
+            "--json",
+        ];
+        let runner = Arc::new(StubRunner::new().fail("fj", &args, 1, "connect timeout"));
+        let b = CliBackend::new(runner.clone()).with_fj_read_retry_waits(NO_WAIT);
+        let err = b
+            .list_open_prs("dev.a8n.run", "contoso/claude-run")
+            .unwrap_err();
+        match err {
+            Error::CliFailed {
+                binary,
+                exit_code,
+                stderr,
+                ..
+            } => {
+                assert_eq!(binary, "fj");
+                assert_eq!(exit_code, 1);
+                assert_eq!(stderr, "connect timeout");
+            }
+            other => panic!("expected Error::CliFailed, got {other:?}"),
+        }
+        assert_eq!(runner.calls.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn read_call_runner_err_is_not_retried() {
+        let runner = Arc::new(StubRunner::new().missing("fj"));
+        let b = CliBackend::new(runner.clone()).with_fj_read_retry_waits(NO_WAIT);
+        let err = b
+            .list_open_prs("dev.a8n.run", "contoso/claude-run")
+            .unwrap_err();
+        assert!(matches!(err, Error::CliNotFound { .. }));
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn write_call_that_fails_is_never_retried() {
+        let args = [
+            "--host",
+            "dev.a8n.run",
+            "pr",
+            "merge",
+            "contoso/claude-run#52",
+            "--method",
+            "merge",
+            "--delete",
+        ];
+        let runner = Arc::new(StubRunner::new().fail("fj", &args, 1, "merge conflict"));
+        let b = CliBackend::new(runner.clone()).with_fj_read_retry_waits(NO_WAIT);
+        let err = b
+            .merge_pr("dev.a8n.run", "contoso/claude-run", 52)
+            .unwrap_err();
+        assert!(matches!(err, Error::CliFailed { .. }));
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -3985,7 +4254,7 @@ mod tests {
             1,
             "not found",
         ));
-        let b = CliBackend::new(runner);
+        let b = CliBackend::new(runner).with_fj_read_retry_waits(NO_WAIT);
         assert!(b
             .repo_permission("dev.a8n.run", "contoso/claude-run", "mallory")
             .is_err());
@@ -4175,7 +4444,8 @@ mod tests {
                     1,
                     "unexpected status code 403 Forbidden",
                 ),
-        ));
+        ))
+        .with_fj_read_retry_waits(NO_WAIT);
         let err = b
             .repo_access("dev.a8n.run", "contoso/gadgets")
             .unwrap_err()
@@ -4202,7 +4472,7 @@ mod tests {
             1,
             "not found: The target couldn't be found.",
         ));
-        let b = CliBackend::new(runner.clone());
+        let b = CliBackend::new(runner.clone()).with_fj_read_retry_waits(NO_WAIT);
         let err = b
             .repo_access("dev.a8n.run", "contoso/gadgets")
             .unwrap_err()
@@ -4213,8 +4483,10 @@ mod tests {
         assert!(err.contains("dev.a8n.run"), "got {err}");
         assert!(err.contains("permission"), "got {err}");
         assert!(err.contains("not visible"), "got {err}");
-        // The second probe is not attempted once the first one fails.
-        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+        // The second probe is not attempted once the first one fails, but
+        // the first one is itself retried four times (CLAUDE-366) before
+        // that failure is surfaced.
+        assert_eq!(runner.calls.lock().unwrap().len(), 4);
     }
 
     #[test]
@@ -4407,8 +4679,9 @@ mod tests {
             1,
             "Error: no action run #889 on contoso/claude-run\n",
         ));
-        let out =
-            FjForgeReads::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
+        let out = FjForgeReads::new(runner)
+            .with_fj_read_retry_waits(NO_WAIT)
+            .run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
         assert!(
             matches!(&out, RunLogsOutcome::NotFound(r) if r.contains("no action run")),
             "{out:?}"
@@ -4424,12 +4697,9 @@ mod tests {
                 1,
                 &format!("Error: unexpected status code {code} Unauthorized\n"),
             ));
-            let out = FjForgeReads::new(runner).run_logs(
-                "dev.a8n.run",
-                "contoso/claude-run",
-                889,
-                None,
-            );
+            let out = FjForgeReads::new(runner)
+                .with_fj_read_retry_waits(NO_WAIT)
+                .run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
             assert!(
                 matches!(&out, RunLogsOutcome::AuthDenied(r) if r.contains(needle)),
                 "{out:?}"
@@ -4446,8 +4716,9 @@ mod tests {
             1,
             "Error: unexpected status code 404 Not Found\n",
         ));
-        let out =
-            FjForgeReads::new(runner).run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
+        let out = FjForgeReads::new(runner)
+            .with_fj_read_retry_waits(NO_WAIT)
+            .run_logs("dev.a8n.run", "contoso/claude-run", 889, None);
         assert!(matches!(out, RunLogsOutcome::NotFound(_)), "{out:?}");
     }
 
@@ -4552,17 +4823,14 @@ mod tests {
                 1,
                 &format!("Error: unexpected status code {code} Unauthorized\n"),
             ));
-            let out = FjForgeReads::new(runner.clone()).list_runs(
-                "dev.a8n.run",
-                RUNS_REPO,
-                RUNS_MAX_PAGES,
-                Some("test-pat"),
-            );
+            let out = FjForgeReads::new(runner.clone())
+                .with_fj_read_retry_waits(NO_WAIT)
+                .list_runs("dev.a8n.run", RUNS_REPO, RUNS_MAX_PAGES, Some("test-pat"));
             assert_eq!(out, RunsListOutcome::AuthDenied(expected));
             assert_eq!(
                 runner.calls.lock().unwrap().len(),
-                1,
-                "terminal: no second page"
+                4,
+                "terminal: no second page, but the first page's own call is retried up to four times (CLAUDE-366)"
             );
         }
     }
@@ -4574,12 +4842,9 @@ mod tests {
         let args = runs_args("2");
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let runner = Arc::new(runner.fail("fj", &args, 1, "Error: connection refused\n"));
-        let out = FjForgeReads::new(runner).list_runs(
-            "dev.a8n.run",
-            RUNS_REPO,
-            RUNS_MAX_PAGES,
-            Some("test-pat"),
-        );
+        let out = FjForgeReads::new(runner)
+            .with_fj_read_retry_waits(NO_WAIT)
+            .list_runs("dev.a8n.run", RUNS_REPO, RUNS_MAX_PAGES, Some("test-pat"));
         let RunsListOutcome::Resolved(entries) = out else {
             panic!("expected Resolved with the collected page-1 entries, got {out:?}");
         };
@@ -4668,6 +4933,7 @@ mod tests {
             "Error: unexpected status code 404 Not Found\n",
         ));
         let e = FjForgeReads::new(runner)
+            .with_fj_read_retry_waits(NO_WAIT)
             .run_timing("dev.a8n.run", RUNS_REPO, 4034, Some("test-pat"))
             .unwrap_err();
         assert!(e.contains("404"), "the reason names the failure: {e}");
@@ -4719,6 +4985,7 @@ mod tests {
             "Error: cannot read `.forgejo/workflows/check.yml` at ref `a456a957` in initech/chat\n",
         ));
         let err = FjForgeReads::new(runner)
+            .with_fj_read_retry_waits(NO_WAIT)
             .read_file(
                 "dev.a8n.run",
                 RUNS_REPO,
