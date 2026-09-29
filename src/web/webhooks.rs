@@ -2,7 +2,8 @@
 //!
 //! `POST /webhooks/{provider}/triage/{source}` routes on the daemon's TCP app
 //! receive Action-run webhook deliveries. `{provider}` names the sending forge
-//! ([`WebhookProvider`]; only `forgejo` is implemented today). Each `{source}`
+//! ([`WebhookProvider`]; `forgejo` and `github` are both implemented,
+//! CLAUDE-362 adding `github`). Each `{source}`
 //! names a configured [`crate::config::WebhookSource`] with its own HMAC
 //! secret, allow-list, and rate-limit bucket; the replay store is shared
 //! across sources (delivery ids are globally unique). The per-request
@@ -232,20 +233,40 @@ const ACTION_RUN_EVENT_PREFIX: &str = "action_run_";
 /// nothing to reconcile until the PR is terminal.
 const PR_ACTION_CLOSED: &str = "closed";
 
+/// GitHub's signature header (`Webhooks / Validating webhook deliveries`,
+/// docs.github.com): hex-encoded HMAC-SHA256 of the raw body, prefixed
+/// `sha256=`. GitHub still sends the deprecated `X-Hub-Signature` (SHA1) too;
+/// this listener only ever checks the SHA256 one.
+pub const GITHUB_SIGNATURE_HEADER: &str = "X-Hub-Signature-256";
+/// GitHub's per-delivery unique id header, used for replay protection exactly
+/// like [`DELIVERY_HEADER`].
+pub const GITHUB_DELIVERY_HEADER: &str = "X-GitHub-Delivery";
+/// GitHub's event-type header. Unlike Forgejo, GitHub folds no outcome into
+/// this value (`workflow_run` covers requested/in_progress/completed alike;
+/// the outcome is `workflow_run.conclusion` in the body); dispatch on outcome
+/// happens after parsing, in [`github_workflow_run_to_action_payload`].
+pub const GITHUB_EVENT_HEADER: &str = "X-GitHub-Event";
+/// [`GITHUB_EVENT_HEADER`] value for a workflow-run delivery, GitHub's
+/// analogue of Forgejo's `action_run_*` family.
+pub const GITHUB_WORKFLOW_RUN_EVENT_TYPE: &str = "workflow_run";
+/// Prefix GitHub puts on [`GITHUB_SIGNATURE_HEADER`]'s value ahead of the
+/// hex-encoded HMAC, naming the algorithm.
+const GITHUB_SIGNATURE_PREFIX: &str = "sha256=";
+
 /// The forge sending a webhook delivery, named by the `:provider` URL path
 /// segment (`/webhooks/:provider/triage/:source`,
-/// `/webhooks/:provider/comment/:source`). One variant today; a second
-/// provider is a future issue. This is deliberately a thin data-carrying type
-/// (its own header names, its own signature check, parse/serialize to the
-/// path segment / config value) rather than a trait: the two listeners still
-/// share one signature-verification algorithm (HMAC-SHA256) and one delivery
-/// pipeline, only the header names and the config `provider` value vary by
-/// forge.
+/// `/webhooks/:provider/comment/:source`). This is deliberately a thin
+/// data-carrying type (its own header names, its own signature check,
+/// parse/serialize to the path segment / config value) rather than a trait:
+/// every listener still shares one delivery pipeline (auth, replay,
+/// rate-limit, pause, allow-list), only the header names, the signature
+/// framing, and the event-type mapping vary by forge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum WebhookProvider {
     #[default]
     Forgejo,
+    Github,
 }
 
 impl WebhookProvider {
@@ -255,6 +276,7 @@ impl WebhookProvider {
     pub fn parse(segment: &str) -> Option<Self> {
         match segment {
             "forgejo" => Some(WebhookProvider::Forgejo),
+            "github" => Some(WebhookProvider::Github),
             _ => None,
         }
     }
@@ -264,6 +286,7 @@ impl WebhookProvider {
     pub fn as_str(&self) -> &'static str {
         match self {
             WebhookProvider::Forgejo => "forgejo",
+            WebhookProvider::Github => "github",
         }
     }
 
@@ -271,6 +294,7 @@ impl WebhookProvider {
     pub fn signature_header(&self) -> &'static str {
         match self {
             WebhookProvider::Forgejo => SIGNATURE_HEADER,
+            WebhookProvider::Github => GITHUB_SIGNATURE_HEADER,
         }
     }
 
@@ -278,6 +302,7 @@ impl WebhookProvider {
     pub fn delivery_header(&self) -> &'static str {
         match self {
             WebhookProvider::Forgejo => DELIVERY_HEADER,
+            WebhookProvider::Github => GITHUB_DELIVERY_HEADER,
         }
     }
 
@@ -285,15 +310,24 @@ impl WebhookProvider {
     pub fn event_header(&self) -> &'static str {
         match self {
             WebhookProvider::Forgejo => EVENT_HEADER,
+            WebhookProvider::Github => GITHUB_EVENT_HEADER,
         }
     }
 
     /// Constant-time signature verification of `body` against the
-    /// hex-encoded `signature` under `secret`, in this provider's own scheme.
-    /// Forgejo's is HMAC-SHA256, exactly [`verify_signature`].
+    /// `signature` header value under `secret`, in this provider's own
+    /// scheme. Forgejo's is bare hex HMAC-SHA256 ([`verify_signature`]);
+    /// GitHub's is the same HMAC-SHA256-hex scheme under a `sha256=` prefix
+    /// naming the algorithm, so a missing/wrong prefix (including GitHub's
+    /// own deprecated SHA1 `X-Hub-Signature` value, which this never reads)
+    /// fails closed rather than falling through to a algorithm mismatch.
     pub fn verify_signature(&self, secret: &[u8], body: &[u8], signature: &str) -> bool {
         match self {
             WebhookProvider::Forgejo => verify_signature(secret, body, signature),
+            WebhookProvider::Github => match signature.strip_prefix(GITHUB_SIGNATURE_PREFIX) {
+                Some(hex_sig) => verify_signature(secret, body, hex_sig),
+                None => false,
+            },
         }
     }
 }
@@ -409,6 +443,100 @@ pub struct Repository {
     /// Serde default keeps older/foreign payloads on the public reading.
     #[serde(default)]
     pub private: bool,
+}
+
+/// Subset of GitHub's `workflow_run` webhook payload we consume
+/// (`Webhook events and payloads / workflow_run`, docs.github.com). Extra
+/// fields are ignored, matching [`ActionPayload`]'s tolerance of upstream
+/// additions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GithubWorkflowRunPayload {
+    /// `requested` | `in_progress` | `completed`. Only `completed` carries a
+    /// terminal `conclusion`; the other two are acked and dropped.
+    pub action: String,
+    pub workflow_run: GithubWorkflowRun,
+    pub repository: Repository,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GithubWorkflowRun {
+    /// The run's per-repo sequential number - GitHub's analogue of
+    /// Forgejo's [`ActionRun::index_in_repo`]. Deliberately not the payload's
+    /// `id` (a global, cross-repo identifier that plays no role anywhere
+    /// downstream, which keys everything by the per-repo index).
+    pub run_number: i64,
+    pub head_sha: String,
+    /// The workflow's file path, e.g. `.github/workflows/ci.yml`; reduced to
+    /// its filename in [`github_workflow_run_to_action_payload`] to match
+    /// Forgejo's `workflow_id` convention (a bare filename).
+    pub path: String,
+    pub html_url: String,
+    /// Set only once `action == "completed"`.
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    #[serde(default)]
+    pub actor: Option<GithubActor>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GithubActor {
+    pub login: String,
+}
+
+/// GitHub `workflow_run.conclusion` value meaning the run finished with
+/// nothing to fix. Every other conclusion (`failure`, `cancelled`,
+/// `timed_out`, `action_required`, `stale`, `startup_failure`, ...) is
+/// mapped onto [`RUN_STATUS_FAILURE`], mirroring Forgejo's `action_run_failure`
+/// notifier firing for every non-success done status (see
+/// [`VerifiedFailureEvent::status`]'s doc comment).
+const GITHUB_CONCLUSION_SUCCESS: &str = "success";
+
+/// Map a completed GitHub `workflow_run` delivery onto the same
+/// [`ActionPayload`] shape [`verified_failure_event`] and
+/// [`handle_action_success`] already consume, so neither needs a
+/// GitHub-specific type. `None` for a non-`completed` action, or a
+/// `completed` run with no `conclusion` (should not happen per GitHub's own
+/// docs, but the field is nullable in its schema, so this is defensive
+/// rather than assumed).
+fn github_workflow_run_to_action_payload(
+    payload: &GithubWorkflowRunPayload,
+) -> Option<ActionPayload> {
+    if payload.action != "completed" {
+        return None;
+    }
+    let conclusion = payload.workflow_run.conclusion.clone()?;
+    let action = if conclusion == GITHUB_CONCLUSION_SUCCESS {
+        "success".to_string()
+    } else {
+        "failure".to_string()
+    };
+    let workflow_id = payload
+        .workflow_run
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&payload.workflow_run.path)
+        .to_string();
+    let trigger_login = payload
+        .workflow_run
+        .actor
+        .as_ref()
+        .map(|a| a.login.clone())
+        .unwrap_or_default();
+    Some(ActionPayload {
+        action,
+        run: ActionRun {
+            index_in_repo: payload.workflow_run.run_number,
+            commit_sha: payload.workflow_run.head_sha.clone(),
+            workflow_id,
+            status: conclusion,
+            trigger_user: ActionUser {
+                login: trigger_login,
+            },
+            html_url: payload.workflow_run.html_url.clone(),
+            repository: payload.repository.clone(),
+        },
+    })
 }
 
 /// The typed event emitted downstream for a verified, allow-listed failure.
@@ -1847,32 +1975,54 @@ fn pr_comment_body_path(paths: &Paths, repo: &str, pr_number: u64) -> PathBuf {
 }
 
 /// Resolve `source`'s `write_token_ref` and build a forge backend
-/// carrying it in a temp single-host `keys.json` (the same mechanism
-/// `comment_webhooks::build_env` also uses), so a PR-comment token never
-/// appears in YAML, env, a process argument, or a settings response. A source
-/// with no `write_token_ref` configured is a hard failure: it must never be
-/// silent about being unable to post.
+/// carrying it, so a PR-comment token never appears in YAML, env, a process
+/// argument, or a settings response. A source with no `write_token_ref`
+/// configured is a hard failure: it must never be silent about being unable
+/// to post. A GitHub-provider source (`source`'s own configured
+/// [`WebhookProvider`], not a host guess - the config already says which forge
+/// this delivery came from) routes through [`GithubForge`] instead of the
+/// `fj`-based [`CliBackend`], mirroring `native::youtrack`'s per-job Forge
+/// pick (`provider::is_github_host` keyed off `gh.hosts`) and
+/// `comment_webhooks::build_env`'s identical branch.
 async fn build_pr_comment_backend(
     ctx: &MintContext,
     webhook_cfg: &WebhookConfig,
     source: &str,
     host: &str,
 ) -> crate::error::Result<PrCommentEnv> {
-    let token_ref = webhook_cfg
-        .sources
-        .get(source)
-        .and_then(|s| s.write_token_ref.as_deref())
-        .ok_or_else(|| {
-            crate::error::Error::Secret(format!(
-                "webhook source `{source}` has no write_token_ref; it cannot comment on pull requests"
-            ))
-        })?;
+    let src_cfg = webhook_cfg.sources.get(source).ok_or_else(|| {
+        crate::error::Error::Secret(format!("webhook source `{source}` is not configured"))
+    })?;
+    let token_ref = src_cfg.write_token_ref.as_deref().ok_or_else(|| {
+        crate::error::Error::Secret(format!(
+            "webhook source `{source}` has no write_token_ref; it cannot comment on pull requests"
+        ))
+    })?;
     let key = SecretsKey::load()?;
     let token = secrets::resolve_secret(&ctx.pool, &key, token_ref)
         .await?
         .trim()
         .to_string();
     let dir = pr_creds_root(&ctx.paths).join(secrets::unique_suffix());
+    if src_cfg.provider == WebhookProvider::Github {
+        let creds = secrets::JobCredentials::materialize(
+            &dir,
+            &secrets::ResolvedCredentials {
+                github_token: Some(token),
+                ..Default::default()
+            },
+            None,
+        )?;
+        let forge = GithubForge::new(
+            ctx.pr_comment_runner.clone(),
+            crate::action::default_github_mcp_endpoint(),
+            creds.github_token.clone(),
+        );
+        return Ok(PrCommentEnv {
+            backend: Box::new(forge),
+            _creds: creds,
+        });
+    }
     let creds = secrets::JobCredentials::materialize(
         &dir,
         &secrets::ResolvedCredentials {
@@ -3296,10 +3446,11 @@ async fn forgejo_webhook(
         return StatusCode::OK.into_response();
     }
 
-    // Dispatch on the event-type header before parsing. A
-    // pull-request delivery takes its own path; an empty/missing header or an
-    // Action-run header keeps the pre-existing path below; anything else is an
-    // event type this endpoint does not handle, acked and dropped.
+    // Dispatch on the event-type header before parsing. A pull-request
+    // delivery (same header value and payload shape on both providers) takes
+    // its own path; everything else is parsed per-provider below into one
+    // shared `ActionPayload` shape, so nothing past this point is
+    // provider-specific.
     let event_type = headers
         .get(provider.event_header())
         .and_then(|v| v.to_str().ok())
@@ -3308,22 +3459,56 @@ async fn forgejo_webhook(
     if event_type == PULL_REQUEST_EVENT_TYPE {
         return handle_pull_request_delivery(&st, &src_cfg, &source, delivery, &body).await;
     }
-    if !event_type.is_empty() && !event_type.starts_with(ACTION_RUN_EVENT_PREFIX) {
-        info!(
-            source = %source,
-            delivery,
-            event = %event_type,
-            "webhook delivery of an unhandled event type acked and dropped"
-        );
-        return StatusCode::OK.into_response();
-    }
 
     // Parse only after the request is authenticated and de-duplicated.
-    let payload: ActionPayload = match serde_json::from_slice(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(source = %source, error = %e, "webhook payload parse failed");
-            return StatusCode::BAD_REQUEST.into_response();
+    let payload: ActionPayload = match provider {
+        WebhookProvider::Forgejo => {
+            if !event_type.is_empty() && !event_type.starts_with(ACTION_RUN_EVENT_PREFIX) {
+                info!(
+                    source = %source,
+                    delivery,
+                    event = %event_type,
+                    "webhook delivery of an unhandled event type acked and dropped"
+                );
+                return StatusCode::OK.into_response();
+            }
+            match serde_json::from_slice(&body) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(source = %source, error = %e, "webhook payload parse failed");
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            }
+        }
+        WebhookProvider::Github => {
+            if event_type != GITHUB_WORKFLOW_RUN_EVENT_TYPE {
+                info!(
+                    source = %source,
+                    delivery,
+                    event = %event_type,
+                    "webhook delivery of an unhandled event type acked and dropped"
+                );
+                return StatusCode::OK.into_response();
+            }
+            let gh_payload: GithubWorkflowRunPayload = match serde_json::from_slice(&body) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(source = %source, error = %e, "webhook payload parse failed");
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            };
+            match github_workflow_run_to_action_payload(&gh_payload) {
+                Some(p) => p,
+                None => {
+                    info!(
+                        source = %source,
+                        delivery,
+                        action = %gh_payload.action,
+                        "webhook event dropped: non-terminal or unmappable workflow_run action"
+                    );
+                    return StatusCode::OK.into_response();
+                }
+            }
         }
     };
 
@@ -8276,6 +8461,88 @@ mod tests {
             h
         }
 
+        const SOURCE_GH: &str = "gh-contoso";
+        const SECRET_GH: &str = "hmac-value-for-gh-contoso";
+
+        /// [`two_source_config`] plus a third, `Github`-provider source
+        /// (`SOURCE_GH`), so a mixed Forgejo/GitHub config shares one
+        /// `max_runs_per_day` cap.
+        fn three_source_config(rate_per_min: u32) -> WebhookConfig {
+            let mut cfg = two_source_config(rate_per_min);
+            cfg.sources.insert(
+                SOURCE_GH.to_string(),
+                WebhookSource {
+                    secret_ref: Some("hmac-gh-contoso".to_string()),
+                    allowed_repos: vec!["contoso/claude-run".to_string()],
+                    rate_limit_per_min: rate_per_min,
+                    log_token_ref: None,
+                    write_token_ref: None,
+                    provider: WebhookProvider::Github,
+                },
+            );
+            cfg
+        }
+
+        /// Like [`setup_pool`], plus the `SOURCE_GH` secret.
+        async fn setup_pool_with_github(tmp: &std::path::Path) -> DbPool {
+            let pool = setup_pool(tmp).await;
+            let key = SecretsKey::load().unwrap();
+            let ciphertext = key.encrypt(SECRET_GH).unwrap();
+            state::secret_create(&pool, "hmac-gh-contoso", &ciphertext)
+                .await
+                .unwrap();
+            pool
+        }
+
+        /// A [`WebhookState`] over [`three_source_config`] at the default rate.
+        async fn state_with_github(
+            tmp: &std::path::Path,
+        ) -> (WebhookState, mpsc::Receiver<VerifiedFailureEvent>) {
+            let pool = setup_pool_with_github(tmp).await;
+            let (tx, rx) = mpsc::channel(8);
+            (WebhookState::new(pool, three_source_config(60), tx), rx)
+        }
+
+        fn github_headers(signature: Option<&str>, delivery: Option<&str>) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            if let Some(s) = signature {
+                h.insert(GITHUB_SIGNATURE_HEADER, HeaderValue::from_str(s).unwrap());
+            }
+            if let Some(d) = delivery {
+                h.insert(GITHUB_DELIVERY_HEADER, HeaderValue::from_str(d).unwrap());
+            }
+            h
+        }
+
+        fn github_headers_with_event(
+            signature: Option<&str>,
+            delivery: Option<&str>,
+            event: Option<&str>,
+        ) -> HeaderMap {
+            let mut h = github_headers(signature, delivery);
+            if let Some(e) = event {
+                h.insert(GITHUB_EVENT_HEADER, HeaderValue::from_str(e).unwrap());
+            }
+            h
+        }
+
+        fn github_sign(secret: &[u8], body: &[u8]) -> String {
+            format!("sha256={}", sign(secret, body))
+        }
+
+        /// A minimal completed `workflow_run` payload (`Webhook events and
+        /// payloads / workflow_run`, docs.github.com) with the given
+        /// `conclusion`.
+        fn github_workflow_run_payload(repo: &str, conclusion: &str) -> String {
+            format!(
+                r#"{{"action":"completed","workflow_run":{{"run_number":7,
+                "head_sha":"deadbeefcafefeed","path":".github/workflows/ci.yml",
+                "html_url":"https://github.com/{repo}/actions/runs/123",
+                "conclusion":"{conclusion}","actor":{{"login":"octocat"}}}},
+                "repository":{{"full_name":"{repo}","private":false}}}}"#
+            )
+        }
+
         #[tokio::test]
         async fn unknown_source_is_404() {
             let _env = crate::secrets::key_file_env_lock().await;
@@ -8306,7 +8573,7 @@ mod tests {
             let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
             let resp = forgejo_webhook(
                 State(st),
-                Path(("github".to_string(), SOURCE_A.to_string())),
+                Path(("gitlab".to_string(), SOURCE_A.to_string())),
                 headers(Some(&sig), Some("d-provider-unknown")),
                 Bytes::from(raw),
             )
@@ -8314,15 +8581,27 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         }
 
-        // Every configured source's provider matches the one recognized
-        // `WebhookProvider` variant today, so the source-vs-URL-provider
-        // mismatch branch in `forgejo_webhook` cannot be driven end-to-end
-        // until a second provider exists to mismatch against. Pin the
-        // comparison it relies on directly instead: a source's `provider`
-        // field is what the handler compares the parsed `:provider` segment
-        // to, and it must default to `Forgejo` so every pre-CLAUDE-361 stored
-        // source (serialized with no `provider` key at all) resolves as a
-        // Forgejo source rather than failing to match anything.
+        // A source configured for one provider 404s a request made against
+        // the other provider's URL segment, now that `Github` is a second
+        // real variant to mismatch against.
+        #[tokio::test]
+        async fn provider_source_mismatch_is_404() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx) = state(tmp.path()).await;
+            let raw = failure_payload("contoso/claude-run");
+            let sig = sign(SECRET_A.as_bytes(), raw.as_bytes());
+            // SOURCE_A is configured with `provider: WebhookProvider::Forgejo`.
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_A.to_string())),
+                headers(Some(&sig), Some("d-provider-mismatch")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
         #[test]
         fn webhook_source_provider_defaults_to_forgejo_and_round_trips() {
             let src: WebhookSource = serde_json::from_str(r#"{"secret_ref":"x"}"#).unwrap();
@@ -8334,6 +8613,166 @@ mod tests {
                 serde_json::from_str::<WebhookProvider>("\"forgejo\"").unwrap(),
                 WebhookProvider::Forgejo
             );
+        }
+
+        // GitHub: signature scheme, delivery/event headers, and the
+        // `workflow_run` -> `ActionPayload` mapping, end to end through mint.
+
+        #[tokio::test]
+        async fn github_triage_delivery_dispatches_verified_failure_event() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state_with_github(tmp.path()).await;
+            let raw = github_workflow_run_payload("contoso/claude-run", "failure");
+            let sig = github_sign(SECRET_GH.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_GH.to_string())),
+                github_headers_with_event(
+                    Some(&sig),
+                    Some("gh-d-1"),
+                    Some(GITHUB_WORKFLOW_RUN_EVENT_TYPE),
+                ),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            let event = rx.recv().await.expect("a verified failure event");
+            assert_eq!(event.repo, "contoso/claude-run");
+            assert_eq!(event.index_in_repo, 7);
+            assert_eq!(event.commit_sha, "deadbeefcafefeed");
+            assert_eq!(event.workflow_id, "ci.yml");
+            assert_eq!(event.trigger_user, "octocat");
+            assert_eq!(event.status, RUN_STATUS_FAILURE);
+        }
+
+        #[tokio::test]
+        async fn github_bad_signature_is_401() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx) = state_with_github(tmp.path()).await;
+            let raw = github_workflow_run_payload("contoso/claude-run", "failure");
+            // Well-formed `sha256=`-prefixed hex, but the wrong MAC.
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_GH.to_string())),
+                github_headers_with_event(
+                    Some("sha256=deadbeef"),
+                    Some("gh-d-2"),
+                    Some(GITHUB_WORKFLOW_RUN_EVENT_TYPE),
+                ),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn github_signature_missing_sha256_prefix_is_401() {
+            // GitHub's deprecated SHA1 `X-Hub-Signature` is never read; a
+            // signature value with no `sha256=` prefix fails closed rather
+            // than falling through to an algorithm mismatch.
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx) = state_with_github(tmp.path()).await;
+            let raw = github_workflow_run_payload("contoso/claude-run", "failure");
+            let bare_sig = sign(SECRET_GH.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_GH.to_string())),
+                github_headers_with_event(
+                    Some(&bare_sig),
+                    Some("gh-d-3"),
+                    Some(GITHUB_WORKFLOW_RUN_EVENT_TYPE),
+                ),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn github_success_conclusion_is_not_a_failure_event() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state_with_github(tmp.path()).await;
+            let raw = github_workflow_run_payload("contoso/claude-run", "success");
+            let sig = github_sign(SECRET_GH.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_GH.to_string())),
+                github_headers_with_event(
+                    Some(&sig),
+                    Some("gh-d-4"),
+                    Some(GITHUB_WORKFLOW_RUN_EVENT_TYPE),
+                ),
+                Bytes::from(raw),
+            )
+            .await;
+            // No `mint` wiring in this fixture's state, so a success delivery
+            // is acked and dropped rather than routed to the automerge path.
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn github_non_workflow_run_event_is_acked_and_dropped() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state_with_github(tmp.path()).await;
+            let raw = github_workflow_run_payload("contoso/claude-run", "failure");
+            let sig = github_sign(SECRET_GH.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_GH.to_string())),
+                github_headers_with_event(Some(&sig), Some("gh-d-5"), Some("issues")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(rx.try_recv().is_err());
+        }
+
+        // A Forgejo source and a GitHub source coexist in one config and share
+        // one `max_runs_per_day` cap.
+        #[tokio::test]
+        async fn forgejo_and_github_sources_coexist_in_one_config() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state_with_github(tmp.path()).await;
+            assert_eq!(
+                st.config.read().await.max_runs_per_day,
+                three_source_config(60).max_runs_per_day,
+                "both sources are read off the same WebhookConfig, so one cap covers both"
+            );
+
+            let fj_raw = failure_payload("contoso/claude-run");
+            let fj_sig = sign(SECRET_A.as_bytes(), fj_raw.as_bytes());
+            let fj_resp = forgejo_webhook(
+                State(st.clone()),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
+                headers(Some(&fj_sig), Some("mixed-fj-1")),
+                Bytes::from(fj_raw),
+            )
+            .await;
+            assert_eq!(fj_resp.status(), StatusCode::ACCEPTED);
+            assert!(rx.recv().await.is_some());
+
+            let gh_raw = github_workflow_run_payload("contoso/claude-run", "failure");
+            let gh_sig = github_sign(SECRET_GH.as_bytes(), gh_raw.as_bytes());
+            let gh_resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_GH.to_string())),
+                github_headers_with_event(
+                    Some(&gh_sig),
+                    Some("mixed-gh-1"),
+                    Some(GITHUB_WORKFLOW_RUN_EVENT_TYPE),
+                ),
+                Bytes::from(gh_raw),
+            )
+            .await;
+            assert_eq!(gh_resp.status(), StatusCode::ACCEPTED);
+            assert!(rx.recv().await.is_some());
         }
 
         // Router-level: the new route accepts a valid delivery and the old,
