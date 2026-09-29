@@ -1846,9 +1846,11 @@ async fn automerge_reconciler_loop(
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
         AUTOMERGE_RECONCILE_TICK_SECS,
     ));
+    let mut listing_failures = std::collections::HashMap::new();
     loop {
         ticker.tick().await;
-        crate::web::webhooks::reconcile_automerge(&pool, &mint, &keygate).await;
+        crate::web::webhooks::reconcile_automerge(&pool, &mint, &keygate, &mut listing_failures)
+            .await;
     }
 }
 
