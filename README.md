@@ -1367,7 +1367,9 @@ saying so and is dropped.
 
 **Configuration** is the `Comment webhook` section on the Settings page (`GET` / `PUT
 /api/settings/webhook_comment`, DB key `config.webhook_comment`). Top level: `trigger`, `max_instruction_chars`,
-`max_runs_per_day` (the daily run cap of this listener's ledger, default 20, at least 1, live), and `sources`. Per source: `secret_ref` (HMAC; unset means the endpoint `401`s everything), `allowed_repos` (the same three
+`max_runs_per_day` (the daily run cap of this listener's ledger, default 20, at least 1, live), `claude_timeout_seconds`
+(the per-run `claude` session timeout for the PR-comment route, default 600, at least 1, read live per command with
+no restart), and `sources`. Per source: `secret_ref` (HMAC; unset means the endpoint `401`s everything), `allowed_repos` (the same three
 pattern forms as the CI-failure allow-list; empty denies all), `rate_limit_per_min`, `write_token_ref`,
 `allowed_permissions`, the `max_files` / `max_lines` decision-gate caps, and the commit identity (`bot_author`,
 `bot_email`, `skip_marker`). The plain-issue route adds no settings of its own: it reads the existing `Mint` section

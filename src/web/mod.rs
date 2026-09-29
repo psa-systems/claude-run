@@ -4139,6 +4139,11 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "daily run cap of the webhook-comment ledger (default 20, at least 1).",
             },
             FieldDoc {
+                name: "claude_timeout_seconds",
+                badge: "next event",
+                note: "per-run claude session timeout for the PR-comment route, read live per command (default 600, at least 1).",
+            },
+            FieldDoc {
                 name: "sources",
                 badge: "live",
                 note: "a saved source puts webhook-comment on the dashboard immediately; per-source secret_ref, allowed_repos, rate_limit_per_min, write_token_ref (WRITE scope), allowed_permissions, max_files, max_lines.",
