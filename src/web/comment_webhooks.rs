@@ -1021,7 +1021,10 @@ async fn run_instruction(
     let daily = state::daily_count_get(&ctx.pool, WEBHOOK_COMMENT_ACTION)
         .await
         .unwrap_or(0);
-    let max_runs_per_day = ctx.config.read().await.max_runs_per_day;
+    let (max_runs_per_day, claude_timeout_seconds) = {
+        let cfg = ctx.config.read().await;
+        (cfg.max_runs_per_day, cfg.claude_timeout_seconds)
+    };
     match admit(attempts, daily, &ctx.defaults, max_runs_per_day) {
         Admission::Run => {}
         Admission::AlreadyHandled => {
@@ -1071,7 +1074,7 @@ async fn run_instruction(
         stage(STAGE_RUNNING).await;
         let claude = ctx.claude.clone();
         let backend = &env.backend;
-        let timeout = Duration::from_secs(u64::from(ctx.defaults.claude_timeout_seconds));
+        let timeout = Duration::from_secs(u64::from(claude_timeout_seconds));
         let cmd = cmd.clone();
         let src = src.clone();
         let workdir = workdir.clone();
@@ -3392,6 +3395,33 @@ mod tests {
         };
         let err = crate::settings::validate_comment_webhook(&zero).unwrap_err();
         assert!(err.contains("max_runs_per_day"));
+    }
+
+    #[test]
+    fn comment_config_without_the_timeout_loads_at_600_and_zero_is_rejected() {
+        let cfg: CommentWebhookConfig = serde_json::from_str(r#"{"trigger":"/x"}"#).unwrap();
+        assert_eq!(cfg.claude_timeout_seconds, 600);
+        let zero = CommentWebhookConfig {
+            claude_timeout_seconds: 0,
+            ..CommentWebhookConfig::default()
+        };
+        let err = crate::settings::validate_comment_webhook(&zero).unwrap_err();
+        assert!(err.contains("claude_timeout_seconds"));
+    }
+
+    /// The PR-comment route reads `claude_timeout_seconds` off the SAME live
+    /// `Arc<RwLock<CommentWebhookConfig>>` a Settings save swaps (mirroring
+    /// `max_runs_per_day`), not a value captured at daemon start: a save
+    /// changes what the next command reads with no restart.
+    #[tokio::test]
+    async fn comment_config_timeout_is_read_live_with_no_restart() {
+        let config = Arc::new(RwLock::new(CommentWebhookConfig::default()));
+        assert_eq!(config.read().await.claude_timeout_seconds, 600);
+        *config.write().await = CommentWebhookConfig {
+            claude_timeout_seconds: 45,
+            ..CommentWebhookConfig::default()
+        };
+        assert_eq!(config.read().await.claude_timeout_seconds, 45);
     }
 
     #[test]
