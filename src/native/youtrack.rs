@@ -1802,7 +1802,9 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
         "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
         "4. Make the minimum change required to satisfy the acceptance criteria.",
-        "5. The runner uses this commit's body as the PR description (if you make more than one commit, the LAST commit carries it, since the runner reads only the branch tip); it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the literal line 'Closes', then the bare issue reference on the next line alone, with nothing after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above the 'Closes' line, never after the reference. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single 'Closes' line. NO 'State ...' command after the reference. Example of the tail:",
+        "5. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success.",
+        "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
+        "7. The runner uses this commit's body as the PR description (if you make more than one commit, the LAST commit carries it, since the runner reads only the branch tip); it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the literal line 'Closes', then the bare issue reference on the next line alone, with nothing after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above the 'Closes' line, never after the reference. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single 'Closes' line. NO 'State ...' command after the reference. Example of the tail:",
         "     ## Verification",
         "",
         "     `just check` passes.",
@@ -1810,9 +1812,8 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "     Closes",
         "     #{{key}}",
         "   Write the message to a file OUTSIDE {{workdir}} and commit with 'git commit --cleanup=verbatim --file <message-file>', so the '##' headings and the '#{{key}}' line survive verbatim. This links the PR to the issue in YouTrack without transitioning it. Do NOT write 'State Done' - the issue must stay In Progress until a human merges the PR.",
-        "6. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success.",
-        "7. Verify completion against the acceptance criteria before stopping. Re-read each criterion and state the concrete evidence that it is met: the file:line you changed, the command and its output, or the test that now passes. For any criterion that REMOVES or DELETES something, prove absence with a search (grep for the symbol or file) and confirm zero hits - never assert a removal you have not grep-verified - and add or extend a test or CI guard that fails if it reappears, so the removal is enforced mechanically. A green check suite is necessary but NOT sufficient: green checks do not prove the acceptance criteria are met. If you cannot produce objective evidence for EVERY criterion, you have NOT completed the issue - take the blocker path below instead of stopping as done.",
-        "8. Stop. Do not push and do not open a PR; beyond the YouTrack writes permitted above, do not touch the tracker. The runner opens the PR from your commits and transitions the issue.",
+        "8. Verify completion against the acceptance criteria before stopping. Re-read each criterion and state the concrete evidence that it is met: the file:line you changed, the command and its output, or the test that now passes. For any criterion that REMOVES or DELETES something, prove absence with a search (grep for the symbol or file) and confirm zero hits - never assert a removal you have not grep-verified - and add or extend a test or CI guard that fails if it reappears, so the removal is enforced mechanically. A green check suite is necessary but NOT sufficient: green checks do not prove the acceptance criteria are met. If you cannot produce objective evidence for EVERY criterion, you have NOT completed the issue - take the blocker path below instead of stopping as done.",
+        "9. Stop. Do not push and do not open a PR; beyond the YouTrack writes permitted above, do not touch the tracker. The runner opens the PR from your commits and transitions the issue.",
         "",
         "If the issue asks for tracker output rather than code - a survey across repos, a report, issues to file - and you therefore finish DELIBERATELY with no commits:",
         "  a. Do the permitted YouTrack writes above: create the issue(s), and link each one as a subtask of {{key}}.",
@@ -1829,7 +1830,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "       {{workdir}}/{{skip_attempt_marker}}",
         "  d. Do NOT set any YouTrack field yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.",
         "",
-        "When you finish, summarize what you did as an acceptance-criteria checklist: one line per criterion with the concrete evidence that proves it is met. Do not include a PR URL - the runner creates the PR.",
+        "When you finish, summarize what you did as an acceptance-criteria checklist: one line per criterion with the concrete evidence that proves it is met. Include one more line: 'Re-read {{key}} before the final commit: unchanged', or 'Re-read {{key}} before the final commit: changed (<what changed>, <how it was handled>)'. Do not include a PR URL - the runner creates the PR.",
     ]
     .join("\n")
 }
@@ -3064,6 +3065,39 @@ mod tests {
         );
         assert!(p.contains("leave it checked out as HEAD when you stop"));
         assert!(p.contains("Never run 'git checkout main'"));
+    }
+
+    /// CLAUDE-367: an issue can be edited after pickup, so the default prompt
+    /// must re-read it after the check suite goes green and before the final
+    /// commit, and the closing summary must report whether anything changed.
+    #[test]
+    fn default_prompt_re_reads_the_issue_before_the_final_commit() {
+        let p = default_youtrack_prompt();
+        let check_suite_step = p
+            .find("Run the target repo's check suite synchronously to green")
+            .expect("check suite step present");
+        let reread_step = p
+            .find("Immediately before your final commit, re-run 'yt issue inspect {{key}}'")
+            .expect("re-read step present");
+        let commit_step = p
+            .find("The runner uses this commit's body as the PR description")
+            .expect("commit step present");
+        assert!(
+            check_suite_step < reread_step,
+            "the re-read must come after the check suite goes green"
+        );
+        assert!(
+            reread_step < commit_step,
+            "the re-read must come before the final commit"
+        );
+        assert!(
+            p.contains("Re-read {{key}} before the final commit: unchanged"),
+            "the closing summary must require the unchanged report line"
+        );
+        assert!(
+            p.contains("Re-read {{key}} before the final commit: changed (<what changed>, <how it was handled>)"),
+            "the closing summary must require the changed report line"
+        );
     }
 
     #[test]
