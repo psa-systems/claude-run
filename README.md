@@ -57,7 +57,13 @@ comments / labels (`fj pr comment`, `fj pr edit labels`) go through the issues A
 at gather time by the repo-access preflight, which probes one read per category (`repo view` and `pr search`) so the
 missing scope is named before a Claude run is paid for. If the open-PR lookup fails anyway (a mid-run permission
 change, or a transient forge error) the runner creates the PR instead of failing the run, logging a `warn` run event
-with the CLI error. The read-only log-fetch token
+with the CLI error. Every read-only `fj` call the runner makes (`repo view`, `pr search`, `pr status`, `whoami`, `repo
+collaborator ... permission`, and the CI-failure log/run/file reads) is retried up to four attempts total on a non-zero
+exit, waiting 0s/2s/5s before attempts 2-4 (CLAUDE-366), so a transient forge blip costs at most 7 seconds rather than
+failing the run outright; a deterministic failure (a 404 or a scope error) still exhausts all four attempts before its
+error surfaces, since the retry never inspects the CLI's error text to decide whether to give up early. Every `fj`
+write (`pr create`, `pr merge`, `pr update`, comments, label edits) is never retried, since a retried write could
+double-post a comment or a PR. The read-only log-fetch token
 (`log_token_ref`, used by the CI-failure sources' log fetch) needs only `read:repository`. Two, separate write-scoped
 tokens exist for two, separate reasons: the CI-failure webhook source's own `write_token_ref` (CLAUDE-276) posts the
 PR comment a CI-failure routing decision needs (the analysis on a human's PR, the agent's own re-queued issue, the
