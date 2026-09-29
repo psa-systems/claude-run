@@ -32,14 +32,16 @@ pub(crate) fn default_audit_prompt() -> String {
         "P2. Read `<target>/_coverage.md` and `<target>/_deferred.md` in the audits checkout FIRST, per `prompts/_filing.md` step 0, and carry forward what is owed before anything found this run.",
         "P3. Execute the audit-type prompt's phases, including its verification phase. Drop what you cannot substantiate and state the dropped count.",
         "P4. Write the dated report BEFORE filing anything: the file the audit-type prompt names, led by its `## Result` block and carrying one finding block per finding you are about to file. Per `prompts/_filing.md`: dedup, group, and select at most 20 finding issues for this target, a roll-up issue included in that count; write everything over the cap to the target's `_deferred.md`; update this target's `_coverage.md`. This report is the record a compacted context re-reads instead of reconstructing a finding from memory, so it must exist, complete, before P5's first `yt issue create`.",
-        "P5. File the findings, working only from the report P4 just wrote, never from conversation memory. For each finding, in this order: re-read that finding's block from the report ON DISK and re-open its first cited `file:line` in the clone; build the issue body from that re-read report text; create it ONLY in one of these projects: {{write_projects}}; set its Priority; add its `Audit-<Type>` tag; link it `subtask of` {{key}} (plus any `relates` or `depends on` links the filing procedure calls for); and set `AI Agent` to `Queued` LAST, so the agent never picks up a half-filed issue. Immediately after each `yt issue create`, before any other write for that finding, append one line `<finding id><TAB><issue key>` to the filing log at `/tmp/audit-filing-{{key}}.tsv` (outside {{workdir}}, so it survives regardless of what happens to this checkout). If you notice that earlier conversation has been replaced by a compaction summary, or you cannot account for a finding's text from your own prior turns, STOP before any further tracker write and re-read both the report and the filing log from disk: never create an issue for a finding id the filing log already lists, even if you no longer recall filing it. Once every finding is filed, append the `## Filed` table to the same report and confirm with ONE batch query, `yt list --query \"issue ID: <KEY>, <KEY>\" --json --top <N>`, that every issue you filed shows its Priority and `AI Agent = Queued`, and fix any that does not.",
-        "P6. Tracker write-back for this target: post ONE summary comment for this target on the parent issue that {{key}} is a subtask of (if {{key}} has no parent, post none and say so in `## Result`), and rewrite the description of {{key}} so it leads with the `## Result` block, keeping the original instructions below it under `## Run instructions (completed <YYYY-MM-DD>)`. Do not touch the anchor issue.",
+        "P5. Immediately before filing, re-run `yt issue inspect {{key}}` and compare its description and links against what S1 showed. If nothing changed, continue to P6. If it changed in a way that changes this target, its scope, or the audit-type prompt to use, reconcile the report P4 wrote against the new text before filing anything from it; if the change makes the run unsafe, contradictory, or ambiguous, take the blocker path below instead of filing.",
+        "P6. File the findings, working only from the report P4 just wrote, never from conversation memory. For each finding, in this order: re-read that finding's block from the report ON DISK and re-open its first cited `file:line` in the clone; build the issue body from that re-read report text; create it ONLY in one of these projects: {{write_projects}}; set its Priority; add its `Audit-<Type>` tag; link it `subtask of` {{key}} (plus any `relates` or `depends on` links the filing procedure calls for); and set `AI Agent` to `Queued` LAST, so the agent never picks up a half-filed issue. Immediately after each `yt issue create`, before any other write for that finding, append one line `<finding id><TAB><issue key>` to the filing log at `/tmp/audit-filing-{{key}}.tsv` (outside {{workdir}}, so it survives regardless of what happens to this checkout). If you notice that earlier conversation has been replaced by a compaction summary, or you cannot account for a finding's text from your own prior turns, STOP before any further tracker write and re-read both the report and the filing log from disk: never create an issue for a finding id the filing log already lists, even if you no longer recall filing it. Once every finding is filed, append the `## Filed` table to the same report and confirm with ONE batch query, `yt list --query \"issue ID: <KEY>, <KEY>\" --json --top <N>`, that every issue you filed shows its Priority and `AI Agent = Queued`, and fix any that does not.",
+        "P7. Tracker write-back for this target: post ONE summary comment for this target on the parent issue that {{key}} is a subtask of (if {{key}} has no parent, post none and say so in `## Result`), and rewrite the description of {{key}} so it leads with the `## Result` block, keeping the original instructions below it under `## Run instructions (completed <YYYY-MM-DD>)`. Do not touch the anchor issue.",
         "",
         "DAILY PARENT RUN steps:",
         "D1. Clone no target repository, run no audit phase, and create, tag, link, or queue no issue.",
         "D2. Read the per-target results: each Epic that is a subtask of {{key}} (`yt issue inspect` each for its `## Result`), the per-target reports those Epics name on the default branch, and both ledger files for each target.",
         "D3. Write `runs/<TYPE>-<YYYY-MM-DD>.md` with its `## Result`, `## Run summary` (including the unfiled-backlog table from `prompts/_filing.md` step 7), and `## Anchor table` sections. Add no `_coverage.md` or `_deferred.md` row; those belong to the per-target runs. Create nothing else.",
-        "D4. Tracker write-back for the day: rewrite the description of {{key}} so it leads with the run-wide `## Result` block (run-wide totals and a link to each Epic), keeping the original instructions below it under `## Run instructions (completed <YYYY-MM-DD>)`; then update the standing table in the description of the anchor issue named in the description of {{key}}. Anchor description only.",
+        "D4. Immediately before the write-back below, re-run `yt issue inspect {{key}}` and compare its description and links against what S1 showed. If nothing changed, continue to D5. If it changed, reconcile `runs/<TYPE>-<YYYY-MM-DD>.md` against the new text before writing back; if the change makes the run unsafe, contradictory, or ambiguous, take the blocker path below instead of writing back.",
+        "D5. Tracker write-back for the day: rewrite the description of {{key}} so it leads with the run-wide `## Result` block (run-wide totals and a link to each Epic), keeping the original instructions below it under `## Run instructions (completed <YYYY-MM-DD>)`; then update the standing table in the description of the anchor issue named in the description of {{key}}. Anchor description only.",
         "",
         "Commit, both run shapes:",
         "C1. Commit the files above to the feature branch. If you make more than one commit, the LAST commit must carry the message below. Write the message to a file OUTSIDE {{workdir}} and commit with `git commit --cleanup=verbatim --file <message-file>`, so lines starting with `#` survive and no stray file lands in the audits repo.",
@@ -80,7 +82,7 @@ pub(crate) fn default_audit_prompt() -> String {
         "       {{workdir}}/{{skip_attempt_marker}}",
         "  d. Do NOT set any field on {{key}} yourself; the runner reads the marker and sets AI Agent to 'Needs Review'.",
         "",
-        "When you finish, summarize the run as a checklist: the run shape, the branch and the files committed, the finding issues filed (key, priority, and confirmed `AI Agent = Queued` for each), any self-created issue you instead set to `Needs Review` (key and reason), existing issues commented on instead of filed, deferred entries added or drained, and each tracker write-back you performed. Do not include a pull request URL; the runner creates the pull request.",
+        "When you finish, summarize the run as a checklist: the run shape, the branch and the files committed, the finding issues filed (key, priority, and confirmed `AI Agent = Queued` for each), any self-created issue you instead set to `Needs Review` (key and reason), existing issues commented on instead of filed, deferred entries added or drained, and each tracker write-back you performed. Include one more line: 'Re-read {{key}} before the final commit: unchanged', or 'Re-read {{key}} before the final commit: changed (<what changed>, <how it was handled>)'. Do not include a pull request URL; the runner creates the pull request.",
     ]
     .join("\n")
 }
@@ -98,10 +100,10 @@ mod tests {
     fn prompt_orders_report_before_filing_and_defines_the_filing_log() {
         let p = default_audit_prompt();
         let report_step = p.find("P4.").expect("P4 step present");
-        let filing_step = p.find("P5.").expect("P5 step present");
+        let filing_step = p.find("P6.").expect("P6 step present");
         assert!(
             report_step < filing_step,
-            "the report step (P4) must precede the filing step (P5)"
+            "the report step (P4) must precede the filing step (P6)"
         );
         assert!(
             p.contains("BEFORE filing anything"),
@@ -109,27 +111,60 @@ mod tests {
         );
         assert!(
             p.contains("re-read that finding's block from the report ON DISK"),
-            "P5 must build each issue body from the on-disk report"
+            "P6 must build each issue body from the on-disk report"
         );
         assert!(
             p.contains("re-open its first cited `file:line` in the clone"),
-            "P5 must re-open the finding's first citation before filing it"
+            "P6 must re-open the finding's first citation before filing it"
         );
         assert!(
             p.contains("/tmp/audit-filing-{{key}}.tsv"),
-            "P5 must define the filing log path"
+            "P6 must define the filing log path"
         );
         assert!(
             p.contains("append one line `<finding id><TAB><issue key>`"),
-            "P5 must define the filing log's line shape"
+            "P6 must define the filing log's line shape"
         );
         assert!(
             p.contains("earlier conversation has been replaced by a compaction summary"),
-            "P5 must define the resume rule after a compaction"
+            "P6 must define the resume rule after a compaction"
         );
         assert!(
             p.contains("never create an issue for a finding id the filing log already lists"),
-            "P5 must forbid re-filing a finding the log already recorded"
+            "P6 must forbid re-filing a finding the log already recorded"
+        );
+    }
+
+    /// CLAUDE-367: the issue can be edited after pickup, so both run shapes
+    /// must re-read it immediately before they file or link their outputs.
+    #[test]
+    fn prompt_re_reads_the_issue_before_filing_and_before_write_back() {
+        let p = default_audit_prompt();
+        let filing_step = p.find("P6.").expect("P6 step present");
+        let reread_step = p.find("P5.").expect("P5 step present");
+        assert!(
+            reread_step < filing_step,
+            "the re-read step (P5) must precede the filing step (P6)"
+        );
+        let write_back_step = p.find("D5.").expect("D5 step present");
+        let daily_reread_step = p.find("D4.").expect("D4 step present");
+        assert!(
+            daily_reread_step < write_back_step,
+            "the re-read step (D4) must precede the write-back step (D5)"
+        );
+        assert_eq!(
+            p.matches("re-run `yt issue inspect {{key}}` and compare its description and links against what S1 showed")
+                .count(),
+            2,
+            "both run shapes must re-read and reconcile against the S1 read"
+        );
+        assert!(
+            p.contains("Re-read {{key}} before the final commit: unchanged"),
+            "the closing summary must require the unchanged report line"
+        );
+        assert!(
+            p.contains("Re-read {{key}} before the final commit: changed (<what changed>, <how it was handled>)"),
+            "the closing summary must require the changed report line"
         );
     }
 
