@@ -178,6 +178,8 @@ native:
         - depends on                      # Depend INWARD: an open blocker gates this issue
         - parent for                      # Subtask OUTWARD: an open child gates this parent
       block_cross_project: true           # false: a link to an issue in another project never blocks
+    tags:                                 # optional; tags written alongside an AI Agent value (CLAUDE-373)
+      needs_info: Needs-Info              # tag added with the needs-review-marker park; empty writes no tag
   forgejo:
     base_url: https://forge.example       # optional; default derives host per issue VCS
     token_ref: fj-prod                    # optional; name of an encrypted secret
@@ -209,6 +211,7 @@ native:
 | `youtrack.dependencies.recheck_timeout` | `5m`              | Humantime backoff before a blocked issue is re-evaluated. While the window is open the issue stays Queued with no `yt` read and no comment (no per-poll spam). Validated at action load, and by the structured web form on save (CLAUDE-298). |
 | `youtrack.dependencies.block_on` | `["depends on", "parent for"]` | Direction-resolved link verbs (YT-40) that block. A queued issue is blocked when it has any link whose `verb` is listed here and whose target is unresolved. The defaults block `depends on` (Depend INWARD, an open blocker) and `parent for` (Subtask OUTWARD, an open child); the reverse verbs `is required for` and `subtask of` never block. Editable in the structured web form as a comma-separated list (CLAUDE-298). |
 | `youtrack.dependencies.block_cross_project` | `true`        | When `false`, a link to an issue in a different project (compared by key prefix: `GAMMA` in `GAMMA-12`) never blocks, whatever its verb. `actions/audit-run.yml` sets it (CLAUDE-295): an audit Epic in `AUDIT` is `parent for` the findings it filed into the product projects, and must not wait on them. Editable in the structured web form (CLAUDE-298). |
+| `youtrack.tags.needs_info` | `Needs-Info`                  | Tag attached (`yt issue tag add <key> <tag> --create`) alongside the `Needs Review` AI Agent value, but only when the agent itself parked the issue via `.claude-run-needs-review` (CLAUDE-373). The attempt-cap and timeout parks also set `Needs Review`, but never write this tag; neither does a normal or no-code completion. Empty disables the tag write. A failed tag write is logged and does not block the `AI Agent` write. Editable in the structured web form as "Needs-Info tag". |
 | `forgejo.base_url`      | per-issue VCS host                 | Forgejo base URL.                                                                                   |
 | `forgejo.token_ref`     | none                               | Name of an encrypted secret holding the Forgejo API token (CLAUDE-26). `None` uses host `fj` auth. The token must carry the **`write:repository`** and **`write:issue`** scopes (see [Forgejo token scopes](#forgejo-token-scopes-claude-196)). |
 | `forgejo.pr_strategy`   | `branch`                           | PR-creation strategy (CLAUDE-103). `branch`: resolve the feature branch by name (independent of the current `HEAD`; CLAUDE-166), push it as `git push --set-upstream origin <branch>:<branch>`, and open the PR over the API with an explicit `--head`, so the PR stays mergeable and updatable. `agit`: `fj pr create -aA`, a branchless PR whose head lives only at `refs/pull/<N>/head` and loses its merge button if it falls behind an up-to-date base. The selected strategy is authoritative (no silent cross-strategy fallback). Both strategies are gated by the same pre-dispatch ahead check (CLAUDE-212): PR creation is attempted only when exactly one local branch has commits ahead of the base, so a run that produced no commits fails loudly instead of opening an empty PR. |
@@ -800,11 +803,17 @@ touch $"($workdir)/.claude-run-skip-attempt"
 ```
 
 The action's finalize post step then reads this marker after claude exits: if `.claude-run-needs-review` exists it parks
-the job (ensuring the skip-attempt marker is present), posts the file's contents verbatim as the issue comment, and sets
-the status field to the project's "needs human input" value, creating no PR. This keeps every external mutation in one
-post step gated on the run outcome, rather than having the agent mutate the external system mid-run. The marker is a
-plain convention between an action's prompt and its post step; the runner itself only special-cases
-`.claude-run-skip-attempt`.
+the job (ensuring the skip-attempt marker is present), posts the file's contents verbatim as the issue comment, attaches
+the `youtrack.tags.needs_info` tag (CLAUDE-373; empty skips the write, and a failed tag write is logged and does not
+block the field write below), and sets the status field to the project's "needs human input" value, creating no PR. This
+keeps every external mutation in one post step gated on the run outcome, rather than having the agent mutate the
+external system mid-run. The marker is a plain convention between an action's prompt and its post step; the runner
+itself only special-cases `.claude-run-skip-attempt`.
+
+The tag is written ONLY on this path: the attempt-cap park (CLAUDE-301) and a timeout park (CLAUDE-232) both also set
+`AI Agent = needs_review`, but neither is the agent asking a question, so neither writes the tag. The built-in prompt's
+blocker-path step requires the marker text to end with exactly one explicit question a human can answer, so the tag's
+presence lines up with "there's a question here" rather than "ran out of attempts" or "timed out".
 
 ### `output.file` (string, optional)
 
