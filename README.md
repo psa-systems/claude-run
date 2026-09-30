@@ -1605,7 +1605,7 @@ docker compose up --detach      # start the daemon from the published image
 docker compose logs --follow    # watch the scheduler
 ```
 
-See [CLAUDE.md](CLAUDE.md) for the project-specific deviations from `niceguyit/governance` and the phase history of the completed Rust port.
+See [CLAUDE.md](CLAUDE.md) for the project-specific deviations from `niceguyit/governance` and the phase history of the completed Rust port; the full text of each convention it indexes lives in [docs/conventions/](docs/conventions/).
 
 ## License
 

@@ -69,9 +69,15 @@ default:
 
 # -- Checks (override) --------------------------------------------------------
 
-# Umbrella check: fmt + clippy + build + tests + builder-stage docker compile. Overrides common's `check`, which omits tests; reuses the inherited `test` recipe so tests run as part of `just check`.
+# Umbrella check: CLAUDE.md guard + fmt + clippy + build + tests + builder-stage docker compile. Overrides common's `check`, which omits tests; reuses the inherited `test` recipe so tests run as part of `just check`.
 [group: 'check']
-check: check-fmt check-clippy check-build test check-docker
+check: check-claude-md check-fmt check-clippy check-build test check-docker
+
+# Guard CLAUDE.md: 20,000-byte cap, 400-character lines, resolvable docs/ links (CLAUDE-370). Runs its self-test first.
+[group: 'check']
+check-claude-md:
+    nu scripts/check-claude-md.nu --self-test
+    nu scripts/check-claude-md.nu
 
 # -- Development --------------------------------------------------------------
 
