@@ -109,8 +109,9 @@
     <div class="grid2">
       {% call m::textfield("Write projects", "yt_write_projects", form.yt_write_projects, "AUD, DEV (blank = the triggering issue's own project)") %}
       {% call m::textfield("No-code label", "state_no_code", form.state_no_code, "blank = inherit the Done label above") %}
+      {% call m::textfield("Needs-Info tag", "tags_needs_info", form.tags_needs_info, "Needs-Info (blank = write no tag)") %}
     </div>
-    <p class="hint dim">Comma-separated project keys the agent may create issues in when filing a gap, deferred item, or out-of-scope bug. Blank resolves to the triggering issue's own project. The no-code label is the AI Agent value set when a run deliberately produces no commits; blank inherits the Done label above.</p>
+    <p class="hint dim">Comma-separated project keys the agent may create issues in when filing a gap, deferred item, or out-of-scope bug. Blank resolves to the triggering issue's own project. The no-code label is the AI Agent value set when a run deliberately produces no commits; blank inherits the Done label above. The Needs-Info tag is attached alongside the Needs review AI Agent value only when the agent parks an issue pending a human answer (not on an attempt-cap or timeout park); blank writes no tag.</p>
   </div>
 
   <div class="card">
