@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use super::cli::{CliBackend, CommandRunner};
+use super::cli::{CliBackend, CmdOutput, CommandRunner};
 use super::{
     Backend, BackendKind, Forge, ForgePullRequest, IssueInspect, IssueLink, IssueTracker,
     PullRequest, VcsMapEntry, VcsRepo, GITHUB_PRIORITY,
@@ -43,6 +43,32 @@ pub const GITHUB_COM: &str = "github.com";
 /// in `extra` (configured GitHub Enterprise hosts). Case-insensitive.
 pub fn is_github_host(host: &str, extra: &[String]) -> bool {
     host.eq_ignore_ascii_case(GITHUB_COM) || extra.iter().any(|h| h.eq_ignore_ascii_case(host))
+}
+
+/// Run `gh auth token --hostname <host>`, returning the trimmed token or a
+/// formatted error naming the failure. Shared by [`GithubForge`] (its own
+/// PR/comment push fallback) and [`GhForgeReads`] (its CI-failure log reads),
+/// since both fall back to the daemon's own `gh` login the same way.
+fn gh_auth_token(
+    runner: &dyn CommandRunner,
+    gh: &str,
+    host: &str,
+) -> std::result::Result<String, String> {
+    let out = runner
+        .run(gh, &["auth", "token", "--hostname", host])
+        .map_err(|e| format!("gh auth token --hostname {host} failed: {e}"))?;
+    if !out.ok {
+        return Err(format!(
+            "gh auth token --hostname {host} exited {}: {}",
+            out.exit_code,
+            out.stderr.trim()
+        ));
+    }
+    let token = out.stdout.trim().to_string();
+    if token.is_empty() {
+        return Err(format!("gh auth token --hostname {host} returned no token"));
+    }
+    Ok(token)
 }
 
 /// Transport for the embedded MCP client. Seam so the synchronous `Forge` path
@@ -241,30 +267,9 @@ impl GithubForge {
         if let Some(result) = cached.as_ref() {
             return result.clone();
         }
-        let result = self.gh_auth_token(host);
+        let result = gh_auth_token(self.runner.as_ref(), &self.gh, host);
         *cached = Some(result.clone());
         result
-    }
-
-    /// Run `gh auth token --hostname <host>`, returning the trimmed token or a
-    /// formatted error naming the failure.
-    fn gh_auth_token(&self, host: &str) -> std::result::Result<String, String> {
-        let out = self
-            .runner
-            .run(&self.gh, &["auth", "token", "--hostname", host])
-            .map_err(|e| format!("gh auth token --hostname {host} failed: {e}"))?;
-        if !out.ok {
-            return Err(format!(
-                "gh auth token --hostname {host} exited {}: {}",
-                out.exit_code,
-                out.stderr.trim()
-            ));
-        }
-        let token = out.stdout.trim().to_string();
-        if token.is_empty() {
-            return Err(format!("gh auth token --hostname {host} returned no token"));
-        }
-        Ok(token)
     }
 
     /// Run `git args...` in `workdir`, returning trimmed stdout or a typed error.
@@ -908,6 +913,425 @@ impl GhPrEntry {
             author: self.author.login,
             html_url: self.url,
             updated_at: String::new(),
+        }
+    }
+}
+
+/// Seam over the GitHub Actions REST API for the CI-failure webhook pipeline
+/// ([`crate::forge_log::ActionLogClient`] / [`crate::forge_log::ActionRunsClient`]
+/// / [`crate::forge_log::RepoFileClient`]), selected instead of
+/// [`crate::provider::cli::FjForgeReads`] for a GitHub host
+/// ([`is_github_host`]).
+///
+/// Every read goes through `gh api ... --hostname <host>`, never `gh run
+/// view --log` (its own help text admits an unreliable job/log association
+/// once a run has more than 25 jobs). GitHub's webhook `run_number` (the
+/// trait methods' `run_number` parameter, from `workflow_run.run_number`) is
+/// not the id the REST API addresses a run by (`workflow_run.id`), so
+/// [`GhForgeReads::find_run`] pages `GET /repos/{repo}/actions/runs`
+/// newest-first and matches `run_number` locally, reusing
+/// [`crate::forge_log::parse_runs_list_entries`]'s tolerant field-name
+/// matching (GitHub's `run_number` / `id` / `path` / `updated_at` are among
+/// its candidate keys). From the matched run's `global_id`, jobs and each
+/// job's plaintext log are two further calls (`.../runs/{id}/jobs`, then
+/// `.../jobs/{job_id}/logs` per job), unlike `fj actions logs`, which
+/// returns every job's log in one response.
+///
+/// Unlike `fj`, `gh api` requires a credential even for a public repo
+/// (verified empirically against a live public repo), so a `None` token
+/// falls back to `gh auth token --hostname <host>` exactly as
+/// [`GithubForge::effective_token`] does; with neither, every trait method
+/// fails naming that.
+pub struct GhForgeReads {
+    runner: Arc<dyn CommandRunner>,
+    gh: String,
+}
+
+/// Runs requested per `gh api .../actions/runs` page.
+const GH_RUNS_PER_PAGE: u32 = 100;
+
+/// Pages searched for one target `run_number` before giving up: enough to
+/// cover the 500 most recent runs, far more than the near-real-time webhook
+/// delivery ever needs to look past.
+const GH_RUN_LOOKUP_MAX_PAGES: u32 = 5;
+
+impl GhForgeReads {
+    /// Client using the default `gh` binary name.
+    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self {
+            runner,
+            gh: "gh".to_string(),
+        }
+    }
+
+    /// Override the binary name (tests point this at a stub).
+    pub fn with_binary(mut self, gh: impl Into<String>) -> Self {
+        self.gh = gh.into();
+        self
+    }
+
+    /// `token` when given, else the daemon's own `gh auth token --hostname
+    /// <host>` login.
+    fn effective_token(
+        &self,
+        host: &str,
+        token: Option<&str>,
+    ) -> std::result::Result<String, String> {
+        match token {
+            Some(t) => Ok(t.to_string()),
+            None => gh_auth_token(self.runner.as_ref(), &self.gh, host),
+        }
+    }
+
+    /// `gh api --hostname <host> <endpoint> [extra...]`, GET by default.
+    fn api_get(
+        &self,
+        host: &str,
+        endpoint: &str,
+        gh_token: &str,
+        extra: &[&str],
+    ) -> Result<CmdOutput> {
+        let envs = [("GH_TOKEN", gh_token)];
+        let mut args: Vec<&str> = vec!["api", "--hostname", host, endpoint];
+        args.extend_from_slice(extra);
+        self.runner.run_in_env(None, &self.gh, &args, &envs)
+    }
+
+    /// Page `GET /repos/{repo}/actions/runs`, newest-first, until the page
+    /// carrying `run_number` is found or [`GH_RUN_LOOKUP_MAX_PAGES`] is
+    /// exhausted. Returns the matched [`crate::forge_log::RunEntry`]; its
+    /// `global_id` is the id `/actions/runs/{id}` addresses.
+    fn find_run(
+        &self,
+        host: &str,
+        repo: &str,
+        run_number: i64,
+        gh_token: &str,
+    ) -> std::result::Result<crate::forge_log::RunEntry, crate::forge_log::RunLogsOutcome> {
+        use crate::forge_log::RunLogsOutcome;
+        let per_page = GH_RUNS_PER_PAGE.to_string();
+        for page in 1..=GH_RUN_LOOKUP_MAX_PAGES {
+            let page_s = page.to_string();
+            let endpoint = format!("repos/{repo}/actions/runs?per_page={per_page}&page={page_s}");
+            let out = self.api_get(host, &endpoint, gh_token, &[]).map_err(|e| {
+                RunLogsOutcome::Failed(format!("running {} api {endpoint}: {e}", self.gh))
+            })?;
+            if !out.ok {
+                return Err(classify_gh_api_error(&out.stderr, out.exit_code));
+            }
+            let entries = crate::forge_log::parse_runs_list_entries(&out.stdout)
+                .map_err(|e| RunLogsOutcome::Failed(format!("parsing gh api {endpoint}: {e}")))?;
+            if let Some(entry) = entries.iter().find(|e| e.index == run_number) {
+                return Ok(entry.clone());
+            }
+            if entries.len() < GH_RUNS_PER_PAGE as usize {
+                break;
+            }
+        }
+        Err(RunLogsOutcome::NotFound(format!(
+            "no workflow run with run_number {run_number} found in the {} most recent runs of {repo}",
+            GH_RUNS_PER_PAGE * GH_RUN_LOOKUP_MAX_PAGES
+        )))
+    }
+}
+
+/// Map a failed `gh api` invocation onto a [`crate::forge_log::RunLogsOutcome`].
+/// `gh api` prints `gh: <message> (HTTP <code>)` on stderr (verified against a
+/// live 403/404 response), so the code is the discriminator: 401/403 is a
+/// rejected or under-scoped token (terminal), 404 is "not visible" (a private
+/// repo without a token, a pruned run, or a job whose log already expired),
+/// and anything else is a fault. Only `gh`'s own stderr is quoted; it carries
+/// no token.
+fn classify_gh_api_error(stderr: &str, exit_code: i32) -> crate::forge_log::RunLogsOutcome {
+    use crate::forge_log::RunLogsOutcome;
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no stderr")
+        .to_string();
+    if detail.contains("HTTP 401") {
+        return RunLogsOutcome::AuthDenied(
+            "HTTP 401: the log token is not a valid GitHub token (wrong value, expired, or revoked)"
+                .to_string(),
+        );
+    }
+    if detail.contains("HTTP 403") {
+        return RunLogsOutcome::AuthDenied(
+            "HTTP 403: the log token is valid but lacks Actions read access on this repo"
+                .to_string(),
+        );
+    }
+    if detail.contains("HTTP 404") {
+        return RunLogsOutcome::NotFound(format!(
+            "HTTP 404: not visible (private repo without a token, or pruned): {detail}"
+        ));
+    }
+    RunLogsOutcome::Failed(format!("gh api exited {exit_code}: {detail}"))
+}
+
+/// Map a failed `gh api .../actions/runs` invocation onto a
+/// [`crate::forge_log::RunsListOutcome`], on the same discriminator
+/// [`classify_gh_api_error`] uses.
+fn classify_gh_runs_error(stderr: &str, exit_code: i32) -> crate::forge_log::RunsListOutcome {
+    use crate::forge_log::RunsListOutcome;
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no stderr")
+        .to_string();
+    if detail.contains("HTTP 401") {
+        return RunsListOutcome::AuthDenied(401);
+    }
+    if detail.contains("HTTP 403") {
+        return RunsListOutcome::AuthDenied(403);
+    }
+    if detail.contains("HTTP 404") {
+        return RunsListOutcome::NotFound;
+    }
+    RunsListOutcome::Failed(format!("gh api exited {exit_code}: {detail}"))
+}
+
+/// One `GET /repos/{repo}/actions/runs/{id}/jobs` document.
+#[derive(Debug, Default, serde::Deserialize)]
+struct GhJobsDoc {
+    #[serde(default)]
+    jobs: Vec<GhJobEntry>,
+}
+
+/// One job of a `GET .../jobs` document.
+#[derive(Debug, serde::Deserialize)]
+struct GhJobEntry {
+    id: i64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    conclusion: Option<String>,
+}
+
+impl crate::forge_log::ActionLogClient for GhForgeReads {
+    fn run_logs(
+        &self,
+        host: &str,
+        repo: &str,
+        run_number: i64,
+        token: Option<&str>,
+    ) -> crate::forge_log::RunLogsOutcome {
+        use crate::forge_log::RunLogsOutcome;
+        let gh_token = match self.effective_token(host, token) {
+            Ok(t) => t,
+            Err(e) => {
+                return RunLogsOutcome::Failed(format!(
+                    "no GitHub credential for host `{host}`: {e}"
+                ))
+            }
+        };
+        let run = match self.find_run(host, repo, run_number, &gh_token) {
+            Ok(r) => r,
+            Err(outcome) => return outcome,
+        };
+        let jobs_endpoint = format!(
+            "repos/{repo}/actions/runs/{}/jobs?per_page=100",
+            run.global_id
+        );
+        let out = match self.api_get(host, &jobs_endpoint, &gh_token, &[]) {
+            Ok(out) => out,
+            Err(e) => {
+                return RunLogsOutcome::Failed(format!(
+                    "running {} api {jobs_endpoint}: {e}",
+                    self.gh
+                ))
+            }
+        };
+        if !out.ok {
+            return classify_gh_api_error(&out.stderr, out.exit_code);
+        }
+        let doc: GhJobsDoc = match serde_json::from_str(out.stdout.trim()) {
+            Ok(d) => d,
+            Err(e) => {
+                return RunLogsOutcome::Failed(format!("parsing gh api {jobs_endpoint}: {e}"))
+            }
+        };
+        let mut jobs = Vec::with_capacity(doc.jobs.len());
+        for job in doc.jobs {
+            let log_endpoint = format!("repos/{repo}/actions/jobs/{}/logs", job.id);
+            let (log, log_state, log_reason) =
+                match self.api_get(host, &log_endpoint, &gh_token, &[]) {
+                    Ok(out) if out.ok => (out.stdout, "available".to_string(), None),
+                    Ok(out) => {
+                        let reason = match classify_gh_api_error(&out.stderr, out.exit_code) {
+                            RunLogsOutcome::NotFound(r) => {
+                                (crate::forge_log::LOG_STATE_MISSING.to_string(), r)
+                            }
+                            RunLogsOutcome::AuthDenied(r) | RunLogsOutcome::Failed(r) => {
+                                ("unavailable".to_string(), r)
+                            }
+                            RunLogsOutcome::Fetched(_) => unreachable!(
+                            "classify_gh_api_error never returns Fetched from an !out.ok result"
+                        ),
+                        };
+                        (String::new(), reason.0, Some(reason.1))
+                    }
+                    Err(e) => (
+                        String::new(),
+                        "unavailable".to_string(),
+                        Some(format!("running {} api {log_endpoint}: {e}", self.gh)),
+                    ),
+                };
+            let status = job
+                .conclusion
+                .filter(|c| !c.is_empty())
+                .unwrap_or(job.status);
+            jobs.push(crate::forge_log::JobLog {
+                name: job.name,
+                status,
+                log,
+                log_state,
+                log_reason,
+            });
+        }
+        RunLogsOutcome::Fetched(jobs)
+    }
+}
+
+impl crate::forge_log::ActionRunsClient for GhForgeReads {
+    fn list_runs(
+        &self,
+        host: &str,
+        repo: &str,
+        max_pages: u32,
+        token: Option<&str>,
+    ) -> crate::forge_log::RunsListOutcome {
+        use crate::forge_log::RunsListOutcome;
+        let gh_token = match self.effective_token(host, token) {
+            Ok(t) => t,
+            Err(e) => {
+                return RunsListOutcome::Failed(format!(
+                    "no GitHub credential for host `{host}`: {e}"
+                ))
+            }
+        };
+        let per_page = GH_RUNS_PER_PAGE.to_string();
+        let mut all = Vec::new();
+        for page in 1..=max_pages {
+            let page_s = page.to_string();
+            let endpoint = format!("repos/{repo}/actions/runs?per_page={per_page}&page={page_s}");
+            let out = match self.api_get(host, &endpoint, &gh_token, &[]) {
+                Ok(out) => out,
+                Err(e) => {
+                    if !all.is_empty() {
+                        break;
+                    }
+                    return RunsListOutcome::Failed(format!(
+                        "running {} api {endpoint}: {e}",
+                        self.gh
+                    ));
+                }
+            };
+            if !out.ok {
+                if !all.is_empty() {
+                    break;
+                }
+                return classify_gh_runs_error(&out.stderr, out.exit_code);
+            }
+            let entries = match crate::forge_log::parse_runs_list_entries(&out.stdout) {
+                Ok(e) => e,
+                Err(e) => {
+                    if !all.is_empty() {
+                        break;
+                    }
+                    return RunsListOutcome::Failed(format!("parsing gh api {endpoint}: {e}"));
+                }
+            };
+            let short = entries.len() < GH_RUNS_PER_PAGE as usize;
+            all.extend(entries);
+            if short {
+                break;
+            }
+        }
+        RunsListOutcome::Resolved(all)
+    }
+
+    fn run_timing(
+        &self,
+        host: &str,
+        repo: &str,
+        run_number: i64,
+        token: Option<&str>,
+    ) -> std::result::Result<crate::forge_log::RunTiming, String> {
+        let gh_token = self
+            .effective_token(host, token)
+            .map_err(|e| format!("no GitHub credential for host `{host}`: {e}"))?;
+        let per_page = GH_RUNS_PER_PAGE.to_string();
+        for page in 1..=GH_RUN_LOOKUP_MAX_PAGES {
+            let page_s = page.to_string();
+            let endpoint = format!("repos/{repo}/actions/runs?per_page={per_page}&page={page_s}");
+            let out = self
+                .api_get(host, &endpoint, &gh_token, &[])
+                .map_err(|e| format!("running {} api {endpoint}: {e}", self.gh))?;
+            if !out.ok {
+                return Err(format!(
+                    "gh api exited {}: {}",
+                    out.exit_code,
+                    out.stderr
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .unwrap_or("no stderr")
+                ));
+            }
+            if let Ok(t) = crate::forge_log::parse_run_timing(&out.stdout, run_number) {
+                return Ok(t);
+            }
+            let entries =
+                crate::forge_log::parse_runs_list_entries(&out.stdout).unwrap_or_default();
+            if entries.len() < GH_RUNS_PER_PAGE as usize {
+                break;
+            }
+        }
+        Err(format!(
+            "no workflow run with run_number {run_number} found in the {} most recent runs of {repo}",
+            GH_RUNS_PER_PAGE * GH_RUN_LOOKUP_MAX_PAGES
+        ))
+    }
+}
+
+impl crate::forge_log::RepoFileClient for GhForgeReads {
+    fn read_file(
+        &self,
+        host: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+        token: Option<&str>,
+    ) -> std::result::Result<String, String> {
+        let gh_token = self
+            .effective_token(host, token)
+            .map_err(|e| format!("no GitHub credential for host `{host}`: {e}"))?;
+        let endpoint = format!("repos/{repo}/contents/{path}?ref={git_ref}");
+        let out = self
+            .api_get(
+                host,
+                &endpoint,
+                &gh_token,
+                &["-H", "Accept: application/vnd.github.raw+json"],
+            )
+            .map_err(|e| format!("running {} api {endpoint}: {e}", self.gh))?;
+        if out.ok {
+            Ok(out.stdout)
+        } else {
+            Err(format!(
+                "gh api exited {}: {}",
+                out.exit_code,
+                out.stderr
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("no stderr")
+            ))
         }
     }
 }
