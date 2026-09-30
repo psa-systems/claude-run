@@ -46,6 +46,7 @@ pub const TABLES: &[&str] = &[
     "secrets",
     "settings",
     "web_admin",
+    "web_admin_recovery_codes",
     "runs",
     "job_outcomes",
     "run_events",
@@ -70,6 +71,7 @@ const IDENTITY_COLUMNS: &[(&str, &str)] = &[
     ("runs", "id"),
     ("job_outcomes", "id"),
     ("secrets", "id"),
+    ("web_admin_recovery_codes", "id"),
     ("run_events", "id"),
     ("ci_failures", "id"),
     ("ci_failure_runs", "id"),
@@ -611,6 +613,15 @@ mod tests {
             .bind(1i64).bind("admin").bind("$argon2id$v=19$hash").bind("session-key")
             .bind("2026-09-01T00:00:00Z").bind("2026-09-01T00:00:00Z")
             .execute(pool).await.unwrap();
+        sqlx::query(&q(
+            "INSERT INTO web_admin_recovery_codes (code_hash, used_at, created_at) VALUES (?, ?, ?)",
+        ))
+        .bind("$argon2id$v=19$recoveryhash")
+        .bind(None::<String>)
+        .bind("2026-09-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
         let run_id: i64 = sqlx::query_scalar(&q("INSERT INTO runs (action_name, started_at, ended_at, exit_code, jobs_processed, triggered_by) VALUES (?, ?, ?, ?, ?, ?) RETURNING id"))
             .bind("youtrack").bind("2026-09-01T00:00:00Z").bind(None::<String>).bind(None::<i64>).bind(1i64).bind("cli")
             .fetch_one(pool).await.unwrap();
