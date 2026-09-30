@@ -231,6 +231,11 @@ pub struct YoutrackSource {
     /// Enabled by default; `enabled: false` makes the gate a no-op.
     #[serde(skip_serializing_if = "Dependencies::is_default")]
     pub dependencies: Dependencies,
+    /// Tags written alongside an AI Agent value. Today just the `Needs-Info`
+    /// tag added when the agent parks an issue via
+    /// `.claude-run-needs-review` (CLAUDE-373).
+    #[serde(skip_serializing_if = "Tags::is_default")]
+    pub tags: Tags,
 }
 
 impl Default for YoutrackSource {
@@ -247,6 +252,7 @@ impl Default for YoutrackSource {
             automerge: Automerge::default(),
             assignee: None,
             dependencies: Dependencies::default(),
+            tags: Tags::default(),
         }
     }
 }
@@ -362,6 +368,33 @@ fn default_recheck_timeout() -> String {
 
 fn default_block_on() -> Vec<String> {
     vec!["depends on".to_string(), "parent for".to_string()]
+}
+
+/// Tag names written alongside an AI Agent value (CLAUDE-373).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tags {
+    /// Tag added when the agent parks an issue via
+    /// `.claude-run-needs-review`, alongside the `Needs Review` AI Agent
+    /// value. An empty value disables the tag write; the attempt-cap and
+    /// timeout parks (which also set `Needs Review`) never write this tag.
+    pub needs_info: String,
+}
+
+impl Default for Tags {
+    fn default() -> Self {
+        Self {
+            needs_info: "Needs-Info".to_string(),
+        }
+    }
+}
+
+impl Tags {
+    /// True when every field is at its default. Used to skip serializing an
+    /// untouched `tags` block so existing action YAML stays unchanged.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Opt-in, CI-gated automerge of the PR the runner opens after a successful

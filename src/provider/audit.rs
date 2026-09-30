@@ -252,6 +252,12 @@ impl IssueTracker for AuditedTracker<'_> {
         out
     }
 
+    fn add_tag(&self, key: &str, tag: &str) -> Result<()> {
+        let out = self.inner.add_tag(key, tag);
+        self.audit.record("add_tag", key, out.is_ok());
+        out
+    }
+
     fn auth_verify(&self) -> Result<String> {
         self.inner.auth_verify()
     }
