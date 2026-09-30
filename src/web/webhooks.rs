@@ -4078,6 +4078,55 @@ fn resolve_automerge_forge(
     }
 }
 
+/// Record this tick's automerge outcome (or fault) for `repo#pr_number` as a
+/// `run_events` row, keyed with the same `PR {repo}#{pr_number}: ` prefix
+/// [CLAUDE-333] used for the `pr_status` failure, so the previous tick's
+/// outcome for this PR can be found regardless of which of the five sites
+/// produced it (`pr_status` failure, behind_base missing, branch-update
+/// failure, not-mergeable, merge failure), and post `body` to the issue only
+/// when `outcome` differs from that previous message: an unchanged outcome
+/// across reconciler ticks is recorded every pass but commented once, while
+/// a changed outcome (a different error text, or a different outcome
+/// entirely) posts again.
+/// The PR and issue a [`record_automerge_outcome_and_comment_once`] call
+/// concerns; bundled to keep that function's argument count down.
+struct AutomergePr<'a> {
+    repo: &'a str,
+    pr_number: u64,
+    issue_key: &'a str,
+}
+
+async fn record_automerge_outcome_and_comment_once(
+    mint: &MintContext,
+    pool: &DbPool,
+    pr: AutomergePr<'_>,
+    level: &str,
+    outcome: String,
+    body: String,
+    comment_context: &str,
+) {
+    let prefix = format!("PR {}#{}: ", pr.repo, pr.pr_number);
+    let msg = format!("{prefix}{outcome}");
+    let previous = state::run_events_last_message_containing(pool, WEBHOOK_MINT_ACTION, &prefix)
+        .await
+        .unwrap_or_else(|read_err| {
+            warn!(error = %read_err, "reading the previous automerge outcome failed; commenting anyway");
+            None
+        });
+    record_run_event(pool, None, WEBHOOK_MINT_ACTION, level, msg.clone()).await;
+    if previous.as_deref() != Some(msg.as_str()) {
+        post_issue_comment(
+            mint,
+            pr.issue_key,
+            body,
+            pr.repo,
+            pr.pr_number,
+            comment_context,
+        )
+        .await;
+    }
+}
+
 /// The shared decision body both [`handle_action_success_for_pr`]
 /// (the webhook's low-latency trigger) and [`reconcile_automerge`] (the
 /// tick-driven backstop for a missed webhook) call once a recorded, open
@@ -4159,35 +4208,27 @@ async fn apply_automerge_decision(
     let status = match status {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
-            // The message names the PR so the previous `run_events`
-            // row for THIS PR can be found; an unchanged fault (the reconciler
-            // re-hits it every tick) is logged and recorded each time but
-            // commented on the issue only once.
             let prefix = format!("PR {repo}#{pr_number}: ");
-            let msg = format!("{prefix}pr_status failed: {e}");
-            let previous =
-                state::run_events_last_message_containing(pool, WEBHOOK_MINT_ACTION, &prefix)
-                    .await
-                    .unwrap_or_else(|read_err| {
-                        warn!(error = %read_err, "reading the previous pr_status failure failed; commenting anyway");
-                        None
-                    });
+            let outcome = format!("pr_status failed: {e}");
+            let msg = format!("{prefix}{outcome}");
             error!(repo = %repo, pr = pr_number, issue = %row.issue_key, error = %e, "action-run success: {msg}");
-            record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
-            if previous.as_deref() != Some(msg.as_str()) {
-                let body = format!(
-                    "The runner could not check this PR's automerge status: {msg}.\n\nPR: {pr_url}\n\nA later Action Run event or the periodic reconciler will retry automatically."
-                );
-                post_issue_comment(
-                    mint,
-                    &row.issue_key,
-                    body,
+            let body = format!(
+                "The runner could not check this PR's automerge status: {msg}.\n\nPR: {pr_url}\n\nA later Action Run event or the periodic reconciler will retry automatically."
+            );
+            record_automerge_outcome_and_comment_once(
+                mint,
+                pool,
+                AutomergePr {
                     repo,
                     pr_number,
-                    "action-run success: pr-status-failed comment failed",
-                )
-                .await;
-            }
+                    issue_key: &row.issue_key,
+                },
+                "error",
+                outcome,
+                body,
+                "action-run success: pr-status-failed comment failed",
+            )
+            .await;
             return Err(msg);
         }
         Err(e) => {
@@ -4208,17 +4249,22 @@ async fn apply_automerge_decision(
                 let msg = format!(
                     "PR #{pr_number}: fj pr status did not report behind_base; the runtime's fj is too old to support this check"
                 );
+                warn!(repo = %repo, pr = pr_number, "action-run success: {msg}");
                 let body = crate::native::youtrack::automerge_behind_base_missing_comment(pr_url);
-                post_issue_comment(
+                record_automerge_outcome_and_comment_once(
                     mint,
-                    &row.issue_key,
+                    pool,
+                    AutomergePr {
+                        repo,
+                        pr_number,
+                        issue_key: &row.issue_key,
+                    },
+                    "warn",
+                    "behind_base missing".to_string(),
                     body,
-                    repo,
-                    pr_number,
                     "action-run success: behind_base-missing comment failed",
                 )
                 .await;
-                warn!(repo = %repo, pr = pr_number, "action-run success: {msg}");
                 Err(msg)
             }
             Some(true) => {
@@ -4252,12 +4298,17 @@ async fn apply_automerge_decision(
                         let msg = format!("update_pr_branch failed: {e}");
                         let body =
                             crate::native::youtrack::automerge_update_failed_comment(pr_url, &msg);
-                        post_issue_comment(
+                        record_automerge_outcome_and_comment_once(
                             mint,
-                            &row.issue_key,
+                            pool,
+                            AutomergePr {
+                                repo,
+                                pr_number,
+                                issue_key: &row.issue_key,
+                            },
+                            "warn",
+                            msg.clone(),
                             body,
-                            repo,
-                            pr_number,
                             "action-run success: update-failed comment failed",
                         )
                         .await;
@@ -4267,12 +4318,17 @@ async fn apply_automerge_decision(
             }
             Some(false) if status.mergeable != Some(true) => {
                 let body = crate::native::youtrack::automerge_not_mergeable_comment(pr_url);
-                post_issue_comment(
+                record_automerge_outcome_and_comment_once(
                     mint,
-                    &row.issue_key,
+                    pool,
+                    AutomergePr {
+                        repo,
+                        pr_number,
+                        issue_key: &row.issue_key,
+                    },
+                    "info",
+                    "not mergeable".to_string(),
                     body,
-                    repo,
-                    pr_number,
                     "action-run success: not-mergeable comment failed",
                 )
                 .await;
@@ -4314,12 +4370,17 @@ async fn apply_automerge_decision(
                         let msg = format!("complete_automerge failed: {e}");
                         let body =
                             crate::native::youtrack::automerge_merge_failed_comment(pr_url, &msg);
-                        post_issue_comment(
+                        record_automerge_outcome_and_comment_once(
                             mint,
-                            &row.issue_key,
+                            pool,
+                            AutomergePr {
+                                repo,
+                                pr_number,
+                                issue_key: &row.issue_key,
+                            },
+                            "error",
+                            msg.clone(),
                             body,
-                            repo,
-                            pr_number,
                             "action-run success: merge-failed comment failed",
                         )
                         .await;
@@ -10619,6 +10680,229 @@ mod tests {
             )
             .await
             .unwrap();
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            assert_eq!(comments(&backend), 2, "{:?}", backend.calls());
+        }
+
+        #[tokio::test]
+        async fn identical_behind_base_missing_comments_once_but_records_every_pass() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", true, None),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let gate = crate::concurrency::KeyGate::new();
+            let comments = |b: &StoreBackend| {
+                b.calls()
+                    .iter()
+                    .filter(|c| c.starts_with("comment MK-16"))
+                    .count()
+            };
+            let events = || async {
+                state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 50)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.message.contains("behind_base missing"))
+                    .count()
+            };
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            assert_eq!(comments(&backend), 1, "{:?}", backend.calls());
+            assert_eq!(events().await, 2);
+        }
+
+        #[tokio::test]
+        async fn identical_update_failed_comments_once_but_records_every_pass() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", false, Some(true))
+                    .with_update_pr_branch_error("boom"),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let gate = crate::concurrency::KeyGate::new();
+            let comments = |b: &StoreBackend| {
+                b.calls()
+                    .iter()
+                    .filter(|c| c.starts_with("comment MK-16"))
+                    .count()
+            };
+            let events = || async {
+                state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 50)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.message.contains("update_pr_branch failed"))
+                    .count()
+            };
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            assert_eq!(comments(&backend), 1, "{:?}", backend.calls());
+            assert_eq!(events().await, 2);
+        }
+
+        #[tokio::test]
+        async fn identical_not_mergeable_comments_once_but_records_every_pass() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", false, Some(false)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let gate = crate::concurrency::KeyGate::new();
+            let comments = |b: &StoreBackend| {
+                b.calls()
+                    .iter()
+                    .filter(|c| c.starts_with("comment MK-16"))
+                    .count()
+            };
+            let events = || async {
+                state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 50)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.message.contains("not mergeable"))
+                    .count()
+            };
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            assert_eq!(comments(&backend), 1, "{:?}", backend.calls());
+            assert_eq!(events().await, 2);
+        }
+
+        #[tokio::test]
+        async fn identical_merge_failed_comments_once_but_records_every_pass() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status("success", true)
+                    .with_merge_pr_error("boom"),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let gate = crate::concurrency::KeyGate::new();
+            let comments = |b: &StoreBackend| {
+                b.calls()
+                    .iter()
+                    .filter(|c| c.starts_with("comment MK-16"))
+                    .count()
+            };
+            let events = || async {
+                state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 50)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.message.contains("complete_automerge failed"))
+                    .count()
+            };
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            assert_eq!(comments(&backend), 1, "{:?}", backend.calls());
+            assert_eq!(events().await, 2);
+        }
+
+        #[tokio::test]
+        async fn two_prs_with_the_same_outcome_each_get_their_own_comment() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-17",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                8,
+                "fix/mk-17",
+                "open",
+                "2026-09-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, ""), pr(8, "")])
+                    .with_pr_status_behind("success", false, Some(false)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let gate = crate::concurrency::KeyGate::new();
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+
+            let calls = backend.calls();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.starts_with("comment MK-16"))
+                    .count(),
+                1,
+                "{calls:?}"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.starts_with("comment MK-17"))
+                    .count(),
+                1,
+                "{calls:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_change_of_outcome_type_posts_a_new_comment() {
+            // Not just a different error text for the same outcome: a
+            // different outcome entirely (not-mergeable, then update-failed)
+            // also posts again, since both share the same `PR {repo}#{pr}: `
+            // dedupe prefix and only their message text differs.
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            seed_open_row(&pool).await;
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", false, Some(false)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let gate = crate::concurrency::KeyGate::new();
+            let comments = |b: &StoreBackend| {
+                b.calls()
+                    .iter()
+                    .filter(|c| c.starts_with("comment MK-16"))
+                    .count()
+            };
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            assert_eq!(comments(&backend), 1, "{:?}", backend.calls());
+
+            *backend.pr_status.lock().unwrap() = Some(crate::provider::PrStatus {
+                state: "success".to_string(),
+                mergeable: Some(false),
+                behind_base: Some(true),
+            });
+            *backend.update_pr_branch_error.lock().unwrap() = Some("boom".to_string());
             reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
             assert_eq!(comments(&backend), 2, "{:?}", backend.calls());
         }
