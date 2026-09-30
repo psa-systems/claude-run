@@ -118,6 +118,9 @@ claude-run access check
 claude-run access check --project CLAUDE
 claude-run access check --repo owner/repo --host forgejo.example.com
 
+# Clear a locked-out administrator's TOTP enrollment (DB-direct); the next login re-enrolls.
+claude-run access reset-2fa
+
 # Self-update. `check` reports whether a newer build is published; `update` swaps the binary in place.
 claude-run version                         # print the build-stamped banner (same as `version show`)
 claude-run version check                   # uses the [update].train default (release)
@@ -783,6 +786,18 @@ non-loopback bind with no resolvable token took the whole web UI down, which no 
 Setup is trust-on-first-use: whoever reaches the exposed port first can claim the instance. Bring it up behind the
 reverse proxy (and whatever the proxy already enforces) and complete setup promptly. `no administrator yet` is logged at
 `warn` on every start while the instance is unclaimed.
+
+**Every administrator requires TOTP.** Setup does not end at `/setup`: the new administrator is signed in and sent
+straight to `/account/2fa/setup`, which shows a QR code (and the manual-entry `otpauth://` URL as a fallback) and asks
+for a current code before enrollment completes. Confirming it shows a one-time set of recovery codes, each usable
+exactly once, and returns to the dashboard. An administrator who is signed in but not yet enrolled cannot reach any
+other page: every browser request redirects back to enrollment until it completes. Login itself is two steps once
+enrolled: a correct password never mints a session by itself, it mints a short-lived pending cookie and redirects to
+`/login/2fa`, and only a correct TOTP code (or an unused recovery code) turns that into a real session. A stored TOTP
+secret the daemon cannot decrypt refuses the login with a visible error rather than failing silently. Losing both the
+authenticator and the recovery codes is an operator's job to fix, not the browser's: run `claude-run access reset-2fa`
+against the daemon's database to clear enrollment, and the next login is sent back to `/account/2fa/setup` to enroll
+again.
 
 **API clients: the bearer token.** Callers send `Authorization: Bearer <token>`. The value lives encrypted in the
 secrets store (resolved once at daemon startup); only its name appears in `config.toml`. `auth_token_ref` is optional

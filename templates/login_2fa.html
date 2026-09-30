@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>claude-run login</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #181b22;
+      --panel-2: #1f232b;
+      --border: #2a2f3a;
+      --fg: #d8dde7;
+      --fg-dim: #8b93a3;
+      --accent: #7ab7ff;
+      --bad: #e07070;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif; font-size: 14px; }
+    .wrap { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 28px; width: 100%; max-width: 360px; }
+    h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
+    .sub { color: var(--fg-dim); font-size: 12px; margin: 0 0 20px; }
+    label { display: block; color: var(--fg-dim); font-size: 12px; margin: 14px 0 4px; }
+    input { width: 100%; background: var(--panel-2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 9px 10px; font-size: 14px; letter-spacing: 2px; }
+    input:focus { outline: none; border-color: var(--accent); }
+    button { width: 100%; margin-top: 20px; background: var(--accent); color: #0a0c10; border: none; border-radius: 4px; padding: 10px; font-size: 14px; font-weight: 600; cursor: pointer; }
+    button:hover { filter: brightness(1.08); }
+    .err { background: rgba(224, 112, 112, 0.12); color: var(--bad); border: 1px solid rgba(224, 112, 112, 0.3); border-radius: 4px; padding: 8px 10px; font-size: 13px; margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <form class="card" method="post" action="/login/2fa">
+      <h1>Second factor</h1>
+      <p class="sub">Enter a code from your authenticator app, or a recovery code.</p>
+      {% if let Some(e) = error %}<div class="err">{{ e }}</div>{% endif %}
+      <label for="code">Code</label>
+      <input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" autofocus required>
+      <button type="submit">Verify</button>
+    </form>
+  </div>
+</body>
+</html>
