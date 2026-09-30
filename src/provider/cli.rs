@@ -1563,6 +1563,13 @@ impl IssueTracker for CliBackend {
         self.yt_ok(&["issue", "link", key, target, "--type", link_type])?;
         Ok(())
     }
+
+    fn add_tag(&self, key: &str, tag: &str) -> Result<()> {
+        // `--create` so a Needs-Info tag not yet present on the instance is
+        // created rather than failing the write.
+        self.yt_ok(&["issue", "tag", "add", key, tag, "--create"])?;
+        Ok(())
+    }
 }
 
 impl Forge for CliBackend {
@@ -2439,6 +2446,25 @@ mod tests {
         ));
         b.link_issue("CLAUDE-230", "subtask of", "CLAUDE-100")
             .unwrap();
+    }
+
+    /// `--create` so a tag not yet present on the instance is created rather
+    /// than failing the write (CLAUDE-373).
+    #[test]
+    fn add_tag_creates_a_missing_tag() {
+        let b = backend(StubRunner::new().ok(
+            "yt",
+            &[
+                "issue",
+                "tag",
+                "add",
+                "CLAUDE-373",
+                "Needs-Info",
+                "--create",
+            ],
+            "",
+        ));
+        b.add_tag("CLAUDE-373", "Needs-Info").unwrap();
     }
 
     #[test]
