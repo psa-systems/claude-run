@@ -2198,7 +2198,7 @@ async fn route_agent_pr_failure(
         error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording failing tests failed");
         return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
     }
-    if let Err(e) = ci_failure_store::attach_run(
+    let run_id = match ci_failure_store::attach_run(
         &ctx.pool,
         failure_id,
         ev.index_in_repo,
@@ -2209,8 +2209,86 @@ async fn route_agent_pr_failure(
     )
     .await
     {
-        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+        Ok(id) => id,
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording run attachment failed");
+            return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+        }
+    };
+
+    // CLAUDE-371: compare this attempt's fingerprint with the immediately
+    // previous attempt's on the same PR before deciding whether to re-queue.
+    // An empty fingerprint never counts as "same as before" (a genuinely
+    // unparseable log would otherwise look identical to every other
+    // unparseable log and falsely stop the loop), so it falls through to the
+    // plain attempt-cap behavior below.
+    let previous = match ci_failure_store::previous_run_test_ids(
+        &ctx.pool,
+        failure_id,
+        record.pr_number,
+        run_id,
+    )
+    .await
+    {
+        Ok(previous) => previous,
+        Err(e) => {
+            error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "reading the previous attempt's fingerprint failed");
+            return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+        }
+    };
+    if let Err(e) = ci_failure_store::set_run_test_ids(&ctx.pool, run_id, test_ids).await {
+        error!(repo = %ev.repo, run = ev.index_in_repo, error = %e, "recording this attempt's fingerprint failed");
         return WebhookRunSummary::error(format!("ci-failure store error: {e}"));
+    }
+    let repeats_previous = !test_ids.is_empty()
+        && previous.as_ref().is_some_and(|(_, prev_ids)| {
+            let prev_set: std::collections::BTreeSet<&str> =
+                prev_ids.iter().map(String::as_str).collect();
+            let cur_set: std::collections::BTreeSet<&str> =
+                test_ids.iter().map(String::as_str).collect();
+            prev_set == cur_set
+        });
+
+    if repeats_previous {
+        let previous_index = previous.map(|(idx, _)| idx).unwrap_or_default();
+        let base = ev.html_url.rsplit_once("/actions/runs/").map(|(b, _)| b);
+        let previous_link = match base {
+            Some(b) => format!("{b}/actions/runs/{previous_index}"),
+            None => format!("run #{previous_index}"),
+        };
+        let tests_display = test_ids.join(", ");
+        let body = format!(
+            "CI failed the same way as the previous attempt on this PR (branch `{branch}`); stopping the fix-attempt loop instead of re-queueing.\n- Repeated failing tests: {tests_display}\n- This run: {}\n- Previous run: {previous_link}",
+            ev.html_url
+        );
+        let backend = ctx.backend.clone();
+        let mint_cfg = ctx.mint_cfg.read().await.clone();
+        let key = record.issue_key.clone();
+        let result = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
+            backend.comment(&key, &body)?;
+            backend.set_field(&key, &mint_cfg.ai_agent_field, NEEDS_REVIEW_VALUE)?;
+            Ok(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "flagging the agent's cyclical PR Needs Review failed");
+                return WebhookRunSummary::error(e.to_string());
+            }
+            Err(e) => {
+                warn!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, error = %e, "flag task panicked");
+                return WebhookRunSummary::error(format!("task panicked: {e}"));
+            }
+        }
+        info!(repo = %ev.repo, run = ev.index_in_repo, key = %record.issue_key, "CI failure repeats the previous attempt unchanged; stopped the fix-attempt loop");
+        return WebhookRunSummary {
+            text: format!(
+                "{} flagged Needs Review (repeated CI failure)",
+                record.issue_key
+            ),
+            ok: true,
+        };
     }
 
     if (record.fix_attempts as u32) < webhook_cfg.agent_pr_fix_attempts {
@@ -5392,6 +5470,27 @@ mod tests {
         )
     }
 
+    /// Like [`failing_test_log`], carrying every id in `test_ids` as a failing
+    /// test on the same target (CLAUDE-371: used to exercise the
+    /// shrinking-set / different-set fingerprint comparisons, which need more
+    /// than one failing test per attempt).
+    fn failing_tests_log(target: &str, test_ids: &[&str], branch: &str) -> String {
+        let mut log = format!(
+            "GITHUB_HEAD_REF={branch}\n     Running tests/{target}.rs (target/debug/deps/{target}-abc123)\n"
+        );
+        for test_id in test_ids {
+            log.push_str(&format!("test {test_id} ... FAILED\n"));
+        }
+        log
+    }
+
+    /// A log on `branch` with no diagnostic line at all, so
+    /// [`fingerprint::fingerprint`] parses an empty id set from it
+    /// (CLAUDE-371: the empty/unparseable-fingerprint fallback case).
+    fn unparseable_log(branch: &str) -> String {
+        format!("GITHUB_HEAD_REF={branch}\nnothing recognizable here\n")
+    }
+
     fn store_mint_cfg() -> MintConfig {
         MintConfig {
             repo_project_map: [("acme/widgets".to_string(), "CLAUDE".to_string())]
@@ -7727,6 +7826,357 @@ mod tests {
             record.fix_attempts, 3,
             "a ceiling hit does not itself bump the counter further"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_pr_repeated_failure_stops_the_loop_without_requeue() {
+        // CLAUDE-371: two consecutive attempts failing the exact same test
+        // set stop the loop - no re-queue, one comment naming the repeated
+        // tests and both runs, `AI Agent = Needs Review` - well under the
+        // fix-attempt ceiling.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        ci_failure_store::record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-50",
+            "dev.a8n.run",
+            "acme/widgets",
+            20,
+            "fix/CLAUDE-50",
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(20, "commit-7200")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+
+        let first = triage_and_mint(
+            &ctx,
+            None,
+            &store_event(7200),
+            failing_test_log("mod_a", "test_one", "fix/CLAUDE-50"),
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+            &test_spend(),
+        )
+        .await;
+        assert!(first.ok, "{}", first.text);
+
+        *backend.open_prs.lock().unwrap() = vec![pr(20, "commit-7201")];
+        let second = triage_and_mint(
+            &ctx,
+            None,
+            &store_event(7201),
+            failing_test_log("mod_a", "test_one", "fix/CLAUDE-50"),
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+            &test_spend(),
+        )
+        .await;
+        assert!(second.ok, "{}", second.text);
+
+        let calls = backend.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("set_field CLAUDE-50 AI Agent Queued"))
+                .count(),
+            1,
+            "only the first attempt re-queues: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-50 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+        let repeat_comment = calls
+            .iter()
+            .find(|c| {
+                c.starts_with("comment CLAUDE-50") && c.contains("stopping the fix-attempt loop")
+            })
+            .unwrap_or_else(|| panic!("expected a stop comment: {calls:?}"));
+        assert!(
+            repeat_comment.contains("test_one") && repeat_comment.contains("mod_a"),
+            "names the repeated test: {repeat_comment}"
+        );
+        assert!(
+            repeat_comment.contains("7200") && repeat_comment.contains("7201"),
+            "names both runs: {repeat_comment}"
+        );
+
+        let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 20)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.fix_attempts, 1,
+            "the stop does not bump the fix-attempt counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_pr_shrinking_failure_set_is_requeued() {
+        // CLAUDE-371: a strict subset of the previous attempt's failing tests
+        // is progress, not a cycle, so it is re-queued as before.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        ci_failure_store::record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-51",
+            "dev.a8n.run",
+            "acme/widgets",
+            21,
+            "fix/CLAUDE-51",
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(21, "commit-7210")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+
+        let first = triage_and_mint(
+            &ctx,
+            None,
+            &store_event(7210),
+            failing_tests_log("mod_a", &["test_one", "test_two"], "fix/CLAUDE-51"),
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+            &test_spend(),
+        )
+        .await;
+        assert!(first.ok, "{}", first.text);
+
+        *backend.open_prs.lock().unwrap() = vec![pr(21, "commit-7211")];
+        let second = triage_and_mint(
+            &ctx,
+            None,
+            &store_event(7211),
+            failing_tests_log("mod_a", &["test_one"], "fix/CLAUDE-51"),
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+            &test_spend(),
+        )
+        .await;
+        assert!(second.ok, "{}", second.text);
+
+        let calls = backend.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("set_field CLAUDE-51 AI Agent Queued"))
+                .count(),
+            2,
+            "shrinking sets keep re-queueing: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-51 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+
+        let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 21)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.fix_attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn agent_pr_different_failure_set_is_requeued() {
+        // CLAUDE-371: a different, non-subset failing set is a new problem,
+        // not a repeat, so it is re-queued as before.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        ci_failure_store::record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-52",
+            "dev.a8n.run",
+            "acme/widgets",
+            22,
+            "fix/CLAUDE-52",
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(22, "commit-7220")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+
+        let first = triage_and_mint(
+            &ctx,
+            None,
+            &store_event(7220),
+            failing_test_log("mod_a", "test_one", "fix/CLAUDE-52"),
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+            &test_spend(),
+        )
+        .await;
+        assert!(first.ok, "{}", first.text);
+
+        *backend.open_prs.lock().unwrap() = vec![pr(22, "commit-7221")];
+        let second = triage_and_mint(
+            &ctx,
+            None,
+            &store_event(7221),
+            failing_test_log("mod_b", "test_two", "fix/CLAUDE-52"),
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+            &test_spend(),
+        )
+        .await;
+        assert!(second.ok, "{}", second.text);
+
+        let calls = backend.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("set_field CLAUDE-52 AI Agent Queued"))
+                .count(),
+            2,
+            "a different failing set keeps re-queueing: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-52 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_pr_empty_fingerprint_falls_back_to_cap_behavior() {
+        // CLAUDE-371: an empty/unparseable fingerprint never counts as "same
+        // as before", so two consecutive unparseable failures still just
+        // re-queue under the ordinary attempt cap instead of falsely
+        // stopping the loop.
+        let pool = crate::db::test_pool().await;
+        let now = "2026-09-01T00:00:00Z";
+        ci_failure_store::record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-53",
+            "dev.a8n.run",
+            "acme/widgets",
+            23,
+            "fix/CLAUDE-53",
+            "open",
+            now,
+        )
+        .await
+        .unwrap();
+
+        let backend = Arc::new(StoreBackend::new().with_open_prs(vec![pr(23, "commit-7230")]));
+        let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+        let ctx = store_mint_context(pool.clone(), backend.clone(), classifier);
+
+        let first = triage_and_mint(
+            &ctx,
+            None,
+            &store_event(7230),
+            unparseable_log("fix/CLAUDE-53"),
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+            &test_spend(),
+        )
+        .await;
+        assert!(first.ok, "{}", first.text);
+
+        *backend.open_prs.lock().unwrap() = vec![pr(23, "commit-7231")];
+        let second = triage_and_mint(
+            &ctx,
+            None,
+            &store_event(7231),
+            unparseable_log("fix/CLAUDE-53"),
+            true,
+            None,
+            None,
+            true,
+            "test".to_string(),
+            None,
+            &crate::concurrency::KeyGate::new(),
+            &WebhookConfig::default(),
+            &test_spend(),
+        )
+        .await;
+        assert!(second.ok, "{}", second.text);
+
+        let calls = backend.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("set_field CLAUDE-53 AI Agent Queued"))
+                .count(),
+            2,
+            "an unparseable fingerprint never matches a previous one: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "set_field CLAUDE-53 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+
+        let record = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "acme/widgets", 23)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.fix_attempts, 2);
     }
 
     #[tokio::test]

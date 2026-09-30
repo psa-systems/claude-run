@@ -213,6 +213,60 @@ pub async fn attach_run(
     Ok(id)
 }
 
+/// Set `run_id`'s own failing-id fingerprint, newline-joined (fingerprint ids
+/// never contain a newline; `find_match`'s test-id overlap match is unrelated
+/// and never queries this column). CLAUDE-371: only the agent-PR fix-attempt
+/// flow needs one sighting's own fingerprint (to compare it against the
+/// immediately previous sighting on the same PR), so this and
+/// [`previous_run_test_ids`] are its only callers; every other `attach_run`
+/// caller leaves the column null.
+pub async fn set_run_test_ids(pool: &DbPool, run_id: i64, test_ids: &[String]) -> Result<()> {
+    let joined = if test_ids.is_empty() {
+        None
+    } else {
+        Some(test_ids.join("\n"))
+    };
+    sqlx::query(&db::q(
+        pool,
+        "UPDATE ci_failure_runs SET test_ids = ? WHERE id = ?",
+    ))
+    .bind(joined)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `failure_id`'s previous sighting on `pr_number` (the newest
+/// `ci_failure_runs` row strictly older than `before_run_id`) whose recorded
+/// fingerprint is non-empty, as `(run_index, test_ids)`. `None` covers both
+/// "no earlier sighting on this PR" and "the earlier sighting's fingerprint
+/// was empty or never recorded": CLAUDE-371 requires the latter to fall back
+/// to the plain attempt-cap flow rather than comparing against a fingerprint
+/// that isn't there.
+pub async fn previous_run_test_ids(
+    pool: &DbPool,
+    failure_id: i64,
+    pr_number: i64,
+    before_run_id: i64,
+) -> Result<Option<(i64, Vec<String>)>> {
+    let row: Option<(i64, Option<String>)> = sqlx::query_as(&db::q(
+        pool,
+        "SELECT run_index, test_ids FROM ci_failure_runs \
+         WHERE failure_id = ? AND pr_number = ? AND id < ? \
+         ORDER BY id DESC LIMIT 1",
+    ))
+    .bind(failure_id)
+    .bind(pr_number)
+    .bind(before_run_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(run_index, ids)| {
+        ids.filter(|s| !s.is_empty())
+            .map(|s| (run_index, s.split('\n').map(str::to_string).collect()))
+    }))
+}
+
 /// Point `failure_id` at `issue_key` (or clear it with `None`).
 pub async fn set_issue(
     pool: &DbPool,
@@ -661,6 +715,91 @@ mod tests {
 
         let branches = distinct_branches(&pool, id).await.unwrap();
         assert_eq!(branches, vec!["feature/x".to_string(), "main".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn previous_run_test_ids_reads_back_the_immediately_prior_sighting_on_the_pr() {
+        let pool = test_pool().await;
+        let id = record_failure(
+            &pool,
+            "acme/widgets",
+            "checks.yml",
+            "test",
+            None,
+            None,
+            "open",
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let run_1 = attach_run(
+            &pool,
+            id,
+            1,
+            "abc123",
+            "fix/x",
+            Some(42),
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        set_run_test_ids(&pool, run_1, &["mod_a::t1".to_string()])
+            .await
+            .unwrap();
+        let run_2 = attach_run(
+            &pool,
+            id,
+            2,
+            "def456",
+            "fix/x",
+            Some(42),
+            "2026-09-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let (prev_index, prev_ids) = previous_run_test_ids(&pool, id, 42, run_2)
+            .await
+            .unwrap()
+            .expect("run 1's fingerprint");
+        assert_eq!(prev_index, 1);
+        assert_eq!(prev_ids, vec!["mod_a::t1".to_string()]);
+
+        // No sighting older than run 1 on this PR.
+        assert_eq!(
+            previous_run_test_ids(&pool, id, 42, run_1).await.unwrap(),
+            None
+        );
+
+        // A never-recorded (null) fingerprint on the prior sighting falls
+        // back to "no previous fingerprint" rather than looking like a match.
+        let run_3 = attach_run(
+            &pool,
+            id,
+            3,
+            "ghi789",
+            "fix/y",
+            Some(43),
+            "2026-09-03T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let run_4 = attach_run(
+            &pool,
+            id,
+            4,
+            "jkl012",
+            "fix/y",
+            Some(43),
+            "2026-09-04T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let _ = run_3;
+        assert_eq!(
+            previous_run_test_ids(&pool, id, 43, run_4).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
