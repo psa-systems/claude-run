@@ -2857,6 +2857,10 @@ struct YoutrackEditForm {
     /// AI Agent label for a deliberate zero-commit run
     /// (`states.no_code`). Blank inherits the `done` label.
     state_no_code: String,
+    /// Tag added alongside the Needs Review AI Agent value when the agent
+    /// parks an issue via `.claude-run-needs-review` (`tags.needs_info`,
+    /// CLAUDE-373). Blank disables the tag write.
+    tags_needs_info: String,
 }
 
 impl YoutrackEditForm {
@@ -2910,6 +2914,7 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
         deps_recheck_timeout: deps.recheck_timeout,
         deps_block_on: deps.block_on.join(", "),
         deps_block_cross_project: deps.block_cross_project.then(|| "on".to_string()),
+        tags_needs_info: c.youtrack.tags.needs_info,
         ..Default::default()
     }
 }
@@ -2997,6 +3002,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
             .block_cross_project
             .then(|| "on".to_string()),
         state_no_code: s(&yt.youtrack.states.no_code),
+        tags_needs_info: yt.youtrack.tags.needs_info.clone(),
     })
 }
 
@@ -3166,6 +3172,10 @@ fn youtrack_form_to_yaml(
     // AI Agent label for a deliberate zero-commit run. Blank -> no
     // `no_code` key (resolves to the `done` label).
     youtrack.states.no_code = opt(&form.state_no_code);
+    // Needs-Info tag. Unlike the state labels above, a blank box is a valid
+    // setting (disables the tag write), not "fall back to the default", so it
+    // is stored verbatim rather than through `opt`/`or_default`.
+    youtrack.tags.needs_info = form.tags_needs_info.trim().to_string();
     // Preserve a hand-written `github` block. The form exposes only
     // `token_ref`, so read the existing `native.github` sub-block off the parsed
     // on-disk action (before we overwrite the `native` key below) to carry its
@@ -8152,6 +8162,43 @@ mod tests {
                 !yaml.contains("dependencies"),
                 "dependencies leaked:\n{yaml}"
             );
+            assert!(!yaml.contains("tags"), "tags leaked:\n{yaml}");
+        }
+
+        #[test]
+        fn needs_info_tag_form_round_trip() {
+            // Saving a non-default Needs-Info tag writes it, and the saved
+            // file loads back with that exact value (CLAUDE-373).
+            let mut f = super::super::youtrack_form_defaults();
+            f.name = "yt".to_string();
+            f.tags_needs_info = "Blocked".to_string();
+            let yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let loaded = crate::action::validate_str(&yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = loaded.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(yt.youtrack.tags.needs_info, "Blocked");
+        }
+
+        #[test]
+        fn needs_info_tag_cleared_box_persists_as_empty_not_the_default() {
+            // Unlike the state labels on this form, a blank Needs-Info tag box
+            // is itself a valid setting (disables the tag write), not "fall
+            // back to the default", so clearing a previously-set tag must save
+            // an empty string rather than reverting to "Needs-Info" (CLAUDE-373).
+            let yaml =
+                "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    tags:\n      needs_info: Blocked\n";
+            let loaded = crate::action::validate_str(yaml, "<test>").unwrap();
+            let mut f = action_to_youtrack_form(&loaded.action).unwrap();
+            f.name = "yt".to_string();
+            assert_eq!(f.tags_needs_info, "Blocked");
+            f.tags_needs_info = String::new();
+            let saved_yaml = youtrack_form_to_yaml(empty_base(), &f).unwrap();
+            let saved = crate::action::validate_str(&saved_yaml, "<test>").unwrap();
+            let crate::action::NativeConfig::Youtrack(yt) = saved.action.native.unwrap() else {
+                panic!("expected youtrack native config");
+            };
+            assert_eq!(yt.youtrack.tags.needs_info, "");
         }
 
         #[test]

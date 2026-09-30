@@ -1824,7 +1824,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "",
         "If you CANNOT safely complete the issue - missing context, ambiguous acceptance criteria, out-of-scope work, dependency on another issue, or you cannot produce objective evidence that every acceptance criterion is met:",
         "  a. Do NOT change any code.",
-        "  b. Write the human-facing explanation of exactly what information or decision you need to proceed to this file (the file contents are the reason, posted verbatim as the issue comment by the runner):",
+        "  b. Write the human-facing explanation of exactly what information or decision you need to proceed to this file (the file contents are the reason, posted verbatim as the issue comment by the runner); end it with exactly one explicit question a human can answer directly:",
         "       {{workdir}}/{{needs_review_marker}}",
         "  c. Touch this marker file so the runner does NOT count this attempt toward the per-key cap (the job is parked pending human input, not failed):",
         "       {{workdir}}/{{skip_attempt_marker}}",
@@ -2011,7 +2011,16 @@ fn finalize(
         }
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
         let reason = append_compaction_note(&reason, stream_log, &job.key);
-        comment_then_field(backend, src, &job.key, &reason, &src.states.needs_review)?;
+        if let Err(e) = backend.comment(&job.key, &reason) {
+            warn!(key = %job.key, error = %e, "issue comment failed (continuing to tag / AI Agent write)");
+        }
+        let needs_info_tag = src.tags.needs_info.trim();
+        if !needs_info_tag.is_empty() {
+            if let Err(e) = backend.add_tag(&job.key, needs_info_tag) {
+                warn!(key = %job.key, tag = %needs_info_tag, error = %e, "Needs-Info tag write failed (continuing to AI Agent write)");
+            }
+        }
+        backend.set_field(&job.key, &src.custom_field, &src.states.needs_review)?;
         Ok(Finalized::NeedsReview)
     } else if claude_result.ok && no_code.exists() {
         // The run deliberately produced tracker output rather than
@@ -2830,6 +2839,12 @@ mod tests {
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
             "{calls:?}"
         );
+        // The attempt-cap park also lands on Needs Review, but it is a
+        // different code path from the agent-signalled blocker and never
+        // writes the Needs-Info tag (CLAUDE-373). No `tag add` response is
+        // stubbed above, so a call to it would have failed `process_job`'s
+        // `unwrap()` before reaching this assertion.
+        assert!(!calls.iter().any(|c| c.contains("tag add")), "{calls:?}");
     }
 
     /// A failed comment or field write at
@@ -3924,6 +3939,144 @@ mod tests {
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
     }
 
+    /// The agent-signalled blocker park (CLAUDE-373) attaches the
+    /// Needs-Info tag alongside the marker comment and the `AI Agent` write,
+    /// in that order: comment, then tag, then field.
+    #[test]
+    fn finalize_needs_review_writes_needs_info_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        std::fs::write(wd.join(NEEDS_REVIEW_MARKER), "need a decision on X").unwrap();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "comment", "MK-16", "need a decision on X"],
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "tag", "add", "MK-16", "Needs-Info", "--create"],
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            wd,
+            &ClaudeResult::synthesized("e", "s"),
+            PrStrategy::Branch,
+            None,
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::NeedsReview);
+        let calls = runner.calls.lock().unwrap();
+        let comment_at = calls
+            .iter()
+            .position(|c| c.starts_with("yt issue comment"))
+            .expect("comment posted");
+        let tag_at = calls
+            .iter()
+            .position(|c| c == "yt issue tag add MK-16 Needs-Info --create")
+            .expect("Needs-Info tag attached");
+        let field_at = calls
+            .iter()
+            .position(|c| c == "yt issue set-field MK-16 AI Agent Needs Review")
+            .expect("AI Agent write");
+        assert!(comment_at < tag_at, "{calls:?}");
+        assert!(tag_at < field_at, "{calls:?}");
+    }
+
+    /// `tags.needs_info` set to empty disables the tag write entirely; the
+    /// `AI Agent` write still happens.
+    #[test]
+    fn finalize_needs_review_skips_tag_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        std::fs::write(wd.join(NEEDS_REVIEW_MARKER), "need a decision on X").unwrap();
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+            "",
+        ));
+        let backend = CliBackend::new(runner.clone());
+        let mut s = src();
+        s.tags.needs_info = String::new();
+        let res = finalize(
+            &backend,
+            &backend,
+            &s,
+            &job(),
+            wd,
+            &ClaudeResult::synthesized("e", "s"),
+            PrStrategy::Branch,
+            None,
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::NeedsReview);
+        let calls = runner.calls.lock().unwrap();
+        // No stub registered for `tag add`; reaching this point without a
+        // "no canned response" error proves add_tag was never called.
+        assert!(!calls.iter().any(|c| c.contains("tag add")), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+    }
+
+    /// A failing tag write is logged and does not block the authoritative
+    /// `AI Agent` write.
+    #[test]
+    fn finalize_needs_review_tag_failure_does_not_block_ai_agent_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        std::fs::write(wd.join(NEEDS_REVIEW_MARKER), "need a decision on X").unwrap();
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail(
+                    "yt",
+                    &["issue", "tag", "add", "MK-16", "Needs-Info", "--create"],
+                    1,
+                    "no such tag",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            wd,
+            &ClaudeResult::synthesized("e", "s"),
+            PrStrategy::Branch,
+            None,
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::NeedsReview);
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "a failed tag write must not block the AI Agent write: {calls:?}"
+        );
+    }
+
     /// A successful run that deliberately produced tracker output
     /// rather than code leaves `.claude-run-no-code-change`. Finalize skips the
     /// PR entirely, posts the marker text verbatim as the issue comment, and
@@ -3984,6 +4137,8 @@ mod tests {
             !calls.iter().any(|c| c.contains("AI Agent Failed")),
             "a deliberate no-code run must not be Failed: {calls:?}"
         );
+        // A no-code completion never writes the Needs-Info tag (CLAUDE-373).
+        assert!(!calls.iter().any(|c| c.contains("tag add")), "{calls:?}");
     }
 
     /// `states.no_code` is configurable per action and overrides the
@@ -5084,6 +5239,10 @@ mod tests {
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+        // A timeout park also lands on Needs Review but is a different code
+        // path from the agent-signalled blocker; it never writes the
+        // Needs-Info tag (CLAUDE-373).
+        assert!(!calls.iter().any(|c| c.contains("tag add")), "{calls:?}");
     }
 
     #[test]
