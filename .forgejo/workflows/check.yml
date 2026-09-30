@@ -1,7 +1,8 @@
 ---
 
 # Validate code on every push and pull request.
-# Mirrors the local `just check` recipe. This stays a standalone workflow rather
+# Mirrors the local `just check` recipe (the `claude-md` job is its
+# `check-claude-md` step, CLAUDE-370). This stays a standalone workflow rather
 # than calling common's reusable check.yml: that workflow cannot declare the
 # PostgreSQL service or run the suite a second time against it (CLAUDE-250).
 #
@@ -97,6 +98,23 @@ jobs:
           print $"changed files: ($changed)"
           print $"code=($code)"
           $"code=($code)\n" | save --append $env.GITHUB_OUTPUT
+
+  claude-md:
+    # CLAUDE-370: runs on every push and PR, docs-only ones included, since
+    # CLAUDE.md growth is exactly what a docs-only change can introduce.
+    name: CLAUDE.md guard
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Guard self-test
+        run: nu scripts/check-claude-md.nu --self-test
+
+      - name: Guard CLAUDE.md size, line length and docs/ links
+        run: nu scripts/check-claude-md.nu
 
   check:
     needs: changes
