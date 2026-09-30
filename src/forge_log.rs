@@ -477,11 +477,21 @@ pub fn parse_runs_list_entries(stdout: &str) -> std::result::Result<Vec<RunEntry
         out.push(RunEntry {
             global_id,
             index,
-            workflow_id: str_field(&run, &["workflow_id", "workflow_name", "workflow"]),
+            workflow_id: str_field(&run, &["workflow_id", "workflow_name", "workflow", "path"]),
             branch: branch_name(&str_field(&run, &["head_branch", "head_ref", "branch"])),
             status,
             html_url: str_field(&run, &["html_url", "url"]),
-            stopped: str_field(&run, &["stopped", "updated", "created"]),
+            stopped: str_field(
+                &run,
+                &[
+                    "stopped",
+                    "stopped_at",
+                    "updated_at",
+                    "updated",
+                    "created_at",
+                    "created",
+                ],
+            ),
         });
     }
     Ok(out)
@@ -542,8 +552,20 @@ pub fn parse_run_timing(stdout: &str, run_number: i64) -> std::result::Result<Ru
             "the `fj actions runs --json` page carries no run #{run_number}"
         ));
     };
-    let started = str_field(&run, &["started", "started_at", "created"]);
-    let stopped = str_field(&run, &["stopped", "stopped_at", "completed_at"]);
+    let started = str_field(
+        &run,
+        &[
+            "started",
+            "started_at",
+            "run_started_at",
+            "created",
+            "created_at",
+        ],
+    );
+    let stopped = str_field(
+        &run,
+        &["stopped", "stopped_at", "updated_at", "completed_at"],
+    );
     if started.is_empty() || stopped.is_empty() {
         return Err(format!(
             "run #{run_number} reports no start / stop time (started `{started}`, stopped `{stopped}`); the run may still be in flight"
