@@ -394,9 +394,22 @@ impl Daemon {
         let keygate = KeyGate::new();
 
         let webhook_log_dir = self.paths.webhook_logs_dir();
-        let webhook_logs: Arc<dyn crate::forge_log::ActionLogClient> = Arc::new(
-            crate::provider::FjForgeReads::new(Arc::new(crate::provider::ProcessRunner::new())),
-        );
+        // No action is known yet at this point (a failure event is not yet
+        // matched to one), so there is no per-action `github.hosts` GHE list to
+        // consult; `HostRoutedForgeReads` dispatches on `is_github_host(host,
+        // &[])`, i.e. `github.com` only, the same deliberate, narrower default
+        // `resolve_automerge_forge`'s callers use for the same reason
+        // (`src/web/webhooks.rs`).
+        let webhook_logs: Arc<dyn crate::forge_log::ActionLogClient> =
+            Arc::new(crate::provider::HostRoutedForgeReads::new(
+                Arc::new(crate::provider::FjForgeReads::new(Arc::new(
+                    crate::provider::ProcessRunner::new(),
+                ))),
+                Arc::new(crate::provider::GhForgeReads::new(Arc::new(
+                    crate::provider::ProcessRunner::new(),
+                ))),
+                Vec::new(),
+            ));
         // `analysis_timeout_secs` is read once here: the classifier is built
         // once and shared for the daemon's lifetime, so a later Settings save to
         // it needs a restart (unlike the rest of `[webhook]`, which the consumer
@@ -685,9 +698,20 @@ fn build_mint_context(
         // Same for the compaction window.
         autocompact: None,
     };
-    let fj: Arc<dyn crate::forge_log::ForgeReads> = Arc::new(crate::provider::FjForgeReads::new(
-        Arc::new(crate::provider::ProcessRunner::new()),
-    ));
+    // Same deliberate `github.com`-only default as the `webhook_logs` client
+    // above: the classifier is shared across every webhook source for the
+    // daemon's lifetime, so there is no single action's `github.hosts` GHE
+    // list to consult here either.
+    let fj: Arc<dyn crate::forge_log::ForgeReads> =
+        Arc::new(crate::provider::HostRoutedForgeReads::new(
+            Arc::new(crate::provider::FjForgeReads::new(Arc::new(
+                crate::provider::ProcessRunner::new(),
+            ))),
+            Arc::new(crate::provider::GhForgeReads::new(Arc::new(
+                crate::provider::ProcessRunner::new(),
+            ))),
+            Vec::new(),
+        ));
     let classifier: Arc<dyn FailureClassifier> = Arc::new(AnalysisClassifier::new(
         claude.clone(),
         claude_cfg,
