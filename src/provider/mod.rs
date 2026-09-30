@@ -266,6 +266,16 @@ pub trait IssueTracker: Send + Sync {
         )))
     }
 
+    /// Attach an existing tag to an issue, creating the instance-wide tag when
+    /// missing (`yt issue tag add <key> <tag> --create`). Backs the
+    /// `Needs-Info` tag written alongside the `Needs Review` AI Agent value
+    /// when the agent parks an issue pending a human answer (CLAUDE-373). The
+    /// default is a no-op `Ok(())`, for a backend with no tag support.
+    fn add_tag(&self, key: &str, tag: &str) -> Result<()> {
+        let _ = (key, tag);
+        Ok(())
+    }
+
     /// Verify the tracker token and return the authenticated login
     /// (`yt auth verify`, GET /api/users/me). The single read-only answer to "is
     /// this token still valid". Never returns the token itself.
