@@ -36,7 +36,7 @@ use crate::error::{Error, Result};
 
 pub use audit::{AuditedTracker, IssueWriteAudit, DEFAULT_MAX_ISSUES_PER_RUN};
 pub use cli::{CliBackend, CmdOutput, CommandRunner, FjForgeReads, ProcessRunner};
-pub use github::{is_github_host, GithubForge, HttpMcpTransport, McpTransport};
+pub use github::{is_github_host, GhForgeReads, GithubForge, HttpMcpTransport, McpTransport};
 
 /// One project-to-repo binding flattened from a YouTrack project's enabled VCS
 /// integration, the row of the inverse routing map. Each enabled
@@ -780,9 +780,91 @@ pub fn resolve_runner_with(
     Err(Error::NoBackend(tried.join("; ")))
 }
 
+/// Routes every [`crate::forge_log::ActionLogClient`] /
+/// [`crate::forge_log::ActionRunsClient`] / [`crate::forge_log::RepoFileClient`]
+/// call to `gh` ([`GhForgeReads`]) for a GitHub host (`github.com` or a
+/// configured GHE host, [`is_github_host`]) and to `fj` ([`FjForgeReads`]) for
+/// everything else, mirroring the per-host `Forge` dispatch
+/// `resolve_automerge_forge` (`src/web/webhooks.rs`) already uses. Built once
+/// per daemon lifetime - `AnalysisClassifier` and the webhook failure-log
+/// fetch each hold one shared client across every webhook source - so the
+/// `host` argument on each call, not a per-source config lookup, decides
+/// which client answers.
+pub struct HostRoutedForgeReads {
+    fj: Arc<dyn crate::forge_log::ForgeReads>,
+    gh: Arc<dyn crate::forge_log::ForgeReads>,
+    gh_hosts: Vec<String>,
+}
+
+impl HostRoutedForgeReads {
+    pub fn new(
+        fj: Arc<dyn crate::forge_log::ForgeReads>,
+        gh: Arc<dyn crate::forge_log::ForgeReads>,
+        gh_hosts: Vec<String>,
+    ) -> Self {
+        Self { fj, gh, gh_hosts }
+    }
+
+    fn pick(&self, host: &str) -> &Arc<dyn crate::forge_log::ForgeReads> {
+        if is_github_host(host, &self.gh_hosts) {
+            &self.gh
+        } else {
+            &self.fj
+        }
+    }
+}
+
+impl crate::forge_log::ActionLogClient for HostRoutedForgeReads {
+    fn run_logs(
+        &self,
+        host: &str,
+        repo: &str,
+        run_number: i64,
+        token: Option<&str>,
+    ) -> crate::forge_log::RunLogsOutcome {
+        self.pick(host).run_logs(host, repo, run_number, token)
+    }
+}
+
+impl crate::forge_log::ActionRunsClient for HostRoutedForgeReads {
+    fn list_runs(
+        &self,
+        host: &str,
+        repo: &str,
+        max_pages: u32,
+        token: Option<&str>,
+    ) -> crate::forge_log::RunsListOutcome {
+        self.pick(host).list_runs(host, repo, max_pages, token)
+    }
+
+    fn run_timing(
+        &self,
+        host: &str,
+        repo: &str,
+        run_number: i64,
+        token: Option<&str>,
+    ) -> std::result::Result<crate::forge_log::RunTiming, String> {
+        self.pick(host).run_timing(host, repo, run_number, token)
+    }
+}
+
+impl crate::forge_log::RepoFileClient for HostRoutedForgeReads {
+    fn read_file(
+        &self,
+        host: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+        token: Option<&str>,
+    ) -> std::result::Result<String, String> {
+        self.pick(host).read_file(host, repo, path, git_ref, token)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forge_log::ActionLogClient;
     use cli::testutil::StubRunner;
 
     /// A failed clone must say WHY. `git clone exited 128` alone is
@@ -1069,5 +1151,60 @@ mod tests {
             err.contains("no resolvable default branch"),
             "must never guess main: {err}"
         );
+    }
+
+    /// A GitHub-hosted source's log fetch must go through `GhForgeReads`
+    /// (shelling out to `gh`), never `FjForgeReads` (`fj`): the `fj` stub has
+    /// no canned response at all, so any `fj` call would panic the test via
+    /// `StubRunner::lookup`'s "no canned response" error surfacing as a
+    /// `Failed` outcome instead of `Fetched`.
+    #[test]
+    fn host_routed_forge_reads_dispatches_a_github_host_to_gh_not_fj() {
+        let gh_runner = StubRunner::new()
+            .ok(
+                "gh",
+                &[
+                    "api",
+                    "--hostname",
+                    "github.com",
+                    "repos/octo/cat/actions/runs?per_page=100&page=1",
+                ],
+                r#"{"workflow_runs":[{"id":999,"run_number":42,"path":".github/workflows/ci.yml","head_branch":"main","status":"completed","conclusion":"failure","html_url":"https://github.com/octo/cat/actions/runs/999"}]}"#,
+            )
+            .ok(
+                "gh",
+                &[
+                    "api",
+                    "--hostname",
+                    "github.com",
+                    "repos/octo/cat/actions/runs/999/jobs?per_page=100",
+                ],
+                r#"{"jobs":[{"id":1,"name":"test","status":"completed","conclusion":"failure"}]}"#,
+            )
+            .ok(
+                "gh",
+                &[
+                    "api",
+                    "--hostname",
+                    "github.com",
+                    "repos/octo/cat/actions/jobs/1/logs",
+                ],
+                "boom\n",
+            );
+        let fj_runner = StubRunner::new();
+        let logs = HostRoutedForgeReads::new(
+            Arc::new(crate::provider::FjForgeReads::new(Arc::new(fj_runner))),
+            Arc::new(crate::provider::GhForgeReads::new(Arc::new(gh_runner))),
+            Vec::new(),
+        );
+        let out = logs.run_logs("github.com", "octo/cat", 42, Some("tok"));
+        match out {
+            crate::forge_log::RunLogsOutcome::Fetched(jobs) => {
+                assert_eq!(jobs.len(), 1);
+                assert_eq!(jobs[0].status, "failure");
+                assert_eq!(jobs[0].log, "boom\n");
+            }
+            other => panic!("expected Fetched, got {other:?}"),
+        }
     }
 }
