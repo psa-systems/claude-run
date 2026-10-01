@@ -1,6 +1,6 @@
 [package]
 name = "claude-run"
-version = "0.25.7"
+version = "0.26.0"
 edition = "2021"
 description = "YAML-driven Claude Code runner. Rust port of scripts/claude-run.nu."
 license = "MIT"
@@ -48,7 +48,15 @@ tracing = "0.1"
 getrandom = "0.2"
 argon2 = "0.6.0"
 qrcodegen = "1.8.0"
-totp-rs = { version = "6.0.0", default-features = false, features = ["std", "gen_secret", "otpauth"] }
+
+[dependencies.totp-rs]
+version = "6.0.0"
+default-features = false
+features = [
+    "std",
+    "gen_secret",
+    "otpauth",
+]
 
 [dependencies.pulldown-cmark]
 version = "0.13.4"
