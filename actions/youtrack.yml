@@ -35,8 +35,11 @@
 # triggering issue; a bug found outside the triggering issue's scope is filed in the project whose VCS integration
 # binds the buggy repo (falling back to native.youtrack.write_projects) and linked relates to the triggering issue.
 # Either way the agent may update / comment on / link only the issues it created this run, so a gap or bug it finds
-# becomes a tracked issue rather than a line of prose. Everything else stays the handler's: the AI Agent field on ANY
-# issue, and every other write to the triggering issue. The finalize step owns PR creation and the AI Agent transition
+# becomes a tracked issue rather than a line of prose. The agent may also comment on the triggering issue itself,
+# including an early size note when it expects the issue to be too large for one run (CLAUDE-378); the runner still
+# posts its own outcome comment on it. Everything else stays the handler's: the AI Agent field on ANY issue, and every
+# other write to the triggering issue (description/summary, tags, assignee, state, fields). The finalize step owns PR
+# creation and the AI Agent transition
 # and runs them after the claude process exits, gated on the run outcome. The agent signals a blocker by writing
 # .claude-run-needs-review (reason text) + .claude-run-skip-attempt.
 #
