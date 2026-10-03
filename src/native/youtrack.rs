@@ -43,8 +43,10 @@
 //! goes to the project whose VCS integration binds the buggy repo (falling
 //! back to `write_projects`), linked `relates to` the triggering issue. Either
 //! way the agent may update / comment / link only the issues it created this
-//! run. `AI Agent` on any issue, and every other write to the triggering
-//! issue, stay the runner's.
+//! run. The agent may also comment on the triggering issue itself (including
+//! an early size note when it expects the issue to be too large for one run).
+//! `AI Agent` on any issue, and every other write to the triggering issue
+//! (description/summary, tags, assignee, state, fields), stay the runner's.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1789,16 +1791,16 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "  1. A gap, deferred item, or descoped piece of {{key}} itself: create it ONLY in these projects: {{write_projects}}, then link it with 'yt issue link <new-issue> {{key}} --type \"subtask of\"'. This is how the CLAUDE.md 'No orphan notes' rule is satisfied: the piece becomes its own tracked issue instead of a sentence in the PR body that nobody owns.",
         "  2. A bug you find that is NOT part of {{key}}, in this repo or in any other repo (for example a defect in a server repo you hit while working on the app that calls it). If it blocks {{key}}'s acceptance criteria and lives in this repo, fix it as part of {{key}}'s change and file nothing. Otherwise do NOT fix it in this run; file it. First run 'yt search' for an open issue that already reports it; if one exists, file nothing and name that issue in your final summary. Create it in the project whose VCS integration binds the repo the bug lives in: find that project with 'yt project list' and 'yt project vcs list <PROJECT>', and if no project or more than one project binds that repo, create it in {{write_projects}}. Its description states what you observed, how to reproduce it, and the file:line or command output that shows it. Then link it with 'yt issue link <new-issue> {{key}} --type \"relates to\"'. If the bug blocks {{key}}'s acceptance criteria from another repo, also take the blocker path below and name the new issue in the reason.",
         "- Update, comment on, and link ONLY the issues you created during THIS run: 'yt issue update', 'yt issue comment', 'yt issue link'.",
-        "- On the triggering issue {{key}}, the ONLY writes are the links named in the two cases above, one per issue you created. Nothing else on {{key}}.",
+        "- On the triggering issue {{key}}, you MAY comment with 'yt issue comment {{key}}' (see the size-note instruction in step 1 below), and you MAY add the links named in the two create cases above, one per issue you created. The runner still posts its own outcome comment on {{key}}; do not duplicate it.",
         "",
         "HARD BANS on YouTrack, no exceptions:",
         "- NEVER set the 'AI Agent' field on ANY issue, including issues you created yourself: no 'yt issue set-field ... \"AI Agent\" ...', and no equivalent through 'yt issue update' or 'yt issue apply'. Setting that field queues an agent run, so an agent that can set it can spawn runs. It belongs to the runner alone.",
-        "- No other write to {{key}}: no description or summary edit, no comment, no tag, no assignee change, no 'yt issue set-state', no 'yt issue set-field'. The runner owns the outcome comment and the fields on {{key}}, and its State stays In Progress until a human merges the PR.",
+        "- No other write to {{key}}: no description or summary edit, no tag, no assignee change, no 'yt issue set-state', no 'yt issue set-field'. The runner owns the outcome comment and the fields on {{key}}, and its State stays In Progress until a human merges the PR.",
         "- No write of any kind to an issue you did not create during this run.",
         "- Never run 'yt issue delete' anywhere.",
         "",
         "Steps:",
-        "1. Run 'yt issue inspect {{key}}' to read the full description and acceptance criteria.",
+        "1. Run 'yt issue inspect {{key}}' to read the full description and acceptance criteria. If you believe {{key}} is too large to finish and verify within the time budget, post one short comment on {{key}} with 'yt issue comment {{key}}' saying why and which layers you expect to be at risk, early, before you start changing code. Do not stop for this and do not use the blocker markers for this: post the comment, then continue with the work regardless. There is no size limit and no refusal; this is a paper trail for a possible timeout, not a decision point.",
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
         "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
         "4. Make the minimum change required to satisfy the acceptance criteria.",
@@ -3310,9 +3312,24 @@ mod tests {
             p.contains("create it ONLY in these projects: MK,"),
             "create scope must render the project list: {p}"
         );
-        // The single permitted write to the triggering issue.
+        // The single permitted link write to the triggering issue.
         assert!(
             p.contains("yt issue link <new-issue> MK-16 --type \"subtask of\""),
+            "{p}"
+        );
+        // The triggering issue may now also be commented on.
+        assert!(
+            p.contains(
+                "you MAY comment with 'yt issue comment {{key}}'"
+                    .replace("{{key}}", "MK-16")
+                    .as_str()
+            ),
+            "the comment permission on the triggering issue must be present: {p}"
+        );
+        assert!(
+            p.contains(
+                "The runner still posts its own outcome comment on MK-16; do not duplicate it"
+            ),
             "{p}"
         );
 
@@ -3322,6 +3339,10 @@ mod tests {
             "the AI Agent ban must be present verbatim: {p}"
         );
         assert!(p.contains("No other write to MK-16"), "{p}");
+        assert!(
+            !p.contains("No other write to MK-16: no description or summary edit, no comment,"),
+            "comment must no longer be listed among the bans on the triggering issue: {p}"
+        );
         assert!(
             p.contains("No write of any kind to an issue you did not create during this run"),
             "{p}"
@@ -3335,6 +3356,27 @@ mod tests {
             !p.contains("do NOT touch YouTrack"),
             "the blanket YouTrack ban must stay removed: {p}"
         );
+    }
+
+    /// The prompt tells the agent to post an early size note on the triggering
+    /// issue when it expects the issue to be too large, and to keep working
+    /// rather than stopping or using the blocker markers.
+    #[test]
+    fn build_prompt_default_documents_the_size_note() {
+        let p = build_prompt(&src(), &job(), std::path::Path::new("/tmp/wd"), None);
+        assert!(
+            p.contains("too large to finish and verify within the time budget"),
+            "{p}"
+        );
+        assert!(
+            p.contains("post one short comment on MK-16 with 'yt issue comment MK-16'"),
+            "{p}"
+        );
+        assert!(
+            p.contains("Do not stop for this and do not use the blocker markers for this"),
+            "{p}"
+        );
+        assert!(p.contains("There is no size limit and no refusal"), "{p}");
     }
 
     /// The no-code path is advertised in the prompt, with the marker
