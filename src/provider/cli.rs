@@ -815,7 +815,13 @@ impl CliBackend {
     /// outcome, because `cleanup_or_preserve` makes the keep-or-delete
     /// decision later, from its own check of the workdir, and can legitimately
     /// delete the directory.
-    fn create_pr_branch(&self, workdir: &Path, host: &str, branch: &str) -> Result<PullRequest> {
+    fn create_pr_branch(
+        &self,
+        workdir: &Path,
+        host: &str,
+        branch: &str,
+        draft: bool,
+    ) -> Result<PullRequest> {
         // Repo path (`owner/repo`) for the open-PR lookup, derived from the
         // workdir's `origin` remote (the form `list_open_prs` expects).
         let repo = self.origin_repo_path(workdir)?;
@@ -830,11 +836,11 @@ impl CliBackend {
             // PR with `--head <branch>`).
             None => {
                 self.push_branch(workdir, branch)?;
-                self.find_or_create_pr(workdir, host, &repo, branch)
+                self.find_or_create_pr(workdir, host, &repo, branch, draft)
             }
             // Equal to local: nothing to push; find-or-create the PR.
             Some(ref remote_sha) if *remote_sha == local_sha => {
-                self.find_or_create_pr(workdir, host, &repo, branch)
+                self.find_or_create_pr(workdir, host, &repo, branch, draft)
             }
             // Present and not equal. A fast-forward push is legal only when the
             // remote tip is an ancestor of the local tip; then push (never force)
@@ -844,7 +850,7 @@ impl CliBackend {
             Some(remote_sha) => {
                 if self.is_ancestor(workdir, &remote_sha, &local_sha)? {
                     self.push_branch(workdir, branch)?;
-                    self.find_or_create_pr(workdir, host, &repo, branch)
+                    self.find_or_create_pr(workdir, host, &repo, branch, draft)
                 } else {
                     // The lookup stays FATAL on this arm only. Here
                     // its result decides between adopting and refusing, so an
@@ -996,6 +1002,7 @@ impl CliBackend {
         host: &str,
         repo: &str,
         branch: &str,
+        draft: bool,
     ) -> Result<PullRequest> {
         let lookup_err = match self.find_open_pr(host, repo, branch) {
             Ok(Some(pr)) => return Ok(pr),
@@ -1006,12 +1013,19 @@ impl CliBackend {
             }
         };
 
-        // Title/body derive from the feature branch tip, not `HEAD`.
+        // Title/body derive from the feature branch tip, not `HEAD`. A draft
+        // open (CLAUDE-379, timeout salvage) is forced to carry fj's `WIP: `
+        // title-prefix convention regardless of the tip commit's own subject,
+        // so the draft status holds even when the tip is a pre-existing agent
+        // commit rather than the salvage's own `WIP: ...` commit.
         let title_args = ["log", "-1", "--format=%s", branch];
         let out = self
             .runner
             .run_in_env(Some(workdir), "git", &title_args, &[])?;
-        let title = Self::checked("git", out, &title_args)?.trim().to_string();
+        let mut title = Self::checked("git", out, &title_args)?.trim().to_string();
+        if draft && !title.starts_with("WIP: ") {
+            title = format!("WIP: {title}");
+        }
 
         let body_args = ["log", "-1", "--format=%b", branch];
         let out = self
@@ -1593,12 +1607,59 @@ impl Forge for CliBackend {
             // The selected strategy is authoritative: a failure errors loudly
             // (the finalize step preserves the workdir) rather than silently
             // emitting a branchless AGit PR.
-            PrStrategy::Branch => self.create_pr_branch(workdir, host, &branch),
+            PrStrategy::Branch => self.create_pr_branch(workdir, host, &branch, false),
             // Opt-in AGit + autofill: fj derives the title/body from the local
             // commit messages, which already carry the bare #<KEY>-N reference.
             // No server branch (head lives only at `refs/pull/<N>/head`).
             PrStrategy::Agit => self.create_pr_agit(workdir, host),
         }
+    }
+
+    /// Draft support (CLAUDE-379) is implemented only for the branch-backed
+    /// strategy, which is the one the timeout salvage path uses (AGit produces
+    /// no server branch, so it cannot be resumed and is never used there);
+    /// `PrStrategy::Agit` falls back to the plain create, unprefixed.
+    fn create_pr_with_draft(
+        &self,
+        workdir: &Path,
+        host: &str,
+        strategy: crate::action::PrStrategy,
+        draft: bool,
+    ) -> Result<PullRequest> {
+        use crate::action::PrStrategy;
+        let branch = self.resolve_feature_branch(workdir)?;
+        match strategy {
+            PrStrategy::Branch => self.create_pr_branch(workdir, host, &branch, draft),
+            PrStrategy::Agit => self.create_pr_agit(workdir, host),
+        }
+    }
+
+    /// Strip the `WIP: ` title prefix a timeout-salvaged draft PR (CLAUDE-379)
+    /// carries, when a re-queued run resumes onto it and now succeeds. A PR
+    /// whose title already lacks the prefix (not a salvaged draft, or already
+    /// stripped) is left untouched.
+    fn mark_pr_ready(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
+        let prs = self.list_open_prs(host, repo)?;
+        let title = prs
+            .into_iter()
+            .find(|p| p.number == pr_number)
+            .map(|p| p.title)
+            .ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
+                    "PR #{pr_number} in `{repo}` on {host} is not open; cannot read its title \
+                     to strip the draft prefix"
+                ))
+            })?;
+        let Some(stripped) = title.strip_prefix("WIP: ") else {
+            return Ok(());
+        };
+        let id = format!("{repo}#{pr_number}");
+        let args = ["--host", host, "pr", "edit", &id, "--title", stripped];
+        let out = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
+        Self::checked(&self.fj, out, &args)?;
+        Ok(())
     }
 
     fn take_notices(&self) -> Vec<String> {

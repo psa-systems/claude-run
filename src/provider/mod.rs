@@ -377,6 +377,37 @@ pub trait Forge: Send + Sync {
         strategy: crate::action::PrStrategy,
     ) -> Result<PullRequest>;
 
+    /// Like [`Self::create_pr`], but `draft` selects whether the opened PR is a
+    /// draft (Forgejo: a `WIP: ` title prefix, the convention `fj pr search
+    /// --json` reports through its `draft` field; GitHub: the real draft flag).
+    /// Used by the timeout salvage path (CLAUDE-379) to open a draft PR for
+    /// work rescued from a timed-out run. The default ignores `draft` and
+    /// falls back to [`Self::create_pr`], so a backend with no draft notion
+    /// (including every test-only stub) keeps compiling unchanged.
+    fn create_pr_with_draft(
+        &self,
+        workdir: &std::path::Path,
+        host: &str,
+        strategy: crate::action::PrStrategy,
+        draft: bool,
+    ) -> Result<PullRequest> {
+        let _ = draft;
+        self.create_pr(workdir, host, strategy)
+    }
+
+    /// Strip PR `pr_number` in `repo` on `host` of its draft status (Forgejo:
+    /// remove the `WIP: ` title prefix; GitHub: `gh pr ready`). Used when a
+    /// re-queued run resumes onto a draft PR a prior timed-out run salvaged
+    /// (CLAUDE-379) and now succeeds. The default errors so a backend without
+    /// draft support (including every test-only stub) reports clearly rather
+    /// than silently no-op'ing.
+    fn mark_pr_ready(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
+        let _ = (host, repo, pr_number);
+        Err(Error::Other(anyhow::anyhow!(
+            "mark_pr_ready not supported by this forge backend"
+        )))
+    }
+
     /// Drain the operator-visible notices this backend accumulated
     /// while serving the job, e.g. an open-PR lookup that failed and was
     /// degraded to a create. The caller persists them as `run_events` so they
