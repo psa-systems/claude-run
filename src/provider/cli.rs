@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{Backend, Forge, ForgePullRequest, IssueTracker, PullRequest, VcsMapEntry, VcsRepo};
 use crate::error::{Error, Result};
@@ -802,13 +802,19 @@ impl CliBackend {
     /// key; a pre-existing remote branch of the same name is legitimate, not just
     /// a collision, because the resume path for a re-queued issue clones its
     /// recorded PR branch by name and continues committing on it. Before pushing,
-    /// the remote
-    /// state of the branch is read (`git ls-remote`) and reconciled WITHOUT force:
-    /// absent -> push + create; local fast-forwards or equals remote -> (fast-
-    /// forward) push then find-or-create the PR; diverged (or remote-ahead) ->
-    /// never push, adopt an already-open PR for the branch if one exists, else
-    /// fail loudly naming both SHAs and the workdir. No `--force` /
-    /// `--force-with-lease` is ever issued.
+    /// the remote state of the branch is read (`git ls-remote`) and the remote
+    /// branch is fetched (CLAUDE-382: a resumed run's clone predates any commit
+    /// the runner pushed onto the branch while the run was working, and without
+    /// the fetch `is_ancestor` fails with exit 128 rather than resolving
+    /// ancestry), then reconciled WITHOUT force: absent -> push + create; local
+    /// fast-forwards or equals remote -> (fast-forward) push then find-or-create
+    /// the PR; diverged (the remote gained commits, typically the runner's own
+    /// "behind its base" update, while the local branch has the agent's own) ->
+    /// merge `origin/<branch>` into the local branch, then push (still a fast-
+    /// forward, since the merge now carries the remote tip as an ancestor) and
+    /// find-or-create the PR. No `--force` / `--force-with-lease` is ever
+    /// issued; a merge conflict aborts the merge and fails loudly naming both
+    /// SHAs and the workdir.
     ///
     /// The error text states the retention CONDITION
     /// ("preserved only if the cleanup check finds it there"), never a flat
@@ -842,41 +848,27 @@ impl CliBackend {
             Some(ref remote_sha) if *remote_sha == local_sha => {
                 self.find_or_create_pr(workdir, host, &repo, branch, draft)
             }
-            // Present and not equal. A fast-forward push is legal only when the
-            // remote tip is an ancestor of the local tip; then push (never force)
-            // and find-or-create. Otherwise the branch has diverged (or the
-            // remote is ahead): refuse to force, adopt an open PR if one exists,
-            // else fail loudly.
+            // Present and not equal. Fetch first (CLAUDE-382) so the remote
+            // tip's objects exist locally: a resumed run's clone predates any
+            // commit the runner pushed onto the branch while the run was
+            // working, and without this `is_ancestor` fails with exit 128
+            // ("not a valid commit name") rather than resolving ancestry.
             Some(remote_sha) => {
+                self.fetch_branch(workdir, branch)?;
                 if self.is_ancestor(workdir, &remote_sha, &local_sha)? {
+                    // A fast-forward push is legal when the remote tip is an
+                    // ancestor of the local tip.
                     self.push_branch(workdir, branch)?;
                     self.find_or_create_pr(workdir, host, &repo, branch, draft)
                 } else {
-                    // The lookup stays FATAL on this arm only. Here
-                    // its result decides between adopting and refusing, so an
-                    // "assume none" would raise the refusal for the wrong
-                    // reason; a failed search and a genuine "no open PR" are
-                    // reported as the different conditions they are.
-                    match self.find_open_pr(host, &repo, branch) {
-                        Ok(Some(pr)) => Ok(pr),
-                        Ok(None) => Err(Error::Other(anyhow::anyhow!(
-                            "remote branch `{branch}` has diverged from the local work \
-                             (local {local_sha}, remote {remote_sha}) and no open PR exists \
-                             for it; refusing to force-push over it. Any unpushed work in the \
-                             workdir `{}` is preserved only if the cleanup check finds it \
-                             there; branches already pushed remain on the remote regardless.",
-                            workdir.display()
-                        ))),
-                        Err(e) => Err(Error::Other(anyhow::anyhow!(
-                            "remote branch `{branch}` has diverged from the local work \
-                             (local {local_sha}, remote {remote_sha}) and the open-PR lookup \
-                             failed ({e}), so whether an open PR exists for it is UNKNOWN; \
-                             refusing to force-push over it. Any unpushed work in the workdir \
-                             `{}` is preserved only if the cleanup check finds it there; \
-                             branches already pushed remain on the remote regardless.",
-                            workdir.display()
-                        ))),
-                    }
+                    // Diverged: the remote gained commits (typically the
+                    // runner's own "branch was behind its base" update) while
+                    // the local branch has the agent's own. Merge the remote
+                    // in (never force) so the push below stays a fast-forward,
+                    // then find-or-create the PR as usual.
+                    self.merge_remote_branch(workdir, branch, &local_sha, &remote_sha)?;
+                    self.push_branch(workdir, branch)?;
+                    self.find_or_create_pr(workdir, host, &repo, branch, draft)
                 }
             }
         }
@@ -952,6 +944,68 @@ impl CliBackend {
             // Any other exit is a real failure (bad object, not a repo, ...).
             _ => Self::checked("git", out, &args).map(|_| unreachable!()),
         }
+    }
+
+    /// Fetch `branch` from `origin` (CLAUDE-382), read-only and
+    /// authenticated the same way as every other git subprocess here
+    /// (`self.runner.run_in_env`, CLAUDE-252). Called before `is_ancestor`
+    /// touches the remote tip, so the remote's objects exist in the local
+    /// clone: a resumed run's clone predates any commit the runner pushed
+    /// onto the branch while the run was working, and without this fetch
+    /// `git merge-base` fails with exit 128 ("not a valid commit name")
+    /// rather than resolving ancestry.
+    fn fetch_branch(&self, workdir: &Path, branch: &str) -> Result<()> {
+        let args = ["fetch", "origin", branch];
+        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        Self::checked("git", out, &args)?;
+        Ok(())
+    }
+
+    /// Merge `origin/<branch>` into the local branch (CLAUDE-382),
+    /// called only once `is_ancestor` has ruled out a plain fast-forward: the
+    /// remote gained commits (typically the runner's own "branch was behind
+    /// its base" update) while the local branch carries the agent's own, so
+    /// neither is an ancestor of the other. A clean merge leaves the local
+    /// branch with the remote tip as an ancestor, so the caller's subsequent
+    /// push stays a fast-forward; `--force` is never used anywhere in this
+    /// path. A conflicting merge is aborted immediately (never left for the
+    /// caller to push over) and reported loudly, naming both SHAs and the
+    /// workdir, exactly as this arm did before it attempted a merge at all.
+    fn merge_remote_branch(
+        &self,
+        workdir: &Path,
+        branch: &str,
+        local_sha: &str,
+        remote_sha: &str,
+    ) -> Result<()> {
+        let remote_ref = format!("origin/{branch}");
+        let args = ["merge", "--no-edit", remote_ref.as_str()];
+        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        if out.ok {
+            return Ok(());
+        }
+        let merge_stderr = out.stderr.trim().to_string();
+        error!(
+            branch = %branch,
+            local_sha = %local_sha,
+            remote_sha = %remote_sha,
+            workdir = %workdir.display(),
+            stderr = %merge_stderr,
+            "merging the remote branch into the local work conflicted; aborting the merge"
+        );
+        let abort_args = ["merge", "--abort"];
+        let abort_out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &abort_args, &[])?;
+        Self::checked("git", abort_out, &abort_args)?;
+        Err(Error::Other(anyhow::anyhow!(
+            "remote branch `{branch}` has diverged from the local work (local {local_sha}, \
+             remote {remote_sha}) and merging origin/{branch} into it conflicted ({merge_stderr}); \
+             the merge was aborted. Refusing to force-push over it. Any unpushed work in the \
+             workdir `{}` is preserved only if the cleanup check finds it there; branches \
+             already pushed remain on the remote regardless.",
+            workdir.display()
+        )))
     }
 
     /// Push the resolved branch BY NAME (`<branch>:<branch>`), not
@@ -3387,6 +3441,9 @@ mod tests {
         );
         let runner = with_remote_state(runner, "feat/x", "newsha", "oldsha\trefs/heads/feat/x\n");
         let runner = with_open_pr_search(runner, "[]")
+            // CLAUDE-382: fetched before the ancestry check, so the remote
+            // tip's objects (oldsha) are present locally when it runs.
+            .ok("git", &["fetch", "origin", "feat/x"], "")
             // remote (oldsha) IS an ancestor of local (newsha) -> fast-forward.
             .ok(
                 "git",
@@ -3446,15 +3503,30 @@ mod tests {
             !calls.iter().any(|c| c.contains("--force")),
             "fast-forward must never force: {calls:?}"
         );
+        let fetch_idx = calls
+            .iter()
+            .position(|c| c == "git fetch origin feat/x")
+            .expect("fetch must be called before the ancestry check");
+        let ancestor_idx = calls
+            .iter()
+            .position(|c| c.starts_with("git merge-base --is-ancestor"))
+            .expect("the ancestry check must be called");
+        assert!(
+            fetch_idx < ancestor_idx,
+            "CLAUDE-382: fetch must happen before `is_ancestor` touches the remote tip, \
+             else merge-base fails with exit 128 on a SHA the clone has never seen: {calls:?}"
+        );
     }
 
     #[test]
     fn create_pr_branch_adopts_open_pr_when_diverged() {
         // The YOTUN-96 signature: the remote branch is present
         // and NOT a fast-forward of the local tip (neither is an ancestor of the
-        // other). Force is banned, so the runner adopts the already-open PR for
-        // the branch: it returns the PR (finalize advances to Code Review, NOT
-        // Failed), pushes nothing, and issues no `pr create` and no force.
+        // other). Force is banned, so the runner fetches, merges `origin/<branch>`
+        // into the local work (CLAUDE-382), pushes the resulting fast-forward,
+        // and adopts the already-open PR for the branch via the ordinary
+        // find-or-create path: it returns the PR (finalize advances to Code
+        // Review, NOT Failed) and issues no `pr create` and no force.
         let wd = tempfile::tempdir().unwrap();
         let runner = with_branch_resolution(
             StubRunner::new(),
@@ -3472,11 +3544,23 @@ mod tests {
             runner,
             r#"[{"number":165,"head_ref":"feat/yotun-96","html_url":"https://dev.a8n.run/a/y/pulls/165"}]"#,
         )
+        .ok("git", &["fetch", "origin", "feat/yotun-96"], "")
         // Neither commit is an ancestor of the other -> diverged (exit 1).
         .fail(
             "git",
             &["merge-base", "--is-ancestor", "remotesha", "localsha"],
             1,
+            "",
+        )
+        .ok("git", &["merge", "--no-edit", "origin/feat/yotun-96"], "")
+        .ok(
+            "git",
+            &[
+                "push",
+                "--set-upstream",
+                "origin",
+                "feat/yotun-96:feat/yotun-96",
+            ],
             "",
         );
         let runner = Arc::new(runner);
@@ -3488,8 +3572,16 @@ mod tests {
         assert_eq!(pr.url, "https://dev.a8n.run/a/y/pulls/165");
         let calls = runner.calls.lock().unwrap();
         assert!(
-            !calls.iter().any(|c| c.starts_with("git push")),
-            "diverged must not push: {calls:?}"
+            calls
+                .iter()
+                .any(|c| c == "git merge --no-edit origin/feat/yotun-96"),
+            "diverged must merge the remote branch in: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin feat/yotun-96:feat/yotun-96"),
+            "diverged must push the merge result: {calls:?}"
         );
         assert!(
             !calls.iter().any(|c| c.contains("pr create")),
@@ -3503,11 +3595,12 @@ mod tests {
 
     #[test]
     fn create_pr_branch_diverged_with_no_pr_is_loud_error() {
-        // Remote branch present and diverged with NO open PR. The
-        // runner cannot force and has nothing to adopt: it returns a distinct,
-        // actionable error naming the branch, both SHAs, and the preserved
-        // workdir. The raw git "fetch first" hint never surfaces, no push is
-        // issued, and no force is attempted.
+        // Remote branch present and diverged, and merging
+        // `origin/<branch>` into the local work conflicts. The runner cannot
+        // force and has nothing clean to push, so it aborts the merge and
+        // returns a distinct, actionable error naming the branch, both SHAs,
+        // and the preserved workdir. No push is issued and no force is
+        // attempted.
         let wd = tempfile::tempdir().unwrap();
         let runner = with_branch_resolution(
             StubRunner::new(),
@@ -3521,12 +3614,21 @@ mod tests {
             "localsha",
             "remotesha\trefs/heads/feat/x\n",
         );
-        let runner = with_open_pr_search(runner, "[]").fail(
-            "git",
-            &["merge-base", "--is-ancestor", "remotesha", "localsha"],
-            1,
-            "",
-        );
+        let runner = with_open_pr_search(runner, "[]")
+            .ok("git", &["fetch", "origin", "feat/x"], "")
+            .fail(
+                "git",
+                &["merge-base", "--is-ancestor", "remotesha", "localsha"],
+                1,
+                "",
+            )
+            .fail(
+                "git",
+                &["merge", "--no-edit", "origin/feat/x"],
+                1,
+                "CONFLICT (content): Merge conflict in src/lib.rs",
+            )
+            .ok("git", &["merge", "--abort"], "");
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b
@@ -3540,16 +3642,20 @@ mod tests {
                 assert!(msg.contains("remotesha"), "names the remote SHA: {msg}");
                 assert!(msg.contains("preserved"), "names the workdir: {msg}");
                 assert!(
-                    !msg.contains("fetch first"),
-                    "raw git hint must not surface: {msg}"
+                    msg.contains("conflicted"),
+                    "names the merge conflict: {msg}"
                 );
             }
             other => panic!("expected Other actionable error, got {other:?}"),
         }
         let calls = runner.calls.lock().unwrap();
         assert!(
+            calls.iter().any(|c| c == "git merge --abort"),
+            "a conflicting merge must be aborted: {calls:?}"
+        );
+        assert!(
             !calls.iter().any(|c| c.starts_with("git push")),
-            "diverged must not push: {calls:?}"
+            "a conflicting merge must not push: {calls:?}"
         );
         assert!(
             !calls.iter().any(|c| c.contains("--force")),
@@ -3791,10 +3897,12 @@ mod tests {
 
     #[test]
     fn create_pr_branch_diverged_distinguishes_failed_lookup_from_no_pr() {
-        // The diverged arm stays fatal (the lookup is the only
-        // alternative to a force-push there), but a FAILED search no longer
-        // reads as "no open PR exists": the message says the answer is unknown
-        // and names the CLI error. Still no push and no force.
+        // CLAUDE-382: once the diverged arm merges and pushes
+        // cleanly, it falls through to the ordinary find-or-create path, so a
+        // FAILED open-PR search degrades the same way it does for any other
+        // arm: assume no open PR, push is already done, and create one (with
+        // an operator-visible notice), rather than treating the diverged
+        // branch as fatal on a lookup failure.
         let wd = tempfile::tempdir().unwrap();
         let runner = with_branch_resolution(
             StubRunner::new(),
@@ -3808,44 +3916,76 @@ mod tests {
             "localsha",
             "remotesha\trefs/heads/fix/CLAUDE-206\n",
         );
-        let runner = Arc::new(with_failed_open_pr_search(runner).fail(
-            "git",
-            &["merge-base", "--is-ancestor", "remotesha", "localsha"],
-            1,
-            "",
-        ));
+        let runner = with_failed_open_pr_search(runner)
+            .ok("git", &["fetch", "origin", "fix/CLAUDE-206"], "")
+            .fail(
+                "git",
+                &["merge-base", "--is-ancestor", "remotesha", "localsha"],
+                1,
+                "",
+            )
+            .ok("git", &["merge", "--no-edit", "origin/fix/CLAUDE-206"], "")
+            .ok(
+                "git",
+                &[
+                    "push",
+                    "--set-upstream",
+                    "origin",
+                    "fix/CLAUDE-206:fix/CLAUDE-206",
+                ],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "fix/CLAUDE-206"],
+                "fix(pr): degrade a failed lookup after a merge\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "fix/CLAUDE-206"],
+                "#CLAUDE-206\n",
+            );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path_str = scratch
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "fix(pr): degrade a failed lookup after a merge",
+                "--body-file",
+                body_path_str.as_str(),
+                "--head",
+                "fix/CLAUDE-206",
+                "--json",
+            ],
+            r#"{"number":91,"html_url":"https://dev.a8n.run/n/c/pulls/91"}"#,
+        );
+        let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone()).with_fj_read_retry_waits(NO_WAIT);
-        match b
+        let pr = b
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
-            .unwrap_err()
-        {
-            Error::Other(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("open-PR lookup failed"),
-                    "names the failed search: {msg}"
-                );
-                assert!(msg.contains("403 Forbidden"), "names the CLI error: {msg}");
-                assert!(msg.contains("UNKNOWN"), "not a bare no-PR claim: {msg}");
-                assert!(
-                    !msg.contains("no open PR exists"),
-                    "must not claim no PR exists: {msg}"
-                );
-            }
-            other => panic!("expected Other actionable error, got {other:?}"),
-        }
+            .unwrap();
+        assert_eq!(pr.number, Some(91));
         let calls = runner.calls.lock().unwrap();
         assert!(
-            !calls.iter().any(|c| c.starts_with("git push")),
-            "diverged must not push: {calls:?}"
+            calls
+                .iter()
+                .any(|c| c == "git merge --no-edit origin/fix/CLAUDE-206"),
+            "diverged must merge the remote branch in: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with("git push")),
+            "the merge result must still be pushed: {calls:?}"
         );
         assert!(
             !calls.iter().any(|c| c.contains("--force")),
             "no force anywhere: {calls:?}"
-        );
-        assert!(
-            !calls.iter().any(|c| c.contains("pr create")),
-            "diverged must not create: {calls:?}"
         );
     }
 
