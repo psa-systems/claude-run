@@ -219,6 +219,13 @@ pub struct VerifiedCommentCommand {
     pub html_url: String,
     /// The thread's title, carried into a minted issue's summary.
     pub title: String,
+    /// True for a command the runner dispatched itself (the automerge
+    /// conflict auto-resolve, CLAUDE-380) rather than a human's comment.
+    /// Skips only the commenter permission check and its denial reply; every
+    /// other gate (readiness, `KeyGate`, `admit`, daily cap, decision gate)
+    /// still applies.
+    #[serde(default)]
+    pub synthetic: bool,
 }
 
 impl VerifiedCommentCommand {
@@ -355,6 +362,7 @@ pub fn verified_comment_command(
             payload.issue.html_url.clone()
         },
         title: payload.issue.title.clone(),
+        synthetic: false,
     })
 }
 
@@ -638,6 +646,14 @@ fn access_rank(permission: &str) -> Option<u8> {
     }
 }
 
+/// Whether a command's authorization still requires the live commenter
+/// permission check. A synthetic command (CLAUDE-380's automerge conflict
+/// auto-resolve dispatch) skips only this gate; readiness, `KeyGate`,
+/// `admit`, the daily cap, and the decision gate all run unchanged for it.
+fn requires_permission_check(cmd: &VerifiedCommentCommand) -> bool {
+    !cmd.synthetic
+}
+
 /// True when `permission` is in `allowed` (case-insensitive), or outranks a
 /// Forgejo access level listed in it. An empty list denies everyone; the
 /// settings validator rejects one, so this is defence in depth for a
@@ -798,33 +814,39 @@ async fn serve_command(ctx: Arc<CommentContext>, cmd: VerifiedCommentCommand) {
         return;
     };
 
-    // Authorization: a live permission read, fail closed on error.
-    let verdict = {
-        let backend = &env.backend;
-        let (host, repo, author) = (cmd.host.clone(), cmd.repo.clone(), cmd.author.clone());
-        let allowed = src.allowed_permissions.clone();
-        // The read shells out to `fj`; keep it off the async runtime.
-        tokio::task::block_in_place(|| {
-            check_permission(backend.as_ref(), &host, &repo, &author, &allowed)
-        })
-    };
-    if !verdict.is_allowed() {
-        let body = denied_comment(&verdict, &src.allowed_permissions);
-        match &verdict {
-            PermissionVerdict::Denied(p) => {
-                info!(repo = %cmd.repo, number = cmd.number, author = %cmd.author, permission = %p, "commenter permission denied")
+    // Authorization: a live permission read, fail closed on error. A
+    // synthetic command (the runner's own dispatch, e.g. the automerge
+    // conflict auto-resolve) skips this check and its denial reply: there is
+    // no human commenter to authorize, and every other gate below still
+    // applies (readiness, KeyGate, admit, daily cap, decision gate).
+    if requires_permission_check(&cmd) {
+        let verdict = {
+            let backend = &env.backend;
+            let (host, repo, author) = (cmd.host.clone(), cmd.repo.clone(), cmd.author.clone());
+            let allowed = src.allowed_permissions.clone();
+            // The read shells out to `fj`; keep it off the async runtime.
+            tokio::task::block_in_place(|| {
+                check_permission(backend.as_ref(), &host, &repo, &author, &allowed)
+            })
+        };
+        if !verdict.is_allowed() {
+            let body = denied_comment(&verdict, &src.allowed_permissions);
+            match &verdict {
+                PermissionVerdict::Denied(p) => {
+                    info!(repo = %cmd.repo, number = cmd.number, author = %cmd.author, permission = %p, "commenter permission denied")
+                }
+                PermissionVerdict::LookupFailed(e) => {
+                    warn!(repo = %cmd.repo, number = cmd.number, author = %cmd.author, error = %e, "commenter permission lookup failed; denying")
+                }
+                PermissionVerdict::Allowed(_) => unreachable!(),
             }
-            PermissionVerdict::LookupFailed(e) => {
-                warn!(repo = %cmd.repo, number = cmd.number, author = %cmd.author, error = %e, "commenter permission lookup failed; denying")
+            if ctx.denials.allow(&cmd.repo, &cmd.author, Instant::now()) {
+                reply(&ctx, &env, &cmd, &key, body).await;
+            } else {
+                info!(repo = %cmd.repo, author = %cmd.author, "denial reply suppressed (per repo+login throttle)");
             }
-            PermissionVerdict::Allowed(_) => unreachable!(),
+            return;
         }
-        if ctx.denials.allow(&cmd.repo, &cmd.author, Instant::now()) {
-            reply(&ctx, &env, &cmd, &key, body).await;
-        } else {
-            info!(repo = %cmd.repo, author = %cmd.author, "denial reply suppressed (per repo+login throttle)");
-        }
-        return;
     }
 
     info!(
@@ -3514,6 +3536,19 @@ mod tests {
         // Lowered below the default.
         assert_eq!(admit(0, 5, &d, 5), Admission::DailyCapReached);
         assert_eq!(admit(0, 4, &d, 5), Admission::Run);
+    }
+
+    /// A synthetic command (CLAUDE-380's automerge conflict auto-resolve
+    /// dispatch) skips only the commenter permission check; every other
+    /// gate (`admit`, readiness, `KeyGate`, the daily cap) is untouched by
+    /// `cmd.synthetic` and runs exactly as it does for a human comment.
+    #[test]
+    fn synthetic_command_skips_only_the_permission_check() {
+        let mut cmd = gate_cmd();
+        assert!(!cmd.synthetic, "a real comment is never synthetic");
+        assert!(requires_permission_check(&cmd));
+        cmd.synthetic = true;
+        assert!(!requires_permission_check(&cmd));
     }
 
     #[test]
