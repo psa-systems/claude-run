@@ -118,6 +118,11 @@ pub struct PrStatus {
     /// `fj` predating that field, or a value Forgejo has not computed yet).
     #[serde(default)]
     pub behind_base: Option<bool>,
+    /// The PR head commit SHA. `None` for a merged PR or an `fj` predating
+    /// this field; used to bound a conflict auto-resolve dispatch to one
+    /// attempt per head commit (CLAUDE-380).
+    #[serde(default)]
+    pub head_sha: Option<String>,
 }
 
 /// A pull request opened by a [`Forge`] backend.

@@ -2273,6 +2273,24 @@ pub(crate) fn automerge_update_failed_comment(pr_url: &str, error: &str) -> Stri
     .join("\n")
 }
 
+/// The branch is behind its base and updating it failed because of a merge
+/// conflict; the runner dispatched a `/claude` conflict-resolution run
+/// instead of leaving it to a human (CLAUDE-380). Posted in place of
+/// [`automerge_update_failed_comment`] on the first attempt per PR head
+/// commit; a second failure for the SAME head commit falls back to that
+/// comment instead, since the auto-resolve attempt already ran and did not
+/// resolve it.
+pub(crate) fn automerge_conflict_resolving_comment(pr_url: &str) -> String {
+    [
+        "This PR's branch is behind its base, and updating it hit a merge conflict.".to_string(),
+        String::new(),
+        format!("PR: {pr_url}"),
+        String::new(),
+        "The runner is attempting to resolve the conflict automatically.".to_string(),
+    ]
+    .join("\n")
+}
+
 /// `fj pr status` did not report `behind_base` at all, meaning the
 /// runtime's `fj` predates FJ-99. Automerge cannot tell whether the branch is
 /// up to date, so it takes no merge action and leaves the issue at Code
