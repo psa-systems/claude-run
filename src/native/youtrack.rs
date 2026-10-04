@@ -3426,7 +3426,7 @@ mod tests {
     /// rather than stopping or using the blocker markers.
     #[test]
     fn build_prompt_default_documents_the_size_note() {
-        let p = build_prompt(&src(), &job(), std::path::Path::new("/tmp/wd"), None);
+        let p = build_prompt(&src(), &job(), std::path::Path::new("/tmp/wd"), 60, None);
         assert!(
             p.contains("too large to finish and verify within the time budget"),
             "{p}"
