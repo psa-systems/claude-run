@@ -1765,12 +1765,17 @@ impl Forge for CliBackend {
             // `None`: unknown, never collapsed to `false`.
             #[serde(default)]
             behind_base: Option<bool>,
+            // Absent (an `fj` predating this field) or explicit `null` (a merged
+            // PR) both parse to `None`.
+            #[serde(default)]
+            head_sha: Option<String>,
         }
         let status: Status = Self::parse_json(&self.fj, "fj pr status --json", &stdout)?;
         Ok(super::PrStatus {
             state: status.state,
             mergeable: status.mergeable,
             behind_base: status.behind_base,
+            head_sha: status.head_sha,
         })
     }
 

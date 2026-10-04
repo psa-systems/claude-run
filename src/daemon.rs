@@ -338,6 +338,10 @@ impl Daemon {
         // loop-safety bot logins.
         let (comment_tx, comment_rx) =
             mpsc::channel::<crate::web::comment_webhooks::VerifiedCommentCommand>(64);
+        // Cloned before the sender moves into `comment_state`: automerge's
+        // conflict auto-resolve dispatch (CLAUDE-380) needs its own handle on
+        // the same channel `consume_commands` drains below.
+        let automerge_comment_tx = comment_tx.clone();
         let comment_state = crate::web::comment_webhooks::CommentWebhookState::from_shared(
             pool.clone(),
             settings.webhook_comment_handle(),
@@ -435,6 +439,10 @@ impl Daemon {
             &claude,
             &webhook_log_dir,
             &self.paths,
+            Some(crate::web::webhooks::CommentDispatch {
+                tx: automerge_comment_tx,
+                cfg: settings.webhook_comment_handle(),
+            }),
         );
         // The pull-request and success-event consumers share the same
         // MintContext (backend, mint config) as the failure consumer; built
@@ -678,6 +686,7 @@ fn build_mint_context(
     claude: &Arc<ClaudeInvoker>,
     webhook_log_dir: &Path,
     paths: &Paths,
+    comment_dispatch: Option<crate::web::webhooks::CommentDispatch>,
 ) -> Option<crate::web::webhooks::MintContext> {
     use crate::action::ClaudeBlock;
     use crate::triage::{AnalysisClassifier, FailureClassifier};
@@ -747,6 +756,7 @@ fn build_mint_context(
         )),
         paths: paths.clone(),
         pr_comment_runner: Arc::new(crate::provider::ProcessRunner::new()),
+        comment_dispatch,
     })
 }
 
