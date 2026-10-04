@@ -118,8 +118,8 @@ claude-run access check
 claude-run access check --project CLAUDE
 claude-run access check --repo owner/repo --host forgejo.example.com
 
-# Clear a locked-out administrator's TOTP enrollment (DB-direct); the next login re-enrolls.
-claude-run access reset-2fa
+# Clear a locked-out account's TOTP enrollment (DB-direct); the next login re-enrolls.
+claude-run access reset-2fa admin
 
 # Self-update. `check` reports whether a newer build is published; `update` swaps the binary in place.
 claude-run version                         # print the build-stamped banner (same as `version show`)
@@ -330,7 +330,7 @@ docker compose --profile postgres up --detach
 ```
 
 **Nothing is carried over by switching alone.** Pointing an existing install at PostgreSQL and starting it opens a
-fresh, empty instance: no run history, no caps ledger, no stored secrets, and no web administrator, so the browser lands
+fresh, empty instance: no run history, no caps ledger, no stored secrets, and no web accounts, so the browser lands
 on `/setup` again. Move the data first with `claude-run import`.
 
 **Adding a table.** `migrations/sqlite/` is a chain (each file byte-identical once shipped, so an existing `state.db`
@@ -344,7 +344,7 @@ is what catches the two directories drifting apart.
 
 `claude-run import` copies every table out of a SQLite state store and into the database the configuration resolves to,
 so a switched backend keeps the same history, the same attempt and daily caps, the same settings documents, the same
-encrypted secrets and the same web administrator. Stop the daemon, point the configuration at the new database, and run
+encrypted secrets and the same web accounts. Stop the daemon, point the configuration at the new database, and run
 it:
 
 ```nu
@@ -767,7 +767,7 @@ port = 7321
 # Optional: name of a stored secret (see "Secrets store" below) holding a bearer token for API
 # clients. The browser login does not need it: that credential is created at /setup on first run.
 auth_token_ref = "web-ui-token"
-# Optional, and only used while no administrator exists: the username for the pre-setup login form.
+# Optional, and only used while no account exists yet: the username for the pre-setup login form.
 auth_username = "admin"
 # Optional: require the token even on a loopback bind (off by default; useful for local testing).
 require_auth_on_loopback = false
@@ -775,36 +775,44 @@ require_auth_on_loopback = false
 
 Two credentials answer that gate, for two kinds of caller.
 
-**The browser: a first-run administrator.** An exposed instance with no credential yet serves exactly one page: `/setup`,
-which asks for a username and a password (minimum 12 characters) and creates the administrator. Everything else
-redirects there, and non-browser callers get `503` naming the state. The credential is an argon2id hash in the
-`web_admin` table, so it needs neither the secrets store, nor a key file, nor the CLI, and the setup page closes itself
-the moment an administrator exists: a second POST to `/setup` is refused and redirected to `/login`. The new credential
-applies to the next request, with no restart. This is what makes a container reachable out of the box; before it, a
-non-loopback bind with no resolvable token took the whole web UI down, which no browser could recover from.
+**The browser: any number of accounts, created by setup or by invite.** An exposed instance with no account yet serves
+exactly one page: `/setup`, which asks for a username and a password (minimum 12 characters) and creates the first
+account. Everything else redirects there, and non-browser callers get `503` naming the state. The credential is an
+argon2id hash in the `web_accounts` table, so it needs neither the secrets store, nor a key file, nor the CLI, and the
+setup page closes itself the moment any account exists: a second POST to `/setup` is refused and redirected to
+`/login`. The new credential applies to the next request, with no restart. This is what makes a container reachable
+out of the box; before it, a non-loopback bind with no resolvable token took the whole web UI down, which no browser
+could recover from.
 
-Setup is trust-on-first-use: whoever reaches the exposed port first can claim the instance. Bring it up behind the
-reverse proxy (and whatever the proxy already enforces) and complete setup promptly. `no administrator yet` is logged at
+Setup is trust-on-first-use: whoever reaches the exposed port first claims the instance. Bring it up behind the
+reverse proxy (and whatever the proxy already enforces) and complete setup promptly. `no account yet` is logged at
 `warn` on every start while the instance is unclaimed.
 
-**Every administrator requires TOTP.** Setup does not end at `/setup`: the new administrator is signed in and sent
-straight to `/account/2fa/setup`, which shows a QR code (and the manual-entry `otpauth://` URL as a fallback) and asks
-for a current code before enrollment completes. Confirming it shows a one-time set of recovery codes, each usable
-exactly once, and returns to the dashboard. An administrator who is signed in but not yet enrolled cannot reach any
-other page: every browser request redirects back to enrollment until it completes. Login itself is two steps once
-enrolled: a correct password never mints a session by itself, it mints a short-lived pending cookie and redirects to
-`/login/2fa`, and only a correct TOTP code (or an unused recovery code) turns that into a real session. A stored TOTP
-secret the daemon cannot decrypt refuses the login with a visible error rather than failing silently. Losing both the
-authenticator and the recovery codes is an operator's job to fix, not the browser's: run `claude-run access reset-2fa`
-against the daemon's database to clear enrollment, and the next login is sent back to `/account/2fa/setup` to enroll
-again.
+Every account after the first comes from an invite, not from `/setup`. Any signed-in account can open **Accounts**
+(`/settings/accounts`) and create a single-use invite link, valid for 72 hours and shown exactly once. The invitee
+opens `/invite/<token>`, picks their own username and password, and is signed in and sent straight to TOTP enrollment,
+the same as first-run setup. Accepting an invite marks it used; a second visit to the same link is refused. The same
+page lists every account and outstanding invite, and lets a signed-in account remove another account or revoke an
+invite; removing the last remaining account, or removing yourself, is refused rather than silently ignored. There are
+no roles yet: every account has full access.
+
+**Every account requires TOTP.** Setup and invite acceptance do not end at account creation: the new account is signed
+in and sent straight to `/account/2fa/setup`, which shows a QR code (and the manual-entry `otpauth://` URL as a
+fallback) and asks for a current code before enrollment completes. Confirming it shows a one-time set of recovery
+codes, each usable exactly once, and returns to the dashboard. An account that is signed in but not yet enrolled cannot
+reach any other page: every browser request redirects back to enrollment until it completes. Login itself is two steps
+once enrolled: a correct password never mints a session by itself, it mints a short-lived pending cookie and redirects
+to `/login/2fa`, and only a correct TOTP code (or an unused recovery code) turns that into a real session, scoped to
+that one account. A stored TOTP secret the daemon cannot decrypt refuses the login with a visible error rather than
+failing silently. Losing both the authenticator and the recovery codes is an operator's job to fix, not the browser's:
+run `claude-run access reset-2fa <username>` against the daemon's database to clear that account's enrollment, and its
+next login is sent back to `/account/2fa/setup` to enroll again.
 
 **API clients: the bearer token.** Callers send `Authorization: Bearer <token>`. The value lives encrypted in the
 secrets store (resolved once at daemon startup); only its name appears in `config.toml`. `auth_token_ref` is optional
 now: when it is unset, or its secret cannot be decrypted, the reason is logged at `warn` and bearer auth is simply
-unavailable for the run, while the browser login and setup are unaffected. Where no administrator exists, the older
-pairing still signs in: `auth_username` plus the token plaintext as the password, so existing host deployments are
-unchanged.
+unavailable for the run, while the browser login and setup are unaffected. Where no account exists, the older pairing
+still signs in: `auth_username` plus the token plaintext as the password, so existing host deployments are unchanged.
 
 Run the daemon behind a TLS-terminating reverse proxy when exposed; the token is bearer credentials and must not cross
 the network in plaintext. The `/webhooks/` route keeps its own HMAC verification and is exempt from the gate, before and
@@ -1526,14 +1534,14 @@ the host, and logins still happen inside the container.
 
 **No unix-socket API.** The image runs `serve --no-socket`, so the daemon binds only the TCP listener. That socket is the CLI's control plane on a host install, and this container has no CLI operator: the web UI and its `/api` routes are the whole interface, and they carry the same handlers (`/api/actions/<n>/trigger`, `/api/pause`, `/api/resume`, `/settings/<section>`). Binding it here would only leave a second copy of that control plane with no token gate on it, reachable by the `claude` agent the daemon spawns as the same user. `claude-run trigger` and `claude-run cancel` inside the container therefore fail, naming the reason rather than claiming no daemon is running; every other subcommand (`secret set`, `action list`, `status`) works as before because it goes to the database directly. Override `command: ["serve"]` in compose if a deployment really does want the socket.
 
-**Web bind and first-run setup.** The image seeds a bootstrap `config.toml` (from `deploy/container-config.toml`) that binds `0.0.0.0:7321`, because a loopback bind inside a container is reachable from nothing outside it, published port or reverse proxy included. A non-loopback bind requires auth, and that credential is created in the browser: open the URL and the daemon serves `/setup`, which takes a username and a password and creates the administrator. No token, no key file, no CLI. The seeded `config.toml` is copied only when the config volume has none, so operator edits survive restarts and image upgrades. See "Web UI / API auth" for what setup is and is not (it is trust-on-first-use; bring the instance up behind the proxy).
+**Web bind and first-run setup.** The image seeds a bootstrap `config.toml` (from `deploy/container-config.toml`) that binds `0.0.0.0:7321`, because a loopback bind inside a container is reachable from nothing outside it, published port or reverse proxy included. A non-loopback bind requires auth, and that credential is created in the browser: open the URL and the daemon serves `/setup`, which takes a username and a password and creates the first account. No token, no key file, no CLI. Every account after that comes from an invite minted on the Accounts page, never from `/setup` again. The seeded `config.toml` is copied only when the config volume has none, so operator edits survive restarts and image upgrades. See "Web UI / API auth" for what setup is and is not (it is trust-on-first-use; bring the instance up behind the proxy).
 
-**First-run logins.** Everything is in the browser: after creating the administrator, open **Settings -> Auth**, press **Sign in with Anthropic** (or store an API key), and enter the YouTrack base URL plus token, the Forgejo host plus token, and the GitHub host plus token. No restart, and no CLI. Until the Claude credential exists the scheduler runs nothing and says so on the dashboard. Git commit identity (`user.name` / `user.email` for the commits the agent makes inside a job's clone) is on the same page: leave it unset and the daemon defaults it to `claude-run <claude-run@a8n.run>`, or type your own name and email to override it, materialized to the path `GIT_CONFIG_GLOBAL` names with no `exec` step required (CLAUDE-358). The `exec` route below remains for operators who would rather the CLIs own their own config. The daemon comes up before any login exists (a missing Claude credential is a `warn`, not a startup failure), so the container is there to exec into:
+**First-run logins.** Everything is in the browser: after creating the first account, open **Settings -> Auth**, press **Sign in with Anthropic** (or store an API key), and enter the YouTrack base URL plus token, the Forgejo host plus token, and the GitHub host plus token. No restart, and no CLI. Until the Claude credential exists the scheduler runs nothing and says so on the dashboard. Git commit identity (`user.name` / `user.email` for the commits the agent makes inside a job's clone) is on the same page: leave it unset and the daemon defaults it to `claude-run <claude-run@a8n.run>`, or type your own name and email to override it, materialized to the path `GIT_CONFIG_GLOBAL` names with no `exec` step required (CLAUDE-358). The `exec` route below remains for operators who would rather the CLIs own their own config. The daemon comes up before any login exists (a missing Claude credential is a `warn`, not a startup failure), so the container is there to exec into:
 
 ```nu
 docker compose up --detach
 
-# Create the web administrator at https://<your-host>/setup, then the tool logins:
+# Create the first web account at https://<your-host>/setup, then the tool logins:
 docker compose exec --user claudebot claude-bot claude auth login
 docker compose exec --user claudebot claude-bot yt auth login --base-url https://yt.example.com
 docker compose exec --user claudebot claude-bot fj auth add-key

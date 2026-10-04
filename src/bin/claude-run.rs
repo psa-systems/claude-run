@@ -233,12 +233,15 @@ enum AccessCmd {
         #[arg(long)]
         secret: Option<String>,
     },
-    /// Clear the web administrator's TOTP enrollment and every recovery code,
-    /// forcing re-enrollment at the next login. Rotates the session key too,
-    /// signing out any session already open. DB-direct: works with no daemon
-    /// running, which is what makes it useful for lockout recovery.
+    /// Clear a web account's TOTP enrollment and every recovery code, forcing
+    /// re-enrollment at the next login. Rotates the session key too, signing
+    /// out any session already open. DB-direct: works with no daemon running,
+    /// which is what makes it useful for lockout recovery.
     #[command(name = "reset-2fa")]
-    ResetTotp,
+    ResetTotp {
+        /// The account's username.
+        username: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1170,9 +1173,20 @@ async fn access_cmd(
     db_target: &cfg::DatabaseTarget,
 ) -> claude_run::error::Result<i32> {
     let (repo, host, project, secret) = match cmd {
-        AccessCmd::ResetTotp => {
+        AccessCmd::ResetTotp { username } => {
             let pool = db::open(db_target).await?;
-            return match claude_run::web_admin::reset_totp(&pool).await {
+            let account = match claude_run::web_admin::load_by_username(&pool, &username).await {
+                Ok(Some(a)) => a,
+                Ok(None) => {
+                    paint::error(&format!("no account named `{username}`"));
+                    return Ok(exit::CONFIG_ERROR);
+                }
+                Err(e) => {
+                    paint::error(&format!("could not look up `{username}`: {e}"));
+                    return Ok(exit::CONFIG_ERROR);
+                }
+            };
+            return match claude_run::web_admin::reset_totp(&pool, account.id).await {
                 Ok(_) => {
                     paint::success(
                         "TOTP enrollment cleared; the next login will be sent to enrollment",
@@ -1412,12 +1426,15 @@ mod tests {
         assert!(Cli::try_parse_from(["claude-run", "access", "check"]).is_ok());
     }
 
-    /// `access reset-2fa` takes no arguments; it is the DB-direct lockout
-    /// recovery path.
+    /// `access reset-2fa` takes the target account's username; it is the
+    /// DB-direct lockout recovery path.
     #[test]
     fn access_reset_2fa_parses() {
-        let cli = Cli::try_parse_from(["claude-run", "access", "reset-2fa"]).unwrap();
-        assert!(matches!(cli.cmd, Cmd::Access(AccessCmd::ResetTotp)));
+        let cli = Cli::try_parse_from(["claude-run", "access", "reset-2fa", "admin"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Access(AccessCmd::ResetTotp { username }) if username == "admin"
+        ));
     }
 
     /// `import` takes its source from `--from` (defaulting to the
