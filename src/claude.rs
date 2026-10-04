@@ -1094,21 +1094,75 @@ pub(crate) fn count_compact_boundaries(stream_log: &Path) -> std::io::Result<usi
         .count())
 }
 
-fn read_tail(p: &Path, max: usize) -> std::io::Result<String> {
-    let raw = std::fs::read_to_string(p)?;
+/// `raw.len() - max` can land inside a multi-byte UTF-8 character; advance to
+/// the next char boundary so the slice never panics. The tail then comes back
+/// up to three bytes shorter than `max`, which is the cost of staying inside
+/// `max` bytes.
+fn tail_bytes(raw: &str, max: usize) -> String {
     if raw.len() <= max {
-        Ok(raw)
+        raw.to_string()
     } else {
-        // `raw.len() - max` can land inside a multi-byte UTF-8
-        // character; advance to the next char boundary so the slice never
-        // panics. The tail then comes back up to three bytes shorter than
-        // `max`, which is the cost of staying inside `max` bytes.
         let mut start = raw.len() - max;
         while !raw.is_char_boundary(start) {
             start += 1;
         }
-        Ok(raw[start..].to_string())
+        raw[start..].to_string()
     }
+}
+
+/// Render one line per stream-log event, dropping every `thinking` /
+/// `redacted_thinking` content block so neither the thinking text nor its
+/// `signature` ever reaches the rendered line. A `tool_use` block contributes
+/// its tool name; every other surviving block type contributes nothing beyond
+/// the event's own `type`, since that is all a failure summary needs to say
+/// "what was it doing".
+fn render_sanitized_event(event: &Value) -> String {
+    let mut line = event
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let content = event
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array());
+    for block in content.into_iter().flatten() {
+        match block.get("type").and_then(|v| v.as_str()) {
+            Some("thinking") | Some("redacted_thinking") => {}
+            Some("tool_use") => {
+                if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                    line.push_str(" tool_use=");
+                    line.push_str(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    line
+}
+
+/// The sanitized replacement for a raw stream-log tail: parse each line as an
+/// NDJSON event and render it with [`render_sanitized_event`], which drops
+/// `thinking` / `redacted_thinking` content blocks (and their `signature`
+/// field) before anything reaches a comment body. A line that does not parse
+/// as JSON is kept as-is, since it is plain stderr text rather than a content
+/// block. The rendered text is capped at `max` bytes from the end, same as
+/// the raw tail it replaces.
+fn sanitized_tail(stream_log: &Path, max: usize) -> std::io::Result<String> {
+    let raw = std::fs::read_to_string(stream_log)?;
+    let mut rendered = String::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(event) => rendered.push_str(&render_sanitized_event(&event)),
+            Err(_) => rendered.push_str(line),
+        }
+        rendered.push('\n');
+    }
+    Ok(tail_bytes(&rendered, max))
 }
 
 /// Extract a short, human-readable failure summary from the stream
@@ -1118,8 +1172,10 @@ fn read_tail(p: &Path, max: usize) -> std::io::Result<String> {
 ///    e.g. `API Error: 529 Overloaded...`), falling back to its `error` string.
 /// 2. The concatenated text blocks of the last `assistant` message event, which
 ///    captures the human-readable error text when no result event ever landed.
-/// 3. The bounded 2000-byte tail of the stream log (the prior behavior).
-fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -> String {
+/// 3. The bounded 2000-byte sanitized tail of the stream log, with every
+///    `thinking` / `redacted_thinking` content block (and its `signature`)
+///    dropped before rendering.
+pub(crate) fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -> String {
     if final_event.get("type").and_then(|v| v.as_str()) == Some("result") {
         let result = final_event
             .get("result")
@@ -1145,7 +1201,7 @@ fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -> String {
         Ok(_) => {}
         Err(err) => return unreadable_log_summary(stream_log, &err),
     }
-    match read_tail(stream_log, 2000) {
+    match sanitized_tail(stream_log, 2000) {
         Ok(tail) => tail,
         Err(err) => unreadable_log_summary(stream_log, &err),
     }
@@ -2383,7 +2439,7 @@ exit "$code"
     }
 
     /// Neither a result event nor an assistant message - fall back to
-    /// the bounded raw tail.
+    /// the sanitized tail, which renders a JSON event line as its `type`.
     #[test]
     fn friendly_summary_falls_back_to_tail() {
         let dir = tempfile::tempdir().unwrap();
@@ -2391,9 +2447,46 @@ exit "$code"
         std::fs::write(&log, "{\"type\":\"system\",\"subtype\":\"init\"}\n").unwrap();
         // No result event, so the caller falls back to `Value::Null`.
         let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
+        assert_eq!(friendly_failure_summary(&final_event, &log), "system\n");
+    }
+
+    /// A `thinking` block with a `signature` never reaches the summary,
+    /// but the last tool used still does: this is the fixture from
+    /// CLAUDE-372, a run killed before any text landed.
+    #[test]
+    fn friendly_summary_tail_drops_thinking_and_signature_but_names_last_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"system\",\"subtype\":\"init\"}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"secret reasoning\",\"signature\":\"SIGXYZ\"}]}}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"1\",\"name\":\"Bash\",\"input\":{}}]}}\n",
+        )
+        .unwrap();
+        // No result event and no text content, so the caller falls back to
+        // `Value::Null` and `last_assistant_text` returns an empty string.
+        let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
+        let summary = friendly_failure_summary(&final_event, &log);
+        assert!(!summary.contains("secret reasoning"), "{summary}");
+        assert!(!summary.contains("SIGXYZ"), "{summary}");
+        assert!(!summary.contains("signature"), "{summary}");
+        assert!(
+            summary.contains("Bash"),
+            "names the last tool used, got: {summary}"
+        );
+    }
+
+    /// A non-JSON line in the tail (plain stderr text) is kept as-is.
+    #[test]
+    fn friendly_summary_tail_keeps_non_json_lines_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(&log, "panic: out of memory\n").unwrap();
+        let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
         assert_eq!(
             friendly_failure_summary(&final_event, &log),
-            "{\"type\":\"system\",\"subtype\":\"init\"}\n"
+            "panic: out of memory\n"
         );
     }
 
@@ -2402,19 +2495,22 @@ exit "$code"
     /// multi-byte character. This log is over the 2000-byte cap with a euro
     /// sign (3 bytes) straddling the cut point, so a fix that just clamped
     /// the index instead of walking to a char boundary would still panic.
+    /// The line is not valid JSON, so the sanitizer keeps it (plus its
+    /// rendered trailing newline) as-is.
     #[test]
     fn friendly_summary_tail_cut_inside_multibyte_char_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("stream.jsonl");
-        // Length 2003: the cut at len - 2000 = byte 3 falls inside the euro
-        // sign, which occupies bytes 1..4.
-        let raw = format!("a€{}", "a".repeat(1999));
-        assert_eq!(raw.len(), 2003);
+        // Length 2002, plus the sanitizer's trailing newline makes 2003: the
+        // cut at len - 2000 = byte 3 falls inside the euro sign, which
+        // occupies bytes 1..4.
+        let raw = format!("a€{}", "a".repeat(1998));
+        assert_eq!(raw.len(), 2002);
         std::fs::write(&log, &raw).unwrap();
         // No result event, so the caller falls back to `Value::Null`.
         let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
         let summary = friendly_failure_summary(&final_event, &log);
-        assert_eq!(summary, "a".repeat(1999));
+        assert_eq!(summary, format!("{}\n", "a".repeat(1998)));
     }
 
     /// A non-zero exit whose stream ends with a `result` event makes

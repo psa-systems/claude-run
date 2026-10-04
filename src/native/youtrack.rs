@@ -3273,6 +3273,35 @@ mod tests {
         assert!(!body.contains("<details>"));
     }
 
+    /// CLAUDE-372: a killed run's stream tail holds a `thinking` block with a
+    /// `signature`. `failure_comment` and `timeout_comment` render whatever
+    /// `friendly_failure_summary` produced, so neither body may carry it.
+    #[test]
+    fn failure_and_timeout_comments_never_carry_a_thinking_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"secret reasoning\",\"signature\":\"SIGXYZ\"}]}}\n",
+        )
+        .unwrap();
+        let summary = crate::claude::friendly_failure_summary(&serde_json::Value::Null, &log);
+        let mut r = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
+        r.summary = summary;
+
+        let failure_body = failure_comment(&r);
+        assert!(!failure_body.contains("signature"), "{failure_body}");
+        assert!(!failure_body.contains("secret reasoning"), "{failure_body}");
+
+        let salvage = SalvageReport {
+            nothing_to_salvage: true,
+            ..Default::default()
+        };
+        let timeout_body = timeout_comment(&r, Duration::from_secs(60), &salvage);
+        assert!(!timeout_body.contains("signature"), "{timeout_body}");
+        assert!(!timeout_body.contains("secret reasoning"), "{timeout_body}");
+    }
+
     /// A run with no `compact_boundary` event in its stream log
     /// leaves the outcome comment untouched.
     #[test]

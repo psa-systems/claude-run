@@ -3081,6 +3081,27 @@ mod tests {
         assert!(!with_hint.contains("SIGKILL"), "{with_hint}");
     }
 
+    /// CLAUDE-372: a killed run's stream tail holds a `thinking` block with a
+    /// `signature`. `outcome_comment` renders whatever `friendly_failure_summary`
+    /// produced, so the rendered body must never carry that signature.
+    #[test]
+    fn claude_failed_comment_never_carries_a_thinking_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("stream.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"secret reasoning\",\"signature\":\"SIGXYZ\"}]}}\n",
+        )
+        .unwrap();
+        let summary = crate::claude::friendly_failure_summary(&serde_json::Value::Null, &log);
+        let mut killed = ClaudeResult::synthesized("claude exited 137, see stream.jsonl", "");
+        killed.killed = true;
+        killed.summary = summary;
+        let body = outcome_comment(&Decision::ClaudeFailed, &killed, None);
+        assert!(!body.contains("signature"), "{body}");
+        assert!(!body.contains("secret reasoning"), "{body}");
+    }
+
     /// The plain-issue route's own reply bodies. Both outcomes name
     /// the minted key, so a failed queue write never reads as a lost request.
     #[test]
