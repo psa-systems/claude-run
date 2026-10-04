@@ -47,6 +47,9 @@ pub const TABLES: &[&str] = &[
     "settings",
     "web_admin",
     "web_admin_recovery_codes",
+    "web_accounts",
+    "web_account_recovery_codes",
+    "web_invites",
     "runs",
     "job_outcomes",
     "run_events",
@@ -72,6 +75,9 @@ const IDENTITY_COLUMNS: &[(&str, &str)] = &[
     ("job_outcomes", "id"),
     ("secrets", "id"),
     ("web_admin_recovery_codes", "id"),
+    ("web_accounts", "id"),
+    ("web_account_recovery_codes", "id"),
+    ("web_invites", "id"),
     ("run_events", "id"),
     ("ci_failures", "id"),
     ("ci_failure_runs", "id"),
@@ -619,6 +625,31 @@ mod tests {
         .bind("$argon2id$v=19$recoveryhash")
         .bind(None::<String>)
         .bind("2026-09-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(&q("INSERT INTO web_accounts (id, username, username_key, password_hash, session_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"))
+            .bind(1i64).bind("admin").bind("admin").bind("$argon2id$v=19$hash").bind("session-key")
+            .bind("2026-09-01T00:00:00Z").bind("2026-09-01T00:00:00Z")
+            .execute(pool).await.unwrap();
+        sqlx::query(&q(
+            "INSERT INTO web_account_recovery_codes (account_id, code_hash, used_at, created_at) VALUES (?, ?, ?, ?)",
+        ))
+        .bind(1i64)
+        .bind("$argon2id$v=19$recoveryhash")
+        .bind(None::<String>)
+        .bind("2026-09-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(&q(
+            "INSERT INTO web_invites (token_hash, created_by, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, ?)",
+        ))
+        .bind("invite-hash")
+        .bind(1i64)
+        .bind("2026-09-01T00:00:00Z")
+        .bind("2026-09-04T00:00:00Z")
+        .bind(None::<String>)
         .execute(pool)
         .await
         .unwrap();
