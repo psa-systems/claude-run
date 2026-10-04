@@ -41,6 +41,9 @@ file and the prompt disagree, the prompt wins. In outline you MAY:
   `relates to` the triggering issue, and not fixed in this run unless it blocks
   the triggering issue's acceptance criteria and lives in this repo.
 - Update, comment on, and link the issues YOU created during this run.
+- Comment on the triggering issue itself, including an early size note when you
+  expect it to be too large to finish and verify within the run's time budget.
+  The runner still posts its own outcome comment; do not duplicate it.
 
 Hard bans, lifted only where the job prompt explicitly names an exception:
 
@@ -49,8 +52,8 @@ Hard bans, lifted only where the job prompt explicitly names an exception:
   created during this run. Setting it queues an agent run, so outside that
   exception the field is the runner's alone.
 - No other write to the triggering issue: no description or summary edit, no
-  comment, no tag, no assignee change, no `set-state` / `set-field`. The runner
-  owns its outcome comment and its fields.
+  tag, no assignee change, no `set-state` / `set-field`. The runner owns its
+  outcome comment and its fields.
 - No write of any kind to an issue you did not create during this run.
 
 Never run `yt issue delete` anywhere, whatever the prompt says.

@@ -43,8 +43,10 @@
 //! goes to the project whose VCS integration binds the buggy repo (falling
 //! back to `write_projects`), linked `relates to` the triggering issue. Either
 //! way the agent may update / comment / link only the issues it created this
-//! run. `AI Agent` on any issue, and every other write to the triggering
-//! issue, stay the runner's.
+//! run. The agent may also comment on the triggering issue itself (including
+//! an early size note when it expects the issue to be too large for one run).
+//! `AI Agent` on any issue, and every other write to the triggering issue
+//! (description/summary, tags, assignee, state, fields), stay the runner's.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1123,7 +1125,8 @@ async fn process_job(
             )
         }
         Ok(()) => {
-            let prompt = build_prompt(src, job, &workdir_path, resume.as_ref());
+            let timeout_minutes = limits.claude_timeout.as_secs() / 60;
+            let prompt = build_prompt(src, job, &workdir_path, timeout_minutes, resume.as_ref());
             let stream_log =
                 ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1);
             info!(action = %action.name, key = %key, stream_log = %stream_log.display(), "invoking claude");
@@ -1791,6 +1794,8 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "Repo: {{clone_url}}",
         "Working directory: {{workdir}} - the repo is already cloned here, you are inside it.",
         "",
+        "You have {{timeout_minutes}} minutes of wall-clock time; the run is killed at that limit. Budget it: commit your work in checkpoints as you go (see step 4) so a kill still leaves committed progress, and spend the budget on targeted verification rather than repeated full runs (see step 5).",
+        "",
         "Do ONLY local engineering work on code: do NOT push and do NOT open a PR. The runner finalizes the issue after you exit: it opens the PR from your local commits and sets the AI Agent field based on the run outcome.",
         "",
         "YouTrack writes. You MAY do exactly the following, and nothing else:",
@@ -1799,20 +1804,20 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "  1. A gap, deferred item, or descoped piece of {{key}} itself: create it ONLY in these projects: {{write_projects}}, then link it with 'yt issue link <new-issue> {{key}} --type \"subtask of\"'. This is how the CLAUDE.md 'No orphan notes' rule is satisfied: the piece becomes its own tracked issue instead of a sentence in the PR body that nobody owns.",
         "  2. A bug you find that is NOT part of {{key}}, in this repo or in any other repo (for example a defect in a server repo you hit while working on the app that calls it). If it blocks {{key}}'s acceptance criteria and lives in this repo, fix it as part of {{key}}'s change and file nothing. Otherwise do NOT fix it in this run; file it. First run 'yt search' for an open issue that already reports it; if one exists, file nothing and name that issue in your final summary. Create it in the project whose VCS integration binds the repo the bug lives in: find that project with 'yt project list' and 'yt project vcs list <PROJECT>', and if no project or more than one project binds that repo, create it in {{write_projects}}. Its description states what you observed, how to reproduce it, and the file:line or command output that shows it. Then link it with 'yt issue link <new-issue> {{key}} --type \"relates to\"'. If the bug blocks {{key}}'s acceptance criteria from another repo, also take the blocker path below and name the new issue in the reason.",
         "- Update, comment on, and link ONLY the issues you created during THIS run: 'yt issue update', 'yt issue comment', 'yt issue link'.",
-        "- On the triggering issue {{key}}, the ONLY writes are the links named in the two cases above, one per issue you created. Nothing else on {{key}}.",
+        "- On the triggering issue {{key}}, you MAY comment with 'yt issue comment {{key}}' (see the size-note instruction in step 1 below), and you MAY add the links named in the two create cases above, one per issue you created. The runner still posts its own outcome comment on {{key}}; do not duplicate it.",
         "",
         "HARD BANS on YouTrack, no exceptions:",
         "- NEVER set the 'AI Agent' field on ANY issue, including issues you created yourself: no 'yt issue set-field ... \"AI Agent\" ...', and no equivalent through 'yt issue update' or 'yt issue apply'. Setting that field queues an agent run, so an agent that can set it can spawn runs. It belongs to the runner alone.",
-        "- No other write to {{key}}: no description or summary edit, no comment, no tag, no assignee change, no 'yt issue set-state', no 'yt issue set-field'. The runner owns the outcome comment and the fields on {{key}}, and its State stays In Progress until a human merges the PR.",
+        "- No other write to {{key}}: no description or summary edit, no tag, no assignee change, no 'yt issue set-state', no 'yt issue set-field'. The runner owns the outcome comment and the fields on {{key}}, and its State stays In Progress until a human merges the PR.",
         "- No write of any kind to an issue you did not create during this run.",
         "- Never run 'yt issue delete' anywhere.",
         "",
         "Steps:",
-        "1. Run 'yt issue inspect {{key}}' to read the full description and acceptance criteria.",
+        "1. Run 'yt issue inspect {{key}}' to read the full description and acceptance criteria. If you believe {{key}} is too large to finish and verify within the time budget, post one short comment on {{key}} with 'yt issue comment {{key}}' saying why and which layers you expect to be at risk, early, before you start changing code. Do not stop for this and do not use the blocker markers for this: post the comment, then continue with the work regardless. There is no size limit and no refusal; this is a paper trail for a possible timeout, not a decision point.",
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
         "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, ALSO read that PR's own comments (a prior timed-out run may have left one explaining what it salvaged and why, e.g. a draft PR opened from uncommitted work at kill time), then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
-        "4. Make the minimum change required to satisfy the acceptance criteria.",
-        "5. Run the target repo's check suite synchronously to green (e.g. the repo's 'just check', tests, or build). HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success.",
+        "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit whose body ends with the bare '#{{key}}' reference, so a kill leaves committed progress instead of none; the final commit still carries the full PR-description format from step 7 and stays the branch tip.",
+        "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (e.g. the repo's 'just check', tests, or build) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success.",
         "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
         "7. The runner uses this commit's body as the PR description (if you make more than one commit, the LAST commit carries it, since the runner reads only the branch tip); it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the literal line 'Closes', then the bare issue reference on the next line alone, with nothing after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above the 'Closes' line, never after the reference. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single 'Closes' line. NO 'State ...' command after the reference. Example of the tail:",
         "     ## Verification",
@@ -1868,10 +1873,18 @@ fn build_prompt(
     src: &YoutrackSource,
     job: &YoutrackJob,
     workdir: &Path,
+    timeout_minutes: u64,
     resume: Option<&PrResume>,
 ) -> String {
     let template = prompt_template(src);
-    render_prompt_template(&template, job, workdir, &write_projects(src, job), resume)
+    render_prompt_template(
+        &template,
+        job,
+        workdir,
+        timeout_minutes,
+        &write_projects(src, job),
+        resume,
+    )
 }
 
 /// The project list `{{write_projects}}` renders to: the configured
@@ -1897,17 +1910,20 @@ fn render_prompt_template(
     template: &str,
     job: &YoutrackJob,
     workdir: &Path,
+    timeout_minutes: u64,
     write_projects: &str,
     resume: Option<&PrResume>,
 ) -> String {
     let workdir = workdir.display().to_string();
+    let timeout_minutes = timeout_minutes.to_string();
     let existing_pr_url = resume.map(|r| r.pr_url.as_str()).unwrap_or("");
     let existing_branch = resume.map(|r| r.branch.as_str()).unwrap_or("");
-    let vars: [(&str, &str); 10] = [
+    let vars: [(&str, &str); 11] = [
         ("key", job.key.as_str()),
         ("summary", job.summary.as_str()),
         ("clone_url", job.clone_url.as_str()),
         ("workdir", workdir.as_str()),
+        ("timeout_minutes", timeout_minutes.as_str()),
         ("needs_review_marker", NEEDS_REVIEW_MARKER),
         ("skip_attempt_marker", SKIP_ATTEMPT_MARKER),
         ("no_code_marker", NO_CODE_MARKER),
@@ -2870,7 +2886,8 @@ mod tests {
     #[test]
     fn the_prompt_never_renders_an_authenticated_url() {
         let j = job();
-        let rendered = render_prompt_template("Repo: {{clone_url}}", &j, Path::new("/w"), "", None);
+        let rendered =
+            render_prompt_template("Repo: {{clone_url}}", &j, Path::new("/w"), 60, "", None);
         assert!(rendered.contains("https://dev.a8n.run/contoso/claude-run.git"));
         assert!(!rendered.contains("oauth2:"), "{rendered}");
     }
@@ -3309,13 +3326,14 @@ mod tests {
         // The built-in default renders every placeholder
         // and leaves no `{{...}}` behind, preserving the runner-creates-PR contract lines.
         let wd = std::path::Path::new("/tmp/wd");
-        let p = build_prompt(&src(), &job(), wd, None);
+        let p = build_prompt(&src(), &job(), wd, 60, None);
         assert!(p.starts_with(
             "You are working a YouTrack issue end-to-end. Follow the YouTrack and Git workflows from CLAUDE.md."
         ));
         assert!(p.contains("Issue: MK-16: Do the thing"));
         assert!(p.contains("Repo: https://dev.a8n.run/contoso/claude-run.git"));
         assert!(p.contains("Working directory: /tmp/wd - the repo is already cloned here"));
+        assert!(p.contains("You have 60 minutes of wall-clock time"));
         assert!(p.contains("yt issue inspect MK-16"));
         assert!(p.contains("Closes"));
         assert!(p.contains("#MK-16"));
@@ -3333,6 +3351,45 @@ mod tests {
         assert!(p.contains("Never run 'git checkout main'"));
     }
 
+    /// CLAUDE-377: the agent must know its wall-clock budget, checkpoint its
+    /// work with per-layer commits carrying the bare issue reference, and
+    /// follow the four test-discipline rules rather than re-running the full
+    /// suite after every change.
+    #[test]
+    fn build_prompt_default_states_time_budget_checkpoints_and_test_discipline() {
+        let p = default_youtrack_prompt();
+        assert!(
+            p.contains("{{timeout_minutes}} minutes of wall-clock time"),
+            "time-budget statement missing: {p}"
+        );
+        assert!(
+            p.contains("After each layer")
+                && p.contains("make a local commit whose body ends with the bare '#{{key}}'"),
+            "per-layer checkpoint-commit instruction missing: {p}"
+        );
+        // The four test-discipline rules.
+        assert!(
+            p.contains("run only the targeted tests for the code you just changed"),
+            "targeted-tests rule missing: {p}"
+        );
+        assert!(
+            p.contains("Run the repo's full check suite")
+                && p.contains(
+                    "exactly once, after formatting and lint are clean and the work is complete"
+                ),
+            "single full-gate-run rule missing: {p}"
+        );
+        assert!(
+            p.contains("Never re-run a long command only to read its output again")
+                && p.contains("capture it to a file outside {{workdir}} the first time"),
+            "no-rerun-to-read rule missing: {p}"
+        );
+        assert!(
+            p.contains("re-run only what failed until it is green, then run the full check suite once more"),
+            "re-run-only-what-failed rule missing: {p}"
+        );
+    }
+
     /// CLAUDE-367: an issue can be edited after pickup, so the default prompt
     /// must re-read it after the check suite goes green and before the final
     /// commit, and the closing summary must report whether anything changed.
@@ -3340,7 +3397,7 @@ mod tests {
     fn default_prompt_re_reads_the_issue_before_the_final_commit() {
         let p = default_youtrack_prompt();
         let check_suite_step = p
-            .find("Run the target repo's check suite synchronously to green")
+            .find("Run the repo's full check suite")
             .expect("check suite step present");
         let reread_step = p
             .find("Immediately before your final commit, re-run 'yt issue inspect {{key}}'")
@@ -3372,7 +3429,7 @@ mod tests {
         // placeholders substituted.
         let mut s = src();
         s.prompt = Some("Do {{key}}: {{summary}} in {{workdir}}".to_string());
-        let p = build_prompt(&s, &job(), std::path::Path::new("/tmp/wd"), None);
+        let p = build_prompt(&s, &job(), std::path::Path::new("/tmp/wd"), 60, None);
         assert_eq!(p, "Do MK-16: Do the thing in /tmp/wd");
         assert!(!p.contains("You are working a YouTrack issue"));
     }
@@ -3394,7 +3451,7 @@ mod tests {
         s.prompt = Some("Do {{key}}".to_string());
         assert_eq!(prompt_template(&s), "Do {{key}}");
         assert_eq!(
-            build_prompt(&s, &job(), std::path::Path::new("/tmp/wd"), None),
+            build_prompt(&s, &job(), std::path::Path::new("/tmp/wd"), 60, None),
             "Do MK-16"
         );
     }
@@ -3442,7 +3499,7 @@ mod tests {
         };
         let wd = std::path::Path::new("/tmp/wd");
         for r in [None, Some(&resume)] {
-            let p = build_prompt(&audit_src(), &job(), wd, r);
+            let p = build_prompt(&audit_src(), &job(), wd, 60, r);
             assert!(!p.contains("{{"), "unresolved placeholder:\n{p}");
             assert!(p.contains("Issue: MK-16: Do the thing"), "{p}");
             assert!(
@@ -3454,7 +3511,7 @@ mod tests {
             assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"), "{p}");
             assert!(p.contains("#MK-16"), "{p}");
         }
-        let resumed = build_prompt(&audit_src(), &job(), wd, Some(&resume));
+        let resumed = build_prompt(&audit_src(), &job(), wd, 60, Some(&resume));
         assert!(resumed.contains("audit/pms-ui-2026-09-14"), "{resumed}");
         assert!(
             resumed.contains("https://dev.a8n.run/contoso/audits/pulls/9"),
@@ -3486,11 +3543,11 @@ mod tests {
 
     #[test]
     fn render_substitutes_all_documented_placeholders() {
-        let t = "{{key}}|{{summary}}|{{clone_url}}|{{workdir}}|{{needs_review_marker}}|{{skip_attempt_marker}}|{{no_code_marker}}|{{write_projects}}|{{existing_pr_url}}|{{existing_branch}}";
-        let p = render_prompt_template(t, &job(), std::path::Path::new("/wd"), "MK", None);
+        let t = "{{key}}|{{summary}}|{{clone_url}}|{{workdir}}|{{timeout_minutes}}|{{needs_review_marker}}|{{skip_attempt_marker}}|{{no_code_marker}}|{{write_projects}}|{{existing_pr_url}}|{{existing_branch}}";
+        let p = render_prompt_template(t, &job(), std::path::Path::new("/wd"), 60, "MK", None);
         assert_eq!(
             p,
-            "MK-16|Do the thing|https://dev.a8n.run/contoso/claude-run.git|/wd|.claude-run-needs-review|.claude-run-skip-attempt|.claude-run-no-code-change|MK||"
+            "MK-16|Do the thing|https://dev.a8n.run/contoso/claude-run.git|/wd|60|.claude-run-needs-review|.claude-run-skip-attempt|.claude-run-no-code-change|MK||"
         );
     }
 
@@ -3503,7 +3560,14 @@ mod tests {
             branch: "fix/CLAUDE-275".into(),
             pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
         };
-        let p = render_prompt_template(t, &job(), std::path::Path::new("/wd"), "MK", Some(&resume));
+        let p = render_prompt_template(
+            t,
+            &job(),
+            std::path::Path::new("/wd"),
+            60,
+            "MK",
+            Some(&resume),
+        );
         assert_eq!(
             p,
             "https://dev.a8n.run/contoso/claude-run/pulls/7|fix/CLAUDE-275"
@@ -3518,6 +3582,7 @@ mod tests {
             "{{key}} {{bogus}} {{oops",
             &job(),
             std::path::Path::new("/wd"),
+            60,
             "MK",
             None,
         );
@@ -3544,7 +3609,7 @@ mod tests {
     #[test]
     fn build_prompt_default_permits_bounded_tracker_writes() {
         let wd = std::path::Path::new("/tmp/wd");
-        let p = build_prompt(&src(), &job(), wd, None);
+        let p = build_prompt(&src(), &job(), wd, 60, None);
 
         // Permitted: read across projects, create, then update/comment/link what
         // this run created.
@@ -3561,9 +3626,24 @@ mod tests {
             p.contains("create it ONLY in these projects: MK,"),
             "create scope must render the project list: {p}"
         );
-        // The single permitted write to the triggering issue.
+        // The single permitted link write to the triggering issue.
         assert!(
             p.contains("yt issue link <new-issue> MK-16 --type \"subtask of\""),
+            "{p}"
+        );
+        // The triggering issue may now also be commented on.
+        assert!(
+            p.contains(
+                "you MAY comment with 'yt issue comment {{key}}'"
+                    .replace("{{key}}", "MK-16")
+                    .as_str()
+            ),
+            "the comment permission on the triggering issue must be present: {p}"
+        );
+        assert!(
+            p.contains(
+                "The runner still posts its own outcome comment on MK-16; do not duplicate it"
+            ),
             "{p}"
         );
 
@@ -3573,6 +3653,10 @@ mod tests {
             "the AI Agent ban must be present verbatim: {p}"
         );
         assert!(p.contains("No other write to MK-16"), "{p}");
+        assert!(
+            !p.contains("No other write to MK-16: no description or summary edit, no comment,"),
+            "comment must no longer be listed among the bans on the triggering issue: {p}"
+        );
         assert!(
             p.contains("No write of any kind to an issue you did not create during this run"),
             "{p}"
@@ -3588,11 +3672,32 @@ mod tests {
         );
     }
 
+    /// The prompt tells the agent to post an early size note on the triggering
+    /// issue when it expects the issue to be too large, and to keep working
+    /// rather than stopping or using the blocker markers.
+    #[test]
+    fn build_prompt_default_documents_the_size_note() {
+        let p = build_prompt(&src(), &job(), std::path::Path::new("/tmp/wd"), 60, None);
+        assert!(
+            p.contains("too large to finish and verify within the time budget"),
+            "{p}"
+        );
+        assert!(
+            p.contains("post one short comment on MK-16 with 'yt issue comment MK-16'"),
+            "{p}"
+        );
+        assert!(
+            p.contains("Do not stop for this and do not use the blocker markers for this"),
+            "{p}"
+        );
+        assert!(p.contains("There is no size limit and no refusal"), "{p}");
+    }
+
     /// The no-code path is advertised in the prompt, with the marker
     /// path rendered, and is fenced off from the blocker path.
     #[test]
     fn build_prompt_default_documents_the_no_code_path() {
-        let p = build_prompt(&src(), &job(), std::path::Path::new("/tmp/wd"), None);
+        let p = build_prompt(&src(), &job(), std::path::Path::new("/tmp/wd"), 60, None);
         assert!(p.contains("/tmp/wd/.claude-run-no-code-change"), "{p}");
         assert!(
             p.contains("NEVER an escape hatch for a code task you could not finish"),
