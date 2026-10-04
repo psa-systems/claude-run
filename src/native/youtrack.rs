@@ -1680,11 +1680,13 @@ fn run_pre(
     Ok(())
 }
 
-/// Install the repo's git pre-commit hook on a fresh clone so a
-/// commit that fails the repo's local checks is blocked locally instead of only
+/// Install the repo's git hooks on a fresh clone so a
+/// commit or push that fails the repo's local checks is blocked locally instead of only
 /// being caught by CI (the gap that produced A8N-69). Detects a `just
 /// install-hooks` recipe and, when present, runs it; the recipe is idempotent
-/// (it rewrites `.git/hooks/pre-commit`), so running it on every clone is safe.
+/// (it rewrites `.git/hooks/pre-commit` and, under the shared task runner's
+/// default `hook_layout`, `.git/hooks/pre-push` too), so running it on every
+/// clone is safe.
 ///
 /// Non-fatal by contract: this is an additional local backstop, not a hard
 /// gate. A repo with no `install-hooks` recipe, or a host without `just`, is

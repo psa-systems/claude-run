@@ -12,13 +12,16 @@
 #     the exported binary name (binary_name defaults to app, which is correct
 #     here: package.name == binary == claude-run).
 #   - pre_commit_mode = "docker" + dev_image: claude-run has no compose.dev.yml
-#     (daemon plus CLI, not a web service), so `just pre-commit` runs the checks
-#     in the rust-builder-musl image via `docker run`, not a compose service.
-#   - test_args = "": run the full suite. The unit tests live in src/** behind
+#     (daemon plus CLI, not a web service), so `pre-commit` and `pre-push` run
+#     their checks in the rust-builder-musl image via `docker run`, not a
+#     compose service. `hook_layout` stays at common's default `"pre-push"`:
+#     `pre-commit` runs a fmt-only check and `pre-push` runs the full suite.
+#   - test_args = "": run the full suite (in `pre-push`, not `pre-commit`,
+#     under the default hook_layout). The unit tests live in src/** behind
 #     `mod tests` on the library target, which common's default `--bins` skips.
 #   - dockerfile defaults to oci-build/Dockerfile, which is where it lives here.
 #
-# Inherited from common/common.just: install-hooks, pre-commit
+# Inherited from common/common.just: install-hooks, pre-commit, pre-push
 # (+ -compose / -docker), check-fmt, check-clippy, check-build, check-docker,
 # fmt, lint, typecheck, build, test, build-docker, build-docker-export,
 # dev-clean, dev-clean-all, create-release (+ -generic / -workspace). Cargo.toml
@@ -50,14 +53,15 @@ import 'common/common.just'
 # inherited recipes. Overrides common's placeholder default.
 app := "claude-run"
 
-# No compose.dev.yml: run the pre-commit checks in the builder image via
-# `docker run`. Tracks the rust-builder-musl tag baked into oci-build/Dockerfile
-# so the local toolchain matches CI.
+# No compose.dev.yml: run the pre-commit/pre-push checks in the builder image
+# via `docker run`. Tracks the rust-builder-musl tag baked into
+# oci-build/Dockerfile so the local toolchain matches CI.
 pre_commit_mode := "docker"
 dev_image := "dev.a8n.run/pandoras-box/rust-builder-musl:v1.2.0-rust1.98.1-alpine"
 
-# Run the full test suite in pre-commit: the unit tests are library-target
-# tests in src/**, which common's default `--bins` would skip.
+# Run the full test suite (in pre-push under the default hook_layout): the
+# unit tests are library-target tests in src/**, which common's default
+# `--bins` would skip.
 test_args := ""
 
 # -- Default (override) -------------------------------------------------------
