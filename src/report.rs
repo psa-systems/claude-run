@@ -739,7 +739,12 @@ mod tests {
               seven_day_utilization, seven_day_resets_at, max_five_hour_utilization, \
               max_seven_day_utilization, overage_status, is_using_overage, api_retries_json, \
               stream_log_path) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (\
+               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+               CAST(? AS DOUBLE PRECISION), ?, \
+               CAST(? AS DOUBLE PRECISION), ?, \
+               CAST(? AS DOUBLE PRECISION), CAST(? AS DOUBLE PRECISION), \
+               ?, ?, ?, ?)",
         ))
         .bind(ts)
         .bind(action)
