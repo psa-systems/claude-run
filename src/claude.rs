@@ -1094,75 +1094,62 @@ pub(crate) fn count_compact_boundaries(stream_log: &Path) -> std::io::Result<usi
         .count())
 }
 
-/// `raw.len() - max` can land inside a multi-byte UTF-8 character; advance to
-/// the next char boundary so the slice never panics. The tail then comes back
-/// up to three bytes shorter than `max`, which is the cost of staying inside
-/// `max` bytes.
-fn tail_bytes(raw: &str, max: usize) -> String {
-    if raw.len() <= max {
-        raw.to_string()
-    } else {
-        let mut start = raw.len() - max;
-        while !raw.is_char_boundary(start) {
-            start += 1;
-        }
-        raw[start..].to_string()
-    }
-}
-
-/// Render one line per stream-log event, dropping every `thinking` /
-/// `redacted_thinking` content block so neither the thinking text nor its
-/// `signature` ever reaches the rendered line. A `tool_use` block contributes
-/// its tool name; every other surviving block type contributes nothing beyond
-/// the event's own `type`, since that is all a failure summary needs to say
-/// "what was it doing".
-fn render_sanitized_event(event: &Value) -> String {
-    let mut line = event
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?")
-        .to_string();
-    let content = event
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array());
-    for block in content.into_iter().flatten() {
-        match block.get("type").and_then(|v| v.as_str()) {
-            Some("thinking") | Some("redacted_thinking") => {}
-            Some("tool_use") => {
-                if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
-                    line.push_str(" tool_use=");
-                    line.push_str(name);
-                }
-            }
-            _ => {}
-        }
-    }
-    line
-}
-
-/// The sanitized replacement for a raw stream-log tail: parse each line as an
-/// NDJSON event and render it with [`render_sanitized_event`], which drops
-/// `thinking` / `redacted_thinking` content blocks (and their `signature`
-/// field) before anything reaches a comment body. A line that does not parse
-/// as JSON is kept as-is, since it is plain stderr text rather than a content
-/// block. The rendered text is capped at `max` bytes from the end, same as
-/// the raw tail it replaces.
-fn sanitized_tail(stream_log: &Path, max: usize) -> std::io::Result<String> {
+/// Scan every `assistant` event in the stream log, counting how many there
+/// are and remembering the name of the last `tool_use` block seen across all
+/// of them. This is the fallback summary's only source of "what was it
+/// doing" once there is neither a terminal `result` nor any assistant text:
+/// unlike the event-type dump it replaced, it never reaches into content
+/// blocks beyond `tool_use`'s own `name`, so a `thinking` block's text and
+/// `signature` can never reach a comment body.
+fn assistant_turn_stats(stream_log: &Path) -> std::io::Result<(usize, Option<String>)> {
     let raw = std::fs::read_to_string(stream_log)?;
-    let mut rendered = String::new();
+    let mut turns = 0usize;
+    let mut last_tool = None;
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        match serde_json::from_str::<Value>(line) {
-            Ok(event) => rendered.push_str(&render_sanitized_event(&event)),
-            Err(_) => rendered.push_str(line),
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
         }
-        rendered.push('\n');
+        turns += 1;
+        let content = event
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array());
+        for block in content.into_iter().flatten() {
+            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                    last_tool = Some(name.to_string());
+                }
+            }
+        }
     }
-    Ok(tail_bytes(&rendered, max))
+    Ok((turns, last_tool))
+}
+
+/// The summary for a run that produced no terminal `result` and no
+/// assistant text: a plain sentence naming the facts the stream log does
+/// support (how many assistant turns ran, the last tool used, if any) and
+/// the log path, rather than a line-per-event dump of bare `assistant` /
+/// `user` / `system` / `tool_use=` entries that reads like an actor's turn
+/// log and tells a human nothing.
+fn no_final_message_summary(turns: usize, last_tool: Option<&str>, stream_log: &Path) -> String {
+    let tool_note = match last_tool {
+        Some(name) => format!(" The last tool used was `{name}`."),
+        None => String::new(),
+    };
+    let turn_word = if turns == 1 { "turn" } else { "turns" };
+    format!(
+        "The run produced no final message: no terminal result event and no assistant text \
+         were found in the stream log. {turns} assistant {turn_word} were recorded.{tool_note} \
+         See {} for the full stream log.",
+        stream_log.display()
+    )
 }
 
 /// Extract a short, human-readable failure summary from the stream
@@ -1172,9 +1159,9 @@ fn sanitized_tail(stream_log: &Path, max: usize) -> std::io::Result<String> {
 ///    e.g. `API Error: 529 Overloaded...`), falling back to its `error` string.
 /// 2. The concatenated text blocks of the last `assistant` message event, which
 ///    captures the human-readable error text when no result event ever landed.
-/// 3. The bounded 2000-byte sanitized tail of the stream log, with every
-///    `thinking` / `redacted_thinking` content block (and its `signature`)
-///    dropped before rendering.
+/// 3. A plain sentence stating that the run produced no final message, with
+///    the facts the stream log does support: the number of assistant turns,
+///    the last tool name used, and the stream log path.
 pub(crate) fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -> String {
     if final_event.get("type").and_then(|v| v.as_str()) == Some("result") {
         let result = final_event
@@ -1201,8 +1188,8 @@ pub(crate) fn friendly_failure_summary(final_event: &Value, stream_log: &Path) -
         Ok(_) => {}
         Err(err) => return unreadable_log_summary(stream_log, &err),
     }
-    match sanitized_tail(stream_log, 2000) {
-        Ok(tail) => tail,
+    match assistant_turn_stats(stream_log) {
+        Ok((turns, last_tool)) => no_final_message_summary(turns, last_tool.as_deref(), stream_log),
         Err(err) => unreadable_log_summary(stream_log, &err),
     }
 }
@@ -2438,23 +2425,31 @@ exit "$code"
         );
     }
 
-    /// Neither a result event nor an assistant message - fall back to
-    /// the sanitized tail, which renders a JSON event line as its `type`.
+    /// Neither a result event nor an assistant message - fall back to the
+    /// plain no-final-message sentence, not a dump of bare event-type lines.
     #[test]
-    fn friendly_summary_falls_back_to_tail() {
+    fn friendly_summary_falls_back_to_no_final_message() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("stream.jsonl");
         std::fs::write(&log, "{\"type\":\"system\",\"subtype\":\"init\"}\n").unwrap();
         // No result event, so the caller falls back to `Value::Null`.
         let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
-        assert_eq!(friendly_failure_summary(&final_event, &log), "system\n");
+        let summary = friendly_failure_summary(&final_event, &log);
+        assert!(
+            summary.contains("no final message") && summary.contains("stream.jsonl"),
+            "states no final message and names the log path, got: {summary}"
+        );
+        assert!(
+            !summary.split_whitespace().any(|w| w == "system"),
+            "no bare event-type line, got: {summary}"
+        );
     }
 
     /// A `thinking` block with a `signature` never reaches the summary,
     /// but the last tool used still does: this is the fixture from
     /// CLAUDE-372, a run killed before any text landed.
     #[test]
-    fn friendly_summary_tail_drops_thinking_and_signature_but_names_last_tool() {
+    fn friendly_summary_no_final_message_drops_thinking_and_signature_but_names_last_tool() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("stream.jsonl");
         std::fs::write(
@@ -2475,42 +2470,27 @@ exit "$code"
             summary.contains("Bash"),
             "names the last tool used, got: {summary}"
         );
+        assert!(
+            summary.contains("no final message"),
+            "states no final message, got: {summary}"
+        );
     }
 
-    /// A non-JSON line in the tail (plain stderr text) is kept as-is.
+    /// A log with only non-JSON lines (plain stderr text, e.g. a crash
+    /// before any event was ever written) still produces the plain sentence
+    /// rather than panicking or dumping the raw text.
     #[test]
-    fn friendly_summary_tail_keeps_non_json_lines_as_is() {
+    fn friendly_summary_no_final_message_on_non_json_log() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("stream.jsonl");
         std::fs::write(&log, "panic: out of memory\n").unwrap();
         let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
-        assert_eq!(
-            friendly_failure_summary(&final_event, &log),
-            "panic: out of memory\n"
-        );
-    }
-
-    /// The tail fallback used to slice the raw log at a fixed byte
-    /// offset from the end, which panics when that offset lands inside a
-    /// multi-byte character. This log is over the 2000-byte cap with a euro
-    /// sign (3 bytes) straddling the cut point, so a fix that just clamped
-    /// the index instead of walking to a char boundary would still panic.
-    /// The line is not valid JSON, so the sanitizer keeps it (plus its
-    /// rendered trailing newline) as-is.
-    #[test]
-    fn friendly_summary_tail_cut_inside_multibyte_char_does_not_panic() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("stream.jsonl");
-        // Length 2002, plus the sanitizer's trailing newline makes 2003: the
-        // cut at len - 2000 = byte 3 falls inside the euro sign, which
-        // occupies bytes 1..4.
-        let raw = format!("a€{}", "a".repeat(1998));
-        assert_eq!(raw.len(), 2002);
-        std::fs::write(&log, &raw).unwrap();
-        // No result event, so the caller falls back to `Value::Null`.
-        let final_event = parse_final_result(&log).unwrap().unwrap_or(Value::Null);
         let summary = friendly_failure_summary(&final_event, &log);
-        assert_eq!(summary, format!("{}\n", "a".repeat(1998)));
+        assert!(
+            summary.contains("no final message") && summary.contains("stream.jsonl"),
+            "got: {summary}"
+        );
+        assert!(summary.contains("0 assistant turns"), "got: {summary}");
     }
 
     /// A non-zero exit whose stream ends with a `result` event makes
