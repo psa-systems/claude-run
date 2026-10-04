@@ -89,6 +89,19 @@ impl Daemon {
         let effective = crate::settings::effective(&pool, &self.on_disk).await?;
         let replay_window_secs = effective.webhook.replay_window_secs;
 
+        // CLAUDE-347: a webhook source missing a required credential
+        // reference (its HMAC `secret_ref` or its comment-path
+        // `write_token_ref`) used to start up clean and only fail the first
+        // time the comment backend needed the missing token. Enforce the
+        // same check `/settings` applies on save here too, so a config that
+        // reached this state some other way (a direct DB edit, an upgrade)
+        // refuses to start, naming the source and the missing field, rather
+        // than serving requests it cannot act on.
+        crate::settings::validate_webhook(&effective.webhook)
+            .map_err(|e| anyhow::anyhow!("config.webhook: {e}"))?;
+        crate::settings::validate_comment_webhook(&effective.webhook_comment)
+            .map_err(|e| anyhow::anyhow!("config.webhook_comment: {e}"))?;
+
         // CLAUDE-360: an `enabled`-unset (defaulted `false`) section with
         // pre-existing sources is the upgrade-time transition this flag adds -
         // surface it loudly rather than letting the listener go quiet with no
