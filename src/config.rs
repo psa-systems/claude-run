@@ -349,10 +349,11 @@ pub struct WebhookSource {
     /// PAT that authorizes commenting on this source's pull requests
     /// (routing a CI failure on an open PR back to its issue, or onto the
     /// human author's PR). Reaches `fj` the same way `log_token_ref` does: a
-    /// temp single-host `keys.json` carrying only this one secret. Unset, a
-    /// failure that needs a PR comment logs at `error`, writes a `run_events`
-    /// row naming this source, and fails the run rather than posting nothing
-    /// silently.
+    /// temp single-host `keys.json` carrying only this one secret. CLAUDE-347:
+    /// required on every source of an `enabled` listener, same as
+    /// `secret_ref` - unset fails `/settings` save and `serve` startup,
+    /// naming this source, rather than only surfacing when the comment
+    /// backend needs it and cannot find it.
     pub write_token_ref: Option<String>,
     /// The forge sending this source's deliveries, and the `:provider` URL
     /// path segment (`/webhooks/<provider>/triage/<source>`) the request
@@ -473,7 +474,10 @@ pub struct CommentWebhookSource {
     /// Name of the secret holding a PAT with WRITE scope. It authorizes
     /// the commenter's permission read, the PR replies, and the branch push, and
     /// reaches `fj` in a temp single-host `keys.json` carrying that one secret.
-    /// Unset means no command can be served (every delivery is refused).
+    /// CLAUDE-347: required on every source of an `enabled` listener, same as
+    /// `secret_ref` - unset fails `/settings` save and `serve` startup,
+    /// naming this source, rather than discovering it when a delivery is
+    /// refused.
     pub write_token_ref: Option<String>,
     /// Repository permissions that may run a command. A Forgejo access level (read, write,
     /// admin, owner) also admits every higher level; any other value matches exactly.
@@ -1329,6 +1333,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("secret"));
+    }
+
+    /// CLAUDE-347: a source whose `provider` names a forge we do not support
+    /// is an "unknown source type" from the webhook config's point of view -
+    /// closed-enum deserialization catches it at config load, naming the
+    /// unrecognized value, rather than letting it default to a provider the
+    /// operator did not configure.
+    #[test]
+    fn unknown_provider_value_fails_to_parse() {
+        let err = toml::from_str::<OnDiskConfig>(
+            r#"
+            [webhook.sources.contoso]
+            secret_ref = "x"
+            provider = "bitbucket"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bitbucket"), "{err}");
     }
 
     // ---- Comment webhook section is DB-only --------------------
