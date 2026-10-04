@@ -342,7 +342,9 @@ impl GithubForge {
         }
     }
 
-    /// Open the PR via the MCP `create_pull_request` tool.
+    /// Open the PR via the MCP `create_pull_request` tool. `draft` sets the
+    /// real GitHub draft flag (CLAUDE-379 timeout salvage), not a title
+    /// convention.
     fn open_via_mcp(
         &self,
         repo: &str,
@@ -350,6 +352,7 @@ impl GithubForge {
         base: &str,
         title: &str,
         body: &str,
+        draft: bool,
     ) -> Result<PullRequest> {
         let (owner, name) = split_repo(repo)?;
         let result = self.transport.call_tool(
@@ -363,6 +366,7 @@ impl GithubForge {
                 "head": branch,
                 "base": base,
                 "body": body,
+                "draft": draft,
             }),
         )?;
         parse_pr_from_mcp(&result)
@@ -399,7 +403,8 @@ impl GithubForge {
         Ok(())
     }
 
-    /// Open the PR via `gh pr create`, parsing the printed PR URL.
+    /// Open the PR via `gh pr create`, parsing the printed PR URL. `draft`
+    /// passes the real `--draft` flag (CLAUDE-379 timeout salvage).
     fn open_via_gh(
         &self,
         workdir: &Path,
@@ -407,14 +412,18 @@ impl GithubForge {
         base: &str,
         title: &str,
         body: &str,
+        draft: bool,
     ) -> Result<PullRequest> {
         let envs: Vec<(&str, &str)> = match &self.token {
             Some(t) => vec![("GH_TOKEN", t.as_str())],
             None => Vec::new(),
         };
-        let args = [
+        let mut args = vec![
             "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
         ];
+        if draft {
+            args.push("--draft");
+        }
         let out = self
             .runner
             .run_in_env(Some(workdir), &self.gh, &args, &envs)?;
@@ -428,15 +437,9 @@ impl GithubForge {
         }
         Ok(parse_pr_from_gh(&out.stdout))
     }
-}
 
-impl Forge for GithubForge {
-    fn create_pr(
-        &self,
-        workdir: &Path,
-        host: &str,
-        _strategy: crate::action::PrStrategy,
-    ) -> Result<PullRequest> {
+    /// Shared body for [`Forge::create_pr`] / [`Forge::create_pr_with_draft`].
+    fn create_pr_impl(&self, workdir: &Path, host: &str, draft: bool) -> Result<PullRequest> {
         // GitHub has no AGit equivalent: PRs are always branch-backed, so the
         // branch-strategy selector does not apply here and is ignored.
         // Push the branch before opening the PR.
@@ -468,7 +471,7 @@ impl Forge for GithubForge {
                         // proves nothing about the API identity's access.
                         Ok(()) => {
                             return self
-                                .open_via_mcp(&repo, &branch, &base, &title, &body)
+                                .open_via_mcp(&repo, &branch, &base, &title, &body, draft)
                                 .map(|mut pr| {
                                     // GitHub PRs are always branch-backed;
                                     // this is the branch just pushed above.
@@ -483,7 +486,7 @@ impl Forge for GithubForge {
                 BackendKind::Gh => match self.runner.run(&self.gh, &["--version"]) {
                     Ok(out) if out.ok => {
                         return self
-                            .open_via_gh(workdir, &branch, &base, &title, &body)
+                            .open_via_gh(workdir, &branch, &base, &title, &body, draft)
                             .map(|mut pr| {
                                 pr.head_branch = Some(branch.clone());
                                 pr
@@ -497,6 +500,53 @@ impl Forge for GithubForge {
             }
         }
         Err(Error::NoBackend(tried.join("; ")))
+    }
+}
+
+impl Forge for GithubForge {
+    fn create_pr(
+        &self,
+        workdir: &Path,
+        host: &str,
+        _strategy: crate::action::PrStrategy,
+    ) -> Result<PullRequest> {
+        self.create_pr_impl(workdir, host, false)
+    }
+
+    /// `draft` sets GitHub's real draft flag (CLAUDE-379 timeout salvage);
+    /// `_strategy` is ignored for the same reason [`Self::create_pr`] ignores
+    /// it (GitHub PRs are always branch-backed).
+    fn create_pr_with_draft(
+        &self,
+        workdir: &Path,
+        host: &str,
+        _strategy: crate::action::PrStrategy,
+        draft: bool,
+    ) -> Result<PullRequest> {
+        self.create_pr_impl(workdir, host, draft)
+    }
+
+    /// `gh pr ready <number> --repo <repo>` clears the draft flag a
+    /// timeout-salvaged PR (CLAUDE-379) opened with, when a re-queued run
+    /// resumes onto it and now succeeds. A no-op (exit 0, "is already ready
+    /// for review") on a PR that was never a draft.
+    fn mark_pr_ready(&self, _host: &str, repo: &str, pr_number: u64) -> Result<()> {
+        let envs: Vec<(&str, &str)> = match &self.token {
+            Some(t) => vec![("GH_TOKEN", t.as_str())],
+            None => Vec::new(),
+        };
+        let number_str = pr_number.to_string();
+        let args = ["pr", "ready", &number_str, "--repo", repo];
+        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        if !out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: args.join(" "),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn clone_url(&self, host: &str, repo: &str) -> Result<String> {
