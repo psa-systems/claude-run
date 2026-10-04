@@ -54,7 +54,7 @@ app := "claude-run"
 # `docker run`. Tracks the rust-builder-musl tag baked into oci-build/Dockerfile
 # so the local toolchain matches CI.
 pre_commit_mode := "docker"
-dev_image := "dev.a8n.run/pandoras-box/rust-builder-musl:v1.1.0-rust1.98.1-alpine"
+dev_image := "dev.a8n.run/pandoras-box/rust-builder-musl:v1.2.0-rust1.98.1-alpine"
 
 # Run the full test suite in pre-commit: the unit tests are library-target
 # tests in src/**, which common's default `--bins` would skip.
