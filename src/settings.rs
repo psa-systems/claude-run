@@ -935,7 +935,11 @@ fn comment_rate_map(cfg: &CommentWebhookConfig) -> HashMap<String, Mutex<RateLim
 /// CLAUDE-360: `enabled: true` is rejected unless every configured source
 /// carries a `secret_ref`, and at least one source is configured, so
 /// "enabled" can never mean "accepting requests with no real authentication
-/// configured behind it."
+/// configured behind it." CLAUDE-347: the same rejection applies to
+/// `write_token_ref`, so a source missing the PAT the comment path needs is
+/// caught here, at startup, naming the source and the field, instead of only
+/// surfacing when [`crate::web::webhooks::build_pr_comment_backend`] (or its
+/// `comment_webhooks.rs` counterpart) tries to use it and fails the run.
 pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> {
     if cfg.analysis_concurrency < 1 {
         return Err("analysis_concurrency must be >= 1".to_string());
@@ -953,44 +957,76 @@ pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> 
 }
 
 /// Shared by [`validate_webhook`] and [`validate_comment_webhook`]: a listener
-/// being enabled requires at least one source and every source to carry a
-/// `secret_ref`, naming every offending source key in one error.
+/// being enabled requires at least one source and every source to carry both
+/// `secret_ref` (CLAUDE-360) and `write_token_ref` (CLAUDE-347), naming every
+/// offending source key and its missing field(s) in one error. This is a
+/// presence check only: it tells a missing reference from a configured one,
+/// but not a configured one from an unauthorized token, since the scopes on a
+/// resolved token are only discoverable by calling the forge, which happens at
+/// request time (see the 401/403 handling in `provider/cli.rs` and
+/// `provider/github.rs`) and not here.
 fn validate_enabled_sources<S>(sources: &BTreeMap<String, S>) -> std::result::Result<(), String>
 where
-    S: HasSecretRef,
+    S: RequiredRefs,
 {
     if sources.is_empty() {
         return Err("enabled requires at least one configured source".to_string());
     }
-    let missing: Vec<&str> = sources
-        .iter()
-        .filter(|(_, s)| s.secret_ref().is_none())
-        .map(|(name, _)| name.as_str())
-        .collect();
-    if !missing.is_empty() {
+    let mut problems: Vec<String> = Vec::new();
+    for (name, source) in sources {
+        let missing = source.missing_refs();
+        if !missing.is_empty() {
+            problems.push(format!("{name} (missing {})", missing.join(", ")));
+        }
+    }
+    if !problems.is_empty() {
         return Err(format!(
-            "enabled requires secret_ref on every source; missing on: {}",
-            missing.join(", ")
+            "enabled requires secret_ref and write_token_ref on every source: {}",
+            problems.join("; ")
         ));
     }
     Ok(())
 }
 
-/// Lets [`validate_enabled_sources`] read `secret_ref` off either source type
-/// with no duplicated body.
-trait HasSecretRef {
+/// Lets [`validate_enabled_sources`] read the required credential references
+/// off either source type with no duplicated body. CLAUDE-347: declares the
+/// required-reference set per webhook source type in one place, so a type
+/// added later that forgets to implement this trait fails to compile rather
+/// than silently skipping validation.
+trait RequiredRefs {
     fn secret_ref(&self) -> Option<&String>;
-}
+    fn write_token_ref(&self) -> Option<&String>;
 
-impl HasSecretRef for WebhookSource {
-    fn secret_ref(&self) -> Option<&String> {
-        self.secret_ref.as_ref()
+    /// Names of the required references that are unset, in declaration order.
+    fn missing_refs(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.secret_ref().is_none() {
+            missing.push("secret_ref");
+        }
+        if self.write_token_ref().is_none() {
+            missing.push("write_token_ref");
+        }
+        missing
     }
 }
 
-impl HasSecretRef for CommentWebhookSource {
+impl RequiredRefs for WebhookSource {
     fn secret_ref(&self) -> Option<&String> {
         self.secret_ref.as_ref()
+    }
+
+    fn write_token_ref(&self) -> Option<&String> {
+        self.write_token_ref.as_ref()
+    }
+}
+
+impl RequiredRefs for CommentWebhookSource {
+    fn secret_ref(&self) -> Option<&String> {
+        self.secret_ref.as_ref()
+    }
+
+    fn write_token_ref(&self) -> Option<&String> {
+        self.write_token_ref.as_ref()
     }
 }
 
@@ -1890,15 +1926,39 @@ mod tests {
             "no-secret".to_string(),
             WebhookSource {
                 secret_ref: None,
+                write_token_ref: Some("pat-ok".to_string()),
                 ..WebhookSource::default()
             },
         );
         let err = validate_webhook(&cfg).unwrap_err();
         assert!(err.contains("no-secret"), "{err}");
+        assert!(err.contains("secret_ref"), "{err}");
+    }
+
+    /// CLAUDE-347: this is the exact gap the issue reports - a source with an
+    /// HMAC secret but no comment-path PAT used to start up clean and only
+    /// fail the first time the comment backend needed `write_token_ref`.
+    #[test]
+    fn webhook_enabled_with_a_source_missing_write_token_ref_is_rejected() {
+        let mut cfg = WebhookConfig {
+            enabled: true,
+            ..WebhookConfig::default()
+        };
+        cfg.sources.insert(
+            "no-write-token".to_string(),
+            WebhookSource {
+                secret_ref: Some("hmac-ok".to_string()),
+                write_token_ref: None,
+                ..WebhookSource::default()
+            },
+        );
+        let err = validate_webhook(&cfg).unwrap_err();
+        assert!(err.contains("no-write-token"), "{err}");
+        assert!(err.contains("missing write_token_ref"), "{err}");
     }
 
     #[test]
-    fn webhook_enabled_with_every_source_secret_backed_is_accepted() {
+    fn webhook_enabled_with_every_source_fully_configured_is_accepted() {
         let mut cfg = WebhookConfig {
             enabled: true,
             ..WebhookConfig::default()
@@ -1907,6 +1967,7 @@ mod tests {
             "ok".to_string(),
             WebhookSource {
                 secret_ref: Some("hmac-ok".to_string()),
+                write_token_ref: Some("pat-ok".to_string()),
                 ..WebhookSource::default()
             },
         );
@@ -1938,11 +1999,53 @@ mod tests {
             "no-secret".to_string(),
             CommentWebhookSource {
                 secret_ref: None,
+                write_token_ref: Some("pat-ok".to_string()),
                 ..CommentWebhookSource::default()
             },
         );
         let err = validate_comment_webhook(&cfg).unwrap_err();
         assert!(err.contains("no-secret"), "{err}");
+        assert!(err.contains("missing secret_ref"), "{err}");
+    }
+
+    /// CLAUDE-347: the comment-webhook equivalent of the gap the issue
+    /// reports - `write_token_ref` is the only credential this listener needs
+    /// to act (it pushes branches and replies), so missing it must be caught
+    /// here rather than at the first refused delivery.
+    #[test]
+    fn comment_webhook_enabled_with_a_source_missing_write_token_ref_is_rejected() {
+        let mut cfg = CommentWebhookConfig {
+            enabled: true,
+            ..CommentWebhookConfig::default()
+        };
+        cfg.sources.insert(
+            "no-write-token".to_string(),
+            CommentWebhookSource {
+                secret_ref: Some("hmac-ok".to_string()),
+                write_token_ref: None,
+                ..CommentWebhookSource::default()
+            },
+        );
+        let err = validate_comment_webhook(&cfg).unwrap_err();
+        assert!(err.contains("no-write-token"), "{err}");
+        assert!(err.contains("missing write_token_ref"), "{err}");
+    }
+
+    #[test]
+    fn comment_webhook_enabled_with_every_source_fully_configured_is_accepted() {
+        let mut cfg = CommentWebhookConfig {
+            enabled: true,
+            ..CommentWebhookConfig::default()
+        };
+        cfg.sources.insert(
+            "ok".to_string(),
+            CommentWebhookSource {
+                secret_ref: Some("hmac-ok".to_string()),
+                write_token_ref: Some("pat-ok".to_string()),
+                ..CommentWebhookSource::default()
+            },
+        );
+        validate_comment_webhook(&cfg).expect("fully-configured source must pass");
     }
 
     #[test]
