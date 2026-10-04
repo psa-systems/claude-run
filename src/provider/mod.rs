@@ -624,6 +624,47 @@ pub fn shallow_clone(
     if let Some(pinned) = branch {
         restore_default_branch_refs(url, pinned, workdir, depth)?;
     }
+    init_submodules(url, workdir)?;
+    Ok(())
+}
+
+/// Check out every submodule the clone pinned, when the repo has any.
+///
+/// A repo that vendors its task runner as a submodule (for example `common`,
+/// pulled in via a `justfile` import) is otherwise cloned with an empty
+/// submodule directory, and the repo's own gate recipes (`just pre-commit`)
+/// fail on the agent's very first call. Skipped silently when there is no
+/// `.gitmodules`, so a repo with none behaves exactly as before. `--depth 1`
+/// assumes the pinned submodule commit is reachable from the submodule's
+/// default branch tip, matching the shallow top-level clone.
+///
+/// `protocol.file.allow=always` only widens what a LOCAL `file://` submodule
+/// may do (git otherwise refuses to follow one from an untrusted superproject,
+/// CVE-2022-39253); every real submodule here is fetched over the same
+/// `https`/`ssh` host as the superproject, which this never restricts.
+///
+/// A submodule fetch failure is a clone failure: it surfaces through the same
+/// [`git_error`] path as every other git failure in this module, with
+/// redacted stderr, never a warning followed by a half-populated tree.
+fn init_submodules(url: &str, workdir: &std::path::Path) -> Result<()> {
+    if !workdir.join(".gitmodules").is_file() {
+        return Ok(());
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .arg("-c")
+        .arg("protocol.file.allow=always")
+        .arg("submodule")
+        .arg("update")
+        .arg("--init")
+        .arg("--recursive")
+        .arg("--depth")
+        .arg("1")
+        .output()?;
+    if !out.status.success() {
+        return Err(git_error("submodule update", &out, Some(url)));
+    }
     Ok(())
 }
 
@@ -1154,6 +1195,127 @@ mod tests {
         assert_eq!(
             rev_parse_abbrev(&clone, "origin/HEAD").as_deref(),
             Some("origin/main")
+        );
+    }
+
+    // ---- submodule init on clone -------------
+
+    /// A bare submodule repo with one commit, plus a superproject that vendors
+    /// it at `sub/` and commits the `.gitmodules` entry. Returns the
+    /// superproject's `file://` URL `shallow_clone` can pull from. `git
+    /// submodule add` over `file://` needs the same
+    /// `protocol.file.allow=always` escape hatch as `init_submodules` itself,
+    /// since it is the same CVE-2022-39253 guard.
+    fn origin_with_submodule(base: &std::path::Path) -> String {
+        let git_in = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let sub = base.join("sub-origin");
+        std::fs::create_dir_all(&sub).unwrap();
+        git_in(&sub, &["init", "-q", "-b", "main"]);
+        git_in(&sub, &["config", "user.name", "t"]);
+        git_in(&sub, &["config", "user.email", "t@t.example"]);
+        std::fs::write(sub.join("s.txt"), "s").unwrap();
+        git_in(&sub, &["add", "."]);
+        git_in(&sub, &["commit", "-q", "-m", "sub init"]);
+
+        let origin = base.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init", "-q", "-b", "main"]);
+        git_in(&origin, &["config", "user.name", "t"]);
+        git_in(&origin, &["config", "user.email", "t@t.example"]);
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-q", "-m", "init"]);
+        let sub_url = format!("file://{}", sub.display());
+        git_in(
+            &origin,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &sub_url,
+                "sub",
+            ],
+        );
+        git_in(&origin, &["commit", "-q", "-m", "add submodule"]);
+        format!("file://{}", origin.display())
+    }
+
+    /// Acceptance: a clone of a repo with a `.gitmodules` entry leaves the
+    /// submodule checked out (non-empty), for a fresh (unpinned) clone.
+    #[test]
+    fn a_fresh_clone_checks_out_its_submodule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_submodule(tmp.path());
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, None, &clone, 50).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(clone.join("sub").join("s.txt")).unwrap(),
+            "s",
+            "the submodule's tracked file must be checked out, not an empty directory"
+        );
+    }
+
+    /// Acceptance: the pinned-branch resume clone also checks out submodules,
+    /// not just the fresh-pickup path.
+    #[test]
+    fn a_pinned_resume_clone_checks_out_its_submodule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_submodule(tmp.path());
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, Some("main"), &clone, 50).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(clone.join("sub").join("s.txt")).unwrap(),
+            "s"
+        );
+    }
+
+    /// Acceptance: a repo with no `.gitmodules` runs no submodule command and
+    /// behaves exactly as before - the existing unpinned-clone coverage above
+    /// (e.g. `an_unpinned_clone_is_unaffected`) already clones a repo with no
+    /// submodules successfully; this asserts the negative directly; no `sub/`
+    /// directory and no `.gitmodules` file ever appear.
+    #[test]
+    fn a_clone_with_no_gitmodules_runs_no_submodule_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_default_branch(tmp.path(), "main");
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, None, &clone, 50).unwrap();
+        assert!(!clone.join(".gitmodules").exists());
+        assert!(!clone.join("sub").exists());
+    }
+
+    /// Acceptance: a submodule fetch failure fails the clone with the
+    /// redacted git stderr, never a silent half-populated tree. Removing the
+    /// submodule's origin after it is committed into `.gitmodules` leaves the
+    /// pointer unreachable, so `submodule update --init` fails.
+    #[test]
+    fn a_submodule_fetch_failure_fails_the_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_submodule(tmp.path());
+        std::fs::remove_dir_all(tmp.path().join("sub-origin")).unwrap();
+        let clone = tmp.path().join("clone");
+        let err = shallow_clone(&url, None, &clone, 50)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("git submodule update exited"), "{err}");
+        assert!(
+            clone.join("sub").read_dir().unwrap().next().is_none(),
+            "a failed submodule fetch must not leave a populated submodule directory"
         );
     }
 
