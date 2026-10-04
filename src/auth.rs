@@ -15,32 +15,42 @@
 //! - `Authorization: Bearer <token>`, where the token is an encrypted secret
 //!   named by `web.auth_token_ref`, resolved once at daemon startup and never
 //!   read from the config file in plaintext. This is the API clients' path.
-//! - The browser login, which since the first-run setup page is the
-//!   [`crate::web_admin`] credential in the DB: a username plus an argon2id
-//!   hash, created from `/setup` with no CLI and no secrets key file. Where no
-//!   admin row exists, `web.auth_username` plus the token plaintext still works
-//!   as the login, so existing host deployments are unchanged.
+//! - The browser login, which since the first-run setup page is one of any
+//!   number of [`crate::web_admin`] accounts in the DB: a username plus an
+//!   argon2id hash, created from `/setup` (the first account) or from an
+//!   accepted invite (every account after). Where no account exists at all,
+//!   `web.auth_username` plus the token plaintext still works as the login,
+//!   so existing host deployments are unchanged.
 //!
 //! When auth is required and NEITHER credential exists, the instance is
 //! unconfigured: every request is steered to `/setup` (browsers) or answered
-//! `503` (everything else) until an administrator is created. That replaces the
+//! `503` (everything else) until an account is created. That replaces the
 //! older behaviour of refusing to bind the TCP listener at all, which was
 //! unrecoverable in a container: the operator could not reach the UI that would
 //! have configured the credential the daemon was demanding. The surface is never
 //! served unauthenticated either way.
+//!
+//! The session cookie carries the account id as a plaintext claim alongside the
+//! expiry (`"<account id>.<expiry>.<hmac>"`), signed with that account's own
+//! rotating `session_key`; a sentinel id of `0` is the legacy
+//! `auth_username`/token pair, signed with the bearer token instead. Carrying
+//! the id lets `require_token` look the account up fresh on every request
+//! rather than caching a single administrator, which is what makes multiple
+//! concurrently valid accounts (and multiple accounts mid-2FA at once) work.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::DbPool;
+use crate::web_admin::Account;
 use askama::Template;
 use axum::{
-    extract::{Form, Request, State},
+    extract::{Extension, Form, Path, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use hmac::{Hmac, Mac};
@@ -52,7 +62,6 @@ use tracing::{error, warn};
 use crate::config::WebConfig;
 use crate::error::Result;
 use crate::secrets::SecretsKey;
-use crate::web_admin::AdminCredential;
 
 /// Session cookie name set on a successful form login and accepted by the gate
 /// in lieu of a bearer header.
@@ -70,25 +79,23 @@ const PENDING_2FA_TTL_SECS: u64 = 5 * 60;
 /// discarded and the operator is sent back to `/login`.
 const PENDING_2FA_MAX_ATTEMPTS: u32 = 5;
 
-/// The live administrator credential, shared between the gate and the setup
-/// handler so a first-run setup takes effect on the next request instead of at
-/// the next restart.
-pub type AdminHandle = Arc<tokio::sync::RwLock<Option<Arc<AdminCredential>>>>;
+/// Sentinel session account id for the legacy `web.auth_username` plus
+/// `auth_token_ref` login, which has no row in `web_accounts`.
+const LEGACY_ACCOUNT_ID: i64 = 0;
 
 /// Holds whatever credentials this run has: the bearer token (when
-/// `auth_token_ref` resolved), the legacy form-login username, and a live handle
-/// to the DB administrator. Cheaply cloned into the middleware.
+/// `auth_token_ref` resolved), the legacy form-login username, and the pool
+/// every account lookup reads through. Cheaply cloned into the middleware.
 #[derive(Clone)]
 pub struct TokenGate {
     /// `None` when no `auth_token_ref` is configured or it did not resolve.
     /// Bearer auth is then simply unavailable; the browser login still works.
     token: Option<Arc<String>>,
     /// `Some` when `web.auth_username` is set: the legacy login username, used
-    /// only while no DB administrator exists.
+    /// only while no DB account exists.
     username: Option<Arc<String>>,
-    /// The DB administrator, or `None` on an instance that has not run setup.
-    admin: AdminHandle,
-    /// Pool the setup handler writes the new administrator through.
+    /// Pool every account lookup (login, session verification, setup, invite
+    /// acceptance, management) reads and writes through.
     pool: Option<DbPool>,
     /// The key that encrypts/decrypts a stored TOTP secret. `None` when it
     /// could not be loaded, which makes enrollment and 2FA login unavailable
@@ -97,13 +104,12 @@ pub struct TokenGate {
 }
 
 impl TokenGate {
-    /// Bearer-only gate (no form login, no DB administrator). Used by tests and
-    /// any caller that does not configure a username.
+    /// Bearer-only gate (no form login, no DB accounts). Used by tests and any
+    /// caller that does not configure a username.
     pub fn new(token: String) -> Self {
         Self {
             token: Some(Arc::new(token)),
             username: None,
-            admin: Arc::new(tokio::sync::RwLock::new(None)),
             pool: None,
             secrets_key: None,
         }
@@ -117,9 +123,8 @@ impl TokenGate {
         }
     }
 
-    /// Attach the live administrator handle and the pool `/setup` writes through.
-    pub fn with_admin(mut self, admin: AdminHandle, pool: DbPool) -> Self {
-        self.admin = admin;
+    /// Attach the pool every account operation reads and writes through.
+    pub fn with_accounts(mut self, pool: DbPool) -> Self {
         self.pool = Some(pool);
         self
     }
@@ -132,43 +137,32 @@ impl TokenGate {
 
     /// A gate with no credential at all: the instance is unconfigured and every
     /// request is steered to `/setup`.
-    pub fn unconfigured(admin: AdminHandle, pool: DbPool) -> Self {
+    pub fn unconfigured(pool: DbPool) -> Self {
         Self {
             token: None,
             username: None,
-            admin,
             pool: Some(pool),
             secrets_key: None,
         }
     }
 
-    /// The current administrator, if setup has run.
-    async fn admin(&self) -> Option<Arc<AdminCredential>> {
-        self.admin.read().await.clone()
-    }
-
     /// Whether any credential can authenticate a request. `false` means the
     /// instance still needs first-run setup.
     async fn configured(&self) -> bool {
-        self.token.is_some() || self.admin().await.is_some()
-    }
-
-    /// The key that signs and verifies login session cookies: the
-    /// administrator's rotating session key when one exists, else the bearer
-    /// token (the pre-setup behaviour). Returns `None` on an unconfigured
-    /// instance, where no session can be minted at all.
-    async fn session_key(&self) -> Option<String> {
-        if let Some(admin) = self.admin().await {
-            return Some(admin.session_key().to_string());
+        if self.token.is_some() {
+            return true;
         }
-        self.token.as_ref().map(|t| t.to_string())
+        match &self.pool {
+            Some(pool) => crate::web_admin::exists(pool).await.unwrap_or(false),
+            None => false,
+        }
     }
 
     /// Whether a browser should be sent to a form rather than a bare 401. True
-    /// once there is any form to send them to: a DB administrator, a configured
-    /// legacy username, or an unconfigured instance needing setup.
+    /// once there is any form to send them to: a configured legacy username, a
+    /// pool that can hold accounts, or an unconfigured instance needing setup.
     async fn has_browser_login(&self) -> bool {
-        self.username.is_some() || self.admin().await.is_some() || !self.configured().await
+        self.username.is_some() || self.pool.is_some() || !self.configured().await
     }
 }
 
@@ -179,37 +173,46 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Sign a session for `expiry` (unix seconds) under `token`, returning the
-/// cookie value `"<expiry>.<hex-hmac>"`. The HMAC keys on the token, so rotating
-/// the secret invalidates every outstanding session.
-fn sign_session(token: &str, expiry: u64) -> String {
+/// Sign a session for `account_id` and `expiry` (unix seconds) under `key`,
+/// returning the cookie value `"<account_id>.<expiry>.<hex-hmac>"`. The HMAC
+/// keys on the account's own `session_key` (or the bearer token for the legacy
+/// sentinel account id), so rotating either invalidates every outstanding
+/// session signed with it.
+fn sign_session(key: &str, account_id: i64, expiry: u64) -> String {
+    let payload = format!("{account_id}.{expiry}");
     let mut mac =
-        Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("HMAC accepts any key length");
-    mac.update(expiry.to_string().as_bytes());
-    format!("{expiry}.{}", hex::encode(mac.finalize().into_bytes()))
+        Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(payload.as_bytes());
+    format!("{payload}.{}", hex::encode(mac.finalize().into_bytes()))
 }
 
-/// True when `cookie_val` is a non-expired session signed by `token`.
-fn verify_session(token: &str, cookie_val: &str) -> bool {
-    let Some((exp_str, _)) = cookie_val.split_once('.') else {
-        return false;
-    };
-    let Ok(expiry) = exp_str.parse::<u64>() else {
-        return false;
-    };
+/// Parse the plaintext `(account_id, expiry)` claims out of a session cookie
+/// value, with no signature check: like a JWT's claims, these are read before
+/// the matching key is known, then verified by recomputing the signature.
+fn parse_session_claims(cookie_val: &str) -> Option<(i64, u64)> {
+    let mut parts = cookie_val.splitn(3, '.');
+    let account_id: i64 = parts.next()?.parse().ok()?;
+    let expiry: u64 = parts.next()?.parse().ok()?;
+    parts.next()?;
+    Some((account_id, expiry))
+}
+
+/// True when `cookie_val` is a non-expired session for `account_id` signed by
+/// `key`.
+fn verify_session(key: &str, account_id: i64, expiry: u64, cookie_val: &str) -> bool {
     if now_unix() > expiry {
         return false;
     }
     constant_time_eq(
-        sign_session(token, expiry).as_bytes(),
+        sign_session(key, account_id, expiry).as_bytes(),
         cookie_val.as_bytes(),
     )
 }
 
 /// The `Set-Cookie` value for a fresh session: HttpOnly + Secure + SameSite=Lax,
 /// scoped to the whole site, expiring with the session TTL.
-fn session_set_cookie(token: &str) -> String {
-    let value = sign_session(token, now_unix() + SESSION_TTL_SECS);
+fn session_set_cookie(key: &str, account_id: i64) -> String {
+    let value = sign_session(key, account_id, now_unix() + SESSION_TTL_SECS);
     format!(
         "{SESSION_COOKIE}={value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECS}"
     )
@@ -229,38 +232,50 @@ fn session_cookie(request: &Request) -> Option<String> {
     cookie_value(request.headers(), SESSION_COOKIE)
 }
 
-/// Sign a pending-2FA cookie: password already checked, a second factor is
-/// still owed. `attempts` is the number of wrong codes already tried against
-/// it, so a cap can be enforced without a DB round trip.
-fn sign_pending_2fa(key: &str, expiry: u64, attempts: u32) -> String {
-    let payload = format!("{expiry}.{attempts}");
+/// Sign a pending-2FA cookie: password already checked for `account_id`, a
+/// second factor is still owed. `attempts` is the number of wrong codes
+/// already tried against it, so a cap can be enforced without a DB round trip.
+fn sign_pending_2fa(key: &str, account_id: i64, expiry: u64, attempts: u32) -> String {
+    let payload = format!("{account_id}.{expiry}.{attempts}");
     let mut mac =
         Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
     mac.update(payload.as_bytes());
     format!("{payload}.{}", hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Verify a pending-2FA cookie signed by `key`, returning its attempt count
-/// when it is well-formed, unexpired, correctly signed, and under the cap.
-fn verify_pending_2fa(key: &str, cookie_val: &str) -> Option<u32> {
-    let mut parts = cookie_val.splitn(3, '.');
+/// Parse the plaintext `(account_id, expiry, attempts)` claims out of a
+/// pending-2FA cookie, with no signature check.
+fn parse_pending_claims(cookie_val: &str) -> Option<(i64, u64, u32)> {
+    let mut parts = cookie_val.splitn(4, '.');
+    let account_id: i64 = parts.next()?.parse().ok()?;
     let expiry: u64 = parts.next()?.parse().ok()?;
     let attempts: u32 = parts.next()?.parse().ok()?;
     parts.next()?;
+    Some((account_id, expiry, attempts))
+}
+
+/// Verify a pending-2FA cookie for `account_id` signed by `key`, given its
+/// already-parsed `expiry` and `attempts` claims.
+fn verify_pending_2fa(
+    key: &str,
+    account_id: i64,
+    expiry: u64,
+    attempts: u32,
+    cookie_val: &str,
+) -> bool {
     if now_unix() > expiry || attempts >= PENDING_2FA_MAX_ATTEMPTS {
-        return None;
+        return false;
     }
     constant_time_eq(
-        sign_pending_2fa(key, expiry, attempts).as_bytes(),
+        sign_pending_2fa(key, account_id, expiry, attempts).as_bytes(),
         cookie_val.as_bytes(),
     )
-    .then_some(attempts)
 }
 
 /// The `Set-Cookie` value for a fresh (or re-issued, incremented) pending-2FA
 /// cookie.
-fn pending_2fa_set_cookie(key: &str, attempts: u32) -> String {
-    let value = sign_pending_2fa(key, now_unix() + PENDING_2FA_TTL_SECS, attempts);
+fn pending_2fa_set_cookie(key: &str, account_id: i64, attempts: u32) -> String {
+    let value = sign_pending_2fa(key, account_id, now_unix() + PENDING_2FA_TTL_SECS, attempts);
     format!(
         "{PENDING_2FA_COOKIE}={value}; HttpOnly; Secure; SameSite=Lax; Path=/; \
          Max-Age={PENDING_2FA_TTL_SECS}"
@@ -304,7 +319,7 @@ pub fn is_loopback_bind(bind: &str) -> bool {
 }
 
 /// Resolve the gate for this daemon run from the web config, the secrets store
-/// and the DB administrator.
+/// and the DB accounts.
 ///
 /// - `Ok(None)`: auth not required (loopback bind); serve the TCP surface
 ///   unauthenticated, as before.
@@ -324,8 +339,7 @@ pub async fn resolve_gate(web: &WebConfig, pool: &DbPool) -> Result<Option<Token
     if !auth_required(web) {
         return Ok(None);
     }
-    let admin = crate::web_admin::load(pool).await?.map(Arc::new);
-    let handle: AdminHandle = Arc::new(tokio::sync::RwLock::new(admin.clone()));
+    let has_account = crate::web_admin::exists(pool).await?;
     let token = resolve_token(web, pool).await;
     let secrets_key = match crate::secrets::SecretsKey::load() {
         Ok(k) => Some(Arc::new(k)),
@@ -341,22 +355,21 @@ pub async fn resolve_gate(web: &WebConfig, pool: &DbPool) -> Result<Option<Token
 
     let mut gate = match token {
         Some(token) => {
-            let mut gate = match web.auth_username.as_deref() {
+            let gate = match web.auth_username.as_deref() {
                 Some(u) if !u.trim().is_empty() => {
                     TokenGate::with_login(token, u.trim().to_string())
                 }
                 _ => TokenGate::new(token),
             };
-            gate = gate.with_admin(handle, pool.clone());
-            gate
+            gate.with_accounts(pool.clone())
         }
-        None if admin.is_some() => TokenGate::unconfigured(handle, pool.clone()),
+        None if has_account => TokenGate::unconfigured(pool.clone()),
         None => {
             warn!(
                 "no web credential configured; serving first-run setup at /setup until an \
-                 administrator is created. Every other request is refused until then."
+                 account is created. Every other request is refused until then."
             );
-            TokenGate::unconfigured(handle, pool.clone())
+            TokenGate::unconfigured(pool.clone())
         }
     };
     if let Some(key) = secrets_key {
@@ -404,14 +417,14 @@ async fn resolve_token(web: &WebConfig, pool: &DbPool) -> Option<String> {
 
 /// Wrap `router` so every request must carry either `Authorization: Bearer
 /// <token>` or a valid session cookie, except requests under the `/webhooks/`
-/// prefix and the login routes. When the gate has a configured username, the
-/// `/login` (+ `/logout`) form routes are mounted so a browser / password
-/// manager can sign in.
+/// prefix, the login routes, and invite acceptance. When the gate has a
+/// configured username, the `/login` (+ `/logout`) form routes are mounted so a
+/// browser / password manager can sign in.
 pub fn protect(router: Router, gate: TokenGate) -> Router {
-    // `/login`, `/logout` and `/setup` are always mounted and always reachable:
-    // which of them is useful depends on state the gate reads per request (a DB
-    // administrator can appear at runtime), so deciding at mount time would
-    // require a restart to pick setup up.
+    // `/login`, `/logout`, `/setup` and `/invite/*` are always mounted and
+    // always reachable: which of them is useful depends on state the gate
+    // reads per request (an account can appear at runtime), so deciding at
+    // mount time would require a restart to pick that up.
     let auth_routes = Router::new()
         .route("/login", get(login_page).post(login_submit))
         .route("/login/2fa", get(login_totp_page).post(login_totp_submit))
@@ -421,6 +434,11 @@ pub fn protect(router: Router, gate: TokenGate) -> Router {
             "/account/2fa/setup",
             get(totp_setup_page).post(totp_setup_submit),
         )
+        .route("/invite/:token", get(invite_page).post(invite_submit))
+        .route("/settings/accounts", get(accounts_page))
+        .route("/settings/accounts/invite", post(create_invite_submit))
+        .route("/settings/accounts/remove", post(remove_account_submit))
+        .route("/settings/accounts/revoke", post(revoke_invite_submit))
         .with_state(gate.clone());
     router
         .merge(auth_routes)
@@ -428,20 +446,24 @@ pub fn protect(router: Router, gate: TokenGate) -> Router {
 }
 
 /// Axum middleware enforcing a bearer token or a session cookie. Exempts the
-/// webhook prefix and the auth routes. An unauthenticated browser navigation
-/// (GET accepting HTML) is redirected to the form it needs (`/setup` before the
-/// instance is configured, `/login` after); everything else gets a 401, or a 503
-/// while unconfigured because there is no credential to present yet.
+/// webhook prefix, the auth routes, and invite acceptance. An unauthenticated
+/// browser navigation (GET accepting HTML) is redirected to the form it needs
+/// (`/setup` before the instance is configured, `/login` after); everything
+/// else gets a 401, or a 503 while unconfigured because there is no credential
+/// to present yet. On a valid session the resolved [`Account`] is attached to
+/// the request as an extension for downstream handlers; the legacy sentinel
+/// session carries none.
 async fn require_token(State(gate): State<TokenGate>, request: Request, next: Next) -> Response {
     // The webhook route authenticates itself via HMAC and Forgejo cannot send a
-    // bearer token, so it is never gated here. The auth routes must be reachable
-    // unauthenticated or there is no way in.
+    // bearer token, so it is never gated here. The auth routes (and invite
+    // acceptance) must be reachable unauthenticated or there is no way in.
     let path = request.uri().path();
     if path.starts_with("/webhooks/")
         || path == "/login"
         || path == "/login/2fa"
         || path == "/logout"
         || path == "/setup"
+        || path.starts_with("/invite/")
     {
         return next.run(request).await;
     }
@@ -454,7 +476,7 @@ async fn require_token(State(gate): State<TokenGate>, request: Request, next: Ne
         }
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "claude-run has no administrator yet; open /setup in a browser to create one",
+            "claude-run has no account yet; open /setup in a browser to create one",
         )
             .into_response();
     }
@@ -467,27 +489,38 @@ async fn require_token(State(gate): State<TokenGate>, request: Request, next: Ne
         }
     }
     if let Some(cookie) = session_cookie(&request) {
-        if let Some(key) = gate.session_key().await {
-            if verify_session(&key, &cookie) {
-                // A session belonging to a DB administrator who has not yet
-                // completed TOTP enrollment may load nothing else: every other
-                // page (and every non-GET/non-HTML request) is refused until
-                // enrollment is confirmed. `/account/2fa/setup` and its own
-                // static assets are the only exceptions, or there would be no
-                // way to reach the page that fixes it.
-                if let Some(admin) = gate.admin().await {
-                    if !admin.totp_enrolled() && !totp_setup_exempt(path) {
-                        if request.method() == Method::GET && wants_html(&request) {
-                            return Redirect::to("/account/2fa/setup").into_response();
-                        }
-                        return (
-                            StatusCode::FORBIDDEN,
-                            "TOTP enrollment is required before this instance can be used",
-                        )
-                            .into_response();
+        if let Some((account_id, expiry)) = parse_session_claims(&cookie) {
+            if account_id == LEGACY_ACCOUNT_ID {
+                if let Some(token) = gate.token.as_ref() {
+                    if verify_session(token, account_id, expiry, &cookie) {
+                        return next.run(request).await;
                     }
                 }
-                return next.run(request).await;
+            } else if let Some(pool) = gate.pool.as_ref() {
+                if let Ok(Some(account)) = crate::web_admin::load_by_id(pool, account_id).await {
+                    if verify_session(account.session_key(), account_id, expiry, &cookie) {
+                        // A session belonging to an account who has not yet
+                        // completed TOTP enrollment may load nothing else:
+                        // every other page (and every non-GET/non-HTML
+                        // request) is refused until enrollment is confirmed.
+                        // `/account/2fa/setup` and its own static assets are
+                        // the only exceptions, or there would be no way to
+                        // reach the page that fixes it.
+                        if !account.totp_enrolled() && !totp_setup_exempt(path) {
+                            if request.method() == Method::GET && wants_html(&request) {
+                                return Redirect::to("/account/2fa/setup").into_response();
+                            }
+                            return (
+                                StatusCode::FORBIDDEN,
+                                "TOTP enrollment is required before this instance can be used",
+                            )
+                                .into_response();
+                        }
+                        let mut request = request;
+                        request.extensions_mut().insert(account);
+                        return next.run(request).await;
+                    }
+                }
             }
         }
     }
@@ -543,6 +576,25 @@ struct SetupTpl {
     min_password_len: usize,
 }
 
+#[derive(Template)]
+#[template(path = "invite_accept.html")]
+struct InviteAcceptTpl {
+    token: String,
+    error: Option<String>,
+    min_password_len: usize,
+}
+
+#[derive(Template)]
+#[template(path = "accounts.html")]
+struct AccountsTpl {
+    version: &'static str,
+    accounts: Vec<crate::web_admin::AccountSummary>,
+    invites: Vec<crate::web_admin::InviteSummary>,
+    current_id: i64,
+    error: Option<String>,
+    new_invite_link: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct LoginForm {
     username: String,
@@ -566,6 +618,23 @@ struct SetupForm {
     confirm: String,
 }
 
+#[derive(Deserialize)]
+struct InviteAcceptForm {
+    username: String,
+    password: String,
+    confirm: String,
+}
+
+#[derive(Deserialize)]
+struct RemoveAccountForm {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct RevokeInviteForm {
+    id: i64,
+}
+
 /// GET `/login`: render the sign-in form, or bounce to setup when the instance
 /// has no credential to sign in with.
 async fn login_page(State(gate): State<TokenGate>) -> Response {
@@ -576,84 +645,105 @@ async fn login_page(State(gate): State<TokenGate>) -> Response {
 }
 
 /// POST `/login`: verify the credentials, mint a session cookie, and redirect to
-/// the dashboard. The DB administrator wins when one exists; otherwise the
-/// pre-setup pair (`web.auth_username` plus the `auth_token_ref` plaintext)
-/// still authenticates, so existing host deployments keep working. On mismatch,
-/// re-render with a 401 and a generic error naming neither field.
+/// the dashboard. A DB account matching the username wins when any account
+/// exists; otherwise the pre-setup pair (`web.auth_username` plus the
+/// `auth_token_ref` plaintext) still authenticates, so existing host
+/// deployments keep working. On mismatch, re-render with a 401 and a generic
+/// error naming neither field.
 async fn login_submit(State(gate): State<TokenGate>, Form(form): Form<LoginForm>) -> Response {
     if !gate.configured().await {
         return Redirect::to("/setup").into_response();
     }
-    let ok = match gate.admin().await {
-        Some(admin) => {
-            let user_ok = constant_time_eq(form.username.as_bytes(), admin.username.as_bytes());
-            match admin.verify_password(&form.password) {
-                Ok(pass_ok) => user_ok && pass_ok,
-                Err(e) => {
-                    // A corrupt stored hash is an operator problem, not a wrong
-                    // password: log the cause rather than let it read as a typo.
-                    warn!(error = %e, "admin password hash could not be parsed; login refused");
-                    false
+    let mut matched: Option<Account> = None;
+    let mut ok = false;
+    let any_accounts = match gate.pool.as_ref() {
+        Some(pool) => crate::web_admin::exists(pool).await.unwrap_or(false),
+        None => false,
+    };
+    if any_accounts {
+        if let Some(pool) = gate.pool.as_ref() {
+            if let Ok(Some(account)) =
+                crate::web_admin::load_by_username(pool, &form.username).await
+            {
+                match account.verify_password(&form.password) {
+                    Ok(true) => {
+                        ok = true;
+                        matched = Some(account);
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        // A corrupt stored hash is an operator problem, not a
+                        // wrong password: log the cause rather than let it
+                        // read as a typo.
+                        warn!(error = %e, "account password hash could not be parsed; login refused");
+                    }
                 }
             }
         }
-        None => match (gate.username.as_ref(), gate.token.as_ref()) {
-            (Some(username), Some(token)) => {
-                constant_time_eq(form.username.as_bytes(), username.as_bytes())
-                    && constant_time_eq(form.password.as_bytes(), token.as_bytes())
-            }
-            _ => false,
-        },
-    };
+    } else if let (Some(username), Some(token)) = (gate.username.as_ref(), gate.token.as_ref()) {
+        ok = constant_time_eq(form.username.as_bytes(), username.as_bytes())
+            && constant_time_eq(form.password.as_bytes(), token.as_bytes());
+    }
     if !ok {
         return render_login(
             Some("Invalid username or password.".to_string()),
             StatusCode::UNAUTHORIZED,
         );
     }
-    // An enrolled DB administrator owes a second factor before a session is
-    // granted; an unenrolled one (or the legacy username/token pair, which has
-    // no TOTP concept) goes straight to a session, and the enrolled-check in
+    // An enrolled account owes a second factor before a session is granted; an
+    // unenrolled one goes straight to a session, and the enrolled-check in
     // `require_token` is what then forces enrollment before anything else
     // loads.
-    if let Some(admin) = gate.admin().await {
-        if admin.totp_enrolled() {
+    if let Some(account) = matched {
+        if account.totp_enrolled() {
             let mut resp = Redirect::to("/login/2fa").into_response();
-            if let Ok(v) = HeaderValue::from_str(&pending_2fa_set_cookie(admin.session_key(), 0)) {
+            if let Ok(v) = HeaderValue::from_str(&pending_2fa_set_cookie(
+                account.session_key(),
+                account.id,
+                0,
+            )) {
                 resp.headers_mut().insert(header::SET_COOKIE, v);
             }
             return resp;
         }
+        return redirect_with_session("/", account.session_key(), account.id);
     }
-    let Some(key) = gate.session_key().await else {
+    let Some(token) = gate.token.as_ref() else {
         return render_login(
             Some("No session key is available; check the daemon log.".to_string()),
             StatusCode::INTERNAL_SERVER_ERROR,
         );
     };
-    redirect_with_session("/", &key)
+    redirect_with_session("/", token, LEGACY_ACCOUNT_ID)
 }
 
 /// GET `/login/2fa`: render the second-factor form, or bounce to `/login` when
 /// there is no live pending-2FA cookie to redeem (a direct visit, an expired
-/// cookie, or an instance with no enrolled administrator at all).
+/// cookie, or an account that is not enrolled).
 async fn login_totp_page(State(gate): State<TokenGate>, request: Request) -> Response {
     if !gate.configured().await {
         return Redirect::to("/setup").into_response();
     }
-    let Some(admin) = gate.admin().await else {
+    let Some(account) = pending_2fa_account(&gate, request.headers()).await else {
         return Redirect::to("/login").into_response();
     };
-    if !admin.totp_enrolled() {
-        return Redirect::to("/login").into_response();
-    }
-    let Some(cookie) = cookie_value(request.headers(), PENDING_2FA_COOKIE) else {
-        return Redirect::to("/login").into_response();
-    };
-    if verify_pending_2fa(admin.session_key(), &cookie).is_none() {
+    if !account.totp_enrolled() {
         return Redirect::to("/login").into_response();
     }
     render_login_totp(None, StatusCode::OK)
+}
+
+/// Resolve the account named by a live pending-2FA cookie, verifying its
+/// signature against that account's own key.
+async fn pending_2fa_account(gate: &TokenGate, headers: &HeaderMap) -> Option<Account> {
+    let cookie = cookie_value(headers, PENDING_2FA_COOKIE)?;
+    let (account_id, expiry, attempts) = parse_pending_claims(&cookie)?;
+    let pool = gate.pool.as_ref()?;
+    let account = crate::web_admin::load_by_id(pool, account_id)
+        .await
+        .ok()??;
+    verify_pending_2fa(account.session_key(), account_id, expiry, attempts, &cookie)
+        .then_some(account)
 }
 
 /// POST `/login/2fa`: redeem the pending cookie against a TOTP or recovery
@@ -669,16 +759,18 @@ async fn login_totp_submit(
     if !gate.configured().await {
         return Redirect::to("/setup").into_response();
     }
-    let Some(admin) = gate.admin().await else {
+    let Some(account) = pending_2fa_account(&gate, &headers).await else {
         return Redirect::to("/login").into_response();
     };
-    if !admin.totp_enrolled() {
+    if !account.totp_enrolled() {
         return Redirect::to("/login").into_response();
     }
+    // The cookie was already verified in `pending_2fa_account`; re-read its
+    // attempt count here so a wrong code can bump it.
     let Some(cookie) = cookie_value(&headers, PENDING_2FA_COOKIE) else {
         return Redirect::to("/login").into_response();
     };
-    let Some(attempts) = verify_pending_2fa(admin.session_key(), &cookie) else {
+    let Some((_, _, attempts)) = parse_pending_claims(&cookie) else {
         return Redirect::to("/login").into_response();
     };
     let Some(pool) = gate.pool.clone() else {
@@ -694,9 +786,9 @@ async fn login_totp_submit(
             StatusCode::INTERNAL_SERVER_ERROR,
         );
     };
-    match crate::web_admin::verify_totp_or_recovery(&pool, &key, &admin, &form.code).await {
+    match crate::web_admin::verify_totp_or_recovery(&pool, &key, &account, &form.code).await {
         Ok(true) => {
-            let mut resp = redirect_with_session("/", admin.session_key());
+            let mut resp = redirect_with_session("/", account.session_key(), account.id);
             if let Ok(v) = HeaderValue::from_str(&pending_2fa_clear_cookie()) {
                 resp.headers_mut().append(header::SET_COOKIE, v);
             }
@@ -711,7 +803,7 @@ async fn login_totp_submit(
             let cookie = if attempts >= PENDING_2FA_MAX_ATTEMPTS {
                 pending_2fa_clear_cookie()
             } else {
-                pending_2fa_set_cookie(admin.session_key(), attempts)
+                pending_2fa_set_cookie(account.session_key(), account.id, attempts)
             };
             if let Ok(v) = HeaderValue::from_str(&cookie) {
                 resp.headers_mut().insert(header::SET_COOKIE, v);
@@ -731,13 +823,13 @@ async fn login_totp_submit(
 /// GET `/account/2fa/setup`: begin (or resume) enrollment, showing the
 /// `otpauth://` URI, its QR code, and a confirmation form. Reachable only by
 /// an authenticated session (the `require_token` gate lets an unenrolled
-/// session through to exactly this page), so no separate auth check is needed
-/// beyond an enrolled admin having nothing to do here.
-async fn totp_setup_page(State(gate): State<TokenGate>) -> Response {
-    let Some(admin) = gate.admin().await else {
-        return Redirect::to("/login").into_response();
-    };
-    if admin.totp_enrolled() {
+/// session through to exactly this page), so the current account comes from
+/// the request extension it attached.
+async fn totp_setup_page(
+    State(gate): State<TokenGate>,
+    Extension(account): Extension<Account>,
+) -> Response {
+    if account.totp_enrolled() {
         return Redirect::to("/").into_response();
     }
     let (Some(pool), Some(key)) = (gate.pool.clone(), gate.secrets_key.clone()) else {
@@ -748,7 +840,8 @@ async fn totp_setup_page(State(gate): State<TokenGate>) -> Response {
         )
             .into_response();
     };
-    match crate::web_admin::begin_totp_enrollment(&pool, &key, &admin.username).await {
+    match crate::web_admin::begin_totp_enrollment(&pool, &key, account.id, &account.username).await
+    {
         Ok(pending) => render_totp_setup(None, pending, StatusCode::OK),
         Err(e) => {
             error!(error = %e, "starting TOTP enrollment failed");
@@ -766,12 +859,10 @@ async fn totp_setup_page(State(gate): State<TokenGate>) -> Response {
 /// persisting them anywhere they could be re-displayed.
 async fn totp_setup_submit(
     State(gate): State<TokenGate>,
+    Extension(account): Extension<Account>,
     Form(form): Form<TotpConfirmForm>,
 ) -> Response {
-    let Some(admin) = gate.admin().await else {
-        return Redirect::to("/login").into_response();
-    };
-    if admin.totp_enrolled() {
+    if account.totp_enrolled() {
         return Redirect::to("/").into_response();
     }
     let (Some(pool), Some(key)) = (gate.pool.clone(), gate.secrets_key.clone()) else {
@@ -782,27 +873,25 @@ async fn totp_setup_submit(
         )
             .into_response();
     };
-    match crate::web_admin::confirm_totp_enrollment(&pool, &key, &admin.username, &form.code).await
-    {
-        Ok(codes) => {
-            // Adopt the now-enrolled admin for the live gate so the very next
-            // request (the recovery-codes page's own "continue" link) passes
-            // straight through instead of bouncing back to enrollment.
-            if let Ok(Some(reloaded)) = crate::web_admin::load(&pool).await {
-                *gate.admin.write().await = Some(Arc::new(reloaded));
-            }
-            match (TotpRecoveryCodesTpl { codes }).render() {
-                Ok(html) => (StatusCode::OK, Html(html)).into_response(),
-                Err(_) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "recovery codes template error",
-                )
-                    .into_response(),
-            }
-        }
+    match crate::web_admin::confirm_totp_enrollment(&pool, &key, account.id, &form.code).await {
+        Ok(codes) => match (TotpRecoveryCodesTpl { codes }).render() {
+            Ok(html) => (StatusCode::OK, Html(html)).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "recovery codes template error",
+            )
+                .into_response(),
+        },
         Err(e) => {
             warn!(error = %e, "TOTP enrollment confirmation refused");
-            match crate::web_admin::begin_totp_enrollment(&pool, &key, &admin.username).await {
+            match crate::web_admin::begin_totp_enrollment(
+                &pool,
+                &key,
+                account.id,
+                &account.username,
+            )
+            .await
+            {
                 Ok(pending) => {
                     render_totp_setup(Some(e.to_string()), pending, StatusCode::BAD_REQUEST)
                 }
@@ -829,9 +918,9 @@ async fn logout() -> Response {
     resp
 }
 
-/// GET `/setup`: the first-run administrator form. Once an administrator exists
-/// this is a dead end by design, so it redirects to the login form: setup runs
-/// exactly once and cannot be used to mint a second admin.
+/// GET `/setup`: the first-run account form. Once any account exists this is a
+/// dead end by design, so it redirects to the login form: setup runs exactly
+/// once and cannot be used to mint a second account (invites do that).
 async fn setup_page(State(gate): State<TokenGate>) -> Response {
     if gate.configured().await {
         return Redirect::to("/login").into_response();
@@ -839,8 +928,7 @@ async fn setup_page(State(gate): State<TokenGate>) -> Response {
     render_setup(None, StatusCode::OK)
 }
 
-/// POST `/setup`: create the administrator, adopt it for this run without a
-/// restart, and sign the operator in.
+/// POST `/setup`: create the first account and sign the operator in.
 async fn setup_submit(State(gate): State<TokenGate>, Form(form): Form<SetupForm>) -> Response {
     if gate.configured().await {
         return Redirect::to("/login").into_response();
@@ -857,8 +945,9 @@ async fn setup_submit(State(gate): State<TokenGate>, Form(form): Form<SetupForm>
             StatusCode::BAD_REQUEST,
         );
     }
-    let cred = match crate::web_admin::create(&pool, &form.username, &form.password).await {
-        Ok(c) => c,
+    let account = match crate::web_admin::create_first(&pool, &form.username, &form.password).await
+    {
+        Ok(a) => a,
         Err(e) => {
             // Surface the rule that was broken (too short, empty username,
             // already set up) rather than a generic failure.
@@ -866,22 +955,205 @@ async fn setup_submit(State(gate): State<TokenGate>, Form(form): Form<SetupForm>
             return render_setup(Some(e.to_string()), StatusCode::BAD_REQUEST);
         }
     };
-    let key = cred.session_key().to_string();
-    let username = cred.username.clone();
-    // Adopt it for the live gate so the very next request is authenticated
-    // against it; without this the operator would have to restart the daemon.
-    *gate.admin.write().await = Some(Arc::new(cred));
-    tracing::info!(username, "administrator created from first-run setup");
-    // A fresh admin has no TOTP enrolled yet: send them straight to enrollment
-    // rather than the dashboard, which `require_token` would bounce them out of
-    // anyway. Going there directly avoids a pointless redirect round trip.
-    redirect_with_session("/account/2fa/setup", &key)
+    tracing::info!(
+        username = account.username,
+        "account created from first-run setup"
+    );
+    // A fresh account has no TOTP enrolled yet: send them straight to
+    // enrollment rather than the dashboard, which `require_token` would
+    // bounce them out of anyway. Going there directly avoids a pointless
+    // redirect round trip.
+    redirect_with_session("/account/2fa/setup", account.session_key(), account.id)
 }
 
-/// Redirect to `to`, carrying a fresh session cookie signed by `key`.
-fn redirect_with_session(to: &str, key: &str) -> Response {
+/// GET `/invite/<token>`: render the invite-acceptance form, or refuse once the
+/// token is unknown, expired, or already used.
+async fn invite_page(State(gate): State<TokenGate>, Path(token): Path<String>) -> Response {
+    let Some(pool) = gate.pool.clone() else {
+        return (StatusCode::NOT_FOUND, "invites are unavailable").into_response();
+    };
+    match crate::web_admin::find_live_invite_by_token(&pool, &token).await {
+        Ok(Some(_)) => render_invite_accept(token, None, StatusCode::OK),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            "this invite link is invalid or has expired",
+        )
+            .into_response(),
+        Err(e) => {
+            error!(error = %e, "invite lookup failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not check this invite",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST `/invite/<token>`: accept the invite, create the account, and send the
+/// new account straight to forced TOTP enrollment with a fresh session, the
+/// same as first-run setup.
+async fn invite_submit(
+    State(gate): State<TokenGate>,
+    Path(token): Path<String>,
+    Form(form): Form<InviteAcceptForm>,
+) -> Response {
+    let Some(pool) = gate.pool.clone() else {
+        return (StatusCode::NOT_FOUND, "invites are unavailable").into_response();
+    };
+    if form.password != form.confirm {
+        return render_invite_accept(
+            token,
+            Some("The two passwords do not match.".to_string()),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let invite = match crate::web_admin::find_live_invite_by_token(&pool, &token).await {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                "this invite link is invalid or has expired",
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "invite lookup failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not check this invite",
+            )
+                .into_response();
+        }
+    };
+    let account =
+        match crate::web_admin::accept_invite(&pool, &invite, &form.username, &form.password).await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(error = %e, "invite acceptance refused");
+                return render_invite_accept(token, Some(e.to_string()), StatusCode::BAD_REQUEST);
+            }
+        };
+    tracing::info!(
+        username = account.username,
+        "account created from an accepted invite"
+    );
+    redirect_with_session("/account/2fa/setup", account.session_key(), account.id)
+}
+
+/// GET `/settings/accounts`: list every account and outstanding invite.
+async fn accounts_page(
+    State(gate): State<TokenGate>,
+    Extension(account): Extension<Account>,
+) -> Response {
+    render_accounts(&gate, account.id, None, None).await
+}
+
+/// POST `/settings/accounts/invite`: mint a single-use invite and show its link
+/// once.
+async fn create_invite_submit(
+    State(gate): State<TokenGate>,
+    Extension(account): Extension<Account>,
+) -> Response {
+    let Some(pool) = gate.pool.clone() else {
+        return render_accounts(
+            &gate,
+            account.id,
+            Some("no database handle".to_string()),
+            None,
+        )
+        .await;
+    };
+    match crate::web_admin::create_invite(&pool, account.id).await {
+        Ok((token, _id)) => {
+            tracing::info!(created_by = account.username, "invite created");
+            let link = format!("/invite/{token}");
+            render_accounts(&gate, account.id, None, Some(link)).await
+        }
+        Err(e) => render_accounts(&gate, account.id, Some(e.to_string()), None).await,
+    }
+}
+
+/// POST `/settings/accounts/remove`: remove an account, refusing the last
+/// account or self-removal (surfaced visibly, never a silent no-op).
+async fn remove_account_submit(
+    State(gate): State<TokenGate>,
+    Extension(account): Extension<Account>,
+    Form(form): Form<RemoveAccountForm>,
+) -> Response {
+    let Some(pool) = gate.pool.clone() else {
+        return render_accounts(
+            &gate,
+            account.id,
+            Some("no database handle".to_string()),
+            None,
+        )
+        .await;
+    };
+    match crate::web_admin::remove(&pool, account.id, form.id).await {
+        Ok(()) => render_accounts(&gate, account.id, None, None).await,
+        Err(e) => render_accounts(&gate, account.id, Some(e.to_string()), None).await,
+    }
+}
+
+/// POST `/settings/accounts/revoke`: revoke an outstanding invite.
+async fn revoke_invite_submit(
+    State(gate): State<TokenGate>,
+    Extension(account): Extension<Account>,
+    Form(form): Form<RevokeInviteForm>,
+) -> Response {
+    let Some(pool) = gate.pool.clone() else {
+        return render_accounts(
+            &gate,
+            account.id,
+            Some("no database handle".to_string()),
+            None,
+        )
+        .await;
+    };
+    match crate::web_admin::revoke_invite(&pool, form.id).await {
+        Ok(()) => render_accounts(&gate, account.id, None, None).await,
+        Err(e) => render_accounts(&gate, account.id, Some(e.to_string()), None).await,
+    }
+}
+
+async fn render_accounts(
+    gate: &TokenGate,
+    current_id: i64,
+    error: Option<String>,
+    new_invite_link: Option<String>,
+) -> Response {
+    let Some(pool) = gate.pool.as_ref() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no database handle").into_response();
+    };
+    let accounts = match crate::web_admin::list(pool).await {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    let invites = match crate::web_admin::list_invites(pool).await {
+        Ok(i) => i,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    };
+    let tpl = AccountsTpl {
+        version: crate::VERSION,
+        accounts,
+        invites,
+        current_id,
+        error,
+        new_invite_link,
+    };
+    match tpl.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "accounts template error").into_response(),
+    }
+}
+
+/// Redirect to `to`, carrying a fresh session cookie for `account_id` signed by
+/// `key`.
+fn redirect_with_session(to: &str, key: &str, account_id: i64) -> Response {
     let mut resp = Redirect::to(to).into_response();
-    if let Ok(v) = HeaderValue::from_str(&session_set_cookie(key)) {
+    if let Ok(v) = HeaderValue::from_str(&session_set_cookie(key, account_id)) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     resp
@@ -895,6 +1167,22 @@ fn render_setup(error: Option<String>, status: StatusCode) -> Response {
     match tpl.render() {
         Ok(html) => (status, Html(html)).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "setup template error").into_response(),
+    }
+}
+
+fn render_invite_accept(token: String, error: Option<String>, status: StatusCode) -> Response {
+    let tpl = InviteAcceptTpl {
+        token,
+        error,
+        min_password_len: crate::web_admin::MIN_PASSWORD_LEN,
+    };
+    match tpl.render() {
+        Ok(html) => (status, Html(html)).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invite accept template error",
+        )
+            .into_response(),
     }
 }
 
@@ -1044,8 +1332,7 @@ mod tests {
             .route("/api/status", get(|| async { "ok" }))
             .route("/", get(|| async { "dashboard" }))
             .route("/webhooks/forgejo/contoso", get(|| async { "hook" }));
-        let handle: AdminHandle = Arc::new(tokio::sync::RwLock::new(None));
-        protect(app, TokenGate::unconfigured(handle, pool.clone()))
+        protect(app, TokenGate::unconfigured(pool.clone()))
     }
 
     fn html_get(uri: &str) -> Request {
@@ -1113,16 +1400,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// Posting the setup form creates the administrator, signs the operator in
-    /// with a session cookie, and takes effect for the very next request with no
-    /// restart.
+    /// Posting the setup form creates the account and signs the operator in
+    /// with a session cookie that works on the very next request.
     #[tokio::test]
-    async fn setup_creates_the_admin_and_signs_in() {
+    async fn setup_creates_the_account_and_signs_in() {
         let pool = setup_pool().await;
         let app = Router::new().route("/", get(|| async { "dashboard" }));
-        let handle: AdminHandle = Arc::new(tokio::sync::RwLock::new(None));
-        let gate = TokenGate::unconfigured(handle.clone(), pool.clone());
-        let router = protect(app, gate.clone());
+        let gate = TokenGate::unconfigured(pool.clone());
+        let router = protect(app, gate);
 
         let body = "username=admin&password=correct+horse+battery&confirm=correct+horse+battery";
         let req = Request::builder()
@@ -1136,7 +1421,7 @@ mod tests {
         assert_eq!(
             resp.headers().get(header::LOCATION).unwrap(),
             "/account/2fa/setup",
-            "a fresh admin is sent straight to TOTP enrollment, not the dashboard"
+            "a fresh account is sent straight to TOTP enrollment, not the dashboard"
         );
         let cookie = resp
             .headers()
@@ -1148,11 +1433,7 @@ mod tests {
 
         assert!(
             crate::web_admin::exists(&pool).await.unwrap(),
-            "the administrator is persisted, not just held in memory"
-        );
-        assert!(
-            gate.configured().await,
-            "the live gate adopts the new administrator without a restart"
+            "the account is persisted, not just held in memory"
         );
 
         // That cookie authenticates, but the dashboard itself is still gated
@@ -1182,24 +1463,17 @@ mod tests {
         );
     }
 
-    /// Setup runs once. A second POST cannot mint another administrator, whether
-    /// or not the caller is signed in.
+    /// Setup runs once. A second POST cannot mint another account, whether or
+    /// not the caller is signed in.
     #[tokio::test]
-    async fn setup_is_refused_once_an_admin_exists() {
+    async fn setup_is_refused_once_an_account_exists() {
         let pool = setup_pool().await;
-        crate::web_admin::create(&pool, "admin", "correct horse battery")
+        crate::web_admin::create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let admin = crate::web_admin::load(&pool).await.unwrap().map(Arc::new);
-        let handle: AdminHandle = Arc::new(tokio::sync::RwLock::new(admin));
         let router = protect(
             Router::new().route("/", get(|| async { "dashboard" })),
-            TokenGate::unconfigured(handle, pool.clone()).with_admin(
-                Arc::new(tokio::sync::RwLock::new(
-                    crate::web_admin::load(&pool).await.unwrap().map(Arc::new),
-                )),
-                pool.clone(),
-            ),
+            TokenGate::unconfigured(pool.clone()),
         );
         let body = "username=intruder&password=another+long+password&confirm=another+long+password";
         let req = Request::builder()
@@ -1215,22 +1489,22 @@ mod tests {
             "/login",
             "a configured instance sends setup traffic to the login form"
         );
-        let still = crate::web_admin::load(&pool).await.unwrap().unwrap();
-        assert_eq!(still.username, "admin", "the original admin is untouched");
+        let still = crate::web_admin::load_by_username(&pool, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still.username, "admin", "the original account is untouched");
     }
 
-    /// The DB administrator authenticates the login form, and its password is
+    /// The DB account authenticates the login form, and its password is
     /// checked against the hash rather than any configured token.
     #[tokio::test]
-    async fn admin_credentials_sign_in_through_the_login_form() {
+    async fn account_credentials_sign_in_through_the_login_form() {
         let pool = setup_pool().await;
-        crate::web_admin::create(&pool, "admin", "correct horse battery")
+        crate::web_admin::create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let handle: AdminHandle = Arc::new(tokio::sync::RwLock::new(
-            crate::web_admin::load(&pool).await.unwrap().map(Arc::new),
-        ));
-        let gate = TokenGate::unconfigured(handle, pool.clone());
+        let gate = TokenGate::unconfigured(pool.clone());
         let router = protect(
             Router::new().route("/", get(|| async { "dashboard" })),
             gate,
@@ -1354,23 +1628,25 @@ mod tests {
 
     #[test]
     fn session_round_trips_and_rejects_tampering() {
-        let cookie = sign_session("s3cret", now_unix() + 60);
-        assert!(verify_session("s3cret", &cookie));
-        // Wrong token, garbage, and a non-numeric expiry all fail.
-        assert!(!verify_session("other", &cookie));
-        assert!(!verify_session("s3cret", "not-a-session"));
-        assert!(!verify_session("s3cret", "abc.deadbeef"));
+        let cookie = sign_session("s3cret", 42, now_unix() + 60);
+        assert!(verify_session("s3cret", 42, now_unix() + 60, &cookie));
+        // Wrong key, wrong id, garbage, and a non-numeric expiry all fail.
+        assert!(!verify_session("other", 42, now_unix() + 60, &cookie));
+        let (id, expiry) = parse_session_claims(&cookie).unwrap();
+        assert!(!verify_session("s3cret", id + 1, expiry, &cookie));
+        assert!(parse_session_claims("not-a-session").is_none());
+        assert!(parse_session_claims("abc.deadbeef").is_none());
         // A flipped signature byte fails.
         let mut bad = cookie.clone();
         bad.pop();
         bad.push(if cookie.ends_with('0') { '1' } else { '0' });
-        assert!(!verify_session("s3cret", &bad));
+        assert!(!verify_session("s3cret", 42, now_unix() + 60, &bad));
     }
 
     #[test]
     fn expired_session_is_rejected() {
-        let cookie = sign_session("s3cret", now_unix() - 1);
-        assert!(!verify_session("s3cret", &cookie));
+        let cookie = sign_session("s3cret", 42, now_unix() - 1);
+        assert!(!verify_session("s3cret", 42, now_unix() - 1, &cookie));
     }
 
     /// A router protected with form login enabled.
@@ -1468,20 +1744,20 @@ mod tests {
         Arc::new(SecretsKey::load_from_file(&path).unwrap())
     }
 
-    /// A fully enrolled admin, its gate, and the router built from it, for
+    /// A fully enrolled account, its gate, and the router built from it, for
     /// exercising the full login -> 2FA -> dashboard flow.
     async fn enrolled_router() -> (Router, DbPool, Arc<SecretsKey>, String) {
         let pool = setup_pool().await;
         let key = test_secrets_key();
-        crate::web_admin::create(&pool, "admin", "correct horse battery")
+        let account = crate::web_admin::create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let pending = crate::web_admin::begin_totp_enrollment(&pool, &key, "admin")
+        let pending = crate::web_admin::begin_totp_enrollment(&pool, &key, account.id, "admin")
             .await
             .unwrap();
         // Recover the base32 secret from the otpauth URL rather than reaching
-        // into `AdminCredential`'s private stored-ciphertext field, so this
-        // test only depends on `web_admin`'s public surface.
+        // into `Account`'s private stored-ciphertext field, so this test only
+        // depends on `web_admin`'s public surface.
         let base32 = pending
             .otpauth_url
             .split("secret=")
@@ -1497,7 +1773,7 @@ mod tests {
             .build()
             .unwrap();
         let enroll_code = totp.generate_current().to_string();
-        crate::web_admin::confirm_totp_enrollment(&pool, &key, "admin", &enroll_code)
+        crate::web_admin::confirm_totp_enrollment(&pool, &key, account.id, &enroll_code)
             .await
             .unwrap();
         // The code that confirmed enrollment is itself now spent (replay
@@ -1505,22 +1781,12 @@ mod tests {
         // from the next time step.
         let next_code = totp.generate(now_unix() + 30).to_string();
 
-        let handle: AdminHandle = Arc::new(tokio::sync::RwLock::new(
-            crate::web_admin::load(&pool).await.unwrap().map(Arc::new),
-        ));
-        let gate = TokenGate::unconfigured(handle, pool.clone())
-            .with_admin(
-                Arc::new(tokio::sync::RwLock::new(
-                    crate::web_admin::load(&pool).await.unwrap().map(Arc::new),
-                )),
-                pool.clone(),
-            )
-            .with_secrets_key(key.clone());
+        let gate = TokenGate::unconfigured(pool.clone()).with_secrets_key(key.clone());
         let app = Router::new().route("/", get(|| async { "dashboard" }));
         (protect(app, gate), pool, key, next_code)
     }
 
-    /// An enrolled admin's login with the right password never yields a
+    /// An enrolled account's login with the right password never yields a
     /// session cookie until the second factor is also presented.
     #[tokio::test]
     async fn login_with_correct_password_and_no_second_factor_never_sessions() {
@@ -1548,9 +1814,12 @@ mod tests {
     /// A wrong second factor also never yields a session cookie.
     #[tokio::test]
     async fn login_with_wrong_second_factor_never_sessions() {
-        let (router, _pool, admin_key, _code) = enrolled_router().await;
-        let admin = crate::web_admin::load(&_pool).await.unwrap().unwrap();
-        let pending = pending_2fa_set_cookie(admin.session_key(), 0);
+        let (router, pool, admin_key, _code) = enrolled_router().await;
+        let account = crate::web_admin::load_by_username(&pool, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = pending_2fa_set_cookie(account.session_key(), account.id, 0);
         let pending_val = pending.split(';').next().unwrap().to_string();
         let _ = admin_key;
 
@@ -1578,9 +1847,12 @@ mod tests {
     #[tokio::test]
     async fn login_then_valid_totp_code_yields_a_session() {
         let (router, pool, key, code) = enrolled_router().await;
-        let _ = (&pool, &key);
-        let admin = crate::web_admin::load(&pool).await.unwrap().unwrap();
-        let pending = pending_2fa_set_cookie(admin.session_key(), 0);
+        let _ = &key;
+        let account = crate::web_admin::load_by_username(&pool, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = pending_2fa_set_cookie(account.session_key(), account.id, 0);
         let pending_val = pending.split(';').next().unwrap().to_string();
 
         let req = Request::builder()
@@ -1619,24 +1891,22 @@ mod tests {
         assert_eq!(router.oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
-    /// An existing admin with no TOTP enrolled is redirected to enrollment on
+    /// An existing account with no TOTP enrolled is redirected to enrollment on
     /// every browser GET except the setup page itself, and refused outright
     /// for anything else, so no other page loads until enrollment completes.
     #[tokio::test]
-    async fn unenrolled_admin_is_redirected_to_totp_setup_on_every_page() {
+    async fn unenrolled_account_is_redirected_to_totp_setup_on_every_page() {
         let pool = setup_pool().await;
-        crate::web_admin::create(&pool, "admin", "correct horse battery")
+        let account = crate::web_admin::create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let admin = crate::web_admin::load(&pool).await.unwrap().unwrap();
-        let handle: AdminHandle = Arc::new(tokio::sync::RwLock::new(Some(Arc::new(admin.clone()))));
-        let gate = TokenGate::unconfigured(handle, pool.clone());
+        let gate = TokenGate::unconfigured(pool.clone());
         let app = Router::new()
             .route("/", get(|| async { "dashboard" }))
             .route("/other", get(|| async { "other" }));
         let router = protect(app, gate);
 
-        let session = sign_session(admin.session_key(), now_unix() + 60);
+        let session = sign_session(account.session_key(), account.id, now_unix() + 60);
         let cookie = format!("{SESSION_COOKIE}={session}");
 
         let req = Request::builder()
@@ -1668,28 +1938,29 @@ mod tests {
     async fn corrupt_stored_secret_refuses_login_with_a_visible_message() {
         let pool = setup_pool().await;
         let key = test_secrets_key();
-        crate::web_admin::create(&pool, "admin", "correct horse battery")
+        let account = crate::web_admin::create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
         sqlx::query(&crate::db::q(
             &pool,
-            "UPDATE web_admin SET totp_secret = ?, totp_enrolled_at = ? WHERE id = 1",
+            "UPDATE web_accounts SET totp_secret = ?, totp_enrolled_at = ? WHERE id = ?",
         ))
         .bind(b"not a real ciphertext".to_vec())
         .bind(chrono::Utc::now().to_rfc3339())
+        .bind(account.id)
         .execute(&pool)
         .await
         .unwrap();
 
-        let handle: AdminHandle = Arc::new(tokio::sync::RwLock::new(
-            crate::web_admin::load(&pool).await.unwrap().map(Arc::new),
-        ));
-        let gate = TokenGate::unconfigured(handle, pool.clone()).with_secrets_key(key);
+        let gate = TokenGate::unconfigured(pool.clone()).with_secrets_key(key);
         let app = Router::new().route("/", get(|| async { "dashboard" }));
         let router = protect(app, gate);
 
-        let admin = crate::web_admin::load(&pool).await.unwrap().unwrap();
-        let pending = pending_2fa_set_cookie(admin.session_key(), 0);
+        let account = crate::web_admin::load_by_username(&pool, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = pending_2fa_set_cookie(account.session_key(), account.id, 0);
         let pending_val = pending.split(';').next().unwrap().to_string();
 
         let req = Request::builder()
@@ -1709,6 +1980,64 @@ mod tests {
         assert!(
             html.contains("verification failed"),
             "the failure must be visible, not silent: {html}"
+        );
+    }
+
+    /// Accepting an invite creates a second account that can sign in on its
+    /// own session, independent of the inviter's.
+    #[tokio::test]
+    async fn accepting_an_invite_signs_in_a_second_account() {
+        let pool = setup_pool().await;
+        let admin = crate::web_admin::create_first(&pool, "admin", "correct horse battery")
+            .await
+            .unwrap();
+        let (token, _id) = crate::web_admin::create_invite(&pool, admin.id)
+            .await
+            .unwrap();
+        let gate = TokenGate::unconfigured(pool.clone());
+        let app = Router::new().route("/", get(|| async { "dashboard" }));
+        let router = protect(app, gate);
+
+        let req = Request::builder()
+            .uri(format!("/invite/{token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "a live invite's page is reachable unauthenticated"
+        );
+
+        let body = "username=second&password=another+long+password&confirm=another+long+password";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/invite/{token}"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/account/2fa/setup"
+        );
+        assert!(
+            crate::web_admin::load_by_username(&pool, "second")
+                .await
+                .unwrap()
+                .is_some(),
+            "the invited account is persisted"
+        );
+
+        // A second acceptance of the same (now used) token is refused.
+        let req = Request::builder()
+            .uri(format!("/invite/{token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "a used invite link no longer resolves"
         );
     }
 }
