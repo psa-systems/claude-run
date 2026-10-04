@@ -6360,6 +6360,147 @@ mod tests {
     }
 
     #[test]
+    fn finalize_resumed_success_on_a_moved_remote_branch_still_strips_the_draft_prefix() {
+        // CLAUDE-382 criterion 7: the resumed run's clone predates a commit the
+        // runner itself pushed onto the branch while the run was working (e.g.
+        // a "branch was behind its base" update), so the remote tip has moved
+        // and neither SHA is an ancestor of the other. The runner fetches,
+        // merges the remote branch in, pushes the merge (never force), adopts
+        // the WIP PR the earlier timeout salvage opened, and still strips the
+        // `WIP: ` prefix via `mark_pr_ready` and finalizes as Code Review.
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "localsha\n")
+                .ok(
+                    "git",
+                    &["ls-remote", "--heads", "origin", "feat/x"],
+                    "remotesha\trefs/heads/feat/x\n",
+                )
+                .ok("git", &["fetch", "origin", "feat/x"], "")
+                .fail(
+                    "git",
+                    &["merge-base", "--is-ancestor", "remotesha", "localsha"],
+                    1,
+                    "",
+                )
+                .ok("git", &["merge", "--no-edit", "origin/feat/x"], "")
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                // `pr search` is called twice with identical args: once by
+                // `find_open_pr` (adopting the WIP PR the timeout salvage left
+                // open) and again by `mark_pr_ready` after the issue advances.
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    r#"{"pull_requests":[{"number":7,"title":"WIP: feat: x","head_ref":"feat/x","head_sha":"localsha"}]}"#,
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "edit",
+                        "contoso/claude-run#7",
+                        "--title",
+                        "feat: x",
+                    ],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git merge --no-edit origin/feat/x"),
+            "a moved remote branch must be merged in: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+            "the merge result must still be pushed: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("pr create")),
+            "the adopted PR must not be re-created: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("--force")),
+            "no force anywhere: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(
+                |c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"
+            ),
+            "a resumed success on a moved branch must still strip the WIP: prefix: {calls:?}"
+        );
+    }
+
+    #[test]
     fn default_prompt_tells_a_resumed_run_to_read_the_prs_comments() {
         // CLAUDE-379 criterion 5: a re-queue's rendered prompt must direct the
         // agent to the PR's own comments, not just the issue's, since a

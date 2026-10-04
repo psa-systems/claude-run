@@ -515,11 +515,11 @@ The probe is skipped entirely when the action sets no forge `token_ref`, and ski
 
 The CLAUDE-170 idempotency reconcile asks the forge for an already-open PR on the branch before creating one (`fj pr search`, an issue-category call). That lookup is an optimization: `fj pr create` (repository-category) is what delivers the work, and the two can fail independently, so a failed lookup must not discard a paid Claude run.
 
-On the three create-capable arms (remote branch absent, remote equal to local, remote fast-forwardable), a failed lookup is treated as "unknown, assume none": the runner logs a `warn`, records a `warn` run event naming the CLI error and the repo (visible on the action page under the issue key), and proceeds to `pr create`. The adopt path is unchanged when the lookup succeeds.
+On every create-capable arm (remote branch absent, remote equal to local, remote fast-forwardable, and - since CLAUDE-382 - remote diverged after a clean merge), a failed lookup is treated as "unknown, assume none": the runner logs a `warn`, records a `warn` run event naming the CLI error and the repo (visible on the action page under the issue key), and proceeds to `pr create`. The adopt path is unchanged when the lookup succeeds.
 
 That degraded path can race a PR that already exists. Forgejo answers such a create with 409 and the message `pull request already exists for these targets [...]`; on that specific failure the runner retries the lookup **exactly once** and adopts the PR when the retry succeeds. If it still cannot produce one, the error names both causes (the lookup failure and the create failure) rather than reporting a bare "PR creation failed".
 
-The diverged arm keeps the lookup fatal: there the lookup result is the only alternative to a force-push, so an assumed "none" would raise the refusal for the wrong reason. Its error distinguishes a failed search ("the open-PR lookup failed ..., so whether an open PR exists is UNKNOWN") from a genuine "no open PR exists for it". No `--force` is issued on any arm.
+CLAUDE-382: the diverged arm (neither SHA is an ancestor of the other, typically because the runner itself pushed its own "branch was behind its base" update onto the branch while the run was working) first fetches `origin/<branch>` and merges it into the local work with `git merge --no-edit`, then pushes the fast-forward result and falls through to the same lookup-or-create path as every other arm. `--force` / `--force-with-lease` is never issued on any arm. Only a merge CONFLICT is fatal: the merge is aborted immediately and the error names the branch, both SHAs, and the workdir, stating that any unpushed work is preserved only if the cleanup check finds it there.
 
 #### Credential injection (CLAUDE-26)
 
