@@ -16,7 +16,7 @@
 #                        and the build-binary.yml workflow
 
 # syntax=docker/dockerfile:1.6
-FROM dev.a8n.run/pandoras-box/rust-builder-musl:v1.1.0-rust1.98.1-alpine AS builder
+FROM dev.a8n.run/pandoras-box/rust-builder-musl:v1.2.0-rust1.98.1-alpine AS builder
 
 WORKDIR /build
 
