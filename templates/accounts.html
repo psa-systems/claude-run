@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Accounts - claude-run{% endblock %}
+{% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><span class="current">Accounts</span>{% endblock %}
+{% block main %}
+
+<h2>Accounts</h2>
+
+{% if let Some(e) = error %}
+<div class="card" style="border-color: var(--bad); margin-bottom: 16px;">
+  <strong style="color: var(--bad);">{{ e }}</strong>
+</div>
+{% endif %}
+
+{% if let Some(link) = new_invite_link %}
+<div class="card" style="border-color: var(--ok); margin-bottom: 16px;">
+  <strong style="color: var(--ok);">Invite created.</strong>
+  <span class="dim">This link is shown once and works for 72 hours. Share it with the person you are inviting:</span>
+  <div class="kv" style="margin-top: 8px;"><dt>Link</dt><dd>{{ link }}</dd></div>
+</div>
+{% endif %}
+
+<div class="card" style="margin-bottom: 16px;">
+  <h3>Signed-in accounts</h3>
+  <span class="dim">Every account has full access; there are no roles yet. An account cannot remove itself, and the last remaining account cannot be removed.</span>
+  <table style="margin-top: 12px;">
+    <thead>
+      <tr><th>Username</th><th>2FA</th><th>Created</th><th>Invited by</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for a in accounts %}
+      <tr>
+        <td class="mono">{{ a.username }}{% if a.id == current_id %} <span class="badge neutral">you</span>{% endif %}</td>
+        <td>{% if a.totp_enrolled %}<span class="badge ok">enrolled</span>{% else %}<span class="badge warn">not enrolled</span>{% endif %}</td>
+        <td class="dim">{{ a.created_at }}</td>
+        <td class="dim">{% if let Some(c) = a.created_by %}{{ c }}{% else %}-{% endif %}</td>
+        <td class="row-actions">
+          {% if a.id != current_id %}
+          <form method="post" action="/settings/accounts/remove">
+            <input type="hidden" name="id" value="{{ a.id }}">
+            <button type="submit" class="btn">Remove</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card" style="margin-bottom: 16px;">
+  <h3>Invites</h3>
+  <span class="dim">A single-use link that lets someone create their own account. It expires 72 hours after creation if unused.</span>
+  <form method="post" action="/settings/accounts/invite" style="margin-top: 12px;">
+    <button type="submit" class="btn">Create invite</button>
+  </form>
+  <table style="margin-top: 12px;">
+    <thead>
+      <tr><th>Created by</th><th>Created</th><th>Expires</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for i in invites %}
+      <tr>
+        <td class="mono">{{ i.created_by_username }}</td>
+        <td class="dim">{{ i.created_at }}</td>
+        <td class="dim">{{ i.expires_at }}</td>
+        <td class="row-actions">
+          <form method="post" action="/settings/accounts/revoke">
+            <input type="hidden" name="id" value="{{ i.id }}">
+            <button type="submit" class="btn">Revoke</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% endblock %}
