@@ -2601,6 +2601,20 @@ fn commit_timeout_wip(workdir: &Path) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// The cost line for a timeout comment. A killed run has no terminal
+/// `result` event, so `r.cost` defaults to 0.0 whether or not any money was
+/// actually spent; printing that default as `Cost: $0 USD` lies to a human
+/// reading the comment about a run that may well have cost real money.
+/// `r.raw` holding `total_cost_usd` is what distinguishes a real reported
+/// cost (the killed-background-task path, which does capture a terminal
+/// result before failing) from a run killed before any result landed.
+fn timeout_cost_line(r: &ClaudeResult) -> String {
+    match r.raw.get("total_cost_usd").and_then(|v| v.as_f64()) {
+        Some(cost) => format!("Cost: ${cost} USD"),
+        None => "Cost: unknown (the run was killed before it reported one)".to_string(),
+    }
+}
+
 /// PR comment explaining why a timeout-salvaged draft PR (CLAUDE-379) exists:
 /// the timeout limit, the agent's cost and summary at kill time, whether the
 /// branch tip is the runner's own WIP commit or the agent's, and a note that
@@ -2620,7 +2634,7 @@ fn timeout_salvage_pr_comment(
         "Claude AI agent run TIMED OUT; this draft PR salvages the work in progress at kill time.".to_string(),
         String::new(),
         format!("Timeout limit: {}s", timeout.as_secs()),
-        format!("Cost: ${} USD", r.cost),
+        timeout_cost_line(r),
         String::new(),
         last_commit_note,
         String::new(),
@@ -2678,7 +2692,7 @@ fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport)
     lines.push(String::new());
     lines.push(r.summary.clone());
     lines.push(String::new());
-    lines.push(format!("Cost: ${} USD", r.cost));
+    lines.push(timeout_cost_line(r));
 
     let mut body = lines.join("\n");
     body.push_str(&raw_event_details(&r.raw));
@@ -3279,6 +3293,48 @@ mod tests {
         assert!(body.contains("<details>\n<summary>Raw result event</summary>"));
         assert!(body.contains("```json"));
         assert!(body.contains("\"api_error_status\": \"529\""));
+    }
+
+    /// A killed run has no terminal `result` event, so `r.cost` defaults to
+    /// 0.0 whether or not the run actually cost money. The timeout comments
+    /// must say "unknown", never claim `$0 USD`.
+    #[test]
+    fn timeout_comments_report_cost_unknown_when_no_result_event_landed() {
+        let r = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "");
+        let salvage = SalvageReport {
+            nothing_to_salvage: true,
+            ..Default::default()
+        };
+        let body = timeout_comment(&r, Duration::from_secs(60), &salvage);
+        assert!(
+            body.contains("Cost: unknown (the run was killed before it reported one)"),
+            "{body}"
+        );
+        assert!(!body.contains("Cost: $0 USD"), "{body}");
+
+        let pr_body = timeout_salvage_pr_comment(&r, Duration::from_secs(60), None);
+        assert!(
+            pr_body.contains("Cost: unknown (the run was killed before it reported one)"),
+            "{pr_body}"
+        );
+        assert!(!pr_body.contains("Cost: $0 USD"), "{pr_body}");
+    }
+
+    /// When the stream log did capture a terminal result with a real cost
+    /// (e.g. the killed-background-task path), the timeout comments still
+    /// print the tracked dollar figure rather than "unknown".
+    #[test]
+    fn timeout_comments_report_the_tracked_cost_when_a_result_event_landed() {
+        let mut r = ClaudeResult::synthesized("claude exited 124, see stream.jsonl", "");
+        r.cost = 1.23;
+        r.raw = serde_json::json!({"type": "result", "total_cost_usd": 1.23});
+        let salvage = SalvageReport {
+            nothing_to_salvage: true,
+            ..Default::default()
+        };
+        let body = timeout_comment(&r, Duration::from_secs(60), &salvage);
+        assert!(body.contains("Cost: $1.23 USD"), "{body}");
+        assert!(!body.contains("unknown"), "{body}");
     }
 
     /// A synthesized failure (empty `raw`) omits the `<details>` block.
