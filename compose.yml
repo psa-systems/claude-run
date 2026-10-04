@@ -61,6 +61,21 @@ services:
       # `claude` sessions the daemon spawns inherit this, since nothing in
       # src/ calls env_clear or env_remove.
       DOCKER_HOST: tcp://127.0.0.1:2375
+      # CLAUDE-383: the images CI's `runs-on: ${{ vars.RUNS_ON_* }}` resolves to,
+      # so the agent can run the same images CI runs instead of guessing a
+      # literal tag. In a workflow the same name is a Forgejo Actions variable
+      # that resolves to a RUNNER LABEL; here the value is the pullable IMAGE
+      # REFERENCE the label's runner advertises, so `docker run
+      # "$RUNS_ON_RUST_BUILDER_MUSL"` and a compose `image: ${RUNS_ON_RUST_BUILDER_MUSL}`
+      # work directly. The value is always a `dev.a8n.run` image, never from
+      # the GitHub Container Registry.
+      RUNS_ON_OPENSUSE_BASE_HEAVY: dev.a8n.run/pandoras-box/opensuse-dev:v1.13.0-leap-16.0
+      RUNS_ON_OPENSUSE_BASE_MASSIVE: dev.a8n.run/pandoras-box/opensuse-dev:v1.13.0-leap-16.0
+      RUNS_ON_OPENSUSE_BASE_LIGHT: dev.a8n.run/pandoras-box/opensuse-base:v1.13.0-leap-16.0
+      RUNS_ON_OPENSUSE_BASE_MEDIUM: dev.a8n.run/pandoras-box/opensuse-base:v1.13.0-leap-16.0
+      RUNS_ON_RUST_BUILDER_MUSL: dev.a8n.run/pandoras-box/rust-builder-musl:v1.2.0-rust1.98.1-alpine
+      RUNS_ON_RUST_BUILDER_GLIBC: dev.a8n.run/pandoras-box/rust-builder-glibc:v1.2.0-rust1.98.1-trixie
+      RUNS_ON_RUST_BUILDER_GLIBC_WINDOWS: dev.a8n.run/pandoras-box/rust-builder-glibc-windows:v1.2.0-rust1.98.1-trixie
       # CLAUDE-250: uncomment together with the `claude-run-database-url` secret
       # below to put the runner state on the `postgres` profile's server instead
       # of the SQLite file on claude-bot-data. Unset means SQLite, which is what
