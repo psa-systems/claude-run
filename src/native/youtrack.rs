@@ -1212,6 +1212,8 @@ async fn process_job(
             &claude_result,
             pr_strategy,
             stream_log.as_deref(),
+            limits.claude_timeout,
+            resume.is_some(),
         )
     });
     // ---- record a newly opened PR against its issue ----
@@ -1221,11 +1223,17 @@ async fn process_job(
     // itself: it is a synchronous state machine whose own unit tests run with
     // no tokio runtime, so the write happens here, right after it returns.
     if resume.is_none() {
-        if let Ok(Finalized::CodeReview {
-            pr_number: Some(pr_number),
-            head_branch: Some(head_branch),
-            ..
-        }) = &finalize_res
+        if let Ok(
+            Finalized::CodeReview {
+                pr_number: Some(pr_number),
+                head_branch: Some(head_branch),
+                ..
+            }
+            | Finalized::TimedOut {
+                pr_number: Some(pr_number),
+                head_branch: Some(head_branch),
+            },
+        ) = &finalize_res
         {
             record_new_pr(
                 pool,
@@ -1283,30 +1291,32 @@ async fn process_job(
     // skipped, but a dirty tree or stash is work that never made it into the
     // PR at all, so it is checked and preserved just the same.
     crate::blocking::in_place(|| match &finalize_res {
-        Ok(Finalized::CodeReview { .. }) => {
-            match crate::workdir::uncommitted_or_stashed(&workdir_path) {
-                Ok(dirty) if dirty.is_empty() => cleanup_workdir(&workdir_path),
-                Ok(dirty) => {
-                    warn!(
-                        action = %action.name,
-                        key = %key,
-                        workdir = %workdir_path.display(),
-                        dirty_paths = dirty.paths.len(),
-                        stashes = dirty.stashes.len(),
-                        "workdir preserved after PR: uncommitted work not in the PR"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        action = %action.name,
-                        key = %key,
-                        workdir = %workdir_path.display(),
-                        error = %e,
-                        "workdir preserved after PR: uncommitted-work check failed"
-                    );
-                }
+        Ok(Finalized::CodeReview { .. })
+        | Ok(Finalized::TimedOut {
+            pr_number: Some(_),
+            head_branch: Some(_),
+        }) => match crate::workdir::uncommitted_or_stashed(&workdir_path) {
+            Ok(dirty) if dirty.is_empty() => cleanup_workdir(&workdir_path),
+            Ok(dirty) => {
+                warn!(
+                    action = %action.name,
+                    key = %key,
+                    workdir = %workdir_path.display(),
+                    dirty_paths = dirty.paths.len(),
+                    stashes = dirty.stashes.len(),
+                    "workdir preserved after PR: uncommitted work not in the PR"
+                );
             }
-        }
+            Err(e) => {
+                tracing::error!(
+                    action = %action.name,
+                    key = %key,
+                    workdir = %workdir_path.display(),
+                    error = %e,
+                    "workdir preserved after PR: uncommitted-work check failed"
+                );
+            }
+        },
         _ => cleanup_or_preserve(&workdir_path, &action.name, key),
     });
 
@@ -1805,7 +1815,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "Steps:",
         "1. Run 'yt issue inspect {{key}}' to read the full description and acceptance criteria. If you believe {{key}} is too large to finish and verify within the time budget, post one short comment on {{key}} with 'yt issue comment {{key}}' saying why and which layers you expect to be at risk, early, before you start changing code. Do not stop for this and do not use the blocker markers for this: post the comment, then continue with the work regardless. There is no size limit and no refusal; this is a paper trail for a possible timeout, not a decision point.",
         "2. If any acceptance criterion depends on another issue, repo, endpoint, or symbol, verify that dependency exists in the source of truth NOW, before writing code: read the actual file, query the endpoint, or grep for the symbol on the current default branch. Do NOT trust another issue's Done or Resolved state - an issue marked Done may not have shipped its code. If the depended-on artifact is missing or contradicts this issue, take the blocker path below instead of building against it.",
-        "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
+        "3. If {{existing_branch}} is empty, create a feature branch off the default branch (name it for the change, e.g. 'fix/...', 'feat/...', 'chore/...'). If {{existing_branch}} is NOT empty, that branch is already checked out here with its open PR at {{existing_pr_url}}: this issue was re-queued onto its own existing PR, so run 'yt issue inspect {{key}}' and read the newest comments for what needs fixing, ALSO read that PR's own comments (a prior timed-out run may have left one explaining what it salvaged and why, e.g. a draft PR opened from uncommitted work at kill time), then fix it on this SAME branch - do not create another branch or PR. Either way, do ALL work on that branch and leave it checked out as HEAD when you stop. Never run 'git checkout main' / 'git switch main' or otherwise move HEAD off the feature branch: the runner opens the PR from whatever branch is checked out, so switching back to 'main' strands your work on the unpushed branch and produces an empty PR.",
         "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit whose body ends with the bare '#{{key}}' reference, so a kill leaves committed progress instead of none; the final commit still carries the full PR-description format from step 7 and stays the branch tip.",
         "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (e.g. the repo's 'just check', tests, or build) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success.",
         "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
@@ -1980,8 +1990,15 @@ enum Finalized {
     /// complete, partial, or absent, so the issue is NOT marked Failed: a
     /// timeout-specific comment is posted and the AI Agent field is advanced to
     /// Needs Review only when still Working (a human/agent-advanced state is left
-    /// untouched).
-    TimedOut,
+    /// untouched). Any local work (uncommitted changes and/or local commits) is
+    /// salvaged as a draft PR (CLAUDE-379) before the comment is composed, so
+    /// `pr_number`/`head_branch` carry the salvaged PR's identity exactly like
+    /// [`Finalized::CodeReview`] does (`None` when there was nothing to salvage
+    /// or salvaging failed).
+    TimedOut {
+        pr_number: Option<u64>,
+        head_branch: Option<String>,
+    },
 }
 
 impl Finalized {
@@ -1991,7 +2008,7 @@ impl Finalized {
             Finalized::NoCodeChange => "No Code Change",
             Finalized::CodeReview { .. } => "Code Review",
             Finalized::Failed => "Failed",
-            Finalized::TimedOut => "Timed Out",
+            Finalized::TimedOut { .. } => "Timed Out",
         }
     }
 }
@@ -2014,6 +2031,8 @@ fn finalize(
     claude_result: &ClaudeResult,
     pr_strategy: crate::action::PrStrategy,
     stream_log: Option<&Path>,
+    claude_timeout: Duration,
+    resumed: bool,
 ) -> Result<Finalized> {
     let needs_review = workdir.join(NEEDS_REVIEW_MARKER);
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
@@ -2061,6 +2080,18 @@ fn finalize(
         match forge.create_pr(workdir, &host, pr_strategy) {
             Ok(pr) => {
                 let url = pr_url(job, &pr);
+                // A resumed run (CLAUDE-275) may be adopting a draft PR a
+                // prior timed-out run salvaged (CLAUDE-379); now that the run
+                // succeeded, strip the draft/`WIP: ` status. Best-effort: a
+                // failure here does not block the success outcome, it just
+                // leaves the PR looking like a draft until fixed by hand.
+                if resumed {
+                    if let Some(pr_number) = pr.number {
+                        if let Err(e) = forge.mark_pr_ready(&host, &job.repo_path, pr_number) {
+                            error!(key = %job.key, pr_number, error = %e, "clearing draft status on the resumed PR failed (continuing)");
+                        }
+                    }
+                }
                 let body = success_comment(claude_result, &url);
                 let body = append_compaction_note(&body, stream_log, &job.key);
                 comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
@@ -2089,11 +2120,22 @@ fn finalize(
     } else if claude_result.timed_out {
         // Timeout (exit 124). Ambiguous outcome: the agent may have
         // finished the work yet a lingering background task held the process
-        // open past the limit. Do NOT mark Failed. Comment with the situation,
-        // and advance AI Agent to Needs Review only when it is still Working;
-        // if a human/agent already moved it on (Done, Code Review, ...), leave
-        // the field untouched so we never stomp an advanced state.
-        let body = timeout_comment(claude_result);
+        // open past the limit. Do NOT mark Failed. Salvage any local work
+        // (CLAUDE-379) as a draft PR before composing the comment, so a human
+        // or a re-queue has something to pick back up from rather than
+        // losing it, then advance AI Agent to Needs Review only when it is
+        // still Working; if a human/agent already moved it on (Done, Code
+        // Review, ...), leave the field untouched so we never stomp an
+        // advanced state.
+        let salvage = salvage_timeout_work(
+            forge,
+            job,
+            workdir,
+            pr_strategy,
+            claude_result,
+            claude_timeout,
+        );
+        let body = timeout_comment(claude_result, claude_timeout, &salvage);
         if let Err(e) = backend.comment(&job.key, &body) {
             warn!(key = %job.key, error = %e, "timeout comment failed (continuing)");
         }
@@ -2105,7 +2147,10 @@ fn finalize(
         } else {
             info!(key = %job.key, current = %current, "timeout: AI Agent already advanced off Working, leaving untouched");
         }
-        Ok(Finalized::TimedOut)
+        Ok(Finalized::TimedOut {
+            pr_number: salvage.pr.as_ref().and_then(|p| p.number),
+            head_branch: salvage.pr.as_ref().and_then(|p| p.head_branch.clone()),
+        })
     } else {
         // Failure: crash, empty prompt, or pre failure.
         let body = failure_comment(claude_result);
@@ -2393,25 +2438,231 @@ fn pr_failure_comment(r: &ClaudeResult, err: &Error, work: &WorkLocation) -> Str
     body
 }
 
-/// Timeout-specific comment. Surfaces the ambiguity (the work may be
+/// Outcome of attempting to salvage a timed-out run's local work as a draft PR
+/// (CLAUDE-379), so a human or a re-queue has something to pick back up from
+/// rather than losing work a timeout killed mid-flight. Every failure point
+/// (reading git state, committing, opening the PR, commenting on it) is
+/// recorded separately, never swallowed into one generic "salvage failed", so
+/// the issue's timeout comment can name exactly which step a human needs to
+/// redo by hand.
+#[derive(Default)]
+struct SalvageReport {
+    /// Nothing local beyond the remote default branch and a clean working
+    /// tree: no salvage was attempted.
+    nothing_to_salvage: bool,
+    /// The working-tree commit step failed (dirty tree present).
+    commit_error: Option<String>,
+    /// Pushing the branch and/or opening the draft PR failed.
+    open_error: Option<String>,
+    /// Posting the timeout-explanation comment on the opened PR failed.
+    comment_error: Option<String>,
+    /// The draft PR opened (or an already-open one adopted), if the open
+    /// step succeeded.
+    pr: Option<PullRequest>,
+    /// `pr_url(job, &pr)` computed at salvage time, for the issue comment.
+    pr_url: Option<String>,
+}
+
+/// Commit, push, and open a draft PR from a timed-out run's local work
+/// (CLAUDE-379). Reuses [`workdir::local_only_work`], the exact query the
+/// cleanup/preserve decision runs, so "is there anything to salvage" can
+/// never disagree with "should the workdir be preserved". Every step that can
+/// fail independently (reading git state, the WIP commit, the push/PR-create,
+/// the PR comment) is logged at `error` here and recorded on the returned
+/// report rather than swallowed.
+fn salvage_timeout_work(
+    forge: &dyn Forge,
+    job: &YoutrackJob,
+    workdir: &Path,
+    pr_strategy: crate::action::PrStrategy,
+    claude_result: &ClaudeResult,
+    timeout: Duration,
+) -> SalvageReport {
+    let work = match crate::workdir::local_only_work(workdir) {
+        Ok(w) => w,
+        Err(e) => {
+            error!(key = %job.key, error = %e, "timeout salvage: reading the workdir's git state failed; nothing salvaged");
+            return SalvageReport {
+                open_error: Some(format!("reading the workdir's git state failed: {e}")),
+                ..Default::default()
+            };
+        }
+    };
+
+    if work.dirty.paths.is_empty() && work.unpushed_branches.is_empty() {
+        return SalvageReport {
+            nothing_to_salvage: true,
+            ..Default::default()
+        };
+    }
+
+    let mut report = SalvageReport::default();
+    if !work.dirty.paths.is_empty() {
+        if let Err(e) = commit_timeout_wip(workdir) {
+            error!(key = %job.key, error = %e, "timeout salvage: committing the uncommitted working tree failed");
+            report.commit_error = Some(e);
+        }
+    }
+
+    let host = host_only(&job.repo_host);
+    match forge.create_pr_with_draft(workdir, &host, pr_strategy, true) {
+        Ok(pr) => {
+            report.pr_url = Some(pr_url(job, &pr));
+            if let Some(pr_number) = pr.number {
+                let body = timeout_salvage_pr_comment(
+                    claude_result,
+                    timeout,
+                    report.commit_error.as_deref(),
+                );
+                let scratch = std::env::temp_dir()
+                    .join(format!("claude-run-timeout-pr-comment-{}.md", job.key));
+                match std::fs::write(&scratch, &body) {
+                    Ok(()) => {
+                        if let Err(e) = forge.pr_comment(&host, &job.repo_path, pr_number, &scratch)
+                        {
+                            error!(key = %job.key, pr_number, error = %e, "timeout salvage: posting the PR comment failed");
+                            report.comment_error = Some(e.to_string());
+                        }
+                        if let Err(e) = std::fs::remove_file(&scratch) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                error!(path = %scratch.display(), error = %e, "timeout salvage: removing the PR comment scratch file failed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(key = %job.key, pr_number, error = %e, "timeout salvage: writing the PR comment scratch file failed");
+                        report.comment_error =
+                            Some(format!("writing the comment body failed: {e}"));
+                    }
+                }
+            } else {
+                warn!(key = %job.key, "timeout salvage: opened PR reported no number; skipping the PR comment");
+            }
+            report.pr = Some(pr);
+            report
+        }
+        Err(e) => {
+            error!(key = %job.key, error = %e, "timeout salvage: opening the draft PR failed");
+            report.open_error = Some(e.to_string());
+            report
+        }
+    }
+}
+
+/// Commit the dirty working tree of a timed-out run as a single `WIP:
+/// uncommitted changes at timeout` commit (CLAUDE-379), so it travels with
+/// whatever branch a draft PR gets opened from rather than being lost once
+/// the workdir is garbage-collected. `.claude-run-*` marker files are
+/// excluded by pathspec (operator/runner state, never agent work); gitignored
+/// files are never staged by a bare `git add -A` to begin with.
+fn commit_timeout_wip(workdir: &Path) -> std::result::Result<(), String> {
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(["add", "-A", "--", ".", ":!.claude-run-*"])
+        .output()
+        .map_err(|e| format!("running `git add` failed: {e}"))?;
+    if !add.status.success() {
+        return Err(format!(
+            "`git add` failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        ));
+    }
+    let commit = Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(["commit", "-m", "WIP: uncommitted changes at timeout"])
+        .output()
+        .map_err(|e| format!("running `git commit` failed: {e}"))?;
+    if !commit.status.success() {
+        return Err(format!(
+            "`git commit` failed: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// PR comment explaining why a timeout-salvaged draft PR (CLAUDE-379) exists:
+/// the timeout limit, the agent's cost and summary at kill time, whether the
+/// branch tip is the runner's own WIP commit or the agent's, and a note that
+/// re-queuing resumes on this branch rather than opening a second PR.
+fn timeout_salvage_pr_comment(
+    r: &ClaudeResult,
+    timeout: Duration,
+    commit_error: Option<&str>,
+) -> String {
+    let last_commit_note = match commit_error {
+        None => "The last commit on this branch is a `WIP: uncommitted changes at timeout` commit the runner made from the working tree at kill time, not the agent's own work.".to_string(),
+        Some(e) => format!(
+            "Committing the working tree's uncommitted changes failed ({e}); only the agent's own prior commits (if any) made it onto this branch."
+        ),
+    };
+    [
+        "Claude AI agent run TIMED OUT; this draft PR salvages the work in progress at kill time.".to_string(),
+        String::new(),
+        format!("Timeout limit: {}s", timeout.as_secs()),
+        format!("Cost: ${} USD", r.cost),
+        String::new(),
+        last_commit_note,
+        String::new(),
+        "Re-queuing this issue (set AI Agent = Queued) resumes on this branch rather than opening a second PR.".to_string(),
+        String::new(),
+        r.summary.clone(),
+    ]
+    .join("\n")
+}
+
+/// Timeout-specific issue comment. Surfaces the ambiguity (the work may be
 /// complete despite the kill, e.g. a backgrounded command held the process open
-/// past the limit), states the runner did NOT mark the issue Failed, and points
-/// a human at the branch/PR and the run log (`r.error` carries the log path).
-fn timeout_comment(r: &ClaudeResult) -> String {
-    let mut body = [
+/// past the limit), states the runner did NOT mark the issue Failed, names the
+/// salvage outcome (CLAUDE-379), and points a human at the branch/PR and the
+/// run log (`r.error` carries the log path).
+fn timeout_comment(r: &ClaudeResult, timeout: Duration, salvage: &SalvageReport) -> String {
+    let mut lines = vec![
         "Claude AI agent run TIMED OUT (the run hit its time limit and was killed):".to_string(),
         String::new(),
         format!("Details: {}", r.error),
+        format!("Timeout limit: {}s", timeout.as_secs()),
         String::new(),
         "The agent may have completed all, some, or none of the work before being killed. A backgrounded command can hold the process open past the limit even after the functional work is done, so this is not necessarily a failure. The runner did NOT mark this issue Failed.".to_string(),
         String::new(),
-        "A human should inspect the branch/PR and the run log above, then either resolve the issue manually or re-queue it (set AI Agent = Queued).".to_string(),
-        String::new(),
-        r.summary.clone(),
-        String::new(),
-        format!("Cost: ${} USD", r.cost),
-    ]
-    .join("\n");
+    ];
+
+    if salvage.nothing_to_salvage {
+        lines.push("No local work was found to salvage (clean working tree, no commits ahead of the remote default branch).".to_string());
+    } else {
+        if let Some(e) = &salvage.commit_error {
+            lines.push(format!(
+                "Committing the uncommitted working tree failed: {e}"
+            ));
+        }
+        match (&salvage.pr_url, &salvage.open_error) {
+            (Some(url), _) => {
+                lines.push(format!(
+                    "Work in progress was salvaged as a draft PR: {url}"
+                ));
+                if let Some(e) = &salvage.comment_error {
+                    lines.push(format!(
+                        "Posting the explanation comment on that PR failed: {e}"
+                    ));
+                }
+            }
+            (None, Some(e)) => {
+                lines.push(format!("Salvaging the work as a draft PR failed: {e}"));
+            }
+            (None, None) => {}
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("A human should inspect the branch/PR and the run log above, then either resolve the issue manually or re-queue it (set AI Agent = Queued); a re-queue resumes on the salvaged branch rather than starting over.".to_string());
+    lines.push(String::new());
+    lines.push(r.summary.clone());
+    lines.push(String::new());
+    lines.push(format!("Cost: ${} USD", r.cost));
+
+    let mut body = lines.join("\n");
     body.push_str(&raw_event_details(&r.raw));
     body
 }
@@ -4028,6 +4279,8 @@ mod tests {
             &ClaudeResult::synthesized("e", "s"),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -4080,6 +4333,8 @@ mod tests {
             &ClaudeResult::synthesized("e", "s"),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -4124,6 +4379,8 @@ mod tests {
             &ClaudeResult::synthesized("e", "s"),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -4170,6 +4427,8 @@ mod tests {
             &ClaudeResult::synthesized("e", "s"),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -4207,6 +4466,8 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -4270,6 +4531,8 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -4306,6 +4569,8 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -4412,6 +4677,8 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -4468,6 +4735,8 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -4979,6 +5248,8 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -5048,6 +5319,8 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -5150,6 +5423,8 @@ mod tests {
             &ok_result(),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -5213,6 +5488,8 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
@@ -5253,6 +5530,8 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -5285,6 +5564,8 @@ mod tests {
             &claude,
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(res, Finalized::Failed);
@@ -5326,9 +5607,17 @@ mod tests {
             &timed_out_result(),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
-        assert_eq!(res, Finalized::TimedOut);
+        assert_eq!(
+            res,
+            Finalized::TimedOut {
+                pr_number: None,
+                head_branch: None
+            }
+        );
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls
@@ -5371,9 +5660,17 @@ mod tests {
             &timed_out_result(),
             PrStrategy::Branch,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
-        assert_eq!(res, Finalized::TimedOut);
+        assert_eq!(
+            res,
+            Finalized::TimedOut {
+                pr_number: None,
+                head_branch: None
+            }
+        );
         let calls = runner.calls.lock().unwrap();
         // The field is read but never written.
         assert!(
@@ -5384,6 +5681,591 @@ mod tests {
         );
         assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    // ---- CLAUDE-379: salvage timed-out work as a draft PR -----------------
+
+    /// A single-branch clone of `origin` with one tracked file modified in the
+    /// working tree but never staged or committed: the real git state
+    /// `workdir::local_only_work` reports as a dirty tree (nothing unpushed).
+    /// `salvage_timeout_work` reads this directly with real `git`, never
+    /// through a `CommandRunner`, so this fixture is real on disk; every
+    /// subsequent push/PR-create/comment call below still goes through the
+    /// backend's `StubRunner` regardless of what branches this clone actually
+    /// has, exactly like the non-timeout `finalize_success_*` tests.
+    fn dirty_single_branch_clone(base: &Path) -> PathBuf {
+        let origin = base.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init"]);
+        set_identity(&origin);
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-m", "feat: x"]);
+        let clone = base.join("clone");
+        git_in(
+            base,
+            &[
+                "clone",
+                "--single-branch",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        set_identity(&clone);
+        std::fs::write(clone.join("f.txt"), "wip change").unwrap();
+        clone
+    }
+
+    #[test]
+    fn finalize_timeout_salvages_dirty_tree_opens_draft_pr_and_comments() {
+        // A dirty tree at kill time is committed as the runner's own WIP
+        // commit, pushed, opened as a draft (`WIP: `-prefixed title) PR, and
+        // the PR gets a comment explaining the timeout. The issue still lands
+        // on Needs Review and the TimedOut outcome carries the PR so
+        // `record_new_pr` can store it exactly like a successful run (CLAUDE-275).
+        let base = tempfile::tempdir().unwrap();
+        let clone = dirty_single_branch_clone(base.path());
+        let git_dir = clone.join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let scratch = std::env::temp_dir().join("claude-run-timeout-pr-comment-MK-16.md");
+        let _ = std::fs::remove_file(&scratch);
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%s", "feat/x"],
+                    "feat: agent work\n",
+                )
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: agent work",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":9,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/9"}"#,
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "contoso/claude-run#9",
+                        "--body-file",
+                        scratch.to_string_lossy().as_ref(),
+                    ],
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            &clone,
+            &timed_out_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::TimedOut {
+                pr_number: Some(9),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "git push --set-upstream origin feat/x:feat/x"),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.contains("WIP: feat: agent work")),
+            "the draft PR title must carry the WIP: prefix: {calls:?}"
+        );
+        let expect_comment_call = format!(
+            "fj --host dev.a8n.run pr comment contoso/claude-run#9 --body-file {}",
+            scratch.display()
+        );
+        assert!(calls.iter().any(|c| c == &expect_comment_call), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+        let _ = std::fs::remove_file(&scratch);
+    }
+
+    #[test]
+    fn finalize_timeout_salvage_push_failure_is_named_in_the_comment() {
+        // The push itself fails (e.g. the remote rejects it): salvage records
+        // `open_error`, the issue still advances to Needs Review, and no PR
+        // is recorded since none was ever opened.
+        let base = tempfile::tempdir().unwrap();
+        let clone = dirty_single_branch_clone(base.path());
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    1,
+                    "remote rejected the push",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            &clone,
+            &timed_out_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::TimedOut {
+                pr_number: None,
+                head_branch: None,
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr create")),
+            "a failed push must never reach PR creation: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_timeout_salvage_pr_comment_failure_still_reports_the_pr() {
+        // The draft PR opens fine but posting the explanation comment on it
+        // fails: the PR is still salvaged and returned (so it gets recorded),
+        // the comment failure is just named separately.
+        let base = tempfile::tempdir().unwrap();
+        let clone = dirty_single_branch_clone(base.path());
+        let git_dir = clone.join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let scratch = std::env::temp_dir().join("claude-run-timeout-pr-comment-MK-16.md");
+        let _ = std::fs::remove_file(&scratch);
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%s", "feat/x"],
+                    "feat: agent work\n",
+                )
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: feat: agent work",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":9,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/9"}"#,
+                )
+                .fail(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "contoso/claude-run#9",
+                        "--body-file",
+                        scratch.to_string_lossy().as_ref(),
+                    ],
+                    1,
+                    "comment rejected",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            &clone,
+            &timed_out_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+        )
+        .unwrap();
+        // The PR still counts, even though the comment on it failed.
+        assert_eq!(
+            res,
+            Finalized::TimedOut {
+                pr_number: Some(9),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let _ = std::fs::remove_file(&scratch);
+    }
+
+    #[test]
+    fn commit_timeout_wip_names_the_git_failure() {
+        // A workdir with no `.git` at all (can't happen on the real salvage
+        // path, which only calls this after `local_only_work` finds a dirty
+        // tracked file, but exercises the commit step's own failure handling
+        // in isolation): `git add` fails loudly rather than panicking or
+        // silently no-op'ing.
+        let dir = tempfile::tempdir().unwrap();
+        let err = commit_timeout_wip(dir.path()).unwrap_err();
+        assert!(
+            err.contains("git add"),
+            "the commit-step failure must name `git add`: {err}"
+        );
+    }
+
+    #[test]
+    fn finalize_resumed_success_strips_the_draft_prefix_via_mark_pr_ready() {
+        // CLAUDE-379 criterion 5: a resumed run that finishes successfully
+        // must clear the draft/`WIP: ` status the timeout salvage left behind.
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                // `pr search` is called twice with identical args: once by
+                // `find_open_pr` (before create, looking for `head_ref ==
+                // "feat/x"`) and again by `mark_pr_ready` after the issue
+                // advances (looking up PR #7's title to strip its `WIP: `
+                // prefix). `StubRunner` keys by exact args, not call order, so
+                // one response must satisfy both: `head_ref` left empty so the
+                // first lookup finds no match and falls through to create.
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    r#"{"pull_requests":[{"number":7,"title":"WIP: feat: x","head_sha":"abc"}]}"#,
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "feat: x",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "edit",
+                        "contoso/claude-run#7",
+                        "--title",
+                        "feat: x",
+                    ],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(
+                |c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"
+            ),
+            "a resumed success must strip the WIP: prefix: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn default_prompt_tells_a_resumed_run_to_read_the_prs_comments() {
+        // CLAUDE-379 criterion 5: a re-queue's rendered prompt must direct the
+        // agent to the PR's own comments, not just the issue's, since a
+        // timed-out run's salvage note (what it committed, why) lives there.
+        let p = default_youtrack_prompt();
+        assert!(
+            p.contains("read that PR's own comments"),
+            "the default prompt must tell a resumed run to read the PR's comments:\n{p}"
+        );
     }
 
     // ---- automerge no longer polls from finalize -------------
@@ -5429,6 +6311,8 @@ mod tests {
             &ok_result(),
             PrStrategy::Agit,
             None,
+            Duration::from_secs(1800),
+            false,
         )
         .unwrap();
         assert_eq!(
