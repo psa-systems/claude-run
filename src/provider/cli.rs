@@ -583,7 +583,10 @@ impl CliBackend {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
         #[cfg(not(test))]
         let keys_path = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
+            .unwrap_or_else(|| {
+                warn!("could not resolve the platform data dir; falling back to `.`");
+                PathBuf::from(".")
+            })
             .join("forgejo-cli")
             .join("keys.json");
         // Tests never read the host's real key store; one that did cloned a live repo.
