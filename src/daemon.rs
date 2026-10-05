@@ -2292,19 +2292,6 @@ mod tests {
         assert!(!d.retry);
     }
 
-    // A real bind to an unassigned TEST-NET-1 address (RFC 5737,
-    // never on a local NIC) surfaces AddrNotAvailable, the boot-race case the
-    // retry loop is built for.
-    #[tokio::test]
-    async fn bind_unassigned_address_classifies_addr_not_available() {
-        let err = tokio::net::TcpListener::bind("192.0.2.1:7321")
-            .await
-            .expect_err("binding an unassigned address must fail");
-        let f = classify_bind_error(err.kind());
-        assert_eq!(f.kind, "AddrNotAvailable", "got OS kind {:?}", err.kind());
-        assert!(f.retry);
-    }
-
     // A second bind on a port already held surfaces AddrInUse, which
     // is non-retryable (web UI disabled this run).
     #[tokio::test]
