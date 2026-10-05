@@ -101,6 +101,20 @@ features = [
     "http1",
 ]
 
+[dependencies.url]
+version = "2"
+
+[dependencies.lettre]
+version = "0.11"
+default-features = false
+features = [
+    "builder",
+    "hostname",
+    "smtp-transport",
+    "tokio1",
+    "tokio1-rustls-tls",
+]
+
 [dependencies.serde]
 version = "1"
 features = ["derive"]
