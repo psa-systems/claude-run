@@ -520,6 +520,10 @@ pub(crate) fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
 /// (`~/.local/share/forgejo-cli/keys.json`), the same store `CliBackend::new`
 /// reads. Used as the template source for a per-job entry.
 fn operator_fj_keys_path() -> PathBuf {
+    // Tests never read the host's real key store.
+    if cfg!(test) {
+        return PathBuf::from("/nonexistent/forgejo-cli/keys.json");
+    }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("forgejo-cli")

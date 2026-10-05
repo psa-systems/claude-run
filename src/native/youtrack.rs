@@ -2940,7 +2940,7 @@ mod tests {
 
         // A real local repo to clone, so `run_pre`'s git clone succeeds with no
         // network. `clone_url_for` falls back to the job's own (unauthenticated)
-        // URL because the stub CliBackend has no forge key store configured.
+        // URL because `CliBackend::new` reads no key store under test.
         let origin = tmp.path().join("origin");
         std::fs::create_dir_all(&origin).unwrap();
         for args in [
@@ -6354,9 +6354,9 @@ mod tests {
         );
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls.iter().any(
-                |c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"
-            ),
+            calls
+                .iter()
+                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"),
             "a resumed success must strip the WIP: prefix: {calls:?}"
         );
     }
@@ -6495,9 +6495,9 @@ mod tests {
             "no force anywhere: {calls:?}"
         );
         assert!(
-            calls.iter().any(
-                |c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"
-            ),
+            calls
+                .iter()
+                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"),
             "a resumed success on a moved branch must still strip the WIP: prefix: {calls:?}"
         );
     }

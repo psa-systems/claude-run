@@ -5188,10 +5188,7 @@ mod tests {
 
     #[test]
     fn repo_allowed_mixed_list_takes_any_match() {
-        let allowed = vec![
-            "contoso/governance".to_string(),
-            "fabrikam/*".to_string(),
-        ];
+        let allowed = vec!["contoso/governance".to_string(), "fabrikam/*".to_string()];
         assert!(repo_allowed(&allowed, "contoso/governance"));
         assert!(repo_allowed(&allowed, "fabrikam/gizmo"));
         assert!(!repo_allowed(&allowed, "contoso/claude-run"));
@@ -12082,8 +12079,7 @@ mod tests {
                     runner.clone(),
                 );
 
-                let result =
-                    list_open_pr_numbers(&pool, &ctx, "github.com", "octo/widget").await;
+                let result = list_open_pr_numbers(&pool, &ctx, "github.com", "octo/widget").await;
 
                 assert_eq!(result, Some(vec![42]));
                 assert!(
@@ -12271,11 +12267,8 @@ mod tests {
             // attempt counter `serve_command` records once it actually runs
             // the command; simulate that completed run here rather than
             // draining the channel through the full comment-webhook pipeline.
-            let key = crate::web::comment_webhooks::command_key(
-                "contoso/claude-run",
-                7,
-                sent.comment_id,
-            );
+            let key =
+                crate::web::comment_webhooks::command_key("contoso/claude-run", 7, sent.comment_id);
             state::attempts_increment(
                 &pool,
                 crate::web::comment_webhooks::WEBHOOK_COMMENT_ACTION,

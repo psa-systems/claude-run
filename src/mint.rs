@@ -1095,10 +1095,7 @@ mod tests {
             Some("YTMCP".to_string())
         );
         // A different host with the same path does not match.
-        assert_eq!(
-            map.lookup("other.example", "fabrikam/youtrack-mcp"),
-            None
-        );
+        assert_eq!(map.lookup("other.example", "fabrikam/youtrack-mcp"), None);
     }
 
     #[test]
@@ -1154,8 +1151,7 @@ mod tests {
         // build), which is what arms the refresh-on-miss.
         let r = route_cache();
         let _ = r.resolve_project(&tracker, &c, "fabrikam/gizmo", "dev.a8n.run");
-        let (project, source) =
-            r.resolve_project(&tracker, &c, "fabrikam/gizmo", "dev.a8n.run");
+        let (project, source) = r.resolve_project(&tracker, &c, "fabrikam/gizmo", "dev.a8n.run");
         assert_eq!((project.as_str(), source), ("GIZMO", RouteSource::Vcs));
     }
 

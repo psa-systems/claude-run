@@ -581,10 +581,14 @@ impl CliBackend {
     /// Backend with default binary names (`yt`, `fj`) and the default forge key
     /// store under the user's data dir.
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        #[cfg(not(test))]
         let keys_path = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("forgejo-cli")
             .join("keys.json");
+        // Tests never read the host's real key store; one that did cloned a live repo.
+        #[cfg(test)]
+        let keys_path = PathBuf::from("/nonexistent/forgejo-cli/keys.json");
         Self {
             runner,
             yt: "yt".to_string(),
@@ -2640,10 +2644,7 @@ mod tests {
         let repo = b.resolve_vcs("MK").unwrap();
         assert_eq!(repo.repo_host, "https://dev.a8n.run");
         assert_eq!(repo.repo_path, "contoso/claude-run");
-        assert_eq!(
-            repo.clone_url,
-            "https://dev.a8n.run/contoso/claude-run.git"
-        );
+        assert_eq!(repo.clone_url, "https://dev.a8n.run/contoso/claude-run.git");
     }
 
     #[test]
@@ -3729,11 +3730,7 @@ mod tests {
         let notices = b.take_notices();
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].contains("403 Forbidden"), "{}", notices[0]);
-        assert!(
-            notices[0].contains("contoso/claude-run"),
-            "{}",
-            notices[0]
-        );
+        assert!(notices[0].contains("contoso/claude-run"), "{}", notices[0]);
         // Drained: a second call reports nothing again.
         assert!(b.take_notices().is_empty());
         let calls = runner.calls.lock().unwrap();
@@ -4322,13 +4319,11 @@ mod tests {
             "",
         ));
         let b = CliBackend::new(runner.clone());
-        b.merge_pr("dev.a8n.run", "contoso/claude-run", 52)
-            .unwrap();
+        b.merge_pr("dev.a8n.run", "contoso/claude-run", 52).unwrap();
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls.iter().any(|c| {
-                c
-                == "fj --host dev.a8n.run pr merge contoso/claude-run#52 --method merge --delete"
+                c == "fj --host dev.a8n.run pr merge contoso/claude-run#52 --method merge --delete"
             }),
             "{calls:?}"
         );
@@ -4390,8 +4385,10 @@ mod tests {
         .unwrap();
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls.iter().any(|c| c
-                == "fj --host dev.a8n.run pr comment contoso/claude-run#52 --body-file /tmp/body.md"),
+            calls.iter().any(|c| {
+                c
+                == "fj --host dev.a8n.run pr comment contoso/claude-run#52 --body-file /tmp/body.md"
+            }),
             "{calls:?}"
         );
     }
@@ -4538,14 +4535,15 @@ mod tests {
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls.iter().any(|c| {
-                c
-                == "fj --host dev.a8n.run pr edit contoso/claude-run#52 labels --add needs-review"
+                c == "fj --host dev.a8n.run pr edit contoso/claude-run#52 labels --add needs-review"
             }),
             "{calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c
-                == "fj --host dev.a8n.run pr edit contoso/claude-run#52 labels --add blocked"),
+            calls
+                .iter()
+                .any(|c| c
+                    == "fj --host dev.a8n.run pr edit contoso/claude-run#52 labels --add blocked"),
             "{calls:?}"
         );
     }
@@ -4643,8 +4641,7 @@ mod tests {
             "XDG_DATA_HOME".to_string(),
             "/tmp/creds".to_string(),
         )]);
-        b.repo_access("dev.a8n.run", "contoso/claude-run")
-            .unwrap();
+        b.repo_access("dev.a8n.run", "contoso/claude-run").unwrap();
         assert_eq!(runner.calls.lock().unwrap().len(), 2);
         let envs = runner.envs.lock().unwrap();
         assert_eq!(envs.len(), 2);
