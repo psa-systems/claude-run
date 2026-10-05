@@ -11,6 +11,12 @@
 </div>
 {% endif %}
 
+{% if let Some(addr) = invite_sent_to %}
+<div class="card" style="border-color: var(--ok); margin-bottom: 16px;">
+  <strong style="color: var(--ok);">Invite sent to {{ addr }}.</strong>
+</div>
+{% endif %}
+
 {% if let Some(link) = new_invite_link %}
 <div class="card" style="border-color: var(--ok); margin-bottom: 16px;">
   <strong style="color: var(--ok);">Invite created.</strong>
@@ -49,13 +55,17 @@
 
 <div class="card" style="margin-bottom: 16px;">
   <h3>Invites</h3>
-  <span class="dim">A single-use link that lets someone create their own account. It expires 72 hours after creation if unused.</span>
+  <span class="dim">A single-use link that lets someone create their own account. It expires 72 hours after creation if unused. Give an email address to send the link instead of showing it here.</span>
   <form method="post" action="/settings/accounts/invite" style="margin-top: 12px;">
+    <input type="email" name="email" placeholder="person@example.com" {% if !email_configured %}disabled{% endif %}>
     <button type="submit" class="btn">Create invite</button>
+    {% if !email_configured %}
+    <span class="dim">Set up the Email (SMTP) card in <a href="/settings">Settings</a> to invite by email.</span>
+    {% endif %}
   </form>
   <table style="margin-top: 12px;">
     <thead>
-      <tr><th>Created by</th><th>Created</th><th>Expires</th><th></th></tr>
+      <tr><th>Created by</th><th>Created</th><th>Expires</th><th>Sent to</th><th></th></tr>
     </thead>
     <tbody>
       {% for i in invites %}
@@ -63,6 +73,7 @@
         <td class="mono">{{ i.created_by_username }}</td>
         <td class="dim">{{ i.created_at }}</td>
         <td class="dim">{{ i.expires_at }}</td>
+        <td class="dim">{% if let Some(addr) = i.email %}{{ addr }}{% else %}-{% endif %}</td>
         <td class="row-actions">
           <form method="post" action="/settings/accounts/revoke">
             <input type="hidden" name="id" value="{{ i.id }}">
