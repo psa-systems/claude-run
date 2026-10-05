@@ -2306,7 +2306,9 @@ mod tests {
     use super::*;
     use crate::config::WebhookConfig;
     use crate::provider::cli::testutil::StubRunner;
-    use crate::web::webhooks::{DELIVERY_HEADER, SIGNATURE_HEADER};
+    use crate::web::webhooks::{
+        DELIVERY_HEADER, GITHUB_DELIVERY_HEADER, GITHUB_SIGNATURE_HEADER, SIGNATURE_HEADER,
+    };
     use age::secrecy::ExposeSecret;
     use axum::http::HeaderValue;
     use hmac::{Hmac, Mac};
@@ -2361,6 +2363,133 @@ mod tests {
             sources,
             ..Default::default()
         }
+    }
+
+    const SOURCE_GH: &str = "gh-contoso";
+    const SECRET_GH: &str = "hmac-value-for-gh-comments";
+
+    fn github_sign(secret: &[u8], body: &[u8]) -> String {
+        format!("sha256={}", sign(secret, body))
+    }
+
+    fn github_headers(signature: Option<&str>, delivery: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(s) = signature {
+            h.insert(GITHUB_SIGNATURE_HEADER, HeaderValue::from_str(s).unwrap());
+        }
+        if let Some(d) = delivery {
+            h.insert(GITHUB_DELIVERY_HEADER, HeaderValue::from_str(d).unwrap());
+        }
+        h
+    }
+
+    fn config_with_github() -> CommentWebhookConfig {
+        let mut cfg = config();
+        cfg.sources.insert(
+            SOURCE_GH.to_string(),
+            CommentWebhookSource {
+                provider: WebhookProvider::Github,
+                secret_ref: Some("hmac-comment-gh".to_string()),
+                allowed_repos: vec![REPO.to_string()],
+                write_token_ref: Some("write-pat".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg
+    }
+
+    async fn setup_pool_with_github(tmp: &FsPath) -> DbPool {
+        let pool = setup_pool(tmp).await;
+        let key = SecretsKey::load().unwrap();
+        let ciphertext = key.encrypt(SECRET_GH).unwrap();
+        state::secret_create(&pool, "hmac-comment-gh", &ciphertext)
+            .await
+            .unwrap();
+        pool
+    }
+
+    async fn state_with_github(
+        tmp: &FsPath,
+    ) -> (CommentWebhookState, mpsc::Receiver<VerifiedCommentCommand>) {
+        let pool = setup_pool_with_github(tmp).await;
+        let (tx, rx) = mpsc::channel(8);
+        (CommentWebhookState::new(pool, config_with_github(), tx), rx)
+    }
+
+    /// GitHub's default webhook Content type delivers the JSON payload
+    /// form-wrapped (`payload=<url-encoded JSON>`); the signature covers the
+    /// form body as sent, and decoding happens only after it verifies.
+    #[tokio::test]
+    async fn github_form_urlencoded_comment_delivery_is_accepted_and_dispatched() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, mut rx) = state_with_github(tmp.path()).await;
+        let raw = payload_json("created", REPO, "/claude fix it", "alice", true);
+        let form_body = serde_urlencoded::to_string([("payload", raw.as_str())]).unwrap();
+        let sig = github_sign(SECRET_GH.as_bytes(), form_body.as_bytes());
+        let mut headers = github_headers(Some(&sig), Some("gh-comment-form-1"));
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let resp = forgejo_comment_webhook(
+            State(st),
+            Path(("github".to_string(), SOURCE_GH.to_string())),
+            headers,
+            Bytes::from(form_body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let cmd = rx.try_recv().expect("command emitted");
+        assert_eq!(cmd.number, 7);
+    }
+
+    #[tokio::test]
+    async fn github_form_urlencoded_comment_delivery_with_no_payload_field_is_400() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _rx) = state_with_github(tmp.path()).await;
+        let form_body = serde_urlencoded::to_string([("not_payload", "x")]).unwrap();
+        let sig = github_sign(SECRET_GH.as_bytes(), form_body.as_bytes());
+        let mut headers = github_headers(Some(&sig), Some("gh-comment-form-2"));
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let resp = forgejo_comment_webhook(
+            State(st),
+            Path(("github".to_string(), SOURCE_GH.to_string())),
+            headers,
+            Bytes::from(form_body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Forgejo always sends JSON; a form-content-typed Forgejo delivery is
+    /// not decoded (the helper is a GitHub-only no-op for other providers)
+    /// and still fails the JSON parse the same way an unrecognized body did
+    /// before this change.
+    #[tokio::test]
+    async fn forgejo_form_content_type_comment_delivery_is_still_rejected() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _rx) = state_for(tmp.path()).await;
+        let form_body = serde_urlencoded::to_string([("payload", "{}")]).unwrap();
+        let sig = sign(SECRET.as_bytes(), form_body.as_bytes());
+        let mut hdrs = headers(Some(&sig), Some("fj-comment-form-1"));
+        hdrs.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let resp = forgejo_comment_webhook(
+            State(st),
+            Path(("forgejo".to_string(), SOURCE.to_string())),
+            hdrs,
+            Bytes::from(form_body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     fn parse(json: &str) -> CommentPayload {
