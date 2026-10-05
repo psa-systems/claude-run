@@ -1148,10 +1148,7 @@ async fn create_invite_submit(
 
     let password = match &email_cfg.smtp_password_ref {
         Some(name) => match crate::secrets::SecretsKey::load() {
-            Ok(key) => match crate::secrets::resolve_secret(&pool, &key, name).await {
-                Ok(p) => Some(p),
-                Err(_) => None,
-            },
+            Ok(key) => crate::secrets::resolve_secret(&pool, &key, name).await.ok(),
             Err(_) => None,
         },
         None => None,
@@ -2235,7 +2232,7 @@ mod tests {
     /// protected route is not turned away by the 2FA-enrollment gate.
     async fn signed_in_accounts_router(pool: &DbPool) -> (Router, String) {
         let key = test_secrets_key();
-        let account = crate::web_admin::create_first(&pool, "admin", "correct horse battery")
+        let account = crate::web_admin::create_first(pool, "admin", "correct horse battery")
             .await
             .unwrap();
         let pending = crate::web_admin::begin_totp_enrollment(pool, &key, account.id, "admin")
