@@ -1,7 +1,7 @@
 flowchart TD
     F(["Forgejo: Actions run finished"])
 
-    subgraph WH ["webhook-forgejo"]
+    subgraph WH ["webhook-triage"]
         W1{"run failed?"}
         W1 -- "no: cancelled" --> N1["ignored"]
         W1 -- "no: success, recover" --> AM1
@@ -59,7 +59,7 @@ flowchart TD
 
     FPR(["Forgejo: pull_request closed"])
 
-    subgraph WHPR ["webhook-forgejo: pull_request closed (CLAUDE-277, same endpoint, dispatched by X-Forgejo-Event)"]
+    subgraph WHPR ["webhook-triage: pull_request closed (CLAUDE-277, same endpoint, dispatched by X-Forgejo-Event)"]
         M1{"merged?"}
         M1 -- no --> M2["mark this PR's agent_pull_requests row closed, if any"]
         M1 -- yes --> M3["mark this PR's agent_pull_requests row merged, if any"]
@@ -72,7 +72,7 @@ flowchart TD
     YTW1 -- yes --> YTW2["issue.fields.State = Fixed"]
     YTW1 -- no --> YTW3["no write"]
 
-    subgraph WHAM ["webhook-forgejo: success/recover (CLAUDE-126, event-driven since CLAUDE-278, same endpoint, dispatched by payload.action)"]
+    subgraph WHAM ["webhook-triage: success/recover (CLAUDE-126, event-driven since CLAUDE-278, same endpoint, dispatched by payload.action)"]
         AM1["find open PR matching this commit"]
         AM1 -- "no match" --> AN1["ignored"]
         AM1 -- match --> AM2{"agent_pull_requests row open for this PR?"}
