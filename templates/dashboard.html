@@ -158,7 +158,7 @@
       <h3><a href="/actions/{{ a.name }}">{{ a.name }}</a></h3>
       <div class="meta">
         {% if a.synthetic %}
-          <span class="badge ok">event-driven</span> - webhook-forgejo (read-only)
+          <span class="badge ok">event-driven</span> - {{ a.name }} (read-only)
           {% if a.paused.is_some() %}<span class="badge pause">paused</span>{% endif %}
         {% else %}
           {% if a.parse_error.is_some() %}
