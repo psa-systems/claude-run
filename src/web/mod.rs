@@ -131,6 +131,8 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/settings/auth/forgejo", post(auth_save_forgejo))
         .route("/settings/auth/github", post(auth_save_github))
         .route("/settings/auth/git", post(auth_save_git))
+        .route("/settings/auth/email", post(auth_save_email))
+        .route("/settings/auth/email/test", post(auth_test_email))
         .route("/settings/:section", post(settings_save))
         // Historical reporting page (spend / runs / time-of-day /
         // day-of-week). Global by default; `action` + `range` query params narrow
@@ -4006,6 +4008,20 @@ struct SettingsTpl {
     sections: Vec<SettingsSectionView>,
     saved: Option<String>,
     auth: AuthCardView,
+    email: EmailCardView,
+}
+
+/// What the Email card shows. Derived from the `config.email` document alone
+/// (no secret is ever decrypted to render a page).
+struct EmailCardView {
+    smtp_host: Option<String>,
+    smtp_port: Option<u16>,
+    smtp_encryption: crate::config::SmtpEncryption,
+    smtp_username: Option<String>,
+    from: Option<String>,
+    public_url: Option<String>,
+    configured: bool,
+    error: Option<String>,
 }
 
 /// What the Auth card shows. Derived from the `config.auth` document alone, so
@@ -4065,6 +4081,8 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
         // Rendered by the Auth card at the top of the page, not the generic JSON
         // editor: the values are typed into password fields and never echoed.
         Auth => vec![],
+        // Rendered by the Email card, for the same reason as Auth.
+        Email => vec![],
         Mint => vec![
             FieldDoc {
                 name: "repo_project_map",
@@ -4317,7 +4335,17 @@ async fn render_settings_with(
     rejected: Option<(crate::settings::Section, String, String)>,
     auth_error: Option<String>,
 ) -> Result<Response, WebError> {
-    render_settings_full(s, status, saved, rejected, auth_error, None).await
+    render_settings_full(s, status, saved, rejected, auth_error, None, None).await
+}
+
+/// Like [`render_settings_with`], but the error belongs to the Email card
+/// instead of the Auth card.
+async fn render_settings_with_email_error(
+    s: &WebState,
+    status: StatusCode,
+    email_error: Option<String>,
+) -> Result<Response, WebError> {
+    render_settings_full(s, status, None, None, None, None, email_error).await
 }
 
 async fn render_settings_full(
@@ -4327,12 +4355,13 @@ async fn render_settings_full(
     rejected: Option<(crate::settings::Section, String, String)>,
     auth_error: Option<String>,
     login_error: Option<String>,
+    email_error: Option<String>,
 ) -> Result<Response, WebError> {
     let mut sections = Vec::with_capacity(crate::settings::Section::ALL.len());
     for section in crate::settings::Section::ALL {
         // The Auth section has its own card with real password inputs; a JSON
         // textarea would invite pasting a token into a stored document.
-        if section == crate::settings::Section::Auth {
+        if section == crate::settings::Section::Auth || section == crate::settings::Section::Email {
             continue;
         }
         let (json, error) = match &rejected {
@@ -4401,6 +4430,19 @@ async fn render_settings_full(
                 .clone()
                 .unwrap_or_else(|| crate::config::DEFAULT_GIT_AUTHOR_EMAIL.to_string()),
             error: auth_error,
+        },
+        email: {
+            let email_cfg = s.api.settings.email_config().await;
+            EmailCardView {
+                smtp_host: email_cfg.smtp_host.clone(),
+                smtp_port: email_cfg.smtp_port,
+                smtp_encryption: email_cfg.smtp_encryption,
+                smtp_username: email_cfg.smtp_username.clone(),
+                from: email_cfg.from.clone(),
+                public_url: email_cfg.public_url.clone(),
+                configured: email_cfg.configured(),
+                error: email_error,
+            }
         },
     };
     Ok((status, Html(tpl.render()?)).into_response())
@@ -4736,6 +4778,176 @@ async fn auth_save_git(
 }
 
 #[derive(Deserialize)]
+struct AuthEmailForm {
+    smtp_host: String,
+    smtp_port: String,
+    smtp_encryption: crate::config::SmtpEncryption,
+    smtp_username: String,
+    /// Blank keeps the currently stored secret; see [`auth_save_email`].
+    smtp_password: String,
+    from: String,
+    public_url: String,
+}
+
+/// Persist `cfg` as the `config.email` document, validating through
+/// [`crate::settings::validate_email`] (invoked by `save_section` itself).
+async fn save_email_config(
+    s: &WebState,
+    cfg: &crate::config::EmailConfig,
+) -> std::result::Result<(), String> {
+    let json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
+    s.api
+        .settings
+        .save_section(crate::settings::Section::Email, &json)
+        .await
+        .map_err(|e| match e {
+            crate::settings::SaveError::Invalid(m) => m,
+            crate::settings::SaveError::Db(e) => e.to_string(),
+        })
+}
+
+/// POST `/settings/auth/email`: saves the SMTP transport invite-by-email
+/// sends through. An empty `smtp_password` field keeps whatever secret is
+/// already stored under `smtp_password_ref`, rather than clearing it: unlike
+/// [`auth_save_git`]'s fields, a blank password here almost never means "use
+/// no password" (an SMTP server configured with `smtp_username` set still
+/// requires one), and typing it again on every unrelated field edit would be
+/// unusable.
+async fn auth_save_email(
+    State(s): State<WebState>,
+    Form(form): Form<AuthEmailForm>,
+) -> Result<Response, WebError> {
+    let host = form.smtp_host.trim().to_string();
+    let username = form.smtp_username.trim().to_string();
+    let password = form.smtp_password.trim().to_string();
+    let from = form.from.trim().to_string();
+    let public_url = form.public_url.trim().to_string();
+    let port_str = form.smtp_port.trim().to_string();
+
+    let port = if port_str.is_empty() {
+        None
+    } else {
+        match port_str.parse::<u16>() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                return render_settings_with_email_error(
+                    &s,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Some(format!("smtp_port `{port_str}` is not a valid port number")),
+                )
+                .await;
+            }
+        }
+    };
+
+    let mut cfg = s.api.settings.email_config().await;
+    cfg.smtp_host = (!host.is_empty()).then_some(host);
+    cfg.smtp_port = port;
+    cfg.smtp_encryption = form.smtp_encryption;
+    cfg.smtp_username = (!username.is_empty()).then_some(username);
+    cfg.from = (!from.is_empty()).then_some(from);
+    cfg.public_url = (!public_url.is_empty()).then_some(public_url);
+
+    if !password.is_empty() {
+        let name = crate::config::SMTP_PASSWORD_SECRET;
+        if let Err(e) = put_secret(&s, name, &password).await {
+            return render_settings_with_email_error(&s, StatusCode::UNPROCESSABLE_ENTITY, Some(e))
+                .await;
+        }
+        cfg.smtp_password_ref = Some(name.to_string());
+    }
+
+    if let Err(e) = save_email_config(&s, &cfg).await {
+        return render_settings_with_email_error(&s, StatusCode::UNPROCESSABLE_ENTITY, Some(e))
+            .await;
+    }
+    Ok(Redirect::to("/settings?saved=Email+%28SMTP%29").into_response())
+}
+
+#[derive(Deserialize)]
+struct TestEmailForm {
+    test_address: String,
+}
+
+/// POST `/settings/auth/email/test`: sends a short test message through the
+/// currently SAVED `config.email` document (not the submitted form), so the
+/// button always proves what a real invite send would do.
+async fn auth_test_email(
+    State(s): State<WebState>,
+    Form(form): Form<TestEmailForm>,
+) -> Result<Response, WebError> {
+    let to = form.test_address.trim().to_string();
+    if to.is_empty() {
+        return render_settings_with_email_error(
+            &s,
+            StatusCode::BAD_REQUEST,
+            Some("enter an address to send the test email to".to_string()),
+        )
+        .await;
+    }
+    let cfg = s.api.settings.email_config().await;
+    if !cfg.configured() {
+        return render_settings_with_email_error(
+            &s,
+            StatusCode::BAD_REQUEST,
+            Some("email is not configured: set host, from and public URL above first".to_string()),
+        )
+        .await;
+    }
+    let password = match &cfg.smtp_password_ref {
+        Some(name) => {
+            let key = match crate::secrets::SecretsKey::load() {
+                Ok(k) => k,
+                Err(e) => {
+                    return render_settings_with_email_error(
+                        &s,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Some(e.to_string()),
+                    )
+                    .await
+                }
+            };
+            match crate::secrets::resolve_secret(&s.api.pool, &key, name).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    return render_settings_with_email_error(
+                        &s,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Some(e.to_string()),
+                    )
+                    .await
+                }
+            }
+        }
+        None => None,
+    };
+    let mailer = match crate::mailer::Mailer::new(&cfg, password.as_deref()) {
+        Ok(m) => m,
+        Err(e) => {
+            return render_settings_with_email_error(
+                &s,
+                StatusCode::BAD_GATEWAY,
+                Some(e.to_string()),
+            )
+            .await
+        }
+    };
+    match mailer
+        .send(
+            &to,
+            "claude-run test email",
+            "This is a test email from claude-run's Email (SMTP) settings card.",
+        )
+        .await
+    {
+        Ok(()) => Ok(Redirect::to("/settings?saved=Test+email+sent").into_response()),
+        Err(e) => {
+            render_settings_with_email_error(&s, StatusCode::BAD_GATEWAY, Some(e.to_string())).await
+        }
+    }
+}
+
+#[derive(Deserialize)]
 struct AuthCodeForm {
     code: String,
 }
@@ -4797,6 +5009,7 @@ async fn auth_login_code(
             None,
             None,
             Some("paste the code from the authorization page".to_string()),
+            None,
         )
         .await;
     }
@@ -4823,6 +5036,7 @@ async fn auth_login_code(
                 None,
                 None,
                 Some(msg),
+                None,
             )
             .await
         }
@@ -4834,6 +5048,7 @@ async fn auth_login_code(
                 None,
                 None,
                 Some(e.to_string()),
+                None,
             )
             .await
         }

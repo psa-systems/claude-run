@@ -33,8 +33,9 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
     AuthConfig, ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig, CommentWebhookSource,
-    ConcurrencyConfig, DbRetentionConfig, MintConfig, OnDiskConfig, Paths, PreferencesConfig,
-    StreamLogGcConfig, UpdateConfig, WebhookConfig, WebhookSource, WorkdirGcConfig,
+    ConcurrencyConfig, DbRetentionConfig, EmailConfig, MintConfig, OnDiskConfig, Paths,
+    PreferencesConfig, StreamLogGcConfig, UpdateConfig, WebhookConfig, WebhookSource,
+    WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -68,11 +69,16 @@ pub enum Section {
     /// editor, because the values are secrets typed into password fields; the
     /// document stored here holds only URLs and secret NAMES.
     Auth,
+    /// The SMTP transport invite-by-email sends through. Edited through the
+    /// Settings page's "Email (SMTP)" card rather than the generic JSON editor,
+    /// for the same reason as [`Section::Auth`]: the password is a secret typed
+    /// into a password field.
+    Email,
 }
 
 impl Section {
     /// Every section, in display order (used by the Settings page).
-    pub const ALL: [Section; 12] = [
+    pub const ALL: [Section; 13] = [
         Section::Mint,
         Section::Update,
         Section::Webhook,
@@ -85,6 +91,7 @@ impl Section {
         Section::DbRetention,
         Section::Claude,
         Section::Auth,
+        Section::Email,
     ];
 
     /// `settings` table primary key for this section's JSON document.
@@ -102,6 +109,7 @@ impl Section {
             Section::WebhookComment => "config.webhook_comment",
             Section::Claude => "config.claude",
             Section::Auth => "config.auth",
+            Section::Email => "config.email",
         }
     }
 
@@ -120,6 +128,7 @@ impl Section {
             Section::WebhookComment => "webhook_comment",
             Section::Claude => "claude",
             Section::Auth => "auth",
+            Section::Email => "email",
         }
     }
 
@@ -143,6 +152,7 @@ impl Section {
             Section::WebhookComment => "Comment webhook",
             Section::Claude => "Claude invocation",
             Section::Auth => "Service auth",
+            Section::Email => "Email (SMTP)",
         }
     }
 
@@ -159,6 +169,7 @@ impl Section {
             Section::WebhookComment => "live",
             Section::Claude => "next invocation",
             Section::Auth => "live",
+            Section::Email => "live",
         }
     }
 }
@@ -368,6 +379,10 @@ pub struct EffectiveRuntime {
     /// `config.toml` section), so the DB value or the built-in default (nothing
     /// configured, i.e. host auth as before).
     pub auth: AuthConfig,
+    /// The SMTP transport invite-by-email sends through. DB-only from day
+    /// one, so the DB value or the built-in default (unconfigured, i.e.
+    /// link-only invites as before).
+    pub email: EmailConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
@@ -410,6 +425,9 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
     let auth = get_json::<AuthConfig>(pool, Section::Auth.key())
         .await?
         .unwrap_or_default();
+    let email = get_json::<EmailConfig>(pool, Section::Email.key())
+        .await?
+        .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
         update,
@@ -423,6 +441,7 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
         webhook_comment,
         claude,
         auth,
+        email,
     })
 }
 
@@ -647,6 +666,9 @@ pub struct LiveSettings {
     /// re-materializes the `yt` / `fj` credential files and by the Settings
     /// page's Auth card.
     auth: Arc<RwLock<AuthConfig>>,
+    /// The SMTP transport invite-by-email sends through, resolved fresh
+    /// (config + password) by [`crate::mailer::Mailer`] on every send.
+    email: Arc<RwLock<EmailConfig>>,
 }
 
 impl LiveSettings {
@@ -676,6 +698,7 @@ impl LiveSettings {
             webhook_comment_rate: Arc::new(RwLock::new(webhook_comment_rate)),
             claude: Arc::new(std::sync::RwLock::new(eff.claude)),
             auth: Arc::new(RwLock::new(eff.auth)),
+            email: Arc::new(RwLock::new(eff.email)),
         };
         if let (Some(apply), Some(filter)) = (s.log_apply.as_ref(), eff.log_filter.as_ref()) {
             match apply(filter) {
@@ -758,6 +781,17 @@ impl LiveSettings {
         self.auth.read().await.clone()
     }
 
+    /// Live handle to the SMTP transport config.
+    pub fn email_handle(&self) -> Arc<RwLock<EmailConfig>> {
+        Arc::clone(&self.email)
+    }
+
+    /// Snapshot of the SMTP transport config (host/port/username/refs only,
+    /// no password).
+    pub async fn email_config(&self) -> EmailConfig {
+        self.email.read().await.clone()
+    }
+
     pub fn claude_handle(&self) -> ClaudeConfigHandle {
         self.claude.clone()
     }
@@ -786,6 +820,7 @@ impl LiveSettings {
             Section::WebhookComment => to_pretty(&*self.webhook_comment.read().await),
             Section::Claude => to_pretty(&*read_claude(&self.claude)),
             Section::Auth => to_pretty(&*self.auth.read().await),
+            Section::Email => to_pretty(&*self.email.read().await),
         }
     }
 
@@ -893,6 +928,12 @@ impl LiveSettings {
                 set_json(&self.pool, section.key(), &v).await?;
                 *self.auth.write().await = v;
             }
+            Section::Email => {
+                let v: EmailConfig = parse(json)?;
+                validate_email(&v).map_err(SaveError::Invalid)?;
+                set_json(&self.pool, section.key(), &v).await?;
+                *self.email.write().await = v;
+            }
         }
         Ok(())
     }
@@ -952,6 +993,40 @@ pub fn validate_webhook(cfg: &WebhookConfig) -> std::result::Result<(), String> 
     }
     if cfg.enabled {
         validate_enabled_sources(&cfg.sources)?;
+    }
+    Ok(())
+}
+
+/// Validate an [`EmailConfig`] before it is persisted: `from` must parse as a
+/// mailbox, `public_url` must parse as an absolute `http`/`https` URL, a
+/// username with no password is refused rather than silently downgraded to
+/// anonymous submission, and `smtp_host` being set requires both `from` and
+/// `public_url`. Returns a human message on failure; nothing is persisted on
+/// an `Err`.
+pub fn validate_email(cfg: &EmailConfig) -> std::result::Result<(), String> {
+    if let Some(from) = cfg.from.as_deref() {
+        from.parse::<lettre::message::Mailbox>()
+            .map_err(|e| format!("from `{from}` is not a valid mailbox: {e}"))?;
+    }
+    if let Some(url) = cfg.public_url.as_deref() {
+        let parsed = url::Url::parse(url)
+            .map_err(|e| format!("public_url `{url}` is not a valid URL: {e}"))?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(format!(
+                "public_url `{url}` must be an absolute http or https URL"
+            ));
+        }
+    }
+    if cfg.smtp_username.is_some() && cfg.smtp_password_ref.is_none() {
+        return Err("smtp_username is set but no SMTP password was provided".to_string());
+    }
+    if cfg.smtp_host.is_some() {
+        if cfg.from.is_none() {
+            return Err("smtp_host is set but from is not".to_string());
+        }
+        if cfg.public_url.is_none() {
+            return Err("smtp_host is set but public_url is not".to_string());
+        }
     }
     Ok(())
 }
@@ -1104,6 +1179,7 @@ mod tests {
             webhook_comment: CommentWebhookConfig::default(),
             claude: ClaudeConfig::default(),
             auth: AuthConfig::default(),
+            email: EmailConfig::default(),
         }
     }
 

@@ -97,6 +97,9 @@ pub struct InviteSummary {
     pub created_by_username: String,
     pub created_at: String,
     pub expires_at: String,
+    /// The address an invite was emailed to, when one was given. `None` for
+    /// the link-only flow.
+    pub email: Option<String>,
 }
 
 /// The `otpauth://` URI and its rendered QR code for a pending enrollment.
@@ -634,7 +637,11 @@ pub async fn reset_totp(pool: &DbPool, id: i64) -> Result<Account> {
 /// Mint a new single-use invite created by `created_by`, returning the plain
 /// token (shown to the inviter exactly once) and the row id. Only the hash of
 /// the token is stored.
-pub async fn create_invite(pool: &DbPool, created_by: i64) -> Result<(String, i64)> {
+pub async fn create_invite(
+    pool: &DbPool,
+    created_by: i64,
+    email: Option<&str>,
+) -> Result<(String, i64)> {
     let mut buf = [0u8; INVITE_TOKEN_BYTES];
     getrandom::getrandom(&mut buf)
         .map_err(|e| Error::Secret(format!("reading random bytes for an invite token: {e}")))?;
@@ -644,13 +651,14 @@ pub async fn create_invite(pool: &DbPool, created_by: i64) -> Result<(String, i6
     let expires_at = now + chrono::Duration::hours(INVITE_TTL_HOURS);
     let id: i64 = sqlx::query_scalar(&crate::db::q(
         pool,
-        "INSERT INTO web_invites (token_hash, created_by, created_at, expires_at, used_at) \
-         VALUES (?, ?, ?, ?, NULL) RETURNING id",
+        "INSERT INTO web_invites (token_hash, created_by, created_at, expires_at, used_at, email) \
+         VALUES (?, ?, ?, ?, NULL, ?) RETURNING id",
     ))
     .bind(&token_hash)
     .bind(created_by)
     .bind(now.to_rfc3339())
     .bind(expires_at.to_rfc3339())
+    .bind(email)
     .fetch_one(pool)
     .await?;
     Ok((token, id))
@@ -659,9 +667,9 @@ pub async fn create_invite(pool: &DbPool, created_by: i64) -> Result<(String, i6
 /// List outstanding (unused, unexpired) invites for the management page.
 pub async fn list_invites(pool: &DbPool) -> Result<Vec<InviteSummary>> {
     let now = chrono::Utc::now().to_rfc3339();
-    let rows: Vec<(i64, String, String, String)> = sqlx::query_as(&crate::db::q(
+    let rows: Vec<(i64, String, String, String, Option<String>)> = sqlx::query_as(&crate::db::q(
         pool,
-        "SELECT i.id, a.username, i.created_at, i.expires_at FROM web_invites i \
+        "SELECT i.id, a.username, i.created_at, i.expires_at, i.email FROM web_invites i \
          JOIN web_accounts a ON a.id = i.created_by \
          WHERE i.used_at IS NULL AND i.expires_at > ? ORDER BY i.id DESC",
     ))
@@ -671,11 +679,12 @@ pub async fn list_invites(pool: &DbPool) -> Result<Vec<InviteSummary>> {
     Ok(rows
         .into_iter()
         .map(
-            |(id, created_by_username, created_at, expires_at)| InviteSummary {
+            |(id, created_by_username, created_at, expires_at, email)| InviteSummary {
                 id,
                 created_by_username,
                 created_at,
                 expires_at,
+                email,
             },
         )
         .collect())
@@ -915,7 +924,7 @@ mod tests {
         let admin = create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let (token, _id) = create_invite(&pool, admin.id).await.unwrap();
+        let (token, _id) = create_invite(&pool, admin.id, None).await.unwrap();
         let invite = find_live_invite_by_token(&pool, &token)
             .await
             .unwrap()
@@ -948,7 +957,7 @@ mod tests {
         let admin = create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let (token, _id) = create_invite(&pool, admin.id).await.unwrap();
+        let (token, _id) = create_invite(&pool, admin.id, None).await.unwrap();
         let invite = find_live_invite_by_token(&pool, &token)
             .await
             .unwrap()
@@ -969,7 +978,7 @@ mod tests {
         let admin = create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let (token, id) = create_invite(&pool, admin.id).await.unwrap();
+        let (token, id) = create_invite(&pool, admin.id, None).await.unwrap();
         revoke_invite(&pool, id).await.unwrap();
         assert!(find_live_invite_by_token(&pool, &token)
             .await
@@ -997,7 +1006,7 @@ mod tests {
         let admin = create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let (token, _id) = create_invite(&pool, admin.id).await.unwrap();
+        let (token, _id) = create_invite(&pool, admin.id, None).await.unwrap();
         let invite = find_live_invite_by_token(&pool, &token)
             .await
             .unwrap()
@@ -1015,7 +1024,7 @@ mod tests {
         let admin = create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let (token, _id) = create_invite(&pool, admin.id).await.unwrap();
+        let (token, _id) = create_invite(&pool, admin.id, None).await.unwrap();
         let invite = find_live_invite_by_token(&pool, &token)
             .await
             .unwrap()
@@ -1141,7 +1150,7 @@ mod tests {
         let admin = create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let (token, _id) = create_invite(&pool, admin.id).await.unwrap();
+        let (token, _id) = create_invite(&pool, admin.id, None).await.unwrap();
         let invite = find_live_invite_by_token(&pool, &token)
             .await
             .unwrap()
