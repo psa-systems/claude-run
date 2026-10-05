@@ -1332,7 +1332,7 @@ impl Dispatcher {
         // global caps) plus the `KeyGate` (same-key serialization). The
         // standalone `claude-run run` path still takes `ActionLock` for its
         // cross-process guard; running standalone `run` for an action the daemon
-        // also schedules is unsupported concurrent use (documented in the README).
+        // also schedules is unsupported concurrent use (documented in docs/operations.md).
 
         run_action_inner(
             &loaded,

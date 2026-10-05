@@ -201,7 +201,7 @@ jobs:
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/check-secrets@main
         with:
           # Placeholder credentials only, also present in git history: the CI
-          # Postgres service password above, the README and compose.yml example
+          # Postgres service password above, the docs/configuration.md and compose.yml example
           # URIs, the token-shaped remote URLs in src/ tests, and the nu
           # interpolation in the removed scripts/claude-run.nu.
           kingfisher_skip_regex: 'claude_run:(claude_run|secret|\(\$password\)|<that password>)@|^x-access-token$|oauth2:(secret|tok|tok-123|\(\$pat\))@|ghp_(secret|from_login|action)@'

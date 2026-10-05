@@ -44,9 +44,9 @@ jobs:
       packages: write
     env:
       REGISTRY_PROVIDER: dev.a8n.run
-      REGISTRY_OWNER: ${{ github.repository_owner }}
+      REGISTRY_OWNER: ${{ vars.PSA_SYSTEMS_PRIVATE_PACKAGE_OWNER }}
       REGISTRY_USER: ""
-      REGISTRY_PASSWORD: ${{ secrets.FORGEJO_PAT }}
+      REGISTRY_PASSWORD: ${{ secrets.PSA_SYSTEMS_PRIVATE_PACKAGE_PAT }}
 
     steps:
       - name: Clone the repository

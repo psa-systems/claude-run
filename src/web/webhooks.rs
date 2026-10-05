@@ -219,7 +219,7 @@ pub const DELIVERY_HEADER: &str = "X-Forgejo-Delivery";
 /// [`VerifiedFailureEvent::status`]'s doc comment cites); for a pull-request
 /// delivery it is [`PULL_REQUEST_EVENT_TYPE`]. Operators must confirm this
 /// against their deployed Forgejo's actual delivery before relying on it (see
-/// the README "Webhook (Forgejo)" operator-setup note): a missing or
+/// the operator-setup note in docs/webhooks.md): a missing or
 /// unrecognized header still falls back to the pre-existing Action-run parse
 /// path, so an Action-run-only deployment that never sends this header is
 /// unaffected.

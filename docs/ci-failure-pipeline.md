@@ -3,7 +3,7 @@
 How a failed Forgejo Actions run becomes YouTrack work, as the code runs today. Any change to the pipeline updates this
 file in the same PR. The improvement discussion lives in [`ROADMAP.md`](ROADMAP.md#ci-failure-pipeline).
 
-Steps with an orange border call `claude`. See [CI failures pipeline](./ci-failures-pipeline.mmd).
+Steps with an orange border call `claude`. See [CI failures pipeline](./ci-failure-pipeline.mmd).
 
 ## Where this lives
 

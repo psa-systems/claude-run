@@ -8,7 +8,7 @@
 # CLAUDE-247: the container is self-contained. It bind-mounts NOTHING from the
 # host and reads no host credential. The operator creates the web administrator
 # at /setup and logs Claude, YouTrack, Forgejo and git in from the Settings ->
-# Auth page (see README "Containerized deployment"). That keeps the runner's
+# Auth page (see docs/self-hosting.md). That keeps the runner's
 # identity separate from the operator's and lets the stack deploy on a host
 # where neither $HOME nor the invocation directory is available.
 #
@@ -33,9 +33,10 @@ services:
     container_name: claude-bot
     # CLAUDE-88: published by .forgejo/workflows/build-image.yml on every main
     # push (`latest`) and release tag (`vX.Y.Z`). Pin a version tag in
-    # production. For local development, comment `image:` and uncomment
+    # production. Pulling needs `docker login dev.a8n.run` with a PAT that can
+    # read the psa-systems-private packages. For local development, comment `image:` and uncomment
     # the build block to build from the working tree instead.
-    image: dev.a8n.run/psa-systems/claude-run:latest
+    image: dev.a8n.run/psa-systems-private/claude-run:latest
     # build:
     #   context: .
     #   dockerfile: oci-build/Dockerfile

@@ -3,7 +3,7 @@
 # and image upgrades never fight).
 #
 # Only bootstrap keys belong here: everything runtime-tunable is DB-backed and
-# edited on the web Settings page. See README "Configuration".
+# edited on the web Settings page. See docs/configuration.md.
 
 [web]
 # 0.0.0.0, not the 127.0.0.1 default: a loopback bind inside a container is
