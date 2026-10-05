@@ -563,11 +563,39 @@ async fn forgejo_comment_webhook(
         return StatusCode::OK.into_response();
     }
 
-    // 6. Parse only after the request is authenticated and de-duplicated.
-    let payload: CommentPayload = match serde_json::from_slice(&body) {
+    // 6. Decode a GitHub form-urlencoded delivery to the JSON bytes it wraps
+    // (Forgejo and a GitHub JSON delivery pass through unchanged). The
+    // signature above was verified over the raw `body`.
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    let payload_body =
+        match crate::web::webhooks::github_json_payload(provider, content_type, &body) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    source = %source,
+                    delivery,
+                    error = %e,
+                    content_type = content_type.unwrap_or("-"),
+                    body_bytes = body.len(),
+                    "webhook payload form-decode failed"
+                );
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        };
+
+    // 7. Parse only after the request is authenticated and de-duplicated.
+    let payload: CommentPayload = match serde_json::from_slice(&payload_body) {
         Ok(p) => p,
         Err(e) => {
-            warn!(source = %source, error = %e, "webhook payload parse failed");
+            warn!(
+                source = %source,
+                error = %e,
+                content_type = content_type.unwrap_or("-"),
+                body_bytes = payload_body.len(),
+                "webhook payload parse failed"
+            );
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
