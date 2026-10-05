@@ -1,23 +1,4 @@
-# Install
-
-## Install
-
-Pull the latest binary from the Forgejo Generic Packages registry. It is published under the private
-`psa-systems-private` package owner, so the request needs a Forgejo PAT that can read it:
-
-```nu
-let token = "<your Forgejo PAT>"
-http get --headers [Authorization $"token ($token)"] https://dev.a8n.run/api/packages/psa-systems-private/generic/claude-run/latest/claude-run-linux-x86_64 | save claude-run
-chmod +x claude-run
-sudo mv claude-run /usr/local/bin/
-```
-
-Runtime dependencies (host-installed, not bundled):
-
-- `nu` 0.112.2+ - executes the action snippets.
-- `claude` (Claude Code CLI) - the AI invocation itself.
-- `timeout` (coreutils) - wall-clock cap around claude.
-- Whatever CLIs the actions themselves invoke (`yt`, `fj`, `git`, ...).
+# Forge tokens and PR resumption
 
 **Forgejo bot token scopes.** The token `fj` authenticates with - the host `keys.json` entry, or the encrypted secret an
 action names in `forgejo.token_ref` - must carry both **`write:repository`** and **`write:issue`**. Forgejo scopes its

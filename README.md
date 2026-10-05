@@ -1,27 +1,23 @@
 # claude-run
 
-A YAML-driven runner for Claude Code: poll a source (YouTrack issues, Forgejo or GitHub CI failures, pull request comments, anything that emits a JSON array), hand each job to `claude --print`, and act on the result. One Rust binary is both the CLI and a long-running daemon with a scheduler, a web UI, and webhook listeners.
+A YAML-driven runner for Claude Code: poll a source (YouTrack issues, Forgejo or GitHub CI failures, pull request comments, anything that emits a JSON array), hand each job to `claude --print`, and act on the result. It runs as a Docker container: one Rust binary that schedules every action, serves a web UI, and listens for webhooks.
 
 ## What it is
 
 - **Actions** are YAML files under `$CLAUDE_RUN_CONFIG_DIR/actions/`. A scripted action runs nu snippets for its input, filter, pre and post steps; a native action (`youtrack`, `closed-issue-summary`) is a Rust handler that owns the whole run. The schema is [`actions/SCHEMA.md`](actions/SCHEMA.md).
-- **The daemon** (`claude-run serve`) schedules every action, serves the web UI, and exposes the same HTTP API over a unix socket for the CLI.
 - **Guard rails**: per-run and per-day spend ceilings, attempt caps, a global pause honored at every entry point, and audited, capped tracker writes.
 - **State** lives in SQLite by default, or PostgreSQL when the operator sets one.
 
 ## Install
 
-The binary and the container image are published under the private `psa-systems-private` package owner, so both need a Forgejo PAT that can read it.
-
-- Binary: [docs/install.md](docs/install.md). It needs `nu`, `claude` and `timeout` on the host, plus whatever CLIs your actions call.
-- Container: `compose.yml` runs the published image; see [docs/self-hosting.md](docs/self-hosting.md).
+Docker is the only supported install. `compose.yml` runs the published image, which carries the tools the runner calls (`nu`, `claude`, `yt`, `fj`, `gh`, `git`, `timeout`). The image is published under the private `psa-systems-private` package owner, so pulling it needs a Forgejo PAT that can read it. The full guide is [docs/self-hosting.md](docs/self-hosting.md).
 
 ## Documentation
 
 Operator and developer docs live in [`docs/`](docs/):
 
 - [overview.md](docs/overview.md) - what the runner does, feature by feature
-- [install.md](docs/install.md) - the binary, its runtime dependencies, and forge token scopes
+- [forge-tokens.md](docs/forge-tokens.md) - forge token scopes, and resuming an open PR on re-queue
 - [usage.md](docs/usage.md) - the CLI, the web UI pages, and the access check
 - [configuration.md](docs/configuration.md) - filesystem layout, SQLite or PostgreSQL, bootstrap file vs Settings page, logging
 - [operations.md](docs/operations.md) - workdirs, retention, concurrency caps, global pause, self-update
@@ -29,7 +25,7 @@ Operator and developer docs live in [`docs/`](docs/):
 - [auth.md](docs/auth.md) - web UI and API auth, service logins, the secrets store
 - [webhooks.md](docs/webhooks.md) - CI-failure webhooks, automerge, auto-fix, GitHub setup
 - [comment-commands.md](docs/comment-commands.md) - commands posted as pull request or issue comments
-- [self-hosting.md](docs/self-hosting.md) - the container image and `compose.yml`
+- [self-hosting.md](docs/self-hosting.md) - install: the container image and `compose.yml`
 - [ROADMAP.md](docs/ROADMAP.md) - planned work
 
 Conventions for AI agents working in this repository are in [CLAUDE.md](CLAUDE.md), with the full text of each in [docs/conventions/](docs/conventions/).
