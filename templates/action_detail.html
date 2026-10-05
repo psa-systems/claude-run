@@ -14,8 +14,12 @@
 <div class="card">
   {% if action.synthetic %}
   <dl class="kv">
-    <dt>Kind</dt>          <dd><span class="badge ok">event-driven</span> webhook-forgejo (read-only)</dd>
-    <dt>Source</dt>        <dd>Forgejo webhook deliveries; minted on verified CI failures.</dd>
+    <dt>Kind</dt>          <dd><span class="badge ok">event-driven</span> {{ action.name }} (read-only)</dd>
+    {% if action.name == "webhook-comment" %}
+    <dt>Source</dt>        <dd>{{ action.providers }} webhook deliveries; <code>/claude</code> comment commands.</dd>
+    {% else %}
+    <dt>Source</dt>        <dd>{{ action.providers }} webhook deliveries; minted on verified CI failures.</dd>
+    {% endif %}
     <dt>Schedule</dt>      <dd><span class="dim">none (fires on webhook events)</span></dd>
   </dl>
   <div class="row-actions" style="margin-top: 16px;">
