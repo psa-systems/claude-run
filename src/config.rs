@@ -976,6 +976,62 @@ pub struct AuthConfig {
     pub git_author_email: Option<String>,
 }
 
+/// Name the SMTP password secret is stored under. See [`ANTHROPIC_KEY_SECRET`]
+/// for why this is fixed rather than operator-chosen.
+pub const SMTP_PASSWORD_SECRET: &str = "email-smtp-password";
+
+/// How the SMTP connection is secured. `Starttls` is the default: plaintext
+/// connect, then upgrade. `Tls` connects already encrypted (the old "implicit
+/// TLS" port 465 style). `None` sends in the clear, for a local relay only.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SmtpEncryption {
+    #[default]
+    Starttls,
+    Tls,
+    None,
+}
+
+/// The `config.email` settings section: the SMTP transport invite-by-email
+/// sends through, entered on the Settings page's "Email (SMTP)" card.
+///
+/// Only non-secret fields and the password secret's NAME live here; the
+/// password itself goes into the encrypted secrets store under
+/// [`SMTP_PASSWORD_SECRET`], resolved fresh on every send by
+/// [`crate::mailer::Mailer`]. Email is "configured" only once `smtp_host`,
+/// `from`, and `public_url` are all set; see [`EmailConfig::configured`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmailConfig {
+    /// SMTP server host, e.g. `smtp.example.com`.
+    pub smtp_host: Option<String>,
+    /// SMTP server port. Unset means the encryption's own default: 587 for
+    /// STARTTLS, 465 for implicit TLS, 25 for none.
+    pub smtp_port: Option<u16>,
+    /// How the connection is secured. Defaults to STARTTLS.
+    pub smtp_encryption: SmtpEncryption,
+    /// SMTP username, when the server requires auth.
+    pub smtp_username: Option<String>,
+    /// Secret name holding the SMTP password. A username with no password is
+    /// refused at save time rather than silently sending anonymously.
+    pub smtp_password_ref: Option<String>,
+    /// The From mailbox, e.g. `claude-run <claude-run@example.com>`.
+    pub from: Option<String>,
+    /// The instance's externally reachable base URL, e.g.
+    /// `https://claude-run.example.com`, used to build the absolute invite
+    /// link. Never built from a request's `Host` header: that would put a
+    /// client-controlled host into an outbound email.
+    pub public_url: Option<String>,
+}
+
+impl EmailConfig {
+    /// Whether enough is set to send mail: host, From, and the public URL the
+    /// invite link is built from.
+    pub fn configured(&self) -> bool {
+        self.smtp_host.is_some() && self.from.is_some() && self.public_url.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {

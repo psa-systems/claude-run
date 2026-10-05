@@ -593,6 +593,8 @@ struct AccountsTpl {
     current_id: i64,
     error: Option<String>,
     new_invite_link: Option<String>,
+    invite_sent_to: Option<String>,
+    email_configured: bool,
 }
 
 #[derive(Deserialize)]
@@ -1047,14 +1049,25 @@ async fn accounts_page(
     State(gate): State<TokenGate>,
     Extension(account): Extension<Account>,
 ) -> Response {
-    render_accounts(&gate, account.id, None, None).await
+    render_accounts(&gate, account.id, None, None, StatusCode::OK).await
 }
 
-/// POST `/settings/accounts/invite`: mint a single-use invite and show its link
-/// once.
+#[derive(Deserialize)]
+struct CreateInviteForm {
+    /// Blank: today's link-only flow. Non-blank: emailed when SMTP is
+    /// configured, refused with `400` otherwise. See [`create_invite_submit`].
+    #[serde(default)]
+    email: String,
+}
+
+/// POST `/settings/accounts/invite`: mint a single-use invite. With `email`
+/// blank, shows its link once (unchanged). With `email` set, emails the link
+/// instead and does not display it, unless the send fails, in which case the
+/// link is shown once as a fallback. See CLAUDE-394.
 async fn create_invite_submit(
     State(gate): State<TokenGate>,
     Extension(account): Extension<Account>,
+    Form(form): Form<CreateInviteForm>,
 ) -> Response {
     let Some(pool) = gate.pool.clone() else {
         return render_accounts(
@@ -1062,17 +1075,151 @@ async fn create_invite_submit(
             account.id,
             Some("no database handle".to_string()),
             None,
+            StatusCode::INTERNAL_SERVER_ERROR,
         )
         .await;
     };
-    match crate::web_admin::create_invite(&pool, account.id).await {
-        Ok((token, _id)) => {
-            tracing::info!(created_by = account.username, "invite created");
-            let link = format!("/invite/{token}");
-            render_accounts(&gate, account.id, None, Some(link)).await
-        }
-        Err(e) => render_accounts(&gate, account.id, Some(e.to_string()), None).await,
+    let email = form.email.trim();
+    if email.is_empty() {
+        return match crate::web_admin::create_invite(&pool, account.id, None).await {
+            Ok((token, _id)) => {
+                tracing::info!(created_by = account.username, "invite created");
+                let link = format!("/invite/{token}");
+                render_accounts(&gate, account.id, None, Some(link), StatusCode::OK).await
+            }
+            Err(e) => {
+                render_accounts(
+                    &gate,
+                    account.id,
+                    Some(e.to_string()),
+                    None,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+                .await
+            }
+        };
     }
+
+    if email.parse::<lettre::message::Mailbox>().is_err() {
+        return render_accounts(
+            &gate,
+            account.id,
+            Some(format!("`{email}` is not a valid email address")),
+            None,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+
+    let email_cfg = load_email_config(&pool).await;
+    if !email_cfg.configured() {
+        return render_accounts(
+            &gate,
+            account.id,
+            Some(
+                "SMTP is not configured; set it up on the Email (SMTP) card in Settings, or \
+                 leave the address blank to get a one-time link instead"
+                    .to_string(),
+            ),
+            None,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+
+    let (token, _id) = match crate::web_admin::create_invite(&pool, account.id, Some(email)).await {
+        Ok(v) => v,
+        Err(e) => {
+            return render_accounts(
+                &gate,
+                account.id,
+                Some(e.to_string()),
+                None,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .await
+        }
+    };
+    tracing::info!(
+        created_by = account.username,
+        recipient = email,
+        "invite created"
+    );
+
+    let password = match &email_cfg.smtp_password_ref {
+        Some(name) => match crate::secrets::SecretsKey::load() {
+            Ok(key) => crate::secrets::resolve_secret(&pool, &key, name).await.ok(),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let public_url = email_cfg
+        .public_url
+        .as_deref()
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    let link = format!("/invite/{token}");
+    let body = format!(
+        "{inviter} has invited you to claude-run.\n\n\
+         Accept the invite: {public_url}{link}\n\n\
+         This link is single-use and expires in 72 hours.",
+        inviter = account.username
+    );
+    let send_result = match crate::mailer::Mailer::new(&email_cfg, password.as_deref()) {
+        Ok(mailer) => {
+            mailer
+                .send(email, "You have been invited to claude-run", &body)
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    match send_result {
+        Ok(()) => {
+            tracing::info!(
+                inviter = account.username,
+                recipient = email,
+                "invite emailed"
+            );
+            render_accounts(
+                &gate,
+                account.id,
+                None,
+                Some(format!("sent:{email}")),
+                StatusCode::OK,
+            )
+            .await
+        }
+        Err(e) => {
+            tracing::error!(
+                recipient = email,
+                error = %e,
+                "invite email send failed; keeping the invite and showing the link"
+            );
+            render_accounts(
+                &gate,
+                account.id,
+                Some(format!("could not email the invite to {email}: {e}")),
+                Some(link),
+                StatusCode::BAD_GATEWAY,
+            )
+            .await
+        }
+    }
+}
+
+/// Load the `config.email` document directly from the DB. `render_accounts`
+/// and `create_invite_submit` only have a [`TokenGate`] (its own `pool`), not
+/// the daemon's `LiveSettings`, so this reads the stored document fresh
+/// rather than through a live handle; a saved settings change still applies
+/// on the very next invite.
+async fn load_email_config(pool: &DbPool) -> crate::config::EmailConfig {
+    crate::settings::get_json::<crate::config::EmailConfig>(
+        pool,
+        crate::settings::Section::Email.key(),
+    )
+    .await
+    .unwrap_or_default()
+    .unwrap_or_default()
 }
 
 /// POST `/settings/accounts/remove`: remove an account, refusing the last
@@ -1088,12 +1235,22 @@ async fn remove_account_submit(
             account.id,
             Some("no database handle".to_string()),
             None,
+            StatusCode::INTERNAL_SERVER_ERROR,
         )
         .await;
     };
     match crate::web_admin::remove(&pool, account.id, form.id).await {
-        Ok(()) => render_accounts(&gate, account.id, None, None).await,
-        Err(e) => render_accounts(&gate, account.id, Some(e.to_string()), None).await,
+        Ok(()) => render_accounts(&gate, account.id, None, None, StatusCode::OK).await,
+        Err(e) => {
+            render_accounts(
+                &gate,
+                account.id,
+                Some(e.to_string()),
+                None,
+                StatusCode::BAD_REQUEST,
+            )
+            .await
+        }
     }
 }
 
@@ -1109,20 +1266,38 @@ async fn revoke_invite_submit(
             account.id,
             Some("no database handle".to_string()),
             None,
+            StatusCode::INTERNAL_SERVER_ERROR,
         )
         .await;
     };
     match crate::web_admin::revoke_invite(&pool, form.id).await {
-        Ok(()) => render_accounts(&gate, account.id, None, None).await,
-        Err(e) => render_accounts(&gate, account.id, Some(e.to_string()), None).await,
+        Ok(()) => render_accounts(&gate, account.id, None, None, StatusCode::OK).await,
+        Err(e) => {
+            render_accounts(
+                &gate,
+                account.id,
+                Some(e.to_string()),
+                None,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .await
+        }
     }
 }
 
+/// Render the Accounts page. `error`/`status` travel together: `status` is
+/// `200` exactly when `error` is `None` for every caller above, so a refused
+/// request (bad address, SMTP unconfigured, last-account/self removal) or a
+/// send failure always answers non-2xx. `new_invite_link` carries either a
+/// bare `/invite/<token>` link to show once, or (as a sentinel distinct from a
+/// real link) `"sent:<address>"` to show the "Invite sent to <address>"
+/// confirmation with no link at all.
 async fn render_accounts(
     gate: &TokenGate,
     current_id: i64,
     error: Option<String>,
     new_invite_link: Option<String>,
+    status: StatusCode,
 ) -> Response {
     let Some(pool) = gate.pool.as_ref() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "no database handle").into_response();
@@ -1135,6 +1310,13 @@ async fn render_accounts(
         Ok(i) => i,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     };
+    let email_configured = load_email_config(pool).await.configured();
+    let (new_invite_link, invite_sent_to) = match new_invite_link {
+        Some(sent) if sent.starts_with("sent:") => {
+            (None, Some(sent.trim_start_matches("sent:").to_string()))
+        }
+        other => (other, None),
+    };
     let tpl = AccountsTpl {
         version: crate::VERSION,
         accounts,
@@ -1142,10 +1324,15 @@ async fn render_accounts(
         current_id,
         error,
         new_invite_link,
+        invite_sent_to,
+        email_configured,
     };
     match tpl.render() {
-        Ok(html) => Html(html).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "accounts template error").into_response(),
+        Ok(html) => (status, Html(html)).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "accounts template failed to render");
+            (StatusCode::INTERNAL_SERVER_ERROR, "accounts template error").into_response()
+        }
     }
 }
 
@@ -1991,7 +2178,7 @@ mod tests {
         let admin = crate::web_admin::create_first(&pool, "admin", "correct horse battery")
             .await
             .unwrap();
-        let (token, _id) = crate::web_admin::create_invite(&pool, admin.id)
+        let (token, _id) = crate::web_admin::create_invite(&pool, admin.id, None)
             .await
             .unwrap();
         let gate = TokenGate::unconfigured(pool.clone());
@@ -2039,5 +2226,140 @@ mod tests {
             StatusCode::NOT_FOUND,
             "a used invite link no longer resolves"
         );
+    }
+
+    /// A router for an enrolled, signed-in `admin` account, so a POST to a
+    /// protected route is not turned away by the 2FA-enrollment gate.
+    async fn signed_in_accounts_router(pool: &DbPool) -> (Router, String) {
+        let key = test_secrets_key();
+        let account = crate::web_admin::create_first(pool, "admin", "correct horse battery")
+            .await
+            .unwrap();
+        let pending = crate::web_admin::begin_totp_enrollment(pool, &key, account.id, "admin")
+            .await
+            .unwrap();
+        let base32 = pending
+            .otpauth_url
+            .split("secret=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .expect("otpauth URL carries the secret")
+            .to_string();
+        let secret = totp_rs::Secret::try_from_base32(&base32).unwrap();
+        let totp = totp_rs::Builder::new()
+            .with_issuer(Some("claude-run"))
+            .with_account_name("admin".to_string())
+            .with_secret(secret)
+            .build()
+            .unwrap();
+        let enroll_code = totp.generate_current().to_string();
+        crate::web_admin::confirm_totp_enrollment(pool, &key, account.id, &enroll_code)
+            .await
+            .unwrap();
+
+        let gate = TokenGate::unconfigured(pool.clone()).with_secrets_key(key);
+        let router = protect(Router::new(), gate);
+        let session = sign_session(account.session_key(), account.id, now_unix() + 60);
+        (router, format!("{SESSION_COOKIE}={session}"))
+    }
+
+    fn invite_post(cookie: &str, email: &str) -> Request {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/settings/accounts/invite")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, cookie.to_string())
+            .body(Body::from(format!("email={}", urlencoding_for_test(email))))
+            .unwrap()
+    }
+
+    /// Minimal percent-encoding for the one special character the test
+    /// addresses below contain.
+    fn urlencoding_for_test(s: &str) -> String {
+        s.replace('@', "%40")
+    }
+
+    /// An invalid email address is refused with `400` and mints no invite.
+    #[tokio::test]
+    async fn create_invite_with_bad_address_is_refused_400() {
+        let pool = setup_pool().await;
+        let (router, cookie) = signed_in_accounts_router(&pool).await;
+
+        let resp = router
+            .oneshot(invite_post(&cookie, "not-an-address"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(crate::web_admin::list_invites(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// With no `config.email` document saved, an email invite is refused with
+    /// `400` naming the Settings card, and mints no invite.
+    #[tokio::test]
+    async fn create_invite_by_email_with_smtp_unconfigured_is_refused_400() {
+        let pool = setup_pool().await;
+        let (router, cookie) = signed_in_accounts_router(&pool).await;
+
+        let resp = router
+            .oneshot(invite_post(&cookie, "person@example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("Email (SMTP)"), "{html}");
+        assert!(crate::web_admin::list_invites(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// With SMTP configured but unreachable, the send fails: the invite is
+    /// still created (kept, not discarded), the response is `502`, and the
+    /// link is shown as a fallback since the email never arrived.
+    #[tokio::test]
+    async fn create_invite_by_email_with_unreachable_smtp_is_502_and_keeps_the_invite() {
+        let pool = setup_pool().await;
+        let (router, cookie) = signed_in_accounts_router(&pool).await;
+
+        let cfg = crate::config::EmailConfig {
+            smtp_host: Some("127.0.0.1".to_string()),
+            smtp_port: Some(1),
+            smtp_encryption: crate::config::SmtpEncryption::None,
+            smtp_username: None,
+            smtp_password_ref: None,
+            from: Some("claude-run@example.com".to_string()),
+            public_url: Some("https://claude-run.example.com".to_string()),
+        };
+        crate::settings::set_json(&pool, crate::settings::Section::Email.key(), &cfg)
+            .await
+            .unwrap();
+
+        let resp = router
+            .oneshot(invite_post(&cookie, "person@example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("/invite/"),
+            "the link must fall back into view: {html}"
+        );
+
+        let invites = crate::web_admin::list_invites(&pool).await.unwrap();
+        assert_eq!(
+            invites.len(),
+            1,
+            "the invite is kept despite the send failure"
+        );
+        assert_eq!(invites[0].email.as_deref(), Some("person@example.com"));
     }
 }
