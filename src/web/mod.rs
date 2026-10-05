@@ -8861,6 +8861,53 @@ mod tests {
             );
         }
 
+        /// A GitHub-only `webhook-triage` source must render as GitHub
+        /// everywhere, with no leftover Forgejo wording: the dashboard card,
+        /// `/actions/webhook-triage`'s Kind and Source lines, and no stray
+        /// `webhook-forgejo` text anywhere in either page.
+        #[tokio::test]
+        async fn github_only_source_renders_as_github_not_forgejo() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+            let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION;
+
+            s.api
+                .settings
+                .save_section(
+                    crate::settings::Section::Webhook,
+                    r#"{"sources":{"gh":{"provider":"github","allowed_repos":["Contoso/*"],"rate_limit_per_min":120}}}"#,
+                )
+                .await
+                .unwrap();
+
+            let dashboard_body = body_string(
+                dashboard(State(s.clone()), Query(DashboardQuery::default()))
+                    .await
+                    .unwrap()
+                    .into_response(),
+            )
+            .await;
+            assert!(dashboard_body.contains(synthetic));
+            assert!(!dashboard_body.contains("webhook-forgejo"));
+            assert!(!dashboard_body.contains("Forgejo"));
+
+            let detail_body = body_string(
+                action_detail(
+                    State(s.clone()),
+                    AxumPath(synthetic.to_string()),
+                    Query(ActionDetailQuery::default()),
+                )
+                .await
+                .unwrap()
+                .into_response(),
+            )
+            .await;
+            assert!(detail_body.contains(synthetic));
+            assert!(detail_body.contains("GitHub"));
+            assert!(!detail_body.contains("webhook-forgejo"));
+            assert!(!detail_body.contains("Forgejo"));
+        }
+
         #[tokio::test]
         async fn dashboard_shows_comment_webhook_listener_as_soon_as_a_source_is_saved() {
             let tmp = tempfile::tempdir().unwrap();
