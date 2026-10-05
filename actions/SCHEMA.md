@@ -611,22 +611,15 @@ per-action isolation on disk for cleanup or quota reasons.
 
 **Resolution rules** (apply to both the YAML value and the env value):
 
-- If the value starts with `$`, it is evaluated as a nu expression and the result is used. Lets you do things like:
+The value is a literal path. `~`, `$VAR` and `${VAR}` are expanded; no nu evaluation happens.
 
-  ```yaml
-  workdir_base: $nu.home-dir | path join scratch
-  workdir_base: $"($env.HOME)/scratch"
-  workdir_base: $"($env.XDG_DATA_HOME)/claude-run"
-  ```
+```yaml
+workdir_base: /data/workdirs-large               # literal, absolute
+workdir_base: ${CLAUDE_RUN_DATA_DIR}/workdirs    # literal, ${VAR} expanded
+```
 
-- Otherwise, the value is treated as a literal path. `path expand` is applied in either case, so `~` and `$env`
-  references that `path expand` understands still work for literal values.
-
-  ```yaml
-  workdir_base: ~/scratch                            # literal, ~ expanded
-  workdir_base: /mnt/data/claude-run                 # literal, absolute
-  workdir_base: $nu.home-dir | path join scratch     # evaluated
-  ```
+A path outside `/data` is not on the volume the Docker sidecar shares, so bind mounts from the workdir will not
+resolve (see CLAUDE-325).
 
 ### `input.command` (nu snippet, required for `kind: scripted`)
 
@@ -1141,7 +1134,7 @@ variables holding compact JSON):
 | `$claude_result` |        -        |    -     |   -   |    -     |  yes   |
 
 `$workdir` is `<workdir_base>/<name>/<dedup_key-or-job-index>`, where `workdir_base` is the action's `workdir_base`
-field if set, else `$CLAUDE_RUN_WORKDIR_BASE`, else `/tmp/claude-run`. The runner creates it before the first `pre` step
+field if set, else `$CLAUDE_RUN_WORKDIR_BASE`, else `<data_dir>/workdirs`. The runner creates it before the first `pre` step
 and **removes it at end of job regardless of outcome** (success, claude failure, pre/post step failure, transient
 error). Plain `rm -r` is used, not `rm -rf`, so permission or read-only issues surface as real errors instead of being
 silently force-deleted.
