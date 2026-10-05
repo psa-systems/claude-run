@@ -1275,8 +1275,9 @@ and one Pause switch, each keyed by its own `sources.<name>` entry.
 
 1. Generate and store one secret: `printf %s '<distinct-random-value>' | claude-run secret set github-hmac-<org>`.
 2. In GitHub, on the repo or org's Settings -> Webhooks, add a webhook with Payload URL
-   `https://<daemon-host>/webhooks/github/triage/<source>`, Content type `application/json`, Secret set to that
-   stored value, and select the single **Workflow runs** event (`workflow_run`). GitHub folds `requested` /
+   `https://<daemon-host>/webhooks/github/triage/<source>`, Content type `application/json` or
+   `application/x-www-form-urlencoded` (GitHub's default; both are accepted), Secret set to that stored value, and
+   select the single **Workflow runs** event (`workflow_run`). GitHub folds `requested` /
    `in_progress` / `completed` into that one event type rather than Forgejo's separate failure/success/recover
    events, and the listener only acts on a `completed` delivery, reading the outcome from
    `workflow_run.conclusion` rather than from the event name. If any `youtrack` action in this org has
@@ -1416,8 +1417,9 @@ verify permission". Store the write PAT first, e.g.
 `printf %s '<pat>' | claude-run secret set forgejo-write-<org>`, and name it in the source's `write_token_ref`.
 
 **GitHub setup.** Set `provider: github` on the source and use
-`https://<daemon-host>/webhooks/github/comment/<source>` as the Payload URL, Content type `application/json`,
-Secret set to the source's stored `secret_ref` value. GitHub has no separate pull-request-comment event: select the
+`https://<daemon-host>/webhooks/github/comment/<source>` as the Payload URL, Content type `application/json` or
+`application/x-www-form-urlencoded` (GitHub's default; both are accepted), Secret set to the source's stored
+`secret_ref` value. GitHub has no separate pull-request-comment event: select the
 single **Issue comments** event (`issue_comment`), which fires for a comment on either a plain issue or a pull
 request, and the listener tells them apart the same way GitHub's own payload does, by whether `issue.pull_request`
 is present. Store the write PAT first, e.g. `printf %s '<pat>' | claude-run secret set github-write-<org>`, and name

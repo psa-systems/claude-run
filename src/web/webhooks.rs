@@ -9458,6 +9458,93 @@ mod tests {
             assert_eq!(event.status, RUN_STATUS_FAILURE);
         }
 
+        /// GitHub's default webhook Content type delivers the JSON payload
+        /// form-wrapped (`payload=<url-encoded JSON>`); the signature covers
+        /// the form body as sent, and decoding happens only after it verifies.
+        #[tokio::test]
+        async fn github_triage_form_urlencoded_delivery_dispatches_same_event() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state_with_github(tmp.path()).await;
+            let raw = github_workflow_run_payload("contoso/claude-run", "failure");
+            let form_body = serde_urlencoded::to_string([("payload", raw.as_str())]).unwrap();
+            let sig = github_sign(SECRET_GH.as_bytes(), form_body.as_bytes());
+            let mut headers = github_headers_with_event(
+                Some(&sig),
+                Some("gh-d-form-1"),
+                Some(GITHUB_WORKFLOW_RUN_EVENT_TYPE),
+            );
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-www-form-urlencoded"),
+            );
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_GH.to_string())),
+                headers,
+                Bytes::from(form_body),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            let event = rx.recv().await.expect("a verified failure event");
+            assert_eq!(event.repo, "contoso/claude-run");
+            assert_eq!(event.commit_sha, "deadbeefcafefeed");
+        }
+
+        #[tokio::test]
+        async fn github_form_urlencoded_delivery_with_no_payload_field_is_400() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, _rx) = state_with_github(tmp.path()).await;
+            let form_body = serde_urlencoded::to_string([("not_payload", "x")]).unwrap();
+            let sig = github_sign(SECRET_GH.as_bytes(), form_body.as_bytes());
+            let mut headers = github_headers_with_event(
+                Some(&sig),
+                Some("gh-d-form-2"),
+                Some(GITHUB_WORKFLOW_RUN_EVENT_TYPE),
+            );
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-www-form-urlencoded"),
+            );
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_GH.to_string())),
+                headers,
+                Bytes::from(form_body),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
+        /// Forgejo always sends JSON; a form-content-typed Forgejo delivery is
+        /// not decoded (the helper is a GitHub-only no-op for other providers)
+        /// and still fails the JSON parse the same way an unrecognized body did
+        /// before this change.
+        #[tokio::test]
+        async fn forgejo_form_content_type_delivery_is_still_rejected() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = setup_pool(tmp.path()).await;
+            let (tx, _rx) = mpsc::channel(8);
+            let st = WebhookState::new(pool, two_source_config(60), tx);
+            let form_body = serde_urlencoded::to_string([("payload", "{}")]).unwrap();
+            let sig = sign(SECRET_A.as_bytes(), form_body.as_bytes());
+            let mut hdrs = headers(Some(&sig), Some("fj-form-1"));
+            hdrs.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-www-form-urlencoded"),
+            );
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("forgejo".to_string(), SOURCE_A.to_string())),
+                hdrs,
+                Bytes::from(form_body),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        }
+
         #[tokio::test]
         async fn github_bad_signature_is_401() {
             let _env = crate::secrets::key_file_env_lock().await;
@@ -10301,6 +10388,72 @@ mod tests {
             assert_eq!(ev.number, 42);
             assert!(ev.merged);
             assert_eq!(ev.head_sha, "deadbeefcafefeed");
+        }
+
+        /// The `pull_request` path is shared by both providers; a GitHub
+        /// delivery sent with the default form Content type must decode the
+        /// same as the JSON delivery above.
+        #[tokio::test]
+        async fn github_pull_request_form_urlencoded_delivery_is_accepted_and_dispatched() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = setup_pool_with_github(tmp.path()).await;
+            let (tx, _rx) = mpsc::channel(8);
+            let (pr_tx, mut pr_rx) = mpsc::channel(8);
+            let st = WebhookState::new(pool, three_source_config(60), tx).with_pr_events(pr_tx);
+            let raw = pull_request_payload("contoso/claude-run", 42, "closed", true);
+            let form_body = serde_urlencoded::to_string([("payload", raw.as_str())]).unwrap();
+            let sig = github_sign(SECRET_GH.as_bytes(), form_body.as_bytes());
+            let mut hdrs = github_headers_with_event(
+                Some(&sig),
+                Some("gh-pr-form-1"),
+                Some(PULL_REQUEST_EVENT_TYPE),
+            );
+            hdrs.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-www-form-urlencoded"),
+            );
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_GH.to_string())),
+                hdrs,
+                Bytes::from(form_body),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            let ev = pr_rx.try_recv().unwrap();
+            assert_eq!(ev.repo, "contoso/claude-run");
+            assert_eq!(ev.number, 42);
+            assert!(ev.merged);
+        }
+
+        #[tokio::test]
+        async fn github_pull_request_form_urlencoded_delivery_with_no_payload_field_is_400() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = setup_pool_with_github(tmp.path()).await;
+            let (tx, _rx) = mpsc::channel(8);
+            let (pr_tx, _pr_rx) = mpsc::channel(8);
+            let st = WebhookState::new(pool, three_source_config(60), tx).with_pr_events(pr_tx);
+            let form_body = serde_urlencoded::to_string([("not_payload", "x")]).unwrap();
+            let sig = github_sign(SECRET_GH.as_bytes(), form_body.as_bytes());
+            let mut hdrs = github_headers_with_event(
+                Some(&sig),
+                Some("gh-pr-form-2"),
+                Some(PULL_REQUEST_EVENT_TYPE),
+            );
+            hdrs.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-www-form-urlencoded"),
+            );
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_GH.to_string())),
+                hdrs,
+                Bytes::from(form_body),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         }
     }
 
