@@ -73,8 +73,6 @@ Each tool's store is a subdirectory rather than a mount of its own, because the 
 
 `CLAUDE_CONFIG_DIR` deliberately names the same directory the daemon seeds and points its agent children at, so a `claude auth login` run through `docker compose exec` writes the credential where the agent reads it rather than into a second Claude config dir that looks fine and authenticates nothing.
 
-A host install is unaffected by all of this: none of these variables is set there, and every path still resolves through XDG exactly as before.
-
 **CI images (CLAUDE-383).** `compose.yml` also sets seven `RUNS_ON_*` variables on `claude-bot`, one per image CI uses (`RUNS_ON_OPENSUSE_BASE_HEAVY`, `RUNS_ON_OPENSUSE_BASE_MASSIVE`, `RUNS_ON_OPENSUSE_BASE_LIGHT`, `RUNS_ON_OPENSUSE_BASE_MEDIUM`, `RUNS_ON_RUST_BUILDER_MUSL`, `RUNS_ON_RUST_BUILDER_GLIBC`, `RUNS_ON_RUST_BUILDER_GLIBC_WINDOWS`). A workflow's `runs-on: ${{ vars.RUNS_ON_* }}` resolves the same name to a runner LABEL; the container's environment variable of the same name is the pullable IMAGE that label's runner runs, so an agent session can `docker run "$RUNS_ON_RUST_BUILDER_MUSL"` or reference `${RUNS_ON_RUST_BUILDER_MUSL}` in a compose file and get the exact image CI uses, with nothing from the GitHub Container Registry involved. See `deploy/bot-CLAUDE.md`'s "CI images" section for what the agent is told.
 
 **Running user.** The runtime stage stays on `USER root` (the base image's last `USER` is `dev`) so `oci-build/entrypoint.sh` can chown the mounted volumes to `claudebot`, then drops to that user with `setpriv --reuid=claudebot --regid=claudebot --init-groups` (pattern 3 in `governance/CONTAINER_UID_GID.md`); Leap packages neither `su-exec` nor `gosu`, and `setpriv` (util-linux, already in the base) is the equivalent gosu's own README names. The daemon itself runs non-root. `catatonit` (already in the base image) is PID 1 and execs `entrypoint.sh` as its child, so any process an agent session leaves running when its own session exits is reaped instead of accumulating as a zombie for the life of the container (CLAUDE-310). Do NOT set `user:` in compose: the entrypoint would lose the privileges the chown needs and a volume owned by another uid could never be repaired from inside. Two consequences for the operator:
@@ -109,7 +107,7 @@ the host, and logins still happen inside the container.
 
 **Actions.** The `./actions` bind is gone with the other host mounts. The image bakes this repo's action YAML at `/usr/share/claude-run/actions`, and the entrypoint copies it into the config volume the first time that volume holds no `*.yml`, so a fresh container starts with the shipped action set. It never overwrites after that: an action edited in the web UI survives an image upgrade, and a changed shipped action reaches an existing deployment through the same editor (`/actions`), not by recreating the container.
 
-**No unix-socket API.** The image runs `serve --no-socket`, so the daemon binds only the TCP listener. That socket is the CLI's control plane on a host install, and this container has no CLI operator: the web UI and its `/api` routes are the whole interface, and they carry the same handlers (`/api/actions/<n>/trigger`, `/api/pause`, `/api/resume`, `/settings/<section>`). Binding it here would only leave a second copy of that control plane with no token gate on it, reachable by the `claude` agent the daemon spawns as the same user. `claude-run trigger` and `claude-run cancel` inside the container therefore fail, naming the reason rather than claiming no daemon is running; every other subcommand (`secret set`, `action list`, `status`) works as before because it goes to the database directly. Override `command: ["serve"]` in compose if a deployment really does want the socket.
+**No unix-socket API.** The image runs `serve --no-socket`, so the daemon binds only the TCP listener. That socket is the CLI's control plane, and this container has no CLI operator: the web UI and its `/api` routes are the whole interface, and they carry the same handlers (`/api/actions/<n>/trigger`, `/api/pause`, `/api/resume`, `/settings/<section>`). Binding it here would only leave a second copy of that control plane with no token gate on it, reachable by the `claude` agent the daemon spawns as the same user. `claude-run trigger` and `claude-run cancel` inside the container therefore fail, naming the reason rather than claiming no daemon is running; every other subcommand (`secret set`, `action list`, `status`) works as before because it goes to the database directly. Override `command: ["serve"]` in compose if a deployment really does want the socket.
 
 **Web bind and first-run setup.** The image seeds a bootstrap `config.toml` (from `deploy/container-config.toml`) that binds `0.0.0.0:7321`, because a loopback bind inside a container is reachable from nothing outside it, published port or reverse proxy included. A non-loopback bind requires auth, and that credential is created in the browser: open the URL and the daemon serves `/setup`, which takes a username and a password and creates the first account. No token, no key file, no CLI. Every account after that comes from an invite minted on the Accounts page, never from `/setup` again. The seeded `config.toml` is copied only when the config volume has none, so operator edits survive restarts and image upgrades. See [Web UI / API auth](auth.md#web-ui--api-auth) for what setup is and is not (it is trust-on-first-use; bring the instance up behind the proxy).
 
@@ -166,20 +164,6 @@ secrets:
   claude-run-age-key:
     environment: CLAUDE_RUN_AGE_KEY
 ```
-
-**Migrating from a host install.** Carry the EXISTING key across, or the secrets already in the state store cannot be
-decrypted, and do it before the first start so the daemon finds a key instead of generating one. Either copy it onto the
-config volume:
-
-```nu
-docker compose create
-docker cp ~/.config/claude-run/secrets.key claude-bot:/config/secrets.key
-docker compose up --detach
-```
-
-or leave the host file where it is, mount it, and point `CLAUDE_RUN_SECRETS_KEY_FILE` at the mount as above. `docker cp`
-keeps the source's uid and mode; the entrypoint chowns `/config` to `claudebot` on every start, and a key readable
-beyond its owner still loads with a `warn`, so `chmod 600` the copy if you want that warning gone.
 
 **Networking.** The seeded `config.toml` already binds `0.0.0.0:7321`; publish the port (`ports:` mapping or a
 reverse-proxy network) to reach it. A non-loopback bind requires auth, which the first-run `/setup` page creates. A

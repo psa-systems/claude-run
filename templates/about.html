@@ -63,8 +63,8 @@
 <div class="card" style="margin-bottom: 16px;">
   <span class="dim">Check the registry for a newer build on the configured train, then download,
   verify, and atomically replace this binary. Applying an update does <strong>not</strong> restart the
-  service: after a successful apply, restart Claude Run yourself (systemd, container, nohup, ...) to run
-  the new version. A failed apply (checksum mismatch, unwritable binary path, registry unreachable)
+  service: after a successful apply, restart Claude Run yourself to run
+  the new version. In the container, update by pulling a newer image instead. A failed apply (checksum mismatch, unwritable binary path, registry unreachable)
   leaves the running binary untouched.</span>
 </div>
 

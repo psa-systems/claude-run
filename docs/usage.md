@@ -2,12 +2,17 @@
 
 ## Use
 
-```nu
-# Long-running daemon: scheduler + unix-socket API. --detach forks into the background.
-# --no-socket skips the unix-socket API (the container image runs that way).
-claude-run serve --detach
+The container runs the daemon (`serve --no-socket`). Run CLI commands inside it, as the runtime user:
 
-# Manual out-of-cycle run via the daemon (counts as triggered_by=trigger in the runs table).
+```nu
+docker compose exec --user claudebot claude-bot claude-run status
+```
+
+`trigger` and `cancel` talk to the daemon over its unix socket, which the container does not open, so they fail naming
+that reason; use the web UI's buttons instead. Every other command below works directly on the state store.
+
+```nu
+# Manual out-of-cycle run (needs the unix socket; in the container use the web UI).
 claude-run trigger youtrack
 
 # Status (delegates to daemon if it's up, else reads DB directly).
@@ -39,7 +44,7 @@ claude-run access check --repo owner/repo --host forgejo.example.com
 # Clear a locked-out account's TOTP enrollment (DB-direct); the next login re-enrolls.
 claude-run access reset-2fa admin
 
-# Self-update. `check` reports whether a newer build is published; `update` swaps the binary in place.
+# Version and update check. In the container, update by pulling a newer image (see operations.md, Self-update).
 claude-run version                         # print the build-stamped banner (same as `version show`)
 claude-run version check                   # uses the [update].train default (release)
 claude-run version check --train latest    # track the moving main build instead

@@ -110,9 +110,8 @@ endpoint answers `409` naming the reason. That is deliberate. Before it, a fresh
 and logged an auth error per action per tick, which buries real failures and would have burned attempts against
 `max_attempts_per_key` on runs that could only fail. The dashboard carries a banner while it lasts, `/api/status`
 reports `ready` plus `not_ready_reason`, and the transition is logged once in each direction rather than every tick. A
-credential counts when any of these hold, so a host install with an existing login is unaffected: a
-`.credentials.json` in the agent config dir (on a host, the symlink to `~/.claude/.credentials.json`), a stored API
-key, or `ANTHROPIC_API_KEY` in the daemon's environment.
+credential counts when any of these hold: a `.credentials.json` in the agent config dir, a stored API key, or
+`ANTHROPIC_API_KEY` in the daemon's environment.
 
 Precedence is unchanged where an action carries its own credentials: an action's `youtrack.token_ref` /
 `forgejo.token_ref` is materialized per job and sets the same env in the child, so it still wins. These are the
@@ -164,17 +163,9 @@ Auth (and every action `token_ref`) reads from an encrypted secrets store. Two t
    mounted file. That file does not have to be `age-keygen` output: the key is read from wherever it appears on a line,
    so a SOPS-decrypted `data: AGE-SECRET-KEY-...` or an env-style `CLAUDE_RUN_AGE_KEY=AGE-SECRET-KEY-...` works as-is. A
    key file readable beyond its owner is logged at `warn` (every process that can read it can decrypt every stored
-   token) but still loads, since an operator's own delivery may hand it over `0644` deliberately. To generate one
-   yourself:
-
-   ```sh
-   age-keygen -o /etc/claude-run/secrets.key
-   chmod 600 /etc/claude-run/secrets.key   # readable only by the service user
-   ```
-
-   Under systemd, set the env var in the unit (e.g. `systemctl edit claude-run` -> `[Service]` ->
-   `Environment=CLAUDE_RUN_SECRETS_KEY_FILE=/etc/claude-run/secrets.key`, then `systemctl daemon-reload`). A
-   missing/unset key file is exactly the `secret: CLAUDE_RUN_SECRETS_KEY_FILE is not set` error that disables the TCP
+   token) but still loads, since an operator's own delivery may hand it over `0644` deliberately. In the container,
+   deliver it as a compose secret and point `CLAUDE_RUN_SECRETS_KEY_FILE` at it; see [self-hosting.md](self-hosting.md).
+   A missing/unset key file is exactly the `secret: CLAUDE_RUN_SECRETS_KEY_FILE is not set` error that disables the TCP
    web UI on an exposed bind.
 
    Back this file up. If you lose it, every stored secret becomes undecryptable and must be re-entered under a new key.

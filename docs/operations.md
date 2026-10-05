@@ -155,6 +155,11 @@ run dispatched before its row exists and the row catches a run started by a daem
 
 ## Self-update (release trains)
 
+**In the container, update by pulling a newer image** (`docker compose pull && docker compose up --detach`). The
+binary at `/usr/local/bin/claude-run` is owned by root and the daemon runs as `claudebot`, so the in-place apply below
+fails as an unwritable binary path, and a recreated container would start from the image's binary anyway. `version
+check` and the About page's check still report whether a newer build is published.
+
 `claude-run version {show,check,update}` self-updates the binary from the Forgejo Generic Package registry. CI publishes
 two channels ("trains"), and the stored update settings pick the default; `--train <release|latest>` overrides it per
 invocation. The `train` and `token_ref` are edited on the **Settings** page (`Update train` section, formerly `[update]`
@@ -187,7 +192,7 @@ the on-demand registry check (anonymous-first, escalating only to the configured
 newest with whether an update is available; a registry/network failure is surfaced as a non-fatal message rather than an
 error page. "Update now" downloads the newest build on the configured train, verifies its SHA-256, and atomically
 replaces the binary. It does **not** restart the daemon: after a successful apply the page shows the applied tag and "
-Restart Claude Run service to use the new version", which you do yourself (systemd, container, nohup, ...). A failed
+Restart Claude Run service to use the new version", which you do yourself. A failed
 apply (checksum mismatch, unwritable binary path, registry unreachable) leaves the running binary untouched. Version
 pinning (`--version <tag>`) stays a CLI-only option; the web applies the newest build on the configured train. There is
 no background or periodic update check; checks happen only on demand.

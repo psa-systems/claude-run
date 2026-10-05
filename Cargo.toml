@@ -2,7 +2,7 @@
 name = "claude-run"
 version = "0.27.0"
 edition = "2021"
-description = "YAML-driven Claude Code runner. Rust port of scripts/claude-run.nu."
+description = "YAML-driven runner that feeds tracker issues, CI failures and PR comments to Claude Code."
 license = "MIT"
 repository = "https://dev.a8n.run/psa-systems/claude-run"
 

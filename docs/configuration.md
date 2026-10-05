@@ -2,14 +2,14 @@
 
 ## Filesystem layout
 
-XDG-compliant; each path overridable by the matching env var.
+The image sets each root with its env var; [self-hosting.md](self-hosting.md) maps them to volumes.
 
-| Default                        | Env override             | What                                                                                            |
-|--------------------------------|--------------------------|-------------------------------------------------------------------------------------------------|
-| `$XDG_CONFIG_HOME/claude-run/` | `CLAUDE_RUN_CONFIG_DIR`  | `config.toml`, `actions/*.yml`                                                                  |
-| `$XDG_DATA_HOME/claude-run/`   | `CLAUDE_RUN_DATA_DIR`    | `state.db` (SQLite backend only; see "State store backend"), `workdirs/`                        |
-| `$XDG_STATE_HOME/claude-run/`  | `CLAUDE_RUN_STATE_DIR`   | `logs/daemon.log`, `logs/<action>/<output.file>`, `logs/<action>/streams/<key>-attempt-<n>.jsonl`, `snippets/`, `webhook-logs/` |
-| `$XDG_RUNTIME_DIR/claude-run/` | `CLAUDE_RUN_RUNTIME_DIR` | `daemon.pid`, `daemon.sock` (absent under `serve --no-socket`), `locks/<action>.lock`           |
+| Container path      | Env var                  | What                                                                                            |
+|---------------------|--------------------------|-------------------------------------------------------------------------------------------------|
+| `/config`           | `CLAUDE_RUN_CONFIG_DIR`  | `config.toml`, `actions/*.yml`, `secrets.key`                                                   |
+| `/data`             | `CLAUDE_RUN_DATA_DIR`    | `state.db` (SQLite backend only; see "State store backend"), `workdirs/`                        |
+| `/state`            | `CLAUDE_RUN_STATE_DIR`   | `logs/daemon.log`, `logs/<action>/<output.file>`, `logs/<action>/streams/<key>-attempt-<n>.jsonl`, `snippets/`, `webhook-logs/` |
+| `/run/claude-run`   | `CLAUDE_RUN_RUNTIME_DIR` | `daemon.pid`, `locks/<action>.lock` (no `daemon.sock`: the image runs `serve --no-socket`)      |
 
 `workdir_base` (action YAML field or `CLAUDE_RUN_WORKDIR_BASE` env) overrides where per-job workdirs live; defaults to
 `$CLAUDE_RUN_DATA_DIR/workdirs` (`/data/workdirs` in the container). Supports `~`, `$VAR`, `${VAR}` expansion.
@@ -75,13 +75,11 @@ is what catches the two directories drifting apart.
 `claude-run import` copies every table out of a SQLite state store and into the database the configuration resolves to,
 so a switched backend keeps the same history, the same attempt and daily caps, the same settings documents, the same
 encrypted secrets and the same web accounts. Stop the daemon, point the configuration at the new database, and run
-it:
+it as a one-off container (the full sequence is at the end of this section):
 
 ```nu
-claude-run stop
-$env.CLAUDE_RUN_DATABASE_URL = "postgres://claude_run:secret@db.internal:5432/claude_run"
-claude-run import
-claude-run serve --detach
+docker compose stop claude-bot
+docker compose --profile postgres run --rm claude-bot import
 ```
 
 ```
@@ -113,7 +111,7 @@ attempt_counters          412         412         412
 The age key is not in the database and is not copied: back it up as usual and keep it where the new deployment reads it
 (`<CLAUDE_RUN_CONFIG_DIR>/secrets.key`), or the imported ciphertext cannot be decrypted.
 
-In the container the same command runs as a one-off, with the daemon stopped so nothing writes either side:
+The full sequence, with the daemon stopped so nothing writes either side:
 
 ```nu
 docker compose stop claude-bot

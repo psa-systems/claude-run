@@ -7,7 +7,7 @@
 # user's `~/.claude/CLAUDE.md` is the slim bot file baked from
 # `deploy/bot-CLAUDE.md`, never the operator's interactive global CLAUDE.md, so
 # the agent stops inheriting the operator's Git/YouTrack workflow instructions.
-# The Generic-Package binary is still published independently for host installs.
+# The Generic-Package binary is still published independently; `version check` reads it.
 #
 # Targets:
 #   --target builder  -> compile only, for `just check-docker`
@@ -150,8 +150,8 @@ COPY deploy/bot-CLAUDE.md /home/claudebot/.claude/CLAUDE.md
 # reads XDG_CONFIG_HOME, `fj` reads XDG_DATA_HOME (it has no config-dir variable
 # of its own, and claude-run resolves its key store the same way through
 # `dirs::data_dir()`), `claude` reads CLAUDE_CONFIG_DIR and git reads
-# GIT_CONFIG_GLOBAL. Nothing here changes how paths resolve for a HOST install,
-# where none of these variables is set and XDG defaults still apply.
+# GIT_CONFIG_GLOBAL. Outside the container (tests, local development) none of
+# these variables is set and XDG defaults apply.
 #
 # CLAUDE_CONFIG_DIR names the SAME directory the daemon seeds and points its
 # agent children at (`<config dir>/claude-agent-home`, CLAUDE-165), so an
@@ -193,7 +193,7 @@ RUN chmod 0755 /usr/local/bin/entrypoint.sh
 # (CLAUDE-310); it execs entrypoint.sh as its only child and forwards signals.
 #
 # Foreground daemon (no --detach), and no unix-socket API. That socket is the
-# CLI's control plane on a host install; this image has no CLI operator (the web
+# CLI's control plane; this image has no CLI operator (the web
 # UI and its /api routes are the whole interface), so binding it would only leave
 # an unauthenticated second copy of the control plane inside the container,
 # reachable by the agent the daemon spawns. Override the command to `serve` if a
