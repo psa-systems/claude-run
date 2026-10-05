@@ -2209,4 +2209,116 @@ mod tests {
             "rejected save must not persist"
         );
     }
+
+    #[test]
+    fn validate_email_rejects_an_unparseable_from_address() {
+        let cfg = EmailConfig {
+            from: Some("not an address".to_string()),
+            ..Default::default()
+        };
+        let err = validate_email(&cfg).expect_err("bad from must reject");
+        assert!(err.contains("from"), "{err}");
+    }
+
+    #[test]
+    fn validate_email_rejects_a_non_http_public_url() {
+        let cfg = EmailConfig {
+            public_url: Some("/relative/path".to_string()),
+            ..Default::default()
+        };
+        let err = validate_email(&cfg).expect_err("relative public_url must reject");
+        assert!(err.contains("public_url"), "{err}");
+
+        let cfg = EmailConfig {
+            public_url: Some("ftp://example.com".to_string()),
+            ..Default::default()
+        };
+        let err = validate_email(&cfg).expect_err("non-http(s) public_url must reject");
+        assert!(err.contains("http"), "{err}");
+    }
+
+    #[test]
+    fn validate_email_rejects_a_username_with_no_password() {
+        let cfg = EmailConfig {
+            smtp_username: Some("bot".to_string()),
+            smtp_password_ref: None,
+            ..Default::default()
+        };
+        let err = validate_email(&cfg).expect_err("username with no password must reject");
+        assert!(err.contains("password"), "{err}");
+    }
+
+    #[test]
+    fn validate_email_rejects_a_host_with_no_from_or_public_url() {
+        let cfg = EmailConfig {
+            smtp_host: Some("smtp.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(validate_email(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_email_accepts_a_fully_configured_document() {
+        let cfg = EmailConfig {
+            smtp_host: Some("smtp.example.com".to_string()),
+            smtp_port: Some(587),
+            smtp_encryption: crate::config::SmtpEncryption::Starttls,
+            smtp_username: Some("bot".to_string()),
+            smtp_password_ref: Some("email-smtp-password".to_string()),
+            from: Some("claude-run@example.com".to_string()),
+            public_url: Some("https://claude-run.example.com".to_string()),
+        };
+        validate_email(&cfg).unwrap();
+    }
+
+    #[tokio::test]
+    async fn email_section_round_trips_and_validates() {
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+
+        assert!(!live.email_config().await.configured());
+
+        live.save_section(
+            Section::Email,
+            r#"{"smtp_host":"smtp.example.com","smtp_port":587,"smtp_encryption":"starttls","smtp_username":null,"smtp_password_ref":null,"from":"claude-run@example.com","public_url":"https://claude-run.example.com"}"#,
+        )
+        .await
+        .unwrap();
+        let stored: EmailConfig = get_json(&pool, Section::Email.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.smtp_host.as_deref(), Some("smtp.example.com"));
+        assert!(stored.configured());
+        assert!(live.email_config().await.configured());
+
+        // An invalid from address is rejected and does not overwrite the stored value.
+        let err = live
+            .save_section(
+                Section::Email,
+                r#"{"smtp_host":"smtp.example.com","smtp_port":587,"smtp_encryption":"starttls","smtp_username":null,"smtp_password_ref":null,"from":"not an address","public_url":"https://claude-run.example.com"}"#,
+            )
+            .await
+            .expect_err("invalid from must reject");
+        assert!(matches!(err, SaveError::Invalid(_)));
+        let stored: EmailConfig = get_json(&pool, Section::Email.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.from.as_deref(),
+            Some("claude-run@example.com"),
+            "rejected save must not overwrite"
+        );
+
+        // An unknown field is rejected (deny_unknown_fields).
+        let err = live
+            .save_section(
+                Section::Email,
+                r#"{"smtp_host":"smtp.example.com","bogus":true}"#,
+            )
+            .await
+            .expect_err("unknown field must reject");
+        assert!(matches!(err, SaveError::Invalid(_)));
+    }
 }

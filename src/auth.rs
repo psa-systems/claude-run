@@ -2230,4 +2230,139 @@ mod tests {
             "a used invite link no longer resolves"
         );
     }
+
+    /// A router for an enrolled, signed-in `admin` account, so a POST to a
+    /// protected route is not turned away by the 2FA-enrollment gate.
+    async fn signed_in_accounts_router(pool: &DbPool) -> (Router, String) {
+        let key = test_secrets_key();
+        let account = crate::web_admin::create_first(&pool, "admin", "correct horse battery")
+            .await
+            .unwrap();
+        let pending = crate::web_admin::begin_totp_enrollment(pool, &key, account.id, "admin")
+            .await
+            .unwrap();
+        let base32 = pending
+            .otpauth_url
+            .split("secret=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .expect("otpauth URL carries the secret")
+            .to_string();
+        let secret = totp_rs::Secret::try_from_base32(&base32).unwrap();
+        let totp = totp_rs::Builder::new()
+            .with_issuer(Some("claude-run"))
+            .with_account_name("admin".to_string())
+            .with_secret(secret)
+            .build()
+            .unwrap();
+        let enroll_code = totp.generate_current().to_string();
+        crate::web_admin::confirm_totp_enrollment(pool, &key, account.id, &enroll_code)
+            .await
+            .unwrap();
+
+        let gate = TokenGate::unconfigured(pool.clone()).with_secrets_key(key);
+        let router = protect(Router::new(), gate);
+        let session = sign_session(account.session_key(), account.id, now_unix() + 60);
+        (router, format!("{SESSION_COOKIE}={session}"))
+    }
+
+    fn invite_post(cookie: &str, email: &str) -> Request {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/settings/accounts/invite")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, cookie.to_string())
+            .body(Body::from(format!("email={}", urlencoding_for_test(email))))
+            .unwrap()
+    }
+
+    /// Minimal percent-encoding for the one special character the test
+    /// addresses below contain.
+    fn urlencoding_for_test(s: &str) -> String {
+        s.replace('@', "%40")
+    }
+
+    /// An invalid email address is refused with `400` and mints no invite.
+    #[tokio::test]
+    async fn create_invite_with_bad_address_is_refused_400() {
+        let pool = setup_pool().await;
+        let (router, cookie) = signed_in_accounts_router(&pool).await;
+
+        let resp = router
+            .oneshot(invite_post(&cookie, "not-an-address"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(crate::web_admin::list_invites(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// With no `config.email` document saved, an email invite is refused with
+    /// `400` naming the Settings card, and mints no invite.
+    #[tokio::test]
+    async fn create_invite_by_email_with_smtp_unconfigured_is_refused_400() {
+        let pool = setup_pool().await;
+        let (router, cookie) = signed_in_accounts_router(&pool).await;
+
+        let resp = router
+            .oneshot(invite_post(&cookie, "person@example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("Email (SMTP)"), "{html}");
+        assert!(crate::web_admin::list_invites(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// With SMTP configured but unreachable, the send fails: the invite is
+    /// still created (kept, not discarded), the response is `502`, and the
+    /// link is shown as a fallback since the email never arrived.
+    #[tokio::test]
+    async fn create_invite_by_email_with_unreachable_smtp_is_502_and_keeps_the_invite() {
+        let pool = setup_pool().await;
+        let (router, cookie) = signed_in_accounts_router(&pool).await;
+
+        let cfg = crate::config::EmailConfig {
+            smtp_host: Some("127.0.0.1".to_string()),
+            smtp_port: Some(1),
+            smtp_encryption: crate::config::SmtpEncryption::None,
+            smtp_username: None,
+            smtp_password_ref: None,
+            from: Some("claude-run@example.com".to_string()),
+            public_url: Some("https://claude-run.example.com".to_string()),
+        };
+        crate::settings::set_json(&pool, crate::settings::Section::Email.key(), &cfg)
+            .await
+            .unwrap();
+
+        let resp = router
+            .oneshot(invite_post(&cookie, "person@example.com"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(
+            html.contains("/invite/"),
+            "the link must fall back into view: {html}"
+        );
+
+        let invites = crate::web_admin::list_invites(&pool).await.unwrap();
+        assert_eq!(
+            invites.len(),
+            1,
+            "the invite is kept despite the send failure"
+        );
+        assert_eq!(invites[0].email.as_deref(), Some("person@example.com"));
+    }
 }
