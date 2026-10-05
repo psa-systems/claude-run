@@ -93,7 +93,7 @@
   <h3>Identity</h3>
   <div class="grid2">
     {% call textfield("Name", "name", name, name_placeholder) %}
-    {% call textfield("Workdir base", "workdir_base", workdir_base, "~/.local/share/claude-run/workdirs") %}
+    {% call textfield("Workdir base", "workdir_base", workdir_base, "/data/workdirs") %}
     {% call textfield("Link template", "link_template", link_template, "https://youtrack.example.com/issue/{key}") %}
   </div>
   {% call checkbox("enabled", enabled, "Enabled (action is scheduled and eligible to run)") %}

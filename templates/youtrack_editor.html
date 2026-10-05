@@ -30,7 +30,7 @@
     <h3>Identity</h3>
     <div class="grid2">
       {% call m::textfield("Name", "name", form.name, "youtrack") %}
-      {% call m::textfield("Workdir base", "workdir_base", form.workdir_base, "~/.local/share/claude-run/workdirs") %}
+      {% call m::textfield("Workdir base", "workdir_base", form.workdir_base, "/data/workdirs") %}
       {% call m::textfield("Link template", "link_template", form.link_template, "https://youtrack.example.com/issue/{key}") %}
     </div>
     <label class="fld-inline">
