@@ -862,10 +862,31 @@ async fn authorize(
 }
 
 /// Look up the `fj` token for `host` in `~/.local/share/forgejo-cli/keys.json`.
+/// A missing store is a legitimate "no entry" and logs nothing; any other read
+/// error or a parse error is logged at `warn` (naming the path and the cause)
+/// before falling back to `None`, so a corrupted or unreadable store is never
+/// silently indistinguishable from a host with no token.
 pub fn fj_token_for_host(host: &str) -> Option<String> {
     let path = dirs::data_dir()?.join("forgejo-cli").join("keys.json");
-    let contents = std::fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    read_fj_token_for_host(&path, host)
+}
+
+fn read_fj_token_for_host(path: &Path, host: &str) -> Option<String> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "reading the fj key store failed");
+            return None;
+        }
+    };
+    let json: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "parsing the fj key store failed");
+            return None;
+        }
+    };
     json.get("hosts")?
         .get(host)?
         .get("token")?
@@ -889,6 +910,78 @@ fn confirm(question: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Collects the log lines emitted while a closure runs (mirrors
+    /// `action.rs`'s `capture_logs`).
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(sub, f);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (out, logs)
+    }
+
+    /// A missing fj key store is a legitimate "no entry": no warning is
+    /// logged, and the lookup returns `None`.
+    #[test]
+    fn fj_token_for_host_missing_file_logs_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-store.json");
+        let (token, logs) = capture_logs(|| read_fj_token_for_host(&missing, "dev.a8n.run"));
+        assert!(token.is_none());
+        assert!(logs.is_empty(), "expected no log output, got:\n{logs}");
+    }
+
+    /// Malformed JSON in the key store is logged at `warn`, naming the path,
+    /// before falling back to `None`.
+    #[test]
+    fn fj_token_for_host_malformed_json_is_logged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keys.json");
+        std::fs::write(&path, "not valid json").unwrap();
+        let (token, logs) = capture_logs(|| read_fj_token_for_host(&path, "dev.a8n.run"));
+        assert!(token.is_none());
+        assert!(logs.contains("WARN"), "expected a warn log, got:\n{logs}");
+        assert!(
+            logs.contains(&path.display().to_string()),
+            "expected the path in the log, got:\n{logs}"
+        );
+    }
+
+    /// A valid store with no entry for the requested host returns `None` and
+    /// is not itself a failure worth logging.
+    #[test]
+    fn fj_token_for_host_valid_file_no_entry_for_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keys.json");
+        std::fs::write(&path, r#"{"hosts":{"other.host":{"token":"y"}}}"#).unwrap();
+        let (token, logs) = capture_logs(|| read_fj_token_for_host(&path, "dev.a8n.run"));
+        assert!(token.is_none());
+        assert!(logs.is_empty(), "expected no log output, got:\n{logs}");
+    }
 
     #[test]
     fn select_newest_picks_semver_max() {
