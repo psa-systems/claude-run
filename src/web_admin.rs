@@ -200,9 +200,10 @@ pub async fn exists(pool: &DbPool) -> Result<bool> {
 
 /// List every account for the accounts-management page, newest first.
 pub async fn list(pool: &DbPool) -> Result<Vec<AccountSummary>> {
-    let rows: Vec<(i64, String, String, bool, Option<String>)> = sqlx::query_as(&crate::db::q(
+    let rows: Vec<(i64, String, String, i64, Option<String>)> = sqlx::query_as(&crate::db::q(
         pool,
-        "SELECT a.id, a.username, a.created_at, a.totp_enrolled_at IS NOT NULL, b.username \
+        "SELECT a.id, a.username, a.created_at, \
+         CASE WHEN a.totp_enrolled_at IS NOT NULL THEN 1 ELSE 0 END, b.username \
          FROM web_accounts a LEFT JOIN web_accounts b ON b.id = a.created_by \
          ORDER BY a.id ASC",
     ))
@@ -215,7 +216,7 @@ pub async fn list(pool: &DbPool) -> Result<Vec<AccountSummary>> {
                 id,
                 username,
                 created_at,
-                totp_enrolled,
+                totp_enrolled: totp_enrolled != 0,
                 created_by,
             },
         )
@@ -940,6 +941,29 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn create_invite_persists_and_lists_the_email_column() {
+        let pool = mem_pool().await;
+        let admin = create_first(&pool, "admin", "correct horse battery")
+            .await
+            .unwrap();
+        create_invite(&pool, admin.id, Some("person@example.com"))
+            .await
+            .unwrap();
+        create_invite(&pool, admin.id, None).await.unwrap();
+
+        let invites = list_invites(&pool).await.unwrap();
+        assert_eq!(invites.len(), 2);
+        assert_eq!(
+            invites
+                .iter()
+                .filter(|i| i.email.as_deref() == Some("person@example.com"))
+                .count(),
+            1
+        );
+        assert_eq!(invites.iter().filter(|i| i.email.is_none()).count(), 1);
     }
 
     #[tokio::test]
