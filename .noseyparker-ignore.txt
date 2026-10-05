@@ -3,7 +3,7 @@
 # redaction-test fixture tokens
 src/forge_log.rs
 # example Postgres URIs with placeholder passwords
-README.md
+docs/configuration.md
 compose.yml
 # password of the throwaway CI Postgres service container
 .forgejo/workflows/check.yml

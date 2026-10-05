@@ -15,7 +15,7 @@
 //! - [`import`]: copy an existing SQLite state store into the configured
 //!   backend.
 //!
-//! See `actions/SCHEMA.md` for the user-facing schema, `README.md` for the
+//! See `actions/SCHEMA.md` for the user-facing schema, `docs/` for the
 //! runtime contract.
 
 pub mod access;

@@ -7,7 +7,7 @@
 //! `.sha256` sidecar, and atomically swaps the running binary in place.
 //!
 //! The published coordinates mirror `build-binary.yml`:
-//! `https://dev.a8n.run/api/packages/psa-systems/generic/claude-run/<tag>/claude-run-linux-x86_64`.
+//! `https://dev.a8n.run/api/packages/psa-systems-private/generic/claude-run/<tag>/claude-run-linux-x86_64`.
 //! Available versions come from Forgejo's owner package list
 //! (`/api/v1/packages/<owner>?type=generic&q=<package>`); the registry is the
 //! source of truth for what is installable, so consuming its API here builds
@@ -38,7 +38,7 @@ use crate::paint;
 
 /// Default registry host / owner / package, matching `build-binary.yml`.
 const DEFAULT_BASE: &str = "https://dev.a8n.run";
-const DEFAULT_OWNER: &str = "psa-systems";
+const DEFAULT_OWNER: &str = "psa-systems-private";
 const DEFAULT_PACKAGE: &str = "claude-run";
 /// Asset filename published per tag (and its sha256 sidecar).
 const ASSET: &str = "claude-run-linux-x86_64";
