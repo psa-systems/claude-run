@@ -51,6 +51,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 
 - An exposed instance with no credential serves only `/setup`, which writes the argon2id admin ([details](docs/conventions/web-auth.md#setup-bootstrap))
 - TOTP is mandatory for every `web_admin`/`web_accounts` row: recovery codes, replay guard, pending-2FA cookie ([CLAUDE-368](docs/conventions/web-auth.md#mandatory-totp-claude-368))
+- An invite's email goes through `src/mailer.rs`; its link is built from `public_url`, never the `Host` header ([CLAUDE-394](docs/conventions/web-auth.md#invite-by-email-claude-394))
 
 ### Credentials and logins
 
