@@ -525,7 +525,10 @@ fn operator_fj_keys_path() -> PathBuf {
         return PathBuf::from("/nonexistent/forgejo-cli/keys.json");
     }
     dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| {
+            tracing::warn!("could not resolve the platform data dir; falling back to `.`");
+            PathBuf::from(".")
+        })
         .join("forgejo-cli")
         .join("keys.json")
 }
@@ -569,13 +572,38 @@ fn fj_host_entry(
 
 /// Read the operator's key store and return a clone of its host entry for
 /// `host`, or `None` when the store is missing, unparseable, or has no entry for
-/// `host`. Best-effort: any failure falls back to the synthetic entry.
+/// `host`. Best-effort: any failure falls back to the synthetic entry. A
+/// missing store is a legitimate "no entry" and logs nothing; any other read
+/// error or a parse error is logged at `warn` (naming the path and the cause)
+/// before the fallback is used, so a corrupted or unreadable store is never
+/// silently indistinguishable from a host with no credential.
 fn operator_fj_host_entry(
     path: &Path,
     host: &str,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "reading the operator fj key store failed"
+            );
+            return None;
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "parsing the operator fj key store failed"
+            );
+            return None;
+        }
+    };
     let entry = parsed.get("hosts")?.get(host)?.as_object()?;
     Some(entry.clone())
 }
@@ -898,6 +926,82 @@ mod tests {
         assert!(!job_dir.exists());
         assert!(!cfg_path.exists());
         assert!(!keys_path.exists());
+    }
+
+    /// Collects the log lines emitted while a closure runs (mirrors
+    /// `action.rs`'s `capture_logs`).
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(sub, f);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (out, logs)
+    }
+
+    /// A missing operator key store is a legitimate "no entry": no warning is
+    /// logged, and the lookup returns `None`.
+    #[test]
+    fn operator_fj_host_entry_missing_file_logs_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-store.json");
+        let (entry, logs) = capture_logs(|| operator_fj_host_entry(&missing, "dev.a8n.run"));
+        assert!(entry.is_none());
+        assert!(logs.is_empty(), "expected no log output, got:\n{logs}");
+    }
+
+    /// Malformed JSON in the operator store is logged at `warn`, naming the
+    /// path, before falling back to `None`.
+    #[test]
+    fn operator_fj_host_entry_malformed_json_is_logged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keys.json");
+        std::fs::write(&path, "not valid json").unwrap();
+        let (entry, logs) = capture_logs(|| operator_fj_host_entry(&path, "dev.a8n.run"));
+        assert!(entry.is_none());
+        assert!(logs.contains("WARN"), "expected a warn log, got:\n{logs}");
+        assert!(
+            logs.contains(&path.display().to_string()),
+            "expected the path in the log, got:\n{logs}"
+        );
+    }
+
+    /// A valid store with no entry for the requested host returns `None` and
+    /// is not itself a failure worth logging.
+    #[test]
+    fn operator_fj_host_entry_valid_file_no_entry_for_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keys.json");
+        std::fs::write(
+            &path,
+            r#"{"hosts":{"other.host":{"type":"Application","name":"x","token":"y"}}}"#,
+        )
+        .unwrap();
+        let (entry, logs) = capture_logs(|| operator_fj_host_entry(&path, "dev.a8n.run"));
+        assert!(entry.is_none());
+        assert!(logs.is_empty(), "expected no log output, got:\n{logs}");
     }
 
     #[test]
