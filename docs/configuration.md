@@ -142,7 +142,15 @@ the Secrets store and are rendered as that name only. Each
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
 secret refs, adding a source), `next event` for mint / update, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
-`GET` / `PUT /api/settings/{mint,update,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,claude}`.
+`GET` / `PUT /api/settings/{mint,update,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,claude,email}`.
+`email` (CLAUDE-394: the SMTP transport an invite is mailed over) is `live`-applied like the Auth logins, and for the
+same reason as Auth gets its own hand-written **Email (SMTP)** card on the Settings page rather than the generic JSON
+editor: a password field needs a real `type="password"` input and "leave blank to keep the current password"
+semantics, not a JSON textarea. Its fields are `smtp_host`, `smtp_port`, `smtp_encryption` (`starttls` | `tls` |
+`none`), `smtp_username`, `smtp_password_ref` (name-only, like the other secret-ref fields above), `from`, and
+`public_url`; the card's own "Send test email" button exercises the saved document exactly as a real invite send
+would. `EmailConfig::configured()` requires `smtp_host`, `from`, and `public_url` all set before the Accounts page
+offers emailing an invite instead of showing its link.
 The `webhook_comment` (CLAUDE-220), `workdir_gc` (CLAUDE-106), `stream_log_gc` (CLAUDE-245), `preferences` (CLAUDE-154),
 `concurrency` (CLAUDE-162), `db_retention` (CLAUDE-175), and `claude` (CLAUDE-239 `model`, CLAUDE-259 `effort`: the instance-wide `--model` and
 `--effort` defaults an action inherits when it pins neither in its own `claude:` block, each one null by default, which passes no flag and leaves
