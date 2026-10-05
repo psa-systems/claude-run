@@ -184,6 +184,10 @@ struct ActionView {
     /// Pause / Resume controls DO apply and are shown (a paused webhook accepts
     /// and drops deliveries).
     synthetic: bool,
+    /// For a synthetic action, the sorted, de-duplicated display names
+    /// ("Forgejo", "GitHub") of the providers its configured sources use (e.g.
+    /// "Forgejo, GitHub"). Empty for a non-synthetic action.
+    providers: String,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -605,34 +609,29 @@ fn build_usage_chart(points: &[crate::report::ClaudeUsagePoint]) -> UsageChart {
     }
 }
 
-/// Whether each event-driven listener has at least one configured
-/// source, read live off the shared settings handles rather than a startup
-/// snapshot. Saving the first source (or removing the last one) for either
-/// section is reflected on the next page load with no restart.
-async fn listeners_enabled(s: &WebState) -> (bool, bool) {
-    let webhook_enabled = !s
-        .api
-        .settings
-        .webhook_handle()
-        .read()
-        .await
-        .sources
-        .is_empty();
-    let comment_webhook_enabled = !s
-        .api
-        .settings
-        .webhook_comment_handle()
-        .read()
-        .await
-        .sources
-        .is_empty();
-    (webhook_enabled, comment_webhook_enabled)
+/// For each event-driven listener, `Some(providers)` (the sorted,
+/// de-duplicated display names of the providers its configured sources use)
+/// when it has at least one configured source, else `None`. Read live off the
+/// shared settings handles rather than a startup snapshot, so saving the
+/// first source (or removing the last one) for either section is reflected on
+/// the next page load with no restart.
+async fn listener_providers(s: &WebState) -> (Option<String>, Option<String>) {
+    let webhook_handle = s.api.settings.webhook_handle();
+    let webhook = webhook_handle.read().await;
+    let webhook_providers = (!webhook.sources.is_empty())
+        .then(|| provider_display_names(webhook.sources.values().map(|src| src.provider)));
+    drop(webhook);
+    let comment_handle = s.api.settings.webhook_comment_handle();
+    let comment = comment_handle.read().await;
+    let comment_providers = (!comment.sources.is_empty())
+        .then(|| provider_display_names(comment.sources.values().map(|src| src.provider)));
+    (webhook_providers, comment_providers)
 }
 
 async fn enriched_actions(
     pool: &DbPool,
-    webhook_enabled: bool,
-    comment_webhook_enabled: bool,
+    webhook_providers: Option<String>,
+    comment_webhook_providers: Option<String>,
 ) -> Result<Vec<ActionView>, WebError> {
     let rows = state::action_index_list(pool).await?;
     let mut out = Vec::with_capacity(rows.len() + 1);
@@ -656,19 +655,23 @@ async fn enriched_actions(
             last_run_started: last,
             paused,
             synthetic: false,
+            providers: String::new(),
         });
     }
     // Surface the event-driven webhook as a synthetic
     // read-only action when it is configured, so its runs get the same
     // dashboard / action-detail surfaces other actions have. It has no backing
     // YAML and is never indexed in the `actions` table; it lives only here.
-    if webhook_enabled {
-        out.push(synthetic_action_view(pool, webhooks::WEBHOOK_MINT_ACTION).await?);
+    if let Some(providers) = webhook_providers {
+        out.push(synthetic_action_view(pool, webhooks::WEBHOOK_MINT_ACTION, providers).await?);
     }
     // The same treatment for the `/claude` comment listener, so both
     // event-driven listeners surface (and pause) like any other action.
-    if comment_webhook_enabled {
-        out.push(synthetic_action_view(pool, comment_webhooks::WEBHOOK_COMMENT_ACTION).await?);
+    if let Some(providers) = comment_webhook_providers {
+        out.push(
+            synthetic_action_view(pool, comment_webhooks::WEBHOOK_COMMENT_ACTION, providers)
+                .await?,
+        );
     }
     Ok(out)
 }
@@ -683,7 +686,11 @@ async fn enriched_actions(
 /// `paused_actions` row like every other action, so the dashboard shows a
 /// Paused badge and the Pause/Resume controls act on it; a paused delivery is
 /// accepted-and-dropped by the inbound endpoint.
-async fn synthetic_action_view(pool: &DbPool, name: &str) -> Result<ActionView, WebError> {
+async fn synthetic_action_view(
+    pool: &DbPool,
+    name: &str,
+    providers: String,
+) -> Result<ActionView, WebError> {
     let name = name.to_string();
     let last = state::action_last_run_started(pool, &name).await?;
     let paused = state::action_pause_status(pool, &name)
@@ -704,7 +711,24 @@ async fn synthetic_action_view(pool: &DbPool, name: &str) -> Result<ActionView, 
         last_run_started: last,
         paused,
         synthetic: true,
+        providers,
     })
+}
+
+/// The sorted, de-duplicated display names ("Forgejo", "GitHub") of
+/// `providers`, joined with ", ". Used to describe a synthetic listener's
+/// configured sources without hardcoding a provider name that may not be
+/// configured.
+fn provider_display_names(providers: impl Iterator<Item = webhooks::WebhookProvider>) -> String {
+    let mut names: Vec<&'static str> = providers
+        .map(|p| match p {
+            webhooks::WebhookProvider::Forgejo => "Forgejo",
+            webhooks::WebhookProvider::Github => "GitHub",
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.join(", ")
 }
 
 /// True for the reserved synthetic action name. Mutating endpoints
@@ -727,10 +751,10 @@ pub const SYNTHETIC_ACTIONS: &[&str] = &[
 /// of 404ing. An unconfigured listener keeps its historical runs queryable but
 /// has no live entry.
 async fn synthetic_enabled(s: &WebState, name: &str) -> bool {
-    let (webhook_enabled, comment_webhook_enabled) = listeners_enabled(s).await;
+    let (webhook_providers, comment_webhook_providers) = listener_providers(s).await;
     match name {
-        n if n == webhooks::WEBHOOK_MINT_ACTION => webhook_enabled,
-        n if n == comment_webhooks::WEBHOOK_COMMENT_ACTION => comment_webhook_enabled,
+        n if n == webhooks::WEBHOOK_MINT_ACTION => webhook_providers.is_some(),
+        n if n == comment_webhooks::WEBHOOK_COMMENT_ACTION => comment_webhook_providers.is_some(),
         _ => false,
     }
 }
@@ -1542,8 +1566,8 @@ async fn dashboard(
             paused_at: a,
             reason: r,
         });
-    let (webhook_enabled, comment_webhook_enabled) = listeners_enabled(&s).await;
-    let actions = enriched_actions(pool, webhook_enabled, comment_webhook_enabled).await?;
+    let (webhook_providers, comment_webhook_providers) = listener_providers(&s).await;
+    let actions = enriched_actions(pool, webhook_providers, comment_webhook_providers).await?;
 
     // Whitelist the sort/filter selections before they reach SQL or
     // the page. `sort`/`dir`/`exit`/`outcome` are checked against fixed allow-lists; the
@@ -1721,8 +1745,8 @@ async fn action_detail(
     Query(q): Query<ActionDetailQuery>,
 ) -> Result<Response, WebError> {
     let pool = &s.api.pool;
-    let (webhook_enabled, comment_webhook_enabled) = listeners_enabled(&s).await;
-    let actions = enriched_actions(pool, webhook_enabled, comment_webhook_enabled).await?;
+    let (webhook_providers, comment_webhook_providers) = listener_providers(&s).await;
+    let actions = enriched_actions(pool, webhook_providers, comment_webhook_providers).await?;
     let Some(action) = actions.into_iter().find(|a| a.name == name) else {
         return Ok((StatusCode::NOT_FOUND, format!("unknown action `{name}`")).into_response());
     };
@@ -8755,7 +8779,7 @@ mod tests {
             let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION;
 
             // Webhook unconfigured: the synthetic entry is absent.
-            let without = super::super::enriched_actions(&s.api.pool, false, false)
+            let without = super::super::enriched_actions(&s.api.pool, None, None)
                 .await
                 .unwrap();
             assert!(
@@ -8764,9 +8788,10 @@ mod tests {
             );
 
             // Webhook configured: a single read-only synthetic entry appears.
-            let with = super::super::enriched_actions(&s.api.pool, true, false)
-                .await
-                .unwrap();
+            let with =
+                super::super::enriched_actions(&s.api.pool, Some("Forgejo".to_string()), None)
+                    .await
+                    .unwrap();
             let entry = with
                 .iter()
                 .find(|a| a.name == synthetic)
@@ -9419,15 +9444,16 @@ mod tests {
             let failure = crate::web::webhooks::WEBHOOK_MINT_ACTION;
 
             // Neither configured: no synthetic entries at all.
-            let none = super::super::enriched_actions(&s.api.pool, false, false)
+            let none = super::super::enriched_actions(&s.api.pool, None, None)
                 .await
                 .unwrap();
             assert!(!none.iter().any(|a| a.name == comment));
 
             // Only the comment listener configured: only its entry appears.
-            let only_comment = super::super::enriched_actions(&s.api.pool, false, true)
-                .await
-                .unwrap();
+            let only_comment =
+                super::super::enriched_actions(&s.api.pool, None, Some("Forgejo".to_string()))
+                    .await
+                    .unwrap();
             assert!(
                 !only_comment.iter().any(|a| a.name == failure),
                 "the CI-failure entry must not ride along"
@@ -9441,9 +9467,13 @@ mod tests {
             assert!(entry.schedule_kind.is_none(), "event-driven: no schedule");
 
             // Both configured: both entries appear.
-            let both = super::super::enriched_actions(&s.api.pool, true, true)
-                .await
-                .unwrap();
+            let both = super::super::enriched_actions(
+                &s.api.pool,
+                Some("Forgejo".to_string()),
+                Some("Forgejo".to_string()),
+            )
+            .await
+            .unwrap();
             assert!(both.iter().any(|a| a.name == comment));
             assert!(both.iter().any(|a| a.name == failure));
         }
@@ -9460,9 +9490,10 @@ mod tests {
             state::action_pause_set(&s.api.pool, comment, Some("maintenance"))
                 .await
                 .unwrap();
-            let paused = super::super::enriched_actions(&s.api.pool, false, true)
-                .await
-                .unwrap();
+            let paused =
+                super::super::enriched_actions(&s.api.pool, None, Some("Forgejo".to_string()))
+                    .await
+                    .unwrap();
             let entry = paused.iter().find(|a| a.name == comment).unwrap();
             let info = entry.paused.as_ref().expect("paused badge shown");
             assert_eq!(info.reason.as_deref(), Some("maintenance"));
@@ -9470,9 +9501,10 @@ mod tests {
             state::action_pause_clear(&s.api.pool, comment)
                 .await
                 .unwrap();
-            let resumed = super::super::enriched_actions(&s.api.pool, false, true)
-                .await
-                .unwrap();
+            let resumed =
+                super::super::enriched_actions(&s.api.pool, None, Some("Forgejo".to_string()))
+                    .await
+                    .unwrap();
             assert!(resumed
                 .iter()
                 .find(|a| a.name == comment)
@@ -9491,9 +9523,10 @@ mod tests {
             let synthetic = crate::web::webhooks::WEBHOOK_MINT_ACTION;
 
             // Unpaused: the synthetic entry reports no pause.
-            let before = super::super::enriched_actions(&s.api.pool, true, false)
-                .await
-                .unwrap();
+            let before =
+                super::super::enriched_actions(&s.api.pool, Some("Forgejo".to_string()), None)
+                    .await
+                    .unwrap();
             let entry = before.iter().find(|a| a.name == synthetic).unwrap();
             assert!(entry.paused.is_none(), "starts unpaused");
 
@@ -9501,9 +9534,10 @@ mod tests {
             state::action_pause_set(&s.api.pool, synthetic, Some("maintenance"))
                 .await
                 .unwrap();
-            let paused = super::super::enriched_actions(&s.api.pool, true, false)
-                .await
-                .unwrap();
+            let paused =
+                super::super::enriched_actions(&s.api.pool, Some("Forgejo".to_string()), None)
+                    .await
+                    .unwrap();
             let entry = paused.iter().find(|a| a.name == synthetic).unwrap();
             let info = entry.paused.as_ref().expect("synthetic action is paused");
             assert_eq!(info.reason.as_deref(), Some("maintenance"));
@@ -9512,9 +9546,10 @@ mod tests {
             state::action_pause_clear(&s.api.pool, synthetic)
                 .await
                 .unwrap();
-            let after = super::super::enriched_actions(&s.api.pool, true, false)
-                .await
-                .unwrap();
+            let after =
+                super::super::enriched_actions(&s.api.pool, Some("Forgejo".to_string()), None)
+                    .await
+                    .unwrap();
             let entry = after.iter().find(|a| a.name == synthetic).unwrap();
             assert!(entry.paused.is_none(), "resume clears the pause");
         }
