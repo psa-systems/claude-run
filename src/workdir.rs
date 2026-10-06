@@ -110,6 +110,21 @@ fn git_required(workdir: &Path, args: &[&str]) -> Result<String, WorkCheckError>
     git_out(workdir, args).ok_or_else(|| WorkCheckError(format!("git {} failed", args.join(" "))))
 }
 
+/// Like [`git_required`], but for the one network call in this module
+/// (`ls-remote origin`): authenticates per invocation via `token_url`
+/// (CLAUDE-395) instead of relying on a credential embedded in `origin`'s URL.
+fn authed_git_required(
+    workdir: &Path,
+    args: &[&str],
+    token_url: Option<&str>,
+) -> Result<String, WorkCheckError> {
+    let out = crate::provider::authed_git_output(Some(workdir), args, token_url)
+        .ok()
+        .filter(|o| o.status.success())
+        .ok_or_else(|| WorkCheckError(format!("git {} failed", args.join(" "))))?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// The dirty-tree / stash half of the check, with no network call: `git
 /// status --porcelain=v1 --untracked-files=normal` (ignored files are never
 /// listed) plus `git stash list`. A workdir with no `.git` (a plain scratch
@@ -153,7 +168,26 @@ pub fn uncommitted_or_stashed(workdir: &Path) -> Result<DirtyState, WorkCheckErr
 /// ref, so a brand-new branch left at `main`'s tip read as pushed) with an
 /// exact `refs/heads/<name>` lookup, and adds the dirty-tree / stash half the
 /// old check never asked about at all.
+///
+/// No credential: callers with no forge token in scope (the GC sweep,
+/// scripted actions) use this and get the pre-CLAUDE-395 behaviour, an
+/// unauthenticated `ls-remote origin`. Callers that do have one (native
+/// YouTrack job cleanup, the comment webhook) should call
+/// [`local_only_work_with_token`] instead, since `origin` itself no longer
+/// carries the token after CLAUDE-395's post-clone scrub.
 pub fn local_only_work(workdir: &Path) -> Result<LocalWork, WorkCheckError> {
+    local_only_work_with_token(workdir, None)
+}
+
+/// Same check as [`local_only_work`], but the `ls-remote origin` network call
+/// authenticates per invocation with `token_url` (CLAUDE-395) via
+/// [`crate::provider::authed_git_output`], never by writing the token into
+/// `origin`'s URL. `token_url` is only ever read for its userinfo; a `None`
+/// falls back to the prior unauthenticated call.
+pub fn local_only_work_with_token(
+    workdir: &Path,
+    token_url: Option<&str>,
+) -> Result<LocalWork, WorkCheckError> {
     let dirty = uncommitted_or_stashed(workdir)?;
     if !workdir.join(".git").exists() {
         return Ok(LocalWork {
@@ -182,7 +216,7 @@ pub fn local_only_work(workdir: &Path) -> Result<LocalWork, WorkCheckError> {
 
     // The live remote's advertised `refname -> sha` map, plus the `ref:
     // refs/heads/<x>\tHEAD` symref line naming the default branch.
-    let remote = git_required(workdir, &["ls-remote", "--symref", "origin"])?;
+    let remote = authed_git_required(workdir, &["ls-remote", "--symref", "origin"], token_url)?;
     let mut remote_refs: HashMap<String, String> = HashMap::new();
     let mut default_branch: Option<String> = None;
     for line in remote.lines() {
@@ -271,10 +305,24 @@ pub fn force_remove(workdir: &Path) {
 /// any local-only work, or a failed check, preserves instead (pruning
 /// gitignored build artifacts first) and logs what was found.
 pub fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
+    cleanup_or_preserve_with_token(workdir, action, key, None)
+}
+
+/// Same guarded delete as [`cleanup_or_preserve`], but the `local_only_work`
+/// check authenticates its `ls-remote origin` call with `token_url`
+/// (CLAUDE-395). Callers with a forge token in scope (native YouTrack job
+/// cleanup, the comment webhook) should call this instead, since `origin`
+/// carries no credential after the post-clone scrub.
+pub fn cleanup_or_preserve_with_token(
+    workdir: &Path,
+    action: &str,
+    key: &str,
+    token_url: Option<&str>,
+) {
     if !workdir.exists() {
         return;
     }
-    match local_only_work(workdir) {
+    match local_only_work_with_token(workdir, token_url) {
         Ok(work) if work.is_clean() => force_remove(workdir),
         Ok(work) => {
             prune_ignored_artifacts(workdir);
