@@ -589,6 +589,245 @@ pub const GITHUB_PRIORITY: &[BackendKind] = &[BackendKind::Mcp, BackendKind::Gh]
 /// Default priority: CLI-first, and CLI-only for this phase.
 pub const DEFAULT_PRIORITY: &[BackendKind] = &[BackendKind::Cli];
 
+/// Env var carrying the credential username for the inline helper
+/// [`CREDENTIAL_HELPER`] builds. Set only on the child git process's own
+/// environment by [`authed_git_output`] / [`run_authed_git`], never written to
+/// argv or any git config file.
+const GIT_CRED_USER_ENV: &str = "CLAUDE_RUN_GIT_USERNAME";
+/// Env var carrying the credential password/token for [`CREDENTIAL_HELPER`].
+const GIT_CRED_PASS_ENV: &str = "CLAUDE_RUN_GIT_PASSWORD";
+
+/// An inline git credential helper (the `!<shell>` form) that answers git's
+/// credential protocol by echoing back whatever this process set in its own
+/// environment under [`GIT_CRED_USER_ENV`] / [`GIT_CRED_PASS_ENV`]. Passed as
+/// `-c credential.helper=<this>` on the git invocation itself, so the
+/// credential lives only in that one child's environment: never in argv,
+/// never in `.git/config`, never inherited by anything git spawns afterwards.
+pub(crate) const CREDENTIAL_HELPER: &str = concat!(
+    "credential.helper=!f() { echo \"username=$",
+    "CLAUDE_RUN_GIT_USERNAME",
+    "\"; echo \"password=$",
+    "CLAUDE_RUN_GIT_PASSWORD",
+    "\"; }; f"
+);
+
+/// The two leading `-c` arguments that make a git invocation use
+/// [`CREDENTIAL_HELPER`] instead of whatever the host or workdir already
+/// configured. `credential.helper=` (empty value) first CLEARS any inherited
+/// helper list: git accumulates `credential.helper` entries, so without this
+/// an inherited helper could still answer (or cache) ahead of this one.
+fn credential_helper_args() -> [&'static str; 4] {
+    ["-c", "credential.helper=", "-c", CREDENTIAL_HELPER]
+}
+
+/// The `user:pass` pair from a token-bearing clone URL's userinfo
+/// (`https://user:pass@host/...`), for handing to the per-invocation
+/// credential helper. `None` when the URL carries no userinfo at all, which
+/// callers treat as "no credential resolves" and fall back to an
+/// unauthenticated invocation.
+fn url_userinfo(url: &str) -> Option<(String, String)> {
+    let rest = url.split_once("://").map(|(_, r)| r)?;
+    let (userinfo, _) = rest.split_once('@')?;
+    if userinfo.is_empty() {
+        return None;
+    }
+    let (user, pass) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+    Some((user.to_string(), pass.to_string()))
+}
+
+/// `url` with its userinfo stripped (`https://user:pass@host/x` ->
+/// `https://host/x`), unchanged when it carries none. This is what every
+/// remote URL in a job workdir is rewritten to after a clone, so a forge
+/// token is never left sitting in `.git/config` or `.git/modules/**/config`.
+fn strip_userinfo(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('@') {
+            Some((_, hostpath)) => format!("{scheme}://{hostpath}"),
+            None => url.to_string(),
+        },
+        None => url.to_string(),
+    }
+}
+
+/// Run `git <args>` in `dir` (the whole workdir when `None`), authenticated
+/// per invocation via [`credential_helper_args`] when `token_url` resolves a
+/// credential, else unauthenticated (any host git credential helper still
+/// applies). Used by call sites that shell out directly with
+/// [`std::process::Command`] rather than through a [`CommandRunner`] (this
+/// module's own clone/scrub machinery, and [`crate::workdir`]).
+pub fn authed_git_output(
+    dir: Option<&std::path::Path>,
+    args: &[&str],
+    token_url: Option<&str>,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(d) = dir {
+        cmd.arg("-C").arg(d);
+    }
+    if let Some((user, pass)) = token_url.and_then(url_userinfo) {
+        cmd.args(credential_helper_args())
+            .env(GIT_CRED_USER_ENV, user)
+            .env(GIT_CRED_PASS_ENV, pass);
+    }
+    cmd.args(args).output()
+}
+
+/// Same per-invocation authentication as [`authed_git_output`], but through a
+/// [`CommandRunner`] so call sites built on it (notably [`cli::CliBackend`])
+/// stay testable against a [`cli::StubRunner`] instead of a real `git`.
+pub fn run_authed_git(
+    runner: &dyn CommandRunner,
+    dir: Option<&std::path::Path>,
+    args: &[&str],
+    token_url: Option<&str>,
+) -> Result<CmdOutput> {
+    match token_url.and_then(url_userinfo) {
+        Some((user, pass)) => {
+            let mut full: Vec<&str> = Vec::with_capacity(4 + args.len());
+            full.extend(credential_helper_args());
+            full.extend_from_slice(args);
+            runner.run_in_env(
+                dir,
+                "git",
+                &full,
+                &[
+                    (GIT_CRED_USER_ENV, user.as_str()),
+                    (GIT_CRED_PASS_ENV, pass.as_str()),
+                ],
+            )
+        }
+        None => runner.run_in_env(dir, "git", args, &[]),
+    }
+}
+
+/// Rewrite every remote URL a fresh clone could have persisted with
+/// credentials: `origin` in `workdir` itself, `submodule.<name>.url` in the
+/// superproject config, and `origin` inside every submodule's own git
+/// directory, recursively. Called once at the end of [`shallow_clone`], after
+/// `init_submodules` has populated any submodule checkouts, so nothing ever
+/// observes a token-bearing remote even transiently between clone and scrub.
+///
+/// A rewrite failure fails the clone outright (through [`git_error`], same as
+/// every other failure in this module) rather than leaving a half-scrubbed
+/// workdir behind a warning: a swallowed failure here is exactly the leak
+/// this function exists to prevent.
+fn scrub_workdir_credentials(url: &str, workdir: &std::path::Path) -> Result<()> {
+    if !workdir.join(".git").exists() {
+        return Ok(());
+    }
+    scrub_remote_origin_url(url, workdir)?;
+    scrub_submodule_config_urls(url, workdir)?;
+    recurse_into_submodules(url, workdir)
+}
+
+/// Strip userinfo from `origin`'s URL in `workdir`, if it has one and if the
+/// URL carries any.
+fn scrub_remote_origin_url(url: &str, workdir: &std::path::Path) -> Result<()> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .arg("remote")
+        .arg("get-url")
+        .arg("origin")
+        .output()?;
+    if !out.status.success() {
+        // No `origin` remote (shouldn't happen for a fresh clone, but a
+        // submodule-only directory with none has nothing to scrub).
+        return Ok(());
+    }
+    let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stripped = strip_userinfo(&current);
+    if stripped == current {
+        return Ok(());
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .arg("remote")
+        .arg("set-url")
+        .arg("origin")
+        .arg(&stripped)
+        .output()?;
+    if !out.status.success() {
+        return Err(git_error("remote set-url", &out, Some(url)));
+    }
+    Ok(())
+}
+
+/// Strip userinfo from every `submodule.<name>.url` entry recorded in
+/// `workdir`'s own config (written there by `git submodule init`/`update`
+/// when `.gitmodules` carries a relative URL, resolved against the
+/// token-bearing `origin`).
+fn scrub_submodule_config_urls(url: &str, workdir: &std::path::Path) -> Result<()> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .arg("config")
+        .arg("--get-regexp")
+        .arg(r"^submodule\..*\.url$")
+        .output()?;
+    if !out.status.success() {
+        // Exit 1 just means no matching keys (no submodules initialized).
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    for line in stdout.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        let stripped = strip_userinfo(value);
+        if stripped == value {
+            continue;
+        }
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("config")
+            .arg(key)
+            .arg(&stripped)
+            .output()?;
+        if !out.status.success() {
+            return Err(git_error("config submodule url", &out, Some(url)));
+        }
+    }
+    Ok(())
+}
+
+/// Recurse into every submodule `.gitmodules` names (by path, not URL, since
+/// the URL may be relative) and scrub its own `origin` and any
+/// submodules-of-submodules the same way.
+fn recurse_into_submodules(url: &str, workdir: &std::path::Path) -> Result<()> {
+    if !workdir.join(".gitmodules").is_file() {
+        return Ok(());
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .arg("config")
+        .arg("--file")
+        .arg(".gitmodules")
+        .arg("--get-regexp")
+        .arg(r"^submodule\..*\.path$")
+        .output()?;
+    if !out.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    for line in stdout.lines() {
+        let Some((_, path)) = line.split_once(' ') else {
+            continue;
+        };
+        let sub_dir = workdir.join(path.trim());
+        if !sub_dir.join(".git").exists() {
+            continue;
+        }
+        scrub_remote_origin_url(url, &sub_dir)?;
+        scrub_submodule_config_urls(url, &sub_dir)?;
+        recurse_into_submodules(url, &sub_dir)?;
+    }
+    Ok(())
+}
+
 /// Shallow-clone `url` into `workdir`, pinning `branch` when given.
 ///
 /// Captures git's output instead of letting it inherit the daemon's
@@ -630,6 +869,7 @@ pub fn shallow_clone(
         restore_default_branch_refs(url, pinned, workdir, depth)?;
     }
     init_submodules(url, workdir)?;
+    scrub_workdir_credentials(url, workdir)?;
     Ok(())
 }
 
@@ -1321,6 +1561,201 @@ mod tests {
         assert!(
             clone.join("sub").read_dir().unwrap().next().is_none(),
             "a failed submodule fetch must not leave a populated submodule directory"
+        );
+    }
+
+    // ---- post-clone credential scrub -------------
+
+    /// `file://user:pass@localhost/abs/path` round-trips through git exactly
+    /// like a real HTTPS forge URL with userinfo: git persists it verbatim in
+    /// `remote.origin.url`, so it is a faithful fixture for "a clone from a
+    /// URL carrying fake userinfo" without a real network credential.
+    fn with_fake_userinfo(url: &str) -> String {
+        let path = url.strip_prefix("file://").expect("file:// url");
+        format!("file://user:pass@localhost{path}")
+    }
+
+    /// Every URL `git config --list` can report for `workdir` (and
+    /// recursively for every submodule), for asserting none carries userinfo.
+    fn all_configured_urls(workdir: &std::path::Path) -> Vec<String> {
+        let mut urls = Vec::new();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("config")
+            .arg("--get-regexp")
+            .arg(r"\.url$")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        for line in stdout.lines() {
+            if let Some((_, value)) = line.split_once(' ') {
+                urls.push(value.to_string());
+            }
+        }
+        if workdir.join(".gitmodules").is_file() {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(workdir)
+                .arg("config")
+                .arg("--file")
+                .arg(".gitmodules")
+                .arg("--get-regexp")
+                .arg(r"^submodule\..*\.path$")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            for line in stdout.lines() {
+                if let Some((_, path)) = line.split_once(' ') {
+                    let sub = workdir.join(path.trim());
+                    if sub.join(".git").exists() {
+                        urls.extend(all_configured_urls(&sub));
+                    }
+                }
+            }
+        }
+        urls
+    }
+
+    /// Acceptance: after a plain (unpinned) clone from a userinfo-bearing URL,
+    /// `origin` and every other configured URL in the workdir carry none.
+    #[test]
+    fn a_plain_clone_strips_userinfo_from_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = with_fake_userinfo(&origin_with_default_branch(tmp.path(), "main"));
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, None, &clone, 50).unwrap();
+        for configured in all_configured_urls(&clone) {
+            assert!(
+                !configured.contains("user:pass@"),
+                "userinfo survived in a configured URL: {configured}"
+            );
+        }
+    }
+
+    /// Acceptance: a pinned-branch clone (which also runs
+    /// `restore_default_branch_refs`, fetching and setting `origin/HEAD`
+    /// before the scrub) ends up with the same unauthenticated `origin`.
+    #[test]
+    fn a_pinned_clone_strips_userinfo_from_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = with_fake_userinfo(&origin_with_default_branch(tmp.path(), "main"));
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, Some("feat"), &clone, 50).unwrap();
+        for configured in all_configured_urls(&clone) {
+            assert!(
+                !configured.contains("user:pass@"),
+                "userinfo survived in a configured URL: {configured}"
+            );
+        }
+    }
+
+    /// Acceptance: a clone with a submodule added via a RELATIVE URL (the
+    /// common `git submodule add ../name` shape) resolves that relative URL
+    /// against the token-bearing `origin` at clone time, so the resolved
+    /// `submodule.<name>.url` AND the submodule's own `remote.origin.url`
+    /// both carry the credential until the scrub runs.
+    fn origin_with_relative_submodule(base: &std::path::Path) -> String {
+        let git_in = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let sub = base.join("sub-origin");
+        std::fs::create_dir_all(&sub).unwrap();
+        git_in(&sub, &["init", "-q", "-b", "main"]);
+        git_in(&sub, &["config", "user.name", "t"]);
+        git_in(&sub, &["config", "user.email", "t@t.example"]);
+        std::fs::write(sub.join("s.txt"), "s").unwrap();
+        git_in(&sub, &["add", "."]);
+        git_in(&sub, &["commit", "-q", "-m", "sub init"]);
+
+        let origin = base.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init", "-q", "-b", "main"]);
+        git_in(&origin, &["config", "user.name", "t"]);
+        git_in(&origin, &["config", "user.email", "t@t.example"]);
+        std::fs::write(origin.join("f.txt"), "x").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-q", "-m", "init"]);
+        // A relative URL resolves against the superproject's own `origin`,
+        // which is what later carries the userinfo this test cares about.
+        git_in(
+            &origin,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                "../sub-origin",
+                "sub",
+            ],
+        );
+        git_in(&origin, &["commit", "-q", "-m", "add submodule"]);
+        format!("file://{}", origin.display())
+    }
+
+    #[test]
+    fn a_clone_with_a_relative_url_submodule_strips_userinfo_everywhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = with_fake_userinfo(&origin_with_relative_submodule(tmp.path()));
+        let clone = tmp.path().join("clone");
+        shallow_clone(&url, None, &clone, 50).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(clone.join("sub").join("s.txt")).unwrap(),
+            "s",
+            "the submodule must still be checked out"
+        );
+        let configured = all_configured_urls(&clone);
+        assert!(
+            !configured.is_empty(),
+            "the fixture must actually configure URLs for this assertion to mean anything"
+        );
+        for url in &configured {
+            assert!(
+                !url.contains("user:pass@"),
+                "userinfo survived in a configured URL: {url}"
+            );
+        }
+    }
+
+    /// Acceptance: a failure rewriting a remote URL fails the clone through
+    /// the same redacted [`git_error`] path as every other git failure here,
+    /// never a half-scrubbed workdir behind a warning. A read-only
+    /// `.git/config` makes `git remote set-url` fail with a permission error.
+    #[test]
+    fn a_remote_url_rewrite_failure_fails_the_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = with_fake_userinfo(&origin_with_default_branch(tmp.path(), "main"));
+        let clone = tmp.path().join("clone");
+        std::process::Command::new("git")
+            .arg("clone")
+            .arg("-q")
+            .arg(&url)
+            .arg(&clone)
+            .output()
+            .unwrap();
+        // A pre-existing `config.lock` makes `git remote set-url` fail with
+        // "Unable to create ... File exists", with no permission bit involved
+        // (CLAUDE-255 bars `set_mode` from a test; this needs none).
+        let lock = clone.join(".git").join("config.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let result = scrub_workdir_credentials(&url, &clone);
+        std::fs::remove_file(&lock).unwrap();
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("git remote set-url exited"), "{err}");
+        assert!(
+            !err.contains("user:pass"),
+            "the credential must stay redacted: {err}"
         );
     }
 
