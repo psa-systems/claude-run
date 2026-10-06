@@ -309,16 +309,24 @@ impl GithubForge {
     }
 
     /// Push the working branch to the GitHub remote. With a resolvable token
-    /// (the action's own, or the daemon's `gh` login), push to an
-    /// authenticated HTTPS URL; otherwise fall back to `origin` (host git
-    /// auth), warning with both misses named rather than failing silently.
+    /// (the action's own, or the daemon's `gh` login), push to `origin`
+    /// authenticated per invocation through the credential-helper mechanism
+    /// (CLAUDE-395: `origin`'s own URL carries no credential after the
+    /// post-clone scrub, and the token must never appear in argv); otherwise
+    /// fall back to an unauthenticated push against `origin` (host git auth),
+    /// warning with both misses named rather than failing silently.
     fn push(&self, workdir: &Path, host: &str, repo: &str, branch: &str) -> Result<()> {
         let refspec = format!("HEAD:{branch}");
+        let push_args = ["push", "origin", refspec.as_str()];
         let out = match self.effective_token(host) {
             Ok(token) => {
-                let url = format!("https://x-access-token:{token}@{host}/{repo}.git");
-                self.runner
-                    .run_in(workdir, &self.git, &["push", &url, &refspec])?
+                let token_url = format!("https://x-access-token:{token}@{host}/{repo}.git");
+                crate::provider::run_authed_git(
+                    self.runner.as_ref(),
+                    Some(workdir),
+                    &push_args,
+                    Some(&token_url),
+                )?
             }
             Err(e) => {
                 tracing::warn!(
@@ -326,8 +334,12 @@ impl GithubForge {
                     repo,
                     "no github.token_ref on the action and {e}; falling back to origin"
                 );
-                self.runner
-                    .run_in(workdir, &self.git, &["push", "origin", &refspec])?
+                crate::provider::run_authed_git(
+                    self.runner.as_ref(),
+                    Some(workdir),
+                    &push_args,
+                    None,
+                )?
             }
         };
         if out.ok {
@@ -1433,7 +1445,27 @@ mod tests {
     }
 
     /// Register the git interrogation + push every `create_pr` issues.
+    /// `push_remote == "origin"` registers the no-credential fallback shape
+    /// (CLAUDE-395: plain `push origin <refspec>`); anything else is treated
+    /// as "a credential resolved", registering the credential-helper-prefixed
+    /// authenticated shape instead (the token itself never appears in argv
+    /// any more, so `push_remote`'s exact URL text only selects which shape
+    /// to stub, not what argv to expect).
     fn with_git(runner: StubRunner, branch: &str, push_remote: &str) -> StubRunner {
+        let refspec = format!("HEAD:{branch}");
+        let push_args: Vec<&str> = if push_remote == "origin" {
+            vec!["push", "origin", &refspec]
+        } else {
+            vec![
+                "-c",
+                "credential.helper=",
+                "-c",
+                crate::provider::CREDENTIAL_HELPER,
+                "push",
+                "origin",
+                &refspec,
+            ]
+        };
         runner
             .ok(
                 "git",
@@ -1448,7 +1480,7 @@ mod tests {
             )
             .ok("git", &["log", "-1", "--pretty=format:%s"], "feat: x")
             .ok("git", &["log", "-1", "--pretty=format:%b"], "body text")
-            .ok("git", &["push", push_remote, &format!("HEAD:{branch}")], "")
+            .ok("git", &push_args, "")
     }
 
     #[test]
@@ -1535,20 +1567,33 @@ mod tests {
             tcalls.iter().any(|c| c == "call:create_pull_request"),
             "{tcalls:?}"
         );
-        // The branch was pushed to the authenticated URL resolved through the
-        // daemon's own `gh` login, and PR creation never consulted `gh` itself.
+        // The branch was pushed to `origin`, authenticated per invocation
+        // through the credential-helper mechanism with the token resolved via
+        // the daemon's own `gh` login; the token itself never appears in
+        // argv. PR creation never consulted `gh` itself.
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls
-                .iter()
-                .any(|c| *c == format!("git push {push_remote} HEAD:feat/x")),
+            calls.iter().any(|c| c.contains("credential.helper=")
+                && c.ends_with("push origin HEAD:feat/x")),
             "{calls:?}"
         );
+        for call in calls.iter() {
+            assert!(!call.contains("ghp_from_login"), "{call}");
+        }
         assert!(
             !calls
                 .iter()
                 .any(|c| c.starts_with("gh ") && c != "gh auth token --hostname github.com"),
             "{calls:?}"
+        );
+        drop(calls);
+        let envs = runner.envs.lock().unwrap();
+        assert!(
+            envs.iter().any(|(bin, env)| bin == "git"
+                && env
+                    .iter()
+                    .any(|(k, v)| k == "CLAUDE_RUN_GIT_PASSWORD" && v == "ghp_from_login")),
+            "the token resolved via gh auth token must reach the push via env: {envs:?}"
         );
     }
 
@@ -1723,7 +1768,8 @@ mod tests {
 
     #[test]
     fn create_pr_pushes_with_token_to_authenticated_url() {
-        // A token routes the push to an authenticated HTTPS URL (not `origin`).
+        // A token routes the push through the credential helper, never a
+        // token-bearing URL in argv (CLAUDE-395).
         let push_remote = "https://x-access-token:ghp_secret@github.com/octo/widget.git";
         let runner = Arc::new(with_git(StubRunner::new(), "feat/x", push_remote));
         let transport = Arc::new(StubTransport::new(
@@ -1745,9 +1791,21 @@ mod tests {
             .unwrap();
         let calls = runner.calls.lock().unwrap();
         assert!(
-            calls.iter().any(|c| c
-                == "git push https://x-access-token:ghp_secret@github.com/octo/widget.git HEAD:feat/x"),
+            calls.iter().any(|c| c.contains("credential.helper=")
+                && c.ends_with("push origin HEAD:feat/x")),
             "{calls:?}"
+        );
+        for call in calls.iter() {
+            assert!(!call.contains("ghp_secret"), "{call}");
+        }
+        drop(calls);
+        let envs = runner.envs.lock().unwrap();
+        assert!(
+            envs.iter().any(|(bin, env)| bin == "git"
+                && env
+                    .iter()
+                    .any(|(k, v)| k == "CLAUDE_RUN_GIT_PASSWORD" && v == "ghp_secret")),
+            "the configured token must reach the push via env, not argv: {envs:?}"
         );
     }
 

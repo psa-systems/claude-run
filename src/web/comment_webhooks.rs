@@ -1211,7 +1211,17 @@ async fn run_instruction(
         }
     }
     finish_comment_run(&ctx.pool, run_id, key, &outcome, &stream_log, &spend).await;
-    crate::workdir::cleanup_or_preserve(&workdir, WEBHOOK_COMMENT_ACTION, key);
+    // `env.backend`'s `clone_url` resolves the same forge token the clone and
+    // push already used; `origin` itself carries none after the post-clone
+    // scrub (CLAUDE-395), so the preserve-or-delete check's `ls-remote`
+    // authenticates per invocation instead.
+    let token_url = env.backend.clone_url(&cmd.host, &cmd.repo).ok();
+    crate::workdir::cleanup_or_preserve_with_token(
+        &workdir,
+        WEBHOOK_COMMENT_ACTION,
+        key,
+        token_url.as_deref(),
+    );
 }
 
 /// The recorded result of one served instruction, on either route.

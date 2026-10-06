@@ -839,16 +839,26 @@ impl CliBackend {
         // workdir's `origin` remote (the form `list_open_prs` expects).
         let repo = self.origin_repo_path(workdir)?;
 
+        // The token-bearing URL for this host/repo, resolved once up front
+        // (CLAUDE-395): `origin` itself carries no credential after the
+        // post-clone scrub, so every network call below authenticates
+        // per invocation through this instead. `None` when no credential
+        // resolves; callers fall back to an unauthenticated invocation (any
+        // host git credential helper still applies), matching the existing
+        // `clone_url` failure behavior.
+        let token_url = self.clone_url(host, &repo).ok();
+        let token_url = token_url.as_deref();
+
         // Local tip of the resolved branch, and the remote branch's tip (if the
         // branch already exists on `origin`), read BEFORE any push.
         let local_sha = self.rev_parse(workdir, branch)?;
-        let remote_sha = self.remote_branch_sha(workdir, branch)?;
+        let remote_sha = self.remote_branch_sha(workdir, branch, token_url)?;
 
         match remote_sha {
             // Absent: unchanged happy path (push `<branch>:<branch>`, create the
             // PR with `--head <branch>`).
             None => {
-                self.push_branch(workdir, branch)?;
+                self.push_branch(workdir, branch, token_url)?;
                 self.find_or_create_pr(workdir, host, &repo, branch, draft)
             }
             // Equal to local: nothing to push; find-or-create the PR.
@@ -861,11 +871,11 @@ impl CliBackend {
             // working, and without this `is_ancestor` fails with exit 128
             // ("not a valid commit name") rather than resolving ancestry.
             Some(remote_sha) => {
-                self.fetch_branch(workdir, branch)?;
+                self.fetch_branch(workdir, branch, token_url)?;
                 if self.is_ancestor(workdir, &remote_sha, &local_sha)? {
                     // A fast-forward push is legal when the remote tip is an
                     // ancestor of the local tip.
-                    self.push_branch(workdir, branch)?;
+                    self.push_branch(workdir, branch, token_url)?;
                     self.find_or_create_pr(workdir, host, &repo, branch, draft)
                 } else {
                     // Diverged: the remote gained commits (typically the
@@ -874,7 +884,7 @@ impl CliBackend {
                     // in (never force) so the push below stays a fast-forward,
                     // then find-or-create the PR as usual.
                     self.merge_remote_branch(workdir, branch, &local_sha, &remote_sha)?;
-                    self.push_branch(workdir, branch)?;
+                    self.push_branch(workdir, branch, token_url)?;
                     self.find_or_create_pr(workdir, host, &repo, branch, draft)
                 }
             }
@@ -925,9 +935,21 @@ impl CliBackend {
     /// remote, else `None`. `git ls-remote --heads origin <branch>` prints one
     /// `"<sha>\t<ref>"` line per matching head and nothing (exit 0) when the
     /// branch is absent, so no branch existence is inferred from an exit code.
-    fn remote_branch_sha(&self, workdir: &Path, branch: &str) -> Result<Option<String>> {
+    ///
+    /// Authenticated per invocation via `token_url` (CLAUDE-395): `origin`
+    /// itself carries no credential after the post-clone scrub, so this reads
+    /// the remote through the inline credential helper rather than relying on
+    /// a token baked into the remote URL. `None` runs unauthenticated (any
+    /// host git credential helper still applies).
+    fn remote_branch_sha(
+        &self,
+        workdir: &Path,
+        branch: &str,
+        token_url: Option<&str>,
+    ) -> Result<Option<String>> {
         let args = ["ls-remote", "--heads", "origin", branch];
-        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        let out =
+            crate::provider::run_authed_git(self.runner.as_ref(), Some(workdir), &args, token_url)?;
         let stdout = Self::checked("git", out, &args)?;
         Ok(stdout
             .lines()
@@ -960,10 +982,12 @@ impl CliBackend {
     /// clone: a resumed run's clone predates any commit the runner pushed
     /// onto the branch while the run was working, and without this fetch
     /// `git merge-base` fails with exit 128 ("not a valid commit name")
-    /// rather than resolving ancestry.
-    fn fetch_branch(&self, workdir: &Path, branch: &str) -> Result<()> {
+    /// rather than resolving ancestry. Authenticated per invocation via
+    /// `token_url` (CLAUDE-395), same as [`Self::remote_branch_sha`].
+    fn fetch_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
         let args = ["fetch", "origin", branch];
-        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        let out =
+            crate::provider::run_authed_git(self.runner.as_ref(), Some(workdir), &args, token_url)?;
         Self::checked("git", out, &args)?;
         Ok(())
     }
@@ -1019,12 +1043,15 @@ impl CliBackend {
     /// `HEAD`, so the server branch carries the feature name regardless of the
     /// current checkout. Never forced: a rejected non-fast-forward push is a
     /// real-divergence signal the caller has already ruled out before calling.
-    fn push_branch(&self, workdir: &Path, branch: &str) -> Result<()> {
+    fn push_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
         let refspec = format!("{branch}:{branch}");
         let push_args = ["push", "--set-upstream", "origin", refspec.as_str()];
-        let out = self
-            .runner
-            .run_in_env(Some(workdir), "git", &push_args, &[])?;
+        let out = crate::provider::run_authed_git(
+            self.runner.as_ref(),
+            Some(workdir),
+            &push_args,
+            token_url,
+        )?;
         Self::checked("git", out, &push_args)?;
         Ok(())
     }
@@ -3082,6 +3109,138 @@ mod tests {
             !calls.iter().any(|c| c.contains("-aA")),
             "branch strategy must never invoke -aA: {calls:?}"
         );
+    }
+
+    /// Acceptance (CLAUDE-395): when a credential resolves, `ls-remote` /
+    /// `fetch` / `push` against `origin` are prefixed with the credential
+    /// helper's `-c` arguments and NEVER carry the token itself anywhere in
+    /// argv; the token is visible only in each call's own env.
+    #[test]
+    fn create_pr_branch_authenticates_network_calls_without_token_in_argv() {
+        let wd = tempfile::tempdir().unwrap();
+        let keys_dir = tempfile::tempdir().unwrap();
+        let keys = keys_dir.path().join("keys.json");
+        std::fs::write(
+            &keys,
+            r#"{"hosts":{"dev.a8n.run":{"token":"super-secret-token"}}}"#,
+        )
+        .unwrap();
+
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = runner
+            .ok(
+                "git",
+                &["remote", "get-url", "origin"],
+                "https://dev.a8n.run/contoso/claude-run.git",
+            )
+            .ok("git", &["rev-parse", "feat/x"], "abc123")
+            .ok(
+                "git",
+                &[
+                    "-c",
+                    "credential.helper=",
+                    "-c",
+                    crate::provider::CREDENTIAL_HELPER,
+                    "ls-remote",
+                    "--heads",
+                    "origin",
+                    "feat/x",
+                ],
+                "",
+            );
+        let runner = with_open_pr_search(runner, "[]")
+            .ok(
+                "git",
+                &[
+                    "-c",
+                    "credential.helper=",
+                    "-c",
+                    crate::provider::CREDENTIAL_HELPER,
+                    "push",
+                    "--set-upstream",
+                    "origin",
+                    "feat/x:feat/x",
+                ],
+                "",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "feat(x): do the thing\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "Body of the commit.\n\n#MK-16\n",
+            );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path = scratch.join(".claude-run-pr-body.md");
+        let runner = runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "feat(x): do the thing",
+                "--body-file",
+                body_path.to_string_lossy().as_ref(),
+                "--head",
+                "feat/x",
+                "--json",
+            ],
+            r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone()).with_keys_path(&keys);
+        b.create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap();
+
+        let calls = runner.calls.lock().unwrap();
+        for call in calls.iter() {
+            assert!(
+                !call.contains("super-secret-token"),
+                "the token must never appear in argv: {call}"
+            );
+        }
+        assert!(
+            calls.iter().any(|c| c.contains("credential.helper=")
+                && c.contains("push")
+                && c.contains("--set-upstream")),
+            "the push must run through the credential helper: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("git -c credential.helper= -c")
+                    && c.contains("ls-remote --heads origin feat/x")),
+            "ls-remote must run through the credential helper too: {calls:?}"
+        );
+        drop(calls);
+
+        let envs = runner.envs.lock().unwrap();
+        let git_envs_with_cred: Vec<_> = envs
+            .iter()
+            .filter(|(bin, env)| {
+                bin == "git" && env.iter().any(|(k, _)| k == "CLAUDE_RUN_GIT_USERNAME")
+            })
+            .collect();
+        assert!(
+            !git_envs_with_cred.is_empty(),
+            "the credential must reach at least one git call via env: {envs:?}"
+        );
+        for (_, env) in git_envs_with_cred {
+            assert!(
+                env.iter()
+                    .any(|(k, v)| k == "CLAUDE_RUN_GIT_PASSWORD" && v == "super-secret-token"),
+                "the token must be carried in the child's env, not argv: {env:?}"
+            );
+        }
     }
 
     #[test]

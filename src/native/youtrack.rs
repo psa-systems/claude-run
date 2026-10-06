@@ -1184,7 +1184,10 @@ async fn process_job(
         // The preserve decision runs `git ls-remote` against the
         // remote (network) and may then run `git clean -fdX`; keep it off the
         // async worker thread.
-        crate::blocking::in_place(|| cleanup_or_preserve(&workdir_path, &action.name, key));
+        let token_url = clone_url_for(forge, job);
+        crate::blocking::in_place(|| {
+            cleanup_or_preserve(&workdir_path, &action.name, key, Some(&token_url))
+        });
         return Ok(ProcessedJob::Transient { key: key.clone() });
     }
 
@@ -1317,7 +1320,12 @@ async fn process_job(
                 );
             }
         },
-        _ => cleanup_or_preserve(&workdir_path, &action.name, key),
+        _ => cleanup_or_preserve(
+            &workdir_path,
+            &action.name,
+            key,
+            Some(&clone_url_for(forge, job)),
+        ),
     });
 
     Ok(ProcessedJob::Done {
@@ -2114,7 +2122,12 @@ fn finalize(
                 // is (preserved workdir, or the remote branch the push already
                 // landed), never "nothing to preserve".
                 warn!(key = %job.key, error = %e, "PR creation failed; finalizing as Failed");
-                let body = pr_failure_comment(claude_result, &e, &work_location(workdir));
+                let token_url = clone_url_for(forge, job);
+                let body = pr_failure_comment(
+                    claude_result,
+                    &e,
+                    &work_location(workdir, Some(&token_url)),
+                );
                 comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
                 Ok(Finalized::Failed)
             }
@@ -2775,7 +2788,17 @@ fn cleanup_workdir(workdir: &Path) {
 /// wrong delete costs the run. Used by both `cleanup_or_preserve`'s per-job
 /// callers and `crate::gc`'s age-based sweep, so the two decisions agree.
 pub(crate) fn has_local_only_work(workdir: &Path) -> bool {
-    match crate::workdir::local_only_work(workdir) {
+    has_local_only_work_with_token(workdir, None)
+}
+
+/// Same check as [`has_local_only_work`], authenticating the `ls-remote
+/// origin` network call with `token_url` (CLAUDE-395) rather than relying on
+/// a credential embedded in `origin`'s URL, which the post-clone scrub now
+/// strips. Used by the per-job callers, which have a forge token in scope;
+/// `crate::gc`'s context-free age-based sweep keeps calling
+/// [`has_local_only_work`] unauthenticated.
+pub(crate) fn has_local_only_work_with_token(workdir: &Path, token_url: Option<&str>) -> bool {
+    match crate::workdir::local_only_work_with_token(workdir, token_url) {
         Ok(w) => !w.is_clean(),
         Err(_) => true,
     }
@@ -2804,9 +2827,9 @@ enum WorkLocation {
     None,
 }
 
-fn work_location(workdir: &Path) -> WorkLocation {
+fn work_location(workdir: &Path, token_url: Option<&str>) -> WorkLocation {
     // A failed query errs toward preserve, matching `has_local_only_work`.
-    let work = match crate::workdir::local_only_work(workdir) {
+    let work = match crate::workdir::local_only_work_with_token(workdir, token_url) {
         Ok(w) => w,
         Err(_) => return WorkLocation::PreservedWorkdir(workdir.to_path_buf()),
     };
@@ -2834,8 +2857,8 @@ fn work_location(workdir: &Path) -> WorkLocation {
 /// unconditional cleanup destroy a run's only copy of the committed work, and
 /// the guard was later extended past committed-but-unpushed branches to the
 /// uncommitted and stashed work a branch-only check would miss.
-fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str) {
-    crate::workdir::cleanup_or_preserve(workdir, action, key);
+fn cleanup_or_preserve(workdir: &Path, action: &str, key: &str, token_url: Option<&str>) {
+    crate::workdir::cleanup_or_preserve_with_token(workdir, action, key, token_url);
 }
 
 /// Move a leftover (preserved) workdir out of the way of a fresh
@@ -4930,7 +4953,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         repo_with_commit(dir.path());
         assert!(has_local_only_work(dir.path()));
-        cleanup_or_preserve(dir.path(), "YouTrack", "MK-16");
+        cleanup_or_preserve(dir.path(), "YouTrack", "MK-16", None);
         assert!(dir.path().exists(), "unpushed commits must survive cleanup");
     }
 
@@ -4948,7 +4971,7 @@ mod tests {
             &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
         );
         assert!(!has_local_only_work(&clone));
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
         assert!(
             !clone.exists(),
             "a workdir with no unpushed work is removed"
@@ -4978,7 +5001,7 @@ mod tests {
             has_local_only_work(&clone),
             "a dirty tree with no unpushed branch must still count as local-only work"
         );
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
         assert!(clone.exists(), "a dirty tree must survive cleanup");
     }
 
@@ -5003,7 +5026,7 @@ mod tests {
             has_local_only_work(&clone),
             "a stash with no unpushed branch must still count as local-only work"
         );
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
         assert!(clone.exists(), "a stash must survive cleanup");
     }
 
@@ -5113,7 +5136,7 @@ mod tests {
         git_in(&clone, &["checkout", "-b", "feat/x"]);
         git_in(&clone, &["push", "origin", "feat/x"]);
         assert!(!has_local_only_work(&clone));
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
         assert!(!clone.exists(), "tip present on remote must be deleted");
     }
 
@@ -5127,7 +5150,7 @@ mod tests {
         git_in(&clone, &["add", "."]);
         git_in(&clone, &["commit", "-m", "feat: y"]);
         assert!(has_local_only_work(&clone));
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
         assert!(clone.exists(), "an unpushed commit must survive cleanup");
     }
 
@@ -5162,7 +5185,7 @@ mod tests {
         .trim()
         .to_string();
 
-        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone));
+        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone, None));
 
         assert!(
             body.contains("fix/redact-env-vars-on-export"),
@@ -5187,7 +5210,7 @@ mod tests {
         git_in(&clone, &["add", "."]);
         git_in(&clone, &["commit", "-m", "feat: y"]);
 
-        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone));
+        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone, None));
 
         assert!(
             body.contains("PRESERVED on the daemon host at: `"),
@@ -5204,7 +5227,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let clone = origin_and_single_branch_clone(base.path());
 
-        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone));
+        let body = pr_failure_comment(&ok_result(), &pr_error(), &work_location(&clone, None));
 
         assert!(body.contains("No local commits were found to preserve."));
     }
@@ -5224,7 +5247,7 @@ mod tests {
         );
         std::fs::write(clone.join("f.txt"), "edited but never committed").unwrap();
 
-        let loc = work_location(&clone);
+        let loc = work_location(&clone, None);
         assert!(
             matches!(loc, WorkLocation::UncommittedChanges { .. }),
             "expected UncommittedChanges"
@@ -5241,7 +5264,7 @@ mod tests {
         );
         assert!(body.contains(&clone.display().to_string()));
 
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
         assert!(clone.exists(), "the dirty tree must survive cleanup");
     }
 
@@ -5270,7 +5293,7 @@ mod tests {
         git_in(&clone, &["add", ".gitignore", "src.txt"]);
         git_in(&clone, &["commit", "-m", "feat: z"]);
 
-        cleanup_or_preserve(&clone, "YouTrack", "MK-16");
+        cleanup_or_preserve(&clone, "YouTrack", "MK-16", None);
 
         assert!(clone.exists(), "unpushed work must be preserved");
         assert!(
