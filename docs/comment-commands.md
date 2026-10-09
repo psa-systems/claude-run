@@ -133,4 +133,7 @@ it in the source's `write_token_ref`; it needs `contents:write` (to push the bra
 `issues:write` scopes. Authorization is a live read of the commenter's permission via `GithubForge::repo_permission`
 (`gh api repos/<owner>/<repo>/collaborators/<username>/permission --jq .permission`), matched against the source's
 `allowed_permissions` the same way as the Forgejo route; the token used for that read needs read access to the
-repository's collaborators, which a token with `contents:write` on a repo the bot administers already has.
+repository's collaborators, which a token with `contents:write` on a repo the bot administers already has. An
+org-level webhook may subscribe to more events than Issue comments: the listener acknowledges and ignores the
+`ping` GitHub sends on webhook creation or "Redeliver", and any other delivered event that is not `issue_comment`,
+with `200` and an `info` log rather than failing the delivery.
