@@ -252,6 +252,15 @@ pub const GITHUB_WORKFLOW_RUN_EVENT_TYPE: &str = "workflow_run";
 /// Prefix GitHub puts on [`GITHUB_SIGNATURE_HEADER`]'s value ahead of the
 /// hex-encoded HMAC, naming the algorithm.
 const GITHUB_SIGNATURE_PREFIX: &str = "sha256=";
+/// [`GITHUB_EVENT_HEADER`] value for an issue/PR comment delivery, the only
+/// event the comment listener's GitHub arm acts on; every other event
+/// (including `ping`) is acked and dropped.
+pub const GITHUB_ISSUE_COMMENT_EVENT_TYPE: &str = "issue_comment";
+/// [`GITHUB_EVENT_HEADER`] value GitHub sends when a webhook is created or
+/// redelivered via "Redeliver" on the setup check; never carries a real
+/// comment, so it gets its own ack log message distinct from other
+/// unhandled events.
+pub const GITHUB_PING_EVENT_TYPE: &str = "ping";
 
 /// The forge sending a webhook delivery, named by the `:provider` URL path
 /// segment (`/webhooks/:provider/triage/:source`,
@@ -9653,6 +9662,33 @@ mod tests {
                 State(st),
                 Path(("github".to_string(), SOURCE_GH.to_string())),
                 github_headers_with_event(Some(&sig), Some("gh-d-5"), Some("issues")),
+                Bytes::from(raw),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(rx.try_recv().is_err());
+        }
+
+        /// CLAUDE-389's sweep: the CI-failure listener's GitHub arm already
+        /// acks-and-drops any non-`workflow_run` event, so a `ping` delivery
+        /// (sent on webhook creation / "Redeliver") never 400s here either.
+        /// No code change needed; this just confirms it by test.
+        #[tokio::test]
+        async fn github_ping_is_acked_and_dropped() {
+            let _env = crate::secrets::key_file_env_lock().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let (st, mut rx) = state_with_github(tmp.path()).await;
+            let raw = r#"{"zen":"Non-blocking is better than blocking.","hook_id":1,
+                "hook":{"type":"Repository","id":1,"events":["workflow_run"]}}"#;
+            let sig = github_sign(SECRET_GH.as_bytes(), raw.as_bytes());
+            let resp = forgejo_webhook(
+                State(st),
+                Path(("github".to_string(), SOURCE_GH.to_string())),
+                github_headers_with_event(
+                    Some(&sig),
+                    Some("gh-ping-1"),
+                    Some(GITHUB_PING_EVENT_TYPE),
+                ),
                 Bytes::from(raw),
             )
             .await;
