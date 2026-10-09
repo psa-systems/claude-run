@@ -465,6 +465,11 @@ logged at `error`, written to `run_events`, and posted as a PR comment naming th
 `automerge.check_interval_seconds` are deprecated: the runner no longer polls, so an action file still setting them keeps
 loading (with one deprecation warning at load) but the values are otherwise ignored.
 
+CLAUDE-397: a reconciler pass records a `webhook-triage` run only when it merges a PR, marks an already-merged PR
+merged, updates a behind-base branch, or fails; a pass whose decision changes nothing (checks not green yet, automerge
+disabled, the action isn't a youtrack action, or not mergeable) opens no run row, so the 300s sweep over every open
+agent PR no longer floods run history with one row per PR per pass.
+
 Automerge is currently implemented for the Forgejo (`fj`) backend only; a GitHub-hosted job with automerge enabled has no
 merge event to react to (GitHub automerge is a follow-up).
 
