@@ -86,7 +86,7 @@ use crate::state;
 
 use super::webhooks::{
     begin_webhook_run, rate_map_from, repo_allowed, ActionUser, RateLimiter, SeenDeliveries,
-    WebhookProvider,
+    WebhookProvider, GITHUB_ISSUE_COMMENT_EVENT_TYPE, GITHUB_PING_EVENT_TYPE,
 };
 
 /// Synthetic action name the comment listener records its runs and caps
@@ -548,6 +548,31 @@ async fn forgejo_comment_webhook(
         body_bytes = body.len(),
         "webhook authenticated"
     );
+
+    // 4a. GitHub subscribes an org-level webhook to more than issue comments
+    // (and always gets a `ping` on creation / "Redeliver"); ack and drop
+    // anything that is not `issue_comment` before the pause gate or the
+    // parse. Forgejo is unchanged: its comment event names are not verified
+    // here, so an over-eager filter could drop real commands.
+    if provider == WebhookProvider::Github {
+        let event_type = headers
+            .get(provider.event_header())
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if event_type != GITHUB_ISSUE_COMMENT_EVENT_TYPE {
+            if event_type == GITHUB_PING_EVENT_TYPE {
+                info!(source = %source, delivery, "webhook ping acknowledged");
+            } else {
+                info!(
+                    source = %source,
+                    delivery,
+                    event = %event_type,
+                    "webhook delivery of an unhandled event type acked and dropped"
+                );
+            }
+            return StatusCode::OK.into_response();
+        }
+    }
 
     // 5. Pause: accept-and-drop, matching every other action's "paused = does not
     // run" and keeping the forge from retrying. The GLOBAL pause is checked
@@ -2390,6 +2415,10 @@ mod tests {
         if let Some(d) = delivery {
             h.insert(GITHUB_DELIVERY_HEADER, HeaderValue::from_str(d).unwrap());
         }
+        h.insert(
+            crate::web::webhooks::GITHUB_EVENT_HEADER,
+            HeaderValue::from_static(GITHUB_ISSUE_COMMENT_EVENT_TYPE),
+        );
         h
     }
 
@@ -4541,6 +4570,202 @@ mod tests {
         assert_eq!(
             post(&st, SOURCE, &raw, Some(&sig), Some("shared-1")).await,
             StatusCode::CONFLICT
+        );
+    }
+
+    // ---- GitHub non-issue_comment event filtering (CLAUDE-389) ------------
+
+    fn github_headers_with_event(
+        signature: Option<&str>,
+        delivery: Option<&str>,
+        event: Option<&str>,
+    ) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(s) = signature {
+            h.insert(
+                crate::web::webhooks::GITHUB_SIGNATURE_HEADER,
+                HeaderValue::from_str(s).unwrap(),
+            );
+        }
+        if let Some(d) = delivery {
+            h.insert(
+                crate::web::webhooks::GITHUB_DELIVERY_HEADER,
+                HeaderValue::from_str(d).unwrap(),
+            );
+        }
+        if let Some(e) = event {
+            h.insert(
+                crate::web::webhooks::GITHUB_EVENT_HEADER,
+                HeaderValue::from_str(e).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// GitHub's `ping` delivery shape (`Webhook events and payloads / ping`,
+    /// docs.github.com): none of `action`, `comment`, `issue`, `repository`.
+    fn github_ping_payload() -> &'static str {
+        r#"{"zen":"Non-blocking is better than blocking.","hook_id":1,
+            "hook":{"type":"Repository","id":1,"events":["issue_comment"]}}"#
+    }
+
+    async fn post_github(
+        st: &CommentWebhookState,
+        source: &str,
+        body: &str,
+        signature: Option<&str>,
+        delivery: Option<&str>,
+        event: Option<&str>,
+    ) -> StatusCode {
+        forgejo_comment_webhook(
+            State(st.clone()),
+            Path(("github".to_string(), source.to_string())),
+            github_headers_with_event(signature, delivery, event),
+            Bytes::from(body.to_string()),
+        )
+        .await
+        .status()
+    }
+
+    #[tokio::test]
+    async fn github_ping_is_acked_and_dropped() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, mut rx) = state_with_github(tmp.path()).await;
+        let raw = github_ping_payload();
+        let sig = github_sign(SECRET_GH.as_bytes(), raw.as_bytes());
+        let status = post_github(
+            &st,
+            SOURCE_GH,
+            raw,
+            Some(&sig),
+            Some("gh-ping-1"),
+            Some(GITHUB_PING_EVENT_TYPE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            rx.try_recv().is_err(),
+            "a ping mints, clones, or pushes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_non_issue_comment_event_is_acked_and_dropped() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, mut rx) = state_with_github(tmp.path()).await;
+        // The body is irrelevant once the event header fails the filter; a
+        // `pull_request_review_comment` body shape is not even modeled here.
+        let raw = github_ping_payload();
+        let sig = github_sign(SECRET_GH.as_bytes(), raw.as_bytes());
+        let status = post_github(
+            &st,
+            SOURCE_GH,
+            raw,
+            Some(&sig),
+            Some("gh-prrc-1"),
+            Some("pull_request_review_comment"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn github_ping_with_bad_signature_is_401() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _rx) = state_with_github(tmp.path()).await;
+        let raw = github_ping_payload();
+        let status = post_github(
+            &st,
+            SOURCE_GH,
+            raw,
+            Some("sha256=deadbeef"),
+            Some("gh-ping-bad-sig"),
+            Some(GITHUB_PING_EVENT_TYPE),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "signature verification stays ahead of the event-type filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_issue_comment_still_reaches_verified_comment_command() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, mut rx) = state_with_github(tmp.path()).await;
+        let raw = payload_json("created", REPO, "/claude fix it", "alice", true);
+        let sig = github_sign(SECRET_GH.as_bytes(), raw.as_bytes());
+        let status = post_github(
+            &st,
+            SOURCE_GH,
+            &raw,
+            Some(&sig),
+            Some("gh-issue-comment-1"),
+            Some(GITHUB_ISSUE_COMMENT_EVENT_TYPE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let cmd = rx
+            .try_recv()
+            .expect("command emitted for a real issue_comment delivery");
+        assert_eq!(cmd.number, 7);
+    }
+
+    #[tokio::test]
+    async fn malformed_github_issue_comment_still_400s() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _rx) = state_with_github(tmp.path()).await;
+        let raw = "not json";
+        let sig = github_sign(SECRET_GH.as_bytes(), raw.as_bytes());
+        let status = post_github(
+            &st,
+            SOURCE_GH,
+            raw,
+            Some(&sig),
+            Some("gh-malformed-1"),
+            Some(GITHUB_ISSUE_COMMENT_EVENT_TYPE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn replayed_github_ping_delivery_is_409() {
+        let _env = crate::secrets::key_file_env_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (st, _rx) = state_with_github(tmp.path()).await;
+        let raw = github_ping_payload();
+        let sig = github_sign(SECRET_GH.as_bytes(), raw.as_bytes());
+        let first = post_github(
+            &st,
+            SOURCE_GH,
+            raw,
+            Some(&sig),
+            Some("gh-ping-dup"),
+            Some(GITHUB_PING_EVENT_TYPE),
+        )
+        .await;
+        assert_eq!(first, StatusCode::OK);
+        let second = post_github(
+            &st,
+            SOURCE_GH,
+            raw,
+            Some(&sig),
+            Some("gh-ping-dup"),
+            Some(GITHUB_PING_EVENT_TYPE),
+        )
+        .await;
+        assert_eq!(
+            second,
+            StatusCode::CONFLICT,
+            "the event-type filter runs after replay protection, so a redelivered ping still 409s"
         );
     }
 }
