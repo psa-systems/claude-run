@@ -11347,6 +11347,20 @@ mod tests {
                 .state
         }
 
+        /// CLAUDE-397: count of `runs` rows for `WEBHOOK_MINT_ACTION`, used to
+        /// assert a no-action reconciler pass opens zero of them and an
+        /// acted/failed pass opens exactly one.
+        async fn webhook_triage_runs_count(pool: &DbPool) -> i64 {
+            sqlx::query_scalar(&crate::db::q(
+                pool,
+                "SELECT COUNT(*) FROM runs WHERE action_name = ?",
+            ))
+            .bind(WEBHOOK_MINT_ACTION)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
         #[tokio::test]
         async fn reconciler_marks_merged_pr_merged_and_never_walks_it_again() {
             // `pr_status` reporting `merged` must retire the row.
@@ -12184,6 +12198,278 @@ mod tests {
                         .any(|c| c.starts_with("pr_status") || c.starts_with("merge_pr")),
                     "fj must never be consulted for a GitHub host: {:?}",
                     backend.calls()
+                );
+            }
+        }
+
+        // CLAUDE-397: a reconciler pass whose decision is a no-action creates
+        // zero `runs` rows, for every no-action shape; an acted or failed
+        // decision still creates exactly one, with the same summary as before.
+        mod no_op_run_rows {
+            use super::*;
+
+            #[tokio::test]
+            async fn checks_not_green_creates_no_run_row() {
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                seed_open_row(&pool).await;
+                let backend = Arc::new(
+                    StoreBackend::new()
+                        .with_open_prs(vec![pr(7, "")])
+                        .with_pr_status("pending", false),
+                );
+                let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+                reconcile_automerge(
+                    &pool,
+                    &ctx,
+                    &crate::concurrency::KeyGate::new(),
+                    &mut std::collections::HashMap::new(),
+                )
+                .await;
+
+                assert_eq!(webhook_triage_runs_count(&pool).await, 0);
+            }
+
+            #[tokio::test]
+            async fn automerge_disabled_creates_no_run_row() {
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", false);
+                seed_open_row(&pool).await;
+                let backend = Arc::new(
+                    StoreBackend::new()
+                        .with_open_prs(vec![pr(7, "")])
+                        .with_pr_status("success", true),
+                );
+                let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+                reconcile_automerge(
+                    &pool,
+                    &ctx,
+                    &crate::concurrency::KeyGate::new(),
+                    &mut std::collections::HashMap::new(),
+                )
+                .await;
+
+                assert_eq!(webhook_triage_runs_count(&pool).await, 0);
+            }
+
+            #[tokio::test]
+            async fn non_youtrack_action_creates_no_run_row() {
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                let actions_dir = dir.path().join("actions");
+                std::fs::create_dir_all(&actions_dir).unwrap();
+                std::fs::write(
+                    actions_dir.join("reporting.yml"),
+                    "name: reporting\nkind: closed-issue-summary\nnative:\n  enabled: true\n  parents: []\n  query: \"\"\n  custom_field: \"AI Agent\"\n  done_label: Done\n  failed_label: Failed\n  projects:\n    - CLAUDE\n  window_days: 7\n",
+                )
+                .unwrap();
+                ci_failure_store::record_agent_pr(
+                    &pool,
+                    "reporting",
+                    "MK-16",
+                    "dev.a8n.run",
+                    "contoso/claude-run",
+                    7,
+                    "fix/mk-16",
+                    "open",
+                    "2026-09-01T00:00:00Z",
+                )
+                .await
+                .unwrap();
+                let backend = Arc::new(
+                    StoreBackend::new()
+                        .with_open_prs(vec![pr(7, "")])
+                        .with_pr_status("success", true),
+                );
+                let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+                reconcile_automerge(
+                    &pool,
+                    &ctx,
+                    &crate::concurrency::KeyGate::new(),
+                    &mut std::collections::HashMap::new(),
+                )
+                .await;
+
+                assert_eq!(webhook_triage_runs_count(&pool).await, 0);
+            }
+
+            #[tokio::test]
+            async fn not_mergeable_creates_no_run_row() {
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                seed_open_row(&pool).await;
+                let backend = Arc::new(
+                    StoreBackend::new()
+                        .with_open_prs(vec![pr(7, "")])
+                        .with_pr_status_behind("success", false, Some(false)),
+                );
+                let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+                reconcile_automerge(
+                    &pool,
+                    &ctx,
+                    &crate::concurrency::KeyGate::new(),
+                    &mut std::collections::HashMap::new(),
+                )
+                .await;
+
+                assert_eq!(webhook_triage_runs_count(&pool).await, 0);
+                // The existing `run_events` row for `not mergeable` is unchanged.
+                let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 10)
+                    .await
+                    .unwrap();
+                assert!(
+                    events.iter().any(|e| e.message.contains("not mergeable")),
+                    "{events:?}"
+                );
+            }
+
+            #[tokio::test]
+            async fn merged_pr_creates_exactly_one_run_row_with_the_merge_summary() {
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                seed_open_row(&pool).await;
+                let backend = Arc::new(
+                    StoreBackend::new()
+                        .with_open_prs(vec![pr(7, "")])
+                        .with_pr_status("success", true),
+                );
+                let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+                reconcile_automerge(
+                    &pool,
+                    &ctx,
+                    &crate::concurrency::KeyGate::new(),
+                    &mut std::collections::HashMap::new(),
+                )
+                .await;
+
+                assert_eq!(webhook_triage_runs_count(&pool).await, 1);
+                let (ok, summary): (i64, String) =
+                    sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(ok, 1);
+                assert_eq!(
+                    summary,
+                    "merged PR #7; issue MK-16 left for the YouTrack workflow to resolve"
+                );
+            }
+
+            #[tokio::test]
+            async fn already_merged_pr_creates_exactly_one_run_row_with_the_same_summary() {
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                seed_open_row(&pool).await;
+                let backend = Arc::new(
+                    StoreBackend::new()
+                        .with_open_prs(vec![pr(7, "")])
+                        .with_pr_status("merged", true),
+                );
+                let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+                reconcile_automerge(
+                    &pool,
+                    &ctx,
+                    &crate::concurrency::KeyGate::new(),
+                    &mut std::collections::HashMap::new(),
+                )
+                .await;
+
+                assert_eq!(webhook_triage_runs_count(&pool).await, 1);
+                let (ok, summary): (i64, String) =
+                    sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(ok, 1);
+                assert_eq!(summary, "agent PR #7 already merged; marked merged");
+            }
+
+            #[tokio::test]
+            async fn branch_updated_creates_exactly_one_run_row_with_the_same_summary() {
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                seed_open_row(&pool).await;
+                let backend = Arc::new(
+                    StoreBackend::new()
+                        .with_open_prs(vec![pr(7, "")])
+                        .with_pr_status_behind("success", true, Some(true)),
+                );
+                let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+                reconcile_automerge(
+                    &pool,
+                    &ctx,
+                    &crate::concurrency::KeyGate::new(),
+                    &mut std::collections::HashMap::new(),
+                )
+                .await;
+
+                assert_eq!(webhook_triage_runs_count(&pool).await, 1);
+                let (ok, summary): (i64, String) =
+                    sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(ok, 1);
+                assert_eq!(
+                    summary,
+                    "PR #7 branch updated from base; will automerge on next green run"
+                );
+            }
+
+            #[tokio::test]
+            async fn decision_err_still_creates_one_failed_run_row() {
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                seed_open_row(&pool).await;
+                let backend = Arc::new(
+                    StoreBackend::new()
+                        .with_open_prs(vec![pr(7, "")])
+                        .with_pr_status("success", true)
+                        .with_merge_pr_error("boom"),
+                );
+                let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+
+                reconcile_automerge(
+                    &pool,
+                    &ctx,
+                    &crate::concurrency::KeyGate::new(),
+                    &mut std::collections::HashMap::new(),
+                )
+                .await;
+
+                assert_eq!(webhook_triage_runs_count(&pool).await, 1);
+                let (ok, summary): (i64, String) =
+                    sqlx::query_as(&crate::db::q(&pool, "SELECT ok, summary FROM job_outcomes"))
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(ok, 0);
+                assert!(summary.contains("complete_automerge failed"), "{summary}");
+
+                // The existing `run_events` row and comment for a merge
+                // failure are unchanged.
+                let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 10)
+                    .await
+                    .unwrap();
+                assert!(
+                    events
+                        .iter()
+                        .any(|e| e.message.contains("complete_automerge failed")),
+                    "{events:?}"
                 );
             }
         }
