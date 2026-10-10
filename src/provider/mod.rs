@@ -1878,6 +1878,81 @@ mod tests {
         );
     }
 
+    /// `restore_default_branch_refs_retrying`'s `fetch` step (reached only
+    /// when the pinned branch differs from the remote's default) retries a
+    /// transient failure (CLAUDE-396) via a `git remote-ext` wrapper placed
+    /// on the clone's own `origin` remote, exercising the real production
+    /// function end to end; the `url` argument stays the plain `file://`
+    /// origin so the preceding `ls-remote` succeeds on its first attempt and
+    /// only the `fetch` retry is under test.
+    #[test]
+    fn restore_default_branch_refs_fetch_retries_once_and_succeeds_on_second_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_default_branch(tmp.path(), "main");
+        let origin_path = url.strip_prefix("file://").unwrap().to_string();
+
+        let workdir = tmp.path().join("clone");
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q", "--branch", "feat", "--depth", "1", &url])
+            .arg(&workdir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let log = tmp.path().join("helper-calls.log");
+        let script = tmp.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho called >> {log}\nif [ $(wc -l < {log}) -eq 1 ]; then\n  echo 'simulated transient failure' >&2\n  exit 1\nfi\nexec git-upload-pack {origin_path}\n",
+                log = log.display(),
+                origin_path = origin_path,
+            ),
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workdir)
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                &format!("ext::sh {}", script.display()),
+            ])
+            .output()
+            .unwrap();
+
+        // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
+        // widening it, so `file` (needed by `url`'s own `ls-remote`) stays
+        // listed alongside `ext`; the lock keeps this test's set/remove pair
+        // from racing another thread's.
+        let _guard = git_allow_protocol_test_lock();
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
+        let result = restore_default_branch_refs_retrying(&url, "feat", &workdir, 50, &NO_WAIT);
+        std::env::remove_var("GIT_ALLOW_PROTOCOL");
+
+        result.unwrap();
+        assert_eq!(
+            rev_parse_abbrev(&workdir, "origin/main").as_deref(),
+            Some("origin/main"),
+            "the retried fetch must still have landed refs/remotes/origin/main"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            2,
+            "fetch must have been attempted exactly twice"
+        );
+    }
+
     // ---- post-clone credential scrub -------------
 
     /// `file://user:pass@localhost/abs/path` round-trips through git exactly
