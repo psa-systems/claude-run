@@ -73,7 +73,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cancel::CancellationToken;
 use crate::claude::{ClaudeInvoker, ClaudeResult};
@@ -1141,7 +1141,13 @@ async fn run_instruction(
         warn!(error = %e, "advancing the comment attempt counter failed");
     }
 
-    let run_id = begin_webhook_run(&ctx.pool, WEBHOOK_COMMENT_ACTION, key, &cmd.html_url).await;
+    // `run` carries the `RunGuard` through to `finish_comment_run` below, so a
+    // panic in `serve_run` / `serve_mint` (reached via `block_in_place`) still
+    // closes the row as `exit::UNEXPECTED` on drop instead of leaving it open
+    // forever (CLAUDE-402). `run_id` is split out as its own `Copy` value for
+    // the bookkeeping uses in between.
+    let run = begin_webhook_run(&ctx.pool, WEBHOOK_COMMENT_ACTION, key, &cmd.html_url).await;
+    let run_id = run.as_ref().map(|(id, _)| *id);
     let stage = |s: &'static str| async move {
         if let Some(id) = run_id {
             if let Err(e) = state::run_stage_set(&ctx.pool, id, Some(s)).await {
@@ -1235,7 +1241,7 @@ async fn run_instruction(
             warn!(error = %e, "advancing the comment daily ledger failed");
         }
     }
-    finish_comment_run(&ctx.pool, run_id, key, &outcome, &stream_log, &spend).await;
+    finish_comment_run(&ctx.pool, run, key, &outcome, &stream_log, &spend).await;
     // `env.backend`'s `clone_url` resolves the same forge token the clone and
     // push already used; `origin` itself carries none after the post-clone
     // scrub (CLAUDE-395), so the preserve-or-delete check's `ls-remote`
@@ -2291,16 +2297,18 @@ fn first_line(s: &str) -> String {
 }
 
 /// Close a comment run: one `job_outcomes` row carrying the decision summary and
-/// the stream-log link, then finalize the run.
+/// the stream-log link, then finalize the run through its [`state::RunGuard`],
+/// so a failed finalize still leaves the row closed by the guard's `Drop`
+/// retry (CLAUDE-402) instead of open forever.
 async fn finish_comment_run(
     pool: &DbPool,
-    run_id: Option<i64>,
+    run: Option<(i64, state::RunGuard)>,
     key: &str,
     outcome: &RunOutcome,
     stream_log: &FsPath,
     spend: &crate::usage::RunSpend,
 ) {
-    let Some(run_id) = run_id else {
+    let Some((run_id, guard)) = run else {
         // No run row (the begin failed), but the spend was real, so the
         // usage record still names the action.
         spend.finish(None, crate::exit::UNEXPECTED);
@@ -2333,8 +2341,8 @@ async fn finish_comment_run(
     } else {
         crate::exit::UNEXPECTED
     });
-    if let Err(e) = state::run_finish(pool, run_id, exit_code, 1).await {
-        warn!(error = %e, "finalizing the comment run failed");
+    if let Err(e) = guard.finish(exit_code, 1).await {
+        error!(run_id, error = %e, "finalizing the comment run failed; the guard retries closing it as unexpected on drop");
     }
     // One summary line and one machine-readable record per run.
     spend.finish(Some(run_id), exit_code);
