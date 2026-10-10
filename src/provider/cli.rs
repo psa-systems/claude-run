@@ -34,6 +34,15 @@ const DEFAULT_FJ_READ_RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(5),
 ];
 
+/// The known secrets to redact out of a retried git call's logged stderr
+/// (CLAUDE-396): `token_url`'s userinfo when it carries a credential, empty
+/// when the call ran unauthenticated.
+fn token_url_secrets(token_url: Option<&str>) -> Vec<String> {
+    token_url
+        .map(crate::provider::url_secrets)
+        .unwrap_or_default()
+}
+
 /// The last non-empty line of `stderr`, for a retry log that names the failure
 /// without repeating the CLI's full (often multi-line) error text.
 fn stderr_tail(stderr: &str) -> &str {
@@ -466,6 +475,10 @@ pub struct CliBackend {
     /// Wait schedule for a retried read-only `fj` call (CLAUDE-366). Defaults to
     /// [`DEFAULT_FJ_READ_RETRY_WAITS`]; overridable so tests run with no delay.
     fj_read_retry_waits: [Duration; 3],
+    /// Wait schedule for a retried git network call (CLAUDE-396). Defaults to
+    /// [`crate::provider::GIT_NETWORK_RETRY_WAITS`]; overridable so tests run
+    /// with no delay.
+    git_retry_waits: [Duration; 3],
 }
 
 /// Shape of the forge CLI key store (`~/.local/share/forgejo-cli/keys.json`):
@@ -601,6 +614,7 @@ impl CliBackend {
             fj_env: Vec::new(),
             notices: std::sync::Mutex::new(Vec::new()),
             fj_read_retry_waits: DEFAULT_FJ_READ_RETRY_WAITS,
+            git_retry_waits: crate::provider::GIT_NETWORK_RETRY_WAITS,
         }
     }
 
@@ -635,6 +649,13 @@ impl CliBackend {
     /// retried read runs with no delay).
     pub fn with_fj_read_retry_waits(mut self, waits: [Duration; 3]) -> Self {
         self.fj_read_retry_waits = waits;
+        self
+    }
+
+    /// Override the git network retry wait schedule (CLAUDE-396; tests set
+    /// this to all-zero so a retried git call runs with no delay).
+    pub fn with_git_retry_waits(mut self, waits: [Duration; 3]) -> Self {
+        self.git_retry_waits = waits;
         self
     }
 
@@ -948,8 +969,20 @@ impl CliBackend {
         token_url: Option<&str>,
     ) -> Result<Option<String>> {
         let args = ["ls-remote", "--heads", "origin", branch];
-        let out =
-            crate::provider::run_authed_git(self.runner.as_ref(), Some(workdir), &args, token_url)?;
+        let secrets = token_url_secrets(token_url);
+        let out = crate::provider::retry_git_network(
+            "ls-remote",
+            &secrets,
+            &self.git_retry_waits,
+            || {
+                crate::provider::run_authed_git(
+                    self.runner.as_ref(),
+                    Some(workdir),
+                    &args,
+                    token_url,
+                )
+            },
+        )?;
         let stdout = Self::checked("git", out, &args)?;
         Ok(stdout
             .lines()
@@ -986,8 +1019,16 @@ impl CliBackend {
     /// `token_url` (CLAUDE-395), same as [`Self::remote_branch_sha`].
     fn fetch_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
         let args = ["fetch", "origin", branch];
+        let secrets = token_url_secrets(token_url);
         let out =
-            crate::provider::run_authed_git(self.runner.as_ref(), Some(workdir), &args, token_url)?;
+            crate::provider::retry_git_network("fetch", &secrets, &self.git_retry_waits, || {
+                crate::provider::run_authed_git(
+                    self.runner.as_ref(),
+                    Some(workdir),
+                    &args,
+                    token_url,
+                )
+            })?;
         Self::checked("git", out, &args)?;
         Ok(())
     }
@@ -1046,12 +1087,16 @@ impl CliBackend {
     fn push_branch(&self, workdir: &Path, branch: &str, token_url: Option<&str>) -> Result<()> {
         let refspec = format!("{branch}:{branch}");
         let push_args = ["push", "--set-upstream", "origin", refspec.as_str()];
-        let out = crate::provider::run_authed_git(
-            self.runner.as_ref(),
-            Some(workdir),
-            &push_args,
-            token_url,
-        )?;
+        let secrets = token_url_secrets(token_url);
+        let out =
+            crate::provider::retry_git_network("push", &secrets, &self.git_retry_waits, || {
+                crate::provider::run_authed_git(
+                    self.runner.as_ref(),
+                    Some(workdir),
+                    &push_args,
+                    token_url,
+                )
+            })?;
         Self::checked("git", out, &push_args)?;
         Ok(())
     }
