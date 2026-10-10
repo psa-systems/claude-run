@@ -2374,6 +2374,70 @@ mod tests {
         crate::db::test_pool().await
     }
 
+    // ---- CLAUDE-402: webhook-comment runs close even when the handler panics
+
+    /// The regression this issue fixes, for the comment listener: a panic
+    /// inside the pipeline (reached via `block_in_place` around `serve_run` /
+    /// `serve_mint` in `process_comment`), after `begin_webhook_run` opened
+    /// the row, used to leave it open forever. `begin_webhook_run` now hands
+    /// back a `RunGuard` alongside the id, so its `Drop` closes the row as
+    /// `exit::UNEXPECTED` however the handler dies.
+    #[tokio::test]
+    async fn webhook_comment_run_row_closes_when_the_handler_panics() {
+        let pool = memory_pool().await;
+        let task = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let run = begin_webhook_run(
+                    &pool,
+                    WEBHOOK_COMMENT_ACTION,
+                    "contoso/claude-run#9",
+                    "https://example/pull/9#comment",
+                )
+                .await;
+                let _keep_the_guard_alive_across_the_panic = run;
+                panic!("simulated: webhook-comment pipeline panicked mid-run");
+            }
+        });
+        assert!(
+            task.await.is_err(),
+            "the spawned handler was expected to panic"
+        );
+
+        let run_id: i64 = sqlx::query_scalar(&crate::db::q(&pool, "SELECT id FROM runs"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut ended: Option<String> = None;
+        for _ in 0..200 {
+            ended = sqlx::query_scalar(&crate::db::q(
+                &pool,
+                "SELECT ended_at FROM runs WHERE id = ?",
+            ))
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if ended.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            ended.is_some(),
+            "a panicking webhook-comment handler must not leave its run row open"
+        );
+        let exit: Option<i64> = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT exit_code FROM runs WHERE id = ?",
+        ))
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(exit, Some(crate::exit::UNEXPECTED as i64));
+    }
+
     fn sign(secret: &[u8], body: &[u8]) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
         mac.update(body);

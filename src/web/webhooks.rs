@@ -7899,6 +7899,171 @@ mod tests {
         assert!(summary.contains("log="), "artifact reference: {summary}");
     }
 
+    // ---- CLAUDE-402: webhook runs close even when the handler panics ------
+
+    /// The regression this issue fixes: a panic inside the webhook-triage
+    /// pipeline, after `begin_webhook_run` opened the row, used to leave it
+    /// open forever (`consume_events`'s `for t in tasks` loop only ever sees a
+    /// `JoinError`, never a chance to finalize the row itself). `begin_webhook_run`
+    /// now hands back a `RunGuard` alongside the id, so its `Drop` closes the
+    /// row as `exit::UNEXPECTED` however the handler dies.
+    #[tokio::test]
+    async fn webhook_triage_run_row_closes_when_the_handler_panics() {
+        let pool = memory_pool().await;
+        let task = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let run = begin_webhook_run(
+                    &pool,
+                    WEBHOOK_MINT_ACTION,
+                    "contoso/claude-run#9",
+                    "https://example/actions/runs/9",
+                )
+                .await;
+                let _keep_the_guard_alive_across_the_panic = run;
+                panic!("simulated: webhook-triage pipeline panicked mid-run");
+            }
+        });
+        assert!(
+            task.await.is_err(),
+            "the spawned handler was expected to panic"
+        );
+
+        let run_id: i64 = sqlx::query_scalar(&crate::db::q(&pool, "SELECT id FROM runs"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut ended: Option<String> = None;
+        for _ in 0..200 {
+            ended = sqlx::query_scalar(&crate::db::q(
+                &pool,
+                "SELECT ended_at FROM runs WHERE id = ?",
+            ))
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if ended.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            ended.is_some(),
+            "a panicking webhook-triage handler must not leave its run row open"
+        );
+        let exit: Option<i64> = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT exit_code FROM runs WHERE id = ?",
+        ))
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(exit, Some(crate::exit::UNEXPECTED as i64));
+    }
+
+    /// `run_finish` failing once (simulated here by renaming the `runs` table
+    /// out from under the first attempt) must stay visible at `error` with the
+    /// run id, and the row must still close once the guard's `Drop` retries it
+    /// after the table is back.
+    #[tokio::test]
+    async fn webhook_finish_run_finish_failure_is_logged_and_retried() {
+        let pool = memory_pool().await;
+        let run_id = state::run_begin(&pool, WEBHOOK_MINT_ACTION, WEBHOOK_TRIGGERED_BY)
+            .await
+            .unwrap();
+        let guard = state::RunGuard::new(&pool, run_id);
+
+        sqlx::query("ALTER TABLE runs RENAME TO runs_hidden_for_test")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(self.0.clone())
+            }
+        }
+        let sub = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let dispatch_guard = tracing::subscriber::set_default(sub);
+
+        finish_webhook_run(
+            &pool,
+            Some((run_id, guard)),
+            "job-1",
+            "forced failure for CLAUDE-402",
+            true,
+            None,
+            None,
+        )
+        .await;
+
+        drop(dispatch_guard);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("ERROR"),
+            "expected an error-level log: {logs}"
+        );
+        assert!(
+            logs.contains(&run_id.to_string()),
+            "expected the run id in the log: {logs}"
+        );
+
+        sqlx::query("ALTER TABLE runs_hidden_for_test RENAME TO runs")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut ended: Option<String> = None;
+        for _ in 0..200 {
+            ended = sqlx::query_scalar(&crate::db::q(
+                &pool,
+                "SELECT ended_at FROM runs WHERE id = ?",
+            ))
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if ended.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            ended.is_some(),
+            "the guard's retry must close the row once the table is back"
+        );
+        let exit: Option<i64> = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT exit_code FROM runs WHERE id = ?",
+        ))
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            exit,
+            Some(crate::exit::UNEXPECTED as i64),
+            "the retry always closes as UNEXPECTED, not the caller's intended exit code"
+        );
+    }
+
     #[test]
     fn decide_mint_reports_stages_in_order_for_an_llm_classification() {
         // A non-transient log goes rules -> LLM -> mint, so the

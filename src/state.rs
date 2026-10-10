@@ -1881,6 +1881,12 @@ mod tests {
     /// mechanically over the runner sources so a NEW runner, or a `run_begin`
     /// added to an existing one, fails here instead of silently reintroducing
     /// the leak. Test modules are excluded: they open rows deliberately.
+    ///
+    /// `web/webhooks.rs`'s single `run_begin` call lives inside
+    /// `begin_webhook_run`, the one opener both it and `web/comment_webhooks.rs`
+    /// share (CLAUDE-402); `comment_webhooks_opens_no_run_row_of_its_own` below
+    /// is `web/comment_webhooks.rs`'s half of this pairing, since it has no
+    /// `run_begin` call of its own to enumerate here.
     #[test]
     fn every_runner_pairs_run_begin_with_a_run_guard() {
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1888,6 +1894,7 @@ mod tests {
             "native/youtrack.rs",
             "native/closed_issue_summary.rs",
             "daemon.rs",
+            "web/webhooks.rs",
         ];
         for file in runners {
             let text = std::fs::read_to_string(src_dir.join(file)).unwrap();
@@ -1903,6 +1910,25 @@ mod tests {
                 "{file}: {begins} run_begin call(s) but {guards} RunGuard(s); an unguarded row stays open forever when the handler errors"
             );
         }
+    }
+
+    /// Half of the CLAUDE-402 pairing check: `web/comment_webhooks.rs` must
+    /// open no `run_begin` row of its own; it only ever obtains one through
+    /// `web/webhooks.rs::begin_webhook_run`, which
+    /// `every_runner_pairs_run_begin_with_a_run_guard` above already proves is
+    /// guarded. A direct `run_begin(` call added here would bypass that single
+    /// guarded opener and reintroduce the leak this issue fixed.
+    #[test]
+    fn comment_webhooks_opens_no_run_row_of_its_own() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/comment_webhooks.rs");
+        let text = std::fs::read_to_string(path).unwrap();
+        let code = text.split("\n#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            code.matches("run_begin(").count(),
+            0,
+            "web/comment_webhooks.rs now opens a run row directly; route it through begin_webhook_run (and its RunGuard) instead"
+        );
     }
 
     /// Every `claude` invocation must leave a `claude_invocations`
