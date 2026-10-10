@@ -451,7 +451,15 @@ impl GithubForge {
     }
 
     /// Shared body for [`Forge::create_pr`] / [`Forge::create_pr_with_draft`].
-    fn create_pr_impl(&self, workdir: &Path, host: &str, draft: bool) -> Result<PullRequest> {
+    /// `body_override`, when `Some` (the timeout-salvage draft body,
+    /// CLAUDE-398), is written verbatim instead of the tip commit's own body.
+    fn create_pr_impl(
+        &self,
+        workdir: &Path,
+        host: &str,
+        draft: bool,
+        body_override: Option<&str>,
+    ) -> Result<PullRequest> {
         // GitHub has no AGit equivalent: PRs are always branch-backed, so the
         // branch-strategy selector does not apply here and is ignored.
         // Push the branch before opening the PR.
@@ -465,7 +473,10 @@ impl GithubForge {
         let branch = self.git(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
         let base = self.detect_base(workdir);
         let title = self.git(workdir, &["log", "-1", "--pretty=format:%s"])?;
-        let body = self.git(workdir, &["log", "-1", "--pretty=format:%b"])?;
+        let body = match body_override {
+            Some(b) => b.to_string(),
+            None => self.git(workdir, &["log", "-1", "--pretty=format:%b"])?,
+        };
 
         // The subject guard (CLAUDE-398) runs before any push.
         crate::provider::validate_pr_subject(&title, &branch)?;
@@ -525,7 +536,7 @@ impl Forge for GithubForge {
         host: &str,
         _strategy: crate::action::PrStrategy,
     ) -> Result<PullRequest> {
-        self.create_pr_impl(workdir, host, false)
+        self.create_pr_impl(workdir, host, false, None)
     }
 
     /// `draft` sets GitHub's real draft flag (CLAUDE-379 timeout salvage);
@@ -537,8 +548,9 @@ impl Forge for GithubForge {
         host: &str,
         _strategy: crate::action::PrStrategy,
         draft: bool,
+        body: Option<&str>,
     ) -> Result<PullRequest> {
-        self.create_pr_impl(workdir, host, draft)
+        self.create_pr_impl(workdir, host, draft, body)
     }
 
     /// `gh pr ready <number> --repo <repo>` clears the draft flag a

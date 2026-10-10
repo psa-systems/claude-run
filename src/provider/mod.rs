@@ -407,17 +407,23 @@ pub trait Forge: Send + Sync {
     /// draft (Forgejo: a `WIP: ` title prefix, the convention `fj pr search
     /// --json` reports through its `draft` field; GitHub: the real draft flag).
     /// Used by the timeout salvage path (CLAUDE-379) to open a draft PR for
-    /// work rescued from a timed-out run. The default ignores `draft` and
-    /// falls back to [`Self::create_pr`], so a backend with no draft notion
-    /// (including every test-only stub) keeps compiling unchanged.
+    /// work rescued from a timed-out run. `body`, when `Some`, is written
+    /// verbatim as the PR body instead of the tip commit's own body
+    /// (CLAUDE-398): a killed run's tip is often an agent layer commit whose
+    /// body is only the bare `#<KEY>` line, which tells a reader nothing. The
+    /// title still comes from the tip subject, carrying the `WIP: ` prefix.
+    /// The default ignores `draft` and `body` and falls back to
+    /// [`Self::create_pr`], so a backend with no draft notion (including
+    /// every test-only stub) keeps compiling unchanged.
     fn create_pr_with_draft(
         &self,
         workdir: &std::path::Path,
         host: &str,
         strategy: crate::action::PrStrategy,
         draft: bool,
+        body: Option<&str>,
     ) -> Result<PullRequest> {
-        let _ = draft;
+        let _ = (draft, body);
         self.create_pr(workdir, host, strategy)
     }
 
