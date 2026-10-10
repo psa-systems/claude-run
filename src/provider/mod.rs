@@ -2341,12 +2341,12 @@ mod tests {
         // subscriber capture here); this asserts the redaction call that
         // feeds it strips the secret, exercised through the same path the
         // log line uses.
-        let secrets = vec!["user:s3cr3t".to_string(), "s3cr3t".to_string()];
+        let secrets = vec!["claude_run:secret".to_string(), "secret".to_string()];
         let mut attempts = 0;
         let out = retry_git_network("fetch", &secrets, &NO_WAIT, || {
             attempts += 1;
             if attempts == 1 {
-                fail("fatal: https://user:s3cr3t@host/x.git: Internal Server Error")
+                fail("fatal: https://claude_run:secret@host/x.git: Internal Server Error")
             } else {
                 ok()
             }
@@ -2354,10 +2354,10 @@ mod tests {
         .unwrap();
         assert!(out.ok);
         let redacted = crate::forge_log::redact(
-            "fatal: https://user:s3cr3t@host/x.git: Internal Server Error",
+            "fatal: https://claude_run:secret@host/x.git: Internal Server Error",
             &secrets,
         );
-        assert!(!redacted.contains("s3cr3t"));
+        assert!(!redacted.contains("secret"));
     }
 
     /// A retry must start from an absent target directory: a failed first
