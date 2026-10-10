@@ -105,13 +105,6 @@ pub enum Error {
     #[error("secret: {0}")]
     Secret(String),
 
-    #[error(
-        "{database} already has `_sqlx_migrations`: this is a live runner database, not a \
-         disposable test server. Point CLAUDE_RUN_TEST_DATABASE_URL at a disposable Postgres \
-         instead."
-    )]
-    LiveDatabase { database: String },
-
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

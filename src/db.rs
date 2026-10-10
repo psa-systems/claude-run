@@ -485,7 +485,7 @@ pub async fn test_pg_pool() -> Option<DbPool> {
 /// just created. Schema-qualified so the connection's `search_path` does not
 /// matter.
 #[cfg(test)]
-async fn refuse_live_database(pool: &DbPool, schema: &str) -> crate::error::Result<()> {
+async fn refuse_live_database(pool: &DbPool, schema: &str) -> anyhow::Result<()> {
     let regclass = format!("{schema}._sqlx_migrations");
     let already_migrated: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
         .bind(&regclass)
@@ -495,7 +495,11 @@ async fn refuse_live_database(pool: &DbPool, schema: &str) -> crate::error::Resu
         let database: String = sqlx::query_scalar("SELECT current_database()")
             .fetch_one(pool)
             .await?;
-        return Err(crate::error::Error::LiveDatabase { database });
+        anyhow::bail!(
+            "{database} already has `_sqlx_migrations`: this is a live runner database, not a \
+             disposable test server. Point CLAUDE_RUN_TEST_DATABASE_URL at a disposable Postgres \
+             instead."
+        );
     }
     Ok(())
 }
