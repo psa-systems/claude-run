@@ -1829,7 +1829,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit whose body ends with the bare '#{{key}}' reference, so a kill leaves committed progress instead of none; the final commit still carries the full PR-description format from step 7 and stays the branch tip.",
         "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (e.g. the repo's 'just check', tests, or build) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success.",
         "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
-        "7. The runner uses this commit's body as the PR description (if you make more than one commit, the LAST commit carries it, since the runner reads only the branch tip); it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the literal line 'Closes', then the bare issue reference on the next line alone, with nothing after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above the 'Closes' line, never after the reference. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single 'Closes' line. NO 'State ...' command after the reference. Example of the tail:",
+        "7. The runner uses this commit's SUBJECT as the PR title and its body as the PR description (if you make more than one commit, the LAST commit carries both, since the runner reads only the branch tip). The subject is a SEPARATE line from the body, not the body's first heading: write one short imperative line (about 72 characters or fewer, no leading '#', not a Markdown heading like '## Summary') that names the change itself, e.g. 'Fix the off-by-one in the retry budget'; confirm it with 'git log -1 --format=%s' before you stop - if that prints a Markdown heading, a bare issue reference, or anything else that is not a one-line summary of the change, the commit is wrong and the runner will refuse to open the PR from it. The body (what 'git log -1 --format=%b' prints) is the PR description; it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the literal line 'Closes', then the bare issue reference on the next line alone, with nothing after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above the 'Closes' line, never after the reference. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single 'Closes' line. NO 'State ...' command after the reference. Example of the tail:",
         "     ## Verification",
         "",
         "     `just check` passes.",
@@ -3577,7 +3577,7 @@ mod tests {
             .find("Immediately before your final commit, re-run 'yt issue inspect {{key}}'")
             .expect("re-read step present");
         let commit_step = p
-            .find("The runner uses this commit's body as the PR description")
+            .find("The runner uses this commit's SUBJECT as the PR title")
             .expect("commit step present");
         assert!(
             check_suite_step < reread_step,
@@ -3594,6 +3594,29 @@ mod tests {
         assert!(
             p.contains("Re-read {{key}} before the final commit: changed (<what changed>, <how it was handled>)"),
             "the closing summary must require the changed report line"
+        );
+    }
+
+    /// CLAUDE-398 criterion 1: the final commit's SUBJECT (what `git log -1
+    /// --format=%s` prints) is the PR title, and it must be a one-line
+    /// imperative summary, never a Markdown heading like `## Summary`
+    /// mistaken for the subject (the original defect this issue fixes).
+    #[test]
+    fn default_prompt_requires_a_proper_one_line_commit_subject() {
+        let p = default_youtrack_prompt();
+        assert!(
+            p.contains(
+                "The subject is a SEPARATE line from the body, not the body's first heading"
+            ),
+            "the prompt must distinguish the commit subject from the body: {p}"
+        );
+        assert!(
+            p.contains("no leading '#'") && p.contains("not a Markdown heading like '## Summary'"),
+            "the prompt must explicitly rule out a heading as the subject: {p}"
+        );
+        assert!(
+            p.contains("confirm it with 'git log -1 --format=%s' before you stop"),
+            "the prompt must tell the agent to verify its own subject line: {p}"
         );
     }
 
