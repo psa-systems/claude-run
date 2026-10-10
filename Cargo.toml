@@ -39,7 +39,6 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 shellexpand = "3"
 thiserror = "1"
-tokio-stream = "0.1"
 tokio-util = "0.7"
 toml = "0.8"
 tower = "0.5"
@@ -143,10 +142,6 @@ features = [
 [dependencies.tokio]
 version = "1"
 features = ["full"]
-
-[dependencies.tower-http]
-version = "0.6"
-features = ["trace"]
 
 [dependencies.tracing-subscriber]
 version = "0.3"

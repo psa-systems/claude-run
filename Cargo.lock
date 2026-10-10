@@ -598,12 +598,10 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "toml 0.8.23",
  "totp-rs",
  "tower",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -3441,7 +3439,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 
