@@ -2531,7 +2531,7 @@ fn salvage_timeout_work(
 
     let mut report = SalvageReport::default();
     if !work.dirty.paths.is_empty() {
-        if let Err(e) = commit_timeout_wip(workdir) {
+        if let Err(e) = commit_timeout_wip(workdir, &job.key) {
             error!(key = %job.key, error = %e, "timeout salvage: committing the uncommitted working tree failed");
             report.commit_error = Some(e);
         }
@@ -2587,8 +2587,10 @@ fn salvage_timeout_work(
 /// whatever branch a draft PR gets opened from rather than being lost once
 /// the workdir is garbage-collected. `.claude-run-*` marker files are
 /// excluded by pathspec (operator/runner state, never agent work); gitignored
-/// files are never staged by a bare `git add -A` to begin with.
-fn commit_timeout_wip(workdir: &Path) -> std::result::Result<(), String> {
+/// files are never staged by a bare `git add -A` to begin with. The commit
+/// body ends with the bare `#<KEY>` reference (CLAUDE-398), the requirement
+/// CLAUDE-379 specified but the code never wrote.
+fn commit_timeout_wip(workdir: &Path, key: &str) -> std::result::Result<(), String> {
     let add = Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -2601,10 +2603,16 @@ fn commit_timeout_wip(workdir: &Path) -> std::result::Result<(), String> {
             String::from_utf8_lossy(&add.stderr).trim()
         ));
     }
+    let message = format!(
+        "WIP: uncommitted changes at timeout\n\n\
+         The runner committed the working tree a run of {key} left uncommitted when it hit its \
+         time limit.\n\n\
+         #{key}"
+    );
     let commit = Command::new("git")
         .arg("-C")
         .arg(workdir)
-        .args(["commit", "-m", "WIP: uncommitted changes at timeout"])
+        .args(["commit", "-m", &message])
         .output()
         .map_err(|e| format!("running `git commit` failed: {e}"))?;
     if !commit.status.success() {
@@ -6245,10 +6253,31 @@ mod tests {
         // in isolation): `git add` fails loudly rather than panicking or
         // silently no-op'ing.
         let dir = tempfile::tempdir().unwrap();
-        let err = commit_timeout_wip(dir.path()).unwrap_err();
+        let err = commit_timeout_wip(dir.path(), "MK-16").unwrap_err();
         assert!(
             err.contains("git add"),
             "the commit-step failure must name `git add`: {err}"
+        );
+    }
+
+    #[test]
+    fn commit_timeout_wip_body_ends_with_the_bare_issue_reference() {
+        // CLAUDE-398 / CLAUDE-379: the salvage WIP commit's body must end
+        // with the bare `#<KEY>` reference.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        std::fs::write(dir.path().join("dirty.txt"), "uncommitted\n").unwrap();
+        commit_timeout_wip(dir.path(), "MK-16").unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["log", "-1", "--format=%B"])
+            .output()
+            .unwrap();
+        let message = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            message.trim_end().ends_with("#MK-16"),
+            "the commit body must end with the bare issue reference: {message}"
         );
     }
 
