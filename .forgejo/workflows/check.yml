@@ -202,6 +202,9 @@ jobs:
         with:
           # Placeholder credentials only, also present in git history: the CI
           # Postgres service password above, the docs/configuration.md and compose.yml example
-          # URIs, the token-shaped remote URLs in src/ tests, and the nu
-          # interpolation in the removed scripts/claude-run.nu.
-          kingfisher_skip_regex: 'claude_run:(claude_run|secret|\(\$password\)|<that password>)@|^x-access-token$|oauth2:(secret|tok|tok-123|\(\$pat\))@|ghp_(secret|from_login|action)@'
+          # URIs, the token-shaped remote URLs in src/ tests, the nu
+          # interpolation in the removed scripts/claude-run.nu, and the
+          # retry_git_network redaction test's placeholder URL (CLAUDE-396,
+          # still present in this branch's history even after the test
+          # itself moved to an already-allowlisted shape).
+          kingfisher_skip_regex: 'claude_run:(claude_run|secret|\(\$password\)|<that password>)@|^x-access-token$|oauth2:(secret|tok|tok-123|\(\$pat\))@|ghp_(secret|from_login|action)@|user:s3cr3t@'
