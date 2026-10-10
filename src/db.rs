@@ -492,7 +492,7 @@ async fn refuse_live_database(pool: &DbPool, schema: &str) -> anyhow::Result<()>
         .fetch_one(pool)
         .await?;
     if already_migrated.is_some() {
-        let database: String = sqlx::query_scalar("SELECT current_database()")
+        let database: String = sqlx::query_scalar("SELECT current_database()::text")
             .fetch_one(pool)
             .await?;
         anyhow::bail!(
@@ -785,7 +785,7 @@ mod tests {
         let err = refuse_live_database(&pool, &migrated_schema)
             .await
             .expect_err("a schema with _sqlx_migrations must be refused");
-        let database: String = sqlx::query_scalar("SELECT current_database()")
+        let database: String = sqlx::query_scalar("SELECT current_database()::text")
             .fetch_one(&pool)
             .await
             .unwrap();
