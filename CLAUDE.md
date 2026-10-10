@@ -8,7 +8,7 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 
 ## Shape
 
-- Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,cancel,pause,resume,status,action,access,secret,migrate,import}`.
+- Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,cancel,pause,resume,status,action,access,secret,migrate,import,test-postgres}`.
 - Actions are YAML files under `$CLAUDE_RUN_CONFIG_DIR/actions/` (`/config/actions/` in the container). Each action's `input.command` / `filter` / `pre[]` / `prompt` / `post[]` is a nu snippet shelled out via the host's `nu` binary.
 - Runtime state in SQLite at `$CLAUDE_RUN_DATA_DIR/state.db` by default, or in PostgreSQL when the operator sets one (CLAUDE-250; see the `[database]` note below). Per-attempt stream logs at `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`, bounded by the CLAUDE-245 sweep (see below).
 - Daemon (`claude-run serve`) owns scheduling and exposes an HTTP API over `$CLAUDE_RUN_RUNTIME_DIR/daemon.sock`. CLI subcommands delegate to the daemon when reachable, else operate directly on the DB. The socket is the CLI's control plane and nothing else:
@@ -69,6 +69,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 
 - Container layout is flat: `/config`, `/data`, `/state`, tmpfs `/run/claude-run` ([CLAUDE-253](docs/conventions/container.md#flat-container-layout-claude-253))
 - No host bind mounts: logins live inside the container; catatonit is PID 1 ([CLAUDE-247, CLAUDE-287, CLAUDE-310](docs/conventions/container.md#container-identity-claude-247-claude-287-claude-310))
+- `test-postgres` runs a throwaway, non-durable Postgres in the Docker sidecar for agent test runs ([CLAUDE-404](docs/conventions/test-postgres.md#throwaway-test-postgres-claude-404))
 
 ### Actions
 

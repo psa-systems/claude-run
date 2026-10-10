@@ -34,7 +34,7 @@ Conventions for AI agents working in this repository are in [CLAUDE.md](CLAUDE.m
 
 - Work happens in `feat/` / `fix/` / `chore/<short-descriptive-name>` branches off `main`; the merge target is `main` via PR.
 - Clone with `git clone --recurse-submodules`, or run `git submodule update --init` in an existing clone: the `justfile` imports the shared recipes from the `common` submodule ([psa-systems/common](https://dev.a8n.run/psa-systems/common)).
-- `just check` runs fmt + clippy + build + tests + the docker builder stage, the same gate CI runs. `cargo test` runs on SQLite; set `CLAUDE_RUN_TEST_DATABASE_URL` to a disposable PostgreSQL server to run it on PostgreSQL too (the harness refuses a database that already has its own `public._sqlx_migrations`). A schema change needs a migration in both `migrations/sqlite/` and `migrations/postgres/`.
+- `just check` runs fmt + clippy + build + tests + the docker builder stage, the same gate CI runs. `cargo test` runs on SQLite; set `CLAUDE_RUN_TEST_DATABASE_URL` to a disposable PostgreSQL server to run it on PostgreSQL too (the harness refuses a database that already has its own `public._sqlx_migrations`), or run `just test-postgres` / `claude-run test-postgres -- cargo test` for a fresh, throwaway, non-durable one with no setup. A schema change needs a migration in both `migrations/sqlite/` and `migrations/postgres/`.
 - `just install-hooks` writes the git `pre-commit` (fmt only) and `pre-push` (full suite) hooks.
 
 ## Development happens on Forgejo

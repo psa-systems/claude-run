@@ -93,6 +93,11 @@ run *args:
 watch:
     cargo watch --clear
 
+# Run the test suite against a fresh, throwaway, non-durable Postgres (CLAUDE-404).
+[group: 'dev']
+test-postgres:
+    cargo run -- test-postgres -- cargo test
+
 # -- Migrations ---------------------------------------------------------------
 
 # Apply pending sqlx migrations against the local state.db (uses the same XDG paths the binary uses at runtime).
