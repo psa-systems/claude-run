@@ -29,8 +29,10 @@ pub mod cli;
 pub mod github;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 use crate::error::{Error, Result};
 
@@ -723,6 +725,16 @@ pub fn authed_git_output(
     cmd.args(args).output()
 }
 
+/// Serializes every test (across modules) that mutates the process-wide
+/// `GIT_ALLOW_PROTOCOL` env var to drive a `git remote-ext` retry fixture
+/// (CLAUDE-396), so two such tests running on different threads never clobber
+/// each other's setting mid-test (mirrors `secrets::key_file_env_lock`).
+#[cfg(test)]
+pub(crate) fn git_allow_protocol_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Same per-invocation authentication as [`authed_git_output`], but through a
 /// [`CommandRunner`] so call sites built on it (notably [`cli::CliBackend`])
 /// stay testable against a [`cli::StubRunner`] instead of a real `git`.
@@ -879,6 +891,103 @@ fn recurse_into_submodules(url: &str, workdir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Wait before attempts 2, 3 and 4 of a retried git network call
+/// (CLAUDE-396): the same four-attempts-total / `[0s, 2s, 5s]` schedule as
+/// CLAUDE-366's read-only `fj` retry (`run_fj_read_retrying`), for a
+/// worst-case added delay of 7s across four attempts total.
+pub const GIT_NETWORK_RETRY_WAITS: [Duration; 3] = [
+    Duration::from_secs(0),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+];
+
+/// The last non-empty line of `stderr`, for a retry log that names the
+/// failure without repeating git's full (often multi-line) error text.
+/// Mirrors `cli::stderr_tail`, which every read-only `fj` retry log uses.
+pub(crate) fn stderr_tail(stderr: &str) -> &str {
+    stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no stderr")
+}
+
+/// One attempt's output, abstracted over `std::process::Output` (this
+/// module's own direct `Command` calls) and [`cli::CmdOutput`] (calls routed
+/// through a [`cli::CommandRunner`]), so [`retry_git_network`] can retry
+/// either without caring which one a call site spawned through.
+pub trait GitAttemptOutput {
+    fn git_ok(&self) -> bool;
+    fn git_stderr(&self) -> &str;
+}
+
+impl GitAttemptOutput for std::process::Output {
+    fn git_ok(&self) -> bool {
+        self.status.success()
+    }
+    fn git_stderr(&self) -> &str {
+        std::str::from_utf8(&self.stderr).unwrap_or("non-utf8 stderr")
+    }
+}
+
+impl GitAttemptOutput for cli::CmdOutput {
+    fn git_ok(&self) -> bool {
+        self.ok
+    }
+    fn git_stderr(&self) -> &str {
+        &self.stderr
+    }
+}
+
+/// Run a git network call (CLAUDE-396) with up to four attempts total,
+/// waiting `waits[0]` / `waits[1]` / `waits[2]` before attempts 2, 3 and 4,
+/// with the same semantics as CLAUDE-366's `run_fj_read_retrying`: a failed
+/// attempt is a completed process with a non-zero exit, retried on the exit
+/// status alone, never by classifying `stderr`'s wording; a spawn error
+/// (`attempt` returning `Err`) is never retried, since it cannot be
+/// transient the way a completed process can; the wait is spent through
+/// [`crate::blocking::in_place`] (CLAUDE-228). `op` names the git subcommand
+/// for the log line only. `url_secrets` are the token-bearing URL's known
+/// secrets (see [`url_secrets`]): git echoes a token-bearing URL in its own
+/// messages, so the logged stderr tail goes through
+/// [`crate::forge_log::redact`] with them, exactly as [`git_error`] redacts
+/// stderr for the final error. Only the last attempt's output is returned;
+/// the caller converts it to its own error exactly as it did before this
+/// call could retry.
+pub fn retry_git_network<O: GitAttemptOutput>(
+    op: &str,
+    url_secrets: &[String],
+    waits: &[Duration; 3],
+    mut attempt: impl FnMut() -> Result<O>,
+) -> Result<O> {
+    let mut out = attempt()?;
+    for (idx, wait) in waits.iter().enumerate() {
+        if out.git_ok() {
+            return Ok(out);
+        }
+        let attempt_no = idx as u32 + 1;
+        warn!(
+            op,
+            attempt = attempt_no,
+            stderr = %crate::forge_log::redact(stderr_tail(out.git_stderr()), url_secrets),
+            "git network call failed; retrying"
+        );
+        if !wait.is_zero() {
+            crate::blocking::in_place(|| std::thread::sleep(*wait));
+        }
+        out = attempt()?;
+        if out.git_ok() {
+            info!(
+                op,
+                attempt = attempt_no + 1,
+                "git network call succeeded after a retry"
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// Shallow-clone `url` into `workdir`, pinning `branch` when given.
 ///
 /// Captures git's output instead of letting it inherit the daemon's
@@ -898,28 +1007,56 @@ pub fn shallow_clone(
     workdir: &std::path::Path,
     depth: u32,
 ) -> Result<()> {
-    let mut cmd = std::process::Command::new("git");
-    // A detached auto-maintenance repack would race the push and the
-    // workdir removal; an ephemeral clone never benefits from it.
-    cmd.arg("clone")
-        .arg("--config")
-        .arg("maintenance.auto=false");
-    if let Some(b) = branch {
-        cmd.arg("--branch").arg(b);
-    }
-    let out = cmd
-        .arg("--depth")
-        .arg(depth.to_string())
-        .arg(url)
-        .arg(workdir)
-        .output()?;
+    shallow_clone_retrying(url, branch, workdir, depth, &GIT_NETWORK_RETRY_WAITS)
+}
+
+/// Same as [`shallow_clone`], with the retry wait schedule as a parameter
+/// (tests pass an all-zero schedule).
+///
+/// A retry must start from an absent target directory (a half-written clone
+/// left at `workdir` by the failed attempt makes the retry's `git clone`
+/// fail with "already exists and is not an empty directory" instead of
+/// retrying the same operation), so every attempt after the first removes
+/// whatever is at `workdir` first; a removal failure fails loudly rather than
+/// attempting a clone into a directory it could not clear.
+fn shallow_clone_retrying(
+    url: &str,
+    branch: Option<&str>,
+    workdir: &std::path::Path,
+    depth: u32,
+    waits: &[Duration; 3],
+) -> Result<()> {
+    let secrets = url_secrets(url);
+    let mut first = true;
+    let out = retry_git_network("clone", &secrets, waits, || {
+        if first {
+            first = false;
+        } else if workdir.exists() {
+            std::fs::remove_dir_all(workdir)?;
+        }
+        let mut cmd = std::process::Command::new("git");
+        // A detached auto-maintenance repack would race the push and the
+        // workdir removal; an ephemeral clone never benefits from it.
+        cmd.arg("clone")
+            .arg("--config")
+            .arg("maintenance.auto=false");
+        if let Some(b) = branch {
+            cmd.arg("--branch").arg(b);
+        }
+        Ok(cmd
+            .arg("--depth")
+            .arg(depth.to_string())
+            .arg(url)
+            .arg(workdir)
+            .output()?)
+    })?;
     if !out.status.success() {
         return Err(git_error("clone", &out, Some(url)));
     }
     if let Some(pinned) = branch {
-        restore_default_branch_refs(url, pinned, workdir, depth)?;
+        restore_default_branch_refs_retrying(url, pinned, workdir, depth, waits)?;
     }
-    init_submodules(url, workdir)?;
+    init_submodules_retrying(url, workdir, waits)?;
     scrub_workdir_credentials(url, workdir)?;
     Ok(())
 }
@@ -942,22 +1079,29 @@ pub fn shallow_clone(
 /// A submodule fetch failure is a clone failure: it surfaces through the same
 /// [`git_error`] path as every other git failure in this module, with
 /// redacted stderr, never a warning followed by a half-populated tree.
-fn init_submodules(url: &str, workdir: &std::path::Path) -> Result<()> {
+fn init_submodules_retrying(
+    url: &str,
+    workdir: &std::path::Path,
+    waits: &[Duration; 3],
+) -> Result<()> {
     if !workdir.join(".gitmodules").is_file() {
         return Ok(());
     }
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workdir)
-        .arg("-c")
-        .arg("protocol.file.allow=always")
-        .arg("submodule")
-        .arg("update")
-        .arg("--init")
-        .arg("--recursive")
-        .arg("--depth")
-        .arg("1")
-        .output()?;
+    let secrets = url_secrets(url);
+    let out = retry_git_network("submodule update", &secrets, waits, || {
+        Ok(std::process::Command::new("git")
+            .arg("-C")
+            .arg(workdir)
+            .arg("-c")
+            .arg("protocol.file.allow=always")
+            .arg("submodule")
+            .arg("update")
+            .arg("--init")
+            .arg("--recursive")
+            .arg("--depth")
+            .arg("1")
+            .output()?)
+    })?;
     if !out.status.success() {
         return Err(git_error("submodule update", &out, Some(url)));
     }
@@ -973,18 +1117,22 @@ fn init_submodules(url: &str, workdir: &std::path::Path) -> Result<()> {
 /// remote's actual default branch (never assumed) and restores
 /// `origin/HEAD`, so a pinned clone ends up with the same base refs as a
 /// default-branch clone.
-fn restore_default_branch_refs(
+fn restore_default_branch_refs_retrying(
     url: &str,
     pinned: &str,
     workdir: &std::path::Path,
     depth: u32,
+    waits: &[Duration; 3],
 ) -> Result<()> {
-    let out = std::process::Command::new("git")
-        .arg("ls-remote")
-        .arg("--symref")
-        .arg(url)
-        .arg("HEAD")
-        .output()?;
+    let secrets = url_secrets(url);
+    let out = retry_git_network("ls-remote", &secrets, waits, || {
+        Ok(std::process::Command::new("git")
+            .arg("ls-remote")
+            .arg("--symref")
+            .arg(url)
+            .arg("HEAD")
+            .output()?)
+    })?;
     if !out.status.success() {
         return Err(git_error("ls-remote", &out, Some(url)));
     }
@@ -994,7 +1142,6 @@ fn restore_default_branch_refs(
         .find_map(|l| l.strip_prefix("ref: refs/heads/"))
         .and_then(|rest| rest.split_whitespace().next());
     let Some(default_branch) = default_branch else {
-        let secrets = url_secrets(url);
         return Err(Error::Other(anyhow::anyhow!(
             "remote has no resolvable default branch: {}",
             crate::forge_log::redact(stdout.trim(), &secrets)
@@ -1004,15 +1151,17 @@ fn restore_default_branch_refs(
 
     if default_branch != pinned {
         let refspec = format!("+refs/heads/{default_branch}:refs/remotes/origin/{default_branch}");
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(workdir)
-            .arg("fetch")
-            .arg("--depth")
-            .arg(depth.to_string())
-            .arg("origin")
-            .arg(&refspec)
-            .output()?;
+        let out = retry_git_network("fetch", &secrets, waits, || {
+            Ok(std::process::Command::new("git")
+                .arg("-C")
+                .arg(workdir)
+                .arg("fetch")
+                .arg("--depth")
+                .arg(depth.to_string())
+                .arg("origin")
+                .arg(&refspec)
+                .output()?)
+        })?;
         if !out.status.success() {
             return Err(git_error("fetch", &out, Some(url)));
         }
@@ -1061,7 +1210,7 @@ pub fn git_error(context: &str, out: &std::process::Output, url: Option<&str>) -
 /// so it can be masked verbatim wherever git echoed it. Both halves are returned:
 /// the password is the secret, and the whole `user:pass` pair is masked too in
 /// case git printed it unsplit.
-fn url_secrets(url: &str) -> Vec<String> {
+pub(crate) fn url_secrets(url: &str) -> Vec<String> {
     let Some(rest) = url.split_once("//").map(|(_, r)| r) else {
         return Vec::new();
     };
@@ -1245,6 +1394,10 @@ mod tests {
     use crate::forge_log::ActionLogClient;
     use cli::testutil::StubRunner;
 
+    /// Zero-delay retry schedule so a test that exercises a failing git
+    /// network call does not actually wait out CLAUDE-396's real schedule.
+    const NO_WAIT: [Duration; 3] = [Duration::ZERO, Duration::ZERO, Duration::ZERO];
+
     #[test]
     fn validate_pr_subject_rejects_empty() {
         let err = validate_pr_subject("", "feat/x").unwrap_err().to_string();
@@ -1280,9 +1433,15 @@ mod tests {
     #[test]
     fn a_failed_clone_reports_gits_own_reason() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = shallow_clone("/nonexistent/repo.git", None, &tmp.path().join("out"), 50)
-            .unwrap_err()
-            .to_string();
+        let err = shallow_clone_retrying(
+            "/nonexistent/repo.git",
+            None,
+            &tmp.path().join("out"),
+            50,
+            &NO_WAIT,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("git clone exited"), "{err}");
         assert!(
             err.to_lowercase().contains("repository")
@@ -1299,7 +1458,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let token = "abcdef0123456789abcdef0123456789";
         let url = format!("https://oauth2:{token}@127.0.0.1:1/owner/repo.git");
-        let err = shallow_clone(&url, None, &tmp.path().join("out"), 50)
+        let err = shallow_clone_retrying(&url, None, &tmp.path().join("out"), 50, &NO_WAIT)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1633,13 +1792,243 @@ mod tests {
         let url = origin_with_submodule(tmp.path());
         std::fs::remove_dir_all(tmp.path().join("sub-origin")).unwrap();
         let clone = tmp.path().join("clone");
-        let err = shallow_clone(&url, None, &clone, 50)
+        let err = shallow_clone_retrying(&url, None, &clone, 50, &NO_WAIT)
             .unwrap_err()
             .to_string();
         assert!(err.contains("git submodule update exited"), "{err}");
         assert!(
             clone.join("sub").read_dir().unwrap().next().is_none(),
             "a failed submodule fetch must not leave a populated submodule directory"
+        );
+    }
+
+    /// `init_submodules_retrying` retries a transient failure (CLAUDE-396) via
+    /// a `git remote-ext` helper script that fails the first invocation and
+    /// forwards to `git-upload-pack` on the second, exercising the real
+    /// production function (not a stand-in closure) end to end.
+    #[test]
+    fn init_submodules_retries_once_and_succeeds_on_second_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_submodule(tmp.path());
+        let workdir = tmp.path().join("plain_clone");
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q", &url])
+            .arg(&workdir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let sub_origin = tmp.path().join("sub-origin");
+        let log = tmp.path().join("helper-calls.log");
+        let script = tmp.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho called >> {log}\nif [ $(wc -l < {log}) -eq 1 ]; then\n  echo 'simulated transient failure' >&2\n  exit 1\nfi\nexec git-upload-pack {sub_origin}\n",
+                log = log.display(),
+                sub_origin = sub_origin.display(),
+            ),
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let gitmodules = workdir.join(".gitmodules");
+        let rewritten = std::fs::read_to_string(&gitmodules)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("url =") {
+                    format!("\turl = ext::sh {}", script.display())
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&gitmodules, rewritten).unwrap();
+
+        // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
+        // widening it, so `file` (used by other tests' local-path remotes
+        // running concurrently) must stay listed alongside `ext`; the lock
+        // keeps this test's set/remove pair from racing another thread's.
+        let _guard = git_allow_protocol_test_lock();
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
+        let result = init_submodules_retrying(&url, &workdir, &NO_WAIT);
+        std::env::remove_var("GIT_ALLOW_PROTOCOL");
+
+        result.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("sub").join("s.txt")).unwrap(),
+            "s"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            2,
+            "submodule update must have been attempted exactly twice"
+        );
+    }
+
+    /// `restore_default_branch_refs_retrying` retries a transient `ls-remote`
+    /// failure (CLAUDE-396) via a `git remote-ext` helper script, exercising
+    /// the real production function end to end.
+    #[test]
+    fn restore_default_branch_refs_ls_remote_retries_once_and_succeeds_on_second_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg("-b")
+            .arg("main")
+            .arg(&origin)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["config", "user.email", "a@b.c"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["config", "user.name", "a"])
+            .output()
+            .unwrap();
+        std::fs::write(origin.join("f"), "x").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["add", "f"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["commit", "-q", "-m", "x"])
+            .output()
+            .unwrap();
+
+        let log = tmp.path().join("helper-calls.log");
+        let script = tmp.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho called >> {log}\nif [ $(wc -l < {log}) -eq 1 ]; then\n  echo 'simulated transient failure' >&2\n  exit 1\nfi\nexec git-upload-pack {origin}\n",
+                log = log.display(),
+                origin = origin.display(),
+            ),
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let url = format!("ext::sh {}", script.display());
+        let workdir = tmp.path().join("workdir");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
+        // widening it, so `file` stays listed alongside `ext`; the lock keeps
+        // this test's set/remove pair from racing another thread's.
+        let _guard = git_allow_protocol_test_lock();
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
+        let result = restore_default_branch_refs_retrying(&url, "other", &workdir, 50, &NO_WAIT);
+        std::env::remove_var("GIT_ALLOW_PROTOCOL");
+
+        // No local `origin` remote is configured in `workdir`, so the
+        // subsequent `fetch`/`remote set-head` step fails; only the
+        // `ls-remote` retry itself is under test here.
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            2,
+            "ls-remote must have been attempted exactly twice"
+        );
+    }
+
+    /// `restore_default_branch_refs_retrying`'s `fetch` step (reached only
+    /// when the pinned branch differs from the remote's default) retries a
+    /// transient failure (CLAUDE-396) via a `git remote-ext` wrapper placed
+    /// on the clone's own `origin` remote, exercising the real production
+    /// function end to end; the `url` argument stays the plain `file://`
+    /// origin so the preceding `ls-remote` succeeds on its first attempt and
+    /// only the `fetch` retry is under test.
+    #[test]
+    fn restore_default_branch_refs_fetch_retries_once_and_succeeds_on_second_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_default_branch(tmp.path(), "main");
+        let origin_path = url.strip_prefix("file://").unwrap().to_string();
+
+        let workdir = tmp.path().join("clone");
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q", "--branch", "feat", "--depth", "1", &url])
+            .arg(&workdir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let log = tmp.path().join("helper-calls.log");
+        let script = tmp.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho called >> {log}\nif [ $(wc -l < {log}) -eq 1 ]; then\n  echo 'simulated transient failure' >&2\n  exit 1\nfi\nexec git-upload-pack {origin_path}\n",
+                log = log.display(),
+                origin_path = origin_path,
+            ),
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workdir)
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                &format!("ext::sh {}", script.display()),
+            ])
+            .output()
+            .unwrap();
+
+        // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
+        // widening it, so `file` (needed by `url`'s own `ls-remote`) stays
+        // listed alongside `ext`; the lock keeps this test's set/remove pair
+        // from racing another thread's.
+        let _guard = git_allow_protocol_test_lock();
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
+        let result = restore_default_branch_refs_retrying(&url, "feat", &workdir, 50, &NO_WAIT);
+        std::env::remove_var("GIT_ALLOW_PROTOCOL");
+
+        result.unwrap();
+        assert_eq!(
+            rev_parse_abbrev(&workdir, "origin/main").as_deref(),
+            Some("origin/main"),
+            "the retried fetch must still have landed refs/remotes/origin/main"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            2,
+            "fetch must have been attempted exactly twice"
         );
     }
 
@@ -1841,11 +2230,12 @@ mod tests {
     #[test]
     fn ls_remote_failure_reports_gits_own_reason() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = restore_default_branch_refs(
+        let err = restore_default_branch_refs_retrying(
             "/nonexistent/repo.git",
             "feat",
             &tmp.path().join("clone"),
             50,
+            &NO_WAIT,
         )
         .unwrap_err()
         .to_string();
@@ -1866,9 +2256,15 @@ mod tests {
             .output()
             .unwrap();
         let url = format!("file://{}", origin.display());
-        let err = restore_default_branch_refs(&url, "feat", &tmp.path().join("clone"), 50)
-            .unwrap_err()
-            .to_string();
+        let err = restore_default_branch_refs_retrying(
+            &url,
+            "feat",
+            &tmp.path().join("clone"),
+            50,
+            &NO_WAIT,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("no resolvable default branch"),
             "must never guess main: {err}"
@@ -1928,5 +2324,215 @@ mod tests {
             }
             other => panic!("expected Fetched, got {other:?}"),
         }
+    }
+
+    // ---- CLAUDE-396: git network retries ----------------------------------
+
+    #[derive(Clone, Debug)]
+    struct FakeOut {
+        ok: bool,
+        stderr: String,
+    }
+
+    impl GitAttemptOutput for FakeOut {
+        fn git_ok(&self) -> bool {
+            self.ok
+        }
+        fn git_stderr(&self) -> &str {
+            &self.stderr
+        }
+    }
+
+    fn fail(stderr: &str) -> Result<FakeOut> {
+        Ok(FakeOut {
+            ok: false,
+            stderr: stderr.to_string(),
+        })
+    }
+
+    fn ok() -> Result<FakeOut> {
+        Ok(FakeOut {
+            ok: true,
+            stderr: String::new(),
+        })
+    }
+
+    #[test]
+    fn retry_git_network_succeeds_on_attempt_2() {
+        let mut attempts = 0;
+        let out = retry_git_network("push", &[], &NO_WAIT, || {
+            attempts += 1;
+            if attempts == 1 {
+                fail("connection reset")
+            } else {
+                ok()
+            }
+        })
+        .unwrap();
+        assert!(out.ok);
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn retry_git_network_succeeds_on_attempt_4() {
+        let mut attempts = 0;
+        let out = retry_git_network("push", &[], &NO_WAIT, || {
+            attempts += 1;
+            if attempts < 4 {
+                fail("connection reset")
+            } else {
+                ok()
+            }
+        })
+        .unwrap();
+        assert!(out.ok);
+        assert_eq!(attempts, 4);
+    }
+
+    #[test]
+    fn retry_git_network_returns_the_last_error_unchanged_after_4_failures() {
+        let mut attempts = 0;
+        let out = retry_git_network("push", &[], &NO_WAIT, || {
+            attempts += 1;
+            fail(&format!("attempt {attempts} failed"))
+        })
+        .unwrap();
+        assert!(!out.ok);
+        assert_eq!(out.stderr, "attempt 4 failed");
+        assert_eq!(attempts, 4);
+    }
+
+    #[test]
+    fn retry_git_network_never_retries_a_spawn_error() {
+        let mut attempts = 0;
+        let err = retry_git_network("push", &[], &NO_WAIT, || {
+            attempts += 1;
+            Err::<FakeOut, _>(Error::Other(anyhow::anyhow!("spawn failed")))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("spawn failed"));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn retry_git_network_redacts_the_credential_in_the_warn_log() {
+        // The warn log itself isn't asserted on directly (no test
+        // subscriber capture here); this asserts the redaction call that
+        // feeds it strips the secret, exercised through the same path the
+        // log line uses.
+        let secrets = vec!["claude_run:secret".to_string(), "secret".to_string()];
+        let mut attempts = 0;
+        let out = retry_git_network("fetch", &secrets, &NO_WAIT, || {
+            attempts += 1;
+            if attempts == 1 {
+                fail("fatal: https://claude_run:secret@host/x.git: Internal Server Error")
+            } else {
+                ok()
+            }
+        })
+        .unwrap();
+        assert!(out.ok);
+        let redacted = crate::forge_log::redact(
+            "fatal: https://claude_run:secret@host/x.git: Internal Server Error",
+            &secrets,
+        );
+        assert!(!redacted.contains("secret"));
+    }
+
+    /// A retry must start from an absent target directory: a failed first
+    /// clone attempt leaves a directory behind (half-populated or empty),
+    /// and the retry must remove it rather than fail with "already exists".
+    #[test]
+    fn clone_retry_removes_a_directory_a_failed_first_attempt_left_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg("--bare")
+            .arg(&origin)
+            .output()
+            .unwrap();
+        // Pin HEAD to `main` regardless of the host git's configured
+        // default branch name, so the seeded push below lands on the
+        // branch the bare repo's HEAD actually resolves to.
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .output()
+            .unwrap();
+        // Seed a commit so the clone itself can succeed on retry.
+        let seed = tmp.path().join("seed");
+        std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                seed.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        std::fs::write(seed.join("f"), b"x").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&seed)
+            .args(["add", "f"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&seed)
+            .args([
+                "-c",
+                "user.email=a@b.c",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-q",
+                "-m",
+                "x",
+            ])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&seed)
+            .args(["push", "-q", "origin", "HEAD:main"])
+            .output()
+            .unwrap();
+
+        let url = format!("file://{}", origin.display());
+        let workdir = tmp.path().join("clone");
+        // Leave a non-empty, non-repo directory behind, as a failed first
+        // clone attempt would (git refuses to clone into it: "already exists
+        // and is not an empty directory").
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(workdir.join("leftover"), b"stale").unwrap();
+
+        let mut first = true;
+        let secrets = url_secrets(&url);
+        let out = retry_git_network("clone", &secrets, &NO_WAIT, || {
+            if first {
+                first = false;
+            } else if workdir.exists() {
+                std::fs::remove_dir_all(&workdir).unwrap();
+            }
+            Ok(std::process::Command::new("git")
+                .arg("clone")
+                .arg("--depth")
+                .arg("1")
+                .arg(&url)
+                .arg(&workdir)
+                .output()
+                .unwrap())
+        })
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(workdir.join("f").exists());
     }
 }

@@ -222,6 +222,10 @@ pub struct GithubForge {
     /// Lazy `gh auth token` fallback result, cached after the first lookup.
     /// Only consulted when `token` is `None`.
     resolved_token: std::sync::Mutex<Option<std::result::Result<String, String>>>,
+    /// Wait schedule for a retried git network call (CLAUDE-396). Defaults to
+    /// [`crate::provider::GIT_NETWORK_RETRY_WAITS`]; overridable so tests run
+    /// with no delay.
+    git_retry_waits: [std::time::Duration; 3],
 }
 
 impl GithubForge {
@@ -246,12 +250,20 @@ impl GithubForge {
             git: "git".to_string(),
             gh: "gh".to_string(),
             resolved_token: std::sync::Mutex::new(None),
+            git_retry_waits: crate::provider::GIT_NETWORK_RETRY_WAITS,
         }
     }
 
     /// Override the backend priority (tests).
     pub fn with_priority(mut self, priority: Vec<BackendKind>) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Override the git network retry wait schedule (CLAUDE-396; tests set
+    /// this to all-zero so a retried push runs with no delay).
+    pub fn with_git_retry_waits(mut self, waits: [std::time::Duration; 3]) -> Self {
+        self.git_retry_waits = waits;
         self
     }
 
@@ -318,30 +330,30 @@ impl GithubForge {
     fn push(&self, workdir: &Path, host: &str, repo: &str, branch: &str) -> Result<()> {
         let refspec = format!("HEAD:{branch}");
         let push_args = ["push", "origin", refspec.as_str()];
-        let out = match self.effective_token(host) {
-            Ok(token) => {
-                let token_url = format!("https://x-access-token:{token}@{host}/{repo}.git");
-                crate::provider::run_authed_git(
-                    self.runner.as_ref(),
-                    Some(workdir),
-                    &push_args,
-                    Some(&token_url),
-                )?
-            }
+        let token_url = match self.effective_token(host) {
+            Ok(token) => Some(format!("https://x-access-token:{token}@{host}/{repo}.git")),
             Err(e) => {
                 tracing::warn!(
                     host,
                     repo,
                     "no github.token_ref on the action and {e}; falling back to origin"
                 );
+                None
+            }
+        };
+        let secrets = token_url
+            .as_deref()
+            .map(crate::provider::url_secrets)
+            .unwrap_or_default();
+        let out =
+            crate::provider::retry_git_network("push", &secrets, &self.git_retry_waits, || {
                 crate::provider::run_authed_git(
                     self.runner.as_ref(),
                     Some(workdir),
                     &push_args,
-                    None,
-                )?
-            }
-        };
+                    token_url.as_deref(),
+                )
+            })?;
         if out.ok {
             Ok(())
         } else {
@@ -1585,6 +1597,42 @@ mod tests {
             .ok("git", &["log", "-1", "--pretty=format:%s"], "feat: x")
             .ok("git", &["log", "-1", "--pretty=format:%b"], "body text")
             .ok("git", &push_args, "")
+    }
+
+    const NO_WAIT: [std::time::Duration; 3] = [std::time::Duration::ZERO; 3];
+
+    #[test]
+    fn push_retries_once_and_succeeds_on_second_attempt() {
+        let runner = Arc::new(with_git(StubRunner::new(), "feat/x", "origin").fail_once(
+            "git",
+            &["push", "origin", "HEAD:feat/x"],
+            1,
+            "connection reset",
+        ));
+        let transport = Arc::new(StubTransport::new(
+            true,
+            json!({"structuredContent": {"number": 11, "html_url": "https://github.com/octo/widget/pull/11"}}),
+        ));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_git_retry_waits(NO_WAIT);
+        forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        let push_calls = calls
+            .iter()
+            .filter(|c| c.as_str() == "git push origin HEAD:feat/x")
+            .count();
+        assert_eq!(push_calls, 2, "{calls:?}");
     }
 
     #[test]
