@@ -1375,8 +1375,8 @@ pub struct ActiveRun {
 
 /// Every run row with no `ended_at`, oldest first. Trustworthy as a
 /// liveness signal because [`reap_orphaned_runs`] closes every leftover row at
-/// daemon startup and [`RunGuard`] closes one whose handler errors mid-run, so
-/// an open row means a run really is executing. Returns the
+/// daemon startup and [`RunGuard`] closes one whose handler errors, panics, or
+/// drops its future mid-run, so an open row means a run really is executing. Returns the
 /// rows (not a count) so the busy indicator can list and link each one.
 ///
 /// This is only HALF the quiet signal: it misses a run dispatched but not yet
