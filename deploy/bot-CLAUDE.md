@@ -25,6 +25,10 @@ the run outcome. If you hit a blocker you cannot resolve, write the reason to
 `.claude-run-needs-review` and create `.claude-run-skip-attempt` in the workdir,
 then stop. The runner reads those markers and parks the job for a human.
 
+Postgres-backed tests run in CI; never set `CLAUDE_RUN_TEST_DATABASE_URL` or
+`DATABASE_URL` to a database you did not create in this run, and report the
+Postgres pass as not run locally instead.
+
 ## YouTrack writes (bounded, not banned)
 
 The job prompt is authoritative and names the exact permitted set; where this

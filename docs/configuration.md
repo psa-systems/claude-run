@@ -41,6 +41,12 @@ The file form exists because the URL carries the password, and an environment va
 `docker inspect` and `/proc/<pid>/environ`. `CLAUDE_RUN_DATABASE_URL` remains available for a deployment where that
 exposure is acceptable.
 
+The daemon's own `claude` children never see either variable: `src/claude.rs` strips `CLAUDE_RUN_DATABASE_URL` and
+`CLAUDE_RUN_DATABASE_URL_FILE` from every spawned agent's environment, so an agent session cannot read the live
+database URL by inspecting its own environment (CLAUDE-403). That is hygiene, not the enforcement boundary: the real
+guard is in `src/db.rs`, which refuses to build a test fixture against any database that already has its own
+`public._sqlx_migrations`, naming the database in the error.
+
 ```toml
 # config.toml
 [database]
