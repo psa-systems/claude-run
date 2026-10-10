@@ -440,6 +440,30 @@ pub trait Forge: Send + Sync {
         )))
     }
 
+    /// Overwrite PR `pr_number` in `repo` on `host` with the title and body
+    /// derived from `workdir`'s current tip commit (subject and, for
+    /// Forgejo, the reflowed body; GitHub's `create_pr_impl` already reads
+    /// `HEAD` the same way `create_pr` does). Used when a re-queued run
+    /// (CLAUDE-275) resumes onto a draft PR a prior timed-out run salvaged
+    /// (CLAUDE-379) and now finishes: the placeholder title/body the salvage
+    /// wrote (CLAUDE-398) is replaced with the finished tip's own text,
+    /// validated through [`validate_pr_subject`] first so a bad tip refuses
+    /// here exactly as it would at PR-create time. The default errors so a
+    /// backend without support (including every test-only stub) reports
+    /// clearly rather than silently no-op'ing.
+    fn refresh_pr_text(
+        &self,
+        workdir: &std::path::Path,
+        host: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<()> {
+        let _ = (workdir, host, repo, pr_number);
+        Err(Error::Other(anyhow::anyhow!(
+            "refresh_pr_text not supported by this forge backend"
+        )))
+    }
+
     /// Drain the operator-visible notices this backend accumulated
     /// while serving the job, e.g. an open-PR lookup that failed and was
     /// degraded to a create. The caller persists them as `run_events` so they

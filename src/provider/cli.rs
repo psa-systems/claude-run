@@ -1775,6 +1775,71 @@ impl Forge for CliBackend {
         Ok(())
     }
 
+    /// A no-op on a PR whose title lacks the `WIP: ` draft prefix (the same
+    /// signal [`Self::mark_pr_ready`] reads): a non-draft adopted PR is left
+    /// untouched. Otherwise reads the resolved feature branch's current tip
+    /// subject/body, runs them through
+    /// [`crate::provider::validate_pr_subject`], and overwrites the PR with
+    /// one `fj pr edit --title --body-file` call (CLAUDE-398). The body
+    /// scratch file goes through `std::env::temp_dir` rather than the
+    /// clone's git-directory scratch space, mirroring `pr_comment`'s scratch
+    /// convention, and is removed again whether or not the edit succeeds.
+    fn refresh_pr_text(
+        &self,
+        workdir: &Path,
+        host: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<()> {
+        let prs = self.list_open_prs(host, repo)?;
+        let is_draft = prs
+            .into_iter()
+            .find(|p| p.number == pr_number)
+            .is_some_and(|p| p.title.starts_with("WIP: "));
+        if !is_draft {
+            return Ok(());
+        }
+
+        let branch = self.resolve_feature_branch(workdir)?;
+        let title = self.tip_subject(workdir, &branch)?;
+        crate::provider::validate_pr_subject(&title, &branch)?;
+        let body_args = ["log", "-1", "--format=%b", &branch];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &body_args, &[])?;
+        let body = unwrap_prose(Self::checked("git", out, &body_args)?.trim());
+
+        let scratch = std::env::temp_dir().join(format!("claude-run-pr-refresh-{pr_number}.md"));
+        std::fs::write(&scratch, &body)?;
+        let scratch_arg = scratch.to_string_lossy().to_string();
+        let id = format!("{repo}#{pr_number}");
+        let args = [
+            "--host",
+            host,
+            "pr",
+            "edit",
+            &id,
+            "--title",
+            title.as_str(),
+            "--body-file",
+            scratch_arg.as_str(),
+        ];
+        let res = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())
+            .and_then(|out| Self::checked(&self.fj, out, &args));
+        if let Err(e) = std::fs::remove_file(&scratch) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::error!(
+                    path = %scratch.display(),
+                    error = %e,
+                    "removing the PR refresh scratch file failed"
+                );
+            }
+        }
+        res.map(|_| ())
+    }
+
     fn take_notices(&self) -> Vec<String> {
         std::mem::take(&mut *self.notices.lock().unwrap())
     }
@@ -3207,6 +3272,128 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c == "git log -1 --format=%b feat/x"),
             "the tip commit's own body must never be read when a body override is supplied: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_pr_text_is_a_no_op_on_a_non_draft_pr() {
+        // CLAUDE-398: a resumed-but-already-ready PR (no `WIP: ` title
+        // prefix) is left untouched; no `fj pr edit` call at all, and no git
+        // log reads either.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_open_pr_search(
+            StubRunner::new(),
+            r#"[{"number":7,"title":"feat: x","head_ref":"feat/x"}]"#,
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        b.refresh_pr_text(wd.path(), "dev.a8n.run", "contoso/claude-run", 7)
+            .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr edit")),
+            "a non-draft PR must not be edited: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("log")),
+            "a non-draft PR's tip must never be read: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_pr_text_overwrites_a_draft_prs_title_and_body() {
+        // CLAUDE-398: a draft (`WIP: `-prefixed) PR gets one combined
+        // `fj pr edit --title --body-file` call built from the resolved
+        // feature branch's current tip.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_open_pr_search(
+            StubRunner::new(),
+            r#"[{"number":7,"title":"WIP: feat: x","head_ref":"feat/x"}]"#,
+        );
+        let runner = with_branch_resolution(
+            runner,
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = runner
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "feat: the real thing\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "Finished.\n\n#MK-16\n",
+            );
+        let scratch_path = std::env::temp_dir().join("claude-run-pr-refresh-7.md");
+        let runner = runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "edit",
+                "contoso/claude-run#7",
+                "--title",
+                "feat: the real thing",
+                "--body-file",
+                scratch_path.to_string_lossy().as_ref(),
+            ],
+            "",
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        b.refresh_pr_text(wd.path(), "dev.a8n.run", "contoso/claude-run", 7)
+            .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with(
+                "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: the real thing --body-file"
+            )),
+            "the draft PR must be overwritten with the tip's own title and body: {calls:?}"
+        );
+        assert!(
+            !scratch_path.exists(),
+            "the body scratch file must be removed again after the edit"
+        );
+    }
+
+    #[test]
+    fn refresh_pr_text_refuses_a_template_heading_subject() {
+        // CLAUDE-398: the same guard `create_pr` applies at create time also
+        // runs here, so a tip that regressed to a bad subject refuses rather
+        // than overwriting the PR with it.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_open_pr_search(
+            StubRunner::new(),
+            r#"[{"number":7,"title":"WIP: feat: x","head_ref":"feat/x"}]"#,
+        );
+        let runner = with_branch_resolution(
+            runner,
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = runner.ok(
+            "git",
+            &["log", "-1", "--format=%s", "feat/x"],
+            "## Summary\n",
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let err = b
+            .refresh_pr_text(wd.path(), "dev.a8n.run", "contoso/claude-run", 7)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("## Summary")
+                || err.to_string().to_lowercase().contains("subject")
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr edit")),
+            "a bad subject must never reach fj pr edit: {calls:?}"
         );
     }
 
