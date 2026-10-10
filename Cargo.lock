@@ -588,7 +588,6 @@ dependencies = [
  "qrcodegen",
  "reqwest",
  "rpassword",
- "semver",
  "serde",
  "serde_json",
  "serde_urlencoded",

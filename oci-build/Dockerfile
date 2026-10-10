@@ -1,19 +1,16 @@
 # Build a static `claude-run` binary against the musl rust-builder image and
-# either export it via a scratch stage or assemble a self-contained runtime
-# image around it.
+# assemble a self-contained runtime image around it. The image is the only
+# supported distribution; no standalone binary is published.
 #
 # The `runtime` stage (CLAUDE-37) exists so the daemon, and every `claude`
 # child it spawns, runs inside a container with a clean `$HOME`. The container
 # user's `~/.claude/CLAUDE.md` is the slim bot file baked from
 # `deploy/bot-CLAUDE.md`, never the operator's interactive global CLAUDE.md, so
 # the agent stops inheriting the operator's Git/YouTrack workflow instructions.
-# The Generic-Package binary is still published independently; `version check` reads it.
 #
 # Targets:
 #   --target builder  -> compile only, for `just check-docker`
 #   --target runtime  -> daemon runtime image, used by `compose.yml`
-#   --target binary   -> scratch stage, used by `just build-docker-export`
-#                        and the build-binary.yml workflow
 
 # syntax=docker/dockerfile:1.6
 FROM dev.a8n.run/pandoras-box/rust-builder-musl:v1.2.0-rust1.98.1-alpine AS builder
@@ -200,7 +197,3 @@ RUN chmod 0755 /usr/local/bin/entrypoint.sh
 # deployment really does want it.
 ENTRYPOINT ["/usr/bin/catatonit", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["serve", "--no-socket"]
-
-# Export stage: pull just the binary out, no runtime base.
-FROM scratch AS binary
-COPY --from=builder /build/target/release/claude-run /claude-run

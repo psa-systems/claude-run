@@ -17,7 +17,7 @@ use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
 use claude_run::{
     access, action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db,
-    exit, import, jsonfmt, lock, migrate, paint, secrets, settings, snippet, state, update,
+    exit, import, jsonfmt, lock, migrate, paint, secrets, settings, snippet, state,
 };
 
 /// `--color` choices. Maps to both `anstream` (our own output) and clap's
@@ -149,50 +149,6 @@ enum Cmd {
         /// populated one duplicates history.
         #[arg(long)]
         allow_nonempty: bool,
-    },
-    /// Show the running version, check the registry for a newer build, or
-    /// self-update in place. With no subcommand, behaves like `show`.
-    Version {
-        #[command(subcommand)]
-        cmd: Option<VersionCmd>,
-    },
-}
-
-#[derive(Subcommand)]
-enum VersionCmd {
-    /// Print the build-stamped version banner (identical to `--version`).
-    Show,
-    /// Report the current version, the newest available `vX.Y.Z` in the
-    /// registry, and whether an update is available. Exits non-zero only on a
-    /// registry/transport error.
-    Check {
-        /// Update channel: `release` (newest semver) or `latest` (moving main
-        /// build). Defaults to `[update].train` in config.toml (`release`).
-        #[arg(long, value_enum)]
-        train: Option<update::UpdateTrain>,
-        /// On a 401/403, use the `fj` token for the registry host without an
-        /// interactive prompt.
-        #[arg(long)]
-        use_fj_token: bool,
-    },
-    /// Download the newest build (or `--version <tag>`), verify its SHA-256
-    /// against the published sidecar, and atomically replace this binary.
-    Update {
-        /// Pin a specific release tag (e.g. v0.2.0) instead of the newest.
-        /// Independent of `--train`.
-        #[arg(long = "version")]
-        version: Option<String>,
-        /// Update channel: `release` (newest semver) or `latest` (moving main
-        /// build). Defaults to `[update].train` in config.toml (`release`).
-        #[arg(long, value_enum)]
-        train: Option<update::UpdateTrain>,
-        /// On a 401/403, use the `fj` token for the registry host without an
-        /// interactive prompt.
-        #[arg(long)]
-        use_fj_token: bool,
-        /// Skip the confirmation prompt before swapping the binary.
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
 }
 
@@ -517,72 +473,7 @@ async fn real_main(
             );
             Ok(exit::OK)
         }
-        Cmd::Version { cmd } => version_cmd(cmd, &on_disk, &db_target).await,
     }
-}
-
-async fn version_cmd(
-    cmd: Option<VersionCmd>,
-    on_disk: &cfg::OnDiskConfig,
-    db_target: &cfg::DatabaseTarget,
-) -> claude_run::error::Result<i32> {
-    match cmd.unwrap_or(VersionCmd::Show) {
-        VersionCmd::Show => {
-            println!("{}", claude_run::VERSION);
-            Ok(exit::OK)
-        }
-        VersionCmd::Check {
-            train,
-            use_fj_token,
-        } => {
-            // The update config is DB-backed; read the effective value
-            // (DB wins, file is the fallback before any serve migrated it).
-            let pool = db::open(db_target).await?;
-            let update_cfg = settings::effective_update(&pool, on_disk).await?;
-            let train = resolve_train(train, &update_cfg.train)?;
-            let configured = configured_update_token(&pool, &update_cfg);
-            update::check(train, use_fj_token, configured).await
-        }
-        VersionCmd::Update {
-            version,
-            train,
-            use_fj_token,
-            yes,
-        } => {
-            let pool = db::open(db_target).await?;
-            let update_cfg = settings::effective_update(&pool, on_disk).await?;
-            let train = resolve_train(train, &update_cfg.train)?;
-            let configured = configured_update_token(&pool, &update_cfg);
-            update::update(train, version, use_fj_token, configured, yes).await
-        }
-    }
-}
-
-/// CLI `--train` flag overrides the `[update].train` config default.
-fn resolve_train(
-    flag: Option<update::UpdateTrain>,
-    config_train: &str,
-) -> claude_run::error::Result<update::UpdateTrain> {
-    match flag {
-        Some(t) => Ok(t),
-        None => update::UpdateTrain::from_config_str(config_train),
-    }
-}
-
-/// Build a lazy resolver for the registry token named by `[update].token_ref`.
-/// `None` when no `token_ref` is configured (the anonymous-first
-/// path). Nothing is decrypted here; the age key file is loaded and
-/// the secret decrypted only if the registry demands escalation (401/403) and
-/// the configured-token branch is taken, so a configured `token_ref` no longer
-/// forces `CLAUDE_RUN_SECRETS_KEY_FILE` to be present up front.
-fn configured_update_token(
-    pool: &crate::db::DbPool,
-    update_cfg: &cfg::UpdateConfig,
-) -> Option<update::ConfiguredToken> {
-    update_cfg
-        .token_ref
-        .clone()
-        .map(|name| update::ConfiguredToken::new(pool.clone(), name))
 }
 
 async fn run_action(

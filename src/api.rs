@@ -67,7 +67,7 @@ pub struct AppState {
     /// Shared with the dispatcher so the delete handler can refuse a
     /// delete for an action whose run is dispatched but not yet in `runs`.
     pub in_flight: InFlight,
-    /// Live runtime settings (mint/update/webhook/log_filter) backing
+    /// Live runtime settings (mint/webhook/log_filter) backing
     /// the Settings page and the `/api/settings/<section>` endpoints.
     pub settings: Arc<crate::settings::LiveSettings>,
     /// Resolved on-disk locations, so the access check can write its
@@ -115,7 +115,7 @@ pub fn router(state: AppState) -> Router {
         .route("/resume", post(global_resume_handler))
         // JSON settings round-trip, one section per request. Mounted
         // under `/api` over TCP (behind the token auth gate) and at root over
-        // the unix socket. `<section>` is mint|update|webhook|log_filter.
+        // the unix socket. `<section>` is mint|webhook|log_filter|...; see `Section::ALL`.
         .route(
             "/settings/:section",
             get(get_settings_section).put(put_settings_section),
@@ -853,12 +853,12 @@ mod tests {
         // Valid PUT persists; subsequent GET reflects it.
         let _ = put_settings_section(
             State(s.clone()),
-            AxumPath("update".into()),
-            r#"{"train":"latest"}"#.to_string(),
+            AxumPath("mint".into()),
+            r#"{"fallback_project":"FJ"}"#.to_string(),
         )
         .await
         .expect("valid put");
-        let resp = get_settings_section(State(s.clone()), AxumPath("update".into()))
+        let resp = get_settings_section(State(s.clone()), AxumPath("mint".into()))
             .await
             .expect("get");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -866,8 +866,8 @@ mod tests {
         // Invalid PUT (unknown field) -> 400, persists nothing.
         let err = put_settings_section(
             State(s.clone()),
-            AxumPath("update".into()),
-            r#"{"train":"latest","nope":true}"#.to_string(),
+            AxumPath("mint".into()),
+            r#"{"fallback_project":"FJ","nope":true}"#.to_string(),
         )
         .await
         .expect_err("invalid put must 400");

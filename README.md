@@ -20,7 +20,7 @@ Operator and developer docs live in [`docs/`](docs/):
 - [forge-tokens.md](docs/forge-tokens.md) - forge token scopes, and resuming an open PR on re-queue
 - [usage.md](docs/usage.md) - the CLI, the web UI pages, and the access check
 - [configuration.md](docs/configuration.md) - filesystem layout, SQLite or PostgreSQL, bootstrap file vs Settings page, logging
-- [operations.md](docs/operations.md) - workdirs, retention, concurrency caps, global pause, self-update
+- [operations.md](docs/operations.md) - workdirs, retention, concurrency caps, global pause, restart safety
 - [agent-writes-and-audits.md](docs/agent-writes-and-audits.md) - what the agent may write to the tracker, and scheduled audits
 - [auth.md](docs/auth.md) - web UI and API auth, service logins, the secrets store
 - [webhooks.md](docs/webhooks.md) - CI-failure webhooks, automerge, auto-fix, GitHub setup

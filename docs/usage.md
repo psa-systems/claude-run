@@ -44,13 +44,8 @@ claude-run access check --repo owner/repo --host forgejo.example.com
 # Clear a locked-out account's TOTP enrollment (DB-direct); the next login re-enrolls.
 claude-run access reset-2fa admin
 
-# Version and update check. In the container, update by pulling a newer image (see operations.md, Self-update).
-claude-run version                         # print the build-stamped banner (same as `version show`)
-claude-run version check                   # uses the [update].train default (release)
-claude-run version check --train latest    # track the moving main build instead
-claude-run version update --yes            # install the newest release-train build
-claude-run version update --train latest   # install the moving `latest` build
-claude-run version update --version v0.2.0 # pin an exact tag (independent of train)
+# Print the build-stamped version banner. Update by pulling a newer image (see self-hosting.md).
+claude-run --version
 ```
 
 ## Web UI pages
@@ -137,8 +132,7 @@ will want to know about:
   seven-day window, a red marker for a timed-out or failed invocation, and a gap in the line (with a stated count)
   wherever an invocation's log carried no rate-limit reading at all rather than a fabricated zero. A table below the
   chart lists the 20 most recent invocations with their status and API-retry counts.
-- **About** (`/about`, CLAUDE-129) shows version + build info and drives the on-demand self-update check / apply (see
-  "Self-update"). Its **Activity** card (CLAUDE-223) carries the global Pause / Resume control and the live quiet
+- **About** (`/about`, CLAUDE-129) shows version + build info. Its **Activity** card (CLAUDE-223) carries the global Pause / Resume control and the live quiet
   indicator (see [Global pause and the restart-safety workflow](operations.md#global-pause-and-the-restart-safety-workflow-claude-223)).
 
 ## Access check (CLAUDE-216)

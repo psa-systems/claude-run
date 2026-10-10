@@ -1,16 +1,16 @@
 //! Shared color palette and helpers for human-facing CLI messages.
 //!
-//! One place for the success / notice / error palette so the binary and
-//! [`crate::update`] style their output identically. Styles are emitted
+//! One place for the success / notice / error palette so every CLI message
+//! styles its output identically. Styles are emitted
 //! unconditionally as ANSI codes; the strings are written through `anstream`,
 //! which strips them when color is off (piped output, `NO_COLOR`,
 //! `--color never`). JSON highlighting has its own palette in [`crate::jsonfmt`].
 
 use anstyle::{AnsiColor, Style};
 
-/// Success / confirmation lines (`ok`, `created secret`, `up to date`).
+/// Success / confirmation lines (`ok`, `created secret`).
 pub const SUCCESS: Style = AnsiColor::Green.on_default();
-/// Non-fatal notices (`daemon not running`, `update available`, `downloading`).
+/// Non-fatal notices (`daemon not running`).
 pub const NOTICE: Style = AnsiColor::Yellow.on_default();
 /// Errors on stderr.
 pub const ERROR: Style = AnsiColor::Red.on_default().bold();

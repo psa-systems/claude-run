@@ -62,7 +62,6 @@ pub mod state;
 #[cfg(test)]
 pub mod testutil;
 pub mod triage;
-pub mod update;
 pub mod usage;
 pub mod web;
 pub mod web_admin;

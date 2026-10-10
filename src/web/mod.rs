@@ -138,12 +138,8 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         // day-of-week). Global by default; `action` + `range` query params narrow
         // it. The shared aggregations live in `crate::report`.
         .route("/reports", get(reports_page))
-        // About page (version + build info) with on-demand update
-        // check / apply. The POST actions ride the existing auth gate
-        // like every other TCP route; they never restart the daemon.
+        // About page (version + build info) and the live Activity card.
         .route("/about", get(about_page))
-        .route("/about/check", post(about_check))
-        .route("/about/update", post(about_update))
         // The Activity card's live quiet indicator polls this
         // fragment every 2s. Its own route (rather than an `hx-select` off
         // `/about`) so the busy / idle / unknown states are rendered by one
@@ -4125,18 +4121,6 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "AI Agent value for a code-fix issue.",
             },
         ],
-        Update => vec![
-            FieldDoc {
-                name: "train",
-                badge: "next invocation",
-                note: "release | latest.",
-            },
-            FieldDoc {
-                name: "token_ref",
-                badge: "next invocation",
-                note: "secret name for the registry token; null = anonymous-first.",
-            },
-        ],
         Webhook => vec![
             FieldDoc {
                 name: "replay_window_secs",
@@ -5091,60 +5075,8 @@ async fn auth_claude_banner(State(s): State<WebState>) -> Result<Html<String>, W
 
 // ---- About page -------------------------------------------------------
 //
-// Version / build info plus an on-demand "Check for updates" and "Update now"
-// driven through the shared non-interactive cores in `crate::update`. The apply
-// downloads, verifies, and atomically swaps the binary but never restarts the
-// daemon: after a successful apply the page tells the operator to restart the
-// service themselves (the runner does not manage the service lifecycle).
-
-/// View of a completed registry check for the template.
-#[derive(Serialize)]
-struct CheckView {
-    /// Configured train label (`release` / `latest`).
-    train: String,
-    /// Running identity: `vX.Y.Z` (release) or installed SHA-256 (latest).
-    current: String,
-    /// Newest registry identity, or a "(none)" placeholder when nothing is
-    /// published.
-    available: String,
-    update_available: bool,
-    /// Human-readable status line.
-    message: String,
-    /// Whether `current` / `available` are digests (latest train), so the
-    /// template can label them "installed" / "published" rather than
-    /// "current" / "available".
-    digest: bool,
-}
-
-impl CheckView {
-    fn from_outcome(o: &crate::update::CheckOutcome) -> Self {
-        use crate::update::CheckState;
-        let digest = matches!(o.train, crate::update::UpdateTrain::Latest);
-        let message = match o.state {
-            CheckState::UpdateAvailable => "Update available.".to_string(),
-            CheckState::UpToDate => "Up to date.".to_string(),
-            CheckState::Ahead => {
-                "Running a newer build than the registry; nothing to do.".to_string()
-            }
-            CheckState::NoneFound if digest => {
-                "No `latest` build is published in the registry.".to_string()
-            }
-            CheckState::NoneFound => "No vX.Y.Z releases found in the registry.".to_string(),
-        };
-        Self {
-            train: match o.train {
-                crate::update::UpdateTrain::Release => "release",
-                crate::update::UpdateTrain::Latest => "latest",
-            }
-            .to_string(),
-            current: o.current.clone(),
-            available: o.available.clone().unwrap_or_else(|| "(none)".to_string()),
-            update_available: o.update_available(),
-            message,
-            digest,
-        }
-    }
-}
+// Version / build info plus the Activity card (live quiet indicator and global
+// pause). Updating is by pulling a newer image; the page has no update action.
 
 /// The Activity card's live indicator, in exactly one of three states.
 /// `Unknown` exists because the alternative (rendering an empty list as idle)
@@ -5271,42 +5203,9 @@ struct AboutTpl {
     /// The first render of the live indicator; the 2s poll then replaces it
     /// from `/about/activity`.
     activity: ActivityView,
-    /// Configured update train (`release` / `latest`), changed on Settings.
-    train: String,
-    /// Whether a registry `token_ref` is configured (informational note).
-    token_ref_set: bool,
-    /// Outcome of a just-run check (only on `POST /about/check`).
-    check: Option<CheckView>,
-    /// Applied tag after a successful `POST /about/update`.
-    applied: Option<String>,
-    /// Non-fatal error from a failed check or apply (registry unreachable,
-    /// checksum mismatch, unwritable binary path, ...). The running binary is
-    /// left untouched on an apply error.
-    error: Option<String>,
 }
 
-/// Build a lazy resolver for the registry token named by `[update].token_ref`.
-/// `None` when no `token_ref` is set (the anonymous-first path). Mirrors the
-/// CLI's `configured_update_token`: nothing is decrypted here; the secret is
-/// resolved only on registry escalation.
-fn configured_update_token(
-    pool: &DbPool,
-    cfg: &crate::config::UpdateConfig,
-) -> Option<crate::update::ConfiguredToken> {
-    cfg.token_ref
-        .clone()
-        .map(|name| crate::update::ConfiguredToken::new(pool.clone(), name))
-}
-
-/// Render the About page (HTTP 200). `check` / `applied` / `error` carry the
-/// result of a just-run action; all `None` on the plain GET.
-async fn render_about(
-    s: &WebState,
-    check: Option<CheckView>,
-    applied: Option<String>,
-    error: Option<String>,
-) -> Result<Response, WebError> {
-    let cfg = s.api.settings.update_config().await;
+async fn about_page(State(s): State<WebState>) -> Result<Response, WebError> {
     let global_pause = state::global_pause_status(&s.api.pool)
         .await?
         .map(|(a, r)| PauseInfo {
@@ -5316,52 +5215,9 @@ async fn render_about(
     let tpl = AboutTpl {
         version: s.api.version,
         global_pause,
-        activity: activity_view(s).await,
-        train: cfg.train,
-        token_ref_set: cfg.token_ref.is_some(),
-        check,
-        applied,
-        error,
+        activity: activity_view(&s).await,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?).into_response())
-}
-
-async fn about_page(State(s): State<WebState>) -> Result<Response, WebError> {
-    render_about(&s, None, None, None).await
-}
-
-async fn about_check(State(s): State<WebState>) -> Result<Response, WebError> {
-    let cfg = s.api.settings.update_config().await;
-    let train = match crate::update::UpdateTrain::from_config_str(&cfg.train) {
-        Ok(t) => t,
-        Err(e) => return render_about(&s, None, None, Some(e.to_string())).await,
-    };
-    let configured = configured_update_token(&s.api.pool, &cfg);
-    match crate::update::web_check(train, configured).await {
-        Ok(outcome) => render_about(&s, Some(CheckView::from_outcome(&outcome)), None, None).await,
-        Err(e) => {
-            render_about(
-                &s,
-                None,
-                None,
-                Some(format!("Could not reach the registry: {e}")),
-            )
-            .await
-        }
-    }
-}
-
-async fn about_update(State(s): State<WebState>) -> Result<Response, WebError> {
-    let cfg = s.api.settings.update_config().await;
-    let train = match crate::update::UpdateTrain::from_config_str(&cfg.train) {
-        Ok(t) => t,
-        Err(e) => return render_about(&s, None, None, Some(e.to_string())).await,
-    };
-    let configured = configured_update_token(&s.api.pool, &cfg);
-    match crate::update::web_update(train, configured).await {
-        Ok(tag) => render_about(&s, None, Some(tag), None).await,
-        Err(e) => render_about(&s, None, None, Some(e.to_string())).await,
-    }
 }
 
 #[derive(Serialize)]
@@ -10967,13 +10823,9 @@ mod tests {
 
     // ---- About page handlers -----------------------------------------------
     //
-    // The GET renders version + configured train; the check / apply POSTs route
-    // through `crate::update`'s non-interactive cores. Network paths are covered
-    // by `update::tests`; here we cover the page render and the non-network
-    // error path (an invalid configured train surfaces as a rendered message,
-    // not a 500), confirming the handlers never panic the request.
+    // The GET renders the version and the Activity card.
     mod about {
-        use super::super::{about_check, about_page, WebState};
+        use super::super::{about_page, WebState};
         use crate::api::AppState;
         use crate::cancel::RunRegistry;
         use crate::config::Paths;
@@ -11019,18 +10871,16 @@ mod tests {
             String::from_utf8(bytes.to_vec()).unwrap()
         }
 
-        /// The GET renders the build version and the configured (default
-        /// `release`) train, with both update buttons present.
+        /// The GET renders the build version and has no update controls.
         #[tokio::test]
-        async fn get_renders_version_and_train() {
+        async fn get_renders_version_without_update_controls() {
             let s = web_state().await;
             let resp = about_page(State(s)).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = body_string(resp).await;
             assert!(body.contains("9.9.9 (testsha, 2026-06-25)"), "{body}");
-            assert!(body.contains("release"), "{body}");
-            assert!(body.contains("/about/check"), "{body}");
-            assert!(body.contains("/about/update"), "{body}");
+            assert!(!body.contains("/about/check"), "{body}");
+            assert!(!body.contains("/about/update"), "{body}");
         }
 
         /// The Activity card carries the global Pause control and the live
@@ -11091,26 +10941,6 @@ mod tests {
             assert!(body.contains("unknown"), "{body}");
             assert!(body.contains("Do not treat this as idle"), "{body}");
             assert!(!body.contains("Safe to restart"), "{body}");
-        }
-
-        /// An invalid configured train is surfaced as a rendered, non-fatal
-        /// error (HTTP 200), not a 500 - the check never reaches the registry.
-        #[tokio::test]
-        async fn check_with_invalid_train_renders_error() {
-            let s = web_state().await;
-            s.api
-                .settings
-                .save_section(
-                    crate::settings::Section::Update,
-                    "{\"train\":\"nightly\",\"token_ref\":null}",
-                )
-                .await
-                .unwrap();
-            let resp = about_check(State(s)).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-            let body = body_string(resp).await;
-            assert!(body.contains("invalid"), "expected train error: {body}");
-            assert!(body.contains("nightly"), "{body}");
         }
     }
 

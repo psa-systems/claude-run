@@ -13,8 +13,7 @@
 # simultaneously a push to `main` AND the `v*` tag push, so both workflow
 # events fire. With `git describe` as the source of truth, both runs resolved
 # the identical `[vX.Y.Z, latest]` set and raced to write the same destination
-# (a 409 on immutable generic-package files, an overwrite race on the OCI
-# `latest` tag). Trigger-derived modes return DISJOINT tag sets: the tag-push
+# (an overwrite race on the OCI `latest` tag). Trigger-derived modes return DISJOINT tag sets: the tag-push
 # run publishes only `vX.Y.Z`, the branch-push run publishes only `latest`, so
 # the two runs never write the same destination.
 #
