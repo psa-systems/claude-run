@@ -101,7 +101,7 @@ mod tests {
     /// exec bit and fail on any hit.
     ///
     /// Test code only: production code that writes an executable it never execs
-    /// (`update::write_temp`) is a different shape, and directory modes such as
+    /// is a different shape, and directory modes such as
     /// `0o700` in `secrets.rs` are not this hazard at all. A source scan rather
     /// than a runtime check because the defect is a write-then-exec shape, not
     /// an observable behaviour: by the time a test flakes, CI has already gone

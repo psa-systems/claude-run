@@ -128,8 +128,7 @@ login) and `[daemon]` binary overrides (
 `nu_binary`, `claude_binary`) plus `[daemon].claude_config_dir` (CLAUDE-165: where the spawned agent reads its
 user-level `CLAUDE.md` / credentials from; defaults to `<CLAUDE_RUN_CONFIG_DIR>/claude-agent-home`, seeded at serve
 start with the slim bot `CLAUDE.md`, and with a symlink to the host `~/.claude/.credentials.json` when the host has
-one). Everything runtime-tunable, namely issue minting (`[mint]`), the update train (
-`[update]`), the webhook sources (`[webhook]`), and the log filter (`[daemon].log_filter`), now lives in the database
+one). Everything runtime-tunable, namely issue minting (`[mint]`), the webhook sources (`[webhook]`), and the log filter (`[daemon].log_filter`), now lives in the database
 and is edited in the app on the **Settings** page (`/settings`, in the nav next to Dashboard), behind the same auth gate
 as the rest of the web UI. A `config.toml` containing only `[web]` and `[daemon]` binary overrides is a complete, valid
 configuration, and so is an empty one.
@@ -137,12 +136,12 @@ configuration, and so is an empty one.
 Each section is one JSON document validated against the same serde struct the file parser used (`deny_unknown_fields`),
 so an invalid edit is rejected inline with the parser's own error and nothing is persisted. Secret values are never
 shown or stored on the page: fields ending in `_ref` (`auth_token_ref`, a webhook source's `secret_ref` /
-`log_token_ref` / `write_token_ref`, a comment source's `write_token_ref`, `[update].token_ref`) name a credential in
+`log_token_ref` / `write_token_ref`, a comment source's `write_token_ref`) name a credential in
 the Secrets store and are rendered as that name only. Each
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
-secret refs, adding a source), `next event` for mint / update, and `restart` for the webhook
+secret refs, adding a source), `next event` for mint, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
-`GET` / `PUT /api/settings/{mint,update,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,claude,email}`.
+`GET` / `PUT /api/settings/{mint,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,claude,email}`.
 `email` (CLAUDE-394: the SMTP transport an invite is mailed over) is `live`-applied like the Auth logins, and for the
 same reason as Auth gets its own hand-written **Email (SMTP)** card on the Settings page rather than the generic JSON
 editor: a password field needs a real `type="password"` input and "leave blank to keep the current password"

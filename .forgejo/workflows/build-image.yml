@@ -3,10 +3,9 @@
 # CLAUDE-94: publish the runtime image (CLAUDE-37 `runtime` target: daemon +
 # pinned nu/claude/yt/fj toolchain) to the Forgejo OCI registry as
 # `dev.a8n.run/<owner>/claude-run:<tag>` on every push to main / tag, with the
-# trigger-derived tag the binary uses (vX.Y.Z on tags, moving `latest` on
-# main). The image compiles from source via the multi-stage Dockerfile; it is
-# independent of the binary publish (`.forgejo/workflows/build-binary.yml`), so
-# a failure in one never fails the other.
+# trigger-derived tag (vX.Y.Z on tags, moving `latest` on main). The image
+# compiles from source via the multi-stage Dockerfile and is the only published
+# artifact.
 name: Build image
 
 on:

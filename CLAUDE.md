@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # claude-run
 
-YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Forgejo PRs, ...), feed each job to `claude --print`, do something with the result. Shipped as a single Rust binary (`claude-run`) that doubles as a CLI and a long-running daemon with a unix-socket API.
+YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Forgejo PRs, ...), feed each job to `claude --print`, do something with the result. Shipped only as a Docker image around a single Rust binary (`claude-run`) that doubles as a CLI and a long-running daemon with a unix-socket API.
 
 ## Shape
 
-- Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,cancel,pause,resume,status,action,access,secret,migrate,import,version}`.
+- Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,cancel,pause,resume,status,action,access,secret,migrate,import}`.
 - Actions are YAML files under `$CLAUDE_RUN_CONFIG_DIR/actions/` (`/config/actions/` in the container). Each action's `input.command` / `filter` / `pre[]` / `prompt` / `post[]` is a nu snippet shelled out via the host's `nu` binary.
 - Runtime state in SQLite at `$CLAUDE_RUN_DATA_DIR/state.db` by default, or in PostgreSQL when the operator sets one (CLAUDE-250; see the `[database]` note below). Per-attempt stream logs at `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`, bounded by the CLAUDE-245 sweep (see below).
 - Daemon (`claude-run serve`) owns scheduling and exposes an HTTP API over `$CLAUDE_RUN_RUNTIME_DIR/daemon.sock`. CLI subcommands delegate to the daemon when reachable, else operate directly on the DB. The socket is the CLI's control plane and nothing else:
@@ -23,7 +23,7 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 - `just check`: fmt + clippy + build + tests + builder-stage docker compile (the full CI gate). It starts with the CLAUDE.md guard, `just check-claude-md` (CLAUDE-370). `just pre-commit` runs only a fmt-only check inside the builder image via `docker run` (common's default `hook_layout := "pre-push"`); `just pre-push` runs the full suite (fmt, clippy, compile, tests) there.
 - CI's exact steps (`.forgejo/workflows/check.yml`): `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build --all-targets`, then `cargo test` twice: once on SQLite, once with `CLAUDE_RUN_TEST_DATABASE_URL=postgres://...` set, which switches every test fixture onto Postgres (one schema per test). A DB change must pass both.
 - Single test: `cargo test <name_substring>` (e.g. `cargo test shipped_action_queries_are_disjoint`); one module: `cargo test native::youtrack::`. Unit tests live inline in `src/**` under `mod tests` on the library target; `tests/fixtures/` holds data only.
-- `just run <args>` = `cargo run -- <args>` (debug build). `just build-static` builds the musl binary via Docker into `./dist/claude-run`.
+- `just run <args>` = `cargo run -- <args>` (debug build).
 - Any test that execs a stub script must create it with `testutil::write_stub`, never `fs::write` + `set_permissions` (ETXTBSY race across test threads, CLAUDE-224 / CLAUDE-255).
 
 ## Code map

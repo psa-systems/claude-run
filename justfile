@@ -8,9 +8,7 @@
 # claude-run configures the shared recipes through variables wherever common
 # exposes one (per common's blast-radius rule), so the shared implementation
 # stays the single source of truth:
-#   - app: image tags (claude-run:check|local), cargo cache volume names, and
-#     the exported binary name (binary_name defaults to app, which is correct
-#     here: package.name == binary == claude-run).
+#   - app: image tags (claude-run:check|local) and cargo cache volume names.
 #   - pre_commit_mode = "docker" + dev_image: claude-run has no compose.dev.yml
 #     (daemon plus CLI, not a web service), so `pre-commit` and `pre-push` run
 #     their checks in the rust-builder-musl image via `docker run`, not a
@@ -94,12 +92,6 @@ run *args:
 [group: 'dev']
 watch:
     cargo watch --clear
-
-# -- Build --------------------------------------------------------------------
-
-# Build the static musl binary through the Docker builder image (delegates to the inherited build-docker-export). Writes ./dist/claude-run; no host musl target or linker required.
-[group: 'build']
-build-static: build-docker-export
 
 # -- Migrations ---------------------------------------------------------------
 
