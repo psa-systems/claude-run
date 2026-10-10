@@ -4277,6 +4277,79 @@ mod tests {
     }
 
     #[test]
+    fn remote_branch_sha_retries_once_and_succeeds_on_second_attempt() {
+        let args = ["ls-remote", "--heads", "origin", "feature"];
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_once("git", &args, 1, "connect timeout")
+                .ok("git", &args, "deadbeef\trefs/heads/feature\n"),
+        );
+        let b = CliBackend::new(runner.clone()).with_git_retry_waits(NO_WAIT);
+        let sha = b
+            .remote_branch_sha(Path::new("/tmp/wd"), "feature", None)
+            .unwrap();
+        assert_eq!(sha, Some("deadbeef".to_string()));
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn fetch_branch_retries_once_and_succeeds_on_second_attempt() {
+        let args = ["fetch", "origin", "feature"];
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_once("git", &args, 1, "connect timeout")
+                .ok("git", &args, ""),
+        );
+        let b = CliBackend::new(runner.clone()).with_git_retry_waits(NO_WAIT);
+        b.fetch_branch(Path::new("/tmp/wd"), "feature", None)
+            .unwrap();
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn push_branch_retries_once_and_succeeds_on_second_attempt() {
+        let args = ["push", "--set-upstream", "origin", "feature:feature"];
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_once("git", &args, 1, "connect timeout")
+                .ok("git", &args, ""),
+        );
+        let b = CliBackend::new(runner.clone()).with_git_retry_waits(NO_WAIT);
+        b.push_branch(Path::new("/tmp/wd"), "feature", None)
+            .unwrap();
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn push_branch_failing_all_four_attempts_returns_the_last_failure() {
+        let args = ["push", "--set-upstream", "origin", "feature:feature"];
+        let runner = Arc::new(StubRunner::new().fail("git", &args, 1, "connection reset"));
+        let b = CliBackend::new(runner.clone()).with_git_retry_waits(NO_WAIT);
+        let err = b
+            .push_branch(Path::new("/tmp/wd"), "feature", None)
+            .unwrap_err();
+        assert!(err.to_string().contains("connection reset"));
+        assert_eq!(runner.calls.lock().unwrap().len(), 4);
+    }
+
+    /// A rejected non-fast-forward push is a real-divergence signal, never a
+    /// transient blip: it must still fail after exhausting all four attempts,
+    /// and git's own rejection text must still reach the caller unchanged.
+    #[test]
+    fn push_branch_rejected_as_non_fast_forward_fails_after_exhausting_attempts() {
+        let args = ["push", "--set-upstream", "origin", "feature:feature"];
+        let rejection = "! [rejected]        feature -> feature (non-fast-forward)\n\
+             error: failed to push some refs to 'origin'";
+        let runner = Arc::new(StubRunner::new().fail("git", &args, 1, rejection));
+        let b = CliBackend::new(runner.clone()).with_git_retry_waits(NO_WAIT);
+        let err = b
+            .push_branch(Path::new("/tmp/wd"), "feature", None)
+            .unwrap_err();
+        assert!(err.to_string().contains("non-fast-forward"), "{err}");
+        assert_eq!(runner.calls.lock().unwrap().len(), 4);
+    }
+
+    #[test]
     fn read_call_retries_three_times_and_succeeds_on_fourth_attempt() {
         let args = [
             "--host",

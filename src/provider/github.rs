@@ -1495,6 +1495,42 @@ mod tests {
             .ok("git", &push_args, "")
     }
 
+    const NO_WAIT: [std::time::Duration; 3] = [std::time::Duration::ZERO; 3];
+
+    #[test]
+    fn push_retries_once_and_succeeds_on_second_attempt() {
+        let runner = Arc::new(with_git(StubRunner::new(), "feat/x", "origin").fail_once(
+            "git",
+            &["push", "origin", "HEAD:feat/x"],
+            1,
+            "connection reset",
+        ));
+        let transport = Arc::new(StubTransport::new(
+            true,
+            json!({"structuredContent": {"number": 11, "html_url": "https://github.com/octo/widget/pull/11"}}),
+        ));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            transport,
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_git_retry_waits(NO_WAIT);
+        forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        let push_calls = calls
+            .iter()
+            .filter(|c| c.as_str() == "git push origin HEAD:feat/x")
+            .count();
+        assert_eq!(push_calls, 2, "{calls:?}");
+    }
+
     #[test]
     fn is_github_host_matches_dotcom_and_configured_ghe() {
         assert!(is_github_host("github.com", &[]));

@@ -571,6 +571,71 @@ mod tests {
         );
     }
 
+    /// The `ls-remote --symref origin` network call retries a transient
+    /// failure (CLAUDE-396) via a `git remote-ext` helper script that fails
+    /// the first invocation and forwards to `git-upload-pack` on the second,
+    /// so this exercises the real retry path end to end rather than a stub.
+    #[test]
+    fn ls_remote_retries_once_and_succeeds_on_second_attempt() {
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        repo_with_commit(&origin);
+        let clone = base.path().join("clone");
+        git_in(
+            base.path(),
+            &[
+                "clone",
+                "--single-branch",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        set_identity(&clone);
+
+        let log = base.path().join("helper-calls.log");
+        let script = base.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho called >> {log}\nif [ $(wc -l < {log}) -eq 1 ]; then\n  echo 'simulated transient failure' >&2\n  exit 1\nfi\nexec git-upload-pack {origin}\n",
+                log = log.display(),
+                origin = origin.display(),
+            ),
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .output()
+            .unwrap();
+        git_in(
+            &clone,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &format!("ext::sh {}", script.display()),
+            ],
+        );
+
+        // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
+        // widening it, so `file` (used by other tests' local-path remotes
+        // running concurrently) must stay listed alongside `ext`; the lock
+        // keeps this test's set/remove pair from racing another thread's.
+        let _guard = crate::provider::git_allow_protocol_test_lock();
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
+        let work = local_only_work(&clone).unwrap();
+        std::env::remove_var("GIT_ALLOW_PROTOCOL");
+
+        assert!(work.is_clean());
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            2,
+            "ls-remote must have been attempted exactly twice"
+        );
+    }
+
     #[test]
     fn unreachable_remote_preserves() {
         let dir = tempfile::tempdir().unwrap();
