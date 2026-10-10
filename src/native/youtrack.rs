@@ -2538,7 +2538,8 @@ fn salvage_timeout_work(
     }
 
     let host = host_only(&job.repo_host);
-    match forge.create_pr_with_draft(workdir, &host, pr_strategy, true) {
+    let body = draft_pr_body(&job.key);
+    match forge.create_pr_with_draft(workdir, &host, pr_strategy, true, Some(&body)) {
         Ok(pr) => {
             report.pr_url = Some(pr_url(job, &pr));
             if let Some(pr_number) = pr.number {
@@ -2636,6 +2637,28 @@ fn timeout_cost_line(r: &ClaudeResult) -> String {
         Some(cost) => format!("Cost: ${cost} USD"),
         None => "Cost: unknown (the run was killed before it reported one)".to_string(),
     }
+}
+
+/// Runner-written PR body for a timeout-salvaged draft PR (CLAUDE-398): the
+/// tip commit's own body is either an agent commit whose body is just the
+/// bare issue reference or a runner WIP commit with no useful body, so the
+/// draft PR body is written here instead of derived from `git log`. A
+/// re-queued run that finishes replaces this description (see `finalize`'s
+/// resumed-refresh path); until then this is what a human sees on the PR.
+fn draft_pr_body(key: &str) -> String {
+    [
+        "## Summary".to_string(),
+        String::new(),
+        format!(
+            "This draft PR was opened by the runner from a run of {key} that hit its time limit."
+        ),
+        "The branch holds the work committed so far; it may be incomplete.".to_string(),
+        "The first comment on this PR has the timeout limit, the run's cost, and the agent's last summary at kill time.".to_string(),
+        "A re-queued run that finishes replaces this description with the agent's own.".to_string(),
+        String::new(),
+        format!("#{key}"),
+    ]
+    .join("\n")
 }
 
 /// PR comment explaining why a timeout-salvaged draft PR (CLAUDE-379) exists:
@@ -6010,6 +6033,151 @@ mod tests {
                 .iter()
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
             "{calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "git log -1 --format=%b feat/x"),
+            "the runner-written draft body must not be derived from the tip commit's own body: {calls:?}"
+        );
+        let _ = std::fs::remove_file(&scratch);
+    }
+
+    #[test]
+    fn finalize_timeout_salvage_draft_body_ignores_a_runner_wip_tip_body_too() {
+        // Same shape as the test above, but the tip is the runner's own
+        // `WIP: uncommitted changes at timeout` commit rather than a
+        // pre-existing agent commit. Either way the draft PR body is the
+        // runner-written one (CLAUDE-398), never derived from `git log`.
+        let base = tempfile::tempdir().unwrap();
+        let clone = dirty_single_branch_clone(base.path());
+        let git_dir = clone.join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let scratch = std::env::temp_dir().join("claude-run-timeout-pr-comment-MK-16.md");
+        let _ = std::fs::remove_file(&scratch);
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%s", "feat/x"],
+                    "WIP: uncommitted changes at timeout\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: uncommitted changes at timeout",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":9,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/9"}"#,
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "contoso/claude-run#9",
+                        "--body-file",
+                        scratch.to_string_lossy().as_ref(),
+                    ],
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            &clone,
+            &timed_out_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::TimedOut {
+                pr_number: Some(9),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("WIP: uncommitted changes at timeout")
+                    && !c.contains("WIP: WIP:")),
+            "a tip already carrying the WIP: prefix must not be double-prefixed: {calls:?}"
         );
         let _ = std::fs::remove_file(&scratch);
     }
