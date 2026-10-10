@@ -479,6 +479,31 @@ pub async fn test_pg_pool() -> Option<DbPool> {
     Some(test_pg_pool_at(&url).await)
 }
 
+/// Fails when `schema` already holds `_sqlx_migrations`: that means the
+/// target is a database someone has already migrated (the live runner
+/// database, or a stale leftover), not a disposable schema a test fixture
+/// just created. Schema-qualified so the connection's `search_path` does not
+/// matter.
+#[cfg(test)]
+async fn refuse_live_database(pool: &DbPool, schema: &str) -> anyhow::Result<()> {
+    let regclass = format!("{schema}._sqlx_migrations");
+    let already_migrated: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+        .bind(&regclass)
+        .fetch_one(pool)
+        .await?;
+    if already_migrated.is_some() {
+        let database: String = sqlx::query_scalar("SELECT current_database()::text")
+            .fetch_one(pool)
+            .await?;
+        anyhow::bail!(
+            "{database} already has `_sqlx_migrations`: this is a live runner database, not a \
+             disposable test server. Point CLAUDE_RUN_TEST_DATABASE_URL at a disposable Postgres \
+             instead."
+        );
+    }
+    Ok(())
+}
+
 /// A Postgres pool whose every connection sees only a schema of its own, so
 /// `cargo test`'s parallel tests do not share tables. Nothing is dropped: the
 /// server this points at is a disposable CI service container.
@@ -505,6 +530,9 @@ async fn test_pg_pool_at(url: &str) -> DbPool {
         .connect(url)
         .await
         .expect("connect to CLAUDE_RUN_TEST_DATABASE_URL");
+    refuse_live_database(&pool, "public")
+        .await
+        .expect("refuse a live runner database");
     pool.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
         .await
         .expect("create the test schema");
@@ -739,5 +767,42 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pg_indexes, lite_indexes);
+    }
+
+    #[tokio::test]
+    async fn refuse_live_database_flags_a_schema_that_already_has_sqlx_migrations() {
+        let pool = skip_without_postgres!();
+        let migrated_schema = format!("cr_test_guard_migrated_{}", std::process::id());
+        pool.execute(&*format!("CREATE SCHEMA {migrated_schema}"))
+            .await
+            .unwrap();
+        pool.execute(&*format!(
+            "CREATE TABLE {migrated_schema}._sqlx_migrations (version bigint)"
+        ))
+        .await
+        .unwrap();
+
+        let err = refuse_live_database(&pool, &migrated_schema)
+            .await
+            .expect_err("a schema with _sqlx_migrations must be refused");
+        let database: String = sqlx::query_scalar("SELECT current_database()::text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(err.to_string().contains(&database), "{err}");
+        pool.execute(&*format!("DROP SCHEMA {migrated_schema} CASCADE"))
+            .await
+            .unwrap();
+
+        let empty_schema = format!("cr_test_guard_empty_{}", std::process::id());
+        pool.execute(&*format!("CREATE SCHEMA {empty_schema}"))
+            .await
+            .unwrap();
+        refuse_live_database(&pool, &empty_schema)
+            .await
+            .expect("a schema without _sqlx_migrations is not refused");
+        pool.execute(&*format!("DROP SCHEMA {empty_schema} CASCADE"))
+            .await
+            .unwrap();
     }
 }

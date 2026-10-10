@@ -33,6 +33,18 @@ use crate::cancel::CancellationToken;
 use crate::config::ClaudeConfigHandle;
 use crate::error::Result;
 
+/// Strip the live runner database URL out of the `claude` child's
+/// environment. The daemon's own environment carries
+/// `CLAUDE_RUN_DATABASE_URL` / `CLAUDE_RUN_DATABASE_URL_FILE`, and `Command`
+/// otherwise inherits it unchanged: an agent session that runs `env` would
+/// see the runner's own database credentials. This is hygiene, not a
+/// security boundary (the `_FILE` path stays readable by the same Unix user);
+/// the enforcement is the live-database guard in `src/db.rs`.
+fn strip_database_url_env(command: &mut Command) {
+    command.env_remove("CLAUDE_RUN_DATABASE_URL");
+    command.env_remove("CLAUDE_RUN_DATABASE_URL_FILE");
+}
+
 /// Grace window the claude process group gets after SIGTERM, before the
 /// canceller escalates to SIGKILL.
 const CANCEL_GRACE: Duration = Duration::from_millis(2000);
@@ -369,6 +381,7 @@ impl ClaudeInvoker {
             .stderr(Stdio::from(log_err))
             .process_group(0)
             .env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
+        strip_database_url_env(&mut command);
         // Point the agent at its dedicated user-level config dir
         // (slim bot CLAUDE.md + linked host credentials). HOME is left inherited.
         if let Some(dir) = &self.config_dir {
@@ -2097,6 +2110,36 @@ exit "$code"
             env.trim(),
             "BG=1",
             "background tasks must be disabled via the env var, got:\n{env}"
+        );
+    }
+
+    /// `strip_database_url_env` must mark both database-url variables
+    /// removed (so a removed inherited value does not leak through), while
+    /// leaving everything else on the `Command` untouched.
+    #[test]
+    fn strip_database_url_env_removes_both_database_url_vars() {
+        let mut command = Command::new("true");
+        command
+            .env("CLAUDE_RUN_DATABASE_URL", "postgres://live/db")
+            .env("CLAUDE_RUN_DATABASE_URL_FILE", "/run/secrets/db-url")
+            .env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
+        strip_database_url_env(&mut command);
+
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CLAUDE_RUN_DATABASE_URL")),
+            Some(&None),
+            "CLAUDE_RUN_DATABASE_URL must be marked removed"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CLAUDE_RUN_DATABASE_URL_FILE")),
+            Some(&None),
+            "CLAUDE_RUN_DATABASE_URL_FILE must be marked removed"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS")),
+            Some(&Some(std::ffi::OsStr::new("1"))),
+            "unrelated env vars must be left alone"
         );
     }
 
