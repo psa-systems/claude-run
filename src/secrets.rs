@@ -1107,7 +1107,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_ref_resolves_to_decrypted_secret() {
-        // CLAUDE-55: a `[update].token_ref` names a secret; resolving it decrypts
+        // CLAUDE-55: a `token_ref` names a secret; resolving it decrypts
         // the stored ciphertext under the loaded age key and returns the token.
         let tmp = tempfile::tempdir().unwrap();
         let key = SecretsKey::load_from_file(&write_key(tmp.path())).unwrap();

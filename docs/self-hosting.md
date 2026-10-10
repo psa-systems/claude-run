@@ -30,9 +30,8 @@ the ids the earlier Alpine-based image used) with `$HOME=/home/claudebot`, which
 the operator cares about lives on the three flat volumes below.
 
 **Published image (CLAUDE-88).** CI publishes the runtime image to the Forgejo OCI registry on every push to main (
-`:latest`) and every release tag (`:vX.Y.Z`), the same tag set as the binary's Generic Package. The image publish runs
-in its own workflow, `.forgejo/workflows/build-image.yml` (split out of `build-binary.yml` in CLAUDE-94), so the binary
-and image publish independently. Both are published under the private `psa-systems-private` package owner, so pulling
+`:latest`) and every release tag (`:vX.Y.Z`), the only published artifact. The image publish runs
+in its own workflow, `.forgejo/workflows/build-image.yml`. It is published under the private `psa-systems-private` package owner, so pulling
 needs a one-time login with a Forgejo PAT that can read it:
 
 ```nu
@@ -41,7 +40,7 @@ docker pull dev.a8n.run/psa-systems-private/claude-run:latest
 ```
 
 Pin `:vX.Y.Z` in production; `:latest` tracks main. Container deployments update by pulling a newer tag and recreating
-the service; the binary's `claude-run version update` self-update does not apply inside a container:
+the service:
 
 ```nu
 docker compose pull
@@ -129,7 +128,7 @@ docker compose restart
 
 To use an API key instead of an interactive Claude login, set `ANTHROPIC_API_KEY` in the service `environment:` and skip `claude auth login`. Nothing else changes: since CLAUDE-247 the daemon no longer requires a credentials file to start.
 
-**Secrets.** The store itself (web auth token, webhook HMACs, registry token refs) lives encrypted in the state store,
+**Secrets.** The store itself (web auth token, webhook HMACs, token refs) lives encrypted in the state store,
 `state.db` on the data volume or the `secrets` table on a PostgreSQL backend. The age identity that decrypts it needs no
 injection: the daemon generates it at `/config/secrets.key` (mode `0600`) on the `claude-bot-config` volume the first
 time it starts without one, so there is no `age-keygen` step before first start and the shipped `compose.yml` declares

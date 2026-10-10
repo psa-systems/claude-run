@@ -8,7 +8,7 @@
 //! file-parser's validation (`deny_unknown_fields`), and the web Settings page
 //! and the `/api/settings/<section>` JSON endpoints share this one path.
 //!
-//! Four of them were MOVED out of `config.toml` (`[mint]`, `[update]`,
+//! Three of them were MOVED out of `config.toml` (`[mint]`,
 //! `[webhook]`, `[daemon].log_filter`); the rest are DB-only from birth and have
 //! no import path at all. `config.toml` keeps only bootstrap keys (`[web]`,
 //! `[daemon]` binary overrides). On serve start [`migrate_config_file`] imports
@@ -20,8 +20,8 @@
 //! [`LiveSettings`] holds the runtime copy behind `RwLock`s shared with the
 //! webhook listener, the webhook consumer, and the mint context, so a save
 //! applies live: the log filter swaps through the tracing reload handle, the
-//! webhook source map + rate limiters are rebuilt, and mint/update reads see the
-//! new value on the next event / invocation. `replay_window_secs` applies on
+//! webhook source map + rate limiters are rebuilt, and mint reads see the
+//! new value on the next event. `replay_window_secs` applies on
 //! restart only (the replay store is built once at start).
 
 use std::collections::{BTreeMap, HashMap};
@@ -34,8 +34,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::config::{
     AuthConfig, ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig, CommentWebhookSource,
     ConcurrencyConfig, DbRetentionConfig, EmailConfig, MintConfig, OnDiskConfig, Paths,
-    PreferencesConfig, StreamLogGcConfig, UpdateConfig, WebhookConfig, WebhookSource,
-    WorkdirGcConfig,
+    PreferencesConfig, StreamLogGcConfig, WebhookConfig, WebhookSource, WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -45,7 +44,6 @@ use crate::web::webhooks::{build_rate_map, rate_map_from, RateLimiter};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Mint,
-    Update,
     Webhook,
     LogFilter,
     /// Preserved / aside workdir GC retention windows.
@@ -78,9 +76,8 @@ pub enum Section {
 
 impl Section {
     /// Every section, in display order (used by the Settings page).
-    pub const ALL: [Section; 13] = [
+    pub const ALL: [Section; 12] = [
         Section::Mint,
-        Section::Update,
         Section::Webhook,
         Section::WebhookComment,
         Section::LogFilter,
@@ -98,7 +95,6 @@ impl Section {
     pub fn key(self) -> &'static str {
         match self {
             Section::Mint => "config.mint",
-            Section::Update => "config.update",
             Section::Webhook => "config.webhook",
             Section::LogFilter => "config.log_filter",
             Section::WorkdirGc => "config.workdir_gc",
@@ -117,7 +113,6 @@ impl Section {
     pub fn as_path(self) -> &'static str {
         match self {
             Section::Mint => "mint",
-            Section::Update => "update",
             Section::Webhook => "webhook",
             Section::LogFilter => "log_filter",
             Section::WorkdirGc => "workdir_gc",
@@ -141,7 +136,6 @@ impl Section {
     pub fn title(self) -> &'static str {
         match self {
             Section::Mint => "Issue minting",
-            Section::Update => "Update train",
             Section::Webhook => "Webhook sources",
             Section::LogFilter => "Log filter",
             Section::WorkdirGc => "Workdir GC",
@@ -159,7 +153,7 @@ impl Section {
     /// Apply semantics badge shown next to the section heading.
     pub fn apply_badge(self) -> &'static str {
         match self {
-            Section::Mint | Section::Update => "next event",
+            Section::Mint => "next event",
             Section::Webhook => "live (replay window: restart)",
             Section::LogFilter => "live",
             Section::WorkdirGc | Section::StreamLogGc => "next sweep",
@@ -348,7 +342,6 @@ pub async fn set_json<T: Serialize>(pool: &DbPool, key: &str, value: &T) -> Resu
 #[derive(Debug, Clone, Default)]
 pub struct EffectiveRuntime {
     pub mint: MintConfig,
-    pub update: UpdateConfig,
     pub webhook: WebhookConfig,
     pub log_filter: Option<String>,
     /// Preserved / aside workdir GC windows. Brand-new section (never
@@ -391,9 +384,6 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
     let mint = get_json::<MintConfig>(pool, Section::Mint.key())
         .await?
         .unwrap_or_else(|| file.mint.clone());
-    let update = get_json::<UpdateConfig>(pool, Section::Update.key())
-        .await?
-        .unwrap_or_else(|| file.update.clone());
     let webhook = get_json::<WebhookConfig>(pool, Section::Webhook.key())
         .await?
         .unwrap_or_else(|| file.webhook.clone());
@@ -430,7 +420,6 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
         .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
-        update,
         webhook,
         log_filter,
         workdir_gc,
@@ -473,14 +462,6 @@ pub fn validate_db_retention(cfg: &DbRetentionConfig) -> std::result::Result<(),
     Ok(())
 }
 
-/// Resolve the effective [`UpdateConfig`] for a CLI `version` invocation: the DB
-/// value when present, else the file value (`[update]`), else the default.
-pub async fn effective_update(pool: &DbPool, file: &OnDiskConfig) -> Result<UpdateConfig> {
-    Ok(get_json::<UpdateConfig>(pool, Section::Update.key())
-        .await?
-        .unwrap_or_else(|| file.update.clone()))
-}
-
 /// Resolve the effective [`WebhookConfig`] for a consumer that holds
 /// no parsed `config.toml` (the native CI-failure handlers, which reach the
 /// webhook sources only for their per-repo log-token fallback). Same order as
@@ -520,10 +501,6 @@ pub async fn migrate_config_file(pool: &DbPool, paths: &Paths) -> Result<()> {
 
     if let Some(v) = doc.get("mint") {
         import_or_error::<MintConfig>(pool, Section::Mint, "[mint]", v.clone(), &path).await?;
-    }
-    if let Some(v) = doc.get("update") {
-        import_or_error::<UpdateConfig>(pool, Section::Update, "[update]", v.clone(), &path)
-            .await?;
     }
     if let Some(v) = doc.get("webhook") {
         import_or_error::<WebhookConfig>(pool, Section::Webhook, "[webhook]", v.clone(), &path)
@@ -644,7 +621,6 @@ impl From<crate::error::Error> for SaveError {
 pub struct LiveSettings {
     pool: DbPool,
     mint: Arc<RwLock<MintConfig>>,
-    update: Arc<RwLock<UpdateConfig>>,
     webhook: Arc<RwLock<WebhookConfig>>,
     webhook_rate: Arc<RwLock<HashMap<String, Mutex<RateLimiter>>>>,
     log_filter: Arc<RwLock<Option<String>>>,
@@ -684,7 +660,6 @@ impl LiveSettings {
         let s = Self {
             pool,
             mint: Arc::new(RwLock::new(eff.mint)),
-            update: Arc::new(RwLock::new(eff.update)),
             webhook: Arc::new(RwLock::new(eff.webhook)),
             webhook_rate: Arc::new(RwLock::new(webhook_rate)),
             log_filter: Arc::new(RwLock::new(eff.log_filter.clone())),
@@ -796,18 +771,11 @@ impl LiveSettings {
         self.claude.clone()
     }
 
-    /// A snapshot of the live update config (train + token_ref), read
-    /// by the About page handlers to drive the on-demand check / apply.
-    pub async fn update_config(&self) -> UpdateConfig {
-        self.update.read().await.clone()
-    }
-
     /// Current value of `section` as a pretty JSON document (secrets appear as
     /// their `*_ref` names only - no secret material is stored or rendered).
     pub async fn section_json(&self, section: Section) -> String {
         match section {
             Section::Mint => to_pretty(&*self.mint.read().await),
-            Section::Update => to_pretty(&*self.update.read().await),
             Section::Webhook => to_pretty(&*self.webhook.read().await),
             Section::LogFilter => to_pretty(&LogFilterDoc {
                 filter: self.log_filter.read().await.clone(),
@@ -837,11 +805,6 @@ impl LiveSettings {
                 let v: MintConfig = parse(json)?;
                 set_json(&self.pool, section.key(), &v).await?;
                 *self.mint.write().await = v;
-            }
-            Section::Update => {
-                let v: UpdateConfig = parse(json)?;
-                set_json(&self.pool, section.key(), &v).await?;
-                *self.update.write().await = v;
             }
             Section::Webhook => {
                 let v: WebhookConfig = parse(json)?;
@@ -1168,7 +1131,6 @@ mod tests {
     fn eff_default() -> EffectiveRuntime {
         EffectiveRuntime {
             mint: MintConfig::default(),
-            update: UpdateConfig::default(),
             webhook: WebhookConfig::default(),
             log_filter: None,
             workdir_gc: WorkdirGcConfig::default(),
@@ -1186,20 +1148,17 @@ mod tests {
     #[tokio::test]
     async fn json_store_round_trips() {
         let pool = pool().await;
-        assert!(get_json::<UpdateConfig>(&pool, Section::Update.key())
+        assert!(get_json::<MintConfig>(&pool, Section::Mint.key())
             .await
             .unwrap()
             .is_none());
-        let u = UpdateConfig {
-            train: "latest".to_string(),
+        let m = MintConfig {
+            fallback_project: "FJ".to_string(),
             ..Default::default()
         };
-        set_json(&pool, Section::Update.key(), &u).await.unwrap();
-        let got: UpdateConfig = get_json(&pool, Section::Update.key())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.train, "latest");
+        set_json(&pool, Section::Mint.key(), &m).await.unwrap();
+        let got: MintConfig = get_json(&pool, Section::Mint.key()).await.unwrap().unwrap();
+        assert_eq!(got.fallback_project, "FJ");
     }
 
     #[tokio::test]
@@ -1208,31 +1167,28 @@ mod tests {
         let live = LiveSettings::new(pool.clone(), eff_default(), None);
 
         // Valid payload persists and is visible in the snapshot.
-        live.save_section(Section::Update, r#"{"train":"latest"}"#)
+        live.save_section(Section::Mint, r#"{"fallback_project":"FJ"}"#)
             .await
             .unwrap();
-        let stored: UpdateConfig = get_json(&pool, Section::Update.key())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.train, "latest");
-        assert_eq!(live.update.read().await.train, "latest");
+        let stored: MintConfig = get_json(&pool, Section::Mint.key()).await.unwrap().unwrap();
+        assert_eq!(stored.fallback_project, "FJ");
+        assert_eq!(live.mint_handle().read().await.fallback_project, "FJ");
 
         // Invalid payload (unknown field, deny_unknown_fields) is rejected with
         // the serde message and persists nothing new.
         let err = live
-            .save_section(Section::Update, r#"{"train":"latest","bogus":1}"#)
+            .save_section(Section::Mint, r#"{"fallback_project":"FJ","bogus":1}"#)
             .await
             .expect_err("unknown field must reject");
         match err {
             SaveError::Invalid(m) => assert!(m.contains("bogus") || m.contains("unknown")),
             other => panic!("expected Invalid, got {other}"),
         }
-        let stored: UpdateConfig = get_json(&pool, Section::Update.key())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.train, "latest", "rejected save must not overwrite");
+        let stored: MintConfig = get_json(&pool, Section::Mint.key()).await.unwrap().unwrap();
+        assert_eq!(
+            stored.fallback_project, "FJ",
+            "rejected save must not overwrite"
+        );
     }
 
     #[tokio::test]
@@ -1398,23 +1354,44 @@ mod tests {
         let paths = paths_in(tmp.path());
         std::fs::write(
             paths.config_file(),
-            "[web]\nbind = \"127.0.0.1\"\n\n[update]\ntrain = \"latest\"\n",
+            "[web]\nbind = \"127.0.0.1\"\n\n[mint]\nfallback_project = \"FJ\"\n",
         )
         .unwrap();
 
         // First start: DB empty + file section present -> import.
         migrate_config_file(&pool, &paths).await.unwrap();
-        let stored: UpdateConfig = get_json(&pool, Section::Update.key())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.train, "latest");
+        let stored: MintConfig = get_json(&pool, Section::Mint.key()).await.unwrap().unwrap();
+        assert_eq!(stored.fallback_project, "FJ");
 
         // Second start: DB has it AND the file still defines it -> refuse.
         let err = migrate_config_file(&pool, &paths)
             .await
             .expect_err("both sources present must error");
-        assert!(err.to_string().contains("[update]"), "{err}");
+        assert!(err.to_string().contains("[mint]"), "{err}");
+    }
+
+    /// The migration that retired the `update` section deletes its orphaned
+    /// settings row and leaves every other row alone.
+    #[tokio::test]
+    async fn retired_update_setting_migration_deletes_only_that_row() {
+        let pool = pool().await;
+        set_raw(&pool, "config.update", r#"{"train":"latest"}"#)
+            .await
+            .unwrap();
+        set_raw(&pool, Section::Mint.key(), r#"{"fallback_project":"FJ"}"#)
+            .await
+            .unwrap();
+        let sql = match crate::db::dialect(&pool) {
+            crate::db::Dialect::Sqlite => {
+                include_str!("../migrations/sqlite/0027_drop_update_setting.sql")
+            }
+            crate::db::Dialect::Postgres => {
+                include_str!("../migrations/postgres/0008_drop_update_setting.sql")
+            }
+        };
+        sqlx::query(sql).execute(&pool).await.unwrap();
+        assert!(get_raw(&pool, "config.update").await.unwrap().is_none());
+        assert!(get_raw(&pool, Section::Mint.key()).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1429,10 +1406,6 @@ mod tests {
         )
         .unwrap();
         migrate_config_file(&pool, &paths).await.unwrap();
-        assert!(get_raw(&pool, Section::Update.key())
-            .await
-            .unwrap()
-            .is_none());
         assert!(get_raw(&pool, Section::Mint.key()).await.unwrap().is_none());
     }
 
