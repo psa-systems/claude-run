@@ -4847,6 +4847,7 @@ mod tests {
                     &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
                 .ok(
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
@@ -5354,6 +5355,7 @@ mod tests {
                 )
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .fail(
                     "git",
                     &["push", "--set-upstream", "origin", "feat/x:feat/x"],
@@ -5594,6 +5596,7 @@ mod tests {
                     &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
                 .ok(
                     "yt",
                     &[
@@ -6419,6 +6422,7 @@ mod tests {
                     &["ls-remote", "--heads", "origin", "feat/x"],
                     "remotesha\trefs/heads/feat/x\n",
                 )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .ok("git", &["fetch", "origin", "feat/x"], "")
                 .fail(
                     "git",
@@ -6564,6 +6568,7 @@ mod tests {
                     &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
                 .ok(
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],

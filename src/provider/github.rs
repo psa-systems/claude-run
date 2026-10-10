@@ -467,6 +467,9 @@ impl GithubForge {
         let title = self.git(workdir, &["log", "-1", "--pretty=format:%s"])?;
         let body = self.git(workdir, &["log", "-1", "--pretty=format:%b"])?;
 
+        // The subject guard (CLAUDE-398) runs before any push.
+        crate::provider::validate_pr_subject(&title, &branch)?;
+
         self.push(workdir, host, &repo, &branch)?;
 
         // Walk [Mcp, Gh]: prefer the remote MCP, fall back to `gh`.
@@ -1481,6 +1484,41 @@ mod tests {
             .ok("git", &["log", "-1", "--pretty=format:%s"], "feat: x")
             .ok("git", &["log", "-1", "--pretty=format:%b"], "body text")
             .ok("git", &push_args, "")
+    }
+
+    #[test]
+    fn create_pr_refuses_a_template_heading_subject_before_any_push() {
+        // CLAUDE-398: GitHub's create path must reject a tip subject that is
+        // a template heading before pushing.
+        let runner = Arc::new(
+            with_git(
+                StubRunner::new(),
+                "feat/x",
+                "https://github.com/octo/widget.git",
+            )
+            .ok("git", &["log", "-1", "--pretty=format:%s"], "## Summary"),
+        );
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        let err = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("## Summary"), "{err}");
+        assert!(err.contains("feat/x"), "{err}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "no push before the subject guard runs: {calls:?}"
+        );
     }
 
     #[test]

@@ -835,6 +835,11 @@ impl CliBackend {
         branch: &str,
         draft: bool,
     ) -> Result<PullRequest> {
+        // The subject guard (CLAUDE-398) runs before anything else here: a
+        // tip whose subject is a template heading or a bare issue reference
+        // must refuse before any push or PR-create call is made.
+        crate::provider::validate_pr_subject(&self.tip_subject(workdir, branch)?, branch)?;
+
         // Repo path (`owner/repo`) for the open-PR lookup, derived from the
         // workdir's `origin` remote (the form `list_open_prs` expects).
         let repo = self.origin_repo_path(workdir)?;
@@ -906,6 +911,14 @@ impl CliBackend {
                 url.trim()
             ))
         })
+    }
+
+    /// The one-line subject of a revision's tip commit (`git log -1
+    /// --format=%s`), read for the [`validate_pr_subject`] guard (CLAUDE-398).
+    fn tip_subject(&self, workdir: &Path, rev: &str) -> Result<String> {
+        let args = ["log", "-1", "--format=%s", rev];
+        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        Ok(Self::checked("git", out, &args)?.trim().to_string())
     }
 
     /// The commit SHA a git revision (e.g. a branch name) resolves to
@@ -1106,11 +1119,7 @@ impl CliBackend {
         // title-prefix convention regardless of the tip commit's own subject,
         // so the draft status holds even when the tip is a pre-existing agent
         // commit rather than the salvage's own `WIP: ...` commit.
-        let title_args = ["log", "-1", "--format=%s", branch];
-        let out = self
-            .runner
-            .run_in_env(Some(workdir), "git", &title_args, &[])?;
-        let mut title = Self::checked("git", out, &title_args)?.trim().to_string();
+        let mut title = self.tip_subject(workdir, branch)?;
         if draft && !title.starts_with("WIP: ") {
             title = format!("WIP: {title}");
         }
@@ -1222,6 +1231,10 @@ impl CliBackend {
     /// succeeded here (`-aA` pushes the base tip and autofills from an unrelated
     /// commit), and the issue was moved to `AI Agent = Code Review`.
     fn create_pr_agit(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
+        // The subject guard (CLAUDE-398) runs before `fj` pushes anything.
+        let subject = self.tip_subject(workdir, "HEAD")?;
+        crate::provider::validate_pr_subject(&subject, "HEAD")?;
+
         let args = ["--host", host, "pr", "create", "-aA", "--json"];
         let stdout = self
             .runner
@@ -2888,11 +2901,13 @@ mod tests {
         // With exactly one branch ahead of base the guard passes and
         // the AGit call is unchanged.
         let runner = Arc::new(with_branch_resolution(
-            StubRunner::new().ok(
-                "fj",
-                &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
-                r#"{"number":42,"html_url":"https://dev.a8n.run/n/c/pulls/42"}"#,
-            ),
+            StubRunner::new()
+                .ok(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+                    r#"{"number":42,"html_url":"https://dev.a8n.run/n/c/pulls/42"}"#,
+                )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n"),
             "origin/main",
             &["main", "fix/x"],
             &[("fix/x", "aaa\n")],
@@ -3108,6 +3123,64 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains("-aA")),
             "branch strategy must never invoke -aA: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_refuses_a_template_heading_subject_before_any_push() {
+        // CLAUDE-398: the branch strategy must reject a tip subject that is a
+        // template heading before pushing anything or calling `fj`.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = runner.ok(
+            "git",
+            &["log", "-1", "--format=%s", "feat/x"],
+            "## Summary\n",
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let err = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("feat/x"), "{err}");
+        assert!(err.contains("## Summary"), "{err}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "no push before the subject guard runs: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("fj ")),
+            "no fj call before the subject guard runs: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_agit_refuses_a_bare_issue_reference_subject_before_fj_runs() {
+        // CLAUDE-398: the AGit strategy must reject a tip subject that is a
+        // bare issue reference before invoking `fj`.
+        let runner = Arc::new(with_branch_resolution(
+            StubRunner::new().ok("git", &["log", "-1", "--format=%s", "HEAD"], "#MK-16\n"),
+            "origin/main",
+            &["main", "fix/x"],
+            &[("fix/x", "aaa\n")],
+        ));
+        let b = CliBackend::new(runner.clone());
+        let err = b
+            .create_pr(Path::new("/tmp/wd"), "dev.a8n.run", PrStrategy::Agit)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("#MK-16"), "{err}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("fj ")),
+            "no fj call before the subject guard runs: {calls:?}"
         );
     }
 
@@ -3504,12 +3577,16 @@ mod tests {
             &[("feat/x", "abc\n")],
         );
         // Remote branch absent, so the push is attempted (and fails).
-        let runner = Arc::new(with_remote_state(runner, "feat/x", "abc", "").fail(
-            "git",
-            &["push", "--set-upstream", "origin", "feat/x:feat/x"],
-            128,
-            "could not read Username",
-        ));
+        let runner = Arc::new(
+            with_remote_state(runner, "feat/x", "abc", "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "could not read Username",
+                ),
+        );
         let b = CliBackend::new(runner.clone());
         match b
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
@@ -3564,7 +3641,8 @@ mod tests {
             &["main", "feat/x"],
             &[("feat/x", "abc123\n")],
         );
-        let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n");
+        let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n")
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
         let runner = Arc::new(with_open_pr_search(
             runner,
             r#"[{"number":88,"head_ref":"feat/x","html_url":"https://dev.a8n.run/n/c/pulls/88"}]"#,
@@ -3725,6 +3803,11 @@ mod tests {
                 "feat/yotun-96:feat/yotun-96",
             ],
             "",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%s", "feat/yotun-96"],
+            "feat: yotun\n",
         );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
@@ -3791,7 +3874,8 @@ mod tests {
                 1,
                 "CONFLICT (content): Merge conflict in src/lib.rs",
             )
-            .ok("git", &["merge", "--abort"], "");
+            .ok("git", &["merge", "--abort"], "")
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b
@@ -4726,7 +4810,8 @@ mod tests {
                     "fj",
                     &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/n/c/pulls/7"}"#,
-                ),
+                )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n"),
             "origin/main",
             &["main", "fix/x"],
             &[("fix/x", "aaa\n")],
@@ -4953,7 +5038,8 @@ mod tests {
                     "git",
                     &["remote", "get-url", "origin"],
                     "https://dev.a8n.run/contoso/gadgets.git",
-                ),
+                )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n"),
             "origin/main",
             &["main", "fix/x"],
             &[("fix/x", "aaa\n")],
