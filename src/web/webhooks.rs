@@ -937,10 +937,15 @@ async fn process_event(
 
         // Open a run row for every consumed event (user decision:
         // full observability including skips) so the web UI surfaces webhook
-        // activity. `run_id` is `None` only if `run_begin` itself failed; the
-        // pipeline still runs, it just goes unrecorded.
+        // activity. `run` is `None` only if `run_begin` itself failed; the
+        // pipeline still runs, it just goes unrecorded. `run_id` is split out
+        // as its own `Copy` value for the bookkeeping calls below; `run` itself
+        // (carrying the `RunGuard`) is threaded to whichever `finish_webhook_run`
+        // call below actually closes the row, so a panic between here and there
+        // still closes it as `exit::UNEXPECTED` on drop (CLAUDE-402).
         let job_key = format!("{}#{}", ev.repo, ev.index_in_repo);
-        let run_id = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
+        let run = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
+        let run_id = run.as_ref().map(|(id, _)| *id);
 
         // Forgejo fires `action_run_failure` for every non-success
         // done status (`failure`, `cancelled`, `skipped`; bare `else` in
@@ -962,7 +967,7 @@ async fn process_event(
                 "run status is '{}', not 'failure'; log fetch and triage skipped; no issue",
                 ev.status
             );
-            finish_webhook_run(&pool, run_id, &job_key, &summary, true, None, None).await;
+            finish_webhook_run(&pool, run, &job_key, &summary, true, None, None).await;
             return;
         }
 
@@ -982,7 +987,7 @@ async fn process_event(
             warn!(repo = %ev.repo, html_url = %ev.html_url, "could not derive forge host from html_url; skipping log fetch");
             finish_webhook_run(
                 &pool,
-                run_id,
+                run,
                 &job_key,
                 "could not derive forge host from html_url; log fetch skipped",
                 false,
@@ -1134,7 +1139,7 @@ async fn process_event(
                 );
                 finish_webhook_run(
                     &pool,
-                    run_id,
+                    run,
                     &job_key,
                     &summary,
                     true,
@@ -1162,7 +1167,7 @@ async fn process_event(
             };
             finish_webhook_run(
                 &pool,
-                run_id,
+                run,
                 &job_key,
                 summary,
                 true,
@@ -1217,7 +1222,7 @@ async fn process_event(
         }
         finish_webhook_run(
             &pool,
-            run_id,
+            run,
             &job_key,
             &result.text,
             result.ok,
@@ -1276,9 +1281,13 @@ async fn source_log_token(
 /// run-detail badge reads `running`, not `queued`, for the whole pipeline) and
 /// sets the initial stage. Stores the event's `html_url` as the
 /// job's outbound link so the run-detail tables link the key straight to the
-/// Forgejo Actions run. Returns the run id, or `None` when `run_begin` failed
-/// (the pipeline still runs, just unrecorded). Failures are logged, not
-/// propagated: a DB hiccup must never strand the event consumer.
+/// Forgejo Actions run. Returns the run id together with its [`state::RunGuard`],
+/// or `None` when `run_begin` failed (the pipeline still runs, just
+/// unrecorded). Failures are logged, not propagated: a DB hiccup must never
+/// strand the event consumer. The guard must be finished (or simply dropped)
+/// by the caller; a panic or early return between here and that point still
+/// closes the row as [`crate::exit::UNEXPECTED`] instead of leaving it open
+/// until the next daemon start (CLAUDE-402).
 ///
 /// `action` is a parameter so the comment listener records its runs
 /// through this same accounting rather than a forked copy.
@@ -1287,9 +1296,10 @@ pub(crate) async fn begin_webhook_run(
     action: &str,
     job_key: &str,
     html_url: &str,
-) -> Option<i64> {
+) -> Option<(i64, state::RunGuard)> {
     match state::run_begin(pool, action, WEBHOOK_TRIGGERED_BY).await {
         Ok(id) => {
+            let guard = state::RunGuard::new(pool, id);
             if let Err(e) =
                 state::run_set_job_keys(pool, id, std::slice::from_ref(&job_key.to_string())).await
             {
@@ -1308,7 +1318,7 @@ pub(crate) async fn begin_webhook_run(
             if let Err(e) = state::run_stage_set(pool, id, Some(STAGE_FETCHING_LOGS)).await {
                 warn!(error = %e, "setting webhook run stage failed");
             }
-            Some(id)
+            Some((id, guard))
         }
         Err(e) => {
             warn!(error = %e, "opening webhook run row failed; event runs unrecorded");
@@ -1319,24 +1329,26 @@ pub(crate) async fn begin_webhook_run(
 
 /// Close a webhook run. Writes one `job_outcomes` row
 /// carrying the human-readable `summary` (triage bucket + mint result, plus the
-/// redacted-log artifact path when present) and finalizes the run. `spend` is
+/// redacted-log artifact path when present) and finalizes the run through its
+/// [`state::RunGuard`], so a failure here still leaves the row closed by the
+/// guard's `Drop` retry (CLAUDE-402) rather than open forever. `spend` is
 /// this delivery's own ledger: `None` for a path that never reached
 /// triage (nothing to bill), `Some` for every path that did, so `claude_ran` /
 /// `claude_ok` / `claude_cost_usd` reflect what the classification actually
 /// spent instead of always reading false/zero. `attempt_counted = false`: the
 /// caps ledger is advanced separately inside [`triage_and_mint`] and
-/// must not be double counted here. A no-op when `run_id` is `None`, except
+/// must not be double counted here. A no-op when `run` is `None`, except
 /// that a real `spend` must still be finished so its usage record is not lost.
 async fn finish_webhook_run(
     pool: &DbPool,
-    run_id: Option<i64>,
+    run: Option<(i64, state::RunGuard)>,
     job_key: &str,
     summary: &str,
     ok: bool,
     artifact: Option<&std::path::Path>,
     spend: Option<&crate::usage::RunSpend>,
 ) {
-    let Some(run_id) = run_id else {
+    let Some((run_id, guard)) = run else {
         if let Some(spend) = spend {
             spend.finish(None, crate::exit::UNEXPECTED);
         }
@@ -1373,8 +1385,8 @@ async fn finish_webhook_run(
     };
     // An over-budget stop overrides only an otherwise-clean outcome.
     let exit_code = spend.map_or(base_exit_code, |s| s.exit_code(base_exit_code));
-    if let Err(e) = state::run_finish(pool, run_id, exit_code, 1).await {
-        warn!(error = %e, "finalizing webhook run failed");
+    if let Err(e) = guard.finish(exit_code, 1).await {
+        error!(run_id, error = %e, "finalizing webhook run failed; the guard retries closing it as unexpected on drop");
     }
     if let Some(spend) = spend {
         spend.finish(Some(run_id), exit_code);
@@ -3904,7 +3916,7 @@ async fn process_pr_event(
     };
 
     let job_key = format!("pr-{}-{}", ev.repo.replace('/', "_"), ev.number);
-    let run_id = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
+    let run = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
 
     let result = if ev.merged {
         handle_merged_pr(&pool, &host, &ev).await
@@ -3919,7 +3931,7 @@ async fn process_pr_event(
             (false, e.clone())
         }
     };
-    finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None, None).await;
+    finish_webhook_run(&pool, run, &job_key, &summary, ok, None, None).await;
 }
 
 /// A PR closed WITHOUT merging. The only action is marking the
@@ -4097,7 +4109,7 @@ async fn process_action_success_event(
     let _key_guard = keygate.acquire(&key).await;
 
     let job_key = format!("automerge-{}-{}", ev.repo.replace('/', "_"), pr_number);
-    let run_id = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
+    let run = begin_webhook_run(&pool, WEBHOOK_MINT_ACTION, &job_key, &ev.html_url).await;
 
     let result =
         handle_action_success_for_pr(&mint, &pool, &host, &ev.repo, pr_number, &pr_url).await;
@@ -4109,7 +4121,7 @@ async fn process_action_success_event(
     if !ok {
         warn!(repo = %ev.repo, pr = pr_number, error = %summary, "action-run success handling failed");
     }
-    finish_webhook_run(&pool, run_id, &job_key, &summary, ok, None, None).await;
+    finish_webhook_run(&pool, run, &job_key, &summary, ok, None, None).await;
 }
 
 /// A fault that happened before the failing commit could be
@@ -4920,8 +4932,8 @@ pub(crate) async fn reconcile_automerge(
                 (false, e)
             }
         };
-        let run_id = begin_webhook_run(pool, WEBHOOK_MINT_ACTION, &job_key, &pr_url).await;
-        finish_webhook_run(pool, run_id, &job_key, &summary, ok, None, None).await;
+        let run = begin_webhook_run(pool, WEBHOOK_MINT_ACTION, &job_key, &pr_url).await;
+        finish_webhook_run(pool, run, &job_key, &summary, ok, None, None).await;
     }
 }
 
@@ -7885,6 +7897,171 @@ mod tests {
         let summary = summary.expect("summary recorded");
         assert!(summary.contains("log-only"), "{summary}");
         assert!(summary.contains("log="), "artifact reference: {summary}");
+    }
+
+    // ---- CLAUDE-402: webhook runs close even when the handler panics ------
+
+    /// The regression this issue fixes: a panic inside the webhook-triage
+    /// pipeline, after `begin_webhook_run` opened the row, used to leave it
+    /// open forever (`consume_events`'s `for t in tasks` loop only ever sees a
+    /// `JoinError`, never a chance to finalize the row itself). `begin_webhook_run`
+    /// now hands back a `RunGuard` alongside the id, so its `Drop` closes the
+    /// row as `exit::UNEXPECTED` however the handler dies.
+    #[tokio::test]
+    async fn webhook_triage_run_row_closes_when_the_handler_panics() {
+        let pool = memory_pool().await;
+        let task = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                let run = begin_webhook_run(
+                    &pool,
+                    WEBHOOK_MINT_ACTION,
+                    "contoso/claude-run#9",
+                    "https://example/actions/runs/9",
+                )
+                .await;
+                let _keep_the_guard_alive_across_the_panic = run;
+                panic!("simulated: webhook-triage pipeline panicked mid-run");
+            }
+        });
+        assert!(
+            task.await.is_err(),
+            "the spawned handler was expected to panic"
+        );
+
+        let run_id: i64 = sqlx::query_scalar(&crate::db::q(&pool, "SELECT id FROM runs"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut ended: Option<String> = None;
+        for _ in 0..200 {
+            ended = sqlx::query_scalar(&crate::db::q(
+                &pool,
+                "SELECT ended_at FROM runs WHERE id = ?",
+            ))
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if ended.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            ended.is_some(),
+            "a panicking webhook-triage handler must not leave its run row open"
+        );
+        let exit: Option<i64> = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT exit_code FROM runs WHERE id = ?",
+        ))
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(exit, Some(crate::exit::UNEXPECTED as i64));
+    }
+
+    /// `run_finish` failing once (simulated here by renaming the `runs` table
+    /// out from under the first attempt) must stay visible at `error` with the
+    /// run id, and the row must still close once the guard's `Drop` retries it
+    /// after the table is back.
+    #[tokio::test]
+    async fn webhook_finish_run_finish_failure_is_logged_and_retried() {
+        let pool = memory_pool().await;
+        let run_id = state::run_begin(&pool, WEBHOOK_MINT_ACTION, WEBHOOK_TRIGGERED_BY)
+            .await
+            .unwrap();
+        let guard = state::RunGuard::new(&pool, run_id);
+
+        sqlx::query("ALTER TABLE runs RENAME TO runs_hidden_for_test")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(self.0.clone())
+            }
+        }
+        let sub = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let dispatch_guard = tracing::subscriber::set_default(sub);
+
+        finish_webhook_run(
+            &pool,
+            Some((run_id, guard)),
+            "job-1",
+            "forced failure for CLAUDE-402",
+            true,
+            None,
+            None,
+        )
+        .await;
+
+        drop(dispatch_guard);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("ERROR"),
+            "expected an error-level log: {logs}"
+        );
+        assert!(
+            logs.contains(&run_id.to_string()),
+            "expected the run id in the log: {logs}"
+        );
+
+        sqlx::query("ALTER TABLE runs_hidden_for_test RENAME TO runs")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut ended: Option<String> = None;
+        for _ in 0..200 {
+            ended = sqlx::query_scalar(&crate::db::q(
+                &pool,
+                "SELECT ended_at FROM runs WHERE id = ?",
+            ))
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if ended.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            ended.is_some(),
+            "the guard's retry must close the row once the table is back"
+        );
+        let exit: Option<i64> = sqlx::query_scalar(&crate::db::q(
+            &pool,
+            "SELECT exit_code FROM runs WHERE id = ?",
+        ))
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            exit,
+            Some(crate::exit::UNEXPECTED as i64),
+            "the retry always closes as UNEXPECTED, not the caller's intended exit code"
+        );
     }
 
     #[test]
