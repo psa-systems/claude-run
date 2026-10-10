@@ -367,6 +367,27 @@ pub(crate) fn probe_denied(
     ))
 }
 
+/// Reject a PR tip subject that is empty or a template heading/bare issue
+/// reference rather than a one-line subject (CLAUDE-398). Called before any
+/// push or PR-create call, so a bad tip opens nothing: the error names the
+/// branch and the offending subject, and reaches the issue comment through
+/// the existing PR-creation failure path in `finalize`.
+pub fn validate_pr_subject(subject: &str, branch: &str) -> Result<()> {
+    let trimmed = subject.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "branch `{branch}`'s tip commit has no subject line, so no PR can open from it"
+        )));
+    }
+    if trimmed.starts_with('#') {
+        return Err(Error::Other(anyhow::anyhow!(
+            "branch `{branch}`'s tip commit subject is `{trimmed}`, a template heading or a bare \
+             issue reference rather than a one-line subject, so no PR can open from it"
+        )));
+    }
+    Ok(())
+}
+
 /// The Forgejo-side operations native handlers need.
 pub trait Forge: Send + Sync {
     /// Open a PR from the local commits in `workdir` against `host`. `strategy`
@@ -1193,6 +1214,34 @@ mod tests {
     use super::*;
     use crate::forge_log::ActionLogClient;
     use cli::testutil::StubRunner;
+
+    #[test]
+    fn validate_pr_subject_rejects_empty() {
+        let err = validate_pr_subject("", "feat/x").unwrap_err().to_string();
+        assert!(err.contains("feat/x"), "{err}");
+    }
+
+    #[test]
+    fn validate_pr_subject_rejects_template_heading() {
+        let err = validate_pr_subject("## Summary", "feat/x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("feat/x"), "{err}");
+        assert!(err.contains("## Summary"), "{err}");
+    }
+
+    #[test]
+    fn validate_pr_subject_rejects_bare_issue_reference() {
+        let err = validate_pr_subject("#KEY-1", "feat/x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("#KEY-1"), "{err}");
+    }
+
+    #[test]
+    fn validate_pr_subject_accepts_a_real_subject() {
+        validate_pr_subject("Pin base image digests", "feat/x").unwrap();
+    }
 
     /// A failed clone must say WHY. `git clone exited 128` alone is
     /// the same message for a missing credential, an unknown host and a deleted
