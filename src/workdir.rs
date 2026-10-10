@@ -112,16 +112,32 @@ fn git_required(workdir: &Path, args: &[&str]) -> Result<String, WorkCheckError>
 
 /// Like [`git_required`], but for the one network call in this module
 /// (`ls-remote origin`): authenticates per invocation via `token_url`
-/// (CLAUDE-395) instead of relying on a credential embedded in `origin`'s URL.
+/// (CLAUDE-395) instead of relying on a credential embedded in `origin`'s
+/// URL, and retries a failed attempt (CLAUDE-396) via
+/// [`crate::provider::retry_git_network`].
 fn authed_git_required(
     workdir: &Path,
     args: &[&str],
     token_url: Option<&str>,
 ) -> Result<String, WorkCheckError> {
-    let out = crate::provider::authed_git_output(Some(workdir), args, token_url)
-        .ok()
-        .filter(|o| o.status.success())
-        .ok_or_else(|| WorkCheckError(format!("git {} failed", args.join(" "))))?;
+    let secrets = token_url
+        .map(crate::provider::url_secrets)
+        .unwrap_or_default();
+    let out = crate::provider::retry_git_network(
+        &args.join(" "),
+        &secrets,
+        &crate::provider::GIT_NETWORK_RETRY_WAITS,
+        || {
+            Ok(crate::provider::authed_git_output(
+                Some(workdir),
+                args,
+                token_url,
+            )?)
+        },
+    )
+    .ok()
+    .filter(|o| o.status.success())
+    .ok_or_else(|| WorkCheckError(format!("git {} failed", args.join(" "))))?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 

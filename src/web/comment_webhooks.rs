@@ -1997,14 +1997,24 @@ fn git_in(workdir: &FsPath, args: &[&str]) -> crate::error::Result<()> {
 }
 
 /// Kept separate from [`git_in`] so the token-bearing URL never reaches an error.
+/// Retried on a failed attempt (CLAUDE-396) via
+/// [`crate::provider::retry_git_network`].
 fn git_push(workdir: &FsPath, url: &str, branch: &str) -> crate::error::Result<()> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workdir)
-        .arg("push")
-        .arg(url)
-        .arg(branch)
-        .output()?;
+    let secrets = crate::provider::url_secrets(url);
+    let out = crate::provider::retry_git_network(
+        "push",
+        &secrets,
+        &crate::provider::GIT_NETWORK_RETRY_WAITS,
+        || {
+            Ok(std::process::Command::new("git")
+                .arg("-C")
+                .arg(workdir)
+                .arg("push")
+                .arg(url)
+                .arg(branch)
+                .output()?)
+        },
+    )?;
     if out.status.success() {
         Ok(())
     } else {
