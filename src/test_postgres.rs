@@ -295,21 +295,34 @@ fn psql_args() -> [&'static str; 5] {
     ["psql", "--username", "postgres", "--set", "ON_ERROR_STOP=1"]
 }
 
+/// How long a connection may keep failing with "the database system is
+/// starting up" / "shutting down" after `pg_isready` already reported ready.
+/// The official postgres image's entrypoint restarts the server once after
+/// its own `initdb`, and `pg_isready` can observe the brief ready window
+/// before that restart; retrying here rides out that restart instead of
+/// treating it as a real failure.
+const RESTART_WINDOW: Duration = Duration::from_secs(20);
+
 fn apply_sql(name: &str, stage: &str, sql: &str) -> Result<()> {
     let mut args = vec![name];
     args.extend_from_slice(&psql_args());
     args.push("--file");
     args.push("-");
-    let out = docker_exec_stdin(name, &args[1..], sql)?;
-    if !out.status.success() {
-        return Err(docker_error(
-            stage,
-            &args,
-            &String::from_utf8_lossy(&out.stderr),
-            &[],
-        ));
+
+    let deadline = Instant::now() + RESTART_WINDOW;
+    loop {
+        let out = docker_exec_stdin(name, &args[1..], sql)?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let restarting = stderr.contains("the database system is starting up")
+            || stderr.contains("the database system is shutting down");
+        if !restarting || Instant::now() >= deadline {
+            return Err(docker_error(stage, &args, &stderr, &[]));
+        }
+        std::thread::sleep(POLL_INTERVAL);
     }
-    Ok(())
 }
 
 fn disable_durability(name: &str) -> Result<()> {
