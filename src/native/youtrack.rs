@@ -1829,7 +1829,7 @@ pub(crate) fn default_youtrack_prompt() -> String {
         "4. Make the minimum change required to satisfy the acceptance criteria, in coherent layers (for example schema, model, API, UI, docs). After each layer, make a local commit whose body ends with the bare '#{{key}}' reference, so a kill leaves committed progress instead of none; the final commit still carries the full PR-description format from step 7 and stays the branch tip.",
         "5. Test discipline: while iterating, run only the targeted tests for the code you just changed (the repo's single-test or single-binary form), not the full suite. Run the repo's full check suite (e.g. the repo's 'just check', tests, or build) exactly once, after formatting and lint are clean and the work is complete. Never re-run a long command only to read its output again: capture it to a file outside {{workdir}} the first time and read the file. If a long command fails in a way that needs a fix, re-run only what failed until it is green, then run the full check suite once more. HARD RULE: run every long command in the FOREGROUND and wait for it inline. Do NOT background a build, check, or watch and poll/wait on it across turns. Leave NO background task running when you end your turn: any lingering background process keeps the run's process group alive and will get the whole run timeout-killed (exit 124) even after the functional work is complete - that is what blew the run timeout previously. Kill or wait out every spawned background job before you stop. This is enforced, not just requested: the runner starts every session with background tasks disabled and the 'Monitor' / 'ScheduleWakeup' tools disallowed, so a turn that ends still waiting on either is never finalized as a success.",
         "6. Immediately before your final commit, re-run 'yt issue inspect {{key}}' and compare its description, acceptance criteria, and every comment against what step 1 (or step 3's resume read) showed. If nothing changed, continue to the commit. If anything changed, treat the latest text as authoritative: make the additional changes it requires, re-run the check suite (step 5) to green, and only then commit. If you already made a commit before reaching this step, this re-read still happens before the LAST commit: any further commits made after it are the final ones. If the new text makes the work unsafe, contradictory, or ambiguous, take the blocker path below instead of committing.",
-        "7. The runner uses this commit's body as the PR description (if you make more than one commit, the LAST commit carries it, since the runner reads only the branch tip); it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the literal line 'Closes', then the bare issue reference on the next line alone, with nothing after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above the 'Closes' line, never after the reference. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single 'Closes' line. NO 'State ...' command after the reference. Example of the tail:",
+        "7. The runner uses this commit's SUBJECT as the PR title and its body as the PR description (if you make more than one commit, the LAST commit carries both, since the runner reads only the branch tip). The subject is a SEPARATE line from the body, not the body's first heading: write one short imperative line (about 72 characters or fewer, no leading '#', not a Markdown heading like '## Summary') that names the change itself, e.g. 'Fix the off-by-one in the retry budget'; confirm it with 'git log -1 --format=%s' before you stop - if that prints a Markdown heading, a bare issue reference, or anything else that is not a one-line summary of the change, the commit is wrong and the runner will refuse to open the PR from it. The body (what 'git log -1 --format=%b' prints) is the PR description; it joins any hard-wrapped prose lines back together before posting it, but do not rely on that, write it in exactly this format, in order: (a) '## Before this PR is merged' as the FIRST section, but ONLY when the change has a human prerequisite for merging (a secret, a grant, a deploy step, a dependency PR) - name the exact action, identifier and owner; omit the section entirely when there is none, no empty heading and no 'None'. (b) The description of the change under Markdown ATX headings, in order '## Summary', then '## Changes', then '## Verification'; omit a section with nothing to say rather than leaving it empty. (c) Every paragraph and every list item on ONE line, however long - newlines only between paragraphs, between list items, and inside fenced code blocks; never hard-wrap prose. (d) The last block of the body is the literal line 'Closes', then the bare issue reference on the next line alone, with nothing after it on that line and no line after it; a 'Co-Authored-By:' trailer goes above the 'Closes' line, never after the reference. If the commit owns more than one issue, put each '#<KEY>-N' on its own line below the single 'Closes' line. NO 'State ...' command after the reference. Example of the tail:",
         "     ## Verification",
         "",
         "     `just check` passes.",
@@ -2092,17 +2092,32 @@ fn finalize(
                 let url = pr_url(job, &pr);
                 // A resumed run (CLAUDE-275) may be adopting a draft PR a
                 // prior timed-out run salvaged (CLAUDE-379); now that the run
-                // succeeded, strip the draft/`WIP: ` status. Best-effort: a
-                // failure here does not block the success outcome, it just
-                // leaves the PR looking like a draft until fixed by hand.
+                // succeeded, replace the salvage's placeholder title/body
+                // (CLAUDE-398) with the finished tip's own text, then strip
+                // the draft/`WIP: ` status. Both are best-effort: a failure
+                // here does not block the success outcome, it just leaves
+                // the PR looking like (or titled like) a draft until fixed
+                // by hand, and the cause is named in both the error log and
+                // the success comment below so it is never silent.
+                let mut text_refresh_error = None;
                 if resumed {
                     if let Some(pr_number) = pr.number {
+                        if let Err(e) =
+                            forge.refresh_pr_text(workdir, &host, &job.repo_path, pr_number)
+                        {
+                            error!(key = %job.key, pr_number, error = %e, "refreshing the resumed PR's title/body failed (continuing)");
+                            text_refresh_error = Some(e.to_string());
+                        }
                         if let Err(e) = forge.mark_pr_ready(&host, &job.repo_path, pr_number) {
                             error!(key = %job.key, pr_number, error = %e, "clearing draft status on the resumed PR failed (continuing)");
                         }
                     }
                 }
                 let body = success_comment(claude_result, &url);
+                let body = match text_refresh_error {
+                    Some(e) => format!("{body}\n\nPR text could not be updated: {e}"),
+                    None => body,
+                };
                 let body = append_compaction_note(&body, stream_log, &job.key);
                 comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
                 // Finalize no longer waits for CI itself. When
@@ -2531,14 +2546,15 @@ fn salvage_timeout_work(
 
     let mut report = SalvageReport::default();
     if !work.dirty.paths.is_empty() {
-        if let Err(e) = commit_timeout_wip(workdir) {
+        if let Err(e) = commit_timeout_wip(workdir, &job.key) {
             error!(key = %job.key, error = %e, "timeout salvage: committing the uncommitted working tree failed");
             report.commit_error = Some(e);
         }
     }
 
     let host = host_only(&job.repo_host);
-    match forge.create_pr_with_draft(workdir, &host, pr_strategy, true) {
+    let body = draft_pr_body(&job.key);
+    match forge.create_pr_with_draft(workdir, &host, pr_strategy, true, Some(&body)) {
         Ok(pr) => {
             report.pr_url = Some(pr_url(job, &pr));
             if let Some(pr_number) = pr.number {
@@ -2587,8 +2603,10 @@ fn salvage_timeout_work(
 /// whatever branch a draft PR gets opened from rather than being lost once
 /// the workdir is garbage-collected. `.claude-run-*` marker files are
 /// excluded by pathspec (operator/runner state, never agent work); gitignored
-/// files are never staged by a bare `git add -A` to begin with.
-fn commit_timeout_wip(workdir: &Path) -> std::result::Result<(), String> {
+/// files are never staged by a bare `git add -A` to begin with. The commit
+/// body ends with the bare `#<KEY>` reference (CLAUDE-398), the requirement
+/// CLAUDE-379 specified but the code never wrote.
+fn commit_timeout_wip(workdir: &Path, key: &str) -> std::result::Result<(), String> {
     let add = Command::new("git")
         .arg("-C")
         .arg(workdir)
@@ -2601,10 +2619,16 @@ fn commit_timeout_wip(workdir: &Path) -> std::result::Result<(), String> {
             String::from_utf8_lossy(&add.stderr).trim()
         ));
     }
+    let message = format!(
+        "WIP: uncommitted changes at timeout\n\n\
+         The runner committed the working tree a run of {key} left uncommitted when it hit its \
+         time limit.\n\n\
+         #{key}"
+    );
     let commit = Command::new("git")
         .arg("-C")
         .arg(workdir)
-        .args(["commit", "-m", "WIP: uncommitted changes at timeout"])
+        .args(["commit", "-m", &message])
         .output()
         .map_err(|e| format!("running `git commit` failed: {e}"))?;
     if !commit.status.success() {
@@ -2628,6 +2652,28 @@ fn timeout_cost_line(r: &ClaudeResult) -> String {
         Some(cost) => format!("Cost: ${cost} USD"),
         None => "Cost: unknown (the run was killed before it reported one)".to_string(),
     }
+}
+
+/// Runner-written PR body for a timeout-salvaged draft PR (CLAUDE-398): the
+/// tip commit's own body is either an agent commit whose body is just the
+/// bare issue reference or a runner WIP commit with no useful body, so the
+/// draft PR body is written here instead of derived from `git log`. A
+/// re-queued run that finishes replaces this description (see `finalize`'s
+/// resumed-refresh path); until then this is what a human sees on the PR.
+fn draft_pr_body(key: &str) -> String {
+    [
+        "## Summary".to_string(),
+        String::new(),
+        format!(
+            "This draft PR was opened by the runner from a run of {key} that hit its time limit."
+        ),
+        "The branch holds the work committed so far; it may be incomplete.".to_string(),
+        "The first comment on this PR has the timeout limit, the run's cost, and the agent's last summary at kill time.".to_string(),
+        "A re-queued run that finishes replaces this description with the agent's own.".to_string(),
+        String::new(),
+        format!("#{key}"),
+    ]
+    .join("\n")
 }
 
 /// PR comment explaining why a timeout-salvaged draft PR (CLAUDE-379) exists:
@@ -3531,7 +3577,7 @@ mod tests {
             .find("Immediately before your final commit, re-run 'yt issue inspect {{key}}'")
             .expect("re-read step present");
         let commit_step = p
-            .find("The runner uses this commit's body as the PR description")
+            .find("The runner uses this commit's SUBJECT as the PR title")
             .expect("commit step present");
         assert!(
             check_suite_step < reread_step,
@@ -3548,6 +3594,29 @@ mod tests {
         assert!(
             p.contains("Re-read {{key}} before the final commit: changed (<what changed>, <how it was handled>)"),
             "the closing summary must require the changed report line"
+        );
+    }
+
+    /// CLAUDE-398 criterion 1: the final commit's SUBJECT (what `git log -1
+    /// --format=%s` prints) is the PR title, and it must be a one-line
+    /// imperative summary, never a Markdown heading like `## Summary`
+    /// mistaken for the subject (the original defect this issue fixes).
+    #[test]
+    fn default_prompt_requires_a_proper_one_line_commit_subject() {
+        let p = default_youtrack_prompt();
+        assert!(
+            p.contains(
+                "The subject is a SEPARATE line from the body, not the body's first heading"
+            ),
+            "the prompt must distinguish the commit subject from the body: {p}"
+        );
+        assert!(
+            p.contains("no leading '#'") && p.contains("not a Markdown heading like '## Summary'"),
+            "the prompt must explicitly rule out a heading as the subject: {p}"
+        );
+        assert!(
+            p.contains("confirm it with 'git log -1 --format=%s' before you stop"),
+            "the prompt must tell the agent to verify its own subject line: {p}"
         );
     }
 
@@ -4847,6 +4916,7 @@ mod tests {
                     &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
                 .ok(
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
@@ -5354,6 +5424,7 @@ mod tests {
                 )
                 .ok("git", &["rev-parse", "feat/x"], "abc\n")
                 .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
                 .fail(
                     "git",
                     &["push", "--set-upstream", "origin", "feat/x:feat/x"],
@@ -5594,6 +5665,7 @@ mod tests {
                     &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
                 .ok(
                     "yt",
                     &[
@@ -6000,6 +6072,151 @@ mod tests {
                 .any(|c| c == "yt issue set-field MK-16 AI Agent Needs Review"),
             "{calls:?}"
         );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "git log -1 --format=%b feat/x"),
+            "the runner-written draft body must not be derived from the tip commit's own body: {calls:?}"
+        );
+        let _ = std::fs::remove_file(&scratch);
+    }
+
+    #[test]
+    fn finalize_timeout_salvage_draft_body_ignores_a_runner_wip_tip_body_too() {
+        // Same shape as the test above, but the tip is the runner's own
+        // `WIP: uncommitted changes at timeout` commit rather than a
+        // pre-existing agent commit. Either way the draft PR body is the
+        // runner-written one (CLAUDE-398), never derived from `git log`.
+        let base = tempfile::tempdir().unwrap();
+        let clone = dirty_single_branch_clone(base.path());
+        let git_dir = clone.join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let scratch = std::env::temp_dir().join("claude-run-timeout-pr-comment-MK-16.md");
+        let _ = std::fs::remove_file(&scratch);
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    "[]",
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%s", "feat/x"],
+                    "WIP: uncommitted changes at timeout\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "WIP: uncommitted changes at timeout",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":9,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/9"}"#,
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "comment",
+                        "contoso/claude-run#9",
+                        "--body-file",
+                        scratch.to_string_lossy().as_ref(),
+                    ],
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Needs Review"],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            &clone,
+            &timed_out_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::TimedOut {
+                pr_number: Some(9),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("WIP: uncommitted changes at timeout")
+                    && !c.contains("WIP: WIP:")),
+            "a tip already carrying the WIP: prefix must not be double-prefixed: {calls:?}"
+        );
         let _ = std::fs::remove_file(&scratch);
     }
 
@@ -6242,10 +6459,31 @@ mod tests {
         // in isolation): `git add` fails loudly rather than panicking or
         // silently no-op'ing.
         let dir = tempfile::tempdir().unwrap();
-        let err = commit_timeout_wip(dir.path()).unwrap_err();
+        let err = commit_timeout_wip(dir.path(), "MK-16").unwrap_err();
         assert!(
             err.contains("git add"),
             "the commit-step failure must name `git add`: {err}"
+        );
+    }
+
+    #[test]
+    fn commit_timeout_wip_body_ends_with_the_bare_issue_reference() {
+        // CLAUDE-398 / CLAUDE-379: the salvage WIP commit's body must end
+        // with the bare `#<KEY>` reference.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        std::fs::write(dir.path().join("dirty.txt"), "uncommitted\n").unwrap();
+        commit_timeout_wip(dir.path(), "MK-16").unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["log", "-1", "--format=%B"])
+            .output()
+            .unwrap();
+        let message = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            message.trim_end().ends_with("#MK-16"),
+            "the commit body must end with the bare issue reference: {message}"
         );
     }
 
@@ -6349,6 +6587,24 @@ mod tests {
                         "contoso/claude-run#7",
                         "--title",
                         "feat: x",
+                        "--body-file",
+                        std::env::temp_dir()
+                            .join("claude-run-pr-refresh-7.md")
+                            .to_string_lossy()
+                            .as_ref(),
+                    ],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "edit",
+                        "contoso/claude-run#7",
+                        "--title",
+                        "feat: x",
                     ],
                     "",
                 ),
@@ -6381,6 +6637,155 @@ mod tests {
                 .iter()
                 .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"),
             "a resumed success must strip the WIP: prefix: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with(
+                "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x --body-file"
+            )),
+            "a resumed success must refresh the salvage placeholder title/body too: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn finalize_resumed_success_surfaces_a_refresh_failure_in_the_success_comment() {
+        // CLAUDE-398 criterion 8: `refresh_pr_text` is best-effort (it must
+        // never block the success outcome), but its failure is never silent:
+        // it is logged AND named in the success comment. Omitting the
+        // combined --title/--body-file edit stub makes the refresh fail with
+        // a "no canned response" error from the StubRunner.
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        let body_path = git_dir
+            .join("claude-run")
+            .join(".claude-run-pr-body.md")
+            .to_string_lossy()
+            .to_string();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "git",
+                    &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                    "origin/main",
+                )
+                .ok(
+                    "git",
+                    &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                    "main\nfeat/x",
+                )
+                .ok("git", &["rev-list", "origin/main..feat/x"], "abc\n")
+                .ok(
+                    "git",
+                    &["remote", "get-url", "origin"],
+                    "https://dev.a8n.run/contoso/claude-run.git",
+                )
+                .ok("git", &["rev-parse", "feat/x"], "abc\n")
+                .ok("git", &["ls-remote", "--heads", "origin", "feat/x"], "")
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "search",
+                        "--repo",
+                        "contoso/claude-run",
+                        "--state",
+                        "open",
+                        "--json",
+                    ],
+                    r#"{"pull_requests":[{"number":7,"title":"WIP: feat: x","head_sha":"abc"}]}"#,
+                )
+                .ok(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    "",
+                )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok(
+                    "git",
+                    &["log", "-1", "--format=%b", "feat/x"],
+                    "body\n\n#MK-16\n",
+                )
+                .ok(
+                    "git",
+                    &["rev-parse", "--absolute-git-dir"],
+                    &git_dir.to_string_lossy(),
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "create",
+                        "feat: x",
+                        "--body-file",
+                        body_path.as_str(),
+                        "--head",
+                        "feat/x",
+                        "--json",
+                    ],
+                    r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],
+                    "",
+                )
+                // The combined --title/--body-file edit stub is deliberately
+                // absent: refresh_pr_text's `fj pr edit` call has no canned
+                // response, so it fails. mark_pr_ready's own title-only edit
+                // is still stubbed, so it still succeeds independently.
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "edit",
+                        "contoso/claude-run#7",
+                        "--title",
+                        "feat: x",
+                    ],
+                    "",
+                ),
+        );
+        let backend = CliBackend::new(runner.clone());
+        let res = finalize(
+            &backend,
+            &backend,
+            &src(),
+            &job(),
+            dir.path(),
+            &ok_result(),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            res,
+            Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
+                pr_number: Some(7),
+                head_branch: Some("feat/x".into()),
+            }
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x"),
+            "mark_pr_ready must still succeed even when the refresh failed: {calls:?}"
+        );
+        let comment = calls
+            .iter()
+            .find(|c| c.starts_with("yt issue comment MK-16"))
+            .unwrap_or_else(|| panic!("no issue comment call recorded: {calls:?}"));
+        assert!(
+            comment.contains("PR text could not be updated"),
+            "a refresh failure must be surfaced in the success comment, not silently swallowed: {comment}"
         );
     }
 
@@ -6419,6 +6824,8 @@ mod tests {
                     &["ls-remote", "--heads", "origin", "feat/x"],
                     "remotesha\trefs/heads/feat/x\n",
                 )
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .ok("git", &["log", "-1", "--format=%b", "feat/x"], "body\n")
                 .ok("git", &["fetch", "origin", "feat/x"], "")
                 .fail(
                     "git",
@@ -6470,6 +6877,24 @@ mod tests {
                         "contoso/claude-run#7",
                         "--title",
                         "feat: x",
+                        "--body-file",
+                        std::env::temp_dir()
+                            .join("claude-run-pr-refresh-7.md")
+                            .to_string_lossy()
+                            .as_ref(),
+                    ],
+                    "",
+                )
+                .ok(
+                    "fj",
+                    &[
+                        "--host",
+                        "dev.a8n.run",
+                        "pr",
+                        "edit",
+                        "contoso/claude-run#7",
+                        "--title",
+                        "feat: x",
                     ],
                     "",
                 ),
@@ -6502,6 +6927,12 @@ mod tests {
                 .iter()
                 .any(|c| c == "git merge --no-edit origin/feat/x"),
             "a moved remote branch must be merged in: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.starts_with(
+                "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: x --body-file"
+            )),
+            "a resumed success on a moved branch must still refresh the salvage placeholder title/body: {calls:?}"
         );
         assert!(
             calls
@@ -6564,6 +6995,7 @@ mod tests {
                     &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/contoso/claude-run/pulls/7"}"#,
                 )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "feat: x\n")
                 .ok(
                     "yt",
                     &["issue", "set-field", "MK-16", "AI Agent", "Code Review"],

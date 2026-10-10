@@ -367,6 +367,27 @@ pub(crate) fn probe_denied(
     ))
 }
 
+/// Reject a PR tip subject that is empty or a template heading/bare issue
+/// reference rather than a one-line subject (CLAUDE-398). Called before any
+/// push or PR-create call, so a bad tip opens nothing: the error names the
+/// branch and the offending subject, and reaches the issue comment through
+/// the existing PR-creation failure path in `finalize`.
+pub fn validate_pr_subject(subject: &str, branch: &str) -> Result<()> {
+    let trimmed = subject.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "branch `{branch}`'s tip commit has no subject line, so no PR can open from it"
+        )));
+    }
+    if trimmed.starts_with('#') {
+        return Err(Error::Other(anyhow::anyhow!(
+            "branch `{branch}`'s tip commit subject is `{trimmed}`, a template heading or a bare \
+             issue reference rather than a one-line subject, so no PR can open from it"
+        )));
+    }
+    Ok(())
+}
+
 /// The Forgejo-side operations native handlers need.
 pub trait Forge: Send + Sync {
     /// Open a PR from the local commits in `workdir` against `host`. `strategy`
@@ -386,17 +407,23 @@ pub trait Forge: Send + Sync {
     /// draft (Forgejo: a `WIP: ` title prefix, the convention `fj pr search
     /// --json` reports through its `draft` field; GitHub: the real draft flag).
     /// Used by the timeout salvage path (CLAUDE-379) to open a draft PR for
-    /// work rescued from a timed-out run. The default ignores `draft` and
-    /// falls back to [`Self::create_pr`], so a backend with no draft notion
-    /// (including every test-only stub) keeps compiling unchanged.
+    /// work rescued from a timed-out run. `body`, when `Some`, is written
+    /// verbatim as the PR body instead of the tip commit's own body
+    /// (CLAUDE-398): a killed run's tip is often an agent layer commit whose
+    /// body is only the bare `#<KEY>` line, which tells a reader nothing. The
+    /// title still comes from the tip subject, carrying the `WIP: ` prefix.
+    /// The default ignores `draft` and `body` and falls back to
+    /// [`Self::create_pr`], so a backend with no draft notion (including
+    /// every test-only stub) keeps compiling unchanged.
     fn create_pr_with_draft(
         &self,
         workdir: &std::path::Path,
         host: &str,
         strategy: crate::action::PrStrategy,
         draft: bool,
+        body: Option<&str>,
     ) -> Result<PullRequest> {
-        let _ = draft;
+        let _ = (draft, body);
         self.create_pr(workdir, host, strategy)
     }
 
@@ -410,6 +437,30 @@ pub trait Forge: Send + Sync {
         let _ = (host, repo, pr_number);
         Err(Error::Other(anyhow::anyhow!(
             "mark_pr_ready not supported by this forge backend"
+        )))
+    }
+
+    /// Overwrite PR `pr_number` in `repo` on `host` with the title and body
+    /// derived from `workdir`'s current tip commit (subject and, for
+    /// Forgejo, the reflowed body; GitHub's `create_pr_impl` already reads
+    /// `HEAD` the same way `create_pr` does). Used when a re-queued run
+    /// (CLAUDE-275) resumes onto a draft PR a prior timed-out run salvaged
+    /// (CLAUDE-379) and now finishes: the placeholder title/body the salvage
+    /// wrote (CLAUDE-398) is replaced with the finished tip's own text,
+    /// validated through [`validate_pr_subject`] first so a bad tip refuses
+    /// here exactly as it would at PR-create time. The default errors so a
+    /// backend without support (including every test-only stub) reports
+    /// clearly rather than silently no-op'ing.
+    fn refresh_pr_text(
+        &self,
+        workdir: &std::path::Path,
+        host: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<()> {
+        let _ = (workdir, host, repo, pr_number);
+        Err(Error::Other(anyhow::anyhow!(
+            "refresh_pr_text not supported by this forge backend"
         )))
     }
 
@@ -1193,6 +1244,34 @@ mod tests {
     use super::*;
     use crate::forge_log::ActionLogClient;
     use cli::testutil::StubRunner;
+
+    #[test]
+    fn validate_pr_subject_rejects_empty() {
+        let err = validate_pr_subject("", "feat/x").unwrap_err().to_string();
+        assert!(err.contains("feat/x"), "{err}");
+    }
+
+    #[test]
+    fn validate_pr_subject_rejects_template_heading() {
+        let err = validate_pr_subject("## Summary", "feat/x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("feat/x"), "{err}");
+        assert!(err.contains("## Summary"), "{err}");
+    }
+
+    #[test]
+    fn validate_pr_subject_rejects_bare_issue_reference() {
+        let err = validate_pr_subject("#KEY-1", "feat/x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("#KEY-1"), "{err}");
+    }
+
+    #[test]
+    fn validate_pr_subject_accepts_a_real_subject() {
+        validate_pr_subject("Pin base image digests", "feat/x").unwrap();
+    }
 
     /// A failed clone must say WHY. `git clone exited 128` alone is
     /// the same message for a missing credential, an unknown host and a deleted

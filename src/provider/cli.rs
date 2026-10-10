@@ -834,7 +834,13 @@ impl CliBackend {
         host: &str,
         branch: &str,
         draft: bool,
+        body: Option<&str>,
     ) -> Result<PullRequest> {
+        // The subject guard (CLAUDE-398) runs before anything else here: a
+        // tip whose subject is a template heading or a bare issue reference
+        // must refuse before any push or PR-create call is made.
+        crate::provider::validate_pr_subject(&self.tip_subject(workdir, branch)?, branch)?;
+
         // Repo path (`owner/repo`) for the open-PR lookup, derived from the
         // workdir's `origin` remote (the form `list_open_prs` expects).
         let repo = self.origin_repo_path(workdir)?;
@@ -859,11 +865,11 @@ impl CliBackend {
             // PR with `--head <branch>`).
             None => {
                 self.push_branch(workdir, branch, token_url)?;
-                self.find_or_create_pr(workdir, host, &repo, branch, draft)
+                self.find_or_create_pr(workdir, host, &repo, branch, draft, body)
             }
             // Equal to local: nothing to push; find-or-create the PR.
             Some(ref remote_sha) if *remote_sha == local_sha => {
-                self.find_or_create_pr(workdir, host, &repo, branch, draft)
+                self.find_or_create_pr(workdir, host, &repo, branch, draft, body)
             }
             // Present and not equal. Fetch first (CLAUDE-382) so the remote
             // tip's objects exist locally: a resumed run's clone predates any
@@ -876,7 +882,7 @@ impl CliBackend {
                     // A fast-forward push is legal when the remote tip is an
                     // ancestor of the local tip.
                     self.push_branch(workdir, branch, token_url)?;
-                    self.find_or_create_pr(workdir, host, &repo, branch, draft)
+                    self.find_or_create_pr(workdir, host, &repo, branch, draft, body)
                 } else {
                     // Diverged: the remote gained commits (typically the
                     // runner's own "branch was behind its base" update) while
@@ -885,7 +891,7 @@ impl CliBackend {
                     // then find-or-create the PR as usual.
                     self.merge_remote_branch(workdir, branch, &local_sha, &remote_sha)?;
                     self.push_branch(workdir, branch, token_url)?;
-                    self.find_or_create_pr(workdir, host, &repo, branch, draft)
+                    self.find_or_create_pr(workdir, host, &repo, branch, draft, body)
                 }
             }
         }
@@ -906,6 +912,14 @@ impl CliBackend {
                 url.trim()
             ))
         })
+    }
+
+    /// The one-line subject of a revision's tip commit (`git log -1
+    /// --format=%s`), read for the [`validate_pr_subject`] guard (CLAUDE-398).
+    fn tip_subject(&self, workdir: &Path, rev: &str) -> Result<String> {
+        let args = ["log", "-1", "--format=%s", rev];
+        let out = self.runner.run_in_env(Some(workdir), "git", &args, &[])?;
+        Ok(Self::checked("git", out, &args)?.trim().to_string())
     }
 
     /// The commit SHA a git revision (e.g. a branch name) resolves to
@@ -1091,6 +1105,7 @@ impl CliBackend {
         repo: &str,
         branch: &str,
         draft: bool,
+        body: Option<&str>,
     ) -> Result<PullRequest> {
         let lookup_err = match self.find_open_pr(host, repo, branch) {
             Ok(Some(pr)) => return Ok(pr),
@@ -1106,20 +1121,24 @@ impl CliBackend {
         // title-prefix convention regardless of the tip commit's own subject,
         // so the draft status holds even when the tip is a pre-existing agent
         // commit rather than the salvage's own `WIP: ...` commit.
-        let title_args = ["log", "-1", "--format=%s", branch];
-        let out = self
-            .runner
-            .run_in_env(Some(workdir), "git", &title_args, &[])?;
-        let mut title = Self::checked("git", out, &title_args)?.trim().to_string();
+        let mut title = self.tip_subject(workdir, branch)?;
         if draft && !title.starts_with("WIP: ") {
             title = format!("WIP: {title}");
         }
 
-        let body_args = ["log", "-1", "--format=%b", branch];
-        let out = self
-            .runner
-            .run_in_env(Some(workdir), "git", &body_args, &[])?;
-        let body = unwrap_prose(Self::checked("git", out, &body_args)?.trim());
+        // A caller-supplied body (CLAUDE-398: the timeout-salvage draft body)
+        // overrides the tip commit's own body, which for a killed run is
+        // often only the bare `#<KEY>` line.
+        let body = match body {
+            Some(b) => b.to_string(),
+            None => {
+                let body_args = ["log", "-1", "--format=%b", branch];
+                let out = self
+                    .runner
+                    .run_in_env(Some(workdir), "git", &body_args, &[])?;
+                unwrap_prose(Self::checked("git", out, &body_args)?.trim())
+            }
+        };
 
         const BODY_FILE: &str = ".claude-run-pr-body.md";
         // Written into the clone's git-directory scratch space,
@@ -1222,6 +1241,10 @@ impl CliBackend {
     /// succeeded here (`-aA` pushes the base tip and autofills from an unrelated
     /// commit), and the issue was moved to `AI Agent = Code Review`.
     fn create_pr_agit(&self, workdir: &Path, host: &str) -> Result<PullRequest> {
+        // The subject guard (CLAUDE-398) runs before `fj` pushes anything.
+        let subject = self.tip_subject(workdir, "HEAD")?;
+        crate::provider::validate_pr_subject(&subject, "HEAD")?;
+
         let args = ["--host", host, "pr", "create", "-aA", "--json"];
         let stdout = self
             .runner
@@ -1695,7 +1718,7 @@ impl Forge for CliBackend {
             // The selected strategy is authoritative: a failure errors loudly
             // (the finalize step preserves the workdir) rather than silently
             // emitting a branchless AGit PR.
-            PrStrategy::Branch => self.create_pr_branch(workdir, host, &branch, false),
+            PrStrategy::Branch => self.create_pr_branch(workdir, host, &branch, false, None),
             // Opt-in AGit + autofill: fj derives the title/body from the local
             // commit messages, which already carry the bare #<KEY>-N reference.
             // No server branch (head lives only at `refs/pull/<N>/head`).
@@ -1706,18 +1729,20 @@ impl Forge for CliBackend {
     /// Draft support (CLAUDE-379) is implemented only for the branch-backed
     /// strategy, which is the one the timeout salvage path uses (AGit produces
     /// no server branch, so it cannot be resumed and is never used there);
-    /// `PrStrategy::Agit` falls back to the plain create, unprefixed.
+    /// `PrStrategy::Agit` falls back to the plain create, unprefixed, ignoring
+    /// `body` (AGit derives title/body from the commit messages only).
     fn create_pr_with_draft(
         &self,
         workdir: &Path,
         host: &str,
         strategy: crate::action::PrStrategy,
         draft: bool,
+        body: Option<&str>,
     ) -> Result<PullRequest> {
         use crate::action::PrStrategy;
         let branch = self.resolve_feature_branch(workdir)?;
         match strategy {
-            PrStrategy::Branch => self.create_pr_branch(workdir, host, &branch, draft),
+            PrStrategy::Branch => self.create_pr_branch(workdir, host, &branch, draft, body),
             PrStrategy::Agit => self.create_pr_agit(workdir, host),
         }
     }
@@ -1748,6 +1773,71 @@ impl Forge for CliBackend {
             .run_in_env(None, &self.fj, &args, &self.fj_envs())?;
         Self::checked(&self.fj, out, &args)?;
         Ok(())
+    }
+
+    /// A no-op on a PR whose title lacks the `WIP: ` draft prefix (the same
+    /// signal [`Self::mark_pr_ready`] reads): a non-draft adopted PR is left
+    /// untouched. Otherwise reads the resolved feature branch's current tip
+    /// subject/body, runs them through
+    /// [`crate::provider::validate_pr_subject`], and overwrites the PR with
+    /// one `fj pr edit --title --body-file` call (CLAUDE-398). The body
+    /// scratch file goes through `std::env::temp_dir` rather than the
+    /// clone's git-directory scratch space, mirroring `pr_comment`'s scratch
+    /// convention, and is removed again whether or not the edit succeeds.
+    fn refresh_pr_text(
+        &self,
+        workdir: &Path,
+        host: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<()> {
+        let prs = self.list_open_prs(host, repo)?;
+        let is_draft = prs
+            .into_iter()
+            .find(|p| p.number == pr_number)
+            .is_some_and(|p| p.title.starts_with("WIP: "));
+        if !is_draft {
+            return Ok(());
+        }
+
+        let branch = self.resolve_feature_branch(workdir)?;
+        let title = self.tip_subject(workdir, &branch)?;
+        crate::provider::validate_pr_subject(&title, &branch)?;
+        let body_args = ["log", "-1", "--format=%b", &branch];
+        let out = self
+            .runner
+            .run_in_env(Some(workdir), "git", &body_args, &[])?;
+        let body = unwrap_prose(Self::checked("git", out, &body_args)?.trim());
+
+        let scratch = std::env::temp_dir().join(format!("claude-run-pr-refresh-{pr_number}.md"));
+        std::fs::write(&scratch, &body)?;
+        let scratch_arg = scratch.to_string_lossy().to_string();
+        let id = format!("{repo}#{pr_number}");
+        let args = [
+            "--host",
+            host,
+            "pr",
+            "edit",
+            &id,
+            "--title",
+            title.as_str(),
+            "--body-file",
+            scratch_arg.as_str(),
+        ];
+        let res = self
+            .runner
+            .run_in_env(None, &self.fj, &args, &self.fj_envs())
+            .and_then(|out| Self::checked(&self.fj, out, &args));
+        if let Err(e) = std::fs::remove_file(&scratch) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::error!(
+                    path = %scratch.display(),
+                    error = %e,
+                    "removing the PR refresh scratch file failed"
+                );
+            }
+        }
+        res.map(|_| ())
     }
 
     fn take_notices(&self) -> Vec<String> {
@@ -2888,11 +2978,13 @@ mod tests {
         // With exactly one branch ahead of base the guard passes and
         // the AGit call is unchanged.
         let runner = Arc::new(with_branch_resolution(
-            StubRunner::new().ok(
-                "fj",
-                &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
-                r#"{"number":42,"html_url":"https://dev.a8n.run/n/c/pulls/42"}"#,
-            ),
+            StubRunner::new()
+                .ok(
+                    "fj",
+                    &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
+                    r#"{"number":42,"html_url":"https://dev.a8n.run/n/c/pulls/42"}"#,
+                )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n"),
             "origin/main",
             &["main", "fix/x"],
             &[("fix/x", "aaa\n")],
@@ -3108,6 +3200,258 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.contains("-aA")),
             "branch strategy must never invoke -aA: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_with_draft_writes_the_caller_supplied_body_ignoring_the_tips_own() {
+        // The timeout-salvage caller (CLAUDE-398) passes a runner-written
+        // body; it must land in the `--body-file` scratch file verbatim, and
+        // the tip commit's own body (`%b`) must never be read at all.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = with_remote_state(runner, "feat/x", "abc123", "");
+        let runner = with_open_pr_search(runner, "[]").ok(
+            "git",
+            &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+            "",
+        );
+        let runner = runner.ok(
+            "git",
+            &["log", "-1", "--format=%s", "feat/x"],
+            "feat(x): do the thing\n",
+        );
+        let (runner, scratch) = with_git_dir_scratch(runner, wd.path());
+        let body_path = scratch.join(".claude-run-pr-body.md");
+        let body_path_str = body_path.to_string_lossy().to_string();
+        let runner = runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "create",
+                "WIP: feat(x): do the thing",
+                "--body-file",
+                body_path_str.as_str(),
+                "--head",
+                "feat/x",
+                "--json",
+            ],
+            r#"{"number":77,"html_url":"https://dev.a8n.run/n/c/pulls/77"}"#,
+        );
+        let captured = Arc::new(Mutex::new(None));
+        let capturing = BodyCapturingRunner {
+            inner: runner,
+            body_path,
+            captured: captured.clone(),
+        };
+        let runner_calls = Arc::new(capturing);
+        let b = CliBackend::new(runner_calls.clone());
+        let pr = b
+            .create_pr_with_draft(
+                wd.path(),
+                "dev.a8n.run",
+                PrStrategy::Branch,
+                true,
+                Some("## Summary\n\nRunner-written.\n\n#MK-16"),
+            )
+            .unwrap();
+        assert_eq!(pr.number, Some(77));
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("## Summary\n\nRunner-written.\n\n#MK-16"),
+            "the caller-supplied body must land in the --body-file scratch file verbatim"
+        );
+        let calls = runner_calls.inner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c == "git log -1 --format=%b feat/x"),
+            "the tip commit's own body must never be read when a body override is supplied: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_pr_text_is_a_no_op_on_a_non_draft_pr() {
+        // CLAUDE-398: a resumed-but-already-ready PR (no `WIP: ` title
+        // prefix) is left untouched; no `fj pr edit` call at all, and no git
+        // log reads either.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_open_pr_search(
+            StubRunner::new(),
+            r#"[{"number":7,"title":"feat: x","head_ref":"feat/x"}]"#,
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        b.refresh_pr_text(wd.path(), "dev.a8n.run", "contoso/claude-run", 7)
+            .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr edit")),
+            "a non-draft PR must not be edited: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("log")),
+            "a non-draft PR's tip must never be read: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_pr_text_overwrites_a_draft_prs_title_and_body() {
+        // CLAUDE-398: a draft (`WIP: `-prefixed) PR gets one combined
+        // `fj pr edit --title --body-file` call built from the resolved
+        // feature branch's current tip.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_open_pr_search(
+            StubRunner::new(),
+            r#"[{"number":7,"title":"WIP: feat: x","head_ref":"feat/x"}]"#,
+        );
+        let runner = with_branch_resolution(
+            runner,
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = runner
+            .ok(
+                "git",
+                &["log", "-1", "--format=%s", "feat/x"],
+                "feat: the real thing\n",
+            )
+            .ok(
+                "git",
+                &["log", "-1", "--format=%b", "feat/x"],
+                "Finished.\n\n#MK-16\n",
+            );
+        let scratch_path = std::env::temp_dir().join("claude-run-pr-refresh-7.md");
+        let runner = runner.ok(
+            "fj",
+            &[
+                "--host",
+                "dev.a8n.run",
+                "pr",
+                "edit",
+                "contoso/claude-run#7",
+                "--title",
+                "feat: the real thing",
+                "--body-file",
+                scratch_path.to_string_lossy().as_ref(),
+            ],
+            "",
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        b.refresh_pr_text(wd.path(), "dev.a8n.run", "contoso/claude-run", 7)
+            .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with(
+                "fj --host dev.a8n.run pr edit contoso/claude-run#7 --title feat: the real thing --body-file"
+            )),
+            "the draft PR must be overwritten with the tip's own title and body: {calls:?}"
+        );
+        assert!(
+            !scratch_path.exists(),
+            "the body scratch file must be removed again after the edit"
+        );
+    }
+
+    #[test]
+    fn refresh_pr_text_refuses_a_template_heading_subject() {
+        // CLAUDE-398: the same guard `create_pr` applies at create time also
+        // runs here, so a tip that regressed to a bad subject refuses rather
+        // than overwriting the PR with it.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_open_pr_search(
+            StubRunner::new(),
+            r#"[{"number":7,"title":"WIP: feat: x","head_ref":"feat/x"}]"#,
+        );
+        let runner = with_branch_resolution(
+            runner,
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = runner.ok(
+            "git",
+            &["log", "-1", "--format=%s", "feat/x"],
+            "## Summary\n",
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let err = b
+            .refresh_pr_text(wd.path(), "dev.a8n.run", "contoso/claude-run", 7)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("## Summary")
+                || err.to_string().to_lowercase().contains("subject")
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr edit")),
+            "a bad subject must never reach fj pr edit: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_refuses_a_template_heading_subject_before_any_push() {
+        // CLAUDE-398: the branch strategy must reject a tip subject that is a
+        // template heading before pushing anything or calling `fj`.
+        let wd = tempfile::tempdir().unwrap();
+        let runner = with_branch_resolution(
+            StubRunner::new(),
+            "origin/main",
+            &["main", "feat/x"],
+            &[("feat/x", "abc123\n")],
+        );
+        let runner = runner.ok(
+            "git",
+            &["log", "-1", "--format=%s", "feat/x"],
+            "## Summary\n",
+        );
+        let runner = Arc::new(runner);
+        let b = CliBackend::new(runner.clone());
+        let err = b
+            .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("feat/x"), "{err}");
+        assert!(err.contains("## Summary"), "{err}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "no push before the subject guard runs: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("fj ")),
+            "no fj call before the subject guard runs: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn create_pr_agit_refuses_a_bare_issue_reference_subject_before_fj_runs() {
+        // CLAUDE-398: the AGit strategy must reject a tip subject that is a
+        // bare issue reference before invoking `fj`.
+        let runner = Arc::new(with_branch_resolution(
+            StubRunner::new().ok("git", &["log", "-1", "--format=%s", "HEAD"], "#MK-16\n"),
+            "origin/main",
+            &["main", "fix/x"],
+            &[("fix/x", "aaa\n")],
+        ));
+        let b = CliBackend::new(runner.clone());
+        let err = b
+            .create_pr(Path::new("/tmp/wd"), "dev.a8n.run", PrStrategy::Agit)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("#MK-16"), "{err}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("fj ")),
+            "no fj call before the subject guard runs: {calls:?}"
         );
     }
 
@@ -3504,12 +3848,16 @@ mod tests {
             &[("feat/x", "abc\n")],
         );
         // Remote branch absent, so the push is attempted (and fails).
-        let runner = Arc::new(with_remote_state(runner, "feat/x", "abc", "").fail(
-            "git",
-            &["push", "--set-upstream", "origin", "feat/x:feat/x"],
-            128,
-            "could not read Username",
-        ));
+        let runner = Arc::new(
+            with_remote_state(runner, "feat/x", "abc", "")
+                .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n")
+                .fail(
+                    "git",
+                    &["push", "--set-upstream", "origin", "feat/x:feat/x"],
+                    128,
+                    "could not read Username",
+                ),
+        );
         let b = CliBackend::new(runner.clone());
         match b
             .create_pr(wd.path(), "dev.a8n.run", PrStrategy::Branch)
@@ -3564,7 +3912,8 @@ mod tests {
             &["main", "feat/x"],
             &[("feat/x", "abc123\n")],
         );
-        let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n");
+        let runner = with_remote_state(runner, "feat/x", "abc123", "abc123\trefs/heads/feat/x\n")
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
         let runner = Arc::new(with_open_pr_search(
             runner,
             r#"[{"number":88,"head_ref":"feat/x","html_url":"https://dev.a8n.run/n/c/pulls/88"}]"#,
@@ -3725,6 +4074,11 @@ mod tests {
                 "feat/yotun-96:feat/yotun-96",
             ],
             "",
+        )
+        .ok(
+            "git",
+            &["log", "-1", "--format=%s", "feat/yotun-96"],
+            "feat: yotun\n",
         );
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
@@ -3791,7 +4145,8 @@ mod tests {
                 1,
                 "CONFLICT (content): Merge conflict in src/lib.rs",
             )
-            .ok("git", &["merge", "--abort"], "");
+            .ok("git", &["merge", "--abort"], "")
+            .ok("git", &["log", "-1", "--format=%s", "feat/x"], "feat: x\n");
         let runner = Arc::new(runner);
         let b = CliBackend::new(runner.clone());
         match b
@@ -4726,7 +5081,8 @@ mod tests {
                     "fj",
                     &["--host", "dev.a8n.run", "pr", "create", "-aA", "--json"],
                     r#"{"number":7,"html_url":"https://dev.a8n.run/n/c/pulls/7"}"#,
-                ),
+                )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n"),
             "origin/main",
             &["main", "fix/x"],
             &[("fix/x", "aaa\n")],
@@ -4953,7 +5309,8 @@ mod tests {
                     "git",
                     &["remote", "get-url", "origin"],
                     "https://dev.a8n.run/contoso/gadgets.git",
-                ),
+                )
+                .ok("git", &["log", "-1", "--format=%s", "HEAD"], "fix: x\n"),
             "origin/main",
             &["main", "fix/x"],
             &[("fix/x", "aaa\n")],

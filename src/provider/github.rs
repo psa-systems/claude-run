@@ -451,7 +451,15 @@ impl GithubForge {
     }
 
     /// Shared body for [`Forge::create_pr`] / [`Forge::create_pr_with_draft`].
-    fn create_pr_impl(&self, workdir: &Path, host: &str, draft: bool) -> Result<PullRequest> {
+    /// `body_override`, when `Some` (the timeout-salvage draft body,
+    /// CLAUDE-398), is written verbatim instead of the tip commit's own body.
+    fn create_pr_impl(
+        &self,
+        workdir: &Path,
+        host: &str,
+        draft: bool,
+        body_override: Option<&str>,
+    ) -> Result<PullRequest> {
         // GitHub has no AGit equivalent: PRs are always branch-backed, so the
         // branch-strategy selector does not apply here and is ignored.
         // Push the branch before opening the PR.
@@ -465,7 +473,13 @@ impl GithubForge {
         let branch = self.git(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
         let base = self.detect_base(workdir);
         let title = self.git(workdir, &["log", "-1", "--pretty=format:%s"])?;
-        let body = self.git(workdir, &["log", "-1", "--pretty=format:%b"])?;
+        let body = match body_override {
+            Some(b) => b.to_string(),
+            None => self.git(workdir, &["log", "-1", "--pretty=format:%b"])?,
+        };
+
+        // The subject guard (CLAUDE-398) runs before any push.
+        crate::provider::validate_pr_subject(&title, &branch)?;
 
         self.push(workdir, host, &repo, &branch)?;
 
@@ -522,7 +536,7 @@ impl Forge for GithubForge {
         host: &str,
         _strategy: crate::action::PrStrategy,
     ) -> Result<PullRequest> {
-        self.create_pr_impl(workdir, host, false)
+        self.create_pr_impl(workdir, host, false, None)
     }
 
     /// `draft` sets GitHub's real draft flag (CLAUDE-379 timeout salvage);
@@ -534,8 +548,9 @@ impl Forge for GithubForge {
         host: &str,
         _strategy: crate::action::PrStrategy,
         draft: bool,
+        body: Option<&str>,
     ) -> Result<PullRequest> {
-        self.create_pr_impl(workdir, host, draft)
+        self.create_pr_impl(workdir, host, draft, body)
     }
 
     /// `gh pr ready <number> --repo <repo>` clears the draft flag a
@@ -550,6 +565,95 @@ impl Forge for GithubForge {
         let number_str = pr_number.to_string();
         let args = ["pr", "ready", &number_str, "--repo", repo];
         let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        if !out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: args.join(" "),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// A no-op on a PR that is not a real GitHub draft: a non-draft adopted
+    /// PR is left untouched. Otherwise reads `HEAD`'s current subject/body
+    /// (the same read `create_pr_impl` does), validates the subject, and
+    /// overwrites the PR with `gh pr edit <number> --repo <repo> --title
+    /// <title> --body-file <path>` (CLAUDE-398).
+    fn refresh_pr_text(
+        &self,
+        workdir: &Path,
+        _host: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<()> {
+        let envs_ro: Vec<(&str, &str)> = match &self.token {
+            Some(t) => vec![("GH_TOKEN", t.as_str())],
+            None => Vec::new(),
+        };
+        let number_str = pr_number.to_string();
+        let view_args = [
+            "pr",
+            "view",
+            &number_str,
+            "--repo",
+            repo,
+            "--json",
+            "isDraft",
+        ];
+        let view_out = self
+            .runner
+            .run_in_env(None, &self.gh, &view_args, &envs_ro)?;
+        if !view_out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: view_args.join(" "),
+                exit_code: view_out.exit_code,
+                stderr: view_out.stderr.trim().to_string(),
+            });
+        }
+        let is_draft: serde_json::Value = serde_json::from_str(view_out.stdout.trim())
+            .map_err(|e| Error::Other(anyhow::anyhow!("gh pr view --json isDraft: {e}")))?;
+        if !is_draft
+            .get("isDraft")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let branch = self.git(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        let title = self.git(workdir, &["log", "-1", "--pretty=format:%s"])?;
+        crate::provider::validate_pr_subject(&title, &branch)?;
+        let body = self.git(workdir, &["log", "-1", "--pretty=format:%b"])?;
+
+        let envs: Vec<(&str, &str)> = match &self.token {
+            Some(t) => vec![("GH_TOKEN", t.as_str())],
+            None => Vec::new(),
+        };
+        let scratch = std::env::temp_dir().join(format!("claude-run-pr-refresh-{pr_number}.md"));
+        std::fs::write(&scratch, &body)?;
+        let scratch_arg = scratch.to_string_lossy().to_string();
+        let number_str = pr_number.to_string();
+        let args = [
+            "pr",
+            "edit",
+            &number_str,
+            "--repo",
+            repo,
+            "--title",
+            title.as_str(),
+            "--body-file",
+            scratch_arg.as_str(),
+        ];
+        let out = self.runner.run_in_env(None, &self.gh, &args, &envs);
+        if let Err(e) = std::fs::remove_file(&scratch) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::error!(path = %scratch.display(), error = %e, "removing the PR refresh scratch file failed");
+            }
+        }
+        let out = out?;
         if !out.ok {
             return Err(Error::CliFailed {
                 binary: self.gh.clone(),
@@ -1481,6 +1585,186 @@ mod tests {
             .ok("git", &["log", "-1", "--pretty=format:%s"], "feat: x")
             .ok("git", &["log", "-1", "--pretty=format:%b"], "body text")
             .ok("git", &push_args, "")
+    }
+
+    #[test]
+    fn create_pr_refuses_a_template_heading_subject_before_any_push() {
+        // CLAUDE-398: GitHub's create path must reject a tip subject that is
+        // a template heading before pushing.
+        let runner = Arc::new(
+            with_git(
+                StubRunner::new(),
+                "feat/x",
+                "https://github.com/octo/widget.git",
+            )
+            .ok("git", &["log", "-1", "--pretty=format:%s"], "## Summary"),
+        );
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        let err = forge
+            .create_pr(
+                Path::new("/tmp/wd"),
+                "github.com",
+                crate::action::PrStrategy::Branch,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("## Summary"), "{err}");
+        assert!(err.contains("feat/x"), "{err}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git push")),
+            "no push before the subject guard runs: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_pr_text_is_a_no_op_when_not_a_real_draft() {
+        // CLAUDE-398: a resumed-but-already-ready PR (isDraft: false) is left
+        // untouched; no git reads, no `gh pr edit`.
+        let runner = Arc::new(StubRunner::new().ok(
+            "gh",
+            &[
+                "pr",
+                "view",
+                "7",
+                "--repo",
+                "octo/widget",
+                "--json",
+                "isDraft",
+            ],
+            r#"{"isDraft":false}"#,
+        ));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        forge
+            .refresh_pr_text(Path::new("/tmp/wd"), "github.com", "octo/widget", 7)
+            .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr edit")),
+            "a non-draft PR must not be edited: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("git")),
+            "a non-draft PR's tip must never be read: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_pr_text_overwrites_a_draft_prs_title_and_body() {
+        // CLAUDE-398: a real GitHub draft (isDraft: true) gets its title and
+        // body overwritten from HEAD's current tip in one combined edit.
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "view",
+                        "7",
+                        "--repo",
+                        "octo/widget",
+                        "--json",
+                        "isDraft",
+                    ],
+                    r#"{"isDraft":true}"#,
+                )
+                .ok("git", &["rev-parse", "--abbrev-ref", "HEAD"], "feat/x")
+                .ok(
+                    "git",
+                    &["log", "-1", "--pretty=format:%s"],
+                    "feat: the real thing",
+                )
+                .ok(
+                    "git",
+                    &["log", "-1", "--pretty=format:%b"],
+                    "Finished.\n\n#MK-16",
+                )
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "edit",
+                        "7",
+                        "--repo",
+                        "octo/widget",
+                        "--title",
+                        "feat: the real thing",
+                        "--body-file",
+                        std::env::temp_dir()
+                            .join("claude-run-pr-refresh-7.md")
+                            .to_string_lossy()
+                            .as_ref(),
+                    ],
+                    "",
+                ),
+        );
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        forge
+            .refresh_pr_text(Path::new("/tmp/wd"), "github.com", "octo/widget", 7)
+            .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with(
+                "gh pr edit 7 --repo octo/widget --title feat: the real thing --body-file"
+            )),
+            "the draft PR must be overwritten with HEAD's own title and body: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_pr_text_refuses_a_template_heading_subject() {
+        // CLAUDE-398: the same subject guard `create_pr` applies also runs
+        // here, so a HEAD that regressed to a bad subject refuses rather
+        // than overwriting the PR with it.
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "view",
+                        "7",
+                        "--repo",
+                        "octo/widget",
+                        "--json",
+                        "isDraft",
+                    ],
+                    r#"{"isDraft":true}"#,
+                )
+                .ok("git", &["rev-parse", "--abbrev-ref", "HEAD"], "feat/x")
+                .ok("git", &["log", "-1", "--pretty=format:%s"], "## Summary"),
+        );
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        let err = forge
+            .refresh_pr_text(Path::new("/tmp/wd"), "github.com", "octo/widget", 7)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("## Summary"), "{err}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|c| c.contains("pr edit")),
+            "a bad subject must never reach gh pr edit: {calls:?}"
+        );
     }
 
     #[test]
