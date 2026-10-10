@@ -58,6 +58,7 @@ pub mod service_auth;
 pub mod settings;
 pub mod snippet;
 pub mod state;
+pub mod test_postgres;
 /// Test-only helpers shared across the unit tests.
 #[cfg(test)]
 pub mod testutil;

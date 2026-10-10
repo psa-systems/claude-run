@@ -17,7 +17,7 @@ use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
 use claude_run::{
     access, action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db,
-    exit, import, jsonfmt, lock, migrate, paint, secrets, settings, snippet, state,
+    exit, import, jsonfmt, lock, migrate, paint, secrets, settings, snippet, state, test_postgres,
 };
 
 /// `--color` choices. Maps to both `anstream` (our own output) and clap's
@@ -129,6 +129,25 @@ enum Cmd {
     /// (`CLAUDE_RUN_SECRETS_KEY_FILE`); no daemon required.
     #[command(subcommand)]
     Secret(SecretCmd),
+    /// Run `<command>` against a fresh, private, non-durable Postgres in the
+    /// Docker-in-Docker sidecar every agent session has, then stop the
+    /// container, however the command ends. Sweeps any earlier orphaned
+    /// container (owning pid no longer alive) first.
+    TestPostgres {
+        /// Postgres image to run. Default matches CI's own image; override to
+        /// match a repo that pins a different tag (e.g. app-server).
+        #[arg(long)]
+        image: Option<String>,
+        /// SQL file applied (with ON_ERROR_STOP) after durability is
+        /// disabled, in the order given. Repeatable.
+        #[arg(long = "init-sql")]
+        init_sql: Vec<PathBuf>,
+        /// The command to run, with `DATABASE_URL` and
+        /// `CLAUDE_RUN_TEST_DATABASE_URL` pointed at the throwaway Postgres.
+        /// Everything after `--`.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
     /// Import legacy `~/.local/share/claude-run/state/*.json` files into SQLite.
     Migrate {
         #[arg(long)]
@@ -436,6 +455,14 @@ async fn real_main(
         Cmd::Action(c) => action_cmd(c, &paths, &actions_dir, &db_target).await,
         Cmd::Access(c) => access_cmd(c, &paths, &db_target).await,
         Cmd::Secret(c) => secret_cmd(c, &db_target).await,
+        Cmd::TestPostgres {
+            image,
+            init_sql,
+            command,
+        } => {
+            let opts = test_postgres::Opts { image, init_sql };
+            claude_run::blocking::in_place(|| test_postgres::run(&opts, &command))
+        }
         Cmd::Migrate { from } => {
             let pool = db::open(&db_target).await?;
             let legacy = from.map(PathBuf::from).unwrap_or_else(|| {
@@ -1326,6 +1353,50 @@ mod tests {
             cli.cmd,
             Cmd::Access(AccessCmd::ResetTotp { username }) if username == "admin"
         ));
+    }
+
+    /// `test-postgres` takes `--image`, repeatable `--init-sql`, and collects
+    /// everything after `--` as the command, hyphens and all.
+    #[test]
+    fn test_postgres_parses_image_init_sql_and_trailing_command() {
+        let cli = Cli::try_parse_from([
+            "claude-run",
+            "test-postgres",
+            "--image",
+            "postgres:18.2-alpine3.23",
+            "--init-sql",
+            "a.sql",
+            "--init-sql",
+            "b.sql",
+            "--",
+            "cargo",
+            "test",
+            "--",
+            "--nocapture",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::TestPostgres {
+                image,
+                init_sql,
+                command,
+            } => {
+                assert_eq!(image.as_deref(), Some("postgres:18.2-alpine3.23"));
+                assert_eq!(
+                    init_sql,
+                    vec![PathBuf::from("a.sql"), PathBuf::from("b.sql")]
+                );
+                assert_eq!(
+                    command,
+                    vec!["cargo", "test", "--", "--nocapture"]
+                        .into_iter()
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                );
+            }
+            _ => panic!("expected test-postgres"),
+        }
+        assert!(Cli::try_parse_from(["claude-run", "test-postgres"]).is_err());
     }
 
     /// `import` takes its source from `--from` (defaulting to the
