@@ -674,6 +674,16 @@ pub fn authed_git_output(
     cmd.args(args).output()
 }
 
+/// Serializes every test (across modules) that mutates the process-wide
+/// `GIT_ALLOW_PROTOCOL` env var to drive a `git remote-ext` retry fixture
+/// (CLAUDE-396), so two such tests running on different threads never clobber
+/// each other's setting mid-test (mirrors `secrets::key_file_env_lock`).
+#[cfg(test)]
+pub(crate) fn git_allow_protocol_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Same per-invocation authentication as [`authed_git_output`], but through a
 /// [`CommandRunner`] so call sites built on it (notably [`cli::CliBackend`])
 /// stay testable against a [`cli::StubRunner`] instead of a real `git`.
@@ -1713,6 +1723,161 @@ mod tests {
         );
     }
 
+    /// `init_submodules_retrying` retries a transient failure (CLAUDE-396) via
+    /// a `git remote-ext` helper script that fails the first invocation and
+    /// forwards to `git-upload-pack` on the second, exercising the real
+    /// production function (not a stand-in closure) end to end.
+    #[test]
+    fn init_submodules_retries_once_and_succeeds_on_second_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = origin_with_submodule(tmp.path());
+        let workdir = tmp.path().join("plain_clone");
+        let out = std::process::Command::new("git")
+            .args(["clone", "-q", &url])
+            .arg(&workdir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let sub_origin = tmp.path().join("sub-origin");
+        let log = tmp.path().join("helper-calls.log");
+        let script = tmp.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho called >> {log}\nif [ $(wc -l < {log}) -eq 1 ]; then\n  echo 'simulated transient failure' >&2\n  exit 1\nfi\nexec git-upload-pack {sub_origin}\n",
+                log = log.display(),
+                sub_origin = sub_origin.display(),
+            ),
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let gitmodules = workdir.join(".gitmodules");
+        let rewritten = std::fs::read_to_string(&gitmodules)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("url =") {
+                    format!("\turl = ext::sh {}", script.display())
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&gitmodules, rewritten).unwrap();
+
+        // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
+        // widening it, so `file` (used by other tests' local-path remotes
+        // running concurrently) must stay listed alongside `ext`; the lock
+        // keeps this test's set/remove pair from racing another thread's.
+        let _guard = git_allow_protocol_test_lock();
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
+        let result = init_submodules_retrying(&url, &workdir, &NO_WAIT);
+        std::env::remove_var("GIT_ALLOW_PROTOCOL");
+
+        result.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("sub").join("s.txt")).unwrap(),
+            "s"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            2,
+            "submodule update must have been attempted exactly twice"
+        );
+    }
+
+    /// `restore_default_branch_refs_retrying` retries a transient `ls-remote`
+    /// failure (CLAUDE-396) via a `git remote-ext` helper script, exercising
+    /// the real production function end to end.
+    #[test]
+    fn restore_default_branch_refs_ls_remote_retries_once_and_succeeds_on_second_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg("-b")
+            .arg("main")
+            .arg(&origin)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["config", "user.email", "a@b.c"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["config", "user.name", "a"])
+            .output()
+            .unwrap();
+        std::fs::write(origin.join("f"), "x").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["add", "f"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["commit", "-q", "-m", "x"])
+            .output()
+            .unwrap();
+
+        let log = tmp.path().join("helper-calls.log");
+        let script = tmp.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho called >> {log}\nif [ $(wc -l < {log}) -eq 1 ]; then\n  echo 'simulated transient failure' >&2\n  exit 1\nfi\nexec git-upload-pack {origin}\n",
+                log = log.display(),
+                origin = origin.display(),
+            ),
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let url = format!("ext::sh {}", script.display());
+        let workdir = tmp.path().join("workdir");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
+        // widening it, so `file` stays listed alongside `ext`; the lock keeps
+        // this test's set/remove pair from racing another thread's.
+        let _guard = git_allow_protocol_test_lock();
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
+        let result = restore_default_branch_refs_retrying(&url, "other", &workdir, 50, &NO_WAIT);
+        std::env::remove_var("GIT_ALLOW_PROTOCOL");
+
+        // No local `origin` remote is configured in `workdir`, so the
+        // subsequent `fetch`/`remote set-head` step fails; only the
+        // `ls-remote` retry itself is under test here.
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            2,
+            "ls-remote must have been attempted exactly twice"
+        );
+    }
+
     // ---- post-clone credential scrub -------------
 
     /// `file://user:pass@localhost/abs/path` round-trips through git exactly
@@ -2132,6 +2297,15 @@ mod tests {
             .arg("-q")
             .arg("--bare")
             .arg(&origin)
+            .output()
+            .unwrap();
+        // Pin HEAD to `main` regardless of the host git's configured
+        // default branch name, so the seeded push below lands on the
+        // branch the bare repo's HEAD actually resolves to.
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
             .output()
             .unwrap();
         // Seed a commit so the clone itself can succeed on retry.

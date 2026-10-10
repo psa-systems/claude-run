@@ -4778,4 +4778,68 @@ mod tests {
             "the event-type filter runs after replay protection, so a redelivered ping still 409s"
         );
     }
+
+    /// `git_push` retries a transient failure (CLAUDE-396) via a
+    /// `git remote-ext` helper script that fails the first invocation and
+    /// forwards to `git-receive-pack` on the second, exercising the real
+    /// retry path end to end rather than a stub.
+    #[test]
+    fn git_push_retries_once_and_succeeds_on_second_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("origin.git");
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .output()
+            .unwrap();
+
+        let workdir = tmp.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        git_in(&workdir, &["init", "-q", "-b", "main"]).unwrap();
+        git_in(&workdir, &["config", "user.email", "a@b.c"]).unwrap();
+        git_in(&workdir, &["config", "user.name", "a"]).unwrap();
+        std::fs::write(workdir.join("f"), "x").unwrap();
+        git_in(&workdir, &["add", "f"]).unwrap();
+        git_in(&workdir, &["commit", "-q", "-m", "x"]).unwrap();
+
+        let log = tmp.path().join("helper-calls.log");
+        let script = tmp.path().join("helper.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho called >> {log}\nif [ $(wc -l < {log}) -eq 1 ]; then\n  echo 'simulated transient failure' >&2\n  exit 1\nfi\nexec git-receive-pack {bare}\n",
+                log = log.display(),
+                bare = bare.display(),
+            ),
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let url = format!("ext::sh {}", script.display());
+
+        // `GIT_ALLOW_PROTOCOL` replaces git's default allowlist rather than
+        // widening it, so `file` (used by other tests' local-path remotes
+        // running concurrently) must stay listed alongside `ext`; the lock
+        // keeps this test's set/remove pair from racing another thread's.
+        let _guard = crate::provider::git_allow_protocol_test_lock();
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file:ext");
+        let result = git_push(&workdir, &url, "main");
+        std::env::remove_var("GIT_ALLOW_PROTOCOL");
+
+        result.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            2,
+            "push must have been attempted exactly twice"
+        );
+    }
 }
