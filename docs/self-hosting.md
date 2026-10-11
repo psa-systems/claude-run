@@ -63,7 +63,7 @@ agent is never told to push, open PRs, or transition issue state.
 
 | Volume              | Container path   | Purpose                                                                                                    |
 |---------------------|------------------|------------------------------------------------------------------------------------------------------------|
-| `claude-bot-config` | `/config`        | `config.toml`, `actions/`, `secrets.key`, `claude-agent-home/` (the agent's Claude login), `youtrack-cli/` (`yt`), `git/` (commit identity) |
+| `claude-bot-config` | `/config`        | `config.toml`, `actions/`, `secrets.key`, `claude-agent-home/` (the agent's Claude login), `youtrack-cli/` (`yt`), `git/` (commit identity and the `fj auth git-credential` stanza for the Forgejo host) |
 | `claude-bot-data`   | `/data`          | `state.db` (runs, outcomes, the encrypted secrets store; unused on the `postgres` profile), per-job `workdirs/`, `forgejo-cli/` (`fj` keys) |
 | `claude-bot-state`  | `/state`         | logs and per-attempt stream JSONL                                                                          |
 | tmpfs               | `/run/claude-run`| pidfile; ephemeral so nothing stale survives a restart                                                     |

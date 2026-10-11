@@ -174,7 +174,12 @@ pub async fn materialize(
         .git_author_email
         .clone()
         .unwrap_or_else(|| DEFAULT_GIT_AUTHOR_EMAIL.to_string());
-    write_git_config(&git_config_path(paths), &git_author_name, &git_author_email)?;
+    write_git_config(
+        &git_config_path(paths),
+        &git_author_name,
+        &git_author_email,
+        cfg.forgejo_host.as_deref(),
+    )?;
     status.git_author_name = git_author_name;
     status.git_author_email = git_author_email;
 
@@ -372,17 +377,39 @@ fn write_yt_config(path: &Path, base_url: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write the minimal `[user]` git config block `GIT_CONFIG_GLOBAL` names, 0600
-/// like [`write_yt_config`]'s output (not a credential, but the file also has
-/// no reason to be group- or world-readable).
-fn write_git_config(path: &Path, name: &str, email: &str) -> Result<()> {
+/// Write the `[user]` git config block `GIT_CONFIG_GLOBAL` names, 0600 like
+/// [`write_yt_config`]'s output. With a Forgejo host, also scope `fj auth
+/// git-credential` to that host so the agent's plain `git` authenticates from
+/// `keys.json` (CLAUDE-411). The file never holds a token.
+fn write_git_config(
+    path: &Path,
+    name: &str,
+    email: &str,
+    forgejo_host: Option<&str>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    crate::secrets::write_0600(
-        path,
-        format!("[user]\n\tname = {name}\n\temail = {email}\n").as_bytes(),
-    )?;
+    let mut body = format!("[user]\n\tname = {name}\n\temail = {email}\n");
+    if let Some(host) = forgejo_host {
+        let host = host.trim();
+        // The host lands inside a quoted config subsection header: reject
+        // anything that could close it or start a new line.
+        if host.is_empty()
+            || host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\\' | '[' | ']'))
+        {
+            return Err(crate::error::Error::Other(anyhow::anyhow!(
+                "forgejo_host {host:?} is not a bare host; refusing to write it into the git config"
+            )));
+        }
+        // The empty `helper =` clears any inherited helper list for this host.
+        body.push_str(&format!(
+            "[credential \"https://{host}\"]\n\thelper =\n\thelper = !fj auth git-credential\n"
+        ));
+    }
+    crate::secrets::write_0600(path, body.as_bytes())?;
     Ok(())
 }
 
@@ -589,6 +616,150 @@ mod tests {
             body,
             "[user]\n\tname = Ops Bot\n\temail = ops@example.com\n"
         );
+    }
+
+    fn forgejo_cfg(host: &str) -> AuthConfig {
+        AuthConfig {
+            forgejo_host: Some(host.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// With a Forgejo host the stanza follows the `[user]` block, the file stays
+    /// 0600, and a host change rewrites it on the next materialize (CLAUDE-411).
+    #[tokio::test]
+    async fn forgejo_host_writes_the_credential_stanza_and_a_new_host_rewrites_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let pool = crate::db::test_pool().await;
+        let fj_data = tmp.path().join("fj-data");
+
+        materialize(
+            &pool,
+            &paths,
+            &forgejo_cfg("forge.example.com"),
+            &fj_data,
+            "gh",
+        )
+        .await
+        .unwrap();
+        let body = std::fs::read_to_string(git_config_path(&paths)).unwrap();
+        assert_eq!(
+            body,
+            "[user]\n\tname = claude-run\n\temail = claude-run@a8n.run\n\
+             [credential \"https://forge.example.com\"]\n\thelper =\n\
+             \thelper = !fj auth git-credential\n"
+        );
+        let mode = std::fs::metadata(git_config_path(&paths))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        materialize(
+            &pool,
+            &paths,
+            &forgejo_cfg("other.example.org"),
+            &fj_data,
+            "gh",
+        )
+        .await
+        .unwrap();
+        let body = std::fs::read_to_string(git_config_path(&paths)).unwrap();
+        assert!(body.contains("[credential \"https://other.example.org\"]"));
+        assert!(!body.contains("forge.example.com"));
+    }
+
+    /// A host that could close the quoted subsection header or start a new
+    /// config line fails loudly instead of landing in the file.
+    #[test]
+    fn write_git_config_rejects_a_host_that_is_not_bare() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("git").join("config");
+        for bad in [
+            "",
+            "a\"]\n[core]\n\tpager = x",
+            "host name",
+            "host]",
+            "back\\slash",
+        ] {
+            let err = write_git_config(&path, "n", "e", Some(bad)).unwrap_err();
+            assert!(
+                err.to_string().contains("not a bare host"),
+                "{bad:?}: {err}"
+            );
+            assert!(!path.exists(), "{bad:?} must not leave a partial file");
+        }
+    }
+
+    /// Real `git credential fill` through the written config: the stub `fj`
+    /// answers for the configured host, and git never asks it about another.
+    #[test]
+    fn git_credential_fill_uses_the_fj_helper_for_the_configured_host_only() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        crate::testutil::write_stub(
+            &bin.join("fj"),
+            "#!/bin/sh\n\
+             [ \"$1 $2 $3\" = \"auth git-credential get\" ] || exit 2\n\
+             cat >/dev/null\n\
+             printf 'username=fixture-user\\npassword=fixture-pass\\n'\n",
+        );
+        let cfg = tmp.path().join("git-config");
+        write_git_config(&cfg, "n", "e", Some("forge.example.com")).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let fill = |host: &str| {
+            let mut child = Command::new("git")
+                .args(["credential", "fill"])
+                .env("PATH", &path)
+                .env("GIT_CONFIG_GLOBAL", &cfg)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
+                .env("HOME", tmp.path().join("home"))
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("GIT_ASKPASS")
+                .env_remove("SSH_ASKPASS")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!("protocol=https\nhost={host}\n\n").as_bytes())
+                .unwrap();
+            child.wait_with_output().unwrap()
+        };
+
+        let hit = fill("forge.example.com");
+        let out = String::from_utf8_lossy(&hit.stdout);
+        assert!(
+            hit.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&hit.stderr)
+        );
+        assert!(out.contains("username=fixture-user"), "{out}");
+        assert!(out.contains("password=fixture-pass"), "{out}");
+
+        let miss = fill("elsewhere.example.net");
+        assert!(
+            !miss.status.success(),
+            "a host outside the stanza must get no credential: {}",
+            String::from_utf8_lossy(&miss.stdout)
+        );
+        assert!(!String::from_utf8_lossy(&miss.stdout).contains("fixture-pass"));
     }
 
     /// `gh_login` passes the documented flag set, points `GH_CONFIG_DIR`
