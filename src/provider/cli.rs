@@ -25,10 +25,12 @@ struct PrSearchResponse {
     pull_requests: Vec<ForgePullRequest>,
 }
 
-/// Wait before attempts 2, 3 and 4 of a retried read-only `fj` call
-/// (CLAUDE-366): the first retry runs immediately, then 2s, then 5s, for a
-/// worst-case added delay of 7s across four attempts total.
-const DEFAULT_FJ_READ_RETRY_WAITS: [Duration; 3] = [
+/// Wait before attempts 2, 3 and 4 of a retried read-only CLI call
+/// (CLAUDE-366, CLAUDE-407): the first retry runs immediately, then 2s, then
+/// 5s, for a worst-case added delay of 7s across four attempts total. Shared
+/// by every binary-neutral read-retry caller (`fj` and `gh` reads alike) so
+/// there is one copy of the schedule.
+pub(crate) const DEFAULT_READ_RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(0),
     Duration::from_secs(2),
     Duration::from_secs(5),
@@ -54,47 +56,48 @@ fn stderr_tail(stderr: &str) -> &str {
         .unwrap_or("no stderr")
 }
 
-/// Run a read-only `fj` invocation with up to four attempts total, waiting
-/// `waits[0]` / `waits[1]` / `waits[2]` before attempts 2, 3 and 4 (CLAUDE-366).
-/// A failed attempt is a runner `Ok(out)` with `!out.ok`: any non-zero exit is
-/// retried on the exit code alone, never by classifying `stderr`'s wording
-/// (forbidden by `tooling-gap-discipline`), because every read-only `fj` call is
-/// idempotent and a deterministic failure (404, 401) only costs the wait time. A
-/// runner `Err` (a spawn failure, `CliNotFound`) is not retried, since it cannot
-/// be transient. Only the last attempt's outcome is returned; the caller
-/// converts it to `Error::CliFailed` exactly as it did before this call could
-/// retry.
-fn run_fj_read_retrying(
+/// Run a read-only CLI invocation with up to four attempts total, waiting
+/// `waits[0]` / `waits[1]` / `waits[2]` before attempts 2, 3 and 4 (CLAUDE-366,
+/// generalized beyond `fj` in CLAUDE-407). A failed attempt is a runner
+/// `Ok(out)` with `!out.ok`: any non-zero exit is retried on the exit code
+/// alone, never by classifying `stderr`'s wording (forbidden by
+/// `tooling-gap-discipline`), because every read-only call routed through here
+/// is idempotent and a deterministic failure (404, 401) only costs the wait
+/// time. A runner `Err` (a spawn failure, `CliNotFound`) is not retried, since
+/// it cannot be transient. Only the last attempt's outcome is returned; the
+/// caller converts it to `Error::CliFailed` exactly as it did before this call
+/// could retry. `binary` names the CLI (`fj` or `gh`) for the log line only.
+pub(crate) fn run_read_retrying(
     runner: &dyn CommandRunner,
-    fj: &str,
+    binary: &str,
     dir: Option<&Path>,
     args: &[&str],
     envs: &[(&str, &str)],
     waits: &[Duration; 3],
 ) -> Result<CmdOutput> {
-    let mut out = runner.run_in_env(dir, fj, args, envs)?;
+    let mut out = runner.run_in_env(dir, binary, args, envs)?;
     for (idx, wait) in waits.iter().enumerate() {
         if out.ok {
             return Ok(out);
         }
         let attempt = idx as u32 + 1;
         warn!(
-            binary = %fj,
+            binary = %binary,
             args = %args.join(" "),
             attempt,
             stderr = %stderr_tail(&out.stderr),
-            "read-only fj call failed; retrying"
+            "read-only call failed; retrying"
         );
         if !wait.is_zero() {
             crate::blocking::in_place(|| std::thread::sleep(*wait));
         }
-        out = runner.run_in_env(dir, fj, args, envs)?;
+        out = runner.run_in_env(dir, binary, args, envs)?;
         if out.ok {
             info!(
-                binary = %fj,
+                binary = %binary,
                 args = %args.join(" "),
                 attempt = attempt + 1,
-                "read-only fj call succeeded after a retry"
+                "read-only call succeeded after a retry"
             );
         }
     }
@@ -473,7 +476,7 @@ pub struct CliBackend {
     /// Drained by [`Forge::take_notices`] and persisted as run events.
     notices: std::sync::Mutex<Vec<String>>,
     /// Wait schedule for a retried read-only `fj` call (CLAUDE-366). Defaults to
-    /// [`DEFAULT_FJ_READ_RETRY_WAITS`]; overridable so tests run with no delay.
+    /// [`DEFAULT_READ_RETRY_WAITS`]; overridable so tests run with no delay.
     fj_read_retry_waits: [Duration; 3],
     /// Wait schedule for a retried git network call (CLAUDE-396). Defaults to
     /// [`crate::provider::GIT_NETWORK_RETRY_WAITS`]; overridable so tests run
@@ -613,7 +616,7 @@ impl CliBackend {
             yt_env: Vec::new(),
             fj_env: Vec::new(),
             notices: std::sync::Mutex::new(Vec::new()),
-            fj_read_retry_waits: DEFAULT_FJ_READ_RETRY_WAITS,
+            fj_read_retry_waits: DEFAULT_READ_RETRY_WAITS,
             git_retry_waits: crate::provider::GIT_NETWORK_RETRY_WAITS,
         }
     }
@@ -668,7 +671,7 @@ impl CliBackend {
         args: &[&str],
         envs: &[(&str, &str)],
     ) -> Result<CmdOutput> {
-        run_fj_read_retrying(
+        run_read_retrying(
             self.runner.as_ref(),
             &self.fj,
             dir,
@@ -2188,7 +2191,7 @@ pub struct FjForgeReads {
     runner: Arc<dyn CommandRunner>,
     fj: String,
     /// Wait schedule for a retried read (CLAUDE-366); see
-    /// [`DEFAULT_FJ_READ_RETRY_WAITS`].
+    /// [`DEFAULT_READ_RETRY_WAITS`].
     fj_read_retry_waits: [Duration; 3],
 }
 
@@ -2198,7 +2201,7 @@ impl FjForgeReads {
         Self {
             runner,
             fj: "fj".to_string(),
-            fj_read_retry_waits: DEFAULT_FJ_READ_RETRY_WAITS,
+            fj_read_retry_waits: DEFAULT_READ_RETRY_WAITS,
         }
     }
 
@@ -2217,7 +2220,7 @@ impl FjForgeReads {
     /// Every call this client makes is a read (CLAUDE-366): actions logs,
     /// actions runs, and repo file fetches never change forge state.
     fn run_fj_read(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<CmdOutput> {
-        run_fj_read_retrying(
+        run_read_retrying(
             self.runner.as_ref(),
             &self.fj,
             None,
@@ -4594,7 +4597,7 @@ mod tests {
     #[test]
     fn default_fj_read_retry_waits_are_0s_2s_5s() {
         assert_eq!(
-            DEFAULT_FJ_READ_RETRY_WAITS,
+            DEFAULT_READ_RETRY_WAITS,
             [
                 Duration::from_secs(0),
                 Duration::from_secs(2),
