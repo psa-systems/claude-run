@@ -340,5 +340,5 @@ and one Pause switch, each keyed by its own `sources.<name>` entry.
    source, so a failing workflow run should still produce a `verified action_run_failure received` log line
    carrying the right `source` field.
 
-Fetching a GitHub-hosted run's own log (the text the triage classifier reads) is not yet implemented; see the
-`GitHub log fetch is out of scope for CLAUDE-362` note in `actions/SCHEMA.md`.
+Fetching a GitHub-hosted run's own log (the text the triage classifier reads) goes over `gh`/the GitHub API for a
+`github.com` host; see the `GitHub log fetch (CLAUDE-363)` note in `actions/SCHEMA.md`.
