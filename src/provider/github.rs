@@ -3153,6 +3153,121 @@ mod tests {
         assert_eq!(runner.calls.lock().unwrap().len(), 4);
     }
 
+    /// `gh pr create` is a write (CLAUDE-407): a failed open runs exactly
+    /// once, never retried, since retrying risks a duplicate PR.
+    #[test]
+    fn open_via_gh_runs_exactly_once_on_failure() {
+        let runner = Arc::new(StubRunner::new().fail(
+            "gh",
+            &[
+                "pr",
+                "create",
+                "--head",
+                "feat/x",
+                "--base",
+                "main",
+                "--title",
+                "feat: x",
+                "--body",
+                "body text",
+            ],
+            1,
+            "boom",
+        ));
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        assert!(forge
+            .open_via_gh(
+                Path::new("/tmp/wd"),
+                "feat/x",
+                "main",
+                "feat: x",
+                "body text",
+                false,
+            )
+            .is_err());
+        let gh_calls = runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("gh pr create"))
+            .count();
+        assert_eq!(gh_calls, 1);
+    }
+
+    /// The `gh pr edit` half of `refresh_pr_text` is a write (CLAUDE-407): a
+    /// failed edit runs exactly once, never retried.
+    #[test]
+    fn refresh_pr_text_edit_runs_exactly_once_on_failure() {
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "gh",
+                    &[
+                        "pr",
+                        "view",
+                        "7",
+                        "--repo",
+                        "octo/widget",
+                        "--json",
+                        "isDraft",
+                    ],
+                    r#"{"isDraft":true}"#,
+                )
+                .ok("git", &["rev-parse", "--abbrev-ref", "HEAD"], "feat/x")
+                .ok(
+                    "git",
+                    &["log", "-1", "--pretty=format:%s"],
+                    "feat: the real thing",
+                )
+                .ok(
+                    "git",
+                    &["log", "-1", "--pretty=format:%b"],
+                    "Finished.\n\n#MK-16",
+                )
+                .fail(
+                    "gh",
+                    &[
+                        "pr",
+                        "edit",
+                        "7",
+                        "--repo",
+                        "octo/widget",
+                        "--title",
+                        "feat: the real thing",
+                        "--body-file",
+                        std::env::temp_dir()
+                            .join("claude-run-pr-refresh-7.md")
+                            .to_string_lossy()
+                            .as_ref(),
+                    ],
+                    1,
+                    "boom",
+                ),
+        );
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        assert!(forge
+            .refresh_pr_text(Path::new("/tmp/wd"), "github.com", "octo/widget", 7)
+            .is_err());
+        let edit_calls = runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("gh pr edit"))
+            .count();
+        assert_eq!(edit_calls, 1);
+    }
+
     // ---- CLAUDE-407: GhForgeReads read-retry parity ------------------------
 
     #[test]
