@@ -114,7 +114,7 @@
       <tr>
         <td class="mono dim">{{ r.ts|datetime }}</td>
         <td class="mono">{{ r.action }}</td>
-        <td class="mono">{{ r.job_key }}</td>
+        <td class="mono">{% if let Some(href) = r.job_href %}<a href="{{ href }}" target="_blank" rel="noopener">{{ r.job_key }}</a>{% else %}{{ r.job_key }}{% endif %}</td>
         <td class="mono">{{ r.outcome }}</td>
         <td class="mono">{{ r.five_hour_pct }}</td>
         <td class="mono">{{ r.seven_day_pct }}</td>

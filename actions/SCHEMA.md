@@ -18,7 +18,7 @@ name: <kebab-id>            # required
 kind: scripted              # optional: scripted (default) | youtrack | closed-issue-summary
 enabled: true               # optional, default true; false skips the action in the scheduler
 workdir_base: /path/to/dir  # optional, overrides $CLAUDE_RUN_WORKDIR_BASE for this action
-link_template: https://tracker.example.com/issue/{key}  # optional override; {key} -> job key (render_link). Default for YouTrack actions: the Settings -> Auth card's YouTrack URL + /issue/{key}
+link_template: https://tracker.example.com/issue/{key}  # optional override; {key} -> job key (render_link). Default for YouTrack actions: the Settings -> Auth card's YouTrack URL + /issue/{key}. Drives every tracker-keyed job-key link in the web UI: the run-detail tables, the Dashboard's dependency-gate and attempt-cap banners (Issue/Job columns and the gate's blocker keys), /logs (Context column and the row's own key inside Message), the usage report's Job key column, and the job stream page's heading/breadcrumb.
 input:
   command: |                # required, nu snippet, stdout = JSON array
     #!/usr/bin/env nu

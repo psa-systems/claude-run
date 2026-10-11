@@ -1280,7 +1280,7 @@ struct DashboardTpl {
     stale_gates: Vec<StaleGateRow>,
     /// Keys parked at their action's per-key attempt cap. Empty
     /// renders no banner.
-    attempt_cap_hits: Vec<state::CappedKey>,
+    attempt_cap_hits: Vec<CappedKeyRow>,
     /// Whitelisted sort + filter selection, echoed into the header
     /// sort links, filter dropdowns, poll URL, and pagination links so the
     /// chosen view survives the morph poll.
@@ -1297,6 +1297,10 @@ struct DashboardTpl {
 /// dashboard banner.
 struct StaleGateRow {
     gate: state::StaleGate,
+    /// The gate's action's effective link template (`action_link_template`),
+    /// resolved once per page render. `None` when the key has no resolvable
+    /// link; the Issue column and every blocker then render as plain text.
+    link_template: Option<String>,
 }
 
 impl StaleGateRow {
@@ -1308,8 +1312,18 @@ impl StaleGateRow {
         &self.gate.job_key
     }
 
-    fn signature(&self) -> &str {
-        &self.gate.signature
+    /// Link for the gate's own held issue, or `None` to render it as plain
+    /// text.
+    fn href(&self) -> Option<String> {
+        self.link_template
+            .as_deref()
+            .map(|t| crate::action::render_link(t, &self.gate.job_key))
+    }
+
+    /// The blocker signature with each leading key token linked; see
+    /// [`render_blocker_signature`].
+    fn blockers_html(&self) -> String {
+        render_blocker_signature(&self.gate.signature, self.link_template.as_deref())
     }
 
     fn updated_at(&self) -> &str {
@@ -1331,6 +1345,44 @@ impl StaleGateRow {
     /// How long the re-check has been overdue (rendered only when it is).
     fn recheck_overdue_for(&self) -> String {
         format_duration_ms(self.gate.recheck_overdue_ms)
+    }
+}
+
+/// One key parked at its action's attempt cap, with its link template
+/// resolved for the dashboard banner.
+struct CappedKeyRow {
+    capped: state::CappedKey,
+    /// The key's action's effective link template, resolved once per page
+    /// render. `None` when the key has no resolvable link.
+    link_template: Option<String>,
+}
+
+impl CappedKeyRow {
+    fn action_name(&self) -> &str {
+        &self.capped.action_name
+    }
+
+    fn job_key(&self) -> &str {
+        &self.capped.job_key
+    }
+
+    fn count(&self) -> i64 {
+        self.capped.count
+    }
+
+    fn cap(&self) -> i64 {
+        self.capped.cap
+    }
+
+    fn last_at(&self) -> &str {
+        &self.capped.last_at
+    }
+
+    /// Link for the parked key, or `None` to render it as plain text.
+    fn href(&self) -> Option<String> {
+        self.link_template
+            .as_deref()
+            .map(|t| crate::action::render_link(t, &self.capped.job_key))
     }
 }
 
@@ -1662,12 +1714,9 @@ async fn dashboard(
     // nothing reaches the run history either. Read the live gate table so a block
     // that outlives its promised re-evaluation is on screen instead of waiting
     // for someone to notice a stale issue by hand.
-    let stale_gates: Vec<StaleGateRow> =
+    let stale_gates_raw =
         state::dependency_gates_stale(pool, state::now_epoch_ms(), state::STALE_GATE_AFTER_MS, 20)
-            .await?
-            .into_iter()
-            .map(|gate| StaleGateRow { gate })
-            .collect();
+            .await?;
 
     // The sibling silent no-dispatch condition. A key at its
     // action's `max_attempts_per_key` is skipped on every poll with no outcome
@@ -1677,13 +1726,50 @@ async fn dashboard(
     let index_rows = state::action_index_list(pool).await?;
     let defaults = crate::job::RunnerDefaults::default();
     let caps = crate::blocking::in_place(|| crate::job::attempt_caps(&index_rows, &defaults));
-    let attempt_cap_hits = state::attempt_cap_hits(
+    let attempt_cap_hits_raw = state::attempt_cap_hits(
         pool,
         &caps,
         defaults.max_attempts_per_key,
         state::ATTEMPT_CAP_HITS_LIMIT,
     )
     .await?;
+
+    // Resolve each distinct action's effective link template once, shared by
+    // the gate and parked-key banners (same resolution rule as run-detail).
+    let base = s.api.settings.auth_config().await.youtrack_base_url;
+    let actions_dir = s.paths.actions_dir();
+    let mut link_templates: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for name in stale_gates_raw
+        .iter()
+        .map(|g| g.action_name.as_str())
+        .chain(attempt_cap_hits_raw.iter().map(|c| c.action_name.as_str()))
+    {
+        if !link_templates.contains_key(name) {
+            let t = action_link_template(pool, &actions_dir, name, base.as_deref()).await;
+            link_templates.insert(name.to_string(), t);
+        }
+    }
+    let stale_gates: Vec<StaleGateRow> = stale_gates_raw
+        .into_iter()
+        .map(|gate| {
+            let link_template = link_templates.get(&gate.action_name).cloned().flatten();
+            StaleGateRow {
+                gate,
+                link_template,
+            }
+        })
+        .collect();
+    let attempt_cap_hits: Vec<CappedKeyRow> = attempt_cap_hits_raw
+        .into_iter()
+        .map(|capped| {
+            let link_template = link_templates.get(&capped.action_name).cloned().flatten();
+            CappedKeyRow {
+                capped,
+                link_template,
+            }
+        })
+        .collect();
 
     let tpl = DashboardTpl {
         version: s.api.version,
@@ -2096,11 +2182,29 @@ async fn fetch_run_events(
     Ok(q.bind(limit).bind(offset).fetch_all(pool).await?)
 }
 
+/// One `/logs` row, with its Context link and linked-message HTML
+/// pre-rendered: the row's own `context` key is linked wherever it appears in
+/// the Context column and inside the free-text Message column (not any
+/// key-shaped token), everything else HTML-escaped.
+struct EventRow {
+    ts: String,
+    level: String,
+    action_name: String,
+    context: Option<String>,
+    run_id: Option<i64>,
+    /// Link for the Context column, or `None` to render the context as plain
+    /// text.
+    href: Option<String>,
+    /// The Message column, already HTML-escaped and with the row's own
+    /// context key linked; rendered with `|safe`.
+    message_html: String,
+}
+
 #[derive(Template)]
 #[template(path = "logs.html")]
 struct LogsTpl {
     version: &'static str,
-    events: Vec<state::RunEventLogRecord>,
+    events: Vec<EventRow>,
     page: PageNav,
     view: EventsView,
     level_options: Vec<String>,
@@ -2195,8 +2299,44 @@ async fn logs(State(s): State<WebState>, Query(q): Query<LogsQuery>) -> Result<R
     let total_pages = ((total + EVENTS_PAGE_SIZE - 1) / EVENTS_PAGE_SIZE).max(1);
     let page = q.page.unwrap_or(1).clamp(1, total_pages);
     let offset = (page - 1) * EVENTS_PAGE_SIZE;
-    let events =
+    let events_raw =
         fetch_run_events(pool, &view, started_at.as_deref(), EVENTS_PAGE_SIZE, offset).await?;
+
+    // Resolve each distinct action's effective link template once, same rule
+    // as every other site in the table.
+    let base = s.api.settings.auth_config().await.youtrack_base_url;
+    let actions_dir = s.paths.actions_dir();
+    let mut link_templates: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for name in events_raw.iter().map(|e| e.action_name.as_str()) {
+        if !link_templates.contains_key(name) {
+            let t = action_link_template(pool, &actions_dir, name, base.as_deref()).await;
+            link_templates.insert(name.to_string(), t);
+        }
+    }
+    let events: Vec<EventRow> = events_raw
+        .into_iter()
+        .map(|e| {
+            let template = link_templates.get(&e.action_name).cloned().flatten();
+            let href = match (&e.context, &template) {
+                (Some(ctx), Some(t)) if !ctx.is_empty() => Some(crate::action::render_link(t, ctx)),
+                _ => None,
+            };
+            let message_html = match &e.context {
+                Some(ctx) if !ctx.is_empty() => link_message(&e.message, ctx, template.as_deref()),
+                _ => html_escape(&e.message),
+            };
+            EventRow {
+                ts: e.ts,
+                level: e.level,
+                action_name: e.action_name,
+                context: e.context,
+                run_id: e.run_id,
+                href,
+                message_html,
+            }
+        })
+        .collect();
     let page_nav = PageNav {
         page,
         total_pages,
@@ -2274,6 +2414,9 @@ struct RecentInvocationRow {
     ts: String,
     action: String,
     job_key: String,
+    /// Link for the Job key column, or `None` to render it as plain text
+    /// (no key, no resolvable link template).
+    job_href: Option<String>,
     outcome: String,
     five_hour_pct: String,
     seven_day_pct: String,
@@ -2394,33 +2537,57 @@ async fn reports_page(
 
     let usage = crate::report::claude_usage(pool, range, action_filter).await?;
     let usage_chart = (!usage.points.is_empty()).then(|| build_usage_chart(&usage.points));
+
+    // Resolve each distinct action's effective link template once, same rule
+    // as every other site in the table.
+    let base = s.api.settings.auth_config().await.youtrack_base_url;
+    let actions_dir = s.paths.actions_dir();
+    let mut link_templates: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for name in usage.recent.iter().map(|r| r.action.as_str()) {
+        if !link_templates.contains_key(name) {
+            let t = action_link_template(pool, &actions_dir, name, base.as_deref()).await;
+            link_templates.insert(name.to_string(), t);
+        }
+    }
+
     let usage_recent = usage
         .recent
         .iter()
-        .map(|r| RecentInvocationRow {
-            ts: r.ts.clone(),
-            action: r.action.clone(),
-            job_key: r.job_key.clone().unwrap_or_else(|| "-".to_string()),
-            outcome: if r.timed_out {
-                "timed out".to_string()
-            } else if r.ok {
-                "ok".to_string()
-            } else {
-                "failed".to_string()
-            },
-            five_hour_pct: r
-                .five_hour_utilization
-                .map(|u| format!("{:.0}%", u * 100.0))
-                .unwrap_or_else(|| "-".to_string()),
-            seven_day_pct: r
-                .seven_day_utilization
-                .map(|u| format!("{:.0}%", u * 100.0))
-                .unwrap_or_else(|| "-".to_string()),
-            status: r
-                .rate_limit_status
-                .clone()
-                .unwrap_or_else(|| "-".to_string()),
-            api_retries: r.api_retries,
+        .map(|r| {
+            let job_href = r.job_key.as_deref().and_then(|k| {
+                link_templates
+                    .get(r.action.as_str())
+                    .cloned()
+                    .flatten()
+                    .map(|t| crate::action::render_link(&t, k))
+            });
+            RecentInvocationRow {
+                ts: r.ts.clone(),
+                action: r.action.clone(),
+                job_key: r.job_key.clone().unwrap_or_else(|| "-".to_string()),
+                job_href,
+                outcome: if r.timed_out {
+                    "timed out".to_string()
+                } else if r.ok {
+                    "ok".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                five_hour_pct: r
+                    .five_hour_utilization
+                    .map(|u| format!("{:.0}%", u * 100.0))
+                    .unwrap_or_else(|| "-".to_string()),
+                seven_day_pct: r
+                    .seven_day_utilization
+                    .map(|u| format!("{:.0}%", u * 100.0))
+                    .unwrap_or_else(|| "-".to_string()),
+                status: r
+                    .rate_limit_status
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+                api_retries: r.api_retries,
+            }
         })
         .collect();
 
@@ -5504,6 +5671,127 @@ fn effective_link_template(
     })
 }
 
+/// Resolve one action's effective link template: its own declared
+/// `link_template`, else (for a native-kind action, whose keys are YouTrack
+/// issue keys) `{base}/issue/{key}` from the Auth card's YouTrack URL, else
+/// `None`. The single resolution rule behind every tracker-keyed site in the
+/// web UI (Dashboard gates/parked tables, `/logs`, the usage report, the job
+/// stream page, and the run-detail page).
+async fn action_link_template(
+    pool: &crate::db::DbPool,
+    actions_dir: &std::path::Path,
+    action_name: &str,
+    base_url: Option<&str>,
+) -> Option<String> {
+    let declared: Option<String> = sqlx::query_scalar(&crate::db::q(
+        pool,
+        "SELECT link_template FROM actions WHERE name = ?",
+    ))
+    .bind(action_name)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+    let keys_are_youtrack = crate::action::load(action_name, actions_dir)
+        .map(|l| l.action.kind.is_native())
+        .unwrap_or(false);
+    effective_link_template(declared, keys_are_youtrack, base_url)
+}
+
+/// HTML-escape plain text for a context where it is not auto-escaped by
+/// askama (building a `|safe`-marked string in Rust, e.g. the Logs Message
+/// column). Mirrors askama's own default escaping.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// An `<a target="_blank" rel="noopener">` anchor around `text`, both
+/// HTML-escaped, matching the run-detail anchors.
+fn link_anchor(href: &str, text: &str) -> String {
+    format!(
+        r#"<a href="{}" target="_blank" rel="noopener">{}</a>"#,
+        html_escape(href),
+        html_escape(text)
+    )
+}
+
+/// Whether `token` looks like a tracker issue key (`^[A-Z][A-Z0-9_]*-[0-9]+$`),
+/// used to decide whether the leading token of a blocker-signature part is a
+/// key to link, versus free text to leave alone.
+fn looks_like_issue_key(token: &str) -> bool {
+    let Some((prefix, suffix)) = token.rsplit_once('-') else {
+        return false;
+    };
+    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let mut chars = prefix.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Render a dependency-gate `signature` (`KEY (verb); KEY (verb)`, see
+/// `state::StaleGate::signature`), linking each leading key token via
+/// `template` and HTML-escaping every other part of the text. A part whose
+/// leading token is not key-shaped is left unchanged (escaped, not linked).
+fn render_blocker_signature(signature: &str, template: Option<&str>) -> String {
+    signature
+        .split("; ")
+        .map(|part| {
+            let (key, rest) = match part.split_once(' ') {
+                Some((k, r)) => (k, Some(r)),
+                None => (part, None),
+            };
+            let key_html = if looks_like_issue_key(key) {
+                match template.map(|t| crate::action::render_link(t, key)) {
+                    Some(href) => link_anchor(&href, key),
+                    None => html_escape(key),
+                }
+            } else {
+                html_escape(key)
+            };
+            match rest {
+                Some(r) => format!("{key_html} {}", html_escape(r)),
+                None => key_html,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Render a log-event `message`, linking occurrences of the row's own
+/// `context` key (not any key-shaped token) and HTML-escaping everything
+/// else. `context` is linked only when `template` resolves, else the whole
+/// message is just escaped.
+fn link_message(message: &str, context: &str, template: Option<&str>) -> String {
+    if context.is_empty() {
+        return html_escape(message);
+    }
+    let escaped = html_escape(message);
+    match template.map(|t| crate::action::render_link(t, context)) {
+        Some(href) => {
+            let anchor = link_anchor(&href, context);
+            escaped.replace(&html_escape(context), &anchor)
+        }
+        None => escaped,
+    }
+}
+
 async fn run_detail(
     State(s): State<WebState>,
     AxumPath(id): AxumPath<i64>,
@@ -5530,19 +5818,14 @@ async fn run_detail(
     // Look up the action's link_template once and reuse for both planned
     // jobs and the outcomes table. YouTrack-keyed actions with no template
     // fall back to the Auth card's base URL.
-    let declared: Option<String> = sqlx::query_scalar(&crate::db::q(
-        pool,
-        "SELECT link_template FROM actions WHERE name = ?",
-    ))
-    .bind(&run.action_name)
-    .fetch_optional(pool)
-    .await?
-    .flatten();
-    let keys_are_youtrack = crate::action::load(&run.action_name, &s.paths.actions_dir())
-        .map(|l| l.action.kind.is_native())
-        .unwrap_or(false);
     let base = s.api.settings.auth_config().await.youtrack_base_url;
-    let link_template = effective_link_template(declared, keys_are_youtrack, base.as_deref());
+    let link_template = action_link_template(
+        pool,
+        &s.paths.actions_dir(),
+        &run.action_name,
+        base.as_deref(),
+    )
+    .await;
 
     let planned_keys = state::run_job_keys(pool, run.id).await.unwrap_or_default();
     // Per-job links recorded on the run (the webhook stores the event's
@@ -5704,6 +5987,9 @@ struct JobStreamTpl {
     job_key: String,
     attempt: u32,
     stream_path: String,
+    /// Link for the heading and breadcrumb's job key, or `None` to render it
+    /// as plain text.
+    href: Option<String>,
 }
 
 async fn job_stream_page(
@@ -5720,6 +6006,15 @@ async fn job_stream_page(
     .await?;
     let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
     let stream = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
+    let base = s.api.settings.auth_config().await.youtrack_base_url;
+    let href = action_link_template(
+        &s.api.pool,
+        &s.paths.actions_dir(),
+        &action_name,
+        base.as_deref(),
+    )
+    .await
+    .map(|t| crate::action::render_link(&t, &key));
     let tpl = JobStreamTpl {
         version: s.api.version,
         run_id: id,
@@ -5727,6 +6022,7 @@ async fn job_stream_page(
         job_key: key,
         attempt,
         stream_path: stream.display().to_string(),
+        href,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
@@ -6102,6 +6398,139 @@ mod tests {
             eff(own.clone(), true, Some("https://youtrack.example.com")),
             own
         );
+    }
+
+    /// Nothing is hardcoded: the rendered `href` tracks whatever base URL the
+    /// Auth card has configured, for a native action that declares no
+    /// `link_template` of its own.
+    #[test]
+    fn rendered_href_follows_the_configured_base_url() {
+        for base in ["https://youtrack.example.com", "https://other.example.org"] {
+            let template = super::effective_link_template(None, true, Some(base)).unwrap();
+            let href = crate::action::render_link(&template, "CLAUDE-9");
+            assert_eq!(href, format!("{base}/issue/CLAUDE-9"));
+        }
+    }
+
+    /// A blocker signature with one, several, and a non-key leading token:
+    /// each key-shaped leading token links out, the rest renders unchanged.
+    #[test]
+    fn blocker_signature_links_key_tokens_only() {
+        use super::render_blocker_signature as render;
+
+        let template = "https://youtrack.example.com/issue/{key}";
+        let one = render("CLAUDE-9 (depends on)", Some(template));
+        assert_eq!(
+            one,
+            r#"<a href="https://youtrack.example.com/issue/CLAUDE-9" target="_blank" rel="noopener">CLAUDE-9</a> (depends on)"#
+        );
+
+        let several = render("CLAUDE-9 (depends on); ABC-12 (parent for)", Some(template));
+        assert_eq!(
+            several,
+            r#"<a href="https://youtrack.example.com/issue/CLAUDE-9" target="_blank" rel="noopener">CLAUDE-9</a> (depends on); <a href="https://youtrack.example.com/issue/ABC-12" target="_blank" rel="noopener">ABC-12</a> (parent for)"#
+        );
+
+        // A leading token that is not key-shaped is left unchanged (escaped,
+        // not linked).
+        let non_key = render("not-a-key (depends on)", Some(template));
+        assert_eq!(non_key, "not-a-key (depends on)");
+
+        // No template resolves: every part renders as plain (escaped) text.
+        let no_template = render("CLAUDE-9 (depends on)", None);
+        assert_eq!(no_template, "CLAUDE-9 (depends on)");
+    }
+
+    /// The Logs Message-column helper links only the row's own context key,
+    /// HTML-escapes everything else, and leaves a message with no occurrence
+    /// of the key untouched (besides escaping).
+    #[test]
+    fn link_message_links_only_the_context_key() {
+        use super::link_message as render;
+
+        let template = "https://youtrack.example.com/issue/{key}";
+        let linked = render(
+            "attempt counter reset for `CLAUDE-9`: 3 discarded",
+            "CLAUDE-9",
+            Some(template),
+        );
+        assert_eq!(
+            linked,
+            r#"attempt counter reset for `<a href="https://youtrack.example.com/issue/CLAUDE-9" target="_blank" rel="noopener">CLAUDE-9</a>`: 3 discarded"#
+        );
+
+        // HTML special characters in the message are escaped, not passed through.
+        let escaped = render(
+            "preflight failed for <script>CLAUDE-9</script>",
+            "CLAUDE-9",
+            Some(template),
+        );
+        assert!(escaped.contains("&lt;script&gt;"), "{escaped}");
+        assert!(!escaped.contains("<script>"), "{escaped}");
+
+        // A message that doesn't contain the context key is just escaped.
+        let no_match = render(
+            "unrelated failure, see the logs",
+            "CLAUDE-9",
+            Some(template),
+        );
+        assert_eq!(no_match, "unrelated failure, see the logs");
+
+        // No template resolves: the message is escaped but no key is linked.
+        let no_template = render("reset for `CLAUDE-9`", "CLAUDE-9", None);
+        assert_eq!(no_template, "reset for `CLAUDE-9`");
+    }
+
+    /// A parked row and a gate row each render an `<a href>` with the
+    /// expected URL once a link template is present.
+    #[test]
+    fn dashboard_rows_render_expected_hrefs() {
+        use super::{CappedKeyRow, StaleGateRow};
+        use crate::state;
+
+        let row = StaleGateRow {
+            gate: state::StaleGate {
+                action_name: "youtrack".to_string(),
+                job_key: "CLAUDE-9".to_string(),
+                signature: "ABC-12 (depends on)".to_string(),
+                blocked_for_ms: 0,
+                recheck_overdue_ms: 0,
+                updated_at: "2026-08-11T07:30:00Z".to_string(),
+            },
+            link_template: Some("https://youtrack.example.com/issue/{key}".to_string()),
+        };
+        assert_eq!(
+            row.href(),
+            Some("https://youtrack.example.com/issue/CLAUDE-9".to_string())
+        );
+
+        let capped = CappedKeyRow {
+            capped: state::CappedKey {
+                action_name: "youtrack".to_string(),
+                job_key: "ABC-12".to_string(),
+                count: 3,
+                cap: 3,
+                last_at: "2026-08-11T07:30:00Z".to_string(),
+            },
+            link_template: Some("https://youtrack.example.com/issue/{key}".to_string()),
+        };
+        assert_eq!(
+            capped.href(),
+            Some("https://youtrack.example.com/issue/ABC-12".to_string())
+        );
+
+        // No template resolves: no href, plain text.
+        let no_link = CappedKeyRow {
+            capped: state::CappedKey {
+                action_name: "other".to_string(),
+                job_key: "ABC-12".to_string(),
+                count: 1,
+                cap: 3,
+                last_at: "2026-08-11T07:30:00Z".to_string(),
+            },
+            link_template: None,
+        };
+        assert_eq!(no_link.href(), None);
     }
 
     /// Every key links out once a template is present: planned-jobs table,
@@ -6623,6 +7052,7 @@ mod tests {
                 recheck_overdue_ms: 20 * 3_600_000,
                 updated_at: "2026-08-11T07:30:00Z".to_string(),
             },
+            link_template: None,
         }])
         .render()
         .expect("render dashboard");
@@ -6647,11 +7077,11 @@ mod tests {
     /// and the banner is absent entirely when nothing is parked.
     #[test]
     fn dashboard_banners_keys_parked_at_the_attempt_cap() {
-        use super::{DashboardTpl, PageNav, RunsView};
+        use super::{CappedKeyRow, DashboardTpl, PageNav, RunsView};
         use crate::state;
         use askama::Template;
 
-        let tpl = |attempt_cap_hits: Vec<state::CappedKey>| DashboardTpl {
+        let tpl = |attempt_cap_hits: Vec<CappedKeyRow>| DashboardTpl {
             version: "test",
             global_pause: None,
             today_runs: 0,
@@ -6688,12 +7118,15 @@ mod tests {
             "nothing parked must render no banner: {quiet}"
         );
 
-        let html = tpl(vec![state::CappedKey {
-            action_name: "youtrack".to_string(),
-            job_key: "CLAUDE-9".to_string(),
-            count: 3,
-            cap: 3,
-            last_at: "2026-08-11T07:30:00Z".to_string(),
+        let html = tpl(vec![CappedKeyRow {
+            capped: state::CappedKey {
+                action_name: "youtrack".to_string(),
+                job_key: "CLAUDE-9".to_string(),
+                count: 3,
+                cap: 3,
+                last_at: "2026-08-11T07:30:00Z".to_string(),
+            },
+            link_template: None,
         }])
         .render()
         .expect("render dashboard");
