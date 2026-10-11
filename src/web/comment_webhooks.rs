@@ -2007,18 +2007,19 @@ fn git_in(workdir: &FsPath, args: &[&str]) -> crate::error::Result<()> {
 /// [`crate::provider::retry_git_network`].
 fn git_push(workdir: &FsPath, url: &str, branch: &str) -> crate::error::Result<()> {
     let secrets = crate::provider::url_secrets(url);
+    let plain_url = crate::provider::strip_userinfo(url);
     let out = crate::provider::retry_git_network(
         "push",
         &secrets,
         &crate::provider::GIT_NETWORK_RETRY_WAITS,
         || {
-            Ok(std::process::Command::new("git")
-                .arg("-C")
-                .arg(workdir)
-                .arg("push")
-                .arg(url)
-                .arg(branch)
-                .output()?)
+            Ok(
+                crate::provider::authed_git_command(Some(workdir), Some(url))
+                    .arg("push")
+                    .arg(&plain_url)
+                    .arg(branch)
+                    .output()?,
+            )
         },
     )?;
     if out.status.success() {
@@ -4912,6 +4913,57 @@ mod tests {
             std::fs::read_to_string(&log).unwrap().lines().count(),
             2,
             "push must have been attempted exactly twice"
+        );
+    }
+
+    /// Acceptance (CLAUDE-410): `git_push` never puts the clone URL's
+    /// credential in the real git subprocess's argv, checked by tracing the
+    /// actual argv git received (`GIT_TRACE`), not just this crate's own
+    /// `Command` construction. `file://user:<token>@<path>` round-trips
+    /// through git exactly like a real HTTPS forge URL with userinfo.
+    #[test]
+    fn git_push_never_puts_the_token_in_git_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("origin.git");
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .output()
+            .unwrap();
+
+        let workdir = tmp.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        git_in(&workdir, &["init", "-q", "-b", "main"]).unwrap();
+        git_in(&workdir, &["config", "user.email", "a@b.c"]).unwrap();
+        git_in(&workdir, &["config", "user.name", "a"]).unwrap();
+        std::fs::write(workdir.join("f"), "x").unwrap();
+        git_in(&workdir, &["add", "f"]).unwrap();
+        git_in(&workdir, &["commit", "-q", "-m", "x"]).unwrap();
+
+        let token = "CLAUDE-410-push-secret-token";
+        let url = format!("file://user:{token}@{}", bare.display());
+        let trace_file = tmp.path().join("git-trace.log");
+
+        let _guard = crate::provider::git_trace_test_lock();
+        std::env::set_var("GIT_TRACE", &trace_file);
+        let result = git_push(&workdir, &url, "main");
+        std::env::remove_var("GIT_TRACE");
+
+        result.unwrap();
+        let trace = std::fs::read_to_string(&trace_file).unwrap();
+        assert!(
+            !trace.contains(token),
+            "the token must never reach a git subprocess's real argv: {trace}"
+        );
+        assert!(
+            trace.contains("built-in: git push"),
+            "expected the push to have actually run, trace: {trace}"
         );
     }
 }
