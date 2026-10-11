@@ -2580,4 +2580,265 @@ mod tests {
         assert!(err.contains("gh auth token"), "got {err}");
         assert!(err.contains("no oauth token found"), "got {err}");
     }
+
+    /// The args `pr_status` passes to `gh pr view`.
+    fn pr_view_args<'a>(repo: &'a str, number: &'a str) -> Vec<&'a str> {
+        vec![
+            "pr",
+            "view",
+            number,
+            "--repo",
+            repo,
+            "--json",
+            "state,mergeable,mergeStateStatus,headRefOid,statusCheckRollup",
+        ]
+    }
+
+    fn pr_status_runner(json: &str) -> Arc<StubRunner> {
+        Arc::new(StubRunner::new().ok("gh", &pr_view_args("octo/widget", "42"), json))
+    }
+
+    fn pr_status_forge(runner: Arc<StubRunner>) -> GithubForge {
+        GithubForge::new(
+            runner,
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        )
+    }
+
+    #[test]
+    fn pr_status_all_checks_green_and_clean() {
+        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(
+            status,
+            super::super::PrStatus {
+                state: "success".to_string(),
+                mergeable: Some(true),
+                behind_base: Some(false),
+                head_sha: Some("abc123".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn pr_status_failed_check() {
+        let json = r#"{"state":"OPEN","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.state, "failure");
+        assert_eq!(status.mergeable, Some(false));
+        assert_eq!(status.behind_base, Some(false));
+    }
+
+    #[test]
+    fn pr_status_in_progress_check() {
+        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":null}]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.state, "pending");
+    }
+
+    #[test]
+    fn pr_status_empty_rollup_is_pending_never_success() {
+        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.state, "pending");
+    }
+
+    #[test]
+    fn pr_status_behind_base() {
+        // `mergeable` stays `Some(true)` for a BEHIND PR, which is what
+        // `apply_automerge_decision` expects (behind-base checked first).
+        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"BEHIND","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.behind_base, Some(true));
+        assert_eq!(status.mergeable, Some(true));
+    }
+
+    #[test]
+    fn pr_status_conflicting() {
+        let json = r#"{"state":"OPEN","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.mergeable, Some(false));
+    }
+
+    #[test]
+    fn pr_status_unknown_mergeability() {
+        let json = r#"{"state":"OPEN","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.mergeable, None);
+        assert_eq!(status.behind_base, None);
+    }
+
+    #[test]
+    fn pr_status_merged() {
+        let json = r#"{"state":"MERGED","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefOid":"abc123","statusCheckRollup":[]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(
+            status,
+            super::super::PrStatus {
+                state: "merged".to_string(),
+                mergeable: None,
+                behind_base: None,
+                head_sha: None,
+            }
+        );
+    }
+
+    #[test]
+    fn pr_status_closed() {
+        let json = r#"{"state":"CLOSED","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefOid":"abc123","statusCheckRollup":[]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(status.state, "closed");
+    }
+
+    #[test]
+    fn pr_status_unrecognised_check_conclusion_errors() {
+        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"WEIRD"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let err = forge
+            .pr_status("github.com", "octo/widget", 42)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WEIRD"), "got {err}");
+    }
+
+    #[test]
+    fn pr_status_unrecognised_mergeable_errors() {
+        let json = r#"{"state":"OPEN","mergeable":"WEIRD","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let err = forge
+            .pr_status("github.com", "octo/widget", 42)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WEIRD"), "got {err}");
+        assert!(err.contains("mergeable"), "got {err}");
+    }
+
+    #[test]
+    fn pr_status_unrecognised_merge_state_status_errors() {
+        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"WEIRD","headRefOid":"abc123","statusCheckRollup":[]}"#;
+        let forge = pr_status_forge(pr_status_runner(json));
+        let err = forge
+            .pr_status("github.com", "octo/widget", 42)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WEIRD"), "got {err}");
+        assert!(err.contains("mergeStateStatus"), "got {err}");
+    }
+
+    #[test]
+    fn pr_status_omits_gh_token_when_forge_has_none() {
+        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[]}"#;
+        let runner = Arc::new(StubRunner::new().ok("gh", &pr_view_args("octo/widget", "42"), json));
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        let envs = runner.envs.lock().unwrap();
+        assert_eq!(envs.len(), 1);
+        assert!(envs[0].1.is_empty(), "{:?}", envs[0]);
+    }
+
+    #[test]
+    fn merge_pr_invokes_gh_merge_with_merge_and_delete_branch() {
+        let runner = Arc::new(StubRunner::new().ok(
+            "gh",
+            &[
+                "pr",
+                "merge",
+                "42",
+                "--repo",
+                "octo/widget",
+                "--merge",
+                "--delete-branch",
+            ],
+            "",
+        ));
+        let forge = pr_status_forge(runner.clone());
+        forge.merge_pr("github.com", "octo/widget", 42).unwrap();
+        let envs = runner.envs.lock().unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].1,
+            vec![("GH_TOKEN".to_string(), "ghp_secret".to_string())]
+        );
+    }
+
+    #[test]
+    fn merge_pr_omits_gh_token_when_forge_has_none_and_propagates_cli_failure() {
+        let runner = Arc::new(StubRunner::new().fail(
+            "gh",
+            &[
+                "pr",
+                "merge",
+                "42",
+                "--repo",
+                "octo/widget",
+                "--merge",
+                "--delete-branch",
+            ],
+            1,
+            "pull request is not mergeable",
+        ));
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        );
+        let err = forge
+            .merge_pr("github.com", "octo/widget", 42)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pull request is not mergeable"), "got {err}");
+        let envs = runner.envs.lock().unwrap();
+        assert!(envs[0].1.is_empty(), "{:?}", envs[0]);
+    }
+
+    #[test]
+    fn update_pr_branch_invokes_gh_update_branch_without_rebase() {
+        let runner = Arc::new(StubRunner::new().ok(
+            "gh",
+            &["pr", "update-branch", "42", "--repo", "octo/widget"],
+            "",
+        ));
+        let forge = pr_status_forge(runner.clone());
+        forge
+            .update_pr_branch("github.com", "octo/widget", 42)
+            .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "gh pr update-branch 42 --repo octo/widget"),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("--rebase")), "{calls:?}");
+    }
+
+    #[test]
+    fn update_pr_branch_conflict_failure_names_conflict() {
+        let runner = Arc::new(StubRunner::new().fail(
+            "gh",
+            &["pr", "update-branch", "42", "--repo", "octo/widget"],
+            1,
+            "failed to update pull request branch: merge conflict between base and head",
+        ));
+        let forge = pr_status_forge(runner);
+        let err = forge
+            .update_pr_branch("github.com", "octo/widget", 42)
+            .unwrap_err()
+            .to_string();
+        assert!(err.to_lowercase().contains("conflict"), "got {err}");
+    }
 }
