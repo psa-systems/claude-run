@@ -2414,6 +2414,9 @@ struct RecentInvocationRow {
     ts: String,
     action: String,
     job_key: String,
+    /// Link for the Job key column, or `None` to render it as plain text
+    /// (no key, no resolvable link template).
+    job_href: Option<String>,
     outcome: String,
     five_hour_pct: String,
     seven_day_pct: String,
@@ -2534,33 +2537,57 @@ async fn reports_page(
 
     let usage = crate::report::claude_usage(pool, range, action_filter).await?;
     let usage_chart = (!usage.points.is_empty()).then(|| build_usage_chart(&usage.points));
+
+    // Resolve each distinct action's effective link template once, same rule
+    // as every other site in the table.
+    let base = s.api.settings.auth_config().await.youtrack_base_url;
+    let actions_dir = s.paths.actions_dir();
+    let mut link_templates: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for name in usage.recent.iter().map(|r| r.action.as_str()) {
+        if !link_templates.contains_key(name) {
+            let t = action_link_template(pool, &actions_dir, name, base.as_deref()).await;
+            link_templates.insert(name.to_string(), t);
+        }
+    }
+
     let usage_recent = usage
         .recent
         .iter()
-        .map(|r| RecentInvocationRow {
-            ts: r.ts.clone(),
-            action: r.action.clone(),
-            job_key: r.job_key.clone().unwrap_or_else(|| "-".to_string()),
-            outcome: if r.timed_out {
-                "timed out".to_string()
-            } else if r.ok {
-                "ok".to_string()
-            } else {
-                "failed".to_string()
-            },
-            five_hour_pct: r
-                .five_hour_utilization
-                .map(|u| format!("{:.0}%", u * 100.0))
-                .unwrap_or_else(|| "-".to_string()),
-            seven_day_pct: r
-                .seven_day_utilization
-                .map(|u| format!("{:.0}%", u * 100.0))
-                .unwrap_or_else(|| "-".to_string()),
-            status: r
-                .rate_limit_status
-                .clone()
-                .unwrap_or_else(|| "-".to_string()),
-            api_retries: r.api_retries,
+        .map(|r| {
+            let job_href = r.job_key.as_deref().and_then(|k| {
+                link_templates
+                    .get(r.action.as_str())
+                    .cloned()
+                    .flatten()
+                    .map(|t| crate::action::render_link(&t, k))
+            });
+            RecentInvocationRow {
+                ts: r.ts.clone(),
+                action: r.action.clone(),
+                job_key: r.job_key.clone().unwrap_or_else(|| "-".to_string()),
+                job_href,
+                outcome: if r.timed_out {
+                    "timed out".to_string()
+                } else if r.ok {
+                    "ok".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                five_hour_pct: r
+                    .five_hour_utilization
+                    .map(|u| format!("{:.0}%", u * 100.0))
+                    .unwrap_or_else(|| "-".to_string()),
+                seven_day_pct: r
+                    .seven_day_utilization
+                    .map(|u| format!("{:.0}%", u * 100.0))
+                    .unwrap_or_else(|| "-".to_string()),
+                status: r
+                    .rate_limit_status
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+                api_retries: r.api_retries,
+            }
         })
         .collect();
 
@@ -5960,6 +5987,9 @@ struct JobStreamTpl {
     job_key: String,
     attempt: u32,
     stream_path: String,
+    /// Link for the heading and breadcrumb's job key, or `None` to render it
+    /// as plain text.
+    href: Option<String>,
 }
 
 async fn job_stream_page(
@@ -5976,6 +6006,15 @@ async fn job_stream_page(
     .await?;
     let action_name = action_name.ok_or_else(|| WebError::not_found(format!("no run #{id}")))?;
     let stream = ClaudeInvoker::stream_log_path(&s.paths.logs_dir(), &action_name, &key, attempt);
+    let base = s.api.settings.auth_config().await.youtrack_base_url;
+    let href = action_link_template(
+        &s.api.pool,
+        &s.paths.actions_dir(),
+        &action_name,
+        base.as_deref(),
+    )
+    .await
+    .map(|t| crate::action::render_link(&t, &key));
     let tpl = JobStreamTpl {
         version: s.api.version,
         run_id: id,
@@ -5983,6 +6022,7 @@ async fn job_stream_page(
         job_key: key,
         attempt,
         stream_path: stream.display().to_string(),
+        href,
     };
     Ok(Html(tpl.render().map_err(WebError::from)?))
 }
