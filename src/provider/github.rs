@@ -29,7 +29,9 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use super::cli::{CliBackend, CmdOutput, CommandRunner};
+use super::cli::{
+    run_read_retrying, CliBackend, CmdOutput, CommandRunner, DEFAULT_READ_RETRY_WAITS,
+};
 use super::{
     Backend, BackendKind, Forge, ForgePullRequest, IssueInspect, IssueLink, IssueTracker,
     PullRequest, VcsMapEntry, VcsRepo, GITHUB_PRIORITY,
@@ -226,6 +228,10 @@ pub struct GithubForge {
     /// [`crate::provider::GIT_NETWORK_RETRY_WAITS`]; overridable so tests run
     /// with no delay.
     git_retry_waits: [std::time::Duration; 3],
+    /// Wait schedule for a retried read-only `gh` call (CLAUDE-407, parity
+    /// with the `fj` read retry of CLAUDE-366). Defaults to
+    /// [`DEFAULT_READ_RETRY_WAITS`]; overridable so tests run with no delay.
+    gh_read_retry_waits: [std::time::Duration; 3],
 }
 
 impl GithubForge {
@@ -251,6 +257,7 @@ impl GithubForge {
             gh: "gh".to_string(),
             resolved_token: std::sync::Mutex::new(None),
             git_retry_waits: crate::provider::GIT_NETWORK_RETRY_WAITS,
+            gh_read_retry_waits: DEFAULT_READ_RETRY_WAITS,
         }
     }
 
@@ -265,6 +272,27 @@ impl GithubForge {
     pub fn with_git_retry_waits(mut self, waits: [std::time::Duration; 3]) -> Self {
         self.git_retry_waits = waits;
         self
+    }
+
+    /// Override the `gh` read-retry wait schedule (CLAUDE-407; tests set this
+    /// to all-zero so a retried read runs with no delay).
+    pub fn with_gh_read_retry_waits(mut self, waits: [std::time::Duration; 3]) -> Self {
+        self.gh_read_retry_waits = waits;
+        self
+    }
+
+    /// Run a read-only `gh` invocation, retried up to four attempts total
+    /// (CLAUDE-407, parity with the `fj` read retry of CLAUDE-366). Never used
+    /// for a write: a write must fail on its first and only attempt.
+    fn run_gh_read(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<CmdOutput> {
+        run_read_retrying(
+            self.runner.as_ref(),
+            &self.gh,
+            None,
+            args,
+            envs,
+            &self.gh_read_retry_waits,
+        )
     }
 
     /// Resolve the token to authenticate as. Returns `self.token` directly
@@ -614,9 +642,7 @@ impl Forge for GithubForge {
             "--json",
             "isDraft",
         ];
-        let view_out = self
-            .runner
-            .run_in_env(None, &self.gh, &view_args, &envs_ro)?;
+        let view_out = self.run_gh_read(&view_args, &envs_ro)?;
         if !view_out.ok {
             return Err(Error::CliFailed {
                 binary: self.gh.clone(),
@@ -706,7 +732,7 @@ impl Forge for GithubForge {
             None => Vec::new(),
         };
         let args = ["repo", "view", repo, "--json", "nameWithOwner"];
-        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        let out = self.run_gh_read(&args, &envs)?;
         if !out.ok {
             return Err(super::probe_denied(
                 "GitHub token",
@@ -721,7 +747,7 @@ impl Forge for GithubForge {
         let args = [
             "pr", "list", "--repo", repo, "--state", "open", "--limit", "1", "--json", "number",
         ];
-        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        let out = self.run_gh_read(&args, &envs)?;
         if !out.ok {
             return Err(super::probe_denied(
                 "GitHub token",
@@ -744,7 +770,7 @@ impl Forge for GithubForge {
             None => Vec::new(),
         };
         let args = ["api", "user", "--jq", ".login"];
-        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        let out = self.run_gh_read(&args, &envs)?;
         if !out.ok {
             return Err(Error::CliFailed {
                 binary: self.gh.clone(),
@@ -784,7 +810,7 @@ impl Forge for GithubForge {
             "--json",
             "number,title,headRefOid,headRefName,baseRefName,author,url",
         ];
-        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        let out = self.run_gh_read(&args, &envs)?;
         if !out.ok {
             return Err(Error::CliFailed {
                 binary: self.gh.clone(),
@@ -839,7 +865,7 @@ impl Forge for GithubForge {
             "--json",
             "state,mergeable,mergeStateStatus,headRefOid,statusCheckRollup",
         ];
-        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        let out = self.run_gh_read(&args, &envs)?;
         if !out.ok {
             return Err(Error::CliFailed {
                 binary: self.gh.clone(),
@@ -929,7 +955,7 @@ impl Forge for GithubForge {
         };
         let path = format!("repos/{repo}/collaborators/{username}/permission");
         let args = ["api", &path, "--jq", ".permission"];
-        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        let out = self.run_gh_read(&args, &envs)?;
         if !out.ok {
             return Err(Error::CliFailed {
                 binary: self.gh.clone(),
@@ -1368,6 +1394,10 @@ impl GhPrEntry {
 pub struct GhForgeReads {
     runner: Arc<dyn CommandRunner>,
     gh: String,
+    /// Wait schedule for a retried read-only `gh` call (CLAUDE-407, parity
+    /// with the `fj` read retry of CLAUDE-366). Defaults to
+    /// [`DEFAULT_READ_RETRY_WAITS`]; overridable so tests run with no delay.
+    gh_read_retry_waits: [std::time::Duration; 3],
 }
 
 /// Runs requested per `gh api .../actions/runs` page.
@@ -1384,12 +1414,20 @@ impl GhForgeReads {
         Self {
             runner,
             gh: "gh".to_string(),
+            gh_read_retry_waits: DEFAULT_READ_RETRY_WAITS,
         }
     }
 
     /// Override the binary name (tests point this at a stub).
     pub fn with_binary(mut self, gh: impl Into<String>) -> Self {
         self.gh = gh.into();
+        self
+    }
+
+    /// Override the `gh` read-retry wait schedule (CLAUDE-407; tests set this
+    /// to all-zero so a retried read runs with no delay).
+    pub fn with_gh_read_retry_waits(mut self, waits: [std::time::Duration; 3]) -> Self {
+        self.gh_read_retry_waits = waits;
         self
     }
 
@@ -1407,6 +1445,9 @@ impl GhForgeReads {
     }
 
     /// `gh api --hostname <host> <endpoint> [extra...]`, GET by default.
+    /// Retried up to four attempts total (CLAUDE-407, parity with the `fj`
+    /// read retry of CLAUDE-366): every call through here is a read (run
+    /// logs, run listing, run timing, repo file fetches).
     fn api_get(
         &self,
         host: &str,
@@ -1417,7 +1458,14 @@ impl GhForgeReads {
         let envs = [("GH_TOKEN", gh_token)];
         let mut args: Vec<&str> = vec!["api", "--hostname", host, endpoint];
         args.extend_from_slice(extra);
-        self.runner.run_in_env(None, &self.gh, &args, &envs)
+        run_read_retrying(
+            self.runner.as_ref(),
+            &self.gh,
+            None,
+            &args,
+            &envs,
+            &self.gh_read_retry_waits,
+        )
     }
 
     /// Page `GET /repos/{repo}/actions/runs`, newest-first, until the page
@@ -1762,6 +1810,7 @@ impl crate::forge_log::RepoFileClient for GhForgeReads {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forge_log::ActionLogClient;
     use crate::provider::cli::testutil::StubRunner;
     use std::sync::Mutex;
 
@@ -2840,5 +2889,321 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.to_lowercase().contains("conflict"), "got {err}");
+    }
+
+    // ---- CLAUDE-407: gh read-retry parity ----------------------------------
+
+    #[test]
+    fn identity_retries_once_and_succeeds_on_second_attempt() {
+        let args = ["api", "user", "--jq", ".login"];
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_once("gh", &args, 1, "connect timeout")
+                .ok("gh", &args, "octocat\n"),
+        );
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        let login = forge.identity("github.com").unwrap();
+        assert_eq!(login, "octocat");
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn identity_fails_all_four_attempts_and_returns_the_last_error() {
+        let args = ["api", "user", "--jq", ".login"];
+        let runner = Arc::new(StubRunner::new().fail("gh", &args, 7, "HTTP 401: Bad credentials"));
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        let err = forge.identity("github.com").unwrap_err();
+        match err {
+            Error::CliFailed {
+                exit_code, stderr, ..
+            } => {
+                assert_eq!(exit_code, 7);
+                assert!(stderr.contains("Bad credentials"), "got {stderr}");
+            }
+            other => panic!("expected CliFailed, got {other:?}"),
+        }
+        assert_eq!(runner.calls.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn identity_spawn_error_is_not_retried() {
+        let runner = Arc::new(StubRunner::new().missing("gh"));
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        let err = forge.identity("github.com").unwrap_err();
+        assert!(matches!(err, Error::CliNotFound { .. }));
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn repo_access_view_probe_retries_once_and_succeeds() {
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_once("gh", &view_args("octo/widget"), 1, "connect timeout")
+                .ok(
+                    "gh",
+                    &view_args("octo/widget"),
+                    r#"{"nameWithOwner":"octo/widget"}"#,
+                )
+                .ok("gh", &pr_list_args("octo/widget"), "[]"),
+        );
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        forge.repo_access("github.com", "octo/widget").unwrap();
+        assert_eq!(runner.calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn repo_access_pr_list_probe_retries_once_and_succeeds() {
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "gh",
+                    &view_args("octo/widget"),
+                    r#"{"nameWithOwner":"octo/widget"}"#,
+                )
+                .fail_once("gh", &pr_list_args("octo/widget"), 1, "connect timeout")
+                .ok("gh", &pr_list_args("octo/widget"), "[]"),
+        );
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        forge.repo_access("github.com", "octo/widget").unwrap();
+        assert_eq!(runner.calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn list_open_prs_retries_once_and_succeeds_on_second_attempt() {
+        let args = list_open_prs_args("octo/widget");
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_once("gh", &args, 1, "connect timeout")
+                .ok("gh", &args, "[]"),
+        );
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        let prs = forge.list_open_prs("github.com", "octo/widget").unwrap();
+        assert!(prs.is_empty());
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn repo_permission_retries_once_and_succeeds_on_second_attempt() {
+        let args = [
+            "api",
+            "repos/octo/widget/collaborators/octocat/permission",
+            "--jq",
+            ".permission",
+        ];
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_once("gh", &args, 1, "connect timeout")
+                .ok("gh", &args, "write\n"),
+        );
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        let perm = forge
+            .repo_permission("github.com", "octo/widget", "octocat")
+            .unwrap();
+        assert_eq!(perm, "write");
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pr_status_retries_once_and_succeeds_on_second_attempt() {
+        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_once(
+                    "gh",
+                    &pr_view_args("octo/widget", "42"),
+                    1,
+                    "connect timeout",
+                )
+                .ok("gh", &pr_view_args("octo/widget", "42"), json),
+        );
+        let forge = pr_status_forge(runner.clone()).with_gh_read_retry_waits(NO_WAIT);
+        forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn refresh_pr_text_read_retries_once_and_succeeds_on_second_attempt() {
+        let view_args = [
+            "pr",
+            "view",
+            "42",
+            "--repo",
+            "octo/widget",
+            "--json",
+            "isDraft",
+        ];
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_once("gh", &view_args, 1, "connect timeout")
+                .ok("gh", &view_args, r#"{"isDraft":false}"#),
+        );
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghp_secret".into()),
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+        forge
+            .refresh_pr_text(Path::new("/tmp/wd"), "github.com", "octo/widget", 42)
+            .unwrap();
+        // Not a real draft: the write (`gh pr edit`) never runs.
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    }
+
+    /// No `gh` write is retried (CLAUDE-407): a write that fails runs exactly
+    /// once, unlike the reads above.
+    #[test]
+    fn gh_writes_run_exactly_once_on_failure() {
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail(
+                    "gh",
+                    &["pr", "ready", "42", "--repo", "octo/widget"],
+                    1,
+                    "boom",
+                )
+                .fail(
+                    "gh",
+                    &[
+                        "pr",
+                        "merge",
+                        "42",
+                        "--repo",
+                        "octo/widget",
+                        "--merge",
+                        "--delete-branch",
+                    ],
+                    1,
+                    "boom",
+                )
+                .fail(
+                    "gh",
+                    &["pr", "update-branch", "42", "--repo", "octo/widget"],
+                    1,
+                    "boom",
+                )
+                .fail(
+                    "gh",
+                    &[
+                        "pr",
+                        "comment",
+                        "42",
+                        "--repo",
+                        "octo/widget",
+                        "--body-file",
+                        "/tmp/b.md",
+                    ],
+                    1,
+                    "boom",
+                ),
+        );
+        let forge = GithubForge::new(
+            runner.clone(),
+            "https://api.githubcopilot.com/mcp/".into(),
+            None,
+        )
+        .with_gh_read_retry_waits(NO_WAIT);
+
+        assert!(forge
+            .mark_pr_ready("github.com", "octo/widget", 42)
+            .is_err());
+        assert!(forge.merge_pr("github.com", "octo/widget", 42).is_err());
+        assert!(forge
+            .update_pr_branch("github.com", "octo/widget", 42)
+            .is_err());
+        assert!(forge
+            .pr_comment("github.com", "octo/widget", 42, Path::new("/tmp/b.md"))
+            .is_err());
+
+        assert_eq!(runner.calls.lock().unwrap().len(), 4);
+    }
+
+    // ---- CLAUDE-407: GhForgeReads read-retry parity ------------------------
+
+    #[test]
+    fn gh_forge_reads_api_get_retries_once_and_succeeds_on_second_attempt() {
+        let args = [
+            "api",
+            "--hostname",
+            "github.com",
+            "repos/octo/cat/actions/runs?per_page=100&page=1",
+        ];
+        let runner = Arc::new(
+            StubRunner::new()
+                .fail_once("gh", &args, 1, "connect timeout")
+                .ok(
+                    "gh",
+                    &args,
+                    r#"{"workflow_runs":[{"id":999,"run_number":42,"path":".github/workflows/ci.yml","head_branch":"main","status":"completed","conclusion":"failure","html_url":"https://github.com/octo/cat/actions/runs/999"}]}"#,
+                )
+                .ok(
+                    "gh",
+                    &[
+                        "api",
+                        "--hostname",
+                        "github.com",
+                        "repos/octo/cat/actions/runs/999/jobs?per_page=100",
+                    ],
+                    r#"{"jobs":[]}"#,
+                ),
+        );
+        let logs =
+            crate::provider::GhForgeReads::new(runner.clone()).with_gh_read_retry_waits(NO_WAIT);
+        let out = logs.run_logs("github.com", "octo/cat", 42, Some("tok"));
+        match out {
+            crate::forge_log::RunLogsOutcome::Fetched(jobs) => assert!(jobs.is_empty()),
+            other => panic!("expected Fetched, got {other:?}"),
+        }
+        assert_eq!(runner.calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn gh_forge_reads_spawn_error_is_not_retried() {
+        let runner = Arc::new(StubRunner::new().missing("gh"));
+        let logs =
+            crate::provider::GhForgeReads::new(runner.clone()).with_gh_read_retry_waits(NO_WAIT);
+        let out = logs.run_logs("github.com", "octo/cat", 42, Some("tok"));
+        match out {
+            crate::forge_log::RunLogsOutcome::Failed(msg) => {
+                assert!(msg.contains("octo/cat"), "got {msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
     }
 }

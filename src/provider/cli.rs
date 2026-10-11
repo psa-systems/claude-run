@@ -30,7 +30,7 @@ struct PrSearchResponse {
 /// 5s, for a worst-case added delay of 7s across four attempts total. Shared
 /// by every binary-neutral read-retry caller (`fj` and `gh` reads alike) so
 /// there is one copy of the schedule.
-const DEFAULT_READ_RETRY_WAITS: [Duration; 3] = [
+pub(crate) const DEFAULT_READ_RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(0),
     Duration::from_secs(2),
     Duration::from_secs(5),
