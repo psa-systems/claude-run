@@ -751,6 +751,16 @@ pub(crate) fn git_allow_protocol_test_lock() -> std::sync::MutexGuard<'static, (
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Serializes every test that prepends a stub `git` to the process-wide
+/// `PATH` (CLAUDE-410) so two such tests, or a `PATH` read racing a write,
+/// never interleave; `std::env::set_var`/`var` on `PATH` are documented as
+/// unsound under concurrent access from other threads.
+#[cfg(test)]
+pub(crate) fn git_stub_path_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Serializes every test that sets the process-wide `GIT_TRACE` env var to
 /// capture the real argv a git subprocess actually received (CLAUDE-410),
 /// mirroring [`git_allow_protocol_test_lock`]. `std::env::set_var`/`remove_var`
@@ -1958,6 +1968,91 @@ mod tests {
             trace.contains("built-in: git submodule--helper")
                 || trace.contains("built-in: git submodule"),
             "expected a submodule update to have actually run, trace: {trace}"
+        );
+    }
+
+    /// The real `git` binary this test process would otherwise resolve via
+    /// `PATH`, so a forwarding stub (see
+    /// [`install_forwarding_git_stub_on_path`]) can still run a real clone.
+    fn real_git_path() -> String {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v git")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "no real `git` on PATH");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Prepend a stub `git` (written with [`crate::testutil::write_stub`]) to
+    /// `PATH` that logs every invocation's argv (one per line, NUL-separated,
+    /// a `--END--` sentinel line after each call) to `args_log` and every
+    /// `CLAUDE_RUN_GIT_*` env var it sees to `env_log`, then `exec`s the real
+    /// `git` with the same argv and environment, so every OTHER thread's
+    /// concurrent real git calls behave identically (only gaining an
+    /// unrelated log line) while this test's own calls are also recorded
+    /// (CLAUDE-410). Caller holds [`git_stub_path_test_lock`] and restores
+    /// `PATH` itself; this only prepends.
+    fn install_forwarding_git_stub_on_path(
+        bin_dir: &std::path::Path,
+        args_log: &std::path::Path,
+        env_log: &std::path::Path,
+    ) {
+        let real_git = real_git_path();
+        let stub = bin_dir.join("git");
+        crate::testutil::write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done >> {args_log}\nprintf -- '--END--\\n' >> {args_log}\nenv | grep '^CLAUDE_RUN_GIT_' >> {env_log}\nprintf -- '--END--\\n' >> {env_log}\nexec {real_git} \"$@\"\n",
+                args_log = args_log.display(),
+                env_log = env_log.display(),
+                real_git = real_git,
+            ),
+        );
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin_dir.to_path_buf()];
+        paths.extend(std::env::split_paths(&current));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+    }
+
+    /// Acceptance (CLAUDE-410): a stub `git` on `PATH` (forwarding to the real
+    /// binary so the clone still succeeds) records the argv AND environment
+    /// of every real git invocation a pinned clone of a repo with a
+    /// submodule makes (clone, ls-remote, fetch, submodule update): the
+    /// token string appears in none of the recorded argv, and the recorded
+    /// environment carries `CLAUDE_RUN_GIT_USERNAME`/`CLAUDE_RUN_GIT_PASSWORD`
+    /// on at least one call.
+    #[test]
+    fn pinned_clone_stub_git_records_no_token_in_argv_and_credential_in_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare_url = origin_with_default_branch_and_submodule(tmp.path());
+        let path = bare_url.strip_prefix("file://").unwrap();
+        let token = "CLAUDE-410-stub-secret-token";
+        let url = format!("file://user:{token}@{path}");
+        let clone = tmp.path().join("clone");
+
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let args_log = tmp.path().join("args.log");
+        let env_log = tmp.path().join("env.log");
+
+        let _guard = git_stub_path_test_lock();
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        install_forwarding_git_stub_on_path(&bin_dir, &args_log, &env_log);
+        let result = shallow_clone(&url, Some("feat"), &clone, 50);
+        std::env::set_var("PATH", &original_path);
+
+        result.unwrap();
+        let args = std::fs::read_to_string(&args_log).unwrap();
+        assert!(
+            !args.contains(token),
+            "the token must never appear in any recorded git argv: {args}"
+        );
+        let envs = std::fs::read_to_string(&env_log).unwrap();
+        assert!(
+            envs.contains("CLAUDE_RUN_GIT_USERNAME=user")
+                && envs.contains(&format!("CLAUDE_RUN_GIT_PASSWORD={token}")),
+            "the helper env vars must carry the credential on at least one call: {envs}"
         );
     }
 
