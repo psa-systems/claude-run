@@ -62,6 +62,9 @@ pub enum Error {
     #[error("claude binary not found in PATH")]
     ClaudeNotFound,
 
+    #[error("test-postgres {stage}: {message}")]
+    TestPostgresFailed { stage: String, message: String },
+
     #[error("input.command stdout was not a JSON array: {0}")]
     InputNotJsonArray(String),
 
