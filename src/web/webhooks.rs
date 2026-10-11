@@ -12352,19 +12352,28 @@ mod tests {
                 );
             }
 
-            #[tokio::test]
-            async fn apply_automerge_decision_routes_github_host_through_github_forge() {
-                // `mint.backend` (`fj`) is configured with a `pr_status` that
-                // would merge the PR if it were reached; the assertion is that
-                // it never is, because a `github.com` host must dispatch to
-                // `GithubForge` instead, whose `pr_status` is a documented
-                // follow-up (the default `Forge::pr_status` error) rather than
-                // the wrong backend's fj call.
-                let pool = crate::db::test_pool().await;
-                let dir = tempfile::tempdir().unwrap();
-                write_youtrack_action(dir.path(), "yt", true);
+            /// `gh pr view`'s JSON for a green, clean (or behind-base) PR.
+            fn gh_pr_view_json(merge_state_status: &str) -> String {
+                format!(
+                    r#"{{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"{merge_state_status}","headRefOid":"abc123","statusCheckRollup":[{{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}}]}}"#
+                )
+            }
+
+            fn gh_pr_view_args(repo: &str) -> Vec<&str> {
+                vec![
+                    "pr",
+                    "view",
+                    "42",
+                    "--repo",
+                    repo,
+                    "--json",
+                    "state,mergeable,mergeStateStatus,headRefOid,statusCheckRollup",
+                ]
+            }
+
+            async fn seeded_github_row(pool: &DbPool) -> ci_failure_store::AgentPullRequest {
                 ci_failure_store::record_agent_pr(
-                    &pool,
+                    pool,
                     "yt",
                     "MK-16",
                     "github.com",
@@ -12376,20 +12385,54 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                ci_failure_store::agent_pr(pool, "github.com", "octo/widget", 42)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+
+            #[tokio::test]
+            async fn apply_automerge_decision_routes_github_host_through_github_forge_to_merge() {
+                // `mint.backend` (`fj`) would merge the PR if ever reached; the
+                // assertion is that it never is, because a `github.com` host
+                // dispatches `pr_status` / `merge_pr` to `GithubForge` (backed
+                // by `gh`), while the issue comment still goes through
+                // `mint.backend` (the YouTrack `IssueTracker` half every
+                // backend forwards to `CliBackend`/`yt`).
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
                 let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
                 let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
-                let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new());
+                let runner = Arc::new(
+                    crate::provider::cli::testutil::StubRunner::new()
+                        .ok(
+                            "gh",
+                            &gh_pr_view_args("octo/widget"),
+                            &gh_pr_view_json("CLEAN"),
+                        )
+                        .ok(
+                            "gh",
+                            &[
+                                "pr",
+                                "merge",
+                                "42",
+                                "--repo",
+                                "octo/widget",
+                                "--merge",
+                                "--delete-branch",
+                            ],
+                            "",
+                        ),
+                );
                 let ctx = store_mint_context_in(
                     pool.clone(),
                     backend.clone(),
                     classifier,
                     dir.path(),
-                    runner,
+                    runner.clone(),
                 );
-                let row = ci_failure_store::agent_pr(&pool, "github.com", "octo/widget", 42)
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let row = seeded_github_row(&pool).await;
 
                 let result = apply_automerge_decision(
                     &ctx,
@@ -12402,13 +12445,91 @@ mod tests {
                 )
                 .await;
 
-                let err = result.unwrap_err();
-                assert!(err.contains("not supported by this forge backend"), "{err}");
+                assert!(
+                    matches!(result, Ok(AutomergeOutcome::Acted(_))),
+                    "{result:?}"
+                );
+                let calls = runner.calls.lock().unwrap();
+                assert!(
+                    calls.iter().any(|c| c.starts_with("gh pr merge 42")),
+                    "{calls:?}"
+                );
+                drop(calls);
                 assert!(
                     !backend
                         .calls()
                         .iter()
                         .any(|c| c.starts_with("pr_status") || c.starts_with("merge_pr")),
+                    "fj must never be consulted for a GitHub host: {:?}",
+                    backend.calls()
+                );
+                assert!(
+                    backend.calls().iter().any(|c| c.starts_with("comment")),
+                    "the post-merge comment still goes through the YouTrack backend: {:?}",
+                    backend.calls()
+                );
+            }
+
+            #[tokio::test]
+            async fn apply_automerge_decision_routes_github_host_through_github_forge_to_update_branch(
+            ) {
+                // A behind-base `github.com` PR dispatches `update_pr_branch`
+                // to `GithubForge`, never `mint.backend`.
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                let backend = Arc::new(StoreBackend::new());
+                let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+                let runner = Arc::new(
+                    crate::provider::cli::testutil::StubRunner::new()
+                        .ok(
+                            "gh",
+                            &gh_pr_view_args("octo/widget"),
+                            &gh_pr_view_json("BEHIND"),
+                        )
+                        .ok(
+                            "gh",
+                            &["pr", "update-branch", "42", "--repo", "octo/widget"],
+                            "",
+                        ),
+                );
+                let ctx = store_mint_context_in(
+                    pool.clone(),
+                    backend.clone(),
+                    classifier,
+                    dir.path(),
+                    runner.clone(),
+                );
+                let row = seeded_github_row(&pool).await;
+
+                let result = apply_automerge_decision(
+                    &ctx,
+                    &pool,
+                    "github.com",
+                    "octo/widget",
+                    42,
+                    "https://github.com/octo/widget/pulls/42",
+                    &row,
+                )
+                .await;
+
+                assert!(
+                    matches!(result, Ok(AutomergeOutcome::Acted(_))),
+                    "{result:?}"
+                );
+                let calls = runner.calls.lock().unwrap();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|c| c.starts_with("gh pr update-branch 42")),
+                    "{calls:?}"
+                );
+                drop(calls);
+                assert!(
+                    !backend
+                        .calls()
+                        .iter()
+                        .any(|c| c.starts_with("pr_status") || c.starts_with("update_pr_branch")),
                     "fj must never be consulted for a GitHub host: {:?}",
                     backend.calls()
                 );
