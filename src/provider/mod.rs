@@ -751,6 +751,17 @@ pub(crate) fn git_allow_protocol_test_lock() -> std::sync::MutexGuard<'static, (
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Serializes every test that sets the process-wide `GIT_TRACE` env var to
+/// capture the real argv a git subprocess actually received (CLAUDE-410),
+/// mirroring [`git_allow_protocol_test_lock`]. `std::env::set_var`/`remove_var`
+/// are documented as unsound under concurrent access from other threads, so
+/// two such tests must never hold `GIT_TRACE` at once.
+#[cfg(test)]
+pub(crate) fn git_trace_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Same per-invocation authentication as [`authed_git_output`], but through a
 /// [`CommandRunner`] so call sites built on it (notably [`cli::CliBackend`])
 /// stay testable against a [`cli::StubRunner`] instead of a real `git`.
@@ -1410,6 +1421,59 @@ mod tests {
     /// network call does not actually wait out CLAUDE-396's real schedule.
     const NO_WAIT: [Duration; 3] = [Duration::ZERO, Duration::ZERO, Duration::ZERO];
 
+    /// Acceptance (CLAUDE-410): a resolvable token-bearing URL puts the
+    /// credential ONLY in the built [`std::process::Command`]'s environment,
+    /// never in its args, and the args are exactly the clearing `-c
+    /// credential.helper=` pair, with no userinfo anywhere in them.
+    #[test]
+    fn authed_git_command_carries_the_credential_only_in_env_never_in_args() {
+        let cmd = authed_git_command(
+            None,
+            Some("https://user:super-secret-token@example.invalid/o/r.git"),
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for a in &args {
+            assert!(
+                !a.contains("super-secret-token"),
+                "token leaked into args: {a}"
+            );
+            assert!(!a.contains("user:"), "userinfo leaked into args: {a}");
+        }
+        assert_eq!(args, credential_helper_args().to_vec());
+        let envs: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            envs.get(GIT_CRED_USER_ENV).map(String::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            envs.get(GIT_CRED_PASS_ENV).map(String::as_str),
+            Some("super-secret-token")
+        );
+    }
+
+    /// A URL with no userinfo resolves no credential: no helper args, no
+    /// credential env vars, so a call site with nothing to authenticate runs
+    /// exactly like a plain `git` invocation.
+    #[test]
+    fn authed_git_command_with_no_credential_adds_nothing() {
+        let cmd = authed_git_command(None, None);
+        assert_eq!(cmd.get_args().count(), 0);
+        assert_eq!(cmd.get_envs().count(), 0);
+    }
+
     #[test]
     fn validate_pr_subject_rejects_empty() {
         let err = validate_pr_subject("", "feat/x").unwrap_err().to_string();
@@ -1811,6 +1875,89 @@ mod tests {
         assert!(
             clone.join("sub").read_dir().unwrap().next().is_none(),
             "a failed submodule fetch must not leave a populated submodule directory"
+        );
+    }
+
+    /// Like [`origin_with_submodule`], but with an extra `feat` branch one
+    /// commit ahead of `main` so a clone pinned to `feat` exercises
+    /// `restore_default_branch_refs_retrying`'s `ls-remote` AND its `fetch`
+    /// step (reached only when the pinned branch differs from the remote's
+    /// default), on top of the submodule checkout, all from one fixture
+    /// (CLAUDE-410).
+    fn origin_with_default_branch_and_submodule(base: &std::path::Path) -> String {
+        let url = origin_with_submodule(base);
+        let origin = base.join("origin");
+        let git_in = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&origin)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git_in(&["checkout", "-q", "-b", "feat"]);
+        std::fs::write(origin.join("g.txt"), "y").unwrap();
+        git_in(&["add", "."]);
+        git_in(&["commit", "-q", "-m", "feat commit"]);
+        git_in(&["checkout", "-q", "main"]);
+        url
+    }
+
+    /// Acceptance (CLAUDE-410): a pinned-branch clone of a repo with a
+    /// submodule - which exercises `clone`, `ls-remote`, `fetch` AND
+    /// `submodule update`, every git-network call site this issue covers
+    /// except the comment webhook's push - never puts the clone URL's
+    /// credential in any git subprocess's argv, checked by tracing the REAL
+    /// argv git itself received (`GIT_TRACE`), not just this crate's own
+    /// `Command` construction. `file://user:<token>@<path>` round-trips
+    /// through git exactly like a real HTTPS forge URL with userinfo (see
+    /// [`with_fake_userinfo`]), so it is a faithful fixture for this without
+    /// a real network credential.
+    #[test]
+    fn pinned_clone_with_submodule_never_puts_the_token_in_git_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare_url = origin_with_default_branch_and_submodule(tmp.path());
+        let path = bare_url.strip_prefix("file://").unwrap();
+        let token = "CLAUDE-410-secret-token";
+        let url = format!("file://user:{token}@{path}");
+        let clone = tmp.path().join("clone");
+        let trace_file = tmp.path().join("git-trace.log");
+
+        let _guard = git_trace_test_lock();
+        std::env::set_var("GIT_TRACE", &trace_file);
+        let result = shallow_clone(&url, Some("feat"), &clone, 50);
+        std::env::remove_var("GIT_TRACE");
+
+        result.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(clone.join("sub").join("s.txt")).unwrap(),
+            "s",
+            "the submodule must still be checked out"
+        );
+        let trace = std::fs::read_to_string(&trace_file).unwrap();
+        assert!(
+            !trace.contains(token),
+            "the token must never reach a git subprocess's real argv: {trace}"
+        );
+        for op in [
+            "built-in: git clone",
+            "built-in: git ls-remote",
+            "built-in: git fetch",
+        ] {
+            assert!(
+                trace.contains(op),
+                "expected {op} to have actually run, trace: {trace}"
+            );
+        }
+        assert!(
+            trace.contains("built-in: git submodule--helper")
+                || trace.contains("built-in: git submodule"),
+            "expected a submodule update to have actually run, trace: {trace}"
         );
     }
 
