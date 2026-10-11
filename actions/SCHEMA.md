@@ -470,8 +470,9 @@ merged, updates a behind-base branch, or fails; a pass whose decision changes no
 disabled, the action isn't a youtrack action, or not mergeable) opens no run row, so the 300s sweep over every open
 agent PR no longer floods run history with one row per PR per pass.
 
-Automerge is currently implemented for the Forgejo (`fj`) backend only; a GitHub-hosted job with automerge enabled has no
-merge event to react to (GitHub automerge is a follow-up).
+Automerge works on both backends: a Forgejo-hosted PR goes through `fj pr status` / `fj pr merge` / `fj pr update`, and a
+GitHub-hosted PR (CLAUDE-405) goes through `gh pr view --json` / `gh pr merge` / `gh pr update-branch` via `GithubForge`,
+selected automatically by `resolve_automerge_forge` from the PR's host.
 
 ##### Pre-clone dependency gate (CLAUDE-161)
 

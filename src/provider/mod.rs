@@ -561,11 +561,11 @@ pub trait Forge: Send + Sync {
     ) -> Result<()>;
 
     /// Combined CI status plus mergeability of PR `pr_number` in
-    /// `repo` on `host` (`fj pr status <repo>#<n> --json`). Backs the automerge
-    /// poll, which needs both the CI verdict and whether the branch is up to
-    /// date in a single query. The default errors so a backend that has not
-    /// implemented automerge (the GitHub `Forge`, a follow-up) reports clearly
-    /// rather than silently succeeding.
+    /// `repo` on `host` (`fj pr status <repo>#<n> --json` on Forgejo, `gh pr
+    /// view <n> --json ...` on GitHub). Backs the automerge poll, which needs
+    /// both the CI verdict and whether the branch is up to date in a single
+    /// query. The default errors so a backend that has not implemented
+    /// automerge reports clearly rather than silently succeeding.
     fn pr_status(&self, host: &str, repo: &str, pr_number: u64) -> Result<PrStatus> {
         let _ = (host, repo, pr_number);
         Err(Error::Other(anyhow::anyhow!(
@@ -584,12 +584,13 @@ pub trait Forge: Send + Sync {
     }
 
     /// Bring PR `pr_number` in `repo` on `host` up to date with its
-    /// base through Forgejo's Update-branch endpoint (`fj pr update <repo>#<n>
+    /// base (Forgejo's Update-branch endpoint, `fj pr update <repo>#<n>
     /// --update-style merge`; this flag was renamed in a later Forgejo release,
-    /// so an older doc or script may still name the old flag),
-    /// retriggering CI. `--update-style merge` matches [`Self::merge_pr`]'s
-    /// merge-commit policy and never rewrites the agent's branch.
-    /// The default errors for backends without automerge.
+    /// so an older doc or script may still name the old flag; GitHub's
+    /// equivalent is `gh pr update-branch <n>`), retriggering CI. Always a
+    /// merge-style update, matching [`Self::merge_pr`]'s merge-commit policy
+    /// and never rewriting the agent's branch. The default errors for
+    /// backends without automerge.
     fn update_pr_branch(&self, host: &str, repo: &str, pr_number: u64) -> Result<()> {
         let _ = (host, repo, pr_number);
         Err(Error::Other(anyhow::anyhow!(
