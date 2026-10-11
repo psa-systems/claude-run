@@ -756,11 +756,10 @@ impl Forge for GithubForge {
         Ok(out.stdout.trim().to_string())
     }
 
-    // The remaining CI-fix-only operations are Forgejo-specific; `list_open_prs`
-    // is the one exception, needed by the PR-resume lookup for every backend.
-    // A GitHub repo never enters the Forgejo-only CI-fix scan (auto-route-by-host),
-    // so the rest are unsupported on the GitHub backend; split the `Forge` trait
-    // later if a GitHub CI-fix handler is wanted.
+    // `pr_ci_state` and `pr_add_labels` are Forgejo CI-fix-only operations with
+    // no GitHub caller (auto-route-by-host keeps the CI-fix scan Forgejo-only);
+    // `list_open_prs`, `pr_status`, `merge_pr`, and `update_pr_branch` are
+    // needed by every backend and implemented below.
     //
     // `gh pr list --json ...`, run with the action's PAT as `GH_TOKEN`
     // exactly as `repo_access` does. `--limit 1000` bounds a single
@@ -811,6 +810,109 @@ impl Forge for GithubForge {
 
     fn pr_ci_state(&self, _host: &str, _repo: &str, _pr_number: u64) -> Result<String> {
         Err(unsupported("pr_ci_state"))
+    }
+
+    /// `gh pr view <n> --repo <repo> --json state,mergeable,mergeStateStatus,
+    /// headRefOid,statusCheckRollup`, run with the action's PAT as `GH_TOKEN`
+    /// exactly as the other reads above. Mirrors `CliBackend::pr_status`'s
+    /// contract: `state` is the combined CI verdict (`"success"` /
+    /// `"failure"` / `"pending"`, or `"merged"` / `"closed"` short-circuited
+    /// from GitHub's own PR state), `mergeable` is GitHub's own mergeability
+    /// verdict (`None` for a merged PR, which GitHub reports as `UNKNOWN`
+    /// regardless), `behind_base` is read off `mergeStateStatus`, and
+    /// `head_sha` is `headRefOid` (`None` for a merged PR, mirroring
+    /// `mergeable`). An unrecognised check conclusion, `mergeable`, or
+    /// `mergeStateStatus` value is an error naming the value, never a
+    /// default: silently guessing a CI verdict is worse than failing loudly.
+    fn pr_status(&self, _host: &str, repo: &str, pr_number: u64) -> Result<super::PrStatus> {
+        let envs: Vec<(&str, &str)> = match &self.token {
+            Some(t) => vec![("GH_TOKEN", t.as_str())],
+            None => Vec::new(),
+        };
+        let number_str = pr_number.to_string();
+        let args = [
+            "pr",
+            "view",
+            &number_str,
+            "--repo",
+            repo,
+            "--json",
+            "state,mergeable,mergeStateStatus,headRefOid,statusCheckRollup",
+        ];
+        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        if !out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: args.join(" "),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        parse_pr_status(&out.stdout)
+            .map_err(|e| Error::CliParse {
+                binary: self.gh.clone(),
+                context: "gh pr view --json".to_string(),
+                source: e,
+            })
+            .and_then(|doc| doc.into_pr_status())
+    }
+
+    /// `gh pr merge <n> --repo <repo> --merge --delete-branch`, run with the
+    /// action's PAT as `GH_TOKEN`. `--merge` keeps the merge-commit policy
+    /// [`Forge::merge_pr`] documents (the single commit's bare `#<KEY>` line
+    /// survives in history); never `--squash` / `--rebase`. `--delete-branch`
+    /// matches the Forgejo path's `--delete`.
+    fn merge_pr(&self, _host: &str, repo: &str, pr_number: u64) -> Result<()> {
+        let envs: Vec<(&str, &str)> = match &self.token {
+            Some(t) => vec![("GH_TOKEN", t.as_str())],
+            None => Vec::new(),
+        };
+        let number_str = pr_number.to_string();
+        let args = [
+            "pr",
+            "merge",
+            &number_str,
+            "--repo",
+            repo,
+            "--merge",
+            "--delete-branch",
+        ];
+        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        if !out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: args.join(" "),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// `gh pr update-branch <n> --repo <repo>`, run with the action's PAT as
+    /// `GH_TOKEN`. A merge-style update (GitHub's `update-branch` endpoint has
+    /// no rebase mode), matching [`Forge::update_pr_branch`]'s documented
+    /// "never rewrites the agent's branch". A merge-conflict failure's `gh`
+    /// stderr is carried through unmodified in [`Error::CliFailed`], which is
+    /// what lets [`crate::web::webhooks::try_dispatch_conflict_auto_resolve`]
+    /// key on "conflict" in the error text (CLAUDE-380).
+    fn update_pr_branch(&self, _host: &str, repo: &str, pr_number: u64) -> Result<()> {
+        let envs: Vec<(&str, &str)> = match &self.token {
+            Some(t) => vec![("GH_TOKEN", t.as_str())],
+            None => Vec::new(),
+        };
+        let number_str = pr_number.to_string();
+        let args = ["pr", "update-branch", &number_str, "--repo", repo];
+        let out = self.runner.run_in_env(None, &self.gh, &args, &envs)?;
+        if !out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: args.join(" "),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// `gh api repos/<repo>/collaborators/<username>/permission --jq
@@ -1054,6 +1156,149 @@ fn parse_pr_from_gh(stdout: &str) -> PullRequest {
         // Filled in by the caller, which knows the branch it pushed.
         head_branch: None,
     }
+}
+
+/// `gh pr view --json state,mergeable,mergeStateStatus,headRefOid,statusCheckRollup`.
+#[derive(Debug, serde::Deserialize)]
+struct GhPrStatusDoc {
+    state: String,
+    #[serde(default)]
+    mergeable: String,
+    #[serde(default, rename = "mergeStateStatus")]
+    merge_state_status: String,
+    #[serde(default, rename = "headRefOid")]
+    head_ref_oid: String,
+    #[serde(default, rename = "statusCheckRollup")]
+    status_check_rollup: Vec<GhCheckRollupEntry>,
+}
+
+/// One entry of `statusCheckRollup`: either a `CheckRun` (a GitHub Actions job,
+/// discriminated by `status`/`conclusion`) or a `StatusContext` (a legacy
+/// commit status, discriminated by `state`). `__typename` is GitHub's own
+/// discriminator when present; absent, the field shape disambiguates.
+#[derive(Debug, Default, serde::Deserialize)]
+struct GhCheckRollupEntry {
+    #[serde(default, rename = "__typename")]
+    typename: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// One rollup entry's resolved verdict.
+enum CheckVerdict {
+    Success,
+    Pending,
+    Failure,
+}
+
+/// Resolve one `statusCheckRollup` entry to a [`CheckVerdict`], or an error
+/// naming an unrecognised `conclusion` / `state` value.
+fn check_verdict(entry: &GhCheckRollupEntry) -> Result<CheckVerdict> {
+    let is_status_context = entry.typename == "StatusContext"
+        || (entry.typename.is_empty() && entry.state.is_some() && entry.status.is_none());
+    if is_status_context {
+        let state = entry.state.as_deref().unwrap_or("");
+        return match state {
+            "SUCCESS" => Ok(CheckVerdict::Success),
+            "PENDING" | "EXPECTED" => Ok(CheckVerdict::Pending),
+            "FAILURE" | "ERROR" => Ok(CheckVerdict::Failure),
+            other => Err(Error::Other(anyhow::anyhow!(
+                "gh pr view --json statusCheckRollup: unrecognised StatusContext state `{other}`"
+            ))),
+        };
+    }
+    let status = entry.status.as_deref().unwrap_or("");
+    if status != "COMPLETED" {
+        return Ok(CheckVerdict::Pending);
+    }
+    let conclusion = entry.conclusion.as_deref().unwrap_or("");
+    match conclusion {
+        "SUCCESS" | "NEUTRAL" | "SKIPPED" => Ok(CheckVerdict::Success),
+        "FAILURE" | "TIMED_OUT" | "CANCELLED" | "STARTUP_FAILURE" | "ACTION_REQUIRED" | "STALE" => {
+            Ok(CheckVerdict::Failure)
+        }
+        other => Err(Error::Other(anyhow::anyhow!(
+            "gh pr view --json statusCheckRollup: unrecognised CheckRun conclusion `{other}`"
+        ))),
+    }
+}
+
+/// Combine every rollup entry's verdict: any failure wins, else any pending,
+/// else success. An empty rollup is `"pending"`, never `"success"`: no checks
+/// reported is not a green verdict.
+fn combined_rollup_state(rollup: &[GhCheckRollupEntry]) -> Result<String> {
+    if rollup.is_empty() {
+        return Ok("pending".to_string());
+    }
+    let mut any_pending = false;
+    for entry in rollup {
+        match check_verdict(entry)? {
+            CheckVerdict::Failure => return Ok("failure".to_string()),
+            CheckVerdict::Pending => any_pending = true,
+            CheckVerdict::Success => {}
+        }
+    }
+    Ok(if any_pending {
+        "pending".to_string()
+    } else {
+        "success".to_string()
+    })
+}
+
+impl GhPrStatusDoc {
+    /// Map this document onto [`super::PrStatus`], per the contract documented
+    /// on [`Forge::pr_status`]'s GitHub override.
+    fn into_pr_status(self) -> Result<super::PrStatus> {
+        let state_upper = self.state.to_ascii_uppercase();
+        if state_upper == "MERGED" {
+            return Ok(super::PrStatus {
+                state: "merged".to_string(),
+                mergeable: None,
+                behind_base: None,
+                head_sha: None,
+            });
+        }
+        let state = if state_upper == "CLOSED" {
+            "closed".to_string()
+        } else {
+            combined_rollup_state(&self.status_check_rollup)?
+        };
+        let mergeable = match self.mergeable.as_str() {
+            "MERGEABLE" => Some(true),
+            "CONFLICTING" => Some(false),
+            "UNKNOWN" => None,
+            other => {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "gh pr view --json mergeable: unrecognised value `{other}`"
+                )))
+            }
+        };
+        let behind_base = match self.merge_state_status.as_str() {
+            "BEHIND" => Some(true),
+            "BLOCKED" | "CLEAN" | "DIRTY" | "DRAFT" | "HAS_HOOKS" | "UNSTABLE" => Some(false),
+            "UNKNOWN" => None,
+            other => {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "gh pr view --json mergeStateStatus: unrecognised value `{other}`"
+                )))
+            }
+        };
+        Ok(super::PrStatus {
+            state,
+            mergeable,
+            behind_base,
+            head_sha: Some(self.head_ref_oid),
+        })
+    }
+}
+
+/// Parse `gh pr view --json ...` stdout into a [`GhPrStatusDoc`].
+fn parse_pr_status(stdout: &str) -> std::result::Result<GhPrStatusDoc, serde_json::Error> {
+    serde_json::from_str(stdout.trim())
 }
 
 /// One entry of `gh pr list --json number,title,headRefOid,headRefName,baseRefName,author,url`.
