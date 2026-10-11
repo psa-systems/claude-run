@@ -6400,6 +6400,139 @@ mod tests {
         );
     }
 
+    /// Nothing is hardcoded: the rendered `href` tracks whatever base URL the
+    /// Auth card has configured, for a native action that declares no
+    /// `link_template` of its own.
+    #[test]
+    fn rendered_href_follows_the_configured_base_url() {
+        for base in ["https://youtrack.example.com", "https://other.example.org"] {
+            let template = super::effective_link_template(None, true, Some(base)).unwrap();
+            let href = crate::action::render_link(&template, "CLAUDE-9");
+            assert_eq!(href, format!("{base}/issue/CLAUDE-9"));
+        }
+    }
+
+    /// A blocker signature with one, several, and a non-key leading token:
+    /// each key-shaped leading token links out, the rest renders unchanged.
+    #[test]
+    fn blocker_signature_links_key_tokens_only() {
+        use super::render_blocker_signature as render;
+
+        let template = "https://youtrack.example.com/issue/{key}";
+        let one = render("CLAUDE-9 (depends on)", Some(template));
+        assert_eq!(
+            one,
+            r#"<a href="https://youtrack.example.com/issue/CLAUDE-9" target="_blank" rel="noopener">CLAUDE-9</a> (depends on)"#
+        );
+
+        let several = render("CLAUDE-9 (depends on); ABC-12 (parent for)", Some(template));
+        assert_eq!(
+            several,
+            r#"<a href="https://youtrack.example.com/issue/CLAUDE-9" target="_blank" rel="noopener">CLAUDE-9</a> (depends on); <a href="https://youtrack.example.com/issue/ABC-12" target="_blank" rel="noopener">ABC-12</a> (parent for)"#
+        );
+
+        // A leading token that is not key-shaped is left unchanged (escaped,
+        // not linked).
+        let non_key = render("not-a-key (depends on)", Some(template));
+        assert_eq!(non_key, "not-a-key (depends on)");
+
+        // No template resolves: every part renders as plain (escaped) text.
+        let no_template = render("CLAUDE-9 (depends on)", None);
+        assert_eq!(no_template, "CLAUDE-9 (depends on)");
+    }
+
+    /// The Logs Message-column helper links only the row's own context key,
+    /// HTML-escapes everything else, and leaves a message with no occurrence
+    /// of the key untouched (besides escaping).
+    #[test]
+    fn link_message_links_only_the_context_key() {
+        use super::link_message as render;
+
+        let template = "https://youtrack.example.com/issue/{key}";
+        let linked = render(
+            "attempt counter reset for `CLAUDE-9`: 3 discarded",
+            "CLAUDE-9",
+            Some(template),
+        );
+        assert_eq!(
+            linked,
+            r#"attempt counter reset for `<a href="https://youtrack.example.com/issue/CLAUDE-9" target="_blank" rel="noopener">CLAUDE-9</a>`: 3 discarded"#
+        );
+
+        // HTML special characters in the message are escaped, not passed through.
+        let escaped = render(
+            "preflight failed for <script>CLAUDE-9</script>",
+            "CLAUDE-9",
+            Some(template),
+        );
+        assert!(escaped.contains("&lt;script&gt;"), "{escaped}");
+        assert!(!escaped.contains("<script>"), "{escaped}");
+
+        // A message that doesn't contain the context key is just escaped.
+        let no_match = render(
+            "unrelated failure, see the logs",
+            "CLAUDE-9",
+            Some(template),
+        );
+        assert_eq!(no_match, "unrelated failure, see the logs");
+
+        // No template resolves: the message is escaped but no key is linked.
+        let no_template = render("reset for `CLAUDE-9`", "CLAUDE-9", None);
+        assert_eq!(no_template, "reset for `CLAUDE-9`");
+    }
+
+    /// A parked row and a gate row each render an `<a href>` with the
+    /// expected URL once a link template is present.
+    #[test]
+    fn dashboard_rows_render_expected_hrefs() {
+        use super::{CappedKeyRow, StaleGateRow};
+        use crate::state;
+
+        let row = StaleGateRow {
+            gate: state::StaleGate {
+                action_name: "youtrack".to_string(),
+                job_key: "CLAUDE-9".to_string(),
+                signature: "ABC-12 (depends on)".to_string(),
+                blocked_for_ms: 0,
+                recheck_overdue_ms: 0,
+                updated_at: "2026-08-11T07:30:00Z".to_string(),
+            },
+            link_template: Some("https://youtrack.example.com/issue/{key}".to_string()),
+        };
+        assert_eq!(
+            row.href(),
+            Some("https://youtrack.example.com/issue/CLAUDE-9".to_string())
+        );
+
+        let capped = CappedKeyRow {
+            capped: state::CappedKey {
+                action_name: "youtrack".to_string(),
+                job_key: "ABC-12".to_string(),
+                count: 3,
+                cap: 3,
+                last_at: "2026-08-11T07:30:00Z".to_string(),
+            },
+            link_template: Some("https://youtrack.example.com/issue/{key}".to_string()),
+        };
+        assert_eq!(
+            capped.href(),
+            Some("https://youtrack.example.com/issue/ABC-12".to_string())
+        );
+
+        // No template resolves: no href, plain text.
+        let no_link = CappedKeyRow {
+            capped: state::CappedKey {
+                action_name: "other".to_string(),
+                job_key: "ABC-12".to_string(),
+                count: 1,
+                cap: 3,
+                last_at: "2026-08-11T07:30:00Z".to_string(),
+            },
+            link_template: None,
+        };
+        assert_eq!(no_link.href(), None);
+    }
+
     /// Every key links out once a template is present: planned-jobs table,
     /// outcomes table, and the summary-modal heading.
     #[test]
