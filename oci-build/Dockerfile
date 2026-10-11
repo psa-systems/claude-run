@@ -94,6 +94,7 @@ RUN nu --version \
     && claude --version \
     && yt --version \
     && fj version \
+    && fj auth git-credential --help \
     && gh --version \
     && just --version \
     && kingfisher --version \
