@@ -2007,18 +2007,19 @@ fn git_in(workdir: &FsPath, args: &[&str]) -> crate::error::Result<()> {
 /// [`crate::provider::retry_git_network`].
 fn git_push(workdir: &FsPath, url: &str, branch: &str) -> crate::error::Result<()> {
     let secrets = crate::provider::url_secrets(url);
+    let plain_url = crate::provider::strip_userinfo(url);
     let out = crate::provider::retry_git_network(
         "push",
         &secrets,
         &crate::provider::GIT_NETWORK_RETRY_WAITS,
         || {
-            Ok(std::process::Command::new("git")
-                .arg("-C")
-                .arg(workdir)
-                .arg("push")
-                .arg(url)
-                .arg(branch)
-                .output()?)
+            Ok(
+                crate::provider::authed_git_command(Some(workdir), Some(url))
+                    .arg("push")
+                    .arg(&plain_url)
+                    .arg(branch)
+                    .output()?,
+            )
         },
     )?;
     if out.status.success() {

@@ -693,7 +693,7 @@ fn url_userinfo(url: &str) -> Option<(String, String)> {
 /// `https://host/x`), unchanged when it carries none. This is what every
 /// remote URL in a job workdir is rewritten to after a clone, so a forge
 /// token is never left sitting in `.git/config` or `.git/modules/**/config`.
-fn strip_userinfo(url: &str) -> String {
+pub(crate) fn strip_userinfo(url: &str) -> String {
     match url.split_once("://") {
         Some((scheme, rest)) => match rest.split_once('@') {
             Some((_, hostpath)) => format!("{scheme}://{hostpath}"),
@@ -714,6 +714,21 @@ pub fn authed_git_output(
     args: &[&str],
     token_url: Option<&str>,
 ) -> std::io::Result<std::process::Output> {
+    authed_git_command(dir, token_url).args(args).output()
+}
+
+/// Build a `git` [`std::process::Command`] authenticated per invocation
+/// exactly like [`authed_git_output`], for call sites that need to append
+/// their own subcommand and args before executing rather than passing a
+/// flat `args` slice (the clone, the pinned-branch `ls-remote`/`fetch`, the
+/// submodule update, and the comment webhook's push). `token_url` is the
+/// token-bearing URL used only to derive the helper's environment; callers
+/// pass [`strip_userinfo`]`(token_url)` as the actual git argument so the
+/// token itself never reaches argv.
+pub(crate) fn authed_git_command(
+    dir: Option<&std::path::Path>,
+    token_url: Option<&str>,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     if let Some(d) = dir {
         cmd.arg("-C").arg(d);
@@ -723,7 +738,7 @@ pub fn authed_git_output(
             .env(GIT_CRED_USER_ENV, user)
             .env(GIT_CRED_PASS_ENV, pass);
     }
-    cmd.args(args).output()
+    cmd
 }
 
 /// Serializes every test (across modules) that mutates the process-wide
@@ -1035,7 +1050,7 @@ fn shallow_clone_retrying(
         } else if workdir.exists() {
             std::fs::remove_dir_all(workdir)?;
         }
-        let mut cmd = std::process::Command::new("git");
+        let mut cmd = authed_git_command(None, Some(url));
         // A detached auto-maintenance repack would race the push and the
         // workdir removal; an ephemeral clone never benefits from it.
         cmd.arg("clone")
@@ -1047,7 +1062,7 @@ fn shallow_clone_retrying(
         Ok(cmd
             .arg("--depth")
             .arg(depth.to_string())
-            .arg(url)
+            .arg(strip_userinfo(url))
             .arg(workdir)
             .output()?)
     })?;
@@ -1090,9 +1105,7 @@ fn init_submodules_retrying(
     }
     let secrets = url_secrets(url);
     let out = retry_git_network("submodule update", &secrets, waits, || {
-        Ok(std::process::Command::new("git")
-            .arg("-C")
-            .arg(workdir)
+        Ok(authed_git_command(Some(workdir), Some(url))
             .arg("-c")
             .arg("protocol.file.allow=always")
             .arg("submodule")
@@ -1127,10 +1140,10 @@ fn restore_default_branch_refs_retrying(
 ) -> Result<()> {
     let secrets = url_secrets(url);
     let out = retry_git_network("ls-remote", &secrets, waits, || {
-        Ok(std::process::Command::new("git")
+        Ok(authed_git_command(None, Some(url))
             .arg("ls-remote")
             .arg("--symref")
-            .arg(url)
+            .arg(strip_userinfo(url))
             .arg("HEAD")
             .output()?)
     })?;
@@ -1153,9 +1166,7 @@ fn restore_default_branch_refs_retrying(
     if default_branch != pinned {
         let refspec = format!("+refs/heads/{default_branch}:refs/remotes/origin/{default_branch}");
         let out = retry_git_network("fetch", &secrets, waits, || {
-            Ok(std::process::Command::new("git")
-                .arg("-C")
-                .arg(workdir)
+            Ok(authed_git_command(Some(workdir), Some(url))
                 .arg("fetch")
                 .arg("--depth")
                 .arg(depth.to_string())
