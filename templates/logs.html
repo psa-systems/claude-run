@@ -167,8 +167,8 @@
             {% endif %}
           </td>
           <td><a href="/actions/{{ e.action_name }}">{{ e.action_name }}</a></td>
-          <td class="mono">{{ e.context.as_deref().unwrap_or("-") }}</td>
-          <td{% if e.level == "error" || e.level == "warn" %} style="color: var(--bad);"{% endif %}>{{ e.message }}</td>
+          <td class="mono">{% if let Some(href) = e.href %}<a href="{{ href }}" target="_blank" rel="noopener">{{ e.context.as_deref().unwrap_or("-") }}</a>{% else %}{{ e.context.as_deref().unwrap_or("-") }}{% endif %}</td>
+          <td{% if e.level == "error" || e.level == "warn" %} style="color: var(--bad);"{% endif %}>{{ e.message_html|safe }}</td>
           <td class="mono">{% if let Some(rid) = e.run_id %}<a href="/runs/{{ rid }}">#{{ rid }}</a>{% else %}<span class="dim">-</span>{% endif %}</td>
         </tr>
       {% endfor %}

@@ -2182,11 +2182,29 @@ async fn fetch_run_events(
     Ok(q.bind(limit).bind(offset).fetch_all(pool).await?)
 }
 
+/// One `/logs` row, with its Context link and linked-message HTML
+/// pre-rendered: the row's own `context` key is linked wherever it appears in
+/// the Context column and inside the free-text Message column (not any
+/// key-shaped token), everything else HTML-escaped.
+struct EventRow {
+    ts: String,
+    level: String,
+    action_name: String,
+    context: Option<String>,
+    run_id: Option<i64>,
+    /// Link for the Context column, or `None` to render the context as plain
+    /// text.
+    href: Option<String>,
+    /// The Message column, already HTML-escaped and with the row's own
+    /// context key linked; rendered with `|safe`.
+    message_html: String,
+}
+
 #[derive(Template)]
 #[template(path = "logs.html")]
 struct LogsTpl {
     version: &'static str,
-    events: Vec<state::RunEventLogRecord>,
+    events: Vec<EventRow>,
     page: PageNav,
     view: EventsView,
     level_options: Vec<String>,
@@ -2281,8 +2299,44 @@ async fn logs(State(s): State<WebState>, Query(q): Query<LogsQuery>) -> Result<R
     let total_pages = ((total + EVENTS_PAGE_SIZE - 1) / EVENTS_PAGE_SIZE).max(1);
     let page = q.page.unwrap_or(1).clamp(1, total_pages);
     let offset = (page - 1) * EVENTS_PAGE_SIZE;
-    let events =
+    let events_raw =
         fetch_run_events(pool, &view, started_at.as_deref(), EVENTS_PAGE_SIZE, offset).await?;
+
+    // Resolve each distinct action's effective link template once, same rule
+    // as every other site in the table.
+    let base = s.api.settings.auth_config().await.youtrack_base_url;
+    let actions_dir = s.paths.actions_dir();
+    let mut link_templates: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for name in events_raw.iter().map(|e| e.action_name.as_str()) {
+        if !link_templates.contains_key(name) {
+            let t = action_link_template(pool, &actions_dir, name, base.as_deref()).await;
+            link_templates.insert(name.to_string(), t);
+        }
+    }
+    let events: Vec<EventRow> = events_raw
+        .into_iter()
+        .map(|e| {
+            let template = link_templates.get(&e.action_name).cloned().flatten();
+            let href = match (&e.context, &template) {
+                (Some(ctx), Some(t)) if !ctx.is_empty() => Some(crate::action::render_link(t, ctx)),
+                _ => None,
+            };
+            let message_html = match &e.context {
+                Some(ctx) if !ctx.is_empty() => link_message(&e.message, ctx, template.as_deref()),
+                _ => html_escape(&e.message),
+            };
+            EventRow {
+                ts: e.ts,
+                level: e.level,
+                action_name: e.action_name,
+                context: e.context,
+                run_id: e.run_id,
+                href,
+                message_html,
+            }
+        })
+        .collect();
     let page_nav = PageNav {
         page,
         total_pages,
