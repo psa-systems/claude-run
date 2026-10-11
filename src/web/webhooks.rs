@@ -5975,6 +5975,22 @@ mod tests {
         }
     }
 
+    /// A [`store_event`]-shaped event on `github.com`, so a test can
+    /// drive the triage path through [`forge_for_event`]'s GitHub branch.
+    fn github_store_event(index_in_repo: i64, repo: &str) -> VerifiedFailureEvent {
+        VerifiedFailureEvent {
+            repo: repo.to_string(),
+            index_in_repo,
+            commit_sha: format!("commit-{index_in_repo}"),
+            workflow_id: "ci.yml".to_string(),
+            private: false,
+            source: "test-source".to_string(),
+            trigger_user: "alice".to_string(),
+            html_url: format!("https://github.com/{repo}/actions/runs/{index_in_repo}"),
+            status: "failure".to_string(),
+        }
+    }
+
     /// [`ActionLogClient`] returning one canned failing job's log per repo/run
     /// number, keyed the way the worked-example test needs it.
     struct ScriptedFailingLogs {
@@ -12745,6 +12761,278 @@ mod tests {
                     "{events:?}"
                 );
             }
+        }
+    }
+
+    // CLAUDE-406: the triage path's own open-PR lookups (the routing
+    // decision in `resolve_open_pr` and the advisory `has_open_pr` signal in
+    // `resolve_has_open_pr`) must route a `github.com` failure through
+    // `GithubForge`, never `mint.backend` (`fj`, which 410s against GitHub's
+    // API), exactly like the automerge path already does.
+    mod triage_github_hosted {
+        use super::*;
+
+        fn gh_list_open_prs_args(repo: &str) -> Vec<&str> {
+            vec![
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "open",
+                "--limit",
+                "1000",
+                "--json",
+                "number,title,headRefOid,headRefName,baseRefName,author,url",
+            ]
+        }
+
+        #[tokio::test]
+        async fn open_pr_routing_for_a_github_host_uses_github_forge_not_fj() {
+            // An agent's own PR, on `github.com`: the routing lookup must
+            // find it through `GithubForge`'s `gh pr list`, re-queuing its
+            // issue, and never touch `mint.backend` (`fj`, configured to
+            // fail if it is ever reached).
+            let pool = crate::db::test_pool().await;
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "youtrack",
+                "CLAUDE-40",
+                "github.com",
+                "octo/widget",
+                42,
+                "fix/CLAUDE-40",
+                "open",
+                now,
+            )
+            .await
+            .unwrap();
+
+            let backend = Arc::new(StoreBackend::new().with_open_prs_error("fj: 410 Gone"));
+            let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().ok(
+                "gh",
+                &gh_list_open_prs_args("octo/widget"),
+                r#"[{"number":42,"title":"fix","headRefOid":"commit-9201","headRefName":"fix/CLAUDE-40","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#,
+            ));
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = store_mint_context_in(
+                pool.clone(),
+                backend.clone(),
+                classifier,
+                dir.path(),
+                runner.clone(),
+            );
+            let ev = github_store_event(9201, "octo/widget");
+            let log = failing_test_log("mod_a", "test_one", "fix/CLAUDE-40");
+
+            let result = triage_and_mint(
+                &ctx,
+                None,
+                &ev,
+                log,
+                true,
+                None,
+                None,
+                true,
+                "test".to_string(),
+                None,
+                &crate::concurrency::KeyGate::new(),
+                &WebhookConfig::default(),
+                &test_spend(),
+            )
+            .await;
+
+            assert!(result.ok, "{}", result.text);
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("list_open_prs")),
+                "fj must never be consulted for a GitHub host: {calls:?}"
+            );
+            assert!(
+                calls.iter().any(|c| c.starts_with("comment CLAUDE-40")),
+                "the agent's own PR re-queues its issue: {calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c == "set_field CLAUDE-40 AI Agent Queued"),
+                "{calls:?}"
+            );
+            assert!(
+                runner
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.starts_with("gh pr list")),
+                "the routing lookup ran through GithubForge: {:?}",
+                runner.calls.lock().unwrap()
+            );
+        }
+
+        #[tokio::test]
+        async fn has_open_pr_signal_for_a_github_host_uses_github_forge_not_fj() {
+            // No recorded agent PR and no open PR matches this commit, so
+            // this reaches the ordinary classify + mint path (routing's own
+            // `resolve_open_pr` finds nothing and the human-PR-comment
+            // branch never triggers). Its advisory `has_open_pr` signal must
+            // still route through `GithubForge`, never `fj`.
+            let pool = crate::db::test_pool().await;
+            let backend = Arc::new(StoreBackend::new().with_open_prs_error("fj: 410 Gone"));
+            let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().ok(
+                "gh",
+                &gh_list_open_prs_args("octo/widget"),
+                r#"[{"number":42,"title":"fix","headRefOid":"commit-other","headRefName":"fix/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#,
+            ));
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = store_mint_context_in(
+                pool.clone(),
+                backend.clone(),
+                classifier,
+                dir.path(),
+                runner.clone(),
+            );
+            let ev = github_store_event(9301, "octo/widget");
+            let log = failing_test_log("mod_a", "test_one", "main");
+
+            let result = triage_and_mint(
+                &ctx,
+                None,
+                &ev,
+                log,
+                true,
+                None,
+                None,
+                true,
+                "test".to_string(),
+                None,
+                &crate::concurrency::KeyGate::new(),
+                &WebhookConfig::default(),
+                &test_spend(),
+            )
+            .await;
+
+            assert!(result.ok, "{}", result.text);
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("list_open_prs")),
+                "fj must never be consulted for a GitHub host: {calls:?}"
+            );
+            assert!(
+                runner
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.starts_with("gh pr list")),
+                "the advisory has_open_pr signal ran through GithubForge: {:?}",
+                runner.calls.lock().unwrap()
+            );
+        }
+
+        #[tokio::test]
+        async fn open_pr_lookup_failure_for_a_github_host_still_fails_the_routing_run() {
+            // A failed `gh pr list` call for a GitHub host must still fail
+            // the routing run exactly like a failed `fj` lookup does - never
+            // silently read as "no PR".
+            let pool = crate::db::test_pool().await;
+            let backend = Arc::new(StoreBackend::new());
+            let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().fail(
+                "gh",
+                &gh_list_open_prs_args("octo/widget"),
+                1,
+                "gh: 401 Unauthorized",
+            ));
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = store_mint_context_in(
+                pool.clone(),
+                backend.clone(),
+                classifier,
+                dir.path(),
+                runner,
+            );
+            let ev = github_store_event(9401, "octo/widget");
+            let log = failing_test_log("mod_a", "test_one", "main");
+
+            let result = triage_and_mint(
+                &ctx,
+                None,
+                &ev,
+                log,
+                true,
+                None,
+                None,
+                true,
+                "test".to_string(),
+                None,
+                &crate::concurrency::KeyGate::new(),
+                &WebhookConfig::default(),
+                &test_spend(),
+            )
+            .await;
+
+            assert!(
+                !result.ok,
+                "a lookup error must fail the run: {}",
+                result.text
+            );
+            assert!(
+                !backend.calls().iter().any(|c| c.starts_with("create")),
+                "nothing minted: {:?}",
+                backend.calls()
+            );
+        }
+
+        #[tokio::test]
+        async fn resolve_open_pr_fails_for_a_github_host_lookup_failure() {
+            // Direct test of `resolve_open_pr` (the routing decision): a
+            // failed `gh pr list` call is an error, never read as "no PR",
+            // for a GitHub host exactly as it already is for an `fj` one.
+            let pool = crate::db::test_pool().await;
+            let backend = Arc::new(StoreBackend::new());
+            let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().fail(
+                "gh",
+                &gh_list_open_prs_args("octo/widget"),
+                1,
+                "gh: 401 Unauthorized",
+            ));
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = store_mint_context_in(pool, backend, classifier, dir.path(), runner);
+            let ev = github_store_event(9402, "octo/widget");
+
+            let forge = forge_for_event(&ctx, &ev);
+            let result = resolve_open_pr(forge.as_ref(), &ev);
+
+            assert!(result.is_err(), "{result:?}");
+        }
+
+        #[tokio::test]
+        async fn resolve_has_open_pr_degrades_to_false_for_a_github_host_lookup_failure() {
+            // Direct test of `resolve_has_open_pr` (the advisory signal): the
+            // same kind of failure degrades to `false` instead of erroring,
+            // for a GitHub host exactly as it already does for an `fj` one.
+            let pool = crate::db::test_pool().await;
+            let backend = Arc::new(StoreBackend::new());
+            let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().fail(
+                "gh",
+                &gh_list_open_prs_args("octo/widget"),
+                1,
+                "gh: 401 Unauthorized",
+            ));
+            let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = store_mint_context_in(pool, backend, classifier, dir.path(), runner);
+            let ev = github_store_event(9403, "octo/widget");
+
+            let forge = forge_for_event(&ctx, &ev);
+            let has_open_pr = resolve_has_open_pr(forge.as_ref(), &ev);
+
+            assert!(!has_open_pr, "a lookup failure degrades to false");
         }
     }
 
