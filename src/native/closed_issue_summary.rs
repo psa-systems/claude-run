@@ -626,9 +626,10 @@ mod tests {
 
     #[test]
     fn closed_issue_rows_without_an_id_are_dropped() {
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_str(r#"[{"summary":"no id"},{"idReadable":"DELTA-1","summary":"ok"}]"#)
-                .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"summary":"no id"},{"idReadable":"DELTA-1","summary":"ok"}]"#,
+        )
+        .unwrap();
         let parsed: Vec<ClosedIssue> = rows.iter().filter_map(ClosedIssue::from_row).collect();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].key, "DELTA-1");
@@ -904,7 +905,10 @@ mod tests {
         ));
         let backend = CliBackend::new(runner);
         let (targets, from_query) = resolve_targets(&backend, &c).unwrap();
-        assert_eq!(targets, vec!["CLAUDE-100".to_string(), "DELTA-3".to_string()]);
+        assert_eq!(
+            targets,
+            vec!["CLAUDE-100".to_string(), "DELTA-3".to_string()]
+        );
         assert!(from_query.contains("DELTA-3"));
         assert!(from_query.contains("CLAUDE-100"));
     }

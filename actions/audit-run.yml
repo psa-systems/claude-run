@@ -17,8 +17,8 @@
 # prints `"prompt_source": "builtin:audit"` while the preset is in effect.
 #
 # The audit preset permits the tracker writes an audit needs and the engineering prompt forbids: filing the findings
-# into the product projects in `write_projects` (CLAUDE-295), the `## Result` block on the run's own issue, one summary
-# comment per target on the parent, and (daily parent run only) the standing table on anchor issue AUDIT-1. Every
+# into the projects in `write_projects` (CLAUDE-295), the `## Result` block on the run's own issue, one summary
+# comment per target on the parent, and (daily parent run only) the standing table on the anchor issue in the `AUDIT` project. Every
 # finding issue the run files gets `AI Agent = Queued` as its last write, so the `youtrack` action works it; that value,
 # on issues the run created, is the only `AI Agent` write the agent may make. The 20-issue per-target cap is a prompt
 # instruction: `AuditedTracker` bounds the runner's own provider calls, not the `yt` calls an agent makes. The filing
@@ -36,7 +36,7 @@
 # The dependency gate (CLAUDE-161) is left on, which is what makes the daily parent wait: the workflow files one parent
 # plus one Epic per target and queues all of them, and `parent for` blocks the parent until every Epic resolves.
 # `block_cross_project: false` stops an Epic from waiting on its own findings: they are its subtasks but live in the
-# product projects, so a retried Epic would otherwise stay blocked until every finding was worked.
+# other projects, so a retried Epic would otherwise stay blocked until every finding was worked.
 #
 # Automerge is on: an audit pull request only adds dated files to the audits repo, and it has to merge for its Epic to
 # resolve, which is what releases the gated daily parent (whose run reads the per-target reports on the default branch).
@@ -75,15 +75,8 @@ native:
     custom_field: "AI Agent"
     # The built-in audit prompt (`src/native/audit_prompt.rs`). Do not add a `prompt:` key: it would override this.
     prompt_preset: audit
-    # The product projects findings file into: the project mapping in the audits repo's `prompts/_filing.md`.
-    write_projects:
-      - ALPHA
-      - BETA
-      - GAMMA
-      - DELTA
-      - EPSILON
-      - ZETA
-      - ETA
+    # Set `write_projects` to the projects findings should file into (see actions/SCHEMA.md).
+    # Left unset, findings file into the triggering issue's own project (the `AUDIT` project).
     dependencies:
       block_cross_project: false
     # Merge the audit pull request once its CI is green, so the Epic resolves and the gated daily parent can run.

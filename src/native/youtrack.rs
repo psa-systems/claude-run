@@ -3458,7 +3458,7 @@ mod tests {
         assert_eq!(body, "The PR is ready.");
     }
 
-    /// an earlier audit run's shape - a `compact_boundary` event in the run's
+    /// That earlier audit run's shape - a `compact_boundary` event in the run's
     /// stream log - appends the one-line warning to whatever outcome comment
     /// (success or needs-review) it is given.
     #[test]
@@ -3666,7 +3666,7 @@ mod tests {
     fn audit_src() -> YoutrackSource {
         YoutrackSource {
             prompt_preset: PromptPreset::Audit,
-            write_projects: vec!["ALPHA".into(), "GAMMA".into()],
+            write_projects: vec!["ALPHA".into(), "BETA".into()],
             ..YoutrackSource::default()
         }
     }
@@ -3703,7 +3703,7 @@ mod tests {
                 p.contains("Repo: https://dev.a8n.run/contoso/claude-run.git"),
                 "{p}"
             );
-            assert!(p.contains("ONLY in these projects: ALPHA, GAMMA"), "{p}");
+            assert!(p.contains("ONLY in these projects: ALPHA, BETA"), "{p}");
             assert!(p.contains("/tmp/wd/.claude-run-needs-review"), "{p}");
             assert!(p.contains("/tmp/wd/.claude-run-skip-attempt"), "{p}");
             assert!(p.contains("#MK-16"), "{p}");
@@ -7139,14 +7139,14 @@ mod tests {
     }
 
     /// Scoped to its own project, the gate ignores targets anywhere
-    /// else, so an `AUDIT` Epic does not wait on the `GAMMA` findings it filed.
+    /// else, so an `AUDIT` Epic does not wait on the `ALPHA` findings it filed.
     #[test]
     fn unmet_blockers_skips_other_projects_when_scoped() {
         let block_on = crate::action::Dependencies::default().block_on;
         let links = vec![
-            link(LinkDirection::Outward, "parent for", "GAMMA-12", None),
+            link(LinkDirection::Outward, "parent for", "ALPHA-12", None),
             link(LinkDirection::Outward, "parent for", "AUDIT-7", None),
-            link(LinkDirection::Inward, "depends on", "EPSILON-3", None),
+            link(LinkDirection::Inward, "depends on", "BETA-3", None),
         ];
         let ids = |own: Option<&str>| -> Vec<String> {
             unmet_blockers(&links, &block_on, own)
@@ -7154,7 +7154,7 @@ mod tests {
                 .map(|b| b.id)
                 .collect()
         };
-        assert_eq!(ids(None), vec!["AUDIT-7", "GAMMA-12", "EPSILON-3"]);
+        assert_eq!(ids(None), vec!["ALPHA-12", "AUDIT-7", "BETA-3"]);
         assert_eq!(ids(Some("AUDIT")), vec!["AUDIT-7"]);
     }
 
@@ -7162,9 +7162,9 @@ mod tests {
     /// child is in another project is blocked by default and proceeds when false.
     #[tokio::test]
     async fn dependency_gate_scopes_to_own_project_when_configured() {
-        let inspect = r#"{"links":[{"direction":"OUTWARD","verb":"parent for","issues":[{"idReadable":"GAMMA-12","summary":"x"}]}]}"#;
+        let inspect = r#"{"links":[{"direction":"OUTWARD","verb":"parent for","issues":[{"idReadable":"ALPHA-12","summary":"x"}]}]}"#;
         let body = blocked_comment(&[Blocker {
-            id: "GAMMA-12".into(),
+            id: "ALPHA-12".into(),
             verb: "parent for".into(),
         }]);
         let runner = Arc::new(

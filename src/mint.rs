@@ -1653,10 +1653,10 @@ mod tests {
         let a = req_infra(
             &t,
             "disk-full",
-            "fix/GAMMA-1041-invoice-module-gate",
+            "fix/ALPHA-1041-invoice-module-gate",
             "aaaa1111",
         );
-        let b = req_infra(&t, "disk-full", "feat/GAMMA-1126-kb-provenance", "bbbb2222");
+        let b = req_infra(&t, "disk-full", "feat/ALPHA-1126-kb-provenance", "bbbb2222");
         assert_eq!(infra_marker(&a), infra_marker(&b));
         assert_eq!(
             infra_marker(&a),
@@ -1679,10 +1679,10 @@ mod tests {
         let first = req_infra(
             &t,
             "disk-full",
-            "fix/GAMMA-1041-invoice-module-gate",
+            "fix/ALPHA-1041-invoice-module-gate",
             "aaaa1111",
         );
-        let second = req_infra(&t, "disk-full", "feat/GAMMA-1126-kb-provenance", "bbbb2222");
+        let second = req_infra(&t, "disk-full", "feat/ALPHA-1126-kb-provenance", "bbbb2222");
         assert_eq!(infra_marker(&first), infra_marker(&second));
         let tracker = StubTracker::new();
         let out = mint(&tracker, &cfg(), &route_cache(), &second, &caps()).unwrap();

@@ -5926,12 +5926,12 @@ mod tests {
                     dev-billing-${USER} so each developer's stack is its own project, and\n\
                     document the one-time migration step in CLAUDE.md.\n\
                     \n\
-                    #GAMMA-1281\n\
+                    #ALPHA-1281\n\
                     \n\
                     Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
         let expected = "compose.dev.yml pinned name: dev-billing while every container, volume and network was already ${USER}-suffixed, so the project itself was shared: a docker compose run under one USER could treat another developer's network as an orphan of the same project (or wipe their volumes via just down / just dev-clean). Make the project name dev-billing-${USER} so each developer's stack is its own project, and document the one-time migration step in CLAUDE.md.\n\
                         \n\
-                        #GAMMA-1281\n\
+                        #ALPHA-1281\n\
                         \n\
                         Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
         assert_eq!(unwrap_prose(body), expected);
