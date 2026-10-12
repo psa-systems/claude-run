@@ -6029,10 +6029,10 @@ mod tests {
         let classifier: Arc<dyn FailureClassifier> = counting.clone();
 
         let branches = [
-            "fix/GAMMA-1041-invoice-module-gate",
-            "feat/GAMMA-1126-kb-provenance",
-            "chore/GAMMA-1130-cleanup",
-            "fix/GAMMA-1140-retry-logic",
+            "fix/ALPHA-1041-invoice-module-gate",
+            "feat/ALPHA-1126-kb-provenance",
+            "chore/ALPHA-1130-cleanup",
+            "fix/ALPHA-1140-retry-logic",
         ];
         let runs = [5845, 5850, 5859, 5871];
         let mut logs = HashMap::new();
@@ -7243,8 +7243,8 @@ mod tests {
         // runs of one job on two different PR branches: with a host condition
         // in the log they search the SAME key, and without one they search
         // different keys, exactly as before.
-        let a = "GITHUB_HEAD_REF=fix/GAMMA-1041-invoice-module-gate\n";
-        let b = "GITHUB_HEAD_REF=feat/GAMMA-1126-kb-provenance\n";
+        let a = "GITHUB_HEAD_REF=fix/ALPHA-1041-invoice-module-gate\n";
+        let b = "GITHUB_HEAD_REF=feat/ALPHA-1126-kb-provenance\n";
         let guard = "Insufficient free space: the suite needs ~25G to link test binaries.\n";
         assert_eq!(
             collapse_query(&format!("{a}{guard}")),

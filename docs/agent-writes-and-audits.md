@@ -71,7 +71,7 @@ preset handles both run shapes (a per-target Epic and the daily parent) and perm
 prompt forbids: one summary comment per target on the parent issue, a `## Result` block on the run's own issue
 description, the standing table on the anchor issue (daily parent run only), and filing the run's findings
 (CLAUDE-295). Findings are
-created only in `native.youtrack.write_projects` (the seven product projects the audits repo maps its targets to), at
+created only in `native.youtrack.write_projects` (empty by default, which resolves to the triggering issue's own project; an operator sets the projects findings should file into), at
 most 20 finding issues per target, and each gets `AI Agent = Queued` as its last write, so the code-issue action works
 it. `AI Agent = Needs Review` is the one other value the run may set, and only on an issue it created this run whose
 content it later finds wrong (CLAUDE-304); `AI Agent` and `State` on the audit issue itself remain the runner's
@@ -95,7 +95,7 @@ filed turned out fine.
 The dependency gate (CLAUDE-161) is left enabled, which is what sequences a daily rotation: the workflow files one
 parent plus one Epic per target and queues all of them, and `parent for` keeps the parent blocked until every Epic
 resolves, so the run summary has something to summarize. Each finding is filed as a subtask of its Epic, which makes the
-Epic `parent for` open issues in the product projects. `dependencies.block_cross_project: false` makes the gate ignore
+Epic `parent for` open issues in other projects. `dependencies.block_cross_project: false` makes the gate ignore
 those, or an Epic retried after a transient failure would wait until every one of its findings was worked.
 `concurrency.max_parallel: 1` keeps one audit in flight at a time; per-target caps and the coverage ledger, not
 serialization, are what keep a rotation affordable. `automerge.enabled: true` merges an audit pull request once its CI

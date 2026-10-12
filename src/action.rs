@@ -1415,12 +1415,10 @@ native:
         // Audit pull requests must merge so the Epic resolves and the gated
         // daily parent runs.
         assert!(cfg.youtrack.automerge.enabled);
-        // Findings file into the product projects, and an Epic must
-        // not wait on the findings it filed there as its subtasks.
-        assert_eq!(
-            cfg.youtrack.write_projects,
-            vec!["ALPHA", "BETA", "GAMMA", "DELTA", "EPSILON", "ZETA", "ETA"]
-        );
+        // No site-specific projects ship: an empty list files findings into
+        // the triggering issue's own project, and an Epic must not wait on the
+        // findings it filed elsewhere as its subtasks.
+        assert!(cfg.youtrack.write_projects.is_empty());
         assert!(!cfg.youtrack.dependencies.block_cross_project);
         // The parent gate is what makes the daily summary run last, so it must
         // not be disabled here.
@@ -1536,7 +1534,10 @@ native:
             panic!("expected closed-issue-summary native config");
         };
         assert!(cfg.enabled);
-        assert_eq!(cfg.projects, vec!["CLAUDE".to_string(), "DELTA".to_string()]);
+        assert_eq!(
+            cfg.projects,
+            vec!["CLAUDE".to_string(), "DELTA".to_string()]
+        );
         assert_eq!(cfg.window_days, 7);
         // Defaults: no parents, no query, subtask linkage, the parent's project.
         assert!(cfg.parents.is_empty());

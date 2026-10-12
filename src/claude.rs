@@ -2865,7 +2865,7 @@ exit "$code"
         assert_eq!(count_compact_boundaries(&log).unwrap(), 0);
     }
 
-    /// The an earlier audit run shape - one `compact_boundary` event partway
+    /// The shape of that earlier audit run - one `compact_boundary` event partway
     /// through the run - counts as one, whether it appears before or after the
     /// terminal `result` (unlike `killed_tasks_after_result`, compaction can
     /// happen mid-run and still matter, so no result-relative filtering here).

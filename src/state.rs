@@ -2286,9 +2286,7 @@ mod tests {
         run_inflight_add(&pool, r1, "ALPHA-1", "ALPHA")
             .await
             .unwrap();
-        run_inflight_add(&pool, r2, "BETA-3", "BETA")
-            .await
-            .unwrap();
+        run_inflight_add(&pool, r2, "BETA-3", "BETA").await.unwrap();
         // A different action's in-flight concurrency key must not leak in.
         let other = run_begin(&pool, "other", "scheduler").await.unwrap();
         run_inflight_add(&pool, other, "GAMMA-9", "GAMMA")
