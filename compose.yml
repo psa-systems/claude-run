@@ -70,8 +70,8 @@ services:
       # "$RUNS_ON_RUST_BUILDER_MUSL"` and a compose `image: ${RUNS_ON_RUST_BUILDER_MUSL}`
       # work directly. The value is always a `dev.a8n.run` image, never from
       # the GitHub Container Registry.
-      RUNS_ON_OPENSUSE_BASE_HEAVY: dev.a8n.run/pandoras-box/opensuse-dev:v1.13.0-leap-16.0
-      RUNS_ON_OPENSUSE_BASE_MASSIVE: dev.a8n.run/pandoras-box/opensuse-dev:v1.13.0-leap-16.0
+      RUNS_ON_OPENSUSE_BASE_HEAVY: dev.a8n.run/pandoras-box/opensuse-dev:v1.14.0-leap-16.0
+      RUNS_ON_OPENSUSE_BASE_MASSIVE: dev.a8n.run/pandoras-box/opensuse-dev:v1.14.0-leap-16.0
       RUNS_ON_OPENSUSE_BASE_LIGHT: dev.a8n.run/pandoras-box/opensuse-base:v1.13.0-leap-16.0
       RUNS_ON_OPENSUSE_BASE_MEDIUM: dev.a8n.run/pandoras-box/opensuse-base:v1.13.0-leap-16.0
       RUNS_ON_RUST_BUILDER_MUSL: dev.a8n.run/pandoras-box/rust-builder-musl:v1.2.0-rust1.98.1-alpine
