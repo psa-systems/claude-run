@@ -2321,21 +2321,54 @@ pub(crate) fn automerge_conflict_resolving_comment(pr_url: &str) -> String {
     .join("\n")
 }
 
-/// `fj pr status` did not report `behind_base` at all, meaning the
-/// runtime's `fj` predates FJ-99. Automerge cannot tell whether the branch is
-/// up to date, so it takes no merge action and leaves the issue at Code
-/// Review for a human to check.
-pub(crate) fn automerge_behind_base_missing_comment(pr_url: &str) -> String {
+/// The forge backend that reported no `behind_base`, which decides the cause
+/// the comment and run event name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BehindBaseBackend {
+    Forgejo,
+    GitHub,
+}
+
+/// The `behind_base missing` outcome text for `backend`, shared by the
+/// `run_events` row and the issue-comment dedupe key.
+pub(crate) fn behind_base_missing_outcome(backend: BehindBaseBackend) -> String {
+    match backend {
+        BehindBaseBackend::Forgejo => "behind_base missing".to_string(),
+        BehindBaseBackend::GitHub => {
+            "behind_base missing: gh pr view reported mergeStateStatus: UNKNOWN".to_string()
+        }
+    }
+}
+
+/// The forge reported no `behind_base`, so automerge cannot tell whether the
+/// branch is up to date and takes no merge action. Forgejo: the runtime's `fj`
+/// predates FJ-99, a human must act. GitHub: `mergeStateStatus` is still
+/// `UNKNOWN` (computed lazily), a transient state the reconciler re-checks.
+pub(crate) fn automerge_behind_base_missing_comment(
+    pr_url: &str,
+    backend: BehindBaseBackend,
+) -> String {
+    let (head, cause) = match backend {
+        BehindBaseBackend::Forgejo => (
+            "This PR's checks passed, but the runner could not tell whether its branch is behind \
+             its base.",
+            "`fj pr status` did not report `behind_base`; the runtime's fj must include FJ-99. A \
+             human needs to check and merge this PR.",
+        ),
+        BehindBaseBackend::GitHub => (
+            "This PR's checks passed, but GitHub has not yet computed whether its branch is \
+             behind its base.",
+            "`gh pr view` reported `mergeStateStatus: UNKNOWN`. GitHub computes this lazily after \
+             a push, so the runner will re-check on the next reconciler pass. No action is \
+             needed unless this persists.",
+        ),
+    };
     [
-        "This PR's checks passed, but the runner could not tell whether its branch is behind \
-         its base."
-            .to_string(),
+        head.to_string(),
         String::new(),
         format!("PR: {pr_url}"),
         String::new(),
-        "`fj pr status` did not report `behind_base`; the runtime's fj must include FJ-99. A \
-         human needs to check and merge this PR."
-            .to_string(),
+        cause.to_string(),
     ]
     .join("\n")
 }

@@ -66,6 +66,7 @@ use crate::config::{MintConfig, Paths, WebhookConfig, WebhookSource};
 use crate::forge_log::LogOutcome;
 use crate::job::RunnerDefaults;
 use crate::mint::{self, MintCaps, MintOutcome, MintRequest, VcsRouteCache};
+use crate::native::youtrack::BehindBaseBackend;
 use crate::provider::{
     is_github_host, Backend, CliBackend, CommandRunner, Forge, ForgePullRequest, GithubForge,
 };
@@ -4629,14 +4630,26 @@ async fn apply_automerge_decision(
         "success" => match status.behind_base {
             // `mergeable` alone cannot tell whether the branch is
             // behind base (Forgejo's `mergeable` ignores that entirely), so an
-            // `fj` that does not report `behind_base` at all (predates FJ-99)
-            // takes no merge action rather than guessing.
+            // forge that does not report `behind_base` takes no merge action
+            // rather than guessing: `fj` predating FJ-99, or GitHub's lazily
+            // computed `mergeStateStatus` still `UNKNOWN`.
             None => {
-                let msg = format!(
-                    "PR #{pr_number}: fj pr status did not report behind_base; the runtime's fj is too old to support this check"
-                );
+                let backend = if is_github_host(host, &github_cfg.hosts) {
+                    BehindBaseBackend::GitHub
+                } else {
+                    BehindBaseBackend::Forgejo
+                };
+                let msg = match backend {
+                    BehindBaseBackend::Forgejo => format!(
+                        "PR #{pr_number}: fj pr status did not report behind_base; the runtime's fj is too old to support this check"
+                    ),
+                    BehindBaseBackend::GitHub => format!(
+                        "PR #{pr_number}: gh pr view reported mergeStateStatus: UNKNOWN (GitHub has not computed the branch state yet); the runner will re-check on the next pass"
+                    ),
+                };
                 warn!(repo = %repo, pr = pr_number, "action-run success: {msg}");
-                let body = crate::native::youtrack::automerge_behind_base_missing_comment(pr_url);
+                let body =
+                    crate::native::youtrack::automerge_behind_base_missing_comment(pr_url, backend);
                 record_automerge_outcome_and_comment_once(
                     mint,
                     pool,
@@ -4646,7 +4659,7 @@ async fn apply_automerge_decision(
                         issue_key: &row.issue_key,
                     },
                     "warn",
-                    "behind_base missing".to_string(),
+                    crate::native::youtrack::behind_base_missing_outcome(backend),
                     body,
                     "action-run success: behind_base-missing comment failed",
                 )
@@ -11212,6 +11225,8 @@ mod tests {
             .await
             .unwrap_err();
             assert!(result.contains("behind_base"), "{result}");
+            assert!(result.contains("fj pr status"), "{result}");
+            assert!(!result.contains("mergeStateStatus"), "{result}");
             let calls = backend.calls();
             assert!(
                 !calls.iter().any(|c| c.starts_with("merge_pr")),
@@ -11221,10 +11236,14 @@ mod tests {
                 !calls.iter().any(|c| c.starts_with("update_pr_branch")),
                 "{calls:?}"
             );
-            assert!(
-                calls.iter().any(|c| c.starts_with("comment MK-16")),
-                "{calls:?}"
-            );
+            let comment = calls
+                .iter()
+                .find(|c| c.starts_with("comment MK-16"))
+                .unwrap_or_else(|| panic!("expected a comment, got {calls:?}"));
+            assert!(comment.contains("fj pr status"), "{comment}");
+            assert!(comment.contains("FJ-99"), "{comment}");
+            assert!(!comment.contains("gh pr view"), "{comment}");
+            assert!(!comment.contains("mergeStateStatus"), "{comment}");
         }
 
         #[tokio::test]
@@ -12544,6 +12563,74 @@ mod tests {
                     "the post-merge comment still goes through the YouTrack backend: {:?}",
                     backend.calls()
                 );
+            }
+
+            #[tokio::test]
+            async fn behind_base_unknown_on_github_blames_gh_not_fj() {
+                // GitHub reports `mergeStateStatus: UNKNOWN` while it computes
+                // mergeability lazily; the outcome and comment must name `gh`
+                // and the re-check, never `fj` / FJ-99.
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                let backend = Arc::new(StoreBackend::new());
+                let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+                let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().ok(
+                    "gh",
+                    &gh_pr_view_args("octo/widget"),
+                    &gh_pr_view_json("UNKNOWN"),
+                ));
+                let ctx = store_mint_context_in(
+                    pool.clone(),
+                    backend.clone(),
+                    classifier,
+                    dir.path(),
+                    runner.clone(),
+                );
+                let row = seeded_github_row(&pool).await;
+
+                let err = apply_automerge_decision(
+                    &ctx,
+                    &pool,
+                    "github.com",
+                    "octo/widget",
+                    42,
+                    "https://github.com/octo/widget/pulls/42",
+                    &row,
+                )
+                .await
+                .unwrap_err();
+
+                assert!(err.contains("gh pr view"), "{err}");
+                assert!(err.contains("mergeStateStatus: UNKNOWN"), "{err}");
+                assert!(err.contains("re-check"), "{err}");
+                assert!(!err.contains("fj"), "{err}");
+                assert!(!err.contains("FJ-99"), "{err}");
+
+                let calls = backend.calls();
+                let comment = calls
+                    .iter()
+                    .find(|c| c.starts_with("comment MK-16"))
+                    .unwrap_or_else(|| panic!("expected a comment, got {calls:?}"));
+                assert!(comment.contains("gh pr view"), "{comment}");
+                assert!(comment.contains("mergeStateStatus: UNKNOWN"), "{comment}");
+                assert!(comment.contains("re-check"), "{comment}");
+                assert!(!comment.contains("fj"), "{comment}");
+                assert!(!comment.contains("FJ-99"), "{comment}");
+
+                let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 50)
+                    .await
+                    .unwrap();
+                let event = events
+                    .iter()
+                    .find(|e| e.message.contains("behind_base missing"))
+                    .unwrap_or_else(|| panic!("expected a run event, got {events:?}"));
+                assert!(
+                    event.message.contains("mergeStateStatus: UNKNOWN"),
+                    "{}",
+                    event.message
+                );
+                assert!(!event.message.contains("fj"), "{}", event.message);
             }
 
             #[tokio::test]
