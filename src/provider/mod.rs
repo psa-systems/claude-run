@@ -655,8 +655,12 @@ const GIT_CRED_PASS_ENV: &str = "CLAUDE_RUN_GIT_PASSWORD";
 /// credential protocol by echoing back whatever this process set in its own
 /// environment under [`GIT_CRED_USER_ENV`] / [`GIT_CRED_PASS_ENV`]. Passed as
 /// `-c credential.helper=<this>` on the git invocation itself, so the
-/// credential lives only in that one child's environment: never in argv,
-/// never in `.git/config`, never inherited by anything git spawns afterwards.
+/// credential lives only in that one child's environment and never in argv or
+/// `.git/config`. It IS inherited by anything that git child spawns for the
+/// duration of the call, though: a `pre-push` hook sees both
+/// [`GIT_CRED_USER_ENV`] / [`GIT_CRED_PASS_ENV`] and the `-c` pair re-exported
+/// as `GIT_CONFIG_PARAMETERS` (CLAUDE-426), so a hook's own test suite must not
+/// assume a clean ambient git environment (see `testutil::clear_ambient_git_env`).
 pub(crate) const CREDENTIAL_HELPER: &str = concat!(
     "credential.helper=!f() { echo \"username=$",
     "CLAUDE_RUN_GIT_USERNAME",

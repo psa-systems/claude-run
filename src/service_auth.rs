@@ -719,16 +719,16 @@ mod tests {
         );
 
         let fill = |host: &str| {
-            let mut child = Command::new("git")
-                .args(["credential", "fill"])
+            let mut cmd = Command::new("git");
+            cmd.args(["credential", "fill"])
                 .env("PATH", &path)
                 .env("GIT_CONFIG_GLOBAL", &cfg)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
                 .env("HOME", tmp.path().join("home"))
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .env_remove("GIT_ASKPASS")
-                .env_remove("SSH_ASKPASS")
+                .env("GIT_TERMINAL_PROMPT", "0");
+            crate::testutil::clear_ambient_git_env(&mut cmd);
+            let mut child = cmd
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
