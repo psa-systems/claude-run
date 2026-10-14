@@ -1107,6 +1107,38 @@ pub(crate) fn count_compact_boundaries(stream_log: &Path) -> std::io::Result<usi
         .count())
 }
 
+/// Append one runner-written record to the end of a stream log, naming a
+/// post-agent failure that happened after the agent session's own relay
+/// already closed the file (CLAUDE-425): a push or PR-create failure in
+/// `finalize`. `step` is `"push"` or `"pr_create"`. Opened in append mode so
+/// it never disturbs what the relay already wrote. Every existing reader
+/// (`count_compact_boundaries`, `parse_final_result`, the web log viewer)
+/// selects events by `type`/`subtype` rather than by line position, so an
+/// unrecognized `"type":"runner_error"` trailing line is silently skipped by
+/// all of them. Returns the write's `io::Result` rather than swallowing it,
+/// matching the CLAUDE-233 convention for every other writer of this file;
+/// the caller logs a failure and continues, since the run's outcome is
+/// already decided by the time this runs.
+pub(crate) fn append_runner_error(
+    stream_log: &Path,
+    step: &str,
+    cause: &str,
+) -> std::io::Result<()> {
+    let ts = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let line = serde_json::json!({
+        "type": "runner_error",
+        "step": step,
+        "cause": cause,
+        "ts": ts,
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(stream_log)?;
+    writeln!(file, "{line}")?;
+    file.flush()
+}
+
 /// Scan every `assistant` event in the stream log, counting how many there
 /// are and remembering the name of the last `tool_use` block seen across all
 /// of them. This is the fallback summary's only source of "what was it
