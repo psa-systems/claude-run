@@ -198,10 +198,20 @@ pub struct YoutrackSource {
     /// `None` uses host `yt` auth. The raw token is never stored here; it is
     /// resolved from the [`crate::secrets`] store and injected at run time.
     pub token_ref: Option<String>,
-    /// Issue query selecting the jobs this action picks up.
+    /// Issue query selecting the jobs this action picks up. May contain the
+    /// literal placeholder `{{audit_project}}`, substituted with
+    /// `audit_project` by [`YoutrackSource::resolved_query`] so the shipped
+    /// audit/worker partition derives from one field instead of a literal
+    /// project key baked into two independent query strings (CLAUDE-409).
     pub query: String,
     /// Custom field holding the AI Agent state machine.
     pub custom_field: String,
+    /// Short name of the audit project, substituted into `query` wherever it
+    /// contains the `{{audit_project}}` placeholder. Defaults to `AUDIT`, the
+    /// project key the shipped `audit-run.yml` / `youtrack.yml` partition
+    /// (CLAUDE-215) used as a literal before CLAUDE-409.
+    #[serde(skip_serializing_if = "is_default_audit_project")]
+    pub audit_project: String,
     /// Labels of the AI Agent / State machine the handler drives.
     pub states: YoutrackStates,
     /// Full-replacement prompt override. Resolution order: this text, else the
@@ -245,6 +255,7 @@ impl Default for YoutrackSource {
             token_ref: None,
             query: default_query(),
             custom_field: default_custom_field(),
+            audit_project: default_audit_project(),
             states: YoutrackStates::default(),
             prompt: None,
             prompt_preset: PromptPreset::default(),
@@ -265,6 +276,15 @@ impl YoutrackSource {
             Some(_) => PromptSource::Override,
             None => PromptSource::Builtin(self.prompt_preset),
         }
+    }
+
+    /// `query` with every `{{audit_project}}` placeholder substituted by
+    /// `audit_project`. This is what the handler sends to `yt list`
+    /// (CLAUDE-409); `query` itself keeps the placeholder on disk so editing
+    /// `audit_project` alone re-derives both the audit and worker queries
+    /// without hand-editing either query string.
+    pub fn resolved_query(&self) -> String {
+        self.query.replace("{{audit_project}}", &self.audit_project)
     }
 }
 
@@ -442,6 +462,14 @@ fn default_query() -> String {
 
 fn default_custom_field() -> String {
     "AI Agent".to_string()
+}
+
+fn default_audit_project() -> String {
+    "AUDIT".to_string()
+}
+
+fn is_default_audit_project(v: &str) -> bool {
+    v == default_audit_project()
 }
 
 /// The AI Agent (and standard `State`) values the handler reads and writes.

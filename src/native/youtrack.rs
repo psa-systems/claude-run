@@ -189,7 +189,7 @@ async fn run_youtrack(ctx: NativeContext<'_>) -> Result<()> {
         candidate_keys,
     } = gather(
         &gather_backend,
-        &src.query,
+        &src.resolved_query(),
         access.as_ref().map(|a| a as &dyn RepoAccess),
     )?;
     // Drop dependency-gate rows for issues this query no longer
