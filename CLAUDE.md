@@ -70,6 +70,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 - Container layout is flat: `/config`, `/data`, `/state`, tmpfs `/run/claude-run` ([CLAUDE-253](docs/conventions/container.md#flat-container-layout-claude-253))
 - No host bind mounts: logins live inside the container; catatonit is PID 1 ([CLAUDE-247, CLAUDE-287, CLAUDE-310](docs/conventions/container.md#container-identity-claude-247-claude-287-claude-310))
 - `test-postgres` runs a throwaway, non-durable Postgres in the Docker sidecar for agent test runs ([CLAUDE-404](docs/conventions/test-postgres.md#throwaway-test-postgres-claude-404))
+- A sidecar `buildx` session can die to an upstream dockerd bug; no setting here fixes it ([CLAUDE-417](docs/conventions/container.md#buildkit-session-healthcheck-claude-417))
 
 ### Actions
 
