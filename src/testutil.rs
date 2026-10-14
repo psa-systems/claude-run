@@ -14,6 +14,38 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// Strip every ambient git-config and credential input from `cmd` before a
+/// test execs real `git`.
+///
+/// A `git push` run with `-c credential.helper=...` and the runner's own
+/// `CLAUDE_RUN_GIT_USERNAME` / `CLAUDE_RUN_GIT_PASSWORD` exported passes both
+/// to `GIT_CONFIG_PARAMETERS` and the two variables down to any hook it spawns
+/// (CLAUDE-426): a hook's own `cargo test` therefore inherits them from the
+/// process environment unless a test clears them first. Only a test that
+/// invokes git's credential subsystem (`git credential fill`, or a transport
+/// that needs to authenticate) is actually reachable through them, but
+/// clearing the same fixed list everywhere keeps that judgement out of each
+/// call site.
+pub fn clear_ambient_git_env(cmd: &mut Command) {
+    cmd.env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env_remove("CLAUDE_RUN_GIT_USERNAME")
+        .env_remove("CLAUDE_RUN_GIT_PASSWORD");
+    if let Ok(count) = std::env::var("GIT_CONFIG_COUNT") {
+        if let Ok(n) = count.parse::<u32>() {
+            for i in 0..n {
+                cmd.env_remove(format!("GIT_CONFIG_KEY_{i}"))
+                    .env_remove(format!("GIT_CONFIG_VALUE_{i}"));
+            }
+        }
+    }
+}
+
 /// Write an executable test stub WITHOUT this process ever holding a writable
 /// descriptor on it.
 ///
