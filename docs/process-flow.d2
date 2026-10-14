@@ -51,7 +51,7 @@ fj_pr: "Forgejo\nPull request" {class: forgejo}
 fj_ci: "Forgejo\nWorkflows" {class: forgejo}
 
 yt_queued -> yt_action: "any other issue"
-yt_queued -> audit_action: "project: AUDIT, tag: Audit-*"
+yt_queued -> audit_action: "project: {audit_project}, tag: Audit-*"
 
 yt_action -> cc_work: "issue prompt"
 cc_work -> yt_action: "commits"
