@@ -1265,17 +1265,6 @@ async fn process_job(
         }
     };
 
-    // CLAUDE-425: a `Finalized::Failed` is `Ok` from finalize's own
-    // perspective (it is a clean state transition, just an unhappy one), so
-    // `post_failed` above does not catch it; without this, a run whose PR
-    // path failed after a successful agent session recorded `ok = true` and
-    // a Summary that read like a clean success. The cause folds into both
-    // below.
-    let finalize_cause = match &finalize_res {
-        Ok(Finalized::Failed { cause, .. }) => Some(cause.clone()),
-        _ => None,
-    };
-
     // A failure in finalize's own PR path (push or PR create) happens after
     // the agent session's stream log has already closed, so it never
     // appears there; append one runner-written record naming the step and
@@ -1302,12 +1291,8 @@ async fn process_job(
         info!(action = %action.name, key = %key, cancelled, paused = paused_before_claude, "not counting attempt");
     }
 
-    let ok = claude_result.ok && !post_failed && finalize_cause.is_none();
+    let (ok, summary) = record_finalize_outcome(&claude_result, &finalize_res, post_failed);
     let stream_log_path = stream_log.as_deref().map(|p| p.display().to_string());
-    let summary = match &finalize_cause {
-        Some(cause) => format!("{cause}\n\n{}", claude_result.summary),
-        None => claude_result.summary,
-    };
 
     if !skip_attempt {
         state::attempts_increment(pool, &action.name, key).await?;
@@ -2067,6 +2052,34 @@ impl Finalized {
             Finalized::TimedOut { .. } => "Timed Out",
         }
     }
+}
+
+/// Fold a `finalize` outcome into the run's own recorded `ok` and `summary`
+/// (CLAUDE-425). `Finalized::Failed` is `Ok` from `finalize`'s own
+/// perspective (a clean state transition, just an unhappy one), so
+/// `post_failed` (set only when `finalize` itself returns `Err`) never
+/// catches it; without this, a run whose post-agent PR path failed after a
+/// successful agent session recorded `ok = true` and a Summary that read
+/// like a clean success, while the issue itself was marked Failed. Every
+/// other outcome (success, needs-review, no-code-change, timed-out, or a
+/// `finalize` that errored) leaves both exactly as the agent's own result
+/// reported them, so a successful run's Summary stays byte-for-byte
+/// unchanged.
+fn record_finalize_outcome(
+    claude_result: &ClaudeResult,
+    finalize_res: &Result<Finalized>,
+    post_failed: bool,
+) -> (bool, String) {
+    let finalize_cause = match finalize_res {
+        Ok(Finalized::Failed { cause, .. }) => Some(cause.as_str()),
+        _ => None,
+    };
+    let ok = claude_result.ok && !post_failed && finalize_cause.is_none();
+    let summary = match finalize_cause {
+        Some(cause) => format!("{cause}\n\n{}", claude_result.summary),
+        None => claude_result.summary.clone(),
+    };
+    (ok, summary)
 }
 
 /// The finalize state machine (the native "post"). Runs on every path. Mirrors
@@ -5894,6 +5907,109 @@ mod tests {
             "{calls:?}"
         );
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    /// CLAUDE-425 acceptance criterion: a push or PR-create failure after a
+    /// successful agent run must record `ok = false` and a Summary that
+    /// leads with the failure text, not a Summary that reads like a clean
+    /// success while the issue is marked Failed.
+    #[test]
+    fn record_finalize_outcome_folds_pr_failure_cause_into_ok_and_summary() {
+        let claude = ok_result();
+        let finalize_res: Result<Finalized> = Ok(Finalized::Failed {
+            cause: "provider CLI `git push` failed (exit 128): no upstream".to_string(),
+            pr_step: Some("push"),
+        });
+        let (ok, summary) = record_finalize_outcome(&claude, &finalize_res, false);
+        assert!(!ok, "a PR-path failure must never record ok = true");
+        assert!(
+            summary.starts_with("provider CLI `git push` failed (exit 128): no upstream"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&claude.summary),
+            "the agent's own summary must still follow the cause: {summary}"
+        );
+    }
+
+    /// The generic claude-failure arm (crash, empty prompt, pre failure) also
+    /// carries a cause on `Finalized::Failed`, folded the same way.
+    #[test]
+    fn record_finalize_outcome_folds_claude_failure_cause_too() {
+        let claude = ClaudeResult::synthesized("claude exited 1, see stream.jsonl", "tail");
+        let finalize_res: Result<Finalized> = Ok(Finalized::Failed {
+            cause: claude.error.clone(),
+            pr_step: None,
+        });
+        let (ok, summary) = record_finalize_outcome(&claude, &finalize_res, false);
+        assert!(!ok);
+        assert!(
+            summary.starts_with("claude exited 1, see stream.jsonl"),
+            "{summary}"
+        );
+    }
+
+    /// Every non-`Failed` outcome (success, needs-review, no-code-change,
+    /// timed-out, or `finalize` itself returning `Err`) must leave `ok` and
+    /// `summary` byte-for-byte as the agent's own result reported them: a
+    /// successful run's recorded Summary must never change.
+    #[test]
+    fn record_finalize_outcome_leaves_success_byte_for_byte_unchanged() {
+        let claude = ok_result();
+        let cases: Vec<Result<Finalized>> = vec![
+            Ok(Finalized::CodeReview {
+                pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/1".to_string(),
+                pr_number: Some(1),
+                head_branch: Some("feat/x".to_string()),
+            }),
+            Ok(Finalized::NeedsReview),
+            Ok(Finalized::NoCodeChange),
+            Ok(Finalized::TimedOut {
+                pr_number: None,
+                head_branch: None,
+            }),
+            Err(Error::Other(anyhow::anyhow!("comment failed"))),
+        ];
+        for finalize_res in cases {
+            let post_failed = finalize_res.is_err();
+            let (ok, summary) = record_finalize_outcome(&claude, &finalize_res, post_failed);
+            if post_failed {
+                assert!(!ok, "{finalize_res:?}");
+            } else {
+                assert!(ok, "{finalize_res:?}");
+            }
+            assert_eq!(summary, claude.summary, "{finalize_res:?}");
+        }
+    }
+
+    /// CLAUDE-425: a PR-path failure appends one `runner_error` record to the
+    /// attempt's stream log naming the step and cause, and every existing
+    /// reader (here `count_compact_boundaries`, which selects events by
+    /// `type`/`subtype` rather than line position) still succeeds on a log
+    /// that carries it.
+    #[test]
+    fn append_runner_error_is_tolerated_by_stream_log_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("attempt.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n{\"type\":\"result\",\"is_error\":false}\n",
+        )
+        .unwrap();
+        crate::claude::append_runner_error(&log, "pr_create", "fj pr create failed: 404").unwrap();
+
+        let contents = std::fs::read_to_string(&log).unwrap();
+        let last = contents.lines().next_back().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(last).unwrap();
+        assert_eq!(parsed["type"], "runner_error");
+        assert_eq!(parsed["step"], "pr_create");
+        assert_eq!(parsed["cause"], "fj pr create failed: 404");
+
+        assert_eq!(
+            crate::claude::count_compact_boundaries(&log).unwrap(),
+            1,
+            "an unknown trailing record must not break a reader that filters by type"
+        );
     }
 
     #[test]
