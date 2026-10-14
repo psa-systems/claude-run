@@ -1265,6 +1265,35 @@ async fn process_job(
         }
     };
 
+    // CLAUDE-425: a `Finalized::Failed` is `Ok` from finalize's own
+    // perspective (it is a clean state transition, just an unhappy one), so
+    // `post_failed` above does not catch it; without this, a run whose PR
+    // path failed after a successful agent session recorded `ok = true` and
+    // a Summary that read like a clean success. The cause folds into both
+    // below.
+    let finalize_cause = match &finalize_res {
+        Ok(Finalized::Failed { cause, .. }) => Some(cause.clone()),
+        _ => None,
+    };
+
+    // A failure in finalize's own PR path (push or PR create) happens after
+    // the agent session's stream log has already closed, so it never
+    // appears there; append one runner-written record naming the step and
+    // cause so an operator reading the log sees it. Best-effort: a write
+    // failure here must not abort finalize, since the run's outcome is
+    // already decided.
+    if let Ok(Finalized::Failed {
+        cause,
+        pr_step: Some(step),
+    }) = &finalize_res
+    {
+        if let Some(log_path) = stream_log.as_deref() {
+            if let Err(e) = crate::claude::append_runner_error(log_path, step, cause) {
+                tracing::error!(action = %action.name, key = %key, path = %log_path.display(), error = %e, "appending runner_error to the stream log failed (continuing)");
+            }
+        }
+    }
+
     // ---- skip-attempt marker (parked / blocker), cancel, or pause ----
     let skip_marker = workdir_path.join(SKIP_ATTEMPT_MARKER);
     let cancelled = cancel.is_cancelled();
@@ -1273,8 +1302,12 @@ async fn process_job(
         info!(action = %action.name, key = %key, cancelled, paused = paused_before_claude, "not counting attempt");
     }
 
-    let ok = claude_result.ok && !post_failed;
+    let ok = claude_result.ok && !post_failed && finalize_cause.is_none();
     let stream_log_path = stream_log.as_deref().map(|p| p.display().to_string());
+    let summary = match &finalize_cause {
+        Some(cause) => format!("{cause}\n\n{}", claude_result.summary),
+        None => claude_result.summary,
+    };
 
     if !skip_attempt {
         state::attempts_increment(pool, &action.name, key).await?;
@@ -1336,7 +1369,7 @@ async fn process_job(
         claude_ok: claude_result.ok,
         claude_cost: claude_result.cost,
         attempt_counted: !skip_attempt,
-        summary: claude_result.summary,
+        summary,
         stream_log_path,
         duration_ms: started.elapsed().as_millis() as i64,
         timed_out: claude_result.timed_out,
@@ -1995,7 +2028,20 @@ enum Finalized {
     },
     /// Hard failure (claude error, pre failure, or PR-create failure);
     /// AI Agent=Failed, no PR (or a failed PR).
-    Failed,
+    Failed {
+        /// The same redacted cause text the issue comment carries
+        /// (CLAUDE-425), so `process_job` can fold it into the run's own
+        /// recorded Summary and outcome instead of leaving them read as a
+        /// clean success.
+        cause: String,
+        /// Set only for a failure in finalize's own post-agent PR path
+        /// (push or PR create), which runs after the agent session's stream
+        /// log has already closed; `process_job` appends a `runner_error`
+        /// record naming this step (`"push"` or `"pr_create"`) to that log.
+        /// `None` for the claude-crash/pre-failure arm, whose cause is
+        /// already inside that same stream log.
+        pr_step: Option<&'static str>,
+    },
     /// Claude hit the wall-clock limit (exit 124). The work may be
     /// complete, partial, or absent, so the issue is NOT marked Failed: a
     /// timeout-specific comment is posted and the AI Agent field is advanced to
@@ -2017,7 +2063,7 @@ impl Finalized {
             Finalized::NeedsReview => "Needs Review",
             Finalized::NoCodeChange => "No Code Change",
             Finalized::CodeReview { .. } => "Code Review",
-            Finalized::Failed => "Failed",
+            Finalized::Failed { .. } => "Failed",
             Finalized::TimedOut { .. } => "Timed Out",
         }
     }
@@ -2138,13 +2184,21 @@ fn finalize(
                 // landed), never "nothing to preserve".
                 warn!(key = %job.key, error = %e, "PR creation failed; finalizing as Failed");
                 let token_url = clone_url_for(forge, job);
-                let body = pr_failure_comment(
-                    claude_result,
-                    &e,
-                    &work_location(workdir, Some(&token_url)),
-                );
+                let location = work_location(workdir, Some(&token_url));
+                // The push happens before the PR-create call in every
+                // strategy, so `RemoteBranch` (the push landed) means this
+                // failure is in the PR-create step; anything else means the
+                // push itself never completed.
+                let pr_step = match &location {
+                    WorkLocation::RemoteBranch { .. } => "pr_create",
+                    _ => "push",
+                };
+                let body = pr_failure_comment(claude_result, &e, &location);
                 comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
-                Ok(Finalized::Failed)
+                Ok(Finalized::Failed {
+                    cause: e.to_string(),
+                    pr_step: Some(pr_step),
+                })
             }
         }
     } else if claude_result.timed_out {
@@ -2185,7 +2239,10 @@ fn finalize(
         // Failure: crash, empty prompt, or pre failure.
         let body = failure_comment(claude_result);
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
-        Ok(Finalized::Failed)
+        Ok(Finalized::Failed {
+            cause: claude_result.error.clone(),
+            pr_step: None,
+        })
     }
 }
 
@@ -5484,7 +5541,16 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(res, Finalized::Failed);
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some("push"),
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
         assert!(dir.path().exists(), "workdir survives the failed finalize");
         let calls = runner.calls.lock().unwrap();
         let comment = calls
@@ -5555,7 +5621,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(res, Finalized::Failed);
+        assert!(matches!(res, Finalized::Failed { .. }), "{res:?}");
         let calls = runner.calls.lock().unwrap();
         assert!(
             !calls.iter().any(|c| c.starts_with("fj ")),
@@ -5767,7 +5833,16 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(res, Finalized::Failed);
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    pr_step: Some(_),
+                    ..
+                }
+            ),
+            "{res:?}"
+        );
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls
@@ -5801,7 +5876,16 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(res, Finalized::Failed);
+        assert!(
+            matches!(
+                &res,
+                Finalized::Failed {
+                    ref cause,
+                    pr_step: None,
+                } if cause == "claude exited 1, see stream.jsonl"
+            ),
+            "{res:?}"
+        );
         let calls = runner.calls.lock().unwrap();
         assert!(
             calls
