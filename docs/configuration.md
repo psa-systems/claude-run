@@ -147,15 +147,7 @@ the Secrets store and are rendered as that name only. Each
 section (and field) carries an apply badge: `live` for the log filter and webhook source edits (allow-list, rate limit,
 secret refs, adding a source), `next event` for mint, and `restart` for the webhook
 `replay_window_secs` (the replay store is built once at start). The same documents round-trip over the JSON API at
-`GET` / `PUT /api/settings/{mint,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,claude,email}`.
-`email` (CLAUDE-394: the SMTP transport an invite is mailed over) is `live`-applied like the Auth logins, and for the
-same reason as Auth gets its own hand-written **Email (SMTP)** card on the Settings page rather than the generic JSON
-editor: a password field needs a real `type="password"` input and "leave blank to keep the current password"
-semantics, not a JSON textarea. Its fields are `smtp_host`, `smtp_port`, `smtp_encryption` (`starttls` | `tls` |
-`none`), `smtp_username`, `smtp_password_ref` (name-only, like the other secret-ref fields above), `from`, and
-`public_url`; the card's own "Send test email" button exercises the saved document exactly as a real invite send
-would. `EmailConfig::configured()` requires `smtp_host`, `from`, and `public_url` all set before the Accounts page
-offers emailing an invite instead of showing its link.
+`GET` / `PUT /api/settings/{mint,webhook,webhook_comment,log_filter,workdir_gc,stream_log_gc,preferences,concurrency,db_retention,claude}`.
 The `webhook_comment` (CLAUDE-220), `workdir_gc` (CLAUDE-106), `stream_log_gc` (CLAUDE-245), `preferences` (CLAUDE-154),
 `concurrency` (CLAUDE-162), `db_retention` (CLAUDE-175), and `claude` (CLAUDE-239 `model`, CLAUDE-259 `effort`: the instance-wide `--model` and
 `--effort` defaults an action inherits when it pins neither in its own `claude:` block, each one null by default, which passes no flag and leaves
@@ -170,6 +162,24 @@ file. After that, remove the migrated sections from `config.toml`: a later start
 file and the database refuses to run, naming the section, so there is never silent drift between two sources of truth (
 the same breaking-migration signal CLAUDE-87 used). A `config.toml` with no moved sections starts cleanly with the
 database as the only source.
+
+## Email (SMTP) (CLAUDE-428)
+
+The SMTP transport an invite is mailed over is environment-only: there is no Settings-page form and no
+`PUT /api/settings/email`. The daemon resolves it fresh from the environment at the point of use (daemon start, an
+invite send, the Settings page's own read-only card, the "Send test email" button), so a change takes effect on the
+next daemon restart. Variables: `CLAUDE_RUN_SMTP_HOST`, `CLAUDE_RUN_SMTP_PORT`, `CLAUDE_RUN_SMTP_ENCRYPTION`
+(`starttls` | `tls` | `none`), `CLAUDE_RUN_SMTP_USERNAME`, `CLAUDE_RUN_SMTP_PASSWORD` (or
+`CLAUDE_RUN_SMTP_PASSWORD_FILE`, which wins when both are set, same file-beats-plain-value precedence as
+`CLAUDE_RUN_DATABASE_URL_FILE`), `CLAUDE_RUN_SMTP_FROM`, and `CLAUDE_RUN_PUBLIC_URL` (the base URL an invite link is
+built from). `EmailConfig::configured()` requires `smtp_host`, `from`, and `public_url` all set before the Accounts
+page offers emailing an invite instead of showing its link; a username with no password, or a host with no `from` or
+`public_url`, is a validation error. The daemon validates the environment once at serve start and refuses to start on
+a bad value, naming the offending variable and its value, but never the password. The Settings page shows the
+effective non-secret values in a read-only grid, with the password shown only as "set" / "not set". A leftover
+DB-backed `config.email` row from before CLAUDE-428 is retired automatically on the first start after upgrading: the
+daemon logs one warning naming the key and the old host/from (never the password) and deletes both the row and its
+`email-smtp-password` secret.
 
 ## Logging
 

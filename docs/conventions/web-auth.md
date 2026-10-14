@@ -14,17 +14,18 @@ CLAUDE-368 makes TOTP mandatory for every `web_admin` row, not optional, because
 
 The Accounts page invite form (`create_invite_submit` in `src/auth.rs`) takes an optional `email`. Blank keeps the
 original one-time-link flow unchanged. A non-blank address first has to parse as a `lettre::message::Mailbox`
-(refused `400`, nothing minted) and the `config.email` document has to be `EmailConfig::configured()` (`smtp_host`,
-`from`, and `public_url` all set; refused `400` naming the Settings card, nothing minted) before anything happens.
-Only then is the invite minted and the send attempted, in that order: a send failure keeps the invite rather than
-rolling it back, answers `502` with the SMTP error, and falls back to showing the link, so a configured-but-broken
-mailer never strands an invite nobody can reach. `render_accounts` carries a `StatusCode` on every call site for
-exactly this: every refused or failed path above answers non-2xx, not just a visually-flagged `200`.
+(refused `400`, nothing minted) and `crate::config::EmailConfig::from_env()` has to be `configured()` (`smtp_host`,
+`from`, and `public_url` all set from the `CLAUDE_RUN_SMTP_*` / `CLAUDE_RUN_PUBLIC_URL` environment, CLAUDE-428;
+refused `400` naming the missing variables, nothing minted) before anything happens. Only then is the invite minted
+and the send attempted, in that order: a send failure keeps the invite rather than rolling it back, answers `502`
+with the SMTP error, and falls back to showing the link, so a configured-but-broken mailer never strands an invite
+nobody can reach. `render_accounts` carries a `StatusCode` on every call site for exactly this: every refused or
+failed path above answers non-2xx, not just a visually-flagged `200`.
 
-`src/mailer.rs`'s `Mailer` is built fresh per send from the DB-backed `EmailConfig` plus the resolved SMTP password
-(`crate::secrets::resolve_secret`), not cached, so a saved settings change (including a rotated password) applies to
-the very next invite with no daemon restart; it deliberately does not derive `Debug`, since it holds that password in
-memory for the call's lifetime. The invite link in the email body is always built from the configured `public_url`,
-never from the request's `Host` header, because an invite emailed from one browser session is not necessarily
-accepted from the same one. Logging around a send names the recipient address but never the invite token, the full
-link, or the SMTP password; a send failure's log line carries the lettre/SMTP error text only.
+`src/mailer.rs`'s `Mailer` is built fresh per send from `EmailConfig::from_env()` (CLAUDE-428: SMTP is env-only, no
+DB-backed settings section and no Settings-page form), not cached, so an environment change (including a rotated
+password) applies on the daemon's next restart; it deliberately does not derive `Debug`, since it holds the resolved
+password in memory for the call's lifetime. The invite link in the email body is always built from the configured
+`public_url`, never from the request's `Host` header, because an invite emailed from one browser session is not
+necessarily accepted from the same one. Logging around a send names the recipient address but never the invite
+token, the full link, or the SMTP password; a send failure's log line carries the lettre/SMTP error text only.

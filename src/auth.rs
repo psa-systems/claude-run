@@ -1111,14 +1111,14 @@ async fn create_invite_submit(
         .await;
     }
 
-    let email_cfg = load_email_config(&pool).await;
+    let email_cfg = load_email_config();
     if !email_cfg.configured() {
         return render_accounts(
             &gate,
             account.id,
             Some(
-                "SMTP is not configured; set it up on the Email (SMTP) card in Settings, or \
-                 leave the address blank to get a one-time link instead"
+                "SMTP is not configured; set the CLAUDE_RUN_SMTP_* / CLAUDE_RUN_PUBLIC_URL \
+                 environment variables, or leave the address blank to get a one-time link instead"
                     .to_string(),
             ),
             None,
@@ -1146,13 +1146,6 @@ async fn create_invite_submit(
         "invite created"
     );
 
-    let password = match &email_cfg.smtp_password_ref {
-        Some(name) => match crate::secrets::SecretsKey::load() {
-            Ok(key) => crate::secrets::resolve_secret(&pool, &key, name).await.ok(),
-            Err(_) => None,
-        },
-        None => None,
-    };
     let public_url = email_cfg
         .public_url
         .as_deref()
@@ -1165,7 +1158,7 @@ async fn create_invite_submit(
          This link is single-use and expires in 72 hours.",
         inviter = account.username
     );
-    let send_result = match crate::mailer::Mailer::new(&email_cfg, password.as_deref()) {
+    let send_result = match crate::mailer::Mailer::new(&email_cfg) {
         Ok(mailer) => {
             mailer
                 .send(email, "You have been invited to claude-run", &body)
@@ -1207,19 +1200,17 @@ async fn create_invite_submit(
     }
 }
 
-/// Load the `config.email` document directly from the DB. `render_accounts`
-/// and `create_invite_submit` only have a [`TokenGate`] (its own `pool`), not
-/// the daemon's `LiveSettings`, so this reads the stored document fresh
-/// rather than through a live handle; a saved settings change still applies
-/// on the very next invite.
-async fn load_email_config(pool: &DbPool) -> crate::config::EmailConfig {
-    crate::settings::get_json::<crate::config::EmailConfig>(
-        pool,
-        crate::settings::Section::Email.key(),
-    )
-    .await
-    .unwrap_or_default()
-    .unwrap_or_default()
+/// Resolve the SMTP transport config from the environment (CLAUDE-428).
+/// Warns and falls back to unconfigured on a bad environment rather than
+/// failing the request: the daemon's own startup validation
+/// (`src/daemon.rs`) is where a bad `CLAUDE_RUN_SMTP_*` / `CLAUDE_RUN_PUBLIC_URL`
+/// value is fatal, so reaching this path with an invalid environment should
+/// not happen in practice.
+fn load_email_config() -> crate::config::EmailConfig {
+    crate::config::EmailConfig::from_env().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "email environment invalid; treating email as unconfigured");
+        crate::config::EmailConfig::default()
+    })
 }
 
 /// POST `/settings/accounts/remove`: remove an account, refusing the last
@@ -1310,7 +1301,7 @@ async fn render_accounts(
         Ok(i) => i,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     };
-    let email_configured = load_email_config(pool).await.configured();
+    let email_configured = load_email_config().configured();
     let (new_invite_link, invite_sent_to) = match new_invite_link {
         Some(sent) if sent.starts_with("sent:") => {
             (None, Some(sent.trim_start_matches("sent:").to_string()))
@@ -2296,14 +2287,29 @@ mod tests {
             .is_empty());
     }
 
-    /// With no `config.email` document saved, an email invite is refused with
-    /// `400` naming the Settings card, and mints no invite.
+    // One test rather than two, because the SMTP inputs are process-wide
+    // environment variables and `cargo test` runs in parallel (CLAUDE-428,
+    // same reasoning as `database_url_precedence_is_file_then_env_then_config`
+    // in `config.rs`).
     #[tokio::test]
-    async fn create_invite_by_email_with_smtp_unconfigured_is_refused_400() {
+    async fn create_invite_by_email_follows_the_smtp_environment() {
         let pool = setup_pool().await;
         let (router, cookie) = signed_in_accounts_router(&pool).await;
 
+        std::env::remove_var("CLAUDE_RUN_SMTP_HOST");
+        std::env::remove_var("CLAUDE_RUN_SMTP_PORT");
+        std::env::remove_var("CLAUDE_RUN_SMTP_ENCRYPTION");
+        std::env::remove_var("CLAUDE_RUN_SMTP_USERNAME");
+        std::env::remove_var("CLAUDE_RUN_SMTP_PASSWORD");
+        std::env::remove_var("CLAUDE_RUN_SMTP_PASSWORD_FILE");
+        std::env::remove_var("CLAUDE_RUN_SMTP_FROM");
+        std::env::remove_var("CLAUDE_RUN_PUBLIC_URL");
+
+        // With no SMTP environment variables set, an email invite is
+        // refused with `400` naming the environment variables, and mints
+        // no invite.
         let resp = router
+            .clone()
             .oneshot(invite_post(&cookie, "person@example.com"))
             .await
             .unwrap();
@@ -2312,38 +2318,33 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8_lossy(&body);
-        assert!(html.contains("Email (SMTP)"), "{html}");
+        assert!(html.contains("CLAUDE_RUN_SMTP"), "{html}");
         assert!(crate::web_admin::list_invites(&pool)
             .await
             .unwrap()
             .is_empty());
-    }
 
-    /// With SMTP configured but unreachable, the send fails: the invite is
-    /// still created (kept, not discarded), the response is `502`, and the
-    /// link is shown as a fallback since the email never arrived.
-    #[tokio::test]
-    async fn create_invite_by_email_with_unreachable_smtp_is_502_and_keeps_the_invite() {
-        let pool = setup_pool().await;
-        let (router, cookie) = signed_in_accounts_router(&pool).await;
-
-        let cfg = crate::config::EmailConfig {
-            smtp_host: Some("127.0.0.1".to_string()),
-            smtp_port: Some(1),
-            smtp_encryption: crate::config::SmtpEncryption::None,
-            smtp_username: None,
-            smtp_password_ref: None,
-            from: Some("claude-run@example.com".to_string()),
-            public_url: Some("https://claude-run.example.com".to_string()),
-        };
-        crate::settings::set_json(&pool, crate::settings::Section::Email.key(), &cfg)
-            .await
-            .unwrap();
+        // With SMTP configured (via environment variables) but unreachable,
+        // the send fails: the invite is still created (kept, not
+        // discarded), the response is `502`, and the link is shown as a
+        // fallback since the email never arrived.
+        std::env::set_var("CLAUDE_RUN_SMTP_HOST", "127.0.0.1");
+        std::env::set_var("CLAUDE_RUN_SMTP_PORT", "1");
+        std::env::set_var("CLAUDE_RUN_SMTP_ENCRYPTION", "none");
+        std::env::set_var("CLAUDE_RUN_SMTP_FROM", "claude-run@example.com");
+        std::env::set_var("CLAUDE_RUN_PUBLIC_URL", "https://claude-run.example.com");
 
         let resp = router
             .oneshot(invite_post(&cookie, "person@example.com"))
             .await
             .unwrap();
+
+        std::env::remove_var("CLAUDE_RUN_SMTP_HOST");
+        std::env::remove_var("CLAUDE_RUN_SMTP_PORT");
+        std::env::remove_var("CLAUDE_RUN_SMTP_ENCRYPTION");
+        std::env::remove_var("CLAUDE_RUN_SMTP_FROM");
+        std::env::remove_var("CLAUDE_RUN_PUBLIC_URL");
+
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
