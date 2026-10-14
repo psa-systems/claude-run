@@ -2969,6 +2969,11 @@ struct YoutrackEditForm {
     yt_token_ref: String,
     yt_query: String,
     yt_custom_field: String,
+    /// Short name of the audit project (`native.youtrack.audit_project`),
+    /// substituted into `yt_query` wherever it contains the
+    /// `{{audit_project}}` placeholder (CLAUDE-409). Blank falls back to the
+    /// default `AUDIT`.
+    yt_audit_project: String,
     /// Optional Assignee set on the issue at pickup. Empty string
     /// maps to `None` (Assignee left untouched). A login, `me`, or `unassigned`.
     yt_assignee: String,
@@ -3088,6 +3093,7 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
     YoutrackEditForm {
         yt_query: c.youtrack.query,
         yt_custom_field: c.youtrack.custom_field,
+        yt_audit_project: c.youtrack.audit_project,
         yt_prompt: crate::native::youtrack::default_youtrack_prompt(),
         state_queued: c.youtrack.states.queued,
         state_working: c.youtrack.states.working,
@@ -3124,6 +3130,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         yt_token_ref: s(&yt.youtrack.token_ref),
         yt_query: yt.youtrack.query.clone(),
         yt_custom_field: yt.youtrack.custom_field.clone(),
+        yt_audit_project: yt.youtrack.audit_project.clone(),
         yt_assignee: s(&yt.youtrack.assignee),
         yt_prompt: yt
             .youtrack
@@ -3257,6 +3264,9 @@ fn youtrack_form_to_yaml(
     }
     if let Some(c) = opt(&form.yt_custom_field) {
         youtrack.custom_field = c;
+    }
+    if let Some(p) = opt(&form.yt_audit_project) {
+        youtrack.audit_project = p;
     }
     // Blank Assignee box -> no `assignee` key (Assignee untouched);
     // any value is persisted as a literal `yt` assignee argument.

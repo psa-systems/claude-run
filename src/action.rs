@@ -198,10 +198,20 @@ pub struct YoutrackSource {
     /// `None` uses host `yt` auth. The raw token is never stored here; it is
     /// resolved from the [`crate::secrets`] store and injected at run time.
     pub token_ref: Option<String>,
-    /// Issue query selecting the jobs this action picks up.
+    /// Issue query selecting the jobs this action picks up. May contain the
+    /// literal placeholder `{{audit_project}}`, substituted with
+    /// `audit_project` by [`YoutrackSource::resolved_query`] so the shipped
+    /// audit/worker partition derives from one field instead of a literal
+    /// project key baked into two independent query strings (CLAUDE-409).
     pub query: String,
     /// Custom field holding the AI Agent state machine.
     pub custom_field: String,
+    /// Short name of the audit project, substituted into `query` wherever it
+    /// contains the `{{audit_project}}` placeholder. Defaults to `AUDIT`, the
+    /// project key the shipped `audit-run.yml` / `youtrack.yml` partition
+    /// (CLAUDE-215) used as a literal before CLAUDE-409.
+    #[serde(skip_serializing_if = "is_default_audit_project")]
+    pub audit_project: String,
     /// Labels of the AI Agent / State machine the handler drives.
     pub states: YoutrackStates,
     /// Full-replacement prompt override. Resolution order: this text, else the
@@ -245,6 +255,7 @@ impl Default for YoutrackSource {
             token_ref: None,
             query: default_query(),
             custom_field: default_custom_field(),
+            audit_project: default_audit_project(),
             states: YoutrackStates::default(),
             prompt: None,
             prompt_preset: PromptPreset::default(),
@@ -265,6 +276,15 @@ impl YoutrackSource {
             Some(_) => PromptSource::Override,
             None => PromptSource::Builtin(self.prompt_preset),
         }
+    }
+
+    /// `query` with every `{{audit_project}}` placeholder substituted by
+    /// `audit_project`. This is what the handler sends to `yt list`
+    /// (CLAUDE-409); `query` itself keeps the placeholder on disk so editing
+    /// `audit_project` alone re-derives both the audit and worker queries
+    /// without hand-editing either query string.
+    pub fn resolved_query(&self) -> String {
+        self.query.replace("{{audit_project}}", &self.audit_project)
     }
 }
 
@@ -442,6 +462,14 @@ fn default_query() -> String {
 
 fn default_custom_field() -> String {
     "AI Agent".to_string()
+}
+
+fn default_audit_project() -> String {
+    "AUDIT".to_string()
+}
+
+fn is_default_audit_project(v: &str) -> bool {
+    v == default_audit_project()
 }
 
 /// The AI Agent (and standard `State`) values the handler reads and writes.
@@ -1120,6 +1148,48 @@ native:
         );
     }
 
+    /// An untouched `audit_project` stays out of the serialized YAML, so
+    /// existing action files are unchanged by the field (CLAUDE-409).
+    #[test]
+    fn audit_project_default_is_omitted_on_serialize() {
+        let cfg = YoutrackConfig::default();
+        assert_eq!(cfg.youtrack.audit_project, "AUDIT");
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("audit_project"),
+            "default audit_project must not serialize: {yaml}"
+        );
+    }
+
+    #[test]
+    fn audit_project_substitutes_into_query_and_round_trips() {
+        let raw = "\
+name: yt
+kind: youtrack
+native:
+  youtrack:
+    query: \"project: {{audit_project}} tag: Audit-*\"
+    audit_project: AUD2
+";
+        let loaded = validate_str(raw, "<candidate>").unwrap();
+        let Some(NativeConfig::Youtrack(cfg)) = &loaded.action.native else {
+            panic!("expected youtrack native config");
+        };
+        // The placeholder is preserved on the stored field...
+        assert_eq!(
+            cfg.youtrack.query,
+            "project: {{audit_project}} tag: Audit-*"
+        );
+        assert_eq!(cfg.youtrack.audit_project, "AUD2");
+        // ...and substituted only when the query is resolved for use.
+        assert_eq!(cfg.youtrack.resolved_query(), "project: AUD2 tag: Audit-*");
+
+        let yaml = serde_yaml::to_string(&loaded.action).unwrap();
+        assert!(yaml.contains("audit_project: AUD2"), "{yaml}");
+        let reloaded = validate_str(&yaml, "<roundtrip>").unwrap();
+        assert_eq!(reloaded.action.native, loaded.action.native);
+    }
+
     #[test]
     fn prompt_preset_audit_round_trips() {
         let raw = "name: yt\nkind: youtrack\nnative:\n  youtrack:\n    prompt_preset: audit\n";
@@ -1342,10 +1412,16 @@ native:
         let Some(NativeConfig::Youtrack(cfg)) = &action.native else {
             panic!("expected youtrack native config");
         };
-        // Excludes audit runs (`AUDIT` tagged `Audit-*`), which `audit-run.yml` owns,
-        // so it differs from the site-agnostic `default_query()`.
+        // Excludes audit runs (tagged `Audit-*` in the audit project), which `audit-run.yml` owns,
+        // so it differs from the site-agnostic `default_query()`. The `{{audit_project}}` placeholder
+        // resolves against `audit_project` (CLAUDE-409), AUDIT by default.
         assert_eq!(
             cfg.youtrack.query,
+            "(project: -{{audit_project}} or tag: -Audit-*) and -Resolved AI Agent: Queued"
+        );
+        assert_eq!(cfg.youtrack.audit_project, "AUDIT");
+        assert_eq!(
+            cfg.youtrack.resolved_query(),
             "(project: -AUDIT or tag: -Audit-*) and -Resolved AI Agent: Queued"
         );
         assert_eq!(cfg.youtrack.custom_field, "AI Agent");
@@ -1394,6 +1470,11 @@ native:
         };
         assert_eq!(
             cfg.youtrack.query,
+            "-Resolved AI Agent: Queued project: {{audit_project}} tag: Audit-*"
+        );
+        assert_eq!(cfg.youtrack.audit_project, "AUDIT");
+        assert_eq!(
+            cfg.youtrack.resolved_query(),
             "-Resolved AI Agent: Queued project: AUDIT tag: Audit-*"
         );
         // The prompt lives in the binary as a preset, so an image upgrade
@@ -1433,68 +1514,91 @@ native:
     }
 
     /// The two youtrack-kind actions partition queued issues instead of racing for
-    /// them. Static half only: audit selects `AUDIT` + `Audit-*`, the worker its exact complement.
+    /// them. Static half only: audit selects the audit project + `Audit-*`, the
+    /// worker its exact complement. Checked for the shipped default (`AUDIT`) and
+    /// for one non-default key (CLAUDE-409), proving the partition holds by
+    /// construction rather than by two independently hand-written literals.
     #[test]
     fn shipped_youtrack_actions_partition_audit_issues() {
-        fn query_of(raw: &str, path: &str) -> String {
-            let loaded = validate_str(raw, path).expect("shipped action valid");
-            let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
-                panic!("expected youtrack native config in {path}");
-            };
-            cfg.youtrack.query
+        fn resolved_queries_of(audit_project: &str) -> (String, String) {
+            fn resolved_query(raw: &str, path: &str, audit_project: &str) -> String {
+                let raw = raw.replace(
+                    "audit_project: AUDIT",
+                    &format!("audit_project: {audit_project}"),
+                );
+                let loaded = validate_str(&raw, path).expect("shipped action valid");
+                let Some(NativeConfig::Youtrack(cfg)) = loaded.action.native else {
+                    panic!("expected youtrack native config in {path}");
+                };
+                assert_eq!(cfg.youtrack.audit_project, audit_project);
+                cfg.youtrack.resolved_query()
+            }
+            let default_query = resolved_query(
+                include_str!("../actions/youtrack.yml"),
+                "actions/youtrack.yml",
+                audit_project,
+            );
+            let audit_query = resolved_query(
+                include_str!("../actions/audit-run.yml"),
+                "actions/audit-run.yml",
+                audit_project,
+            );
+            (default_query, audit_query)
         }
 
-        let default_query = query_of(
-            include_str!("../actions/youtrack.yml"),
-            "actions/youtrack.yml",
-        );
-        let audit_query = query_of(
-            include_str!("../actions/audit-run.yml"),
-            "actions/audit-run.yml",
-        );
+        for audit_project in ["AUDIT", "AUD2"] {
+            let (default_query, audit_query) = resolved_queries_of(audit_project);
 
-        assert!(
-            audit_query.contains("project: AUDIT") && audit_query.contains("tag: Audit-*"),
-            "audit action must select AUDIT issues tagged Audit-*, got {audit_query:?}"
-        );
-        assert!(
-            !audit_query.contains("project: -AUDIT") && !audit_query.contains("tag: -Audit-*"),
-            "audit action must not negate its own selector, got {audit_query:?}"
-        );
-        assert!(
-            default_query.starts_with("(project: -AUDIT or tag: -Audit-*) and "),
-            "default action must select the exact complement of the audit selector, got {default_query:?}"
-        );
-        for q in [&default_query, &audit_query] {
             assert!(
-                !q.contains("-project:") && !q.contains("-tag:"),
-                "`-project:` / `-tag:` are YouTrack parse errors; negate the value instead, got {q:?}"
+                audit_query.contains(&format!("project: {audit_project}"))
+                    && audit_query.contains("tag: Audit-*"),
+                "audit action must select {audit_project} issues tagged Audit-*, got {audit_query:?}"
             );
-            // The complement is only exact within the same queued, unresolved set.
             assert!(
-                q.contains("-Resolved AI Agent: Queued"),
-                "both actions must pin the same base set, got {q:?}"
+                !audit_query.contains(&format!("project: -{audit_project}"))
+                    && !audit_query.contains("tag: -Audit-*"),
+                "audit action must not negate its own selector, got {audit_query:?}"
             );
-        }
-        assert_ne!(default_query, audit_query);
+            assert!(
+                default_query.starts_with(&format!("(project: -{audit_project} or tag: -Audit-*) and ")),
+                "default action must select the exact complement of the audit selector, got {default_query:?}"
+            );
+            for q in [&default_query, &audit_query] {
+                assert!(
+                    !q.contains("-project:") && !q.contains("-tag:"),
+                    "`-project:` / `-tag:` are YouTrack parse errors; negate the value instead, got {q:?}"
+                );
+                // The complement is only exact within the same queued, unresolved set.
+                assert!(
+                    q.contains("-Resolved AI Agent: Queued"),
+                    "both actions must pin the same base set, got {q:?}"
+                );
+                assert!(
+                    !q.contains("{{audit_project}}"),
+                    "the placeholder must be fully resolved, got {q:?}"
+                );
+            }
+            assert_ne!(default_query, audit_query);
 
-        // Both queries name the project by its real short name. `AUD` is a
-        // legacy alias YouTrack still resolves but lists nowhere.
-        fn project_value(q: &str) -> &str {
-            q.rsplit("project: ")
-                .next()
-                .expect("query names a project")
-                .split_whitespace()
-                .next()
-                .expect("project clause carries a value")
-                .trim_start_matches('-')
-        }
-        for q in [&default_query, &audit_query] {
-            assert_eq!(
-                project_value(q),
-                "AUDIT",
-                "name the audit project by its short name, not a legacy alias: {q:?}"
-            );
+            // Both queries name the project by the configured short name. `AUD`
+            // is a legacy alias YouTrack still resolves but lists nowhere, so the
+            // default case also guards against that literal creeping back in.
+            fn project_value(q: &str) -> &str {
+                q.rsplit("project: ")
+                    .next()
+                    .expect("query names a project")
+                    .split_whitespace()
+                    .next()
+                    .expect("project clause carries a value")
+                    .trim_start_matches('-')
+            }
+            for q in [&default_query, &audit_query] {
+                assert_eq!(
+                    project_value(q),
+                    audit_project,
+                    "name the audit project by the configured short name: {q:?}"
+                );
+            }
         }
     }
 

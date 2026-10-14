@@ -1005,7 +1005,10 @@ fn native_source_key(action: &crate::action::Action) -> Option<String> {
     match action.native.as_ref()? {
         NativeConfig::Youtrack(cfg) => {
             let base = cfg.youtrack.base_url.as_deref().unwrap_or("");
-            Some(format!("youtrack\u{1f}{base}\u{1f}{}", cfg.youtrack.query))
+            Some(format!(
+                "youtrack\u{1f}{base}\u{1f}{}",
+                cfg.youtrack.resolved_query()
+            ))
         }
         NativeConfig::ClosedIssueSummary(cfg) => {
             // Two reporters produce the same report iff they select the same
