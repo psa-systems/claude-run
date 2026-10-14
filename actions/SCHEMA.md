@@ -217,7 +217,7 @@ native:
 | `forgejo.pr_strategy`   | `branch`                           | PR-creation strategy (CLAUDE-103). `branch`: resolve the feature branch by name (independent of the current `HEAD`; CLAUDE-166), push it as `git push --set-upstream origin <branch>:<branch>`, and open the PR over the API with an explicit `--head`, so the PR stays mergeable and updatable. `agit`: `fj pr create -aA`, a branchless PR whose head lives only at `refs/pull/<N>/head` and loses its merge button if it falls behind an up-to-date base. The selected strategy is authoritative (no silent cross-strategy fallback). Both strategies are gated by the same pre-dispatch ahead check (CLAUDE-212): PR creation is attempted only when exactly one local branch has commits ahead of the base, so a run that produced no commits fails loudly instead of opening an empty PR. |
 | `github.hosts`          | empty                              | Extra GitHub host(s) beyond `github.com` to treat as GitHub (e.g. GitHub Enterprise). Bare hosts.   |
 | `github.mcp_endpoint`   | `https://api.githubcopilot.com/mcp/` | Remote GitHub MCP endpoint used to open the PR (no local server to install).                      |
-| `github.token_ref`      | none                               | Name of an encrypted secret holding the GitHub PAT (CLAUDE-26). `None` falls back to the daemon's own GitHub service login (CLAUDE-307), resolved lazily via `gh auth token --hostname <host>`. |
+| `github.token_ref`      | none                               | Name of an encrypted secret holding the GitHub PAT (CLAUDE-26). `None` falls back to the daemon's own GitHub service login (CLAUDE-307), resolved lazily via `gh auth token --hostname <host>`. A fine-grained PAT is enough for this field, but GitHub automerge never reads it (see "CI-gated automerge"). |
 
 ##### Prompt placeholders (CLAUDE-125)
 
@@ -473,6 +473,16 @@ agent PR no longer floods run history with one row per PR per pass.
 Automerge works on both backends: a Forgejo-hosted PR goes through `fj pr status` / `fj pr merge` / `fj pr update`, and a
 GitHub-hosted PR (CLAUDE-405) goes through `gh pr view --json` / `gh pr merge` / `gh pr update-branch` via `GithubForge`,
 selected automatically by `resolve_automerge_forge` from the PR's host.
+
+GitHub automerge needs a **classic PAT with the `repo` scope**. `pr_status` reads `statusCheckRollup`, whose check-run
+entries (GitHub Actions jobs) a fine-grained PAT cannot read, because GitHub offers no fine-grained permission for check
+runs. With a fine-grained PAT `pr_status` fails on every PR with `GraphQL: Resource not accessible by personal access
+token (repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup.contexts.nodes.0)`. The automerge
+reconciler and webhook path (`resolve_forge` in `src/web/webhooks.rs`) builds `GithubForge` with no token, so `gh` uses
+the daemon's own login, the GitHub token saved in Settings -> Auth; `github.token_ref` and a webhook source's
+`write_token_ref` are separate secrets this path does not read. The Settings token is read on every pass, so replacing it
+also fixes PRs that already exist. Saving it runs `gh auth login --with-token`, which needs `repo`, `read:org` and
+`gist`. For a personal-account repository there is no organization approval or SSO step.
 
 ##### Pre-clone dependency gate (CLAUDE-161)
 

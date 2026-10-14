@@ -130,7 +130,11 @@ single **Issue comments** event (`issue_comment`), which fires for a comment on 
 request, and the listener tells them apart the same way GitHub's own payload does, by whether `issue.pull_request`
 is present. Store the write PAT first, e.g. `printf %s '<pat>' | claude-run secret set github-write-<org>`, and name
 it in the source's `write_token_ref`; it needs `contents:write` (to push the branch), `pull_requests:write`, and
-`issues:write` scopes. Authorization is a live read of the commenter's permission via `GithubForge::repo_permission`
+`issues:write` scopes. GitHub automerge does not use this secret: it uses the GitHub login saved in Settings -> Auth
+(`auth-github-token`), which must be a classic PAT because a fine-grained PAT cannot read check runs. To serve both with
+one classic PAT, grant `repo`, `read:org` (needed by `gh auth login --with-token`), `read:user`, and `workflow` only when
+the agent edits `.github/workflows/*`, then save it in both places: Settings -> Auth and the secrets store under the
+`write_token_ref` name. The Settings token and `write_token_ref` stay separate secrets. Authorization is a live read of the commenter's permission via `GithubForge::repo_permission`
 (`gh api repos/<owner>/<repo>/collaborators/<username>/permission --jq .permission`), matched against the source's
 `allowed_permissions` the same way as the Forgejo route; the token used for that read needs read access to the
 repository's collaborators, which a token with `contents:write` on a repo the bot administers already has. An
