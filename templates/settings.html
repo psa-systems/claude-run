@@ -1,7 +1,12 @@
 {% extends "base.html" %}
 {% block title %}Settings - claude-run{% endblock %}
 {% block breadcrumb %}<a href="/">Dashboard</a><span class="sep">/</span><span class="current">Settings</span>{% endblock %}
+
+{% import "form_macros.html" as m %}
+
 {% block main %}
+
+{% call m::form_styles() %}
 
 <h2>Settings</h2>
 
@@ -170,47 +175,55 @@
   </form>
 </div>
 
-<div class="card" style="margin-bottom: 16px;" id="section-email">
-  <h3>Email (SMTP) <span class="badge neutral">apply: live</span></h3>
+<div class="card yt-form" style="margin-bottom: 16px;" id="section-email">
+  <h3>Email (SMTP) <span class="badge neutral">apply: restart</span></h3>
   {% if let Some(e) = email.error %}
   <div class="card" style="border-color: var(--bad); margin-bottom: 12px;">
-    <strong style="color: var(--bad);">Rejected (nothing saved):</strong>
+    <strong style="color: var(--bad);">Test email failed:</strong>
     <pre class="stream" style="max-height: 160px; margin: 8px 0 0;">{{ e }}</pre>
   </div>
   {% endif %}
   <span class="dim">Lets an invite on the <a href="/settings/accounts">Accounts</a> page be emailed instead of
-  shown as a one-time link.
+  shown as a one-time link. Set only through the <code>CLAUDE_RUN_SMTP_*</code> /
+  <code>CLAUDE_RUN_PUBLIC_URL</code> environment variables on the daemon; there is no form to edit
+  it here.
   {% if email.configured %}<span class="badge ok">configured</span>
   {% else %}<span class="badge neutral">not configured</span>{% endif %}</span>
-  <form method="post" action="/settings/auth/email" style="margin-top: 8px;">
-    <label for="email-host">SMTP host</label>
-    <input id="email-host" name="smtp_host" type="text" placeholder="smtp.example.com"
-           {% if let Some(h) = email.smtp_host %}value="{{ h }}"{% endif %}>
-    <label for="email-port" style="margin-top: 8px;">Port</label>
-    <input id="email-port" name="smtp_port" type="text" placeholder="587 (starttls) / 465 (tls) / 25 (none)"
-           {% if let Some(p) = email.smtp_port %}value="{{ p }}"{% endif %}>
-    <label for="email-encryption" style="margin-top: 8px;">Encryption</label>
-    <select id="email-encryption" name="smtp_encryption">
-      <option value="starttls" {% if email.smtp_encryption == crate::config::SmtpEncryption::Starttls %}selected{% endif %}>STARTTLS</option>
-      <option value="tls" {% if email.smtp_encryption == crate::config::SmtpEncryption::Tls %}selected{% endif %}>TLS</option>
-      <option value="none" {% if email.smtp_encryption == crate::config::SmtpEncryption::None %}selected{% endif %}>None</option>
-    </select>
-    <label for="email-username" style="margin-top: 8px;">Username</label>
-    <input id="email-username" name="smtp_username" type="text" autocomplete="off"
-           {% if let Some(u) = email.smtp_username %}value="{{ u }}"{% endif %}>
-    <label for="email-password" style="margin-top: 8px;">Password</label>
-    <input id="email-password" name="smtp_password" type="password" autocomplete="off"
-           placeholder="leave blank to keep the current password">
-    <label for="email-from" style="margin-top: 8px;">From address</label>
-    <input id="email-from" name="from" type="email" placeholder="claude-run@example.com"
-           {% if let Some(f) = email.from %}value="{{ f }}"{% endif %}>
-    <label for="email-public-url" style="margin-top: 8px;">Public URL</label>
-    <input id="email-public-url" name="public_url" type="url" placeholder="https://claude-run.example.com"
-           {% if let Some(u) = email.public_url %}value="{{ u }}"{% endif %}>
-    <span class="dim">Used to build the invite link in the email; never taken from the request's
-    <code>Host</code> header.</span>
-    <button type="submit" style="margin-top: 8px;">Save Email (SMTP) settings</button>
-  </form>
+  <div class="grid2" style="margin-top: 8px;">
+    <div class="fld">
+      <span>SMTP host (CLAUDE_RUN_SMTP_HOST)</span>
+      <strong>{% if let Some(h) = email.smtp_host %}{{ h }}{% else %}(not set){% endif %}</strong>
+    </div>
+    <div class="fld">
+      <span>Port (CLAUDE_RUN_SMTP_PORT)</span>
+      <strong>{% if let Some(p) = email.smtp_port %}{{ p }}{% else %}(default){% endif %}</strong>
+    </div>
+    <div class="fld">
+      <span>Encryption (CLAUDE_RUN_SMTP_ENCRYPTION)</span>
+      <strong>{% if email.smtp_encryption == crate::config::SmtpEncryption::Starttls %}STARTTLS
+              {% else if email.smtp_encryption == crate::config::SmtpEncryption::Tls %}TLS
+              {% else %}None{% endif %}</strong>
+    </div>
+    <div class="fld">
+      <span>Username (CLAUDE_RUN_SMTP_USERNAME)</span>
+      <strong>{% if let Some(u) = email.smtp_username %}{{ u }}{% else %}(not set){% endif %}</strong>
+    </div>
+    <div class="fld">
+      <span>Password (CLAUDE_RUN_SMTP_PASSWORD / _FILE)</span>
+      <strong>{% if email.password_set %}set{% else %}not set{% endif %}</strong>
+    </div>
+    <div class="fld">
+      <span>From address (CLAUDE_RUN_SMTP_FROM)</span>
+      <strong>{% if let Some(f) = email.from %}{{ f }}{% else %}(not set){% endif %}</strong>
+    </div>
+    <div class="fld">
+      <span>Public URL (CLAUDE_RUN_PUBLIC_URL)</span>
+      <strong>{% if let Some(u) = email.public_url %}{{ u }}{% else %}(not set){% endif %}</strong>
+    </div>
+  </div>
+  {% if !email.configured %}
+  <p class="hint dim">Missing: {% for f in email.missing_fields %}<code>{{ f }}</code>{% if !loop.last %}, {% endif %}{% endfor %}.</p>
+  {% endif %}
   <form method="post" action="/settings/auth/email/test" style="margin-top: 12px;">
     <label for="email-test-address">Send test email to</label>
     <input id="email-test-address" name="test_address" type="email" placeholder="you@example.com" required>
