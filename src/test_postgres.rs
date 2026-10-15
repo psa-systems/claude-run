@@ -315,12 +315,14 @@ fn psql_args() -> [&'static str; 5] {
     ["psql", "--username", "postgres", "--set", "ON_ERROR_STOP=1"]
 }
 
-/// How long a connection may keep failing with "the database system is
-/// starting up" / "shutting down" after `pg_isready` already reported ready.
-/// The official postgres image's entrypoint restarts the server once after
-/// its own `initdb`, and `pg_isready` can observe the brief ready window
-/// before that restart; retrying here rides out that restart instead of
-/// treating it as a real failure.
+/// How long a connection may keep failing on a restart shape after
+/// `pg_isready` already reported ready: "the database system is starting
+/// up" / "shutting down", or the socket file briefly disappearing between
+/// that readiness check and the next connection attempt. The official
+/// postgres image's entrypoint restarts the server once after its own
+/// `initdb`, and `pg_isready` can observe the brief ready window before that
+/// restart; retrying here rides out that restart instead of treating it as a
+/// real failure.
 const RESTART_WINDOW: Duration = Duration::from_secs(20);
 
 /// Whether a `psql` connection failure looks like the official postgres
