@@ -83,10 +83,25 @@ services:
       # this file does by default. The URL travels as a file, not as an
       # environment value, because it carries the password.
       # CLAUDE_RUN_DATABASE_URL_FILE: /run/secrets/claude-run-database-url
+      #
+      # CLAUDE-428: SMTP is env-only, no Settings-page form. Uncomment these
+      # together with the `claude-run-smtp-password` secret below to let an
+      # invite on the Accounts page be emailed instead of shown as a
+      # one-time link. The password travels as a file, like the database
+      # URL above, never as a plain environment value.
+      # CLAUDE_RUN_SMTP_HOST: smtp.example.com
+      # CLAUDE_RUN_SMTP_PORT: "587"
+      # CLAUDE_RUN_SMTP_ENCRYPTION: starttls
+      # CLAUDE_RUN_SMTP_USERNAME: claude-run
+      # CLAUDE_RUN_SMTP_PASSWORD_FILE: /run/secrets/claude-run-smtp-password
+      # CLAUDE_RUN_SMTP_FROM: claude-run@example.com
+      # CLAUDE_RUN_PUBLIC_URL: https://claude-run.example.com
     # CLAUDE-250: uncomment with the variable above; the daemon reads the URL
     # from the file this mounts.
+    # CLAUDE-428: uncomment alongside the SMTP variables above.
     # secrets:
     #   - claude-run-database-url
+    #   - claude-run-smtp-password
     # CLAUDE-250: `required: false` so this stays a no-op without
     # `--profile postgres`: the plain stack is SQLite-only and must not wait on
     # a service that was never started.
@@ -226,8 +241,14 @@ volumes:
 #   $"postgres://claude_run:($password)@claude-bot-postgres:5432/claude_run" | save secrets/database-url.txt
 # The daemon reads the URL only when CLAUDE_RUN_DATABASE_URL_FILE above is
 # uncommented; without it the stack stays on SQLite even with the profile on.
+#
+# CLAUDE-428: claude-run-smtp-password is read only when
+# CLAUDE_RUN_SMTP_PASSWORD_FILE above is uncommented:
+#   echo -n 'the SMTP password' | save secrets/smtp-password.txt
 secrets:
   claude-run-postgres-password:
     file: ./secrets/postgres-password.txt
   claude-run-database-url:
     file: ./secrets/database-url.txt
+  claude-run-smtp-password:
+    file: ./secrets/smtp-password.txt

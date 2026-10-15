@@ -80,8 +80,10 @@ native:
     # --query value the handler passes to `yt list`, sent as `--query=<value>` so a query starting with `-` is not
     # mistaken for a flag.
     #
-    # Audit partition (CLAUDE-215): the exact complement of `audit-run.yml`'s `project: AUDIT tag: Audit-*` (tag routing
-    # is in its header). Negate values, not keys (`-project:` is a parse error); a `(...)` group needs an explicit `and`.
+    # Audit partition (CLAUDE-215): the exact complement of `audit-run.yml`'s `project: {{audit_project}} tag: Audit-*`
+    # (tag routing is in its header). Negate values, not keys (`-project:` is a parse error); a `(...)` group needs an
+    # explicit `and`. `{{audit_project}}` is substituted with `audit_project` below (default `AUDIT`, CLAUDE-409); it
+    # must be set to the SAME value as `audit-run.yml`'s so the two queries stay an exact complement.
     #
     # The reporting action (`closed-issue-summary.yml`, CLAUDE-218) is partitioned off the same way
     # but on the `AI Agent` axis rather than the project axis: this query pins the single value
@@ -91,8 +93,10 @@ native:
     # HTTP 400 rather than returning nothing, so spelling the reporting value out would break THIS
     # action's poll until someone added that value in YouTrack. `shipped_action_queries_are_disjoint`
     # in src/action.rs is the mechanical guard on the partition.
-    query: "(project: -AUDIT or tag: -Audit-*) and -Resolved AI Agent: Queued"
+    query: "(project: -{{audit_project}} or tag: -Audit-*) and -Resolved AI Agent: Queued"
     custom_field: "AI Agent"
+    # Short name of the audit project. Must match `audit-run.yml`'s `audit_project`; see actions/SCHEMA.md.
+    audit_project: AUDIT
     # base_url / token_ref (CLAUDE-26): omitted here, so the host-configured yt CLI is used. To inject a token, set
     # base_url plus token_ref: <secret-name>.
     # states: defaults to Queued / Working / Code Review / Needs Review / Failed and State=In Progress; override here

@@ -86,6 +86,16 @@ impl Daemon {
         // the bootstrap fallback) and hold it behind shared RwLocks so
         // Settings-page saves apply live.
         crate::settings::migrate_config_file(&pool, &self.paths).await?;
+
+        // CLAUDE-428: the SMTP transport moved from a DB-backed Settings-page
+        // section to environment variables. Retire any leftover
+        // `config.email` row / secret once, then fail fast naming the
+        // offending variable (never the password) rather than letting a bad
+        // environment surface only on the first invite send.
+        crate::settings::retire_email_section(&pool).await?;
+        crate::config::EmailConfig::from_env()
+            .map_err(|e| anyhow::anyhow!("email configuration: {e}"))?;
+
         let effective = crate::settings::effective(&pool, &self.on_disk).await?;
         let replay_window_secs = effective.webhook.replay_window_secs;
 
@@ -1005,7 +1015,10 @@ fn native_source_key(action: &crate::action::Action) -> Option<String> {
     match action.native.as_ref()? {
         NativeConfig::Youtrack(cfg) => {
             let base = cfg.youtrack.base_url.as_deref().unwrap_or("");
-            Some(format!("youtrack\u{1f}{base}\u{1f}{}", cfg.youtrack.query))
+            Some(format!(
+                "youtrack\u{1f}{base}\u{1f}{}",
+                cfg.youtrack.resolved_query()
+            ))
         }
         NativeConfig::ClosedIssueSummary(cfg) => {
             // Two reporters produce the same report iff they select the same

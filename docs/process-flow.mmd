@@ -30,7 +30,7 @@ flowchart TB
     cc_work -->|"commits"| yt_action
     cc_work -->|"problem identified"| yt_gap
 
-    yt -->|"<span style='color:#f59e0b'>Queued</span><br/>project: AUDIT, tag: Audit-*"| audit_action
+    yt -->|"<span style='color:#f59e0b'>Queued</span><br/>project: {audit_project}, tag: Audit-*"| audit_action
     audit_action -->|"built-in audit prompt"| cc_audit
     cc_audit -->|"creates issues<br/><span style='color:#f59e0b'>Queued</span>"| yt
     cc_audit -->|"commit report"| audit_action

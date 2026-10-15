@@ -46,22 +46,27 @@ guard is unchanged, and the marker is never an escape hatch for a code task the 
 
 Two actions share `kind: youtrack` and partition the queued issues between them:
 
-- `actions/youtrack.yml` works code issues. Query: `(project: -AUDIT or tag: -Audit-*) and -Resolved AI Agent: Queued`.
+- `actions/youtrack.yml` works code issues. Query: `(project: -{{audit_project}} or tag: -Audit-*) and -Resolved AI Agent: Queued`.
 - `actions/audit-run.yml` works read-only repository audits. Query:
-  `-Resolved AI Agent: Queued project: AUDIT tag: Audit-*`.
+  `-Resolved AI Agent: Queued project: {{audit_project}} tag: Audit-*`.
+
+Both `{{audit_project}}` placeholders are substituted with `native.youtrack.audit_project` (default `AUDIT`) at query
+time (CLAUDE-409); the two action files carry this field, not the project key spelled out inside the query string, so
+moving the audit project to a different short name is one field edited in each file instead of two independently
+hand-written query literals. `YoutrackSource::resolved_query` (`src/action.rs`) does the substitution.
 
 The split exists because the handler resolves a job's repository from the triggering issue's project VCS processor, one
 project to one repo, and an audit writes its deliverable into a **different** repo from the one it reads. Audit issues
-live in the `AUDIT` project, whose processor points at the audits repo (e.g. `owner/audits`), so the handler clones the audits repo into the
+live in the configured audit project, whose processor points at the audits repo (e.g. `owner/audits`), so the handler clones the audits repo into the
 job workdir and finalize opens the pull request there; the agent clones the audited repo read-only to a path outside the
 workdir and never writes to it. An audit issue picked up by the code-issue action would clone the audited repo and open
 a pull request against it, which is why the exclusion is not optional: both actions poll on the same interval, so
 without it the winner is a race. The audit side also requires an `Audit-*` tag: the YouTrack workflow tags the daily
 audit parent and every per-target Epic `Audit-<Type>`, and that tag is what routes them to `audit-run.yml`. The worker
-query is the exact complement, so an `AUDIT` issue with no `Audit-*` tag is ordinary engineering work on the audits repo
-and goes to `youtrack.yml`. Note the query syntax - YouTrack rejects `-project: AUDIT` with a parse error, so the
-negation sits on the value (`project: -AUDIT`), and a parenthesized group must be followed by an explicit `and`
-(`#Unresolved (a or b)` is rejected). Name the project by its short name `AUDIT`: `AUD` is a legacy alias YouTrack still
+query is the exact complement, so an issue in the audit project with no `Audit-*` tag is ordinary engineering work on
+the audits repo and goes to `youtrack.yml`. Note the query syntax - YouTrack rejects `-project: AUDIT` with a parse
+error, so the negation sits on the value (`project: -AUDIT`), and a parenthesized group must be followed by an explicit
+`and` (`#Unresolved (a or b)` is rejected). Name the project by its short name: `AUD` is a legacy alias YouTrack still
 resolves after the rename, but it appears in no project listing and must not be used in a query.
 
 `audit-run.yml` sets `prompt_preset: audit`, which selects the audit prompt built into the binary

@@ -43,14 +43,16 @@ page lists every account and outstanding invite, and lets a signed-in account re
 invite; removing the last remaining account, or removing yourself, is refused rather than silently ignored. There are
 no roles yet: every account has full access.
 
-Giving an email address on the invite form sends the link by mail instead of showing it: once the **Email (SMTP)**
-card in Settings is configured, the field accepts an address and the page reports "Invite sent to \<address\>" with no
-link on screen. The field is disabled, with a note pointing at that card, until SMTP is configured; an invalid address
-is refused with `400` before anything is minted. If the send itself fails (bad credentials, an unreachable host), the
-invite is kept rather than discarded, the page answers `502` with the error, and the link is shown as a fallback so
-the invite is not stranded. Leaving the field blank keeps the original link-only flow. See "Email (SMTP)" in
-[`docs/configuration.md`](configuration.md) for the mailer's own fields and `src/mailer.rs` for the transport; the
-link it sends always comes from the configured `public_url`, never from the request's `Host` header.
+Giving an email address on the invite form sends the link by mail instead of showing it: once SMTP is configured
+through the `CLAUDE_RUN_SMTP_*` / `CLAUDE_RUN_PUBLIC_URL` environment variables (CLAUDE-428; the read-only **Email
+(SMTP)** card in Settings shows the effective values), the field accepts an address and the page reports "Invite sent
+to \<address\>" with no link on screen. The field is disabled, with a note pointing at that card, until SMTP is
+configured; an invalid address is refused with `400` before anything is minted. If the send itself fails (bad
+credentials, an unreachable host), the invite is kept rather than discarded, the page answers `502` with the error,
+and the link is shown as a fallback so the invite is not stranded. Leaving the field blank keeps the original
+link-only flow. See "Email (SMTP)" in [`docs/configuration.md`](configuration.md) for the mailer's own fields and
+`src/mailer.rs` for the transport; the link it sends always comes from the configured `public_url`, never from the
+request's `Host` header.
 
 **Every account requires TOTP.** Setup and invite acceptance do not end at account creation: the new account is signed
 in and sent straight to `/account/2fa/setup`, which shows a QR code (and the manual-entry `otpauth://` URL as a

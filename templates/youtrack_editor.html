@@ -46,9 +46,11 @@
       {% call m::tokenfield("Token secret", "yt_token_ref", form.yt_token_ref, secrets) %}
       {% call m::textfield("Issue query", "yt_query", form.yt_query, "-Resolved AI Agent: Queued") %}
       {% call m::textfield("Custom field", "yt_custom_field", form.yt_custom_field, "AI Agent") %}
+      {% call m::textfield("Audit project", "yt_audit_project", form.yt_audit_project, "AUDIT") %}
       {% call m::textfield("Assignee (optional)", "yt_assignee", form.yt_assignee, "login, me, or unassigned (blank = leave Assignee untouched)") %}
     </div>
     <p class="hint dim">When set, the issue is assigned to this user during pickup. A literal <code>yt</code> assignee argument: a login, <code>me</code>, or <code>unassigned</code>. Leave blank to never touch the Assignee.</p>
+    <p class="hint dim">Short name of the audit project. Substituted into "Issue query" wherever it contains the <code>&#123;&#123;audit_project&#125;&#125;</code> placeholder (the shipped <code>audit-run.yml</code> / <code>youtrack.yml</code> pair both use it), so changing this one field re-derives both queries instead of hand-editing the literal project key in each.</p>
   </div>
 
   <div class="card">

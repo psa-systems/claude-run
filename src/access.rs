@@ -471,7 +471,8 @@ fn probe_action(
     if let Some(project) = &req.project {
         projects.push(project.clone());
     } else if req.is_aggregate() {
-        match backend.list_queued(&target.youtrack.query) {
+        let query = target.youtrack.resolved_query();
+        match backend.list_queued(&query) {
             Ok(issues) => {
                 let mut keys: Vec<String> = issues
                     .iter()
@@ -502,7 +503,7 @@ fn probe_action(
                 target: target.name.clone(),
                 kind: CheckKind::Query,
                 credential: yt_cred.clone(),
-                probe: format!("yt list --query=\"{}\"", target.youtrack.query),
+                probe: format!("yt list --query=\"{query}\""),
                 outcome: Outcome::Fail,
                 detail: e.to_string(),
                 remediation: Some(query_remediation(&e.to_string(), None)),
@@ -572,7 +573,7 @@ fn probe_action(
         // The action's own query, scoped to the project. A project this token
         // cannot read comes back as HTTP 400 `invalid_query` rather than a 401,
         // which reads as a broken query unless the row says otherwise.
-        let scoped = format!("{} project: {project}", target.youtrack.query);
+        let scoped = format!("{} project: {project}", target.youtrack.resolved_query());
         rows.push(match backend.list_query_top(&scoped, 1) {
             Ok(hits) => CheckRow {
                 target: project.clone(),

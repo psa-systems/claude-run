@@ -45,6 +45,16 @@ fn strip_database_url_env(command: &mut Command) {
     command.env_remove("CLAUDE_RUN_DATABASE_URL_FILE");
 }
 
+/// Strip the SMTP password out of the `claude` child's environment, same
+/// reasoning and the same hygiene-not-boundary caveat as
+/// [`strip_database_url_env`] (CLAUDE-428): the daemon's own environment
+/// carries `CLAUDE_RUN_SMTP_PASSWORD(_FILE)`, and `Command` otherwise
+/// inherits it unchanged.
+fn strip_smtp_password_env(command: &mut Command) {
+    command.env_remove("CLAUDE_RUN_SMTP_PASSWORD");
+    command.env_remove("CLAUDE_RUN_SMTP_PASSWORD_FILE");
+}
+
 /// Grace window the claude process group gets after SIGTERM, before the
 /// canceller escalates to SIGKILL.
 const CANCEL_GRACE: Duration = Duration::from_millis(2000);
@@ -382,6 +392,7 @@ impl ClaudeInvoker {
             .process_group(0)
             .env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
         strip_database_url_env(&mut command);
+        strip_smtp_password_env(&mut command);
         // Point the agent at its dedicated user-level config dir
         // (slim bot CLAUDE.md + linked host credentials). HOME is left inherited.
         if let Some(dir) = &self.config_dir {
@@ -1105,6 +1116,38 @@ pub(crate) fn count_compact_boundaries(stream_log: &Path) -> std::io::Result<usi
                 && event.get("subtype").and_then(|t| t.as_str()) == Some("compact_boundary")
         })
         .count())
+}
+
+/// Append one runner-written record to the end of a stream log, naming a
+/// post-agent failure that happened after the agent session's own relay
+/// already closed the file (CLAUDE-425): a push or PR-create failure in
+/// `finalize`. `step` is `"push"` or `"pr_create"`. Opened in append mode so
+/// it never disturbs what the relay already wrote. Every existing reader
+/// (`count_compact_boundaries`, `parse_final_result`, the web log viewer)
+/// selects events by `type`/`subtype` rather than by line position, so an
+/// unrecognized `"type":"runner_error"` trailing line is silently skipped by
+/// all of them. Returns the write's `io::Result` rather than swallowing it,
+/// matching the CLAUDE-233 convention for every other writer of this file;
+/// the caller logs a failure and continues, since the run's outcome is
+/// already decided by the time this runs.
+pub(crate) fn append_runner_error(
+    stream_log: &Path,
+    step: &str,
+    cause: &str,
+) -> std::io::Result<()> {
+    let ts = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let line = serde_json::json!({
+        "type": "runner_error",
+        "step": step,
+        "cause": cause,
+        "ts": ts,
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(stream_log)?;
+    writeln!(file, "{line}")?;
+    file.flush()
 }
 
 /// Scan every `assistant` event in the stream log, counting how many there
@@ -2135,6 +2178,38 @@ exit "$code"
             envs.get(std::ffi::OsStr::new("CLAUDE_RUN_DATABASE_URL_FILE")),
             Some(&None),
             "CLAUDE_RUN_DATABASE_URL_FILE must be marked removed"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS")),
+            Some(&Some(std::ffi::OsStr::new("1"))),
+            "unrelated env vars must be left alone"
+        );
+    }
+
+    /// `strip_smtp_password_env` must mark both SMTP password variables
+    /// removed (CLAUDE-428), while leaving everything else untouched.
+    #[test]
+    fn strip_smtp_password_env_removes_both_smtp_password_vars() {
+        let mut command = Command::new("true");
+        command
+            .env("CLAUDE_RUN_SMTP_PASSWORD", "hunter2")
+            .env(
+                "CLAUDE_RUN_SMTP_PASSWORD_FILE",
+                "/run/secrets/smtp-password",
+            )
+            .env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
+        strip_smtp_password_env(&mut command);
+
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CLAUDE_RUN_SMTP_PASSWORD")),
+            Some(&None),
+            "CLAUDE_RUN_SMTP_PASSWORD must be marked removed"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CLAUDE_RUN_SMTP_PASSWORD_FILE")),
+            Some(&None),
+            "CLAUDE_RUN_SMTP_PASSWORD_FILE must be marked removed"
         );
         assert_eq!(
             envs.get(std::ffi::OsStr::new("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS")),

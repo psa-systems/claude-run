@@ -944,8 +944,10 @@ pub struct AuthConfig {
     pub git_author_email: Option<String>,
 }
 
-/// Name the SMTP password secret is stored under. See [`ANTHROPIC_KEY_SECRET`]
-/// for why this is fixed rather than operator-chosen.
+/// Name the SMTP password secret used to be stored under, before CLAUDE-428
+/// moved the SMTP transport to environment variables. Kept only so the
+/// startup retirement in `src/settings.rs` can delete a leftover secret by
+/// this name; no code writes it anymore.
 pub const SMTP_PASSWORD_SECRET: &str = "email-smtp-password";
 
 /// How the SMTP connection is secured. `Starttls` is the default: plaintext
@@ -960,36 +962,58 @@ pub enum SmtpEncryption {
     None,
 }
 
-/// The `config.email` settings section: the SMTP transport invite-by-email
-/// sends through, entered on the Settings page's "Email (SMTP)" card.
+/// The SMTP transport invite-by-email sends through (CLAUDE-428): resolved
+/// once at daemon start from environment variables, never DB-backed. Not
+/// `Debug` (the password would otherwise be printable); see
+/// [`EmailConfig::password`].
 ///
-/// Only non-secret fields and the password secret's NAME live here; the
-/// password itself goes into the encrypted secrets store under
-/// [`SMTP_PASSWORD_SECRET`], resolved fresh on every send by
-/// [`crate::mailer::Mailer`]. Email is "configured" only once `smtp_host`,
-/// `from`, and `public_url` are all set; see [`EmailConfig::configured`].
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
+/// Email is "configured" only once `smtp_host`, `from`, and `public_url` are
+/// all set; see [`EmailConfig::configured`].
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct EmailConfig {
-    /// SMTP server host, e.g. `smtp.example.com`.
+    /// SMTP server host, e.g. `smtp.example.com`. `CLAUDE_RUN_SMTP_HOST`;
+    /// unset means email is not configured.
     pub smtp_host: Option<String>,
-    /// SMTP server port. Unset means the encryption's own default: 587 for
-    /// STARTTLS, 465 for implicit TLS, 25 for none.
+    /// SMTP server port. `CLAUDE_RUN_SMTP_PORT`; unset means the
+    /// encryption's own default: 587 for STARTTLS, 465 for implicit TLS, 25
+    /// for none.
     pub smtp_port: Option<u16>,
-    /// How the connection is secured. Defaults to STARTTLS.
+    /// How the connection is secured. `CLAUDE_RUN_SMTP_ENCRYPTION`; defaults
+    /// to STARTTLS.
     pub smtp_encryption: SmtpEncryption,
     /// SMTP username, when the server requires auth.
+    /// `CLAUDE_RUN_SMTP_USERNAME`.
     pub smtp_username: Option<String>,
-    /// Secret name holding the SMTP password. A username with no password is
-    /// refused at save time rather than silently sending anonymously.
-    pub smtp_password_ref: Option<String>,
+    /// The resolved SMTP password, held in memory only. `CLAUDE_RUN_SMTP_PASSWORD_FILE`
+    /// wins over `CLAUDE_RUN_SMTP_PASSWORD`, the same precedence as
+    /// `CLAUDE_RUN_DATABASE_URL_FILE` over `CLAUDE_RUN_DATABASE_URL`: an
+    /// environment value is readable through `docker inspect` and
+    /// `/proc/<pid>/environ`. A username with no password is refused at
+    /// startup rather than silently sending anonymously.
+    password: Option<String>,
     /// The From mailbox, e.g. `claude-run <claude-run@example.com>`.
+    /// `CLAUDE_RUN_SMTP_FROM`.
     pub from: Option<String>,
     /// The instance's externally reachable base URL, e.g.
     /// `https://claude-run.example.com`, used to build the absolute invite
-    /// link. Never built from a request's `Host` header: that would put a
-    /// client-controlled host into an outbound email.
+    /// link. `CLAUDE_RUN_PUBLIC_URL`; not SMTP-specific, so no `SMTP` in the
+    /// variable name. Never built from a request's `Host` header: that would
+    /// put a client-controlled host into an outbound email.
     pub public_url: Option<String>,
+}
+
+impl std::fmt::Debug for EmailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmailConfig")
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_encryption", &self.smtp_encryption)
+            .field("smtp_username", &self.smtp_username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("from", &self.from)
+            .field("public_url", &self.public_url)
+            .finish()
+    }
 }
 
 impl EmailConfig {
@@ -998,6 +1022,123 @@ impl EmailConfig {
     pub fn configured(&self) -> bool {
         self.smtp_host.is_some() && self.from.is_some() && self.public_url.is_some()
     }
+
+    /// The resolved SMTP password, if any. `None` when `smtp_username` is
+    /// also unset (anonymous submission).
+    pub fn password(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
+
+    /// Which of `smtp_host`, `from`, `public_url` are missing, for the
+    /// Settings card's "not configured" note. Empty when [`Self::configured`].
+    pub fn missing_fields(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.smtp_host.is_none() {
+            missing.push("CLAUDE_RUN_SMTP_HOST");
+        }
+        if self.from.is_none() {
+            missing.push("CLAUDE_RUN_SMTP_FROM");
+        }
+        if self.public_url.is_none() {
+            missing.push("CLAUDE_RUN_PUBLIC_URL");
+        }
+        missing
+    }
+
+    /// Resolve from the real process environment. Thin wrapper over
+    /// [`email_config_from_env`] so call sites do not each repeat the
+    /// `std::env::var` lookup closure.
+    pub fn from_env() -> std::result::Result<Self, String> {
+        email_config_from_env(|k| std::env::var(k).ok())
+    }
+}
+
+/// Build an [`EmailConfig`] from an environment lookup, pure over `get` so
+/// tests exercise every precedence and failure case without touching the
+/// process environment. `get` returns `None` for an unset variable, as
+/// `std::env::var(..).ok()` does.
+///
+/// On any failure, returns a message naming the offending variable and (for
+/// everything except the password itself) its value - never the password.
+/// `CLAUDE_RUN_SMTP_PASSWORD_FILE` wins over `CLAUDE_RUN_SMTP_PASSWORD` when
+/// both are set.
+pub fn email_config_from_env(
+    get: impl Fn(&str) -> Option<String>,
+) -> std::result::Result<EmailConfig, String> {
+    let non_empty = |v: Option<String>| v.filter(|s| !s.is_empty());
+
+    let smtp_host = non_empty(get("CLAUDE_RUN_SMTP_HOST"));
+    let smtp_port = match non_empty(get("CLAUDE_RUN_SMTP_PORT")) {
+        Some(raw) => Some(
+            raw.parse::<u16>()
+                .map_err(|_| format!("CLAUDE_RUN_SMTP_PORT `{raw}` is not a valid port number"))?,
+        ),
+        None => None,
+    };
+    let smtp_encryption = match non_empty(get("CLAUDE_RUN_SMTP_ENCRYPTION")) {
+        Some(raw) => match raw.as_str() {
+            "starttls" => SmtpEncryption::Starttls,
+            "tls" => SmtpEncryption::Tls,
+            "none" => SmtpEncryption::None,
+            other => {
+                return Err(format!(
+                    "CLAUDE_RUN_SMTP_ENCRYPTION `{other}` is not one of starttls, tls, none"
+                ))
+            }
+        },
+        None => SmtpEncryption::default(),
+    };
+    let smtp_username = non_empty(get("CLAUDE_RUN_SMTP_USERNAME"));
+    let password = match non_empty(get("CLAUDE_RUN_SMTP_PASSWORD_FILE")) {
+        Some(path) => {
+            let path = expand_path(&path);
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| format!("reading CLAUDE_RUN_SMTP_PASSWORD_FILE ({path}): {e}"))?;
+            Some(raw.trim().to_string())
+        }
+        None => non_empty(get("CLAUDE_RUN_SMTP_PASSWORD")),
+    };
+    let from = non_empty(get("CLAUDE_RUN_SMTP_FROM"));
+    let public_url = non_empty(get("CLAUDE_RUN_PUBLIC_URL"));
+
+    if let Some(from) = from.as_deref() {
+        from.parse::<lettre::message::Mailbox>()
+            .map_err(|e| format!("CLAUDE_RUN_SMTP_FROM `{from}` is not a valid mailbox: {e}"))?;
+    }
+    if let Some(url) = public_url.as_deref() {
+        let parsed = url::Url::parse(url)
+            .map_err(|e| format!("CLAUDE_RUN_PUBLIC_URL `{url}` is not a valid URL: {e}"))?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(format!(
+                "CLAUDE_RUN_PUBLIC_URL `{url}` must be an absolute http or https URL"
+            ));
+        }
+    }
+    if smtp_username.is_some() && password.is_none() {
+        return Err(
+            "CLAUDE_RUN_SMTP_USERNAME is set but neither CLAUDE_RUN_SMTP_PASSWORD nor \
+             CLAUDE_RUN_SMTP_PASSWORD_FILE was provided"
+                .to_string(),
+        );
+    }
+    if smtp_host.is_some() {
+        if from.is_none() {
+            return Err("CLAUDE_RUN_SMTP_HOST is set but CLAUDE_RUN_SMTP_FROM is not".to_string());
+        }
+        if public_url.is_none() {
+            return Err("CLAUDE_RUN_SMTP_HOST is set but CLAUDE_RUN_PUBLIC_URL is not".to_string());
+        }
+    }
+
+    Ok(EmailConfig {
+        smtp_host,
+        smtp_port,
+        smtp_encryption,
+        smtp_username,
+        password,
+        from,
+        public_url,
+    })
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1526,5 +1667,141 @@ mod tests {
         let (cfg, src) = OnDiskConfig::load(&paths).unwrap();
         assert!(matches!(src, ConfigSource::Loaded(_)));
         assert_eq!(cfg.web.bind, "198.51.100.11");
+    }
+
+    /// Build a `get` closure from a fixed map, for [`email_config_from_env`]
+    /// tests: pure over input, no process env touched.
+    fn env_map(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    #[test]
+    fn email_config_from_env_unset_is_unconfigured() {
+        let cfg = email_config_from_env(env_map(&[])).unwrap();
+        assert!(!cfg.configured());
+        assert_eq!(cfg.password(), None);
+    }
+
+    #[test]
+    fn email_config_from_env_rejects_a_bad_port() {
+        let err = email_config_from_env(env_map(&[("CLAUDE_RUN_SMTP_PORT", "not-a-port")]))
+            .expect_err("bad port must reject");
+        assert!(err.contains("CLAUDE_RUN_SMTP_PORT"), "{err}");
+    }
+
+    #[test]
+    fn email_config_from_env_rejects_an_unknown_encryption() {
+        let err = email_config_from_env(env_map(&[("CLAUDE_RUN_SMTP_ENCRYPTION", "ssl")]))
+            .expect_err("unknown encryption must reject");
+        assert!(err.contains("CLAUDE_RUN_SMTP_ENCRYPTION"), "{err}");
+    }
+
+    #[test]
+    fn email_config_from_env_rejects_an_unparseable_from_address() {
+        let err = email_config_from_env(env_map(&[("CLAUDE_RUN_SMTP_FROM", "not an address")]))
+            .expect_err("bad from must reject");
+        assert!(err.contains("CLAUDE_RUN_SMTP_FROM"), "{err}");
+    }
+
+    #[test]
+    fn email_config_from_env_rejects_a_non_http_public_url() {
+        let err = email_config_from_env(env_map(&[("CLAUDE_RUN_PUBLIC_URL", "/relative/path")]))
+            .expect_err("relative public_url must reject");
+        assert!(err.contains("CLAUDE_RUN_PUBLIC_URL"), "{err}");
+
+        let err = email_config_from_env(env_map(&[("CLAUDE_RUN_PUBLIC_URL", "ftp://example.com")]))
+            .expect_err("non-http(s) public_url must reject");
+        assert!(err.contains("http"), "{err}");
+    }
+
+    #[test]
+    fn email_config_from_env_rejects_a_username_with_no_password() {
+        let err = email_config_from_env(env_map(&[("CLAUDE_RUN_SMTP_USERNAME", "bot")]))
+            .expect_err("username with no password must reject");
+        assert!(err.contains("CLAUDE_RUN_SMTP_USERNAME"), "{err}");
+    }
+
+    #[test]
+    fn email_config_from_env_rejects_a_host_with_no_from_or_public_url() {
+        let err = email_config_from_env(env_map(&[("CLAUDE_RUN_SMTP_HOST", "smtp.example.com")]))
+            .expect_err("host with no from/public_url must reject");
+        assert!(err.contains("CLAUDE_RUN_SMTP_HOST"), "{err}");
+    }
+
+    #[test]
+    fn email_config_from_env_password_file_wins_over_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("smtp-password");
+        std::fs::write(&path, "from-file\n").unwrap();
+        let cfg = email_config_from_env(env_map(&[
+            ("CLAUDE_RUN_SMTP_USERNAME", "bot"),
+            ("CLAUDE_RUN_SMTP_PASSWORD", "from-env"),
+            ("CLAUDE_RUN_SMTP_PASSWORD_FILE", path.to_str().unwrap()),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.password(), Some("from-file"));
+    }
+
+    #[test]
+    fn email_config_from_env_rejects_an_unreadable_password_file() {
+        let err = email_config_from_env(env_map(&[(
+            "CLAUDE_RUN_SMTP_PASSWORD_FILE",
+            "/nonexistent/smtp-password",
+        )]))
+        .expect_err("unreadable password file must reject");
+        assert!(err.contains("CLAUDE_RUN_SMTP_PASSWORD_FILE"), "{err}");
+    }
+
+    #[test]
+    fn email_config_from_env_accepts_a_fully_configured_environment() {
+        let cfg = email_config_from_env(env_map(&[
+            ("CLAUDE_RUN_SMTP_HOST", "smtp.example.com"),
+            ("CLAUDE_RUN_SMTP_PORT", "587"),
+            ("CLAUDE_RUN_SMTP_ENCRYPTION", "starttls"),
+            ("CLAUDE_RUN_SMTP_USERNAME", "bot"),
+            ("CLAUDE_RUN_SMTP_PASSWORD", "hunter2"),
+            ("CLAUDE_RUN_SMTP_FROM", "claude-run@example.com"),
+            ("CLAUDE_RUN_PUBLIC_URL", "https://claude-run.example.com"),
+        ]))
+        .unwrap();
+        assert!(cfg.configured());
+        assert_eq!(cfg.password(), Some("hunter2"));
+    }
+
+    /// No error message, across every failure case, may ever contain the
+    /// password value: that would turn a validation failure into a leak.
+    #[test]
+    fn email_config_from_env_errors_never_contain_the_password() {
+        let cases: &[&[(&str, &str)]] = &[
+            &[("CLAUDE_RUN_SMTP_PORT", "not-a-port")],
+            &[("CLAUDE_RUN_SMTP_ENCRYPTION", "ssl")],
+            &[("CLAUDE_RUN_SMTP_FROM", "not an address")],
+            &[("CLAUDE_RUN_PUBLIC_URL", "/relative")],
+            &[("CLAUDE_RUN_SMTP_USERNAME", "bot")],
+            &[("CLAUDE_RUN_SMTP_HOST", "smtp.example.com")],
+        ];
+        for extra in cases {
+            let mut pairs: Vec<(&str, &str)> =
+                vec![("CLAUDE_RUN_SMTP_PASSWORD", "super-secret-value")];
+            pairs.extend_from_slice(extra);
+            if let Err(e) = email_config_from_env(env_map(&pairs)) {
+                assert!(!e.contains("super-secret-value"), "leaked password: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn email_config_debug_redacts_the_password() {
+        let cfg = email_config_from_env(env_map(&[
+            ("CLAUDE_RUN_SMTP_USERNAME", "bot"),
+            ("CLAUDE_RUN_SMTP_PASSWORD", "super-secret-value"),
+        ]))
+        .unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("super-secret-value"), "{debug}");
     }
 }

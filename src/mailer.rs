@@ -1,11 +1,10 @@
 //! SMTP transport for invite-by-email (CLAUDE-394).
 //!
-//! [`Mailer`] is built fresh from the DB-backed `config.email` document plus
-//! the resolved SMTP password on every send (via
-//! [`crate::settings::LiveSettings::email_config`] and
-//! [`crate::secrets::resolve_secret`]), so a saved settings change applies to
-//! the next invite with no daemon restart. It is deliberately not `Debug`: it
-//! holds the plaintext SMTP credential for the lifetime of one send.
+//! [`Mailer`] is built fresh from [`crate::config::EmailConfig::from_env`] on
+//! every send (CLAUDE-428: the SMTP transport is environment-variable-only, no
+//! Settings-page form), so a changed environment applies on the next daemon
+//! restart. It is deliberately not `Debug`: it holds the plaintext SMTP
+//! credential for the lifetime of one send.
 
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -24,11 +23,11 @@ pub struct Mailer {
 }
 
 impl Mailer {
-    /// Build a transport from `cfg` and the already-resolved `password`
+    /// Build a transport from `cfg`, using its resolved [`EmailConfig::password`]
     /// (empty when no `smtp_username` is set). Fails when `cfg` is not
     /// "configured" ([`EmailConfig::configured`]) or `smtp_host`/`from` do not
     /// parse.
-    pub fn new(cfg: &EmailConfig, password: Option<&str>) -> Result<Self> {
+    pub fn new(cfg: &EmailConfig) -> Result<Self> {
         let host = cfg
             .smtp_host
             .as_deref()
@@ -56,7 +55,7 @@ impl Mailer {
         if let Some(username) = cfg.smtp_username.as_deref() {
             builder = builder.credentials(Credentials::new(
                 username.to_string(),
-                password.unwrap_or_default().to_string(),
+                cfg.password().unwrap_or_default().to_string(),
             ));
         }
 

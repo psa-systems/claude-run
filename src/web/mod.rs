@@ -131,7 +131,6 @@ pub fn router(api: Arc<AppState>, paths: Paths) -> Router {
         .route("/settings/auth/forgejo", post(auth_save_forgejo))
         .route("/settings/auth/github", post(auth_save_github))
         .route("/settings/auth/git", post(auth_save_git))
-        .route("/settings/auth/email", post(auth_save_email))
         .route("/settings/auth/email/test", post(auth_test_email))
         .route("/settings/:section", post(settings_save))
         // Historical reporting page (spend / runs / time-of-day /
@@ -2969,6 +2968,11 @@ struct YoutrackEditForm {
     yt_token_ref: String,
     yt_query: String,
     yt_custom_field: String,
+    /// Short name of the audit project (`native.youtrack.audit_project`),
+    /// substituted into `yt_query` wherever it contains the
+    /// `{{audit_project}}` placeholder (CLAUDE-409). Blank falls back to the
+    /// default `AUDIT`.
+    yt_audit_project: String,
     /// Optional Assignee set on the issue at pickup. Empty string
     /// maps to `None` (Assignee left untouched). A login, `me`, or `unassigned`.
     yt_assignee: String,
@@ -3088,6 +3092,7 @@ fn youtrack_form_defaults() -> YoutrackEditForm {
     YoutrackEditForm {
         yt_query: c.youtrack.query,
         yt_custom_field: c.youtrack.custom_field,
+        yt_audit_project: c.youtrack.audit_project,
         yt_prompt: crate::native::youtrack::default_youtrack_prompt(),
         state_queued: c.youtrack.states.queued,
         state_working: c.youtrack.states.working,
@@ -3124,6 +3129,7 @@ fn action_to_youtrack_form(a: &Action) -> Option<YoutrackEditForm> {
         yt_token_ref: s(&yt.youtrack.token_ref),
         yt_query: yt.youtrack.query.clone(),
         yt_custom_field: yt.youtrack.custom_field.clone(),
+        yt_audit_project: yt.youtrack.audit_project.clone(),
         yt_assignee: s(&yt.youtrack.assignee),
         yt_prompt: yt
             .youtrack
@@ -3257,6 +3263,9 @@ fn youtrack_form_to_yaml(
     }
     if let Some(c) = opt(&form.yt_custom_field) {
         youtrack.custom_field = c;
+    }
+    if let Some(p) = opt(&form.yt_audit_project) {
+        youtrack.audit_project = p;
     }
     // Blank Assignee box -> no `assignee` key (Assignee untouched);
     // any value is persisted as a literal `yt` assignee argument.
@@ -4174,16 +4183,19 @@ struct SettingsTpl {
     email: EmailCardView,
 }
 
-/// What the Email card shows. Derived from the `config.email` document alone
-/// (no secret is ever decrypted to render a page).
+/// What the Email card shows (CLAUDE-428: read-only, resolved from the
+/// environment at render time; the password is never shown, only whether one
+/// is set).
 struct EmailCardView {
     smtp_host: Option<String>,
     smtp_port: Option<u16>,
     smtp_encryption: crate::config::SmtpEncryption,
     smtp_username: Option<String>,
+    password_set: bool,
     from: Option<String>,
     public_url: Option<String>,
     configured: bool,
+    missing_fields: Vec<&'static str>,
     error: Option<String>,
 }
 
@@ -4244,8 +4256,6 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
         // Rendered by the Auth card at the top of the page, not the generic JSON
         // editor: the values are typed into password fields and never echoed.
         Auth => vec![],
-        // Rendered by the Email card, for the same reason as Auth.
-        Email => vec![],
         Mint => vec![
             FieldDoc {
                 name: "repo_project_map",
@@ -4512,7 +4522,7 @@ async fn render_settings_full(
     for section in crate::settings::Section::ALL {
         // The Auth section has its own card with real password inputs; a JSON
         // textarea would invite pasting a token into a stored document.
-        if section == crate::settings::Section::Auth || section == crate::settings::Section::Email {
+        if section == crate::settings::Section::Auth {
             continue;
         }
         let (json, error) = match &rejected {
@@ -4583,15 +4593,17 @@ async fn render_settings_full(
             error: auth_error,
         },
         email: {
-            let email_cfg = s.api.settings.email_config().await;
+            let email_cfg = crate::config::EmailConfig::from_env().unwrap_or_default();
             EmailCardView {
                 smtp_host: email_cfg.smtp_host.clone(),
                 smtp_port: email_cfg.smtp_port,
                 smtp_encryption: email_cfg.smtp_encryption,
                 smtp_username: email_cfg.smtp_username.clone(),
+                password_set: email_cfg.password().is_some(),
                 from: email_cfg.from.clone(),
                 public_url: email_cfg.public_url.clone(),
                 configured: email_cfg.configured(),
+                missing_fields: email_cfg.missing_fields(),
                 error: email_error,
             }
         },
@@ -4929,100 +4941,13 @@ async fn auth_save_git(
 }
 
 #[derive(Deserialize)]
-struct AuthEmailForm {
-    smtp_host: String,
-    smtp_port: String,
-    smtp_encryption: crate::config::SmtpEncryption,
-    smtp_username: String,
-    /// Blank keeps the currently stored secret; see [`auth_save_email`].
-    smtp_password: String,
-    from: String,
-    public_url: String,
-}
-
-/// Persist `cfg` as the `config.email` document, validating through
-/// [`crate::settings::validate_email`] (invoked by `save_section` itself).
-async fn save_email_config(
-    s: &WebState,
-    cfg: &crate::config::EmailConfig,
-) -> std::result::Result<(), String> {
-    let json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
-    s.api
-        .settings
-        .save_section(crate::settings::Section::Email, &json)
-        .await
-        .map_err(|e| match e {
-            crate::settings::SaveError::Invalid(m) => m,
-            crate::settings::SaveError::Db(e) => e.to_string(),
-        })
-}
-
-/// POST `/settings/auth/email`: saves the SMTP transport invite-by-email
-/// sends through. An empty `smtp_password` field keeps whatever secret is
-/// already stored under `smtp_password_ref`, rather than clearing it: unlike
-/// [`auth_save_git`]'s fields, a blank password here almost never means "use
-/// no password" (an SMTP server configured with `smtp_username` set still
-/// requires one), and typing it again on every unrelated field edit would be
-/// unusable.
-async fn auth_save_email(
-    State(s): State<WebState>,
-    Form(form): Form<AuthEmailForm>,
-) -> Result<Response, WebError> {
-    let host = form.smtp_host.trim().to_string();
-    let username = form.smtp_username.trim().to_string();
-    let password = form.smtp_password.trim().to_string();
-    let from = form.from.trim().to_string();
-    let public_url = form.public_url.trim().to_string();
-    let port_str = form.smtp_port.trim().to_string();
-
-    let port = if port_str.is_empty() {
-        None
-    } else {
-        match port_str.parse::<u16>() {
-            Ok(p) => Some(p),
-            Err(_) => {
-                return render_settings_with_email_error(
-                    &s,
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Some(format!("smtp_port `{port_str}` is not a valid port number")),
-                )
-                .await;
-            }
-        }
-    };
-
-    let mut cfg = s.api.settings.email_config().await;
-    cfg.smtp_host = (!host.is_empty()).then_some(host);
-    cfg.smtp_port = port;
-    cfg.smtp_encryption = form.smtp_encryption;
-    cfg.smtp_username = (!username.is_empty()).then_some(username);
-    cfg.from = (!from.is_empty()).then_some(from);
-    cfg.public_url = (!public_url.is_empty()).then_some(public_url);
-
-    if !password.is_empty() {
-        let name = crate::config::SMTP_PASSWORD_SECRET;
-        if let Err(e) = put_secret(&s, name, &password).await {
-            return render_settings_with_email_error(&s, StatusCode::UNPROCESSABLE_ENTITY, Some(e))
-                .await;
-        }
-        cfg.smtp_password_ref = Some(name.to_string());
-    }
-
-    if let Err(e) = save_email_config(&s, &cfg).await {
-        return render_settings_with_email_error(&s, StatusCode::UNPROCESSABLE_ENTITY, Some(e))
-            .await;
-    }
-    Ok(Redirect::to("/settings?saved=Email+%28SMTP%29").into_response())
-}
-
-#[derive(Deserialize)]
 struct TestEmailForm {
     test_address: String,
 }
 
 /// POST `/settings/auth/email/test`: sends a short test message through the
-/// currently SAVED `config.email` document (not the submitted form), so the
-/// button always proves what a real invite send would do.
+/// environment-resolved SMTP transport (CLAUDE-428: no stored document),
+/// proving the same config a real invite send would use.
 async fn auth_test_email(
     State(s): State<WebState>,
     Form(form): Form<TestEmailForm>,
@@ -5036,43 +4961,25 @@ async fn auth_test_email(
         )
         .await;
     }
-    let cfg = s.api.settings.email_config().await;
+    let cfg = match crate::config::EmailConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return render_settings_with_email_error(&s, StatusCode::BAD_GATEWAY, Some(e)).await
+        }
+    };
     if !cfg.configured() {
         return render_settings_with_email_error(
             &s,
             StatusCode::BAD_REQUEST,
-            Some("email is not configured: set host, from and public URL above first".to_string()),
+            Some(
+                "email is not configured: set CLAUDE_RUN_SMTP_HOST, CLAUDE_RUN_SMTP_FROM and \
+                 CLAUDE_RUN_PUBLIC_URL first"
+                    .to_string(),
+            ),
         )
         .await;
     }
-    let password = match &cfg.smtp_password_ref {
-        Some(name) => {
-            let key = match crate::secrets::SecretsKey::load() {
-                Ok(k) => k,
-                Err(e) => {
-                    return render_settings_with_email_error(
-                        &s,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Some(e.to_string()),
-                    )
-                    .await
-                }
-            };
-            match crate::secrets::resolve_secret(&s.api.pool, &key, name).await {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    return render_settings_with_email_error(
-                        &s,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Some(e.to_string()),
-                    )
-                    .await
-                }
-            }
-        }
-        None => None,
-    };
-    let mailer = match crate::mailer::Mailer::new(&cfg, password.as_deref()) {
+    let mailer = match crate::mailer::Mailer::new(&cfg) {
         Ok(m) => m,
         Err(e) => {
             return render_settings_with_email_error(
@@ -9610,6 +9517,75 @@ mod tests {
             let applied = s.api.settings.stream_log_gc_handle().read().await.clone();
             assert_eq!(applied.snippet_retention_days, 7);
             assert_eq!(applied.webhook_log_retention_days, 14);
+        }
+
+        // One test rather than two, because the SMTP inputs are process-wide
+        // environment variables and `cargo test` runs in parallel (CLAUDE-428,
+        // same reasoning as `database_url_precedence_is_file_then_env_then_config`
+        // in `config.rs`).
+        #[tokio::test]
+        async fn settings_page_shows_the_email_card_read_only_from_the_environment() {
+            let tmp = tempfile::tempdir().unwrap();
+            let s = web_state(tmp.path()).await;
+
+            std::env::remove_var("CLAUDE_RUN_SMTP_HOST");
+            std::env::remove_var("CLAUDE_RUN_SMTP_PORT");
+            std::env::remove_var("CLAUDE_RUN_SMTP_ENCRYPTION");
+            std::env::remove_var("CLAUDE_RUN_SMTP_USERNAME");
+            std::env::remove_var("CLAUDE_RUN_SMTP_PASSWORD");
+            std::env::remove_var("CLAUDE_RUN_SMTP_PASSWORD_FILE");
+            std::env::remove_var("CLAUDE_RUN_SMTP_FROM");
+            std::env::remove_var("CLAUDE_RUN_PUBLIC_URL");
+
+            // Unconfigured: no form, no password input, a "not configured"
+            // badge with the missing-field hint.
+            let page = settings_page(
+                State(s.clone()),
+                Query(crate::web::SettingsQuery { saved: None }),
+            )
+            .await
+            .unwrap();
+            let html = body_string(page).await;
+            assert!(html.contains("id=\"section-email\""), "{html}");
+            assert!(!html.contains("name=\"smtp_password\""), "{html}");
+            assert!(!html.contains("/settings/auth/email\""), "{html}");
+            assert!(html.contains("not configured"), "{html}");
+            assert!(html.contains("CLAUDE_RUN_SMTP_HOST"), "{html}");
+
+            // Configured, with a sentinel password: the grid shows every
+            // other effective value but only "set" for the password, never
+            // the sentinel itself.
+            std::env::set_var("CLAUDE_RUN_SMTP_HOST", "smtp.example.com");
+            std::env::set_var("CLAUDE_RUN_SMTP_FROM", "claude-run@example.com");
+            std::env::set_var("CLAUDE_RUN_PUBLIC_URL", "https://claude-run.example.com");
+            std::env::set_var("CLAUDE_RUN_SMTP_USERNAME", "bot");
+            std::env::set_var("CLAUDE_RUN_SMTP_PASSWORD", "super-secret-sentinel");
+
+            let page = settings_page(
+                State(s.clone()),
+                Query(crate::web::SettingsQuery { saved: None }),
+            )
+            .await
+            .unwrap();
+            let html = body_string(page).await;
+
+            std::env::remove_var("CLAUDE_RUN_SMTP_HOST");
+            std::env::remove_var("CLAUDE_RUN_SMTP_FROM");
+            std::env::remove_var("CLAUDE_RUN_PUBLIC_URL");
+            std::env::remove_var("CLAUDE_RUN_SMTP_USERNAME");
+            std::env::remove_var("CLAUDE_RUN_SMTP_PASSWORD");
+
+            assert!(html.contains("class=\"grid2\""), "{html}");
+            assert!(!html.contains("name=\"smtp_password\""), "{html}");
+            assert!(
+                !html.contains("super-secret-sentinel"),
+                "the password value must never reach rendered HTML: {html}"
+            );
+            assert!(html.contains("smtp.example.com"), "{html}");
+            assert!(html.contains("bot"), "{html}");
+            assert!(html.contains(">set<"), "{html}");
+            let configured_badge_count = html.matches("badge ok").count();
+            assert!(configured_badge_count >= 1, "{html}");
         }
 
         /// The `Comment webhook` section renders on `/settings` and a POST to
