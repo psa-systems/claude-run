@@ -84,6 +84,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # CLAUDE-247: the image is self-contained. It mounts nothing from the host, and
 # the operator logs claude / yt / fj / git in INSIDE the container, onto named
 # volumes. See docs/self-hosting.md.
+#
+# CLAUDE-417: a `docker buildx build` run from this image against the
+# claude-bot-docker sidecar can have its build session killed mid-build by the
+# sidecar's own BuildKit session healthcheck ("healthcheck failed fatally",
+# "only one connection allowed"). That is an upstream Docker 29.x defect in the
+# sidecar's dockerd, not something this image or compose.yml can avoid; see
+# docs/conventions/container.md.
 FROM dev.a8n.run/pandoras-box/opensuse-dev:v1.14.0-leap-16.0 AS runtime
 
 USER root
