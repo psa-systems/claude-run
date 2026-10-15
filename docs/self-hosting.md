@@ -104,6 +104,14 @@ anything privileged: the agent now drives a privileged Docker daemon, which is r
 container escapes it. That trade was accepted when CLAUDE-287 was filed; the container still bind-mounts nothing from
 the host, and logins still happen inside the container.
 
+**Known upstream limitation (CLAUDE-417).** A `docker buildx build` run against this sidecar (`just check-docker`,
+and so `just check`) can have its build session torn down mid-build by the sidecar's own `dockerd`, logging
+`healthcheck failed` then `healthcheck failed fatally` with `only one connection allowed`. This is an upstream Docker
+29.x defect (BuildKit's always-on session healthcheck re-dials a second connection that a session proxied over one
+hijacked TCP connection always rejects), not something fixed by any setting here; see
+[`docs/conventions/container.md`](conventions/container.md#buildkit-session-healthcheck-claude-417)
+for the verified cause and the upstream reports.
+
 **Actions.** The `./actions` bind is gone with the other host mounts. The image bakes this repo's action YAML at `/usr/share/claude-run/actions`, and the entrypoint copies it into the config volume the first time that volume holds no `*.yml`, so a fresh container starts with the shipped action set. It never overwrites after that: an action edited in the web UI survives an image upgrade, and a changed shipped action reaches an existing deployment through the same editor (`/actions`), not by recreating the container.
 
 **No unix-socket API.** The image runs `serve --no-socket`, so the daemon binds only the TCP listener. That socket is the CLI's control plane, and this container has no CLI operator: the web UI and its `/api` routes are the whole interface, and they carry the same handlers (`/api/actions/<n>/trigger`, `/api/pause`, `/api/resume`, `/settings/<section>`). Binding it here would only leave a second copy of that control plane with no token gate on it, reachable by the `claude` agent the daemon spawns as the same user. `claude-run trigger` and `claude-run cancel` inside the container therefore fail, naming the reason rather than claiming no daemon is running; every other subcommand (`secret set`, `action list`, `status`) works as before because it goes to the database directly. Override `command: ["serve"]` in compose if a deployment really does want the socket.

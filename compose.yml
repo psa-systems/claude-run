@@ -151,6 +151,12 @@ services:
   # resolve against the host filesystem instead, where that path does not
   # exist. `/var/lib/docker` is a separate named volume rather than anonymous,
   # so its growth is visible and prunable.
+  #
+  # CLAUDE-417: a `docker buildx build` through this daemon (e.g. `just
+  # check-docker`) can have its build session killed mid-build by this
+  # dockerd's own BuildKit session healthcheck ("healthcheck failed fatally",
+  # "only one connection allowed"). That is an upstream Docker 29.x defect, not
+  # fixable by any setting here; see docs/conventions/container.md.
   claude-bot-docker:
     container_name: claude-bot-docker
     image: docker.io/docker:29.6.2-dind
