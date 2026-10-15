@@ -68,7 +68,7 @@ use crate::job::RunnerDefaults;
 use crate::mint::{self, MintCaps, MintOutcome, MintRequest, VcsRouteCache};
 use crate::native::youtrack::BehindBaseBackend;
 use crate::provider::{
-    is_github_host, Backend, CliBackend, CommandRunner, Forge, ForgePullRequest, GithubForge,
+    self, is_github_host, Backend, CliBackend, CommandRunner, Forge, ForgePullRequest, GithubForge,
 };
 use crate::secrets::{self, SecretsKey};
 use crate::state;
@@ -4186,18 +4186,20 @@ async fn notify_agent_prs_of_repo_fault(
         let loaded =
             tokio::task::spawn_blocking(move || crate::action::load(&action_name, &actions_dir))
                 .await;
-        let automerge_enabled = match loaded {
-            Ok(Ok(loaded)) => matches!(
-                loaded.action.native,
-                Some(crate::action::NativeConfig::Youtrack(cfg)) if cfg.youtrack.automerge.enabled
-            ),
+        let (automerge_enabled, gh_hosts) = match loaded {
+            Ok(Ok(loaded)) => match loaded.action.native {
+                Some(crate::action::NativeConfig::Youtrack(cfg)) => {
+                    (cfg.youtrack.automerge.enabled, cfg.github.hosts)
+                }
+                _ => (false, Vec::new()),
+            },
             Ok(Err(e)) => {
                 warn!(repo = %repo, pr = row.pr_number, action = %row.action_name, error = %e, "{context}: could not load action to check automerge while notifying of repo fault");
-                false
+                (false, Vec::new())
             }
             Err(e) => {
                 warn!(repo = %repo, pr = row.pr_number, action = %row.action_name, error = %e, "{context}: action-load task panicked while notifying of repo fault");
-                false
+                (false, Vec::new())
             }
         };
         if !automerge_enabled {
@@ -4207,7 +4209,7 @@ async fn notify_agent_prs_of_repo_fault(
         let msg = format!("{context}: {error_msg}");
         error!(repo = %repo, pr = row.pr_number, issue = %row.issue_key, "{msg}");
         record_run_event(pool, None, WEBHOOK_MINT_ACTION, "error", msg.clone()).await;
-        let pr_url = agent_pr_url(&row.host, repo, row.pr_number);
+        let pr_url = agent_pr_url(&row.host, repo, row.pr_number, &gh_hosts);
         let body = format!(
             "The runner could not check this PR's automerge status: {msg}.\n\nPR: {pr_url}\n\nA later Action Run event or the periodic reconciler will retry automatically."
         );
@@ -4225,9 +4227,12 @@ async fn notify_agent_prs_of_repo_fault(
 
 /// Build a PR's web URL from its recorded host/repo/number, without an extra
 /// forge call: every caller already has these three fields from the
-/// `agent_pull_requests` row.
-fn agent_pr_url(host: &str, repo: &str, pr_number: i64) -> String {
-    format!("https://{host}/{repo}/pulls/{pr_number}")
+/// `agent_pull_requests` row. `extra_github_hosts` is the configured GitHub
+/// Enterprise hosts, the same list [`is_github_host`] takes everywhere else;
+/// a caller with no cheap way to reach it passes `&[]`, which still gets
+/// `github.com` right and matches today's behavior for every other host.
+fn agent_pr_url(host: &str, repo: &str, pr_number: i64, extra_github_hosts: &[String]) -> String {
+    provider::pr_web_url(host, repo, pr_number, extra_github_hosts)
 }
 
 /// The per-PR decision once a success event's PR is known. Looks
@@ -4584,6 +4589,11 @@ async fn apply_automerge_decision(
     // A GitHub-hosted PR must route through `GithubForge`, not
     // `mint.backend` (always `fj`, which 410s against GitHub's API).
     let forge = resolve_forge(mint, host, &github_cfg.hosts, &github_cfg.mcp_endpoint);
+    // Now that the action's configured GitHub Enterprise hosts are loaded,
+    // rebuild the link with them: the caller's `pr_url` only had `github.com`
+    // to go on.
+    let pr_url = agent_pr_url(host, repo, pr_number as i64, &github_cfg.hosts);
+    let pr_url = pr_url.as_str();
 
     let forge_for_status = forge.clone();
     let host_owned = host.to_string();
@@ -4947,7 +4957,11 @@ pub(crate) async fn reconcile_automerge(
         }
         let key = format!("{}#{}", row.repo, row.pr_number);
         let _key_guard = keygate.acquire(&key).await;
-        let pr_url = agent_pr_url(&row.host, &row.repo, row.pr_number);
+        // The action is not loaded at this point (only `apply_automerge_decision`
+        // below loads it, to pick the decision's own forge), so this link
+        // cannot see any configured GitHub Enterprise host; `github.com`
+        // itself still resolves correctly.
+        let pr_url = agent_pr_url(&row.host, &row.repo, row.pr_number, &[]);
         let job_key = format!(
             "automerge-reconcile-{}-{}",
             row.repo.replace('/', "_"),
@@ -12696,6 +12710,75 @@ mod tests {
                     "fj must never be consulted for a GitHub host: {:?}",
                     backend.calls()
                 );
+            }
+
+            #[tokio::test]
+            async fn reconciler_run_link_uses_pull_not_pulls_for_a_github_host() {
+                // CLAUDE-420: the reconciler's own run link (`agent_pr_url`)
+                // must follow GitHub's `/pull/<n>` shape for a `github.com`
+                // row, not Forgejo's `/pulls/<n>`.
+                let pool = crate::db::test_pool().await;
+                let dir = tempfile::tempdir().unwrap();
+                write_youtrack_action(dir.path(), "yt", true);
+                let backend = Arc::new(
+                    StoreBackend::new()
+                        .with_open_prs(vec![pr(42, "")])
+                        .with_pr_status("success", true),
+                );
+                let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+                let runner = Arc::new(
+                    crate::provider::cli::testutil::StubRunner::new()
+                        .ok(
+                            "gh",
+                            &gh_list_open_prs_args("octo/widget"),
+                            r#"[{"number":42,"title":"fix","headRefOid":"abc123","headRefName":"fix/x","baseRefName":"main","author":{"login":"claude-run"},"url":"https://github.com/octo/widget/pull/42"}]"#,
+                        )
+                        .ok(
+                            "gh",
+                            &gh_pr_view_args("octo/widget"),
+                            &gh_pr_view_json("CLEAN"),
+                        )
+                        .ok(
+                            "gh",
+                            &[
+                                "pr",
+                                "merge",
+                                "42",
+                                "--repo",
+                                "octo/widget",
+                                "--merge",
+                                "--delete-branch",
+                            ],
+                            "",
+                        ),
+                );
+                let ctx = store_mint_context_in(
+                    pool.clone(),
+                    backend.clone(),
+                    classifier,
+                    dir.path(),
+                    runner.clone(),
+                );
+                seeded_github_row(&pool).await;
+
+                reconcile_automerge(
+                    &pool,
+                    &ctx,
+                    &crate::concurrency::KeyGate::new(),
+                    &mut std::collections::HashMap::new(),
+                )
+                .await;
+
+                let run_id: i64 = sqlx::query_scalar(&crate::db::q(
+                    &pool,
+                    "SELECT id FROM runs ORDER BY id DESC LIMIT 1",
+                ))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                let links = state::run_job_links(&pool, run_id).await.unwrap();
+                let link = links.values().next().expect("one job link recorded");
+                assert_eq!(link, "https://github.com/octo/widget/pull/42");
             }
         }
 

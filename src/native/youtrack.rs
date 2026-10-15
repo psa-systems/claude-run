@@ -1407,13 +1407,13 @@ async fn resolve_pr_resume(
     if let Some(pr) = open.iter().find(|p| p.number as i64 == rec.pr_number) {
         info!(key = %job.key, pr = rec.pr_number, branch = %rec.head_branch, "CLAUDE-275: resuming the recorded open PR's branch");
         // Prefer the listed PR's own URL, which is correct for any
-        // backend (GitHub's `/pull/<n>` vs Forgejo's `/pulls/<n>`); the `format!`
-        // is only a fallback for a listing that carries no `html_url`.
+        // backend (GitHub's `/pull/<n>` vs Forgejo's `/pulls/<n>`); the
+        // fallback is only for a listing that carries no `html_url`. No
+        // configured GitHub Enterprise hosts are reachable here, so this
+        // still gets `github.com` right and matches today's behavior for
+        // every other host.
         let pr_url = if pr.html_url.is_empty() {
-            format!(
-                "{}/{}/pulls/{}",
-                job.repo_host, job.repo_path, rec.pr_number
-            )
+            provider::pr_web_url(&host, &repo, rec.pr_number, &[])
         } else {
             pr.html_url.clone()
         };
@@ -2529,14 +2529,17 @@ pub(crate) fn host_only(repo_host: &str) -> String {
 
 /// PR URL for the issue comment. When the forge returned a real HTTP URL (both
 /// the GitHub backend and `fj pr create --json` report the PR `html_url`), use
-/// it verbatim. Otherwise render the parsed number against the Forgejo `pulls`
-/// path, falling back to the raw line.
+/// it verbatim. Otherwise render the parsed number against the right forge's
+/// path (GitHub's `/pull/<n>` vs Forgejo's `/pulls/<n>`), falling back to the
+/// raw line. No configured GitHub Enterprise hosts are reachable here, so this
+/// still gets `github.com` right and matches today's behavior for every other
+/// host.
 fn pr_url(job: &YoutrackJob, pr: &PullRequest) -> String {
     if pr.url.starts_with("https://") || pr.url.starts_with("http://") {
         return pr.url.clone();
     }
     match pr.number {
-        Some(n) => format!("{}/{}/pulls/{}", job.repo_host, job.repo_path, n),
+        Some(n) => provider::pr_web_url(&host_only(&job.repo_host), &job.repo_path, n as i64, &[]),
         None => pr.url.clone(),
     }
 }
