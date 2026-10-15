@@ -20,6 +20,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
+use tracing::warn;
+
 use crate::error::{Error, Result};
 
 pub const DEFAULT_IMAGE: &str = "docker.io/postgres:18.4-alpine3.23";
@@ -261,13 +263,31 @@ fn read_host_port(name: &str) -> Result<u16> {
     parse_port(&stdout).ok_or_else(|| fail("docker port", format!("unparseable output: {stdout}")))
 }
 
+/// Wait for a connection to succeed, using `psql` itself rather than
+/// `pg_isready`: `pg_isready` can report ready during the brief window before
+/// the official postgres image's entrypoint restarts the server, and a report
+/// from a different client is no guarantee that `psql`'s own connection (the
+/// one every step after this one makes) will succeed against the same unix
+/// socket. Connecting with `psql` here means a ready report cannot precede
+/// the restart that would otherwise break the next step.
 fn wait_pg_ready(name: &str) -> Result<()> {
     let deadline = Instant::now() + PG_READY_TIMEOUT;
     loop {
         if let Some(sig) = caught_signal() {
-            return Err(fail("pg_isready", format!("interrupted by signal {sig}")));
+            return Err(fail("pg ready", format!("interrupted by signal {sig}")));
         }
-        let out = docker(&["exec", name, "pg_isready", "--username", "postgres"], &[])?;
+        let out = docker(
+            &[
+                "exec",
+                name,
+                "psql",
+                "--username",
+                "postgres",
+                "--command",
+                "SELECT 1",
+            ],
+            &[],
+        )?;
         if out.status.success() {
             return Ok(());
         }
@@ -276,7 +296,7 @@ fn wait_pg_ready(name: &str) -> Result<()> {
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                 .unwrap_or_default();
             return Err(fail(
-                "pg_isready",
+                "pg ready",
                 format!("postgres did not become ready within {PG_READY_TIMEOUT:?}: {logs}"),
             ));
         }
@@ -303,26 +323,68 @@ fn psql_args() -> [&'static str; 5] {
 /// treating it as a real failure.
 const RESTART_WINDOW: Duration = Duration::from_secs(20);
 
+/// Whether a `psql` connection failure looks like the official postgres
+/// image's entrypoint restart rather than a real failure: the two messages
+/// `psql` prints while the server is coming up or down, or a missing unix
+/// socket, which is what `psql` reports when the restart has torn the socket
+/// down between `wait_pg_ready` succeeding and this connection attempt.
+fn is_restart_error(stderr: &str) -> bool {
+    stderr.contains("the database system is starting up")
+        || stderr.contains("the database system is shutting down")
+        || (stderr.contains("No such file or directory")
+            && stderr.contains("Is the server running locally"))
+}
+
+/// Run `docker exec -i <name> <psql_args>` feeding `stdin`, retrying for up
+/// to [`RESTART_WINDOW`] while [`is_restart_error`] holds. Returns whatever
+/// output `docker_exec_stdin` last produced, success or failure; the caller
+/// turns a still-failing output into its own stage-specific error. The first
+/// retry is logged at `warn` so a slow restart is visible without failing
+/// the run.
+fn exec_with_restart_retry(
+    name: &str,
+    psql_args: &[&str],
+    stdin: &str,
+) -> Result<std::process::Output> {
+    let deadline = Instant::now() + RESTART_WINDOW;
+    let mut warned = false;
+    loop {
+        let out = docker_exec_stdin(name, psql_args, stdin)?;
+        if out.status.success() {
+            return Ok(out);
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        if !is_restart_error(&stderr) || Instant::now() >= deadline {
+            return Ok(out);
+        }
+        if !warned {
+            warn!(
+                container = name,
+                stderr = %stderr,
+                "postgres looks mid-restart; retrying the connection",
+            );
+            warned = true;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 fn apply_sql(name: &str, stage: &str, sql: &str) -> Result<()> {
     let mut args = vec![name];
     args.extend_from_slice(&psql_args());
     args.push("--file");
     args.push("-");
 
-    let deadline = Instant::now() + RESTART_WINDOW;
-    loop {
-        let out = docker_exec_stdin(name, &args[1..], sql)?;
-        if out.status.success() {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        let restarting = stderr.contains("the database system is starting up")
-            || stderr.contains("the database system is shutting down");
-        if !restarting || Instant::now() >= deadline {
-            return Err(docker_error(stage, &args, &stderr, &[]));
-        }
-        std::thread::sleep(POLL_INTERVAL);
+    let out = exec_with_restart_retry(name, &args[1..], sql)?;
+    if out.status.success() {
+        return Ok(());
     }
+    Err(docker_error(
+        stage,
+        &args,
+        &String::from_utf8_lossy(&out.stderr),
+        &[],
+    ))
 }
 
 fn disable_durability(name: &str) -> Result<()> {
@@ -338,7 +400,7 @@ fn disable_durability(name: &str) -> Result<()> {
         "--command",
         "SHOW fsync",
     ];
-    let out = docker_exec_stdin(name, &args[1..], "")?;
+    let out = exec_with_restart_retry(name, &args[1..], "")?;
     if !out.status.success() {
         return Err(docker_error(
             "SHOW fsync",
@@ -840,6 +902,86 @@ exit 0
                 std::env::set_var("PATH", old_path);
             }
             assert_eq!(stopped, vec!["dead-container".to_string()]);
+        });
+    }
+
+    #[test]
+    fn is_restart_error_matches_the_starting_up_and_shutting_down_messages() {
+        assert!(is_restart_error(
+            "FATAL:  the database system is starting up"
+        ));
+        assert!(is_restart_error(
+            "FATAL:  the database system is shutting down"
+        ));
+    }
+
+    #[test]
+    fn is_restart_error_matches_the_missing_socket_message() {
+        let stderr = "psql: error: connection to server on socket \"/var/run/postgresql/.s.PGSQL.5432\" failed: No such file or directory\n\tIs the server running locally and accepting connections on that socket?\n";
+        assert!(is_restart_error(stderr));
+    }
+
+    #[test]
+    fn is_restart_error_rejects_an_unrelated_failure() {
+        assert!(!is_restart_error(
+            "psql: error: password authentication failed for user \"postgres\""
+        ));
+        assert!(!is_restart_error("No such file or directory"));
+    }
+
+    #[test]
+    fn disable_durability_retries_the_show_fsync_read_back_through_a_restart() {
+        with_stub_on_path(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let state_path = dir.path().join("show-fsync-attempts");
+            std::fs::write(&state_path, "0").unwrap();
+            let script = format!(
+                r#"#!/bin/sh
+case "$1" in
+  run) echo "stubcontainer" ;;
+  port) echo "127.0.0.1:55432" ;;
+  exec)
+    shift
+    if [ "$1" = "-i" ]; then shift; fi
+    shift # container name
+    case "$*" in
+      *"SELECT 1"*) exit 0 ;;
+      *"SHOW fsync"*)
+        n=$(cat "{state}")
+        n=$((n + 1))
+        echo "$n" > "{state}"
+        if [ "$n" -lt 2 ]; then
+          echo 'psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: No such file or directory' >&2
+          echo '	Is the server running locally and accepting connections on that socket?' >&2
+          exit 2
+        fi
+        echo "off"
+        ;;
+      *) cat > /dev/null ;;
+    esac
+    ;;
+  stop) : ;;
+  ps) : ;;
+  logs) : ;;
+  *) : ;;
+esac
+exit 0
+"#,
+                state = state_path.display()
+            );
+            write_stub(&dir.path().join("docker"), &script);
+            let old_path = std::env::var("PATH").unwrap_or_default();
+            unsafe {
+                std::env::set_var("PATH", format!("{}:{old_path}", dir.path().display()));
+            }
+
+            let result = disable_durability("stubcontainer");
+
+            unsafe {
+                std::env::set_var("PATH", old_path);
+            }
+            result.unwrap();
+            assert_eq!(std::fs::read_to_string(&state_path).unwrap().trim(), "2");
         });
     }
 
