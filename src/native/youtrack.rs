@@ -1226,6 +1226,7 @@ async fn process_job(
     // itself: it is a synchronous state machine whose own unit tests run with
     // no tokio runtime, so the write happens here, right after it returns.
     if resume.is_none() {
+        let salvaged = matches!(&finalize_res, Ok(Finalized::TimedOut { .. }));
         if let Ok(
             Finalized::CodeReview {
                 pr_number: Some(pr_number),
@@ -1246,8 +1247,16 @@ async fn process_job(
                 job,
                 *pr_number,
                 head_branch,
+                salvaged,
             )
             .await;
+        }
+    } else if let Some(resume) = resume.as_ref() {
+        // A resumed run that finishes successfully clears the salvaged flag
+        // (CLAUDE-429) a prior timeout left on this PR. A resumed run that
+        // times out again, or that fails, leaves the flag set.
+        if matches!(&finalize_res, Ok(Finalized::CodeReview { .. })) {
+            clear_salvaged_for_resume(pool, forge, backend, &action.name, job, resume.id).await;
         }
     }
     let post_failed = match &finalize_res {
@@ -1363,6 +1372,9 @@ async fn process_job(
 
 /// An open recorded PR this job continues rather than reopening.
 struct PrResume {
+    /// The `agent_pull_requests` row id, so a successful resumed run can
+    /// clear its `salvaged` flag (CLAUDE-429) without a second lookup.
+    id: i64,
     /// The PR's server head branch, cloned instead of the default branch.
     branch: String,
     /// Human-facing PR URL, rendered into the `{{existing_pr_url}}` placeholder.
@@ -1418,6 +1430,7 @@ async fn resolve_pr_resume(
             pr.html_url.clone()
         };
         return Ok(Some(PrResume {
+            id: rec.id,
             branch: rec.head_branch.clone(),
             pr_url,
         }));
@@ -1439,6 +1452,7 @@ async fn resolve_pr_resume(
 /// [`Forge::note`] (drained by the caller exactly like a degraded lookup), and
 /// named in a follow-up issue comment, but never fails the job - the PR
 /// already exists and the issue already sits at Code Review.
+#[allow(clippy::too_many_arguments)]
 async fn record_new_pr(
     pool: &DbPool,
     forge: &dyn Forge,
@@ -1447,6 +1461,7 @@ async fn record_new_pr(
     job: &YoutrackJob,
     pr_number: u64,
     head_branch: &str,
+    salvaged: bool,
 ) {
     use crate::ci_failure::store;
     let host = host_only(&job.repo_host);
@@ -1460,6 +1475,7 @@ async fn record_new_pr(
         pr_number as i64,
         head_branch,
         "open",
+        salvaged,
         &now,
     )
     .await
@@ -1472,6 +1488,39 @@ async fn record_new_pr(
         forge.note(message.clone());
         if let Err(e) = backend.comment(&job.key, &message) {
             warn!(key = %job.key, error = %e, "PR-record-failure comment also failed (continuing)");
+        }
+    }
+}
+
+/// Clear the `salvaged` flag (CLAUDE-429) a prior timeout left on a resumed
+/// PR's `agent_pull_requests` row, once the resumed run finishes
+/// successfully. Called from `process_job` right after `finalize` returns
+/// `Finalized::CodeReview` for a resumed job, at the same point `finalize`'s
+/// own resumed-success branch already strips the draft status and refreshes
+/// the PR text (CLAUDE-275 / CLAUDE-398). Best-effort, mirroring
+/// `record_new_pr`: a failed clear is logged at `error`, surfaced as a
+/// `run_events` row via [`Forge::note`], and named in a follow-up issue
+/// comment, but never fails the job - the flag simply stays set, which keeps
+/// automerge blocked (the safe direction) until a later resumed run succeeds
+/// or a human clears it by hand.
+async fn clear_salvaged_for_resume(
+    pool: &DbPool,
+    forge: &dyn Forge,
+    backend: &dyn IssueTracker,
+    action_name: &str,
+    job: &YoutrackJob,
+    pr_id: i64,
+) {
+    use crate::ci_failure::store;
+    let now = state::now_iso();
+    if let Err(e) = store::clear_salvaged(pool, pr_id, &now).await {
+        tracing::error!(action = %action_name, key = %job.key, pr_id, error = %e, "CLAUDE-429: failed to clear the salvaged flag on the resumed PR; automerge stays blocked");
+        let message = format!(
+            "CLAUDE-429: clearing the salvaged flag on the resumed PR in the agent_pull_requests store failed ({e}); automerge stays blocked until this is cleared by hand or another resumed run succeeds"
+        );
+        forge.note(message.clone());
+        if let Err(e) = backend.comment(&job.key, &message) {
+            warn!(key = %job.key, error = %e, "salvaged-clear-failure comment also failed (continuing)");
         }
     }
 }
@@ -3797,6 +3846,7 @@ mod tests {
     #[test]
     fn audit_preset_renders_every_placeholder() {
         let resume = PrResume {
+            id: 1,
             branch: "audit/pms-ui-2026-09-14".into(),
             pr_url: "https://dev.a8n.run/contoso/audits/pulls/9".into(),
         };
@@ -3860,6 +3910,7 @@ mod tests {
         // and branch instead of rendering empty.
         let t = "{{existing_pr_url}}|{{existing_branch}}";
         let resume = PrResume {
+            id: 1,
             branch: "fix/CLAUDE-275".into(),
             pr_url: "https://dev.a8n.run/contoso/claude-run/pulls/7".into(),
         };
@@ -7934,6 +7985,7 @@ mod tests {
             7,
             "fix/MK-16",
             "open",
+            false,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -7986,6 +8038,7 @@ mod tests {
             7,
             "fix/MK-16",
             "open",
+            false,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -8034,6 +8087,7 @@ mod tests {
             7,
             "fix/MK-16",
             "open",
+            false,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -8059,7 +8113,7 @@ mod tests {
         let forge = CliBackend::new(runner);
         let backend = CliBackend::new(Arc::new(StubRunner::new()));
 
-        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x").await;
+        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", false).await;
 
         let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
             .await
@@ -8068,6 +8122,148 @@ mod tests {
         assert_eq!(rec.pr_number, 9);
         assert_eq!(rec.head_branch, "feat/x");
         assert_eq!(rec.state, "open");
+        assert!(
+            !rec.salvaged,
+            "a Finalized::CodeReview outcome is not salvaged"
+        );
+    }
+
+    /// `process_job`'s `salvaged` flag follows the `finalize_res` variant: set
+    /// for `Finalized::TimedOut`, clear for `Finalized::CodeReview` (CLAUDE-429).
+    #[tokio::test]
+    async fn record_new_pr_flags_salvaged_for_a_timed_out_outcome() {
+        let pool = mem_pool().await;
+        let runner = Arc::new(StubRunner::new());
+        let forge = CliBackend::new(runner);
+        let backend = CliBackend::new(Arc::new(StubRunner::new()));
+
+        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", true).await;
+
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+            .await
+            .unwrap()
+            .expect("record_new_pr inserts a row");
+        assert!(
+            rec.salvaged,
+            "a Finalized::TimedOut outcome must be flagged salvaged"
+        );
+    }
+
+    /// A resumed run that finishes successfully clears a prior timeout's
+    /// `salvaged` flag, which is exactly what unblocks the next automerge
+    /// decision (CLAUDE-429); `apply_automerge_decision`'s own tests already
+    /// show an unflagged, green, mergeable PR proceeds to merge.
+    #[tokio::test]
+    async fn clear_salvaged_for_resume_clears_the_flag_on_success() {
+        use crate::ci_failure::store;
+        let pool = mem_pool().await;
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let backend = CliBackend::new(Arc::new(StubRunner::new()));
+
+        let id = store::record_agent_pr(
+            &pool,
+            "act",
+            "MK-16",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            9,
+            "feat/x",
+            "open",
+            true,
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        clear_salvaged_for_resume(&pool, &forge, &backend, "act", &job(), id).await;
+
+        let rec = store::agent_pr_for_issue(&pool, "MK-16")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !rec.salvaged,
+            "a successful resumed run must clear the salvaged flag"
+        );
+    }
+
+    /// A failed clear (simulated by hiding the table the way
+    /// `webhook_finish_run_finish_failure_is_logged_and_retried` in
+    /// `web/webhooks.rs` does) is logged at `error` naming CLAUDE-429 and the
+    /// PR id, and leaves the flag set once the table is back: automerge stays
+    /// blocked rather than silently retrying.
+    #[tokio::test]
+    async fn clear_salvaged_for_resume_failure_is_logged_and_leaves_the_flag_set() {
+        use crate::ci_failure::store;
+        let pool = mem_pool().await;
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let backend = CliBackend::new(Arc::new(StubRunner::new()));
+
+        let id = store::record_agent_pr(
+            &pool,
+            "act",
+            "MK-16",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            9,
+            "feat/x",
+            "open",
+            true,
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        sqlx::query("ALTER TABLE agent_pull_requests RENAME TO agent_pull_requests_hidden")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(self.0.clone())
+            }
+        }
+        let sub = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let dispatch_guard = tracing::subscriber::set_default(sub);
+
+        clear_salvaged_for_resume(&pool, &forge, &backend, "act", &job(), id).await;
+
+        drop(dispatch_guard);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("ERROR"), "expected an error log: {logs}");
+        assert!(
+            logs.contains("CLAUDE-429"),
+            "expected the CLAUDE-429 marker in the log: {logs}"
+        );
+
+        sqlx::query("ALTER TABLE agent_pull_requests_hidden RENAME TO agent_pull_requests")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let rec = store::agent_pr_for_issue(&pool, "MK-16")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            rec.salvaged,
+            "a failed clear must leave the salvaged flag set"
+        );
     }
 
     /// A resumed job's PR is already recorded, so `record_new_pr`
@@ -8082,11 +8278,11 @@ mod tests {
         let forge = CliBackend::new(runner);
         let backend = CliBackend::new(Arc::new(StubRunner::new()));
 
-        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x").await;
+        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", false).await;
         // A second record for the SAME PR number is exactly what would happen if
         // `process_job` recorded on a resumed run too; `record_new_pr` reports
         // the conflict as a `note` + comment rather than panicking.
-        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x").await;
+        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", false).await;
 
         assert_eq!(
             forge.take_notices().len(),

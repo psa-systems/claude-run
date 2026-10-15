@@ -4586,6 +4586,34 @@ async fn apply_automerge_decision(
             "automerge disabled for this action; no action".to_string(),
         ));
     }
+    // A PR opened by the timeout salvage path (CLAUDE-379) is never
+    // automerged however its draft status changes, until a resumed run
+    // clears the flag by finishing successfully (CLAUDE-429). Checked before
+    // any forge call (`pr_status` included), so a salvaged PR's automerge
+    // decision never depends on live CI state.
+    if row.salvaged {
+        info!(repo = %repo, pr = pr_number, issue = %row.issue_key, "action-run success: PR was salvaged from a timed-out run; automerge blocked");
+        let body = format!(
+            "This PR was salvaged from a timed-out run; the runner will not automerge it. A human must review and merge it by hand, or re-queue the issue so a resumed run finishes the work.\n\nPR: {pr_url}"
+        );
+        record_automerge_outcome_and_comment_once(
+            mint,
+            pool,
+            AutomergePr {
+                repo,
+                pr_number,
+                issue_key: &row.issue_key,
+            },
+            "info",
+            "salvaged from a timed-out run; automerge blocked".to_string(),
+            body,
+            "action-run success: salvaged-pr comment failed",
+        )
+        .await;
+        return Ok(AutomergeOutcome::NoAction(
+            "PR was salvaged from a timed-out run; automerge blocked".to_string(),
+        ));
+    }
     // A GitHub-hosted PR must route through `GithubForge`, not
     // `mint.backend` (always `fj`, which 410s against GitHub's API).
     let forge = resolve_forge(mint, host, &github_cfg.hosts, &github_cfg.mcp_endpoint);
@@ -8339,6 +8367,7 @@ mod tests {
             17,
             "fix/CLAUDE-40",
             "open",
+            false,
             now,
         )
         .await
@@ -8405,6 +8434,7 @@ mod tests {
             18,
             "fix/CLAUDE-41",
             "open",
+            false,
             now,
         )
         .await
@@ -8478,6 +8508,7 @@ mod tests {
             20,
             "fix/CLAUDE-50",
             "open",
+            false,
             now,
         )
         .await
@@ -8579,6 +8610,7 @@ mod tests {
             21,
             "fix/CLAUDE-51",
             "open",
+            false,
             now,
         )
         .await
@@ -8663,6 +8695,7 @@ mod tests {
             22,
             "fix/CLAUDE-52",
             "open",
+            false,
             now,
         )
         .await
@@ -8743,6 +8776,7 @@ mod tests {
             23,
             "fix/CLAUDE-53",
             "open",
+            false,
             now,
         )
         .await
@@ -9323,6 +9357,7 @@ mod tests {
                 99,
                 "fix/CLAUDE-50",
                 "open",
+                false,
                 now,
             )
             .await
@@ -9367,6 +9402,7 @@ mod tests {
                 99,
                 "fix/CLAUDE-50",
                 "open",
+                false,
                 "2026-09-01T00:00:00Z",
             )
             .await
@@ -9428,6 +9464,7 @@ mod tests {
                 102,
                 "fix/CLAUDE-53",
                 "open",
+                false,
                 now,
             )
             .await
@@ -10834,6 +10871,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -10886,6 +10924,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -10976,6 +11015,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11012,6 +11052,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 "2026-09-01T00:00:00Z",
             )
             .await
@@ -11069,6 +11110,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11117,6 +11159,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11167,6 +11210,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11229,6 +11273,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11286,6 +11331,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11360,7 +11406,12 @@ mod tests {
         /// against two otherwise-identical setups, asserting the two entry
         /// points make IDENTICAL backend calls: this is the "one shared decision
         /// function" acceptance criterion.
-        async fn assert_same_decision(state: &str, mergeable: bool, behind_base: Option<bool>) {
+        async fn assert_same_decision(
+            state: &str,
+            mergeable: bool,
+            behind_base: Option<bool>,
+            salvaged: bool,
+        ) {
             let now = "2026-09-01T00:00:00Z";
 
             let pool_a = crate::db::test_pool().await;
@@ -11375,6 +11426,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                salvaged,
                 now,
             )
             .await
@@ -11407,6 +11459,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                salvaged,
                 now,
             )
             .await
@@ -11434,10 +11487,11 @@ mod tests {
 
         #[tokio::test]
         async fn webhook_and_reconciler_agree_on_every_decision_shape() {
-            assert_same_decision("success", true, Some(false)).await; // green + mergeable
-            assert_same_decision("success", true, Some(true)).await; // green + behind base
-            assert_same_decision("success", false, Some(false)).await; // green + not mergeable
-            assert_same_decision("pending", false, Some(false)).await; // not green
+            assert_same_decision("success", true, Some(false), false).await; // green + mergeable
+            assert_same_decision("success", true, Some(true), false).await; // green + behind base
+            assert_same_decision("success", false, Some(false), false).await; // green + not mergeable
+            assert_same_decision("pending", false, Some(false), false).await; // not green
+            assert_same_decision("success", true, Some(false), true).await; // salvaged: green + mergeable still blocked
             assert_same_conflict_decision().await; // behind base + update conflict (CLAUDE-380)
         }
 
@@ -11461,6 +11515,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11494,6 +11549,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11537,6 +11593,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11578,6 +11635,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11607,6 +11665,76 @@ mod tests {
             );
         }
 
+        /// A green, mergeable, not-behind-base PR flagged `salvaged` (CLAUDE-429)
+        /// is never merged however many ticks pass: no `merge_pr`,
+        /// `update_pr_branch` or conflict-dispatch call, `NoAction`, a
+        /// `run_events` row every pass, and the issue comment posted only once.
+        /// An otherwise-identical PR with `salvaged = false` still merges.
+        #[tokio::test]
+        async fn reconciler_never_merges_a_salvaged_pr() {
+            let pool = crate::db::test_pool().await;
+            let dir = tempfile::tempdir().unwrap();
+            write_youtrack_action(dir.path(), "yt", true);
+            let now = "2026-09-01T00:00:00Z";
+            ci_failure_store::record_agent_pr(
+                &pool,
+                "yt",
+                "MK-16",
+                "dev.a8n.run",
+                "contoso/claude-run",
+                7,
+                "fix/mk-16",
+                "open",
+                true,
+                now,
+            )
+            .await
+            .unwrap();
+            let backend = Arc::new(
+                StoreBackend::new()
+                    .with_open_prs(vec![pr(7, "")])
+                    .with_pr_status_behind("success", true, Some(false)),
+            );
+            let ctx = ctx_for(pool.clone(), backend.clone(), dir.path());
+            let gate = crate::concurrency::KeyGate::new();
+
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+            reconcile_automerge(&pool, &ctx, &gate, &mut std::collections::HashMap::new()).await;
+
+            let calls = backend.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("merge_pr")),
+                "{calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|c| c.starts_with("update_pr_branch")),
+                "{calls:?}"
+            );
+            let comments = calls
+                .iter()
+                .filter(|c| c.starts_with("comment MK-16"))
+                .count();
+            assert_eq!(
+                comments, 1,
+                "comment posted once, not every pass: {calls:?}"
+            );
+
+            let events = state::run_events_for_action(&pool, WEBHOOK_MINT_ACTION, 50)
+                .await
+                .unwrap();
+            let salvage_events = events
+                .iter()
+                .filter(|e| e.message.contains("salvaged from a timed-out run"))
+                .count();
+            assert_eq!(salvage_events, 2, "a run_events row every pass: {events:?}");
+
+            let row = ci_failure_store::agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 7)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "open", "never retired by automerge");
+        }
+
         #[tokio::test]
         async fn reconciler_leaves_non_open_pr_alone() {
             let pool = crate::db::test_pool().await;
@@ -11622,6 +11750,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "merged",
+                false,
                 now,
             )
             .await
@@ -11654,6 +11783,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 "2026-09-01T00:00:00Z",
             )
             .await
@@ -11942,6 +12072,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -12171,6 +12302,7 @@ mod tests {
                 8,
                 "fix/mk-17",
                 "open",
+                false,
                 "2026-09-01T00:00:00Z",
             )
             .await
@@ -12262,6 +12394,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -12316,6 +12449,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -12372,6 +12506,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -12499,6 +12634,7 @@ mod tests {
                     42,
                     "fix/x",
                     "open",
+                    false,
                     "2026-09-01T00:00:00Z",
                 )
                 .await
@@ -12865,6 +13001,7 @@ mod tests {
                     7,
                     "fix/mk-16",
                     "open",
+                    false,
                     "2026-09-01T00:00:00Z",
                 )
                 .await
@@ -13104,6 +13241,7 @@ mod tests {
                 42,
                 "fix/CLAUDE-40",
                 "open",
+                false,
                 now,
             )
             .await
@@ -13387,6 +13525,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 "2026-09-01T00:00:00Z",
             )
             .await

@@ -46,6 +46,10 @@ pub struct AgentPullRequest {
     pub state: String,
     pub created_at: String,
     pub updated_at: String,
+    /// True when this PR was opened by the timeout salvage path (CLAUDE-379)
+    /// and not yet cleared by a resumed run's successful finish (CLAUDE-429).
+    /// Blocks automerge regardless of draft status. See `crate::db::flag`.
+    pub salvaged: bool,
 }
 
 fn failure_from_row(row: &sqlx::any::AnyRow) -> Result<Failure> {
@@ -75,6 +79,7 @@ fn agent_pr_from_row(row: &sqlx::any::AnyRow) -> Result<AgentPullRequest> {
         state: row.try_get("state")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        salvaged: db::flag(row, "salvaged")?,
     })
 }
 
@@ -367,7 +372,9 @@ pub async fn run_indexes_for_failure_pr(
     Ok(indexes)
 }
 
-/// Record a PR the agent opened. Returns its `agent_pull_requests` id.
+/// Record a PR the agent opened. `salvaged` is true for a timeout-salvage PR
+/// (`Finalized::TimedOut`), false otherwise (CLAUDE-429). Returns its
+/// `agent_pull_requests` id.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_agent_pr(
     pool: &DbPool,
@@ -378,13 +385,14 @@ pub async fn record_agent_pr(
     pr_number: i64,
     head_branch: &str,
     state: &str,
+    salvaged: bool,
     now: &str,
 ) -> Result<i64> {
     let id: i64 = sqlx::query_scalar(&db::q(
         pool,
         "INSERT INTO agent_pull_requests \
-         (action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?) RETURNING id",
+         (action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?) RETURNING id",
     ))
     .bind(action_name)
     .bind(issue_key)
@@ -393,11 +401,26 @@ pub async fn record_agent_pr(
     .bind(pr_number)
     .bind(head_branch)
     .bind(state)
+    .bind(salvaged as i64)
     .bind(now)
     .bind(now)
     .fetch_one(pool)
     .await?;
     Ok(id)
+}
+
+/// Clear `id`'s `salvaged` flag: called only from the resumed-success path
+/// (CLAUDE-429), once a resumed run on a salvaged PR finishes successfully.
+pub async fn clear_salvaged(pool: &DbPool, id: i64, now: &str) -> Result<()> {
+    sqlx::query(&db::q(
+        pool,
+        "UPDATE agent_pull_requests SET salvaged = 0, updated_at = ? WHERE id = ?",
+    ))
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// The agent's PR at `(host, repo, pr_number)`, the unique key a PR is
@@ -410,7 +433,7 @@ pub async fn agent_pr(
 ) -> Result<Option<AgentPullRequest>> {
     let row = sqlx::query(&db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, created_at, updated_at \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at \
          FROM agent_pull_requests WHERE host = ? AND repo = ? AND pr_number = ?",
     ))
     .bind(host)
@@ -430,7 +453,7 @@ pub async fn agent_pr_for_issue(
 ) -> Result<Option<AgentPullRequest>> {
     let row = sqlx::query(&db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, created_at, updated_at \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at \
          FROM agent_pull_requests WHERE issue_key = ? ORDER BY updated_at DESC LIMIT 1",
     ))
     .bind(issue_key)
@@ -446,7 +469,7 @@ pub async fn agent_pr_for_issue(
 pub async fn open_agent_prs(pool: &DbPool) -> Result<Vec<AgentPullRequest>> {
     let rows = sqlx::query(&db::q(
         pool,
-        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, created_at, updated_at \
+        "SELECT id, action_name, issue_key, host, repo, pr_number, head_branch, fix_attempts, state, salvaged, created_at, updated_at \
          FROM agent_pull_requests WHERE state = 'open' ORDER BY id",
     ))
     .fetch_all(pool)
@@ -843,6 +866,7 @@ mod tests {
             17,
             "fix/CLAUDE-42",
             "open",
+            false,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -854,6 +878,7 @@ mod tests {
             .unwrap();
         assert_eq!(by_pr.id, id);
         assert_eq!(by_pr.fix_attempts, 0);
+        assert!(!by_pr.salvaged);
 
         let by_issue = agent_pr_for_issue(&pool, "CLAUDE-42")
             .await
@@ -875,6 +900,79 @@ mod tests {
         assert_eq!(after.fix_attempts, 1);
         assert_eq!(after.state, "merged");
         assert_eq!(after.updated_at, "2026-09-03T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn salvaged_flag_roundtrips_and_clears() {
+        let pool = test_pool().await;
+        let id = record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-43",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            18,
+            "fix/CLAUDE-43",
+            "open",
+            true,
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let salvaged = agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 18)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(salvaged.salvaged);
+
+        clear_salvaged(&pool, id, "2026-09-02T00:00:00Z")
+            .await
+            .unwrap();
+
+        let cleared = agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 18)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!cleared.salvaged);
+        assert_eq!(cleared.updated_at, "2026-09-02T00:00:00Z");
+    }
+
+    /// `clear_salvaged` is the only mutator that ever flips `salvaged` to
+    /// false (CLAUDE-429): a state change from any other path, such as a
+    /// human clearing a draft's `WIP: ` prefix (which surfaces here only as
+    /// a PR state transition, never a direct column write), leaves it set.
+    #[tokio::test]
+    async fn set_agent_pr_state_does_not_clear_salvaged() {
+        let pool = test_pool().await;
+        let id = record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-43",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            19,
+            "fix/CLAUDE-43",
+            "open",
+            true,
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        set_agent_pr_state(&pool, id, "closed", "2026-09-02T00:00:00Z")
+            .await
+            .unwrap();
+
+        let rec = agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 19)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.state, "closed");
+        assert!(
+            rec.salvaged,
+            "a state transition must never clear the salvaged flag"
+        );
     }
 
     #[tokio::test]
