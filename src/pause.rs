@@ -68,6 +68,14 @@ impl PauseGate {
         self
     }
 
+    /// Override the cache TTL, so a test asserting cached reads does not depend
+    /// on how long a DB write takes on the backend under test.
+    #[cfg(test)]
+    fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
     /// An inert gate that is never paused. Used where there is no DB to read
     /// (unit tests, the executor's own tests) so the gate is never a reason a
     /// job is skipped.
@@ -317,7 +325,9 @@ mod tests {
     #[tokio::test]
     async fn reads_are_ttl_cached() {
         let pool = pool().await;
-        let gate = PauseGate::new(pool.clone());
+        // An hour-long TTL: the flag write below can take seconds on a loaded
+        // Postgres, and a real-time TTL would expire mid-test.
+        let gate = PauseGate::new(pool.clone()).with_ttl(Duration::from_secs(3600));
         assert!(!gate.paused().await);
         state::global_pause_set(&pool, None).await.unwrap();
         // Still inside the TTL: the cached `false` is reused.
