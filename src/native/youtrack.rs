@@ -1226,6 +1226,7 @@ async fn process_job(
     // itself: it is a synchronous state machine whose own unit tests run with
     // no tokio runtime, so the write happens here, right after it returns.
     if resume.is_none() {
+        let salvaged = matches!(&finalize_res, Ok(Finalized::TimedOut { .. }));
         if let Ok(
             Finalized::CodeReview {
                 pr_number: Some(pr_number),
@@ -1246,6 +1247,7 @@ async fn process_job(
                 job,
                 *pr_number,
                 head_branch,
+                salvaged,
             )
             .await;
         }
@@ -1447,6 +1449,7 @@ async fn record_new_pr(
     job: &YoutrackJob,
     pr_number: u64,
     head_branch: &str,
+    salvaged: bool,
 ) {
     use crate::ci_failure::store;
     let host = host_only(&job.repo_host);
@@ -1460,6 +1463,7 @@ async fn record_new_pr(
         pr_number as i64,
         head_branch,
         "open",
+        salvaged,
         &now,
     )
     .await
@@ -7934,6 +7938,7 @@ mod tests {
             7,
             "fix/MK-16",
             "open",
+            false,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -7986,6 +7991,7 @@ mod tests {
             7,
             "fix/MK-16",
             "open",
+            false,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -8034,6 +8040,7 @@ mod tests {
             7,
             "fix/MK-16",
             "open",
+            false,
             "2026-09-01T00:00:00Z",
         )
         .await
@@ -8059,7 +8066,7 @@ mod tests {
         let forge = CliBackend::new(runner);
         let backend = CliBackend::new(Arc::new(StubRunner::new()));
 
-        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x").await;
+        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", false).await;
 
         let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
             .await
@@ -8068,6 +8075,31 @@ mod tests {
         assert_eq!(rec.pr_number, 9);
         assert_eq!(rec.head_branch, "feat/x");
         assert_eq!(rec.state, "open");
+        assert!(
+            !rec.salvaged,
+            "a Finalized::CodeReview outcome is not salvaged"
+        );
+    }
+
+    /// `process_job`'s `salvaged` flag follows the `finalize_res` variant: set
+    /// for `Finalized::TimedOut`, clear for `Finalized::CodeReview` (CLAUDE-429).
+    #[tokio::test]
+    async fn record_new_pr_flags_salvaged_for_a_timed_out_outcome() {
+        let pool = mem_pool().await;
+        let runner = Arc::new(StubRunner::new());
+        let forge = CliBackend::new(runner);
+        let backend = CliBackend::new(Arc::new(StubRunner::new()));
+
+        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", true).await;
+
+        let rec = crate::ci_failure::store::agent_pr_for_issue(&pool, "MK-16")
+            .await
+            .unwrap()
+            .expect("record_new_pr inserts a row");
+        assert!(
+            rec.salvaged,
+            "a Finalized::TimedOut outcome must be flagged salvaged"
+        );
     }
 
     /// A resumed job's PR is already recorded, so `record_new_pr`
@@ -8082,11 +8114,11 @@ mod tests {
         let forge = CliBackend::new(runner);
         let backend = CliBackend::new(Arc::new(StubRunner::new()));
 
-        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x").await;
+        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", false).await;
         // A second record for the SAME PR number is exactly what would happen if
         // `process_job` recorded on a resumed run too; `record_new_pr` reports
         // the conflict as a `note` + comment rather than panicking.
-        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x").await;
+        record_new_pr(&pool, &forge, &backend, "act", &job(), 9, "feat/x", false).await;
 
         assert_eq!(
             forge.take_notices().len(),

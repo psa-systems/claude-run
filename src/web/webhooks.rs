@@ -8339,6 +8339,7 @@ mod tests {
             17,
             "fix/CLAUDE-40",
             "open",
+            false,
             now,
         )
         .await
@@ -8405,6 +8406,7 @@ mod tests {
             18,
             "fix/CLAUDE-41",
             "open",
+            false,
             now,
         )
         .await
@@ -8478,6 +8480,7 @@ mod tests {
             20,
             "fix/CLAUDE-50",
             "open",
+            false,
             now,
         )
         .await
@@ -8579,6 +8582,7 @@ mod tests {
             21,
             "fix/CLAUDE-51",
             "open",
+            false,
             now,
         )
         .await
@@ -8663,6 +8667,7 @@ mod tests {
             22,
             "fix/CLAUDE-52",
             "open",
+            false,
             now,
         )
         .await
@@ -8743,6 +8748,7 @@ mod tests {
             23,
             "fix/CLAUDE-53",
             "open",
+            false,
             now,
         )
         .await
@@ -9323,6 +9329,7 @@ mod tests {
                 99,
                 "fix/CLAUDE-50",
                 "open",
+                false,
                 now,
             )
             .await
@@ -9367,6 +9374,7 @@ mod tests {
                 99,
                 "fix/CLAUDE-50",
                 "open",
+                false,
                 "2026-09-01T00:00:00Z",
             )
             .await
@@ -9428,6 +9436,7 @@ mod tests {
                 102,
                 "fix/CLAUDE-53",
                 "open",
+                false,
                 now,
             )
             .await
@@ -10834,6 +10843,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -10886,6 +10896,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -10976,6 +10987,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11012,6 +11024,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 "2026-09-01T00:00:00Z",
             )
             .await
@@ -11069,6 +11082,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11117,6 +11131,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11167,6 +11182,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11229,6 +11245,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11286,6 +11303,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11375,6 +11393,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11407,6 +11426,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11461,6 +11481,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11494,6 +11515,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11537,6 +11559,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11578,6 +11601,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -11622,6 +11646,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "merged",
+                false,
                 now,
             )
             .await
@@ -11654,6 +11679,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 "2026-09-01T00:00:00Z",
             )
             .await
@@ -11942,6 +11968,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -12171,6 +12198,7 @@ mod tests {
                 8,
                 "fix/mk-17",
                 "open",
+                false,
                 "2026-09-01T00:00:00Z",
             )
             .await
@@ -12262,6 +12290,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -12316,6 +12345,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -12372,6 +12402,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 now,
             )
             .await
@@ -12499,6 +12530,7 @@ mod tests {
                     42,
                     "fix/x",
                     "open",
+                    false,
                     "2026-09-01T00:00:00Z",
                 )
                 .await
@@ -12865,6 +12897,7 @@ mod tests {
                     7,
                     "fix/mk-16",
                     "open",
+                    false,
                     "2026-09-01T00:00:00Z",
                 )
                 .await
@@ -13104,6 +13137,7 @@ mod tests {
                 42,
                 "fix/CLAUDE-40",
                 "open",
+                false,
                 now,
             )
             .await
@@ -13387,6 +13421,7 @@ mod tests {
                 7,
                 "fix/mk-16",
                 "open",
+                false,
                 "2026-09-01T00:00:00Z",
             )
             .await
