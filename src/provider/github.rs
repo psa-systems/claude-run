@@ -47,6 +47,19 @@ pub fn is_github_host(host: &str, extra: &[String]) -> bool {
     host.eq_ignore_ascii_case(GITHUB_COM) || extra.iter().any(|h| h.eq_ignore_ascii_case(host))
 }
 
+/// A PR's web URL built from its host/repo/number, with no forge call. GitHub
+/// serves a PR at `/pull/<n>`; Forgejo serves it at `/pulls/<n>`. `host` is a
+/// bare host (no scheme); `extra` is the configured GitHub Enterprise hosts,
+/// the same list [`is_github_host`] takes everywhere else.
+pub fn pr_web_url(host: &str, repo: &str, pr_number: i64, extra: &[String]) -> String {
+    let segment = if is_github_host(host, extra) {
+        "pull"
+    } else {
+        "pulls"
+    };
+    format!("https://{host}/{repo}/{segment}/{pr_number}")
+}
+
 /// Run `gh auth token --hostname <host>`, returning the trimmed token or a
 /// formatted error naming the failure. Shared by [`GithubForge`] (its own
 /// PR/comment push fallback) and [`GhForgeReads`] (its CI-failure log reads),
@@ -2117,6 +2130,23 @@ mod tests {
         let ghe = vec!["ghe.example.com".to_string()];
         assert!(is_github_host("ghe.example.com", &ghe));
         assert!(!is_github_host("other.example.com", &ghe));
+    }
+
+    #[test]
+    fn pr_web_url_uses_pull_for_github_and_pulls_for_forgejo() {
+        assert_eq!(
+            pr_web_url("github.com", "octo/widget", 42, &[]),
+            "https://github.com/octo/widget/pull/42"
+        );
+        let ghe = vec!["ghe.example.com".to_string()];
+        assert_eq!(
+            pr_web_url("ghe.example.com", "octo/widget", 42, &ghe),
+            "https://ghe.example.com/octo/widget/pull/42"
+        );
+        assert_eq!(
+            pr_web_url("dev.a8n.run", "contoso/claude-run", 7, &[]),
+            "https://dev.a8n.run/contoso/claude-run/pulls/7"
+        );
     }
 
     #[test]

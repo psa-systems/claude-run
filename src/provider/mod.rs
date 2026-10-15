@@ -38,7 +38,9 @@ use crate::error::{Error, Result};
 
 pub use audit::{AuditedTracker, IssueWriteAudit, DEFAULT_MAX_ISSUES_PER_RUN};
 pub use cli::{CliBackend, CmdOutput, CommandRunner, FjForgeReads, ProcessRunner};
-pub use github::{is_github_host, GhForgeReads, GithubForge, HttpMcpTransport, McpTransport};
+pub use github::{
+    is_github_host, pr_web_url, GhForgeReads, GithubForge, HttpMcpTransport, McpTransport,
+};
 
 /// One project-to-repo binding flattened from a YouTrack project's enabled VCS
 /// integration, the row of the inverse routing map. Each enabled
