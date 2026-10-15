@@ -8039,6 +8039,14 @@ mod tests {
             .await
             .unwrap();
 
+        // The guard's one-shot retry is spawned as soon as the first attempt fails.
+        // Park every spare connection so it queues behind the restore below instead
+        // of racing it on a multi-connection (Postgres) pool.
+        let mut parked = Vec::new();
+        for _ in 1..pool.options().get_max_connections() {
+            parked.push(pool.acquire().await.unwrap());
+        }
+
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for CaptureWriter {
@@ -8088,6 +8096,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        drop(parked);
 
         let mut ended: Option<String> = None;
         for _ in 0..200 {
