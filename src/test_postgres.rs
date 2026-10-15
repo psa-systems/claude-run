@@ -295,13 +295,51 @@ fn psql_args() -> [&'static str; 5] {
     ["psql", "--username", "postgres", "--set", "ON_ERROR_STOP=1"]
 }
 
-/// How long a connection may keep failing with "the database system is
-/// starting up" / "shutting down" after `pg_isready` already reported ready.
-/// The official postgres image's entrypoint restarts the server once after
-/// its own `initdb`, and `pg_isready` can observe the brief ready window
-/// before that restart; retrying here rides out that restart instead of
-/// treating it as a real failure.
+/// How long a connection may keep failing on a restart shape after
+/// `pg_isready` already reported ready: "the database system is starting
+/// up" / "shutting down", or the socket file briefly disappearing between
+/// that readiness check and the next connection attempt. The official
+/// postgres image's entrypoint restarts the server once after its own
+/// `initdb`, and `pg_isready` can observe the brief ready window before that
+/// restart; retrying here rides out that restart instead of treating it as a
+/// real failure.
 const RESTART_WINDOW: Duration = Duration::from_secs(20);
+
+/// Whether `stderr` from a `psql` connection attempt matches a known
+/// restart-window shape rather than a real, persistent failure: the server
+/// reporting it is starting up or shutting down, or the unix socket file
+/// being briefly absent while the entrypoint's post-`initdb` restart is in
+/// progress.
+fn is_restart_shape(stderr: &str) -> bool {
+    stderr.contains("the database system is starting up")
+        || stderr.contains("the database system is shutting down")
+        || (stderr.contains("connection to server on socket")
+            && stderr.contains("No such file or directory"))
+}
+
+/// Run `docker exec -i <name> <full_args[1..]>` feeding `stdin`, retrying
+/// within [`RESTART_WINDOW`] whenever the failure matches [`is_restart_shape`].
+/// `full_args` carries `name` as its first element purely for `docker_error`'s
+/// message; the exec call itself gets `full_args[1..]`.
+fn docker_exec_retrying_restart(
+    name: &str,
+    stage: &str,
+    full_args: &[&str],
+    stdin: &str,
+) -> Result<std::process::Output> {
+    let deadline = Instant::now() + RESTART_WINDOW;
+    loop {
+        let out = docker_exec_stdin(name, &full_args[1..], stdin)?;
+        if out.status.success() {
+            return Ok(out);
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        if !is_restart_shape(&stderr) || Instant::now() >= deadline {
+            return Err(docker_error(stage, full_args, &stderr, &[]));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
 
 fn apply_sql(name: &str, stage: &str, sql: &str) -> Result<()> {
     let mut args = vec![name];
@@ -309,20 +347,8 @@ fn apply_sql(name: &str, stage: &str, sql: &str) -> Result<()> {
     args.push("--file");
     args.push("-");
 
-    let deadline = Instant::now() + RESTART_WINDOW;
-    loop {
-        let out = docker_exec_stdin(name, &args[1..], sql)?;
-        if out.status.success() {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        let restarting = stderr.contains("the database system is starting up")
-            || stderr.contains("the database system is shutting down");
-        if !restarting || Instant::now() >= deadline {
-            return Err(docker_error(stage, &args, &stderr, &[]));
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
+    docker_exec_retrying_restart(name, stage, &args, sql)?;
+    Ok(())
 }
 
 fn disable_durability(name: &str) -> Result<()> {
@@ -338,15 +364,7 @@ fn disable_durability(name: &str) -> Result<()> {
         "--command",
         "SHOW fsync",
     ];
-    let out = docker_exec_stdin(name, &args[1..], "")?;
-    if !out.status.success() {
-        return Err(docker_error(
-            "SHOW fsync",
-            &args,
-            &String::from_utf8_lossy(&out.stderr),
-            &[],
-        ));
-    }
+    let out = docker_exec_retrying_restart(name, "SHOW fsync", &args, "")?;
     let reading = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if reading != "off" {
         return Err(fail(
@@ -473,6 +491,34 @@ mod tests {
     use super::*;
     use crate::testutil::write_stub;
     use std::path::Path;
+
+    #[test]
+    fn is_restart_shape_matches_starting_up() {
+        assert!(is_restart_shape(
+            "psql: error: connection to server at \"localhost\" failed: FATAL: the database system is starting up"
+        ));
+    }
+
+    #[test]
+    fn is_restart_shape_matches_shutting_down() {
+        assert!(is_restart_shape(
+            "psql: error: connection to server at \"localhost\" failed: FATAL: the database system is shutting down"
+        ));
+    }
+
+    #[test]
+    fn is_restart_shape_matches_missing_socket() {
+        assert!(is_restart_shape(
+            "psql: error: connection to server on socket \"/var/run/postgresql/.s.PGSQL.5432\" failed: No such file or directory\n\tIs the server running locally and accepting connections on that socket?"
+        ));
+    }
+
+    #[test]
+    fn is_restart_shape_rejects_an_unrelated_error() {
+        assert!(!is_restart_shape(
+            "psql: error: connection to server at \"localhost\" failed: FATAL: password authentication failed for user \"postgres\""
+        ));
+    }
 
     #[test]
     fn docker_run_args_match_the_spec() {
@@ -718,6 +764,66 @@ exit 0
             let a_pos = log.find("-- A").unwrap();
             let b_pos = log.find("-- B").unwrap();
             assert!(a_pos < b_pos, "init-sql files were not applied in order");
+        });
+    }
+
+    #[test]
+    fn disable_durability_retries_show_fsync_past_a_missing_socket() {
+        with_stub_on_path(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let count_path = dir.path().join("show-fsync-attempts");
+            // First `SHOW fsync` attempt reports the missing-socket shape from
+            // CLAUDE-431; the retry inside `disable_durability` must ride it
+            // out and succeed on the second attempt.
+            let script = format!(
+                r#"#!/bin/sh
+case "$1" in
+  run) echo "stubcontainer" ;;
+  port) echo "127.0.0.1:55432" ;;
+  exec)
+    body=$(cat)
+    case "$*" in
+      *"SHOW fsync"*)
+        n=$(cat "{count}" 2>/dev/null || echo 0)
+        n=$((n + 1))
+        echo "$n" > "{count}"
+        if [ "$n" -eq 1 ]; then
+          echo 'psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: No such file or directory' >&2
+          exit 1
+        fi
+        echo "off"
+        ;;
+      *) : ;;
+    esac
+    ;;
+  stop) : ;;
+  ps) : ;;
+  logs) : ;;
+  *) : ;;
+esac
+exit 0
+"#,
+                count = count_path.display()
+            );
+            write_stub(&dir.path().join("docker"), &script);
+            let old_path = std::env::var("PATH").unwrap_or_default();
+            unsafe {
+                std::env::set_var("PATH", format!("{}:{old_path}", dir.path().display()));
+            }
+
+            let opts = Opts::default();
+            let code = run(&opts, &["true".into()]).unwrap();
+
+            unsafe {
+                std::env::set_var("PATH", old_path);
+            }
+            assert_eq!(code, 0);
+            let attempts: u32 = std::fs::read_to_string(&count_path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(attempts, 2, "SHOW fsync should have retried exactly once");
         });
     }
 
