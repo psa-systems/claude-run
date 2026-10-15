@@ -938,6 +938,43 @@ mod tests {
         assert_eq!(cleared.updated_at, "2026-09-02T00:00:00Z");
     }
 
+    /// `clear_salvaged` is the only mutator that ever flips `salvaged` to
+    /// false (CLAUDE-429): a state change from any other path, such as a
+    /// human clearing a draft's `WIP: ` prefix (which surfaces here only as
+    /// a PR state transition, never a direct column write), leaves it set.
+    #[tokio::test]
+    async fn set_agent_pr_state_does_not_clear_salvaged() {
+        let pool = test_pool().await;
+        let id = record_agent_pr(
+            &pool,
+            "youtrack",
+            "CLAUDE-43",
+            "dev.a8n.run",
+            "contoso/claude-run",
+            19,
+            "fix/CLAUDE-43",
+            "open",
+            true,
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        set_agent_pr_state(&pool, id, "closed", "2026-09-02T00:00:00Z")
+            .await
+            .unwrap();
+
+        let rec = agent_pr(&pool, "dev.a8n.run", "contoso/claude-run", 19)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.state, "closed");
+        assert!(
+            rec.salvaged,
+            "a state transition must never clear the salvaged flag"
+        );
+    }
+
     #[tokio::test]
     async fn failure_for_issue_finds_the_claiming_row() {
         let pool = test_pool().await;
