@@ -485,11 +485,15 @@ Automerge works on both backends: a Forgejo-hosted PR goes through `fj pr status
 GitHub-hosted PR (CLAUDE-405) goes through `gh pr view --json` / `gh pr merge` / `gh pr update-branch` via `GithubForge`,
 selected automatically by `resolve_automerge_forge` from the PR's host.
 
-GitHub automerge needs a **classic PAT with the `repo` scope**. `pr_status` reads `statusCheckRollup`, whose check-run
-entries (GitHub Actions jobs) a fine-grained PAT cannot read, because GitHub offers no fine-grained permission for check
-runs. With a fine-grained PAT `pr_status` fails on every PR with `GraphQL: Resource not accessible by personal access
-token (repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup.contexts.nodes.0)`. The automerge
-reconciler and webhook path (`resolve_forge` in `src/web/webhooks.rs`) builds `GithubForge` with no token, so `gh` uses
+GitHub automerge works with either a classic PAT with the `repo` scope or a fine-grained PAT with `Pull requests: Read`,
+`Actions: Read` and `Commit statuses: Read` (CLAUDE-419). `pr_status` no longer reads `statusCheckRollup`: that
+GraphQL field's check-run entries (GitHub Actions jobs) a fine-grained PAT cannot read at all, because GitHub offers no
+fine-grained permission for check runs, so every call used to fail with `GraphQL: Resource not accessible by personal
+access token (repository.pullRequest.statusCheckRollup.nodes.0.commit.statusCheckRollup.contexts.nodes.0)`. The CI
+verdict instead comes from `gh api repos/{o}/{r}/actions/runs?head_sha=<sha>` (workflow runs) and `gh api
+repos/{o}/{r}/commits/{sha}/status` (the combined commit status), both of which a fine-grained PAT with those three
+permissions can read. The automerge reconciler and webhook path (`resolve_forge` in `src/web/webhooks.rs`) builds
+`GithubForge` with no token, so `gh` uses
 the daemon's own login, the GitHub token saved in Settings -> Auth; `github.token_ref` and a webhook source's
 `write_token_ref` are separate secrets this path does not read. The Settings token is read on every pass, so replacing it
 also fixes PRs that already exist. Saving it runs `gh auth login --with-token`, which needs `repo`, `read:org` and
