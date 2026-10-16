@@ -2760,7 +2760,11 @@ fn salvage_timeout_work(
 /// excluded by pathspec (operator/runner state, never agent work); gitignored
 /// files are never staged by a bare `git add -A` to begin with. The commit
 /// body ends with the bare `#<KEY>` reference (CLAUDE-398), the requirement
-/// CLAUDE-379 specified but the code never wrote.
+/// CLAUDE-379 specified but the code never wrote. A failed `git add` or `git
+/// commit` reports a stdout tail after its stderr, the same
+/// `provider::append_stdout_tail` rule `git_error` applies elsewhere
+/// (CLAUDE-432), because `git commit` runs the repo's `pre-commit` hook and a
+/// failing hook's report goes to stdout, not stderr.
 fn commit_timeout_wip(workdir: &Path, key: &str) -> std::result::Result<(), String> {
     let add = Command::new("git")
         .arg("-C")
@@ -2769,10 +2773,12 @@ fn commit_timeout_wip(workdir: &Path, key: &str) -> std::result::Result<(), Stri
         .output()
         .map_err(|e| format!("running `git add` failed: {e}"))?;
     if !add.status.success() {
-        return Err(format!(
-            "`git add` failed: {}",
-            String::from_utf8_lossy(&add.stderr).trim()
-        ));
+        let detail = crate::provider::append_stdout_tail(
+            String::from_utf8_lossy(&add.stderr).trim(),
+            &String::from_utf8_lossy(&add.stdout),
+            &[],
+        );
+        return Err(format!("`git add` failed: {detail}"));
     }
     let message = format!(
         "WIP: uncommitted changes at timeout\n\n\
@@ -2787,10 +2793,12 @@ fn commit_timeout_wip(workdir: &Path, key: &str) -> std::result::Result<(), Stri
         .output()
         .map_err(|e| format!("running `git commit` failed: {e}"))?;
     if !commit.status.success() {
-        return Err(format!(
-            "`git commit` failed: {}",
-            String::from_utf8_lossy(&commit.stderr).trim()
-        ));
+        let detail = crate::provider::append_stdout_tail(
+            String::from_utf8_lossy(&commit.stderr).trim(),
+            &String::from_utf8_lossy(&commit.stdout),
+            &[],
+        );
+        return Err(format!("`git commit` failed: {detail}"));
     }
     Ok(())
 }
@@ -6750,6 +6758,32 @@ mod tests {
         assert!(
             err.contains("git add"),
             "the commit-step failure must name `git add`: {err}"
+        );
+    }
+
+    #[test]
+    fn commit_timeout_wip_names_the_pre_commit_hook_stdout_tail() {
+        // CLAUDE-432: `git commit` runs the repo's `pre-commit` hook, which
+        // writes its report to stdout, not stderr; a stderr-only failure text
+        // named no cause. Both the hook's stdout and git's own stderr must
+        // appear in the failure text.
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_commit(dir.path());
+        std::fs::write(dir.path().join("f.txt"), "y").unwrap();
+        let hooks_dir = dir.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        crate::testutil::write_stub(
+            &hooks_dir.join("pre-commit"),
+            "#!/bin/sh\nprintf 'pre-commit hook: lint failed\\n'\nexit 1\n",
+        );
+        let err = commit_timeout_wip(dir.path(), "MK-16").unwrap_err();
+        assert!(
+            err.contains("pre-commit hook: lint failed"),
+            "failure text must carry the hook's stdout tail: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("hook"),
+            "failure text must still name the hook's own stderr: {err}"
         );
     }
 
