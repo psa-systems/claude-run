@@ -144,9 +144,9 @@
   <span class="dim">Host (default github.com) and a personal access token. Equivalent to
   <code>gh auth login --with-token</code>. A classic token needs <code>repo</code>,
   <code>read:org</code> and <code>gist</code> (gh's own minimum at login). GitHub automerge
-  reads this token (not an action's <code>github.token_ref</code>) and needs a classic token:
-  a fine-grained token works for opening PRs and reads but cannot read check runs, so
-  automerge fails with <code>Resource not accessible by personal access token</code>.</span>
+  reads this token (not an action's <code>github.token_ref</code>). A fine-grained token with
+  <code>Pull requests: Read</code>, <code>Actions: Read</code> and <code>Commit statuses: Read</code>
+  works for automerge too.</span>
   <form method="post" action="/settings/auth/github" style="margin-top: 8px;">
     <label for="auth-gh-host">Host</label>
     <input id="auth-gh-host" name="host" type="text" placeholder="github.com"

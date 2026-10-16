@@ -99,11 +99,13 @@ names, and the page never renders a stored value back. Saving applies to the nex
 save rewrites, so every `yt`, `fj` and `gh` child (the runner's own calls, and every `claude` session it spawns) picks
 up a saved login with no restart.
 
-The GitHub token must be a **classic PAT**. `gh auth login --with-token` refuses one without `repo`, `read:org` and
-`gist` ([gh manual](https://cli.github.com/manual/gh_auth_login)). GitHub automerge reads this login (not
-`github.token_ref` or a webhook source's `write_token_ref`) and calls `gh pr view --json statusCheckRollup`, which a
-fine-grained PAT cannot satisfy because it cannot read check runs; the call fails with `Resource not accessible by
-personal access token (...statusCheckRollup...contexts.nodes.N)`. A fine-grained PAT is enough for opening PRs and reads.
+`gh auth login --with-token` favors a **classic PAT** with `repo`, `read:org` and `gist`
+([gh manual](https://cli.github.com/manual/gh_auth_login)); save a fine-grained one here with care, per that same
+manual's own caution about `--with-token`. GitHub automerge reads this login (not `github.token_ref` or a webhook
+source's `write_token_ref`). As of CLAUDE-419, `pr_status` itself no longer needs check-run access: it derives the CI
+verdict from `gh api repos/<repo>/actions/runs` and `gh api repos/<repo>/commits/<sha>/status` instead of `gh pr view
+--json statusCheckRollup`, so a fine-grained PAT with `Pull requests: Read`, `Actions: Read` and `Commit statuses: Read`
+is enough for `pr_status`, opening PRs, and reads; it no longer needs to be a classic PAT just to satisfy `pr_status`.
 For a personal-account repository there is no organization approval or SSO step. Replacing the token fixes PRs that
 already exist, because it is read on every pass.
 
