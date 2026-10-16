@@ -852,48 +852,137 @@ impl Forge for GithubForge {
     }
 
     /// `gh pr view <n> --repo <repo> --json state,mergeable,mergeStateStatus,
-    /// headRefOid,statusCheckRollup`, run with the action's PAT as `GH_TOKEN`
-    /// exactly as the other reads above. Mirrors `CliBackend::pr_status`'s
-    /// contract: `state` is the combined CI verdict (`"success"` /
-    /// `"failure"` / `"pending"`, or `"merged"` / `"closed"` short-circuited
-    /// from GitHub's own PR state), `mergeable` is GitHub's own mergeability
-    /// verdict (`None` for a merged PR, which GitHub reports as `UNKNOWN`
-    /// regardless), `behind_base` is read off `mergeStateStatus`, and
-    /// `head_sha` is `headRefOid` (`None` for a merged PR, mirroring
-    /// `mergeable`). An unrecognised check conclusion, `mergeable`, or
-    /// `mergeStateStatus` value is an error naming the value, never a
-    /// default: silently guessing a CI verdict is worse than failing loudly.
+    /// headRefOid`, run with the action's PAT as `GH_TOKEN` exactly as the
+    /// other reads above. A fine-grained PAT cannot read `statusCheckRollup`
+    /// (no "Checks" permission exists for one), so for an open PR the CI
+    /// verdict instead comes from two reads a fine-grained PAT with
+    /// `Actions: Read` and `Commit statuses: Read` CAN make: `gh api
+    /// repos/<repo>/actions/runs?head_sha=<sha>` (GitHub Actions workflow
+    /// runs for the head commit) and `gh api repos/<repo>/commits/<sha>/
+    /// status` (the combined legacy commit status, covering external
+    /// contexts). Mirrors `CliBackend::pr_status`'s contract: `state` is the
+    /// combined CI verdict (`"success"` / `"failure"` / `"pending"`, or
+    /// `"merged"` / `"closed"` short-circuited from GitHub's own PR state,
+    /// neither of which needs the CI reads), `mergeable` is GitHub's own
+    /// mergeability verdict (`None` for a merged PR, which GitHub reports as
+    /// `UNKNOWN` regardless), `behind_base` is read off `mergeStateStatus`,
+    /// and `head_sha` is `headRefOid` (`None` for a merged PR, mirroring
+    /// `mergeable`). An unrecognised run conclusion, status state,
+    /// `mergeable`, or `mergeStateStatus` value is an error naming the
+    /// value, never a default: silently guessing a CI verdict is worse than
+    /// failing loudly.
     fn pr_status(&self, _host: &str, repo: &str, pr_number: u64) -> Result<super::PrStatus> {
         let envs: Vec<(&str, &str)> = match &self.token {
             Some(t) => vec![("GH_TOKEN", t.as_str())],
             None => Vec::new(),
         };
         let number_str = pr_number.to_string();
-        let args = [
+        let view_args = [
             "pr",
             "view",
             &number_str,
             "--repo",
             repo,
             "--json",
-            "state,mergeable,mergeStateStatus,headRefOid,statusCheckRollup",
+            "state,mergeable,mergeStateStatus,headRefOid",
         ];
-        let out = self.run_gh_read(&args, &envs)?;
+        let out = self.run_gh_read(&view_args, &envs)?;
         if !out.ok {
             return Err(Error::CliFailed {
                 binary: self.gh.clone(),
-                args: args.join(" "),
+                args: view_args.join(" "),
                 exit_code: out.exit_code,
                 stderr: out.stderr.trim().to_string(),
             });
         }
-        parse_pr_status(&out.stdout)
+        let doc = parse_pr_status(&out.stdout).map_err(|e| Error::CliParse {
+            binary: self.gh.clone(),
+            context: "gh pr view --json".to_string(),
+            source: e,
+        })?;
+
+        let state_upper = doc.state.to_ascii_uppercase();
+        if state_upper == "MERGED" {
+            return Ok(super::PrStatus {
+                state: "merged".to_string(),
+                mergeable: None,
+                behind_base: None,
+                head_sha: None,
+            });
+        }
+        let mergeable = match doc.mergeable.as_str() {
+            "MERGEABLE" => Some(true),
+            "CONFLICTING" => Some(false),
+            "UNKNOWN" => None,
+            other => {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "gh pr view --json mergeable: unrecognised value `{other}`"
+                )))
+            }
+        };
+        let behind_base = match doc.merge_state_status.as_str() {
+            "BEHIND" => Some(true),
+            "BLOCKED" | "CLEAN" | "DIRTY" | "DRAFT" | "HAS_HOOKS" | "UNSTABLE" => Some(false),
+            "UNKNOWN" => None,
+            other => {
+                return Err(Error::Other(anyhow::anyhow!(
+                    "gh pr view --json mergeStateStatus: unrecognised value `{other}`"
+                )))
+            }
+        };
+        if state_upper == "CLOSED" {
+            return Ok(super::PrStatus {
+                state: "closed".to_string(),
+                mergeable,
+                behind_base,
+                head_sha: Some(doc.head_ref_oid),
+            });
+        }
+
+        let sha = doc.head_ref_oid;
+        let runs_endpoint = format!("repos/{repo}/actions/runs?head_sha={sha}");
+        let runs_args = ["api", runs_endpoint.as_str()];
+        let runs_out = self.run_gh_read(&runs_args, &envs)?;
+        if !runs_out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: runs_args.join(" "),
+                exit_code: runs_out.exit_code,
+                stderr: runs_out.stderr.trim().to_string(),
+            });
+        }
+        let runs_doc: GhWorkflowRunsDoc =
+            serde_json::from_str(runs_out.stdout.trim()).map_err(|e| Error::CliParse {
+                binary: self.gh.clone(),
+                context: "gh api .../actions/runs".to_string(),
+                source: e,
+            })?;
+
+        let status_endpoint = format!("repos/{repo}/commits/{sha}/status");
+        let status_args = ["api", status_endpoint.as_str()];
+        let status_out = self.run_gh_read(&status_args, &envs)?;
+        if !status_out.ok {
+            return Err(Error::CliFailed {
+                binary: self.gh.clone(),
+                args: status_args.join(" "),
+                exit_code: status_out.exit_code,
+                stderr: status_out.stderr.trim().to_string(),
+            });
+        }
+        let status_doc: GhCommitStatusDoc = serde_json::from_str(status_out.stdout.trim())
             .map_err(|e| Error::CliParse {
                 binary: self.gh.clone(),
-                context: "gh pr view --json".to_string(),
+                context: "gh api .../commits/status".to_string(),
                 source: e,
-            })
-            .and_then(|doc| doc.into_pr_status())
+            })?;
+
+        let state = combined_ci_state(&runs_doc.workflow_runs, &status_doc.statuses)?;
+        Ok(super::PrStatus {
+            state,
+            mergeable,
+            behind_base,
+            head_sha: Some(sha),
+        })
     }
 
     /// `gh pr merge <n> --repo <repo> --merge --delete-branch`, run with the
@@ -1197,7 +1286,7 @@ fn parse_pr_from_gh(stdout: &str) -> PullRequest {
     }
 }
 
-/// `gh pr view --json state,mergeable,mergeStateStatus,headRefOid,statusCheckRollup`.
+/// `gh pr view --json state,mergeable,mergeStateStatus,headRefOid`.
 #[derive(Debug, serde::Deserialize)]
 struct GhPrStatusDoc {
     state: String,
@@ -1207,75 +1296,99 @@ struct GhPrStatusDoc {
     merge_state_status: String,
     #[serde(default, rename = "headRefOid")]
     head_ref_oid: String,
-    #[serde(default, rename = "statusCheckRollup")]
-    status_check_rollup: Vec<GhCheckRollupEntry>,
 }
 
-/// One entry of `statusCheckRollup`: either a `CheckRun` (a GitHub Actions job,
-/// discriminated by `status`/`conclusion`) or a `StatusContext` (a legacy
-/// commit status, discriminated by `state`). `__typename` is GitHub's own
-/// discriminator when present; absent, the field shape disambiguates.
+/// Parse `gh pr view --json ...` stdout into a [`GhPrStatusDoc`].
+fn parse_pr_status(stdout: &str) -> std::result::Result<GhPrStatusDoc, serde_json::Error> {
+    serde_json::from_str(stdout.trim())
+}
+
+/// `gh api repos/<repo>/actions/runs?head_sha=<sha>`.
 #[derive(Debug, Default, serde::Deserialize)]
-struct GhCheckRollupEntry {
-    #[serde(default, rename = "__typename")]
-    typename: String,
+struct GhWorkflowRunsDoc {
+    #[serde(default, rename = "workflow_runs")]
+    workflow_runs: Vec<GhWorkflowRun>,
+}
+
+/// One entry of `workflow_runs`. REST reports `status` and `conclusion` in
+/// lowercase, unlike the GraphQL rollup's uppercase enums.
+#[derive(Debug, Default, serde::Deserialize)]
+struct GhWorkflowRun {
     #[serde(default)]
-    status: Option<String>,
+    status: String,
     #[serde(default)]
     conclusion: Option<String>,
-    #[serde(default)]
-    state: Option<String>,
 }
 
-/// One rollup entry's resolved verdict.
+/// `gh api repos/<repo>/commits/<sha>/status`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct GhCommitStatusDoc {
+    #[serde(default)]
+    statuses: Vec<GhCommitStatusEntry>,
+}
+
+/// One entry of the combined status's `statuses` array.
+#[derive(Debug, Default, serde::Deserialize)]
+struct GhCommitStatusEntry {
+    #[serde(default)]
+    state: String,
+}
+
+/// One entry's resolved verdict.
 enum CheckVerdict {
     Success,
     Pending,
     Failure,
 }
 
-/// Resolve one `statusCheckRollup` entry to a [`CheckVerdict`], or an error
-/// naming an unrecognised `conclusion` / `state` value.
-fn check_verdict(entry: &GhCheckRollupEntry) -> Result<CheckVerdict> {
-    let is_status_context = entry.typename == "StatusContext"
-        || (entry.typename.is_empty() && entry.state.is_some() && entry.status.is_none());
-    if is_status_context {
-        let state = entry.state.as_deref().unwrap_or("");
-        return match state {
-            "SUCCESS" => Ok(CheckVerdict::Success),
-            "PENDING" | "EXPECTED" => Ok(CheckVerdict::Pending),
-            "FAILURE" | "ERROR" => Ok(CheckVerdict::Failure),
-            other => Err(Error::Other(anyhow::anyhow!(
-                "gh pr view --json statusCheckRollup: unrecognised StatusContext state `{other}`"
-            ))),
-        };
-    }
-    let status = entry.status.as_deref().unwrap_or("");
-    if status != "COMPLETED" {
+/// Resolve one workflow run to a [`CheckVerdict`], or an error naming an
+/// unrecognised `conclusion` value.
+fn run_verdict(run: &GhWorkflowRun) -> Result<CheckVerdict> {
+    if run.status != "completed" {
         return Ok(CheckVerdict::Pending);
     }
-    let conclusion = entry.conclusion.as_deref().unwrap_or("");
-    match conclusion {
-        "SUCCESS" | "NEUTRAL" | "SKIPPED" => Ok(CheckVerdict::Success),
-        "FAILURE" | "TIMED_OUT" | "CANCELLED" | "STARTUP_FAILURE" | "ACTION_REQUIRED" | "STALE" => {
+    match run.conclusion.as_deref().unwrap_or("") {
+        "success" | "neutral" | "skipped" => Ok(CheckVerdict::Success),
+        "failure" | "timed_out" | "cancelled" | "startup_failure" | "action_required" | "stale" => {
             Ok(CheckVerdict::Failure)
         }
         other => Err(Error::Other(anyhow::anyhow!(
-            "gh pr view --json statusCheckRollup: unrecognised CheckRun conclusion `{other}`"
+            "gh api .../actions/runs: unrecognised workflow run conclusion `{other}`"
         ))),
     }
 }
 
-/// Combine every rollup entry's verdict: any failure wins, else any pending,
-/// else success. An empty rollup is `"pending"`, never `"success"`: no checks
-/// reported is not a green verdict.
-fn combined_rollup_state(rollup: &[GhCheckRollupEntry]) -> Result<String> {
-    if rollup.is_empty() {
+/// Resolve one combined-status entry to a [`CheckVerdict`], or an error
+/// naming an unrecognised `state` value.
+fn status_verdict(entry: &GhCommitStatusEntry) -> Result<CheckVerdict> {
+    match entry.state.as_str() {
+        "success" => Ok(CheckVerdict::Success),
+        "pending" => Ok(CheckVerdict::Pending),
+        "failure" | "error" => Ok(CheckVerdict::Failure),
+        other => Err(Error::Other(anyhow::anyhow!(
+            "gh api .../commits/status: unrecognised status state `{other}`"
+        ))),
+    }
+}
+
+/// Combine every workflow run's and commit status's verdict: any failure
+/// wins, else any pending, else success. An empty set (no runs and no
+/// statuses) is `"pending"`, never `"success"`: nothing reported is not a
+/// green verdict.
+fn combined_ci_state(runs: &[GhWorkflowRun], statuses: &[GhCommitStatusEntry]) -> Result<String> {
+    if runs.is_empty() && statuses.is_empty() {
         return Ok("pending".to_string());
     }
     let mut any_pending = false;
-    for entry in rollup {
-        match check_verdict(entry)? {
+    for run in runs {
+        match run_verdict(run)? {
+            CheckVerdict::Failure => return Ok("failure".to_string()),
+            CheckVerdict::Pending => any_pending = true,
+            CheckVerdict::Success => {}
+        }
+    }
+    for entry in statuses {
+        match status_verdict(entry)? {
             CheckVerdict::Failure => return Ok("failure".to_string()),
             CheckVerdict::Pending => any_pending = true,
             CheckVerdict::Success => {}
@@ -1286,58 +1399,6 @@ fn combined_rollup_state(rollup: &[GhCheckRollupEntry]) -> Result<String> {
     } else {
         "success".to_string()
     })
-}
-
-impl GhPrStatusDoc {
-    /// Map this document onto [`super::PrStatus`], per the contract documented
-    /// on [`Forge::pr_status`]'s GitHub override.
-    fn into_pr_status(self) -> Result<super::PrStatus> {
-        let state_upper = self.state.to_ascii_uppercase();
-        if state_upper == "MERGED" {
-            return Ok(super::PrStatus {
-                state: "merged".to_string(),
-                mergeable: None,
-                behind_base: None,
-                head_sha: None,
-            });
-        }
-        let state = if state_upper == "CLOSED" {
-            "closed".to_string()
-        } else {
-            combined_rollup_state(&self.status_check_rollup)?
-        };
-        let mergeable = match self.mergeable.as_str() {
-            "MERGEABLE" => Some(true),
-            "CONFLICTING" => Some(false),
-            "UNKNOWN" => None,
-            other => {
-                return Err(Error::Other(anyhow::anyhow!(
-                    "gh pr view --json mergeable: unrecognised value `{other}`"
-                )))
-            }
-        };
-        let behind_base = match self.merge_state_status.as_str() {
-            "BEHIND" => Some(true),
-            "BLOCKED" | "CLEAN" | "DIRTY" | "DRAFT" | "HAS_HOOKS" | "UNSTABLE" => Some(false),
-            "UNKNOWN" => None,
-            other => {
-                return Err(Error::Other(anyhow::anyhow!(
-                    "gh pr view --json mergeStateStatus: unrecognised value `{other}`"
-                )))
-            }
-        };
-        Ok(super::PrStatus {
-            state,
-            mergeable,
-            behind_base,
-            head_sha: Some(self.head_ref_oid),
-        })
-    }
-}
-
-/// Parse `gh pr view --json ...` stdout into a [`GhPrStatusDoc`].
-fn parse_pr_status(stdout: &str) -> std::result::Result<GhPrStatusDoc, serde_json::Error> {
-    serde_json::from_str(stdout.trim())
 }
 
 /// One entry of `gh pr list --json number,title,headRefOid,headRefName,baseRefName,author,url`.
@@ -2669,12 +2730,40 @@ mod tests {
             "--repo",
             repo,
             "--json",
-            "state,mergeable,mergeStateStatus,headRefOid,statusCheckRollup",
+            "state,mergeable,mergeStateStatus,headRefOid",
         ]
     }
 
-    fn pr_status_runner(json: &str) -> Arc<StubRunner> {
-        Arc::new(StubRunner::new().ok("gh", &pr_view_args("octo/widget", "42"), json))
+    /// The args `pr_status` passes to `gh api .../actions/runs`.
+    fn pr_runs_args(repo: &str, sha: &str) -> Vec<String> {
+        vec![
+            "api".to_string(),
+            format!("repos/{repo}/actions/runs?head_sha={sha}"),
+        ]
+    }
+
+    /// The args `pr_status` passes to `gh api .../commits/<sha>/status`.
+    fn pr_commit_status_args(repo: &str, sha: &str) -> Vec<String> {
+        vec![
+            "api".to_string(),
+            format!("repos/{repo}/commits/{sha}/status"),
+        ]
+    }
+
+    /// Build a `StubRunner` answering the `pr view` call plus the two CI
+    /// reads (workflow runs, combined commit status) for an open PR with
+    /// head SHA `abc123`.
+    fn pr_status_runner(view_json: &str, runs_json: &str, status_json: &str) -> Arc<StubRunner> {
+        let runs_args = pr_runs_args("octo/widget", "abc123");
+        let runs_args: Vec<&str> = runs_args.iter().map(String::as_str).collect();
+        let status_args = pr_commit_status_args("octo/widget", "abc123");
+        let status_args: Vec<&str> = status_args.iter().map(String::as_str).collect();
+        Arc::new(
+            StubRunner::new()
+                .ok("gh", &pr_view_args("octo/widget", "42"), view_json)
+                .ok("gh", &runs_args, runs_json)
+                .ok("gh", &status_args, status_json),
+        )
     }
 
     fn pr_status_forge(runner: Arc<StubRunner>) -> GithubForge {
@@ -2685,10 +2774,14 @@ mod tests {
         )
     }
 
+    const EMPTY_RUNS: &str = r#"{"workflow_runs":[]}"#;
+    const EMPTY_COMMIT_STATUS: &str = r#"{"statuses":[]}"#;
+
     #[test]
     fn pr_status_all_checks_green_and_clean() {
-        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(
             status,
@@ -2703,8 +2796,9 @@ mod tests {
 
     #[test]
     fn pr_status_failed_check() {
-        let json = r#"{"state":"OPEN","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"}]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+        let view = r#"{"state":"OPEN","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"},{"status":"completed","conclusion":"failure"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.state, "failure");
         assert_eq!(status.mergeable, Some(false));
@@ -2712,17 +2806,27 @@ mod tests {
     }
 
     #[test]
+    fn pr_status_failed_commit_status() {
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let status = r#"{"statuses":[{"state":"failure"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, EMPTY_RUNS, status));
+        let result = forge.pr_status("github.com", "octo/widget", 42).unwrap();
+        assert_eq!(result.state, "failure");
+    }
+
+    #[test]
     fn pr_status_in_progress_check() {
-        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":null}]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"status":"in_progress","conclusion":null}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.state, "pending");
     }
 
     #[test]
     fn pr_status_empty_rollup_is_pending_never_success() {
-        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let forge = pr_status_forge(pr_status_runner(view, EMPTY_RUNS, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.state, "pending");
     }
@@ -2731,8 +2835,9 @@ mod tests {
     fn pr_status_behind_base() {
         // `mergeable` stays `Some(true)` for a BEHIND PR, which is what
         // `apply_automerge_decision` expects (behind-base checked first).
-        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"BEHIND","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"BEHIND","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.behind_base, Some(true));
         assert_eq!(status.mergeable, Some(true));
@@ -2740,16 +2845,18 @@ mod tests {
 
     #[test]
     fn pr_status_conflicting() {
-        let json = r#"{"state":"OPEN","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+        let view = r#"{"state":"OPEN","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.mergeable, Some(false));
     }
 
     #[test]
     fn pr_status_unknown_mergeability() {
-        let json = r#"{"state":"OPEN","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+        let view = r#"{"state":"OPEN","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.mergeable, None);
         assert_eq!(status.behind_base, None);
@@ -2757,8 +2864,11 @@ mod tests {
 
     #[test]
     fn pr_status_merged() {
-        let json = r#"{"state":"MERGED","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefOid":"abc123","statusCheckRollup":[]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+        // A merged PR short-circuits before the CI reads, so no runner
+        // response is registered for them.
+        let view = r#"{"state":"MERGED","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefOid":"abc123"}"#;
+        let runner = Arc::new(StubRunner::new().ok("gh", &pr_view_args("octo/widget", "42"), view));
+        let forge = pr_status_forge(runner);
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(
             status,
@@ -2773,27 +2883,70 @@ mod tests {
 
     #[test]
     fn pr_status_closed() {
-        let json = r#"{"state":"CLOSED","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefOid":"abc123","statusCheckRollup":[]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+        // A closed PR short-circuits before the CI reads, so no runner
+        // response is registered for them.
+        let view = r#"{"state":"CLOSED","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefOid":"abc123"}"#;
+        let runner = Arc::new(StubRunner::new().ok("gh", &pr_view_args("octo/widget", "42"), view));
+        let forge = pr_status_forge(runner);
         let status = forge.pr_status("github.com", "octo/widget", 42).unwrap();
         assert_eq!(status.state, "closed");
     }
 
     #[test]
-    fn pr_status_unrecognised_check_conclusion_errors() {
-        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"WEIRD"}]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+    fn pr_status_unrecognised_run_conclusion_errors() {
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let runs = r#"{"workflow_runs":[{"status":"completed","conclusion":"weird"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, runs, EMPTY_COMMIT_STATUS));
         let err = forge
             .pr_status("github.com", "octo/widget", 42)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("WEIRD"), "got {err}");
+        assert!(err.contains("weird"), "got {err}");
+    }
+
+    #[test]
+    fn pr_status_unrecognised_commit_status_state_errors() {
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let status = r#"{"statuses":[{"state":"weird"}]}"#;
+        let forge = pr_status_forge(pr_status_runner(view, EMPTY_RUNS, status));
+        let err = forge
+            .pr_status("github.com", "octo/widget", 42)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("weird"), "got {err}");
+    }
+
+    #[test]
+    fn pr_status_failing_ci_read_surfaces_stderr_not_a_verdict() {
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let runs_args = pr_runs_args("octo/widget", "abc123");
+        let runs_args: Vec<&str> = runs_args.iter().map(String::as_str).collect();
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok("gh", &pr_view_args("octo/widget", "42"), view)
+                .fail(
+                    "gh",
+                    &runs_args,
+                    1,
+                    "Resource not accessible by personal access token",
+                ),
+        );
+        let forge = pr_status_forge(runner);
+        let err = forge
+            .pr_status("github.com", "octo/widget", 42)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Resource not accessible by personal access token"),
+            "got {err}"
+        );
     }
 
     #[test]
     fn pr_status_unrecognised_mergeable_errors() {
-        let json = r#"{"state":"OPEN","mergeable":"WEIRD","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+        let view = r#"{"state":"OPEN","mergeable":"WEIRD","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let runner = Arc::new(StubRunner::new().ok("gh", &pr_view_args("octo/widget", "42"), view));
+        let forge = pr_status_forge(runner);
         let err = forge
             .pr_status("github.com", "octo/widget", 42)
             .unwrap_err()
@@ -2804,8 +2957,9 @@ mod tests {
 
     #[test]
     fn pr_status_unrecognised_merge_state_status_errors() {
-        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"WEIRD","headRefOid":"abc123","statusCheckRollup":[]}"#;
-        let forge = pr_status_forge(pr_status_runner(json));
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"WEIRD","headRefOid":"abc123"}"#;
+        let runner = Arc::new(StubRunner::new().ok("gh", &pr_view_args("octo/widget", "42"), view));
+        let forge = pr_status_forge(runner);
         let err = forge
             .pr_status("github.com", "octo/widget", 42)
             .unwrap_err()
@@ -2816,8 +2970,8 @@ mod tests {
 
     #[test]
     fn pr_status_omits_gh_token_when_forge_has_none() {
-        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[]}"#;
-        let runner = Arc::new(StubRunner::new().ok("gh", &pr_view_args("octo/widget", "42"), json));
+        let view = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123"}"#;
+        let runner = pr_status_runner(view, EMPTY_RUNS, EMPTY_COMMIT_STATUS);
         let forge = GithubForge::new(
             runner.clone(),
             "https://api.githubcopilot.com/mcp/".into(),
@@ -2825,8 +2979,8 @@ mod tests {
         );
         forge.pr_status("github.com", "octo/widget", 42).unwrap();
         let envs = runner.envs.lock().unwrap();
-        assert_eq!(envs.len(), 1);
-        assert!(envs[0].1.is_empty(), "{:?}", envs[0]);
+        assert_eq!(envs.len(), 3);
+        assert!(envs.iter().all(|e| e.1.is_empty()), "{:?}", envs);
     }
 
     #[test]
@@ -3070,7 +3224,9 @@ mod tests {
 
     #[test]
     fn pr_status_retries_once_and_succeeds_on_second_attempt() {
-        let json = r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","headRefOid":"abc123","statusCheckRollup":[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
+        // CLOSED short-circuits before the CI reads, so the retry on the `pr
+        // view` read is exercised without needing to stub them too.
+        let json = r#"{"state":"CLOSED","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefOid":"abc123"}"#;
         let runner = Arc::new(
             StubRunner::new()
                 .fail_once(
