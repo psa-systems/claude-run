@@ -138,7 +138,7 @@
     <div class="grid2">
       {% call m::tokenfield("Token secret", "github_token_ref", form.github_token_ref, secrets) %}
     </div>
-    <p class="hint dim"><code>github.com</code> repos need no token (host <code>gh</code> auth is the fallback). The PAT needs <code>repo</code> + <code>pull_request</code> scope. GitHub automerge does not read this field: it uses the Settings -> Auth GitHub login, which must be a classic PAT with <code>repo</code> (a fine-grained PAT cannot read check runs). <code>hosts</code> (GitHub Enterprise) and <code>mcp_endpoint</code> are advanced fields edited via the raw-YAML editor; they are preserved on save.</p>
+    <p class="hint dim"><code>github.com</code> repos need no token (host <code>gh</code> auth is the fallback). The PAT needs <code>repo</code> + <code>pull_request</code> scope (or the fine-grained equivalent). GitHub automerge does not read this field: it uses the Settings -> Auth GitHub login, which can be a classic PAT with <code>repo</code> or a fine-grained PAT with <code>Pull requests: Read</code>, <code>Actions: Read</code> and <code>Commit statuses: Read</code>. <code>hosts</code> (GitHub Enterprise) and <code>mcp_endpoint</code> are advanced fields edited via the raw-YAML editor; they are preserved on save.</p>
   </div>
 
   {% call m::schedule_block(form.schedule_kind, form.schedule_spec) %}

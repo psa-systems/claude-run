@@ -12608,7 +12608,7 @@ mod tests {
             /// `gh pr view`'s JSON for a green, clean (or behind-base) PR.
             fn gh_pr_view_json(merge_state_status: &str) -> String {
                 format!(
-                    r#"{{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"{merge_state_status}","headRefOid":"abc123","statusCheckRollup":[{{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}}]}}"#
+                    r#"{{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"{merge_state_status}","headRefOid":"abc123"}}"#
                 )
             }
 
@@ -12620,9 +12620,29 @@ mod tests {
                     "--repo",
                     repo,
                     "--json",
-                    "state,mergeable,mergeStateStatus,headRefOid,statusCheckRollup",
+                    "state,mergeable,mergeStateStatus,headRefOid",
                 ]
             }
+
+            /// The args and green JSON `pr_status` uses for the two
+            /// fine-grained-PAT-friendly CI reads (CLAUDE-419) on an open PR
+            /// with head SHA `abc123`.
+            fn gh_pr_runs_args(repo: &str) -> Vec<String> {
+                vec![
+                    "api".to_string(),
+                    format!("repos/{repo}/actions/runs?head_sha=abc123"),
+                ]
+            }
+            const GH_PR_RUNS_JSON_GREEN: &str =
+                r#"{"workflow_runs":[{"status":"completed","conclusion":"success"}]}"#;
+
+            fn gh_pr_commit_status_args(repo: &str) -> Vec<String> {
+                vec![
+                    "api".to_string(),
+                    format!("repos/{repo}/commits/abc123/status"),
+                ]
+            }
+            const GH_PR_COMMIT_STATUS_JSON_EMPTY: &str = r#"{"statuses":[]}"#;
 
             async fn seeded_github_row(pool: &DbPool) -> ci_failure_store::AgentPullRequest {
                 ci_failure_store::record_agent_pr(
@@ -12658,6 +12678,10 @@ mod tests {
                 write_youtrack_action(dir.path(), "yt", true);
                 let backend = Arc::new(StoreBackend::new().with_pr_status("success", true));
                 let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+                let runs_args = gh_pr_runs_args("octo/widget");
+                let runs_args: Vec<&str> = runs_args.iter().map(String::as_str).collect();
+                let status_args = gh_pr_commit_status_args("octo/widget");
+                let status_args: Vec<&str> = status_args.iter().map(String::as_str).collect();
                 let runner = Arc::new(
                     crate::provider::cli::testutil::StubRunner::new()
                         .ok(
@@ -12665,6 +12689,8 @@ mod tests {
                             &gh_pr_view_args("octo/widget"),
                             &gh_pr_view_json("CLEAN"),
                         )
+                        .ok("gh", &runs_args, GH_PR_RUNS_JSON_GREEN)
+                        .ok("gh", &status_args, GH_PR_COMMIT_STATUS_JSON_EMPTY)
                         .ok(
                             "gh",
                             &[
@@ -12734,11 +12760,20 @@ mod tests {
                 write_youtrack_action(dir.path(), "yt", true);
                 let backend = Arc::new(StoreBackend::new());
                 let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
-                let runner = Arc::new(crate::provider::cli::testutil::StubRunner::new().ok(
-                    "gh",
-                    &gh_pr_view_args("octo/widget"),
-                    &gh_pr_view_json("UNKNOWN"),
-                ));
+                let runs_args = gh_pr_runs_args("octo/widget");
+                let runs_args: Vec<&str> = runs_args.iter().map(String::as_str).collect();
+                let status_args = gh_pr_commit_status_args("octo/widget");
+                let status_args: Vec<&str> = status_args.iter().map(String::as_str).collect();
+                let runner = Arc::new(
+                    crate::provider::cli::testutil::StubRunner::new()
+                        .ok(
+                            "gh",
+                            &gh_pr_view_args("octo/widget"),
+                            &gh_pr_view_json("UNKNOWN"),
+                        )
+                        .ok("gh", &runs_args, GH_PR_RUNS_JSON_GREEN)
+                        .ok("gh", &status_args, GH_PR_COMMIT_STATUS_JSON_EMPTY),
+                );
                 let ctx = store_mint_context_in(
                     pool.clone(),
                     backend.clone(),
@@ -12802,6 +12837,10 @@ mod tests {
                 write_youtrack_action(dir.path(), "yt", true);
                 let backend = Arc::new(StoreBackend::new());
                 let classifier: Arc<dyn FailureClassifier> = Arc::new(CountingClassifier::new());
+                let runs_args = gh_pr_runs_args("octo/widget");
+                let runs_args: Vec<&str> = runs_args.iter().map(String::as_str).collect();
+                let status_args = gh_pr_commit_status_args("octo/widget");
+                let status_args: Vec<&str> = status_args.iter().map(String::as_str).collect();
                 let runner = Arc::new(
                     crate::provider::cli::testutil::StubRunner::new()
                         .ok(
@@ -12809,6 +12848,8 @@ mod tests {
                             &gh_pr_view_args("octo/widget"),
                             &gh_pr_view_json("BEHIND"),
                         )
+                        .ok("gh", &runs_args, GH_PR_RUNS_JSON_GREEN)
+                        .ok("gh", &status_args, GH_PR_COMMIT_STATUS_JSON_EMPTY)
                         .ok(
                             "gh",
                             &["pr", "update-branch", "42", "--repo", "octo/widget"],
@@ -12882,6 +12923,22 @@ mod tests {
                             "gh",
                             &gh_pr_view_args("octo/widget"),
                             &gh_pr_view_json("CLEAN"),
+                        )
+                        .ok(
+                            "gh",
+                            &gh_pr_runs_args("octo/widget")
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
+                            GH_PR_RUNS_JSON_GREEN,
+                        )
+                        .ok(
+                            "gh",
+                            &gh_pr_commit_status_args("octo/widget")
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
+                            GH_PR_COMMIT_STATUS_JSON_EMPTY,
                         )
                         .ok(
                             "gh",
