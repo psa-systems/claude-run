@@ -676,7 +676,7 @@ pub(crate) const CREDENTIAL_HELPER: &str = concat!(
 /// configured. `credential.helper=` (empty value) first CLEARS any inherited
 /// helper list: git accumulates `credential.helper` entries, so without this
 /// an inherited helper could still answer (or cache) ahead of this one.
-fn credential_helper_args() -> [&'static str; 4] {
+pub(crate) fn credential_helper_args() -> [&'static str; 4] {
     ["-c", "credential.helper=", "-c", CREDENTIAL_HELPER]
 }
 
@@ -1232,8 +1232,10 @@ fn restore_default_branch_refs_retrying(
 /// is persisted to `run_events` and can reach a YouTrack comment.
 pub fn git_error(context: &str, out: &std::process::Output, url: Option<&str>) -> Error {
     let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let secrets = url.map(url_secrets).unwrap_or_default();
     let detail = clone_error_tail(&crate::forge_log::redact(stderr.trim(), &secrets));
+    let detail = append_stdout_tail(&detail, &stdout, &secrets);
     Error::Other(anyhow::anyhow!(
         "git {context} exited {}{}",
         out.status.code().unwrap_or(-1),
@@ -1243,6 +1245,40 @@ pub fn git_error(context: &str, out: &std::process::Output, url: Option<&str>) -
             format!(": {detail}")
         }
     ))
+}
+
+/// The most stdout lines a failed call's error text carries (CLAUDE-422).
+const STDOUT_TAIL_MAX_LINES: usize = 40;
+
+/// The most stdout bytes a failed call's error text carries (CLAUDE-422).
+const STDOUT_TAIL_MAX_BYTES: usize = 4000;
+
+/// Append a bounded, redacted tail of a failed call's `stdout` to its error text
+/// (CLAUDE-422). A `pre-push` hook writes its test report to stdout, which git
+/// does not fold into stderr, so a stderr-only message names no failing test.
+/// The tail is the last [`STDOUT_TAIL_MAX_LINES`] lines and at most
+/// [`STDOUT_TAIL_MAX_BYTES`] bytes, redacted with `secrets` before it is cut so a
+/// credential straddling the cut is never half-shown. Empty stdout returns
+/// `stderr` unchanged.
+pub(crate) fn append_stdout_tail(stderr: &str, stdout: &str, secrets: &[String]) -> String {
+    let stdout = stdout.trim();
+    if stdout.is_empty() {
+        return stderr.to_string();
+    }
+    let redacted = crate::forge_log::redact(stdout, secrets);
+    let lines: Vec<&str> = redacted.lines().collect();
+    let by_lines = lines[lines.len().saturating_sub(STDOUT_TAIL_MAX_LINES)..].join("\n");
+    let mut start = by_lines.len().saturating_sub(STDOUT_TAIL_MAX_BYTES);
+    while !by_lines.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = by_lines[start..].trim();
+    let stderr = crate::forge_log::redact(stderr, secrets);
+    if stderr.is_empty() {
+        format!("--- stdout ---\n{tail}")
+    } else {
+        format!("{stderr}\n--- stdout ---\n{tail}")
+    }
 }
 
 /// The credential inside a clone URL's userinfo (`https://user:TOKEN@host/...`),
@@ -1630,6 +1666,64 @@ mod tests {
         );
         assert!(url_secrets("https://host/owner/repo.git").is_empty());
         assert!(url_secrets("/local/path.git").is_empty());
+    }
+
+    #[test]
+    fn append_stdout_tail_is_a_no_op_for_empty_stdout() {
+        assert_eq!(append_stdout_tail("boom", "", &[]), "boom");
+        assert_eq!(append_stdout_tail("boom", " \n ", &[]), "boom");
+    }
+
+    #[test]
+    fn append_stdout_tail_keeps_only_the_last_forty_lines() {
+        let stdout: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+        let text = append_stdout_tail("e", &stdout, &[]);
+        let tail = text.split_once("--- stdout ---\n").unwrap().1;
+        assert_eq!(tail.lines().count(), STDOUT_TAIL_MAX_LINES);
+        assert!(tail.starts_with("line 61"), "{tail}");
+        assert!(tail.ends_with("line 100"), "{tail}");
+    }
+
+    /// The byte bound applies on a char boundary, so a multi-byte tail never panics.
+    #[test]
+    fn append_stdout_tail_bounds_bytes_on_a_char_boundary() {
+        let stdout = "e\u{301}".repeat(3000) + "\nlast";
+        let text = append_stdout_tail("e", &stdout, &[]);
+        let tail = text.split_once("--- stdout ---\n").unwrap().1;
+        assert!(tail.len() <= STDOUT_TAIL_MAX_BYTES, "{}", tail.len());
+        assert!(tail.ends_with("last"), "{tail}");
+    }
+
+    #[test]
+    fn append_stdout_tail_redacts_known_secrets_before_cutting() {
+        let secret = "s3cretTokenValue99".to_string();
+        let text = append_stdout_tail(
+            "e",
+            &format!("x {secret} y\nfailures:"),
+            std::slice::from_ref(&secret),
+        );
+        assert!(!text.contains(&secret), "{text}");
+        assert!(text.contains("failures:"), "{text}");
+    }
+
+    /// CLAUDE-422: a failing `pre-push` hook's report is on git's stdout.
+    #[test]
+    fn git_error_carries_the_stdout_tail_after_the_stderr_tail() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: b"running 1 test\nfailures:\n    some::test\n".to_vec(),
+            stderr: b"error: failed to push some refs\n".to_vec(),
+        };
+        let msg = git_error("push", &out, None).to_string();
+        assert!(
+            msg.contains("exited 1: error: failed to push some refs"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("--- stdout ---\nrunning 1 test\nfailures:\n    some::test"),
+            "{msg}"
+        );
     }
 
     /// The tail keeps the cause and drops git's banner, which is what makes the

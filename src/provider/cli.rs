@@ -1000,7 +1000,7 @@ impl CliBackend {
                 )
             },
         )?;
-        let stdout = Self::checked("git", out, &args)?;
+        let stdout = Self::checked_redacting("git", out, &args, &secrets)?;
         Ok(stdout
             .lines()
             .next()
@@ -1046,7 +1046,7 @@ impl CliBackend {
                     token_url,
                 )
             })?;
-        Self::checked("git", out, &args)?;
+        Self::checked_redacting("git", out, &args, &secrets)?;
         Ok(())
     }
 
@@ -1073,7 +1073,8 @@ impl CliBackend {
         if out.ok {
             return Ok(());
         }
-        let merge_stderr = out.stderr.trim().to_string();
+        // `git merge` prints its CONFLICT lines on stdout, not stderr.
+        let merge_stderr = crate::provider::append_stdout_tail(out.stderr.trim(), &out.stdout, &[]);
         error!(
             branch = %branch,
             local_sha = %local_sha,
@@ -1114,7 +1115,7 @@ impl CliBackend {
                     token_url,
                 )
             })?;
-        Self::checked("git", out, &push_args)?;
+        Self::checked_redacting("git", out, &push_args, &secrets)?;
         Ok(())
     }
 
@@ -1486,6 +1487,18 @@ impl CliBackend {
 
     /// Convert a [`CmdOutput`] into trimmed stdout or a typed [`Error::CliFailed`].
     fn checked(binary: &str, out: CmdOutput, args: &[&str]) -> Result<String> {
+        Self::checked_redacting(binary, out, args, &[])
+    }
+
+    /// [`Self::checked`] for a call that ran with credentials: `secrets` are
+    /// masked out of the failure text. A failure carries the tail of stdout after
+    /// stderr (CLAUDE-422), because a `pre-push` hook writes its test report there.
+    fn checked_redacting(
+        binary: &str,
+        out: CmdOutput,
+        args: &[&str],
+        secrets: &[String],
+    ) -> Result<String> {
         if out.ok {
             Ok(out.stdout)
         } else {
@@ -1493,7 +1506,11 @@ impl CliBackend {
                 binary: binary.to_string(),
                 args: args.join(" "),
                 exit_code: out.exit_code,
-                stderr: out.stderr.trim().to_string(),
+                stderr: crate::provider::append_stdout_tail(
+                    out.stderr.trim(),
+                    &out.stdout,
+                    secrets,
+                ),
             })
         }
     }
@@ -2549,6 +2566,29 @@ pub mod testutil {
                 CmdOutput {
                     ok: false,
                     stdout: String::new(),
+                    stderr: stderr.to_string(),
+                    exit_code,
+                },
+            );
+            self
+        }
+
+        /// Register a failing response (non-zero exit) that wrote to BOTH streams,
+        /// as a failing `pre-push` hook does: its test report on stdout, git's
+        /// own banner on stderr.
+        pub fn fail_with_stdout(
+            mut self,
+            binary: &str,
+            args: &[&str],
+            exit_code: i32,
+            stdout: &str,
+            stderr: &str,
+        ) -> Self {
+            self.responses.insert(
+                Self::key(binary, args),
+                CmdOutput {
+                    ok: false,
+                    stdout: stdout.to_string(),
                     stderr: stderr.to_string(),
                     exit_code,
                 },
@@ -4705,6 +4745,70 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("non-fast-forward"), "{err}");
         assert_eq!(runner.calls.lock().unwrap().len(), 4);
+    }
+
+    /// CLAUDE-422: a failing `pre-push` hook writes its test report to stdout and
+    /// git's banner to stderr; the failure text must carry both.
+    #[test]
+    fn push_branch_failure_carries_the_hook_stdout_and_the_git_stderr() {
+        let args = ["push", "--set-upstream", "origin", "feature:feature"];
+        let runner = Arc::new(StubRunner::new().fail_with_stdout(
+            "git",
+            &args,
+            1,
+            "running 2 tests\nfailures:\n    web::the_failing_test\n",
+            "error: failed to push some refs to 'origin'",
+        ));
+        let b = CliBackend::new(runner).with_git_retry_waits(NO_WAIT);
+        let err = b
+            .push_branch(Path::new("/tmp/wd"), "feature", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to push some refs"), "{err}");
+        assert!(err.contains("--- stdout ---"), "{err}");
+        assert!(err.contains("web::the_failing_test"), "{err}");
+        assert!(
+            err.find("failed to push").unwrap() < err.find("--- stdout ---").unwrap(),
+            "stderr comes first: {err}"
+        );
+    }
+
+    /// A failure with no stdout reads exactly as it did before CLAUDE-422.
+    #[test]
+    fn a_failed_call_with_empty_stdout_keeps_its_stderr_text_unchanged() {
+        let out = CmdOutput {
+            ok: false,
+            stdout: "  \n".to_string(),
+            stderr: " boom \n".to_string(),
+            exit_code: 2,
+        };
+        match CliBackend::checked("fj", out, &["pr", "view"]).unwrap_err() {
+            Error::CliFailed { stderr, .. } => assert_eq!(stderr, "boom"),
+            other => panic!("expected CliFailed, got {other:?}"),
+        }
+    }
+
+    /// A credential a hook echoes on stdout never reaches the failure text.
+    #[test]
+    fn push_branch_redacts_the_token_url_secret_from_the_stdout_tail() {
+        let token_url = "https://bot:s3cretTokenValue99@example.invalid/o/r.git";
+        let args = ["push", "--set-upstream", "origin", "feature:feature"];
+        let mut full: Vec<&str> = crate::provider::credential_helper_args().to_vec();
+        full.extend(args);
+        let runner = Arc::new(StubRunner::new().fail_with_stdout(
+            "git",
+            &full,
+            1,
+            "hook saw s3cretTokenValue99 in its environment\nfailures:\n    a::b\n",
+            "error: failed to push some refs",
+        ));
+        let b = CliBackend::new(runner).with_git_retry_waits(NO_WAIT);
+        let err = b
+            .push_branch(Path::new("/tmp/wd"), "feature", Some(token_url))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a::b"), "{err}");
+        assert!(!err.contains("s3cretTokenValue99"), "{err}");
     }
 
     #[test]
