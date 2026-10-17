@@ -4475,6 +4475,18 @@ fn section_fields(section: crate::settings::Section) -> Vec<FieldDoc> {
                 note: "age past which job_outcomes / run_events / ci_failure_runs rows are pruned; must be >= 90 (the longest report range).",
             },
         ],
+        DockerGc => vec![
+            FieldDoc {
+                name: "enabled",
+                badge: "next sweep",
+                note: "master toggle; false parks the Docker sidecar volume sweep without losing the window.",
+            },
+            FieldDoc {
+                name: "volume_retention_days",
+                badge: "next sweep",
+                note: "age past which an unused named volume in the sidecar is removed, measured from Docker's CreatedAt; must be >= 1.",
+            },
+        ],
     }
 }
 

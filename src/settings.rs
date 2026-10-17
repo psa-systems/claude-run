@@ -33,8 +33,8 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{
     AuthConfig, ClaudeConfig, ClaudeConfigHandle, CommentWebhookConfig, CommentWebhookSource,
-    ConcurrencyConfig, DbRetentionConfig, MintConfig, OnDiskConfig, Paths, PreferencesConfig,
-    StreamLogGcConfig, WebhookConfig, WebhookSource, WorkdirGcConfig,
+    ConcurrencyConfig, DbRetentionConfig, DockerGcConfig, MintConfig, OnDiskConfig, Paths,
+    PreferencesConfig, StreamLogGcConfig, WebhookConfig, WebhookSource, WorkdirGcConfig,
 };
 use crate::error::Result;
 use crate::state::now_iso;
@@ -67,11 +67,13 @@ pub enum Section {
     /// editor, because the values are secrets typed into password fields; the
     /// document stored here holds only URLs and secret NAMES.
     Auth,
+    /// Docker sidecar named-volume GC retention window (CLAUDE-433).
+    DockerGc,
 }
 
 impl Section {
     /// Every section, in display order (used by the Settings page).
-    pub const ALL: [Section; 11] = [
+    pub const ALL: [Section; 12] = [
         Section::Mint,
         Section::Webhook,
         Section::WebhookComment,
@@ -81,6 +83,7 @@ impl Section {
         Section::Preferences,
         Section::Concurrency,
         Section::DbRetention,
+        Section::DockerGc,
         Section::Claude,
         Section::Auth,
     ];
@@ -99,6 +102,7 @@ impl Section {
             Section::WebhookComment => "config.webhook_comment",
             Section::Claude => "config.claude",
             Section::Auth => "config.auth",
+            Section::DockerGc => "config.docker_gc",
         }
     }
 
@@ -116,6 +120,7 @@ impl Section {
             Section::WebhookComment => "webhook_comment",
             Section::Claude => "claude",
             Section::Auth => "auth",
+            Section::DockerGc => "docker_gc",
         }
     }
 
@@ -138,6 +143,7 @@ impl Section {
             Section::WebhookComment => "Comment webhook",
             Section::Claude => "Claude invocation",
             Section::Auth => "Service auth",
+            Section::DockerGc => "Docker volume GC",
         }
     }
 
@@ -154,6 +160,7 @@ impl Section {
             Section::WebhookComment => "live",
             Section::Claude => "next invocation",
             Section::Auth => "live",
+            Section::DockerGc => "next sweep",
         }
     }
 }
@@ -362,6 +369,10 @@ pub struct EffectiveRuntime {
     /// `config.toml` section), so the DB value or the built-in default (nothing
     /// configured, i.e. host auth as before).
     pub auth: AuthConfig,
+    /// Docker sidecar named-volume GC retention window. Brand-new section
+    /// (never in `config.toml`), so the DB value or the built-in default (3
+    /// days).
+    pub docker_gc: DockerGcConfig,
 }
 
 /// Resolve [`EffectiveRuntime`] from the DB, falling back to `file` (the parsed
@@ -401,6 +412,9 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
     let auth = get_json::<AuthConfig>(pool, Section::Auth.key())
         .await?
         .unwrap_or_default();
+    let docker_gc = get_json::<DockerGcConfig>(pool, Section::DockerGc.key())
+        .await?
+        .unwrap_or_default();
     Ok(EffectiveRuntime {
         mint,
         webhook,
@@ -413,6 +427,7 @@ pub async fn effective(pool: &DbPool, file: &OnDiskConfig) -> Result<EffectiveRu
         webhook_comment,
         claude,
         auth,
+        docker_gc,
     })
 }
 
@@ -440,6 +455,17 @@ pub fn validate_db_retention(cfg: &DbRetentionConfig) -> std::result::Result<(),
         return Err(format!(
             "retention_days must be >= {MIN_DB_RETENTION_DAYS} (the longest report range) so reports are not truncated"
         ));
+    }
+    Ok(())
+}
+
+/// Validate a [`DockerGcConfig`] before it is persisted: `volume_retention_days`
+/// must be at least 1, since Docker records no last-used time and a 0-day
+/// window would remove a volume a session created moments ago while its
+/// container was between restarts.
+pub fn validate_docker_gc(cfg: &DockerGcConfig) -> std::result::Result<(), String> {
+    if cfg.volume_retention_days < 1 {
+        return Err("volume_retention_days must be >= 1".to_string());
     }
     Ok(())
 }
@@ -624,6 +650,9 @@ pub struct LiveSettings {
     /// re-materializes the `yt` / `fj` credential files and by the Settings
     /// page's Auth card.
     auth: Arc<RwLock<AuthConfig>>,
+    /// Docker sidecar named-volume GC config, read by the sweeper on each tick
+    /// so a Settings save applies on the next sweep.
+    docker_gc: Arc<RwLock<DockerGcConfig>>,
 }
 
 impl LiveSettings {
@@ -652,6 +681,7 @@ impl LiveSettings {
             webhook_comment_rate: Arc::new(RwLock::new(webhook_comment_rate)),
             claude: Arc::new(std::sync::RwLock::new(eff.claude)),
             auth: Arc::new(RwLock::new(eff.auth)),
+            docker_gc: Arc::new(RwLock::new(eff.docker_gc)),
         };
         if let (Some(apply), Some(filter)) = (s.log_apply.as_ref(), eff.log_filter.as_ref()) {
             match apply(filter) {
@@ -734,6 +764,12 @@ impl LiveSettings {
         self.auth.read().await.clone()
     }
 
+    /// Shared handle to the live Docker-volume GC config, read by the
+    /// sweeper on each tick so a Settings save applies on the next sweep.
+    pub fn docker_gc_handle(&self) -> Arc<RwLock<DockerGcConfig>> {
+        self.docker_gc.clone()
+    }
+
     pub fn claude_handle(&self) -> ClaudeConfigHandle {
         self.claude.clone()
     }
@@ -755,6 +791,7 @@ impl LiveSettings {
             Section::WebhookComment => to_pretty(&*self.webhook_comment.read().await),
             Section::Claude => to_pretty(&*read_claude(&self.claude)),
             Section::Auth => to_pretty(&*self.auth.read().await),
+            Section::DockerGc => to_pretty(&*self.docker_gc.read().await),
         }
     }
 
@@ -856,6 +893,14 @@ impl LiveSettings {
                 let v: AuthConfig = parse(json)?;
                 set_json(&self.pool, section.key(), &v).await?;
                 *self.auth.write().await = v;
+            }
+            Section::DockerGc => {
+                let v: DockerGcConfig = parse(json)?;
+                // Reject a window under 1 day before persisting: nothing is
+                // stored on an invalid payload.
+                validate_docker_gc(&v).map_err(SaveError::Invalid)?;
+                set_json(&self.pool, section.key(), &v).await?;
+                *self.docker_gc.write().await = v;
             }
         }
         Ok(())
@@ -1098,6 +1143,7 @@ mod tests {
             webhook_comment: CommentWebhookConfig::default(),
             claude: ClaudeConfig::default(),
             auth: AuthConfig::default(),
+            docker_gc: DockerGcConfig::default(),
         }
     }
 
@@ -1411,6 +1457,63 @@ mod tests {
         )
         .await
         .expect("a disabled config bypasses the window floor");
+    }
+
+    // ---- docker volume GC section -------------------------------
+
+    #[tokio::test]
+    async fn docker_gc_section_round_trips_and_rejects_zero_window() {
+        let pool = pool().await;
+        let live = LiveSettings::new(pool.clone(), eff_default(), None);
+
+        // Routing surface: the section is addressable as `docker_gc` on
+        // `/settings` and `GET` / `PUT /api/settings/<section>`.
+        assert_eq!(Section::DockerGc.key(), "config.docker_gc");
+        assert_eq!(Section::DockerGc.as_path(), "docker_gc");
+        assert_eq!(Section::from_path("docker_gc"), Some(Section::DockerGc));
+        assert!(Section::ALL.contains(&Section::DockerGc));
+
+        // The default (3 days) is served before anything is stored.
+        let default: DockerGcConfig =
+            serde_json::from_str(&live.section_json(Section::DockerGc).await).unwrap();
+        assert_eq!(default, DockerGcConfig::default());
+        assert_eq!(default.volume_retention_days, 3);
+
+        // A save persists AND applies live off the shared handle.
+        live.save_section(
+            Section::DockerGc,
+            r#"{"enabled":true,"volume_retention_days":7}"#,
+        )
+        .await
+        .expect("a >= 1-day window is valid");
+        let stored: DockerGcConfig = get_json(&pool, Section::DockerGc.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.volume_retention_days, 7);
+        assert_eq!(
+            live.docker_gc_handle().read().await.volume_retention_days,
+            7
+        );
+
+        // Below the 1-day floor is rejected, and nothing is persisted over the
+        // previously stored value.
+        let err = live
+            .save_section(
+                Section::DockerGc,
+                r#"{"enabled":true,"volume_retention_days":0}"#,
+            )
+            .await
+            .expect_err("a 0-day window must be rejected");
+        assert!(matches!(err, SaveError::Invalid(_)), "{err}");
+        let unchanged: DockerGcConfig = get_json(&pool, Section::DockerGc.key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.volume_retention_days, 7,
+            "a rejected save persists nothing"
+        );
     }
 
     // ---- stream-log GC section ---------------------------------

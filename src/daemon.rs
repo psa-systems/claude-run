@@ -575,6 +575,12 @@ impl Daemon {
             settings.stream_log_gc_handle(),
         ));
 
+        // Sweep unused named volumes from the sidecar's Docker daemon older
+        // than the configured window. Nothing ever removed them, and a
+        // deployment can fill its Docker data directory this way (CLAUDE-433).
+        // Same cadence and live-config shape as the sweeps above.
+        let docker_gc_task = tokio::spawn(docker_gc_loop(settings.docker_gc_handle()));
+
         // The status probe. Detects an expired/revoked login even between
         // invocations (a quiet action, or an invalid API key, which never trips
         // the invocation-side detection). Skipped entirely on the `always()`
@@ -630,6 +636,7 @@ impl Daemon {
         gc_task.abort();
         retention_task.abort();
         stream_log_gc_task.abort();
+        docker_gc_task.abort();
         login_probe_task.abort();
 
         // Cancel in-flight runs through the token-cancellation path (child
@@ -1742,6 +1749,33 @@ async fn retention_loop(
             }
             Ok(_) => {}
             Err(e) => warn!(error = %e, "db retention sweep failed"),
+        }
+    }
+}
+
+/// Periodic Docker sidecar volume GC, on the [`GC_TICK_SECS`] cadence the
+/// other sweeps use. The interval's first tick fires immediately, so a sweep
+/// runs on serve start; the config is read off the shared handle per tick so a
+/// Settings save applies on the next pass. Talking to the Docker daemon is
+/// blocking I/O (subprocess calls), so it runs on a blocking thread.
+async fn docker_gc_loop(cfg: Arc<tokio::sync::RwLock<crate::config::DockerGcConfig>>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(GC_TICK_SECS));
+    loop {
+        ticker.tick().await;
+        let snapshot = cfg.read().await.clone();
+        if !snapshot.enabled {
+            continue;
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            crate::gc::sweep_docker_volumes(
+                &crate::gc::CliDockerVolumeClient,
+                &snapshot,
+                std::time::SystemTime::now(),
+            )
+        })
+        .await;
+        if let Err(e) = result {
+            warn!(error = %e, "docker volume GC sweep task failed");
         }
     }
 }
