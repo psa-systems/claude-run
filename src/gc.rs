@@ -29,11 +29,12 @@
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::config::{StreamLogGcConfig, WorkdirGcConfig};
+use crate::config::{DockerGcConfig, StreamLogGcConfig, WorkdirGcConfig};
 
 const SECS_PER_DAY: u64 = 86_400;
 
@@ -637,6 +638,229 @@ fn dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+// ---- Docker sidecar named-volume sweep (CLAUDE-433) -----------------------
+
+/// Name prefix of a buildx state volume. Never removed: it is buildkit's own
+/// cache, not a stack artifact, and recreating it is far more expensive than
+/// the disk it costs.
+pub const BUILDX_VOLUME_PREFIX: &str = "buildx_buildkit_";
+
+/// One Docker named volume as reported by [`DockerVolumeClient::list_volumes`].
+#[derive(Debug, Clone)]
+pub struct DockerVolume {
+    pub name: String,
+    /// True when Docker reports a container currently references this volume.
+    /// Age alone never overrides this: a reused volume is kept regardless of
+    /// how old it is.
+    pub in_use: bool,
+    /// Docker's own `CreatedAt`. Docker records no last-used time, so age
+    /// means time since creation; a volume reused minutes ago still ages from
+    /// when it was first created.
+    pub created_at: SystemTime,
+    /// Size in bytes, when Docker reports one (a plain `docker volume
+    /// inspect` does not compute it, so this is usually `None`).
+    pub size_bytes: Option<u64>,
+}
+
+/// Why [`DockerVolumeClient::remove_volume`] failed, so the sweep can log a
+/// volume Docker refused because it is in use at `info` (routine) and any
+/// other failure at `error` (actionable).
+#[derive(Debug)]
+pub enum VolumeRemoveError {
+    /// Docker refused the remove because a container now references the
+    /// volume (a race with the `in_use` read above, or a session that started
+    /// a container between this sweep's list and remove calls).
+    InUse(String),
+    Other(String),
+}
+
+/// Talks to the sidecar's Docker daemon on behalf of [`sweep_docker_volumes`].
+/// Injected so the sweep's decision logic (age, in-use, buildx-prefix) is
+/// testable without a real Docker daemon; production passes
+/// [`CliDockerVolumeClient`].
+pub trait DockerVolumeClient {
+    /// Every named volume the daemon knows about. `Err` signals the daemon
+    /// could not be reached (including `DOCKER_HOST` unset); the sweep treats
+    /// that as "skip this pass" rather than guessing.
+    fn list_volumes(&self) -> Result<Vec<DockerVolume>, String>;
+    /// Remove one volume by name. Never passes `--force`: Docker's own refusal
+    /// of an in-use volume is exactly the safety net this sweep relies on.
+    fn remove_volume(&self, name: &str) -> Result<(), VolumeRemoveError>;
+}
+
+/// Production [`DockerVolumeClient`], talking to whichever daemon
+/// `DOCKER_HOST` points the `docker` CLI at (the sidecar, in the deployed
+/// container). Never passes `--all` to a list or prune call, which has no age
+/// filter and would remove a volume a session created moments ago.
+pub struct CliDockerVolumeClient;
+
+impl DockerVolumeClient for CliDockerVolumeClient {
+    fn list_volumes(&self) -> Result<Vec<DockerVolume>, String> {
+        if std::env::var_os("DOCKER_HOST").is_none() {
+            return Err("DOCKER_HOST is not set".to_string());
+        }
+        let all = run_docker(&["volume", "ls", "-q"])?;
+        let names: Vec<&str> = all
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dangling_out = run_docker(&["volume", "ls", "-f", "dangling=true", "-q"])?;
+        let dangling: HashSet<&str> = dangling_out
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut args = vec!["volume", "inspect"];
+        args.extend(names.iter().copied());
+        let inspect_out = run_docker(&args)?;
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&inspect_out)
+            .map_err(|e| format!("cannot parse `docker volume inspect` output: {e}"))?;
+
+        let mut volumes = Vec::with_capacity(parsed.len());
+        for v in parsed {
+            let name = v
+                .get("Name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let created_at = v
+                .get("CreatedAt")
+                .and_then(|c| c.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .and_then(|dt| {
+                    SystemTime::UNIX_EPOCH
+                        .checked_add(Duration::from_secs(dt.timestamp().try_into().unwrap_or(0)))
+                })
+                // An unparseable/missing CreatedAt is treated as "now" (age
+                // zero, kept this pass) rather than guessed as old enough to
+                // remove.
+                .unwrap_or_else(SystemTime::now);
+            let in_use = !dangling.contains(name.as_str());
+            volumes.push(DockerVolume {
+                name,
+                in_use,
+                created_at,
+                size_bytes: None,
+            });
+        }
+        Ok(volumes)
+    }
+
+    fn remove_volume(&self, name: &str) -> Result<(), VolumeRemoveError> {
+        let output = Command::new("docker")
+            .args(["volume", "rm", name])
+            .output()
+            .map_err(|e| VolumeRemoveError::Other(format!("failed to spawn docker: {e}")))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.contains("volume is in use") {
+            Err(VolumeRemoveError::InUse(stderr))
+        } else {
+            Err(VolumeRemoveError::Other(stderr))
+        }
+    }
+}
+
+/// Run `docker <args>` against whatever `DOCKER_HOST` points at, returning
+/// stdout on success and a message naming the command on failure (spawn
+/// failure or non-zero exit).
+fn run_docker(args: &[&str]) -> Result<String, String> {
+    let output = Command::new("docker")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to spawn `docker {}`: {e}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`docker {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Remove every named volume in the sidecar's Docker daemon that no container
+/// references and that is older than `cfg.volume_retention_days`, keeping a
+/// `buildx_buildkit_*` state volume regardless of age.
+///
+/// `client` is injected ([`CliDockerVolumeClient`] in production) so the
+/// decision logic is testable without a real Docker daemon. `now` is injected
+/// the same way the other sweeps in this module inject it. When the daemon
+/// cannot be reached (including `DOCKER_HOST` unset), the pass is SKIPPED and
+/// logged at `warn` naming the cause - never reported as a clean sweep, and
+/// nothing is removed. A remove Docker refuses because the volume is now in
+/// use is logged at `info` and left in place; any other remove failure is
+/// logged at `error` naming the volume, and the pass continues.
+pub fn sweep_docker_volumes(
+    client: &dyn DockerVolumeClient,
+    cfg: &DockerGcConfig,
+    now: SystemTime,
+) -> SweepStats {
+    let mut stats = SweepStats::default();
+    if !cfg.enabled {
+        return stats;
+    }
+    let retention = Duration::from_secs(cfg.volume_retention_days.saturating_mul(SECS_PER_DAY));
+
+    let volumes = match client.list_volumes() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "docker volume GC: cannot reach the sidecar's Docker daemon; nothing was swept this pass");
+            return stats;
+        }
+    };
+
+    for vol in volumes {
+        if vol.in_use {
+            stats.kept += 1;
+            continue;
+        }
+        if vol.name.starts_with(BUILDX_VOLUME_PREFIX) {
+            stats.kept += 1;
+            continue;
+        }
+        let age = now.duration_since(vol.created_at).unwrap_or(Duration::ZERO);
+        if age < retention {
+            stats.kept += 1;
+            continue;
+        }
+        match client.remove_volume(&vol.name) {
+            Ok(()) => {
+                info!(
+                    name = %vol.name,
+                    age = %humantime::format_duration(whole_secs(age)),
+                    bytes_reclaimed = ?vol.size_bytes,
+                    "docker volume GC: removed unused named volume older than the retention window"
+                );
+                stats.deleted += 1;
+                stats.bytes_reclaimed += vol.size_bytes.unwrap_or(0);
+            }
+            Err(VolumeRemoveError::InUse(msg)) => {
+                info!(name = %vol.name, reason = %msg, "docker volume GC: volume is now in use; kept");
+                stats.kept += 1;
+            }
+            Err(VolumeRemoveError::Other(msg)) => {
+                error!(name = %vol.name, error = %msg, "docker volume GC: remove failed");
+                stats.kept += 1;
+            }
+        }
+    }
+    info!(
+        deleted = stats.deleted,
+        kept = stats.kept,
+        bytes_reclaimed = stats.bytes_reclaimed,
+        "docker volume GC sweep complete"
+    );
+    stats
 }
 
 #[cfg(test)]
@@ -1334,5 +1558,168 @@ mod tests {
         assert_eq!(stream_log_key("CLAUDE-9-attempt-bogus.jsonl"), None);
         assert_eq!(stream_log_key("CLAUDE-9.jsonl"), None);
         assert_eq!(stream_log_key("CLAUDE-9-attempt-1.txt"), None);
+    }
+
+    // ---- docker volume sweep --------------------------------------------------
+
+    fn docker_cfg(enabled: bool) -> DockerGcConfig {
+        DockerGcConfig {
+            enabled,
+            volume_retention_days: 3,
+        }
+    }
+
+    fn volume(name: &str, in_use: bool, age_days: u64) -> DockerVolume {
+        DockerVolume {
+            name: name.to_string(),
+            in_use,
+            created_at: SystemTime::now() - Duration::from_secs(age_days * SECS_PER_DAY),
+            size_bytes: Some(1024),
+        }
+    }
+
+    /// Fake [`DockerVolumeClient`]: `list` is the fixed set of volumes to
+    /// report, `removed` records every name [`remove_volume`] was called
+    /// with, and `remove_result` maps a name to the outcome to return (missing
+    /// = success).
+    struct FakeDockerClient {
+        list: std::result::Result<Vec<DockerVolume>, String>,
+        removed: std::sync::Mutex<Vec<String>>,
+        remove_result: std::collections::HashMap<String, VolumeRemoveErrorKind>,
+    }
+
+    #[derive(Clone)]
+    enum VolumeRemoveErrorKind {
+        InUse,
+        Other,
+    }
+
+    impl FakeDockerClient {
+        fn new(volumes: Vec<DockerVolume>) -> Self {
+            Self {
+                list: Ok(volumes),
+                removed: std::sync::Mutex::new(Vec::new()),
+                remove_result: std::collections::HashMap::new(),
+            }
+        }
+
+        fn unreachable(reason: &str) -> Self {
+            Self {
+                list: Err(reason.to_string()),
+                removed: std::sync::Mutex::new(Vec::new()),
+                remove_result: std::collections::HashMap::new(),
+            }
+        }
+
+        fn with_remove_failure(mut self, name: &str, kind: VolumeRemoveErrorKind) -> Self {
+            self.remove_result.insert(name.to_string(), kind);
+            self
+        }
+    }
+
+    impl DockerVolumeClient for FakeDockerClient {
+        fn list_volumes(&self) -> std::result::Result<Vec<DockerVolume>, String> {
+            self.list.clone()
+        }
+
+        fn remove_volume(&self, name: &str) -> std::result::Result<(), VolumeRemoveError> {
+            self.removed.lock().unwrap().push(name.to_string());
+            match self.remove_result.get(name) {
+                Some(VolumeRemoveErrorKind::InUse) => {
+                    Err(VolumeRemoveError::InUse("volume is in use".to_string()))
+                }
+                Some(VolumeRemoveErrorKind::Other) => {
+                    Err(VolumeRemoveError::Other("permission denied".to_string()))
+                }
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// AC: an unused volume older than the retention window is removed.
+    #[test]
+    fn stale_unused_volume_is_removed() {
+        let client = FakeDockerClient::new(vec![volume("dev-cargo-registry", false, 10)]);
+        let stats = sweep_docker_volumes(&client, &docker_cfg(true), SystemTime::now());
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.kept, 0);
+        assert_eq!(stats.bytes_reclaimed, 1024);
+        assert_eq!(
+            *client.removed.lock().unwrap(),
+            vec!["dev-cargo-registry".to_string()]
+        );
+    }
+
+    /// AC: an unused volume younger than the retention window is kept.
+    #[test]
+    fn fresh_unused_volume_is_kept() {
+        let client = FakeDockerClient::new(vec![volume("dev-cargo-registry", false, 1)]);
+        let stats = sweep_docker_volumes(&client, &docker_cfg(true), SystemTime::now());
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.kept, 1);
+        assert!(client.removed.lock().unwrap().is_empty());
+    }
+
+    /// AC: an in-use volume is kept regardless of age.
+    #[test]
+    fn in_use_volume_is_kept_regardless_of_age() {
+        let client = FakeDockerClient::new(vec![volume("dev-postgres-data", true, 30)]);
+        let stats = sweep_docker_volumes(&client, &docker_cfg(true), SystemTime::now());
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.kept, 1);
+        assert!(client.removed.lock().unwrap().is_empty());
+    }
+
+    /// AC: a `buildx_buildkit_*` volume is kept regardless of age.
+    #[test]
+    fn buildx_volume_is_kept_regardless_of_age() {
+        let client =
+            FakeDockerClient::new(vec![volume("buildx_buildkit_mybuilder0_state", false, 30)]);
+        let stats = sweep_docker_volumes(&client, &docker_cfg(true), SystemTime::now());
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.kept, 1);
+        assert!(client.removed.lock().unwrap().is_empty());
+    }
+
+    /// AC: an unreachable daemon removes nothing and is not a clean sweep.
+    #[test]
+    fn unreachable_daemon_removes_nothing() {
+        let client = FakeDockerClient::unreachable("DOCKER_HOST is not set");
+        let stats = sweep_docker_volumes(&client, &docker_cfg(true), SystemTime::now());
+        assert_eq!(stats, SweepStats::default());
+    }
+
+    /// AC: a remove error other than "in use" is logged at `error` and the
+    /// volume is kept; the pass continues for the rest.
+    #[test]
+    fn remove_error_other_than_in_use_keeps_the_volume_and_continues() {
+        let client = FakeDockerClient::new(vec![
+            volume("dev-broken-volume", false, 10),
+            volume("dev-ok-volume", false, 10),
+        ])
+        .with_remove_failure("dev-broken-volume", VolumeRemoveErrorKind::Other);
+        let stats = sweep_docker_volumes(&client, &docker_cfg(true), SystemTime::now());
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.kept, 1);
+    }
+
+    /// Docker's own refusal because a container now references the volume
+    /// (a race between the list and the remove) is kept, not treated as an
+    /// error.
+    #[test]
+    fn remove_refused_as_in_use_is_kept_not_errored() {
+        let client = FakeDockerClient::new(vec![volume("dev-raced-volume", false, 10)])
+            .with_remove_failure("dev-raced-volume", VolumeRemoveErrorKind::InUse);
+        let stats = sweep_docker_volumes(&client, &docker_cfg(true), SystemTime::now());
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.kept, 1);
+    }
+
+    #[test]
+    fn disabled_docker_sweep_removes_nothing() {
+        let client = FakeDockerClient::new(vec![volume("dev-cargo-registry", false, 10)]);
+        let stats = sweep_docker_volumes(&client, &docker_cfg(false), SystemTime::now());
+        assert_eq!(stats, SweepStats::default());
+        assert!(client.removed.lock().unwrap().is_empty());
     }
 }
