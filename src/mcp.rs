@@ -839,4 +839,53 @@ mod tests {
         assert_eq!(validate_limit(Some(50), 20, 100).unwrap(), 50);
         assert_eq!(validate_limit(None, 20, 100).unwrap(), 20);
     }
+
+    #[tokio::test]
+    async fn in_process_client_initializes_lists_tools_and_calls_one() {
+        use rmcp::model::CallToolRequestParams;
+        use rmcp::ServiceExt;
+
+        let (server, _dir) = test_server().await;
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+
+        let server_handle = tokio::spawn(async move {
+            let running = server
+                .serve(server_transport)
+                .await
+                .expect("server handshake");
+            running.waiting().await.expect("server loop");
+        });
+
+        // `.serve(...)` performs the MCP `initialize` handshake before
+        // returning, so a successful client here already proves `initialize`
+        // round-tripped end to end.
+        let client = ().serve(client_transport).await.expect("client handshake");
+
+        let tools = client.list_all_tools().await.expect("tools/list");
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "get_attempts",
+                "get_ci_failure",
+                "get_run",
+                "get_status",
+                "get_stream_log",
+                "list_ci_failures",
+                "list_runs",
+            ]
+        );
+
+        let result = client
+            .call_tool(CallToolRequestParams::new("get_status"))
+            .await
+            .expect("tools/call get_status");
+        assert_ne!(result.is_error, Some(true));
+        let value: serde_json::Value = serde_json::from_str(&result_text(&result)).unwrap();
+        assert_eq!(value["source"], "database");
+
+        client.cancel().await.expect("client close");
+        server_handle.await.expect("server task");
+    }
 }

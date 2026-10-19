@@ -48,6 +48,35 @@ claude-run access reset-2fa admin
 claude-run --version
 ```
 
+## Read-only troubleshooting MCP server
+
+`claude-run mcp stdio` (CLAUDE-437) serves a small, read-only Model Context Protocol server over stdio: JSON-RPC frames in on stdin, JSON-RPC frames out on stdout, logs on stderr only. It is DB-direct, same as `status` or `action list`, so it needs no daemon and works identically inside the container (see [self-hosting.md](self-hosting.md#troubleshooting-mcp-server)).
+
+It exposes exactly seven tools, each read-only (no tool ever writes):
+
+| Tool | Purpose |
+|---|---|
+| `get_status` | the same blocks `claude-run status` prints, with `"source": "database"` in place of the CLI's `daemon` / `socket_expected_at` keys |
+| `list_runs` | recent runs, optionally filtered by action name or to failures only |
+| `get_run` | one run's row plus its job outcomes |
+| `get_attempts` | attempt-count history for one action/key pair |
+| `get_stream_log` | the tail of one job attempt's stream log (`tail_lines`, capped and reported as `truncated` when the log is longer) |
+| `list_ci_failures` | recent CI-failure records, optionally filtered by state |
+| `get_ci_failure` | one CI-failure record by id |
+
+`limit` and `tail_lines` arguments error above their max rather than silently clamping. Example client config:
+
+```json
+{
+  "mcpServers": {
+    "claude-run": {
+      "command": "docker",
+      "args": ["compose", "exec", "--no-TTY", "--user", "claudebot", "claude-bot", "claude-run", "mcp", "stdio"]
+    }
+  }
+}
+```
+
 ## Web UI pages
 
 The daemon's TCP web UI (loopback by default; see [Web UI / API auth](auth.md#web-ui--api-auth)) is more than the Dashboard. The pages an operator
