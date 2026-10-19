@@ -649,7 +649,7 @@ pub async fn record_invocation(
     }
 }
 
-async fn try_record_invocation(
+pub(crate) async fn try_record_invocation(
     pool: &DbPool,
     action: &str,
     job_key: Option<&str>,
@@ -663,6 +663,13 @@ async fn try_record_invocation(
     } else {
         Some(serde_json::to_string(&result.usage.api_retries).unwrap_or_default())
     };
+    // The `Any` driver types a NULL `f64` bind as Postgres `float4`, not
+    // `float8` (swapped `Real`/`Double` NULL arms in sqlx-core's
+    // `src/any/arguments.rs`). sqlx caches a prepared statement's parameter
+    // types per pooled connection, so a nullable utilization column must
+    // force a fresh Parse on every execution or a later non-NULL bind on the
+    // same connection sends 8 bytes into a `float4` slot and Postgres
+    // rejects it with 22P03.
     sqlx::query(&crate::db::q(
         pool,
         r#"
@@ -675,13 +682,14 @@ async fn try_record_invocation(
             overage_status, is_using_overage, api_retries_json, stream_log_path
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            CAST(? AS DOUBLE PRECISION), ?,
-            CAST(? AS DOUBLE PRECISION), ?,
-            CAST(? AS DOUBLE PRECISION), CAST(? AS DOUBLE PRECISION),
+            ?, ?,
+            ?, ?,
+            ?, ?,
             ?, ?, ?, ?
         )
         "#,
     ))
+    .persistent(false)
     .bind(crate::state::now_iso())
     .bind(action)
     .bind(job_key)
