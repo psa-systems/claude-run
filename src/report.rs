@@ -741,11 +741,12 @@ mod tests {
               stream_log_path) \
              VALUES (\
                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-               CAST(? AS DOUBLE PRECISION), ?, \
-               CAST(? AS DOUBLE PRECISION), ?, \
-               CAST(? AS DOUBLE PRECISION), CAST(? AS DOUBLE PRECISION), \
+               ?, ?, \
+               ?, ?, \
+               ?, ?, \
                ?, ?, ?, ?)",
         ))
+        .persistent(false)
         .bind(ts)
         .bind(action)
         .bind(job_key)
