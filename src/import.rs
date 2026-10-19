@@ -350,7 +350,12 @@ async fn copy_table(
         .await?;
     let mut copied = 0i64;
     for row in &rows {
-        let mut query = sqlx::query(&insert);
+        // CLAUDE-436: the Any driver types a NULL f64 bind as Postgres
+        // float4, and sqlx caches a prepared statement's parameter types per
+        // connection, so a NULL in a nullable REAL column on one row and a
+        // real value in the same column on a later row of the same table
+        // must not share a cached Parse.
+        let mut query = sqlx::query(&insert).persistent(false);
         for (i, column) in columns.iter().enumerate() {
             query = match column.kind {
                 ColumnKind::Int => query.bind(cell::<i64>(row, i, table, column)?),
