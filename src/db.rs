@@ -452,7 +452,7 @@ fn pool_options(dialect: Dialect) -> AnyPoolOptions {
 #[cfg(test)]
 pub async fn test_pool() -> DbPool {
     match std::env::var("CLAUDE_RUN_TEST_DATABASE_URL") {
-        Ok(url) => test_pg_pool_at(&url).await,
+        Ok(url) => test_pg_pool_at(&url, 4).await,
         Err(_) => test_sqlite_pool().await,
     }
 }
@@ -476,7 +476,18 @@ pub async fn test_sqlite_pool() -> DbPool {
 #[cfg(test)]
 pub async fn test_pg_pool() -> Option<DbPool> {
     let url = std::env::var("CLAUDE_RUN_TEST_DATABASE_URL").ok()?;
-    Some(test_pg_pool_at(&url).await)
+    Some(test_pg_pool_at(&url, 4).await)
+}
+
+/// A single-connection variant of [`test_pg_pool`], for a test that needs
+/// every statement to land on the same pooled connection (for example, one
+/// proving a cached prepared statement's parameter types are not reused
+/// across a NULL and a non-NULL bind). `None` when
+/// `CLAUDE_RUN_TEST_DATABASE_URL` is unset.
+#[cfg(test)]
+pub async fn test_pg_pool_single_connection() -> Option<DbPool> {
+    let url = std::env::var("CLAUDE_RUN_TEST_DATABASE_URL").ok()?;
+    Some(test_pg_pool_at(&url, 1).await)
 }
 
 /// Fails when `schema` already holds `_sqlx_migrations`: that means the
@@ -508,7 +519,7 @@ async fn refuse_live_database(pool: &DbPool, schema: &str) -> anyhow::Result<()>
 /// `cargo test`'s parallel tests do not share tables. Nothing is dropped: the
 /// server this points at is a disposable CI service container.
 #[cfg(test)]
-async fn test_pg_pool_at(url: &str) -> DbPool {
+async fn test_pg_pool_at(url: &str, max_connections: u32) -> DbPool {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let schema = format!(
@@ -519,7 +530,7 @@ async fn test_pg_pool_at(url: &str) -> DbPool {
     sqlx::any::install_default_drivers();
     let set_path = format!("SET search_path TO {schema}");
     let pool = AnyPoolOptions::new()
-        .max_connections(4)
+        .max_connections(max_connections)
         .after_connect(move |conn, _meta| {
             let set_path = set_path.clone();
             Box::pin(async move {
@@ -804,5 +815,69 @@ mod tests {
         pool.execute(&*format!("DROP SCHEMA {empty_schema} CASCADE"))
             .await
             .unwrap();
+    }
+
+    /// CLAUDE-436 regression: a NULL utilization bind declares the `Any`
+    /// driver's cached-statement parameter type `float4`; a later non-NULL
+    /// bind on the SAME connection must not reuse that cached Parse, or
+    /// Postgres rejects the 8-byte `float8` value with 22P03. A
+    /// `max_connections(1)` pool forces both inserts through the one
+    /// connection, so this fails on the unpatched `CAST(? AS DOUBLE
+    /// PRECISION)` statement (confirmed: 22P03) and passes once the
+    /// production insert in `usage::try_record_invocation` uses
+    /// `.persistent(false)` (confirmed: both rows persist).
+    #[tokio::test]
+    async fn claude_invocations_null_then_valued_utilization_same_connection() {
+        let pool = match test_pg_pool_single_connection().await {
+            Some(pool) => pool,
+            None => {
+                eprintln!(
+                    "SKIP {}: CLAUDE_RUN_TEST_DATABASE_URL is unset, no postgres to test against",
+                    concat!(module_path!(), "::", line!())
+                );
+                return;
+            }
+        };
+        let stream_log = Path::new("/logs/act/streams/K-attempt-1.jsonl");
+
+        let null_result = crate::claude::ClaudeResult::synthesized("", "no rate-limit reading");
+        crate::usage::try_record_invocation(
+            &pool,
+            "youtrack",
+            None,
+            None,
+            stream_log,
+            &null_result,
+        )
+        .await
+        .expect("NULL-utilization insert");
+
+        let mut valued_result =
+            crate::claude::ClaudeResult::synthesized("", "carried a rate-limit reading");
+        valued_result.usage.rate_limit = Some(crate::usage::RateLimitSnapshot {
+            status: Some("allowed".to_string()),
+            rate_limit_type: Some("five_hour".to_string()),
+            five_hour_utilization: Some(0.42),
+            seven_day_utilization: Some(0.10),
+            max_five_hour_utilization: Some(0.42),
+            max_seven_day_utilization: Some(0.10),
+            ..Default::default()
+        });
+        crate::usage::try_record_invocation(
+            &pool,
+            "youtrack",
+            None,
+            None,
+            stream_log,
+            &valued_result,
+        )
+        .await
+        .expect("valued-utilization insert on the same connection must not hit 22P03");
+
+        let count: i64 = sqlx::query_scalar(&q(&pool, "SELECT COUNT(*) FROM claude_invocations"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }
