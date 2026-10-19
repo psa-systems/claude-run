@@ -875,17 +875,36 @@ async fn status(
         return Ok(exit::OK);
     }
     let pool = db::open(db_target).await?;
-    jsonfmt::print_json(&daemonless_status(&pool, &sock).await?)?;
+    jsonfmt::print_json(&daemonless_status(&pool, paths, &sock).await?)?;
     Ok(exit::OK)
 }
 
-/// The report `status` prints with no daemon running. Split out of [`status`]
-/// so the blocks it must carry are testable without a live daemon
-/// or captured stdout.
+/// The report `status` prints with no daemon running, or running with the
+/// unix socket disabled. Split out of [`status`] so the blocks it must carry
+/// are testable without a live daemon or captured stdout.
 async fn daemonless_status(
     pool: &crate::db::DbPool,
+    paths: &cfg::Paths,
     sock: &std::path::Path,
 ) -> claude_run::error::Result<serde_json::Value> {
+    // Never guess "not running" from the missing socket alone: it is the
+    // pidfile lock's liveness and the `serve --no-socket` marker that decide
+    // it (CLAUDE-438).
+    let presence = daemon::daemon_presence(paths);
+    let (daemon_field, socket_expected_at) = match &presence {
+        daemon::DaemonPresence::RunningNoSocket => (
+            json!("running (unix-socket API disabled by `serve --no-socket`)"),
+            None,
+        ),
+        daemon::DaemonPresence::NotRunning => {
+            (json!("not running"), Some(sock.display().to_string()))
+        }
+        daemon::DaemonPresence::Undetermined(reason) => (
+            json!({"state": "undetermined", "reason": reason}),
+            Some(sock.display().to_string()),
+        ),
+    };
+
     let global = state::global_pause_status(pool).await?;
     let actions = state::action_index_list(pool).await?;
     // The same activity block `/status` carries, so a reboot script
@@ -911,9 +930,8 @@ async fn daemonless_status(
         state::ATTEMPT_CAP_HITS_LIMIT,
     )
     .await?;
-    Ok(json!({
-        "daemon": "not running",
-        "socket_expected_at": sock.display().to_string(),
+    let mut report = json!({
+        "daemon": daemon_field,
         "global_paused": global.map(|(a, r)| json!({"paused_at": a, "reason": r})),
         "activity": {
             "quiet": active_runs.is_empty(),
@@ -923,7 +941,11 @@ async fn daemonless_status(
         "stale_gates": stale_gates,
         "attempt_cap_hits": attempt_cap_hits,
         "actions": actions,
-    }))
+    });
+    if let Some(expected_at) = socket_expected_at {
+        report["socket_expected_at"] = json!(expected_at);
+    }
+    Ok(report)
 }
 
 /// `action show` output: the index row plus prompt provenance read from the YAML. Both prompt
@@ -1576,9 +1598,10 @@ mod tests {
     async fn daemonless_status_reports_keys_parked_at_the_attempt_cap() {
         let dir = tempfile::tempdir().unwrap();
         let pool = db::open_sqlite(&dir.path().join("state.db")).await.unwrap();
+        let paths = test_paths(dir.path());
         let sock = dir.path().join("daemon.sock");
 
-        let report = daemonless_status(&pool, &sock).await.unwrap();
+        let report = daemonless_status(&pool, &paths, &sock).await.unwrap();
         assert_eq!(report["attempt_cap_hits"].as_array().unwrap().len(), 0);
 
         // No action index row, so the key is measured against the default cap.
@@ -1587,12 +1610,107 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let report = daemonless_status(&pool, &sock).await.unwrap();
+        let report = daemonless_status(&pool, &paths, &sock).await.unwrap();
         let hits = report["attempt_cap_hits"].as_array().unwrap();
         assert_eq!(hits.len(), 1, "{report:#}");
         assert_eq!(hits[0]["job_key"], "CLAUDE-9");
         assert_eq!(hits[0]["action_name"], "youtrack");
         assert_eq!(hits[0]["count"], 3);
         assert_eq!(hits[0]["cap"], 3);
+    }
+
+    fn test_paths(dir: &std::path::Path) -> cfg::Paths {
+        cfg::Paths {
+            config_dir: dir.to_path_buf(),
+            data_dir: dir.to_path_buf(),
+            state_dir: dir.to_path_buf(),
+            runtime_dir: dir.to_path_buf(),
+        }
+    }
+
+    /// With no daemon running at all, `status` reports it as such and omits
+    /// no `socket_expected_at`: a socket would be expected on the next
+    /// `serve` unless that start also disables it.
+    #[tokio::test]
+    async fn daemonless_status_reports_not_running_with_no_pidfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open_sqlite(&dir.path().join("state.db")).await.unwrap();
+        let paths = test_paths(dir.path());
+        let sock = dir.path().join("daemon.sock");
+
+        let report = daemonless_status(&pool, &paths, &sock).await.unwrap();
+        assert_eq!(report["daemon"], "not running");
+        assert_eq!(report["socket_expected_at"], sock.display().to_string());
+    }
+
+    /// A live pidfile pid plus the `--no-socket` marker reports the daemon as
+    /// running with the socket disabled, not as "not running", and omits
+    /// `socket_expected_at` since this deployment deliberately has none.
+    #[tokio::test]
+    async fn daemonless_status_reports_running_with_socket_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open_sqlite(&dir.path().join("state.db")).await.unwrap();
+        let paths = test_paths(dir.path());
+        let sock = dir.path().join("daemon.sock");
+        std::fs::write(
+            daemon::daemon_pidfile_path(&paths),
+            (std::process::id() as i32).to_string(),
+        )
+        .unwrap();
+        std::fs::write(daemon::daemon_no_socket_marker_path(&paths), b"").unwrap();
+
+        let report = daemonless_status(&pool, &paths, &sock).await.unwrap();
+        assert_eq!(
+            report["daemon"],
+            "running (unix-socket API disabled by `serve --no-socket`)"
+        );
+        assert!(report.get("socket_expected_at").is_none(), "{report:#}");
+    }
+
+    /// A stale pidfile left by a crashed daemon (dead pid) still reports "not
+    /// running", even with a leftover `--no-socket` marker beside it.
+    #[tokio::test]
+    async fn daemonless_status_reports_not_running_with_a_stale_pidfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open_sqlite(&dir.path().join("state.db")).await.unwrap();
+        let paths = test_paths(dir.path());
+        let sock = dir.path().join("daemon.sock");
+        std::fs::write(
+            daemon::daemon_pidfile_path(&paths),
+            (0x7fff_fff0_i32).to_string(),
+        )
+        .unwrap();
+        std::fs::write(daemon::daemon_no_socket_marker_path(&paths), b"").unwrap();
+
+        let report = daemonless_status(&pool, &paths, &sock).await.unwrap();
+        assert_eq!(report["daemon"], "not running");
+        assert_eq!(report["socket_expected_at"], sock.display().to_string());
+    }
+
+    /// A live pidfile pid with no `--no-socket` marker (socket expected but
+    /// unreachable for some other reason) is reported as undetermined with a
+    /// reason, not asserted as either running or not running.
+    #[tokio::test]
+    async fn daemonless_status_reports_undetermined_with_a_live_pid_and_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::open_sqlite(&dir.path().join("state.db")).await.unwrap();
+        let paths = test_paths(dir.path());
+        let sock = dir.path().join("daemon.sock");
+        std::fs::write(
+            daemon::daemon_pidfile_path(&paths),
+            (std::process::id() as i32).to_string(),
+        )
+        .unwrap();
+
+        let report = daemonless_status(&pool, &paths, &sock).await.unwrap();
+        assert_eq!(report["daemon"]["state"], "undetermined");
+        assert!(
+            report["daemon"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("unreachable"),
+            "{report:#}"
+        );
+        assert_eq!(report["socket_expected_at"], sock.display().to_string());
     }
 }

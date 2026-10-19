@@ -15,7 +15,12 @@ that reason; use the web UI's buttons instead. Every other command below works d
 # Manual out-of-cycle run (needs the unix socket; in the container use the web UI).
 claude-run trigger youtrack
 
-# Status (delegates to daemon if it's up, else reads DB directly).
+# Status (delegates to daemon if it's up, else reads DB directly). With no socket to ask - the container's
+# `serve --no-socket` - `"daemon"` still reports whether the daemon is up: "running (unix-socket API disabled by
+# `serve --no-socket`)" when a marker next to the pidfile confirms it deliberately has none, "not running" when the
+# pidfile shows no live process, or `{"state": "undetermined", "reason": ...}` when a live process holds the pidfile
+# but neither the socket nor the marker explain why it was unreachable. `socket_expected_at` is present only in the
+# "not running" and "undetermined" cases, since a confirmed `--no-socket` daemon has none to expect.
 claude-run status
 
 # Pause / resume. With no action name, it is the GLOBAL pause.
