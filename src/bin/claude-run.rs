@@ -259,6 +259,10 @@ fn main() -> ExitCode {
         }
     }
 
+    if matches!(&cli.cmd, Cmd::Serve { .. }) {
+        log_server_started();
+    }
+
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -360,6 +364,17 @@ fn detach_now() -> claude_run::error::Result<()> {
         .start()
         .map_err(|e| anyhow::anyhow!("daemonize: {e}"))?;
     Ok(())
+}
+
+/// First log line of a `serve` process, emitted before config load, the pool and
+/// the migrations. `recorded serve start` (`daemon.rs`) is a different line: it
+/// stamps the DB-backed diagnostics window and must stay after the pool opens.
+fn log_server_started() {
+    tracing::info!(
+        version = claude_run::VERSION,
+        pid = std::process::id(),
+        "Server started"
+    );
 }
 
 /// Build the tracing subscriber and return a reload handle for its `EnvFilter`.
@@ -1242,6 +1257,49 @@ async fn secret_cmd(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// `serve` logs `Server started` with `version` and `pid`, in the JSON shape
+    /// `init_tracing` writes, so operators see which build started and when.
+    #[test]
+    fn log_server_started_emits_message_version_and_pid() {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = fmt()
+            .json()
+            .with_target(false)
+            .with_writer(CaptureWriter(buf.clone()))
+            .finish();
+        tracing::subscriber::with_default(sub, log_server_started);
+
+        let raw = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let mut lines = raw.lines();
+        let line: serde_json::Value = serde_json::from_str(lines.next().expect("one log line"))
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {raw}"));
+        assert!(lines.next().is_none(), "exactly one line expected: {raw}");
+        assert_eq!(line["level"], "INFO", "{raw}");
+        assert_eq!(line["fields"]["message"], "Server started", "{raw}");
+        assert_eq!(line["fields"]["version"], claude_run::VERSION, "{raw}");
+        assert_eq!(line["fields"]["pid"], std::process::id(), "{raw}");
+    }
 
     /// `action show` adds the prompt provenance read from each shipped action's YAML.
     #[test]
