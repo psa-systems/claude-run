@@ -402,7 +402,11 @@ impl GithubForge {
                 binary: self.git.clone(),
                 args: format!("push <remote> {refspec}"),
                 exit_code: out.exit_code,
-                stderr: out.stderr.trim().to_string(),
+                stderr: crate::provider::append_stdout_tail(
+                    out.stderr.trim(),
+                    &out.stdout,
+                    &secrets,
+                ),
             })
         }
     }
@@ -1968,6 +1972,62 @@ mod tests {
     }
 
     const NO_WAIT: [std::time::Duration; 3] = [std::time::Duration::ZERO; 3];
+
+    /// CLAUDE-423: `GithubForge::push`'s failure must carry a `pre-push` hook's
+    /// stdout tail, exactly as `CliBackend::push_branch` does for Forgejo
+    /// (CLAUDE-422).
+    #[test]
+    fn push_failure_carries_the_hook_stdout_and_the_git_stderr() {
+        let mut full = crate::provider::credential_helper_args().to_vec();
+        full.extend(["push", "origin", "HEAD:feat/x"]);
+        let runner = Arc::new(StubRunner::new().fail_with_stdout(
+            "git",
+            &full,
+            1,
+            "running 2 tests\nfailures:\n    web::the_failing_test\n",
+            "error: failed to push some refs to 'origin'",
+        ));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghtoken".into()),
+        )
+        .with_git_retry_waits(NO_WAIT);
+        let err = forge
+            .push(Path::new("/tmp/wd"), "github.com", "octo/widget", "feat/x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to push some refs"), "{err}");
+        assert!(err.contains("--- stdout ---"), "{err}");
+        assert!(err.contains("web::the_failing_test"), "{err}");
+        assert!(
+            err.find("failed to push").unwrap() < err.find("--- stdout ---").unwrap(),
+            "stderr comes first: {err}"
+        );
+    }
+
+    /// A failure with no stdout reads exactly as it did before CLAUDE-423.
+    #[test]
+    fn push_failure_with_empty_stdout_keeps_its_stderr_text_unchanged() {
+        let mut full = crate::provider::credential_helper_args().to_vec();
+        full.extend(["push", "origin", "HEAD:feat/x"]);
+        let runner = Arc::new(StubRunner::new().fail("git", &full, 1, " boom \n"));
+        let forge = GithubForge::with_transport(
+            runner.clone(),
+            Arc::new(StubTransport::new(false, json!({}))),
+            "https://api.githubcopilot.com/mcp/".into(),
+            Some("ghtoken".into()),
+        )
+        .with_git_retry_waits(NO_WAIT);
+        match forge
+            .push(Path::new("/tmp/wd"), "github.com", "octo/widget", "feat/x")
+            .unwrap_err()
+        {
+            Error::CliFailed { stderr, .. } => assert_eq!(stderr, "boom"),
+            other => panic!("expected CliFailed, got {other:?}"),
+        }
+    }
 
     #[test]
     fn push_retries_once_and_succeeds_on_second_attempt() {
