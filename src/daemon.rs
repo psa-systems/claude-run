@@ -175,6 +175,11 @@ impl Daemon {
         if sock_path.exists() {
             std::fs::remove_file(&sock_path)?;
         }
+        // Stale from a previous `--no-socket` run; cleared unconditionally so a
+        // restart with the socket enabled does not leave a marker claiming the
+        // opposite of what this run just bound.
+        let no_socket_marker = daemon_no_socket_marker_path(&self.paths);
+        let _ = std::fs::remove_file(&no_socket_marker);
         let listener = if unix_socket {
             let listener = UnixListener::bind(&sock_path)?;
             info!(socket = %sock_path.display(), "daemon listening");
@@ -184,6 +189,11 @@ impl Daemon {
                 "unix-socket API disabled (serve --no-socket); the TCP web UI and its /api routes \
                  are the only control plane this run"
             );
+            // Record that this run deliberately has no socket, so a daemonless
+            // `claude-run status` (run with no socket to ask) can tell "running
+            // with the socket disabled" apart from "not running" instead of
+            // assuming the latter from the missing socket alone.
+            std::fs::write(&no_socket_marker, b"")?;
             None
         };
 
@@ -685,6 +695,7 @@ impl Daemon {
         if unix_socket {
             let _ = std::fs::remove_file(&sock_path);
         }
+        let _ = std::fs::remove_file(&no_socket_marker);
         Ok(())
     }
 }
@@ -2156,10 +2167,58 @@ pub fn daemon_pidfile_path(paths: &Paths) -> PathBuf {
     paths.runtime_dir.join("daemon.pid")
 }
 
+/// Marker written next to the pidfile for the lifetime of a `serve
+/// --no-socket` run, and removed on both a clean shutdown and the next
+/// `serve` start (whichever mode it starts in). A daemonless `status` reads
+/// it, next to the pidfile's own pid/liveness check, to tell "running with
+/// the socket disabled" apart from "not running" rather than inferring it
+/// from the missing socket alone.
+pub fn daemon_no_socket_marker_path(paths: &Paths) -> PathBuf {
+    paths.runtime_dir.join("daemon.no-socket")
+}
+
 /// Read the PID recorded in the daemon pidfile, if it exists and parses.
 pub fn read_pidfile(paths: &Paths) -> Option<i32> {
     let contents = std::fs::read_to_string(daemon_pidfile_path(paths)).ok()?;
     contents.trim().parse::<i32>().ok()
+}
+
+/// What a daemonless caller (one that could not reach the unix socket) can
+/// conclude about the daemon from the pidfile and the `--no-socket` marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonPresence {
+    /// A live process holds the pidfile and the `--no-socket` marker is
+    /// present: the socket is missing on purpose.
+    RunningNoSocket,
+    /// No pidfile, or its pid is not alive: nothing is holding the lock.
+    /// A marker left over from a crashed `--no-socket` run is stale and
+    /// ignored rather than read as "running".
+    NotRunning,
+    /// A live process holds the pidfile but the marker is absent, so the
+    /// socket was expected to exist. It does not (the caller only reaches
+    /// this path when the socket was unreachable), for a reason this check
+    /// cannot name: starting up, or its socket listener crashed.
+    Undetermined(String),
+}
+
+/// Classify the daemon's presence for a daemonless caller. Never guesses
+/// "not running" from a missing socket alone: it is derived from the pidfile
+/// lock's liveness and the `--no-socket` marker written at `serve` start.
+pub fn daemon_presence(paths: &Paths) -> DaemonPresence {
+    match read_pidfile(paths) {
+        Some(pid) if process_alive(pid) => {
+            if daemon_no_socket_marker_path(paths).exists() {
+                DaemonPresence::RunningNoSocket
+            } else {
+                DaemonPresence::Undetermined(format!(
+                    "daemon (pid {pid}) is running but its unix-socket API is unreachable and \
+                     no `serve --no-socket` marker is present; it may still be starting up or \
+                     its socket listener crashed"
+                ))
+            }
+        }
+        _ => DaemonPresence::NotRunning,
+    }
 }
 
 /// True if a process with this PID currently exists, via a `kill(pid, 0)`
@@ -2417,6 +2476,55 @@ mod tests {
         assert_eq!(read_pidfile(&paths), Some(12345));
         std::fs::write(daemon_pidfile_path(&paths), "not-a-pid").unwrap();
         assert_eq!(read_pidfile(&paths), None);
+    }
+
+    #[test]
+    fn daemon_presence_not_running_with_no_pidfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        assert_eq!(daemon_presence(&paths), DaemonPresence::NotRunning);
+    }
+
+    #[test]
+    fn daemon_presence_not_running_ignores_a_stale_no_socket_marker() {
+        // A crashed `--no-socket` daemon leaves its marker behind with a
+        // pidfile pointing at a pid that is no longer alive; the marker alone
+        // must not read as "running".
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        std::fs::write(daemon_pidfile_path(&paths), (0x7fff_fff0_i32).to_string()).unwrap();
+        std::fs::write(daemon_no_socket_marker_path(&paths), b"").unwrap();
+        assert_eq!(daemon_presence(&paths), DaemonPresence::NotRunning);
+    }
+
+    #[test]
+    fn daemon_presence_running_no_socket_with_a_live_pid_and_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        std::fs::write(
+            daemon_pidfile_path(&paths),
+            (std::process::id() as i32).to_string(),
+        )
+        .unwrap();
+        std::fs::write(daemon_no_socket_marker_path(&paths), b"").unwrap();
+        assert_eq!(daemon_presence(&paths), DaemonPresence::RunningNoSocket);
+    }
+
+    #[test]
+    fn daemon_presence_undetermined_with_a_live_pid_and_no_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_runtime(tmp.path());
+        std::fs::write(
+            daemon_pidfile_path(&paths),
+            (std::process::id() as i32).to_string(),
+        )
+        .unwrap();
+        match daemon_presence(&paths) {
+            DaemonPresence::Undetermined(reason) => {
+                assert!(reason.contains("unreachable"), "{reason}");
+            }
+            other => panic!("expected Undetermined, got {other:?}"),
+        }
     }
 
     /// An action whose previous gather is still running does not get
