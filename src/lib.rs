@@ -43,6 +43,7 @@ pub mod job;
 pub mod jsonfmt;
 pub mod lock;
 pub mod mailer;
+pub mod mcp;
 pub mod migrate;
 pub mod mint;
 pub mod native;

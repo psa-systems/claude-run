@@ -46,6 +46,7 @@ tracing = "0.1"
 getrandom = "0.2"
 argon2 = "0.6.0"
 qrcodegen = "1.8.0"
+schemars = "1"
 
 [dependencies.totp-rs]
 version = "6.0.0"
@@ -142,6 +143,11 @@ features = [
 [dependencies.tokio]
 version = "1"
 features = ["full"]
+
+[dependencies.rmcp]
+version = "1.7.0"
+default-features = false
+features = ["server", "macros", "transport-io"]
 
 [dependencies.tracing-subscriber]
 version = "0.3"

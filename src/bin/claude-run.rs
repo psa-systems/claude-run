@@ -17,7 +17,8 @@ use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
 use claude_run::{
     access, action, api, claude as claude_mod, client::DaemonClient, config as cfg, daemon, db,
-    exit, import, jsonfmt, lock, migrate, paint, secrets, settings, snippet, state, test_postgres,
+    exit, import, jsonfmt, lock, mcp, migrate, paint, secrets, settings, snippet, state,
+    test_postgres,
 };
 
 /// `--color` choices. Maps to both `anstream` (our own output) and clap's
@@ -148,6 +149,9 @@ enum Cmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Read-only troubleshooting MCP server subcommands (CLAUDE-437).
+    #[command(subcommand)]
+    Mcp(McpCmd),
     /// Import legacy `~/.local/share/claude-run/state/*.json` files into SQLite.
     Migrate {
         #[arg(long)]
@@ -220,6 +224,15 @@ enum AccessCmd {
 }
 
 #[derive(Subcommand)]
+enum McpCmd {
+    /// Serve the read-only troubleshooting MCP tools over stdio
+    /// (JSON-RPC in on stdin, JSON-RPC out on stdout; logs go to stderr).
+    /// DB-direct: works with no daemon running, same as every other
+    /// DB-direct subcommand. No tool ever writes.
+    Stdio,
+}
+
+#[derive(Subcommand)]
 enum SecretCmd {
     /// Create or replace a secret. The plaintext value never lands in argv (shell
     /// history, `ps`). When run interactively the command prompts twice with input
@@ -234,14 +247,19 @@ enum SecretCmd {
 }
 
 fn main() -> ExitCode {
-    let log_reload = init_tracing();
+    // Pre-scan argv before building the tracing subscriber: `mcp stdio`'s
+    // stdout must carry only MCP frames, so its logs are routed to stderr
+    // from the first line on (see `init_tracing`). This has to happen before
+    // clap parses `Cli::cmd`, since the subscriber is process-global and can
+    // only be installed once.
+    let raw_args: Vec<String> = std::env::args().collect();
+    let log_reload = init_tracing(argv_is_mcp_stdio(&raw_args));
 
     // Resolve the color choice BEFORE clap renders any help/error: clap
     // colorizes its own output during parse, before we could read the parsed
     // `--color` flag, so pre-scan argv for it (honoring NO_COLOR via anstream's
     // auto detection). The flag is still defined on `Cli` for help/validation;
     // this pre-scan only feeds clap's renderer and our global anstream choice.
-    let raw_args: Vec<String> = std::env::args().collect();
     let color = resolve_color_choice(&raw_args);
     anstream_choice(color).write_global();
 
@@ -383,15 +401,45 @@ fn log_server_started() {
 /// logs exactly as it did. Wrapping the filter in a `reload::Layer` lets
 /// `apply_config_log_filter` swap in `[daemon].log_filter` once the config is
 /// loaded, without a second (illegal) `set_global_default`.
-fn init_tracing() -> reload::Handle<EnvFilter, Registry> {
+///
+/// `to_stderr` is true only for `mcp stdio` (CLAUDE-437): that transport's
+/// stdout must carry nothing but MCP JSON-RPC frames, so every other
+/// subcommand keeps logging to stdout as before and only this one is routed
+/// to stderr. Decided by [`argv_is_mcp_stdio`] because this runs before clap
+/// parses `Cli::cmd`.
+fn init_tracing(to_stderr: bool) -> reload::Handle<EnvFilter, Registry> {
     let filter = EnvFilter::try_from_env("CLAUDE_RUN_LOG")
         .unwrap_or_else(|_| EnvFilter::new("info,claude_run=info,sqlx=warn"));
     let (filter_layer, reload_handle) = reload::Layer::new(filter);
-    tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(fmt::layer().with_target(false).json())
-        .init();
+    if to_stderr {
+        tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(
+                fmt::layer()
+                    .with_target(false)
+                    .json()
+                    .with_writer(std::io::stderr),
+            )
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(fmt::layer().with_target(false).json())
+            .init();
+    }
     reload_handle
+}
+
+/// Best-effort scan of argv for the `mcp stdio` subcommand, used only to pick
+/// `init_tracing`'s writer before clap has parsed `Cli::cmd`. Ignores any
+/// token starting with `-` (global flags and their values) and looks at the
+/// remaining positional tokens, mirroring [`resolve_color_choice`]'s
+/// best-effort style; a genuinely ambiguous argv still gets a proper clap
+/// error later in [`parse_cli`].
+fn argv_is_mcp_stdio(args: &[String]) -> bool {
+    let mut positional = args.iter().skip(1).filter(|a| !a.starts_with('-'));
+    positional.next().map(String::as_str) == Some("mcp")
+        && positional.next().map(String::as_str) == Some("stdio")
 }
 
 /// Apply `[daemon].log_filter` after config load, honoring the
@@ -470,6 +518,10 @@ async fn real_main(
         Cmd::Action(c) => action_cmd(c, &paths, &actions_dir, &db_target).await,
         Cmd::Access(c) => access_cmd(c, &paths, &db_target).await,
         Cmd::Secret(c) => secret_cmd(c, &db_target).await,
+        Cmd::Mcp(McpCmd::Stdio) => {
+            mcp::serve_stdio(&db_target, paths).await?;
+            Ok(exit::OK)
+        }
         Cmd::TestPostgres {
             image,
             init_sql,
@@ -886,43 +938,23 @@ async fn daemonless_status(
     pool: &crate::db::DbPool,
     sock: &std::path::Path,
 ) -> claude_run::error::Result<serde_json::Value> {
-    let global = state::global_pause_status(pool).await?;
-    let actions = state::action_index_list(pool).await?;
-    // The same activity block `/status` carries, so a reboot script
-    // reads `quiet` whether or not the daemon is up. With no daemon there is no
-    // in-flight map to consult, so the open `runs` rows are the whole signal.
-    let active_runs = state::active_runs(pool).await?;
-    // The same stale-gate block `/status` carries. The gate table is
-    // the daemon's, but it is plain DB state, so a daemonless status reports a
-    // stuck gate rather than the misleading silence of omitting it.
-    let stale_gates =
-        state::dependency_gates_stale(pool, state::now_epoch_ms(), state::STALE_GATE_AFTER_MS, 20)
-            .await?;
-    // Likewise for the keys parked at their action's attempt cap.
-    // Both counters and action YAML are plain on-disk state, so the daemonless
-    // path reports the same block rather than omitting it and reading as clear.
-    let defaults = claude_run::job::RunnerDefaults::default();
-    let caps =
-        claude_run::blocking::in_place(|| claude_run::job::attempt_caps(&actions, &defaults));
-    let attempt_cap_hits = state::attempt_cap_hits(
-        pool,
-        &caps,
-        defaults.max_attempts_per_key,
-        state::ATTEMPT_CAP_HITS_LIMIT,
-    )
-    .await?;
+    // The same blocks `/status` carries, assembled once in the library
+    // (`state::status_blocks`) so the daemon's `/status` route and this
+    // daemonless path can never drift apart (CLAUDE-437 also builds
+    // `get_status`'s MCP tool output from this function).
+    let b = state::status_blocks(pool).await?;
     Ok(json!({
         "daemon": "not running",
         "socket_expected_at": sock.display().to_string(),
-        "global_paused": global.map(|(a, r)| json!({"paused_at": a, "reason": r})),
+        "global_paused": b.global_paused.map(|(a, r)| json!({"paused_at": a, "reason": r})),
         "activity": {
-            "quiet": active_runs.is_empty(),
-            "active_runs": active_runs,
+            "quiet": b.active_runs.is_empty(),
+            "active_runs": b.active_runs,
             "dispatched_actions": Vec::<String>::new(),
         },
-        "stale_gates": stale_gates,
-        "attempt_cap_hits": attempt_cap_hits,
-        "actions": actions,
+        "stale_gates": b.stale_gates,
+        "attempt_cap_hits": b.attempt_cap_hits,
+        "actions": b.actions,
     }))
 }
 

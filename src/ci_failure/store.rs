@@ -19,7 +19,7 @@ pub struct FailureMatch {
 }
 
 /// A `ci_failures` row's own fields, without the derived match ranking.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Failure {
     pub id: i64,
     pub repo: String,
@@ -370,6 +370,30 @@ pub async fn run_indexes_for_failure_pr(
     .fetch_all(pool)
     .await?;
     Ok(indexes)
+}
+
+/// `ci_failures` rows for `mcp stdio`'s `list_ci_failures` tool, newest first.
+/// `state` narrows to one `state` value (`open` / `resolved` / `pr_only`); with
+/// `None` every state is returned.
+pub async fn list_failures(pool: &DbPool, state: Option<&str>, limit: i64) -> Result<Vec<Failure>> {
+    let sql = match state {
+        Some(_) => {
+            "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, \
+             created_at, updated_at FROM ci_failures WHERE state = ? \
+             ORDER BY updated_at DESC LIMIT ?"
+        }
+        None => {
+            "SELECT id, repo, workflow_id, job_name, infra_kind, issue_key, state, \
+             created_at, updated_at FROM ci_failures ORDER BY updated_at DESC LIMIT ?"
+        }
+    };
+    let dialect_sql = db::q(pool, sql);
+    let mut query = sqlx::query(&dialect_sql);
+    if let Some(s) = state {
+        query = query.bind(s);
+    }
+    let rows = query.bind(limit).fetch_all(pool).await?;
+    rows.iter().map(failure_from_row).collect()
 }
 
 /// Record a PR the agent opened. `salvaged` is true for a timeout-salvage PR
