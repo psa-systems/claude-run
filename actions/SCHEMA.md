@@ -726,6 +726,12 @@ event is followed by a `system`/`task_updated` event reporting `patch.status: ki
 runner terminates a leftover background task that outlived the result), the run finalizes as a non-transient failure
 naming the task id rather than the success the `result` event reported.
 
+**Foreground commands are bounded by the run budget, not the tool's stock 2 minutes (CLAUDE-435).** The `Bash` tool's
+own foreground-command timeout defaults to 2 minutes (ceiling 10) and is unrelated to the `timeout $claude_timeout_seconds`
+wrapper above; the runner sets `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS` on every child, next to
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`, both equal to the invocation's own timeout in milliseconds, so the child never
+has the stock 2-minute limit and the tool can never kill a foreground command before the run's own budget would.
+
 ```
 $CLAUDE_RUN_STATE_DIR/logs/<name>/streams/<key>-attempt-<n>.jsonl
 ```
