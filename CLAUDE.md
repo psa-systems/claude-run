@@ -8,7 +8,7 @@ YAML-driven runner for Claude Code: poll an external source (YouTrack issues, Fo
 
 ## Shape
 
-- Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,cancel,pause,resume,status,action,access,secret,migrate,import,test-postgres}`.
+- Rust binary, library + bin. `clap` derive. Subcommand tree: `claude-run {run,serve,stop,restart,trigger,cancel,pause,resume,status,action,access,secret,mcp,migrate,import,test-postgres}`.
 - Actions are YAML files under `$CLAUDE_RUN_CONFIG_DIR/actions/` (`/config/actions/` in the container). Each action's `input.command` / `filter` / `pre[]` / `prompt` / `post[]` is a nu snippet shelled out via the host's `nu` binary.
 - Runtime state in SQLite at `$CLAUDE_RUN_DATA_DIR/state.db` by default, or in PostgreSQL when the operator sets one (CLAUDE-250; see the `[database]` note below). Per-attempt stream logs at `$CLAUDE_RUN_STATE_DIR/logs/<action>/streams/<key>-attempt-<n>.jsonl`, bounded by the CLAUDE-245 sweep (see below).
 - Daemon (`claude-run serve`) owns scheduling and exposes an HTTP API over `$CLAUDE_RUN_RUNTIME_DIR/daemon.sock`. CLI subcommands delegate to the daemon when reachable, else operate directly on the DB. The socket is the CLI's control plane and nothing else:
@@ -76,6 +76,7 @@ Each line names one rule and links its full text. A new convention adds one inde
 
 - `closed-issue-summary` is a reporting action; shipped action queries stay disjoint ([CLAUDE-218, CLAUDE-215](docs/conventions/actions.md#reporting-actions-claude-218-claude-215))
 - Every YouTrack write goes through run-scoped `AuditedTracker`, which caps and attributes it ([CLAUDE-234](docs/conventions/actions.md#audited-youtrack-writes-claude-234))
+- `claude-run mcp stdio` is a read-only MCP server; stdout carries only MCP frames, no tool ever writes ([CLAUDE-437](docs/conventions/mcp.md))
 
 ### State store and config
 

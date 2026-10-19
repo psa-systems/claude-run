@@ -1540,6 +1540,223 @@ pub async fn secret_touch(pool: &DbPool, name: &str) -> Result<()> {
     Ok(())
 }
 
+// ---- Read-only reports shared by `claude-run status` and `mcp stdio` ----
+
+/// The DB-derived blocks `claude-run status` (no daemon reachable) and the
+/// `get_status` MCP tool both report, assembled once here so the two surfaces
+/// cannot drift. The CLI adds its own `daemon` / `socket_expected_at` keys on
+/// top; the MCP tool adds `"source": "database"` instead.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatusBlocks {
+    pub global_paused: Option<(String, Option<String>)>,
+    pub active_runs: Vec<ActiveRun>,
+    pub stale_gates: Vec<StaleGate>,
+    pub attempt_cap_hits: Vec<CappedKey>,
+    pub actions: Vec<ActionIndexRow>,
+}
+
+/// Assemble [`StatusBlocks`] from the live DB state: global pause, open runs,
+/// stale dependency gates, keys parked at their action's attempt cap, and the
+/// action index. Reads the same tables [`crate::job::attempt_caps`] and the
+/// constants here already governed before this function existed; see
+/// `daemonless_status` in `src/bin/claude-run.rs` for the original inline form.
+pub async fn status_blocks(pool: &DbPool) -> Result<StatusBlocks> {
+    let global_paused = global_pause_status(pool).await?;
+    let actions = action_index_list(pool).await?;
+    let active_runs = active_runs(pool).await?;
+    let stale_gates = dependency_gates_stale(pool, now_epoch_ms(), STALE_GATE_AFTER_MS, 20).await?;
+    let defaults = crate::job::RunnerDefaults::default();
+    let caps = crate::blocking::in_place(|| crate::job::attempt_caps(&actions, &defaults));
+    let attempt_cap_hits = attempt_cap_hits(
+        pool,
+        &caps,
+        defaults.max_attempts_per_key,
+        ATTEMPT_CAP_HITS_LIMIT,
+    )
+    .await?;
+    Ok(StatusBlocks {
+        global_paused,
+        active_runs,
+        stale_gates,
+        attempt_cap_hits,
+        actions,
+    })
+}
+
+/// One `runs` row, as read back for `mcp stdio`'s `list_runs` / `get_run`
+/// tools. Mirrors `RunRow` in `src/web/mod.rs` (kept private there, per
+/// CLAUDE-437's instruction not to touch that module) but is its own type:
+/// the two surfaces render differently enough (JSON tool result vs HTML) that
+/// sharing a struct would couple them for no benefit.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct RunRecord {
+    pub id: i64,
+    pub action_name: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub exit_code: Option<i64>,
+    pub jobs_processed: i64,
+    pub triggered_by: String,
+    pub current_job_key: Option<String>,
+    pub stage: Option<String>,
+}
+
+const RUN_RECORD_COLUMNS: &str = "id, action_name, started_at, ended_at, exit_code, \
+    jobs_processed, triggered_by, current_job_key, stage";
+
+/// One `runs` row by id, or `None` when no run has that id.
+pub async fn run_get(pool: &DbPool, run_id: i64) -> Result<Option<RunRecord>> {
+    let sql = format!("SELECT {RUN_RECORD_COLUMNS} FROM runs WHERE id = ?");
+    let row = sqlx::query_as::<_, RunRecord>(&crate::db::q(pool, &sql))
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+/// Newest-first `runs` rows for `mcp stdio`'s `list_runs` tool. `action`
+/// narrows to one action name; `failed_only` keeps only runs with at least one
+/// job whose latest attempt hard-failed (mirrors `JOB_FAILED` in
+/// `src/web/mod.rs`, duplicated here for the same reason as [`RunRecord`]).
+pub async fn runs_list(
+    pool: &DbPool,
+    action: Option<&str>,
+    failed_only: bool,
+    limit: i64,
+) -> Result<Vec<RunRecord>> {
+    let mut sql = format!("SELECT {RUN_RECORD_COLUMNS} FROM runs");
+    let mut clauses: Vec<&str> = Vec::new();
+    if action.is_some() {
+        clauses.push("action_name = ?");
+    }
+    if failed_only {
+        clauses.push(
+            "EXISTS (SELECT 1 FROM job_outcomes o WHERE o.run_id = runs.id AND o.ok = 0 \
+             AND o.timed_out = 0 AND o.attempt = (SELECT MAX(o2.attempt) FROM job_outcomes o2 \
+             WHERE o2.run_id = o.run_id AND o2.job_key = o.job_key))",
+        );
+    }
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    sql.push_str(" ORDER BY started_at DESC LIMIT ?");
+    let dialect_sql = crate::db::q(pool, &sql);
+    let mut q = sqlx::query_as::<_, RunRecord>(&dialect_sql);
+    if let Some(a) = action {
+        q = q.bind(a);
+    }
+    q = q.bind(limit);
+    let rows = q.fetch_all(pool).await?;
+    Ok(rows)
+}
+
+/// One `job_outcomes` row, as read back for `mcp stdio`'s `get_run` tool.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobOutcomeRecord {
+    pub job_key: String,
+    pub attempt: i64,
+    pub ts: String,
+    pub ok: bool,
+    pub claude_ran: bool,
+    pub claude_ok: bool,
+    pub claude_cost_usd: f64,
+    pub duration_ms: Option<i64>,
+    pub timed_out: bool,
+    pub summary: Option<String>,
+    pub has_stream_log: bool,
+}
+
+// By hand rather than derived: `ok` / `claude_ran` / `claude_ok` / `timed_out`
+// are integer 0/1 columns on both backends. See `crate::db::flag`.
+impl sqlx::FromRow<'_, sqlx::any::AnyRow> for JobOutcomeRecord {
+    fn from_row(row: &sqlx::any::AnyRow) -> sqlx::Result<Self> {
+        use sqlx::Row;
+        Ok(Self {
+            job_key: row.try_get("job_key")?,
+            attempt: row.try_get("attempt")?,
+            ts: row.try_get("ts")?,
+            ok: crate::db::flag(row, "ok")?,
+            claude_ran: crate::db::flag(row, "claude_ran")?,
+            claude_ok: crate::db::flag(row, "claude_ok")?,
+            claude_cost_usd: row.try_get("claude_cost_usd")?,
+            duration_ms: row.try_get("duration_ms")?,
+            timed_out: crate::db::flag(row, "timed_out")?,
+            summary: row.try_get("summary")?,
+            has_stream_log: row
+                .try_get::<Option<String>, _>("stream_log_path")?
+                .is_some(),
+        })
+    }
+}
+
+/// Every `job_outcomes` row for one run, oldest attempt first.
+pub async fn job_outcomes_for_run(pool: &DbPool, run_id: i64) -> Result<Vec<JobOutcomeRecord>> {
+    let rows = sqlx::query_as::<_, JobOutcomeRecord>(&crate::db::q(
+        pool,
+        "SELECT job_key, attempt, ts, ok, claude_ran, claude_ok, claude_cost_usd, \
+         duration_ms, timed_out, summary, stream_log_path \
+         FROM job_outcomes WHERE run_id = ? ORDER BY id ASC",
+    ))
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// This run's `run_events`, warn/error diagnostics first (then newest first
+/// within each group), for `mcp stdio`'s `get_run` tool.
+pub async fn run_events_for_run(pool: &DbPool, run_id: i64) -> Result<Vec<RunEventRecord>> {
+    let rows = sqlx::query_as::<_, RunEventRecord>(&crate::db::q(
+        pool,
+        "SELECT run_id, ts, level, context, message FROM run_events WHERE run_id = ? \
+         ORDER BY (CASE WHEN level IN ('warn', 'error') THEN 0 ELSE 1 END), ts DESC, id DESC",
+    ))
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// The recorded `stream_log_path` (and the attempt it belongs to) for one
+/// job's attempt in one run. `attempt = None` resolves to that job's latest
+/// attempt. Returns `None` when no `job_outcomes` row matches at all (unknown
+/// run/job/attempt), distinct from a matching row whose `stream_log_path` is
+/// itself `NULL`.
+pub async fn job_outcome_stream_log(
+    pool: &DbPool,
+    run_id: i64,
+    job_key: &str,
+    attempt: Option<u32>,
+) -> Result<Option<(i64, Option<String>)>> {
+    let row: Option<(i64, Option<String>)> = match attempt {
+        Some(a) => {
+            sqlx::query_as(&crate::db::q(
+                pool,
+                "SELECT attempt, stream_log_path FROM job_outcomes \
+                 WHERE run_id = ? AND job_key = ? AND attempt = ?",
+            ))
+            .bind(run_id)
+            .bind(job_key)
+            .bind(a as i64)
+            .fetch_optional(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(&crate::db::q(
+                pool,
+                "SELECT attempt, stream_log_path FROM job_outcomes \
+                 WHERE run_id = ? AND job_key = ? ORDER BY attempt DESC LIMIT 1",
+            ))
+            .bind(run_id)
+            .bind(job_key)
+            .fetch_optional(pool)
+            .await?
+        }
+    };
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
