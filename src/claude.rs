@@ -391,6 +391,16 @@ impl ClaudeInvoker {
             .stderr(Stdio::from(log_err))
             .process_group(0)
             .env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
+        // The `Bash` tool's own foreground-command timeout defaults to 2
+        // minutes (ceiling 10) and is unrelated to the `timeout(1)` wrapper
+        // above; without this, a long foreground command is killed well
+        // before the run's own budget. Setting both to the invocation's
+        // `timeout` means the tool can never kill a command the run's
+        // wall-clock budget would not already have killed.
+        let timeout_ms = timeout.as_millis().to_string();
+        command
+            .env("BASH_DEFAULT_TIMEOUT_MS", &timeout_ms)
+            .env("BASH_MAX_TIMEOUT_MS", &timeout_ms);
         strip_database_url_env(&mut command);
         strip_smtp_password_env(&mut command);
         // Point the agent at its dedicated user-level config dir
@@ -1607,6 +1617,44 @@ exit "$code"
         assert!(res.timed_out, "exit 124 should set timed_out");
         assert!(!res.ok, "a timeout is not ok");
         assert!(!res.transient, "a timeout is never transient");
+    }
+
+    #[test]
+    fn invoke_sets_bash_timeout_env_to_the_invocation_timeout() {
+        ensure_coreutils_timeout_on_path();
+
+        let dir = tempfile::tempdir().unwrap();
+        let env_dump = dir.path().join("env.txt");
+        let stub = dir.path().join("claude-stub.sh");
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$BASH_DEFAULT_TIMEOUT_MS\" \"$BASH_MAX_TIMEOUT_MS\" > {}\nprintf '%s\\n' '{{\"type\":\"result\",\"is_error\":false}}'\nexit 0\n",
+                env_dump.display()
+            ),
+        );
+
+        let invoker = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+        let cancel = CancellationToken::new();
+        let log = dir.path().join("stream.jsonl");
+        let cfg = ClaudeBlock::default();
+        let res = invoker
+            .invoke(
+                "hi",
+                &cfg,
+                Duration::from_secs(37),
+                dir.path(),
+                &log,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert!(res.ok, "a clean immediate exit is ok");
+
+        let recorded = std::fs::read_to_string(&env_dump).unwrap();
+        let mut lines = recorded.lines();
+        assert_eq!(lines.next(), Some("37000"), "BASH_DEFAULT_TIMEOUT_MS");
+        assert_eq!(lines.next(), Some("37000"), "BASH_MAX_TIMEOUT_MS");
     }
 
     /// A run that finishes well inside its budget must not block on

@@ -14,6 +14,9 @@
   event is followed by a `system`/`task_updated` event reporting `patch.status: killed` (a leftover background task the
   runner had to terminate), the run finalizes as a non-transient failure naming the task, never as the success the
   `result` event claimed.
+- **Foreground commands run for the whole budget** (CLAUDE-435): the same `invoke` sets `BASH_DEFAULT_TIMEOUT_MS` and
+  `BASH_MAX_TIMEOUT_MS` on every child to the invocation's own wall-clock budget in milliseconds, so the `Bash` tool's
+  stock 2-minute foreground-command timeout never kills a command before the run's own budget would.
 - **Cost ledger + caps**: per-day Claude-invocation cap, per-day USD budget, per-RUN USD ceiling, per-job attempt cap. All in SQLite.
 - **Per-run usage accounting** (DEV-707): every run ends with a `run usage` summary line and appends one newline-delimited JSON record to `$STATE_DIR/logs/usage.jsonl` carrying tokens by category, estimated cost against the budget, wall-clock duration, tool call counts, and per-tool attribution, so "what did this run cost, and which tool dominated it" is answerable without a provider console.
 - **Skip-attempt marker**: an action's post step can write `$workdir/.claude-run-skip-attempt` for outcomes that park a

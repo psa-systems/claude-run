@@ -72,7 +72,7 @@ pub(crate) fn default_audit_prompt() -> String {
         "",
         "Also out of reach, by design: pushing, opening the pull request (the runner does both from the branch you leave checked out), and writing anything at all into any target repository.",
         "",
-        "HARD RULE on long commands: run everything in the FOREGROUND and wait for it inline. Leave NO background job running when you stop; a lingering process keeps the run's process group alive and gets the whole run timeout-killed even after the work is done.",
+        "HARD RULE on long commands: run everything in the FOREGROUND and wait for it inline. Leave NO background job running when you stop; a lingering process keeps the run's process group alive and gets the whole run timeout-killed even after the work is done. The `Bash` tool itself kills a foreground command at its own timeout, so pass an explicit `timeout` for a command you know will run long. A timeout kill (exit 143, \"Command timed out\") means the command was interrupted, not that it failed or passed: never re-run it identical, raise the `timeout` or run only the part that was cut off.",
         "",
         "If you CANNOT safely complete the run - the issue matches neither run shape, the working directory is not the audits checkout, the target clone fails, the audit-type prompt is missing, or a permitted tracker write is rejected:",
         "  a. Do NOT write the report somewhere else and do NOT change any code.",
