@@ -58,7 +58,7 @@ use tracing::{error, info, warn};
 
 use super::{HandlerFuture, NativeContext, NativeHandler};
 use crate::access;
-use crate::action::{NativeConfig, PromptPreset, YoutrackSource};
+use crate::action::{self, NativeConfig, PromptPreset, YoutrackSource};
 use crate::cancel::{CancellationToken, RegistryGuard};
 use crate::claude::{raw_event_details, ClaudeInvoker, ClaudeResult};
 use crate::concurrency::Executor;
@@ -590,6 +590,142 @@ pub(crate) fn credentialed_backend(
         backend = backend.with_keys_path(path.clone());
     }
     backend
+}
+
+/// Comment posted on an issue this restart reconcile re-queues (CLAUDE-440).
+const RESTART_REQUEUE_COMMENT: &str =
+    "The runner restarted while this issue was being worked; the attempt was not completed and it has been re-queued.";
+
+/// Startup reconcile for CLAUDE-440: a daemon that stops or dies mid-job
+/// leaves its issues on `AI Agent = Working` forever, because `run_pre` is the
+/// only place that ever sets `states.working`, and nothing but the (now-dead)
+/// process was ever going to move it on. `serve` startup calls this BEFORE
+/// [`state::reap_orphaned_runs`] discards `run_inflight_jobs`, since that table
+/// is the only record of which keys the dead process had picked up.
+///
+/// For each leftover row whose action still resolves to a `kind: youtrack`
+/// action, this re-reads `AI Agent` through that action's own tracker
+/// (its `token_ref` credentials, same as a live job) and, only when it is
+/// still `states.working`, sets `states.queued` and posts
+/// [`RESTART_REQUEUE_COMMENT`]. A key whose field already moved on (a human or
+/// another process advanced it) is left untouched. Never aborts: every
+/// failure (an action that no longer exists or is not `kind: youtrack`, a
+/// credential or tracker error) is logged and the row is left to
+/// [`state::reap_orphaned_runs`]'s unconditional delete; the daemon must
+/// finish starting either way.
+pub async fn reconcile_restart_inflight(
+    pool: &DbPool,
+    paths: &Paths,
+    runner: &Arc<dyn CommandRunner>,
+) {
+    let rows = match state::run_inflight_rows_all(pool).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!(error = %e, "restart reconcile: reading leftover run_inflight_jobs rows failed; nothing reconciled this startup");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+
+    let actions_dir = paths.actions_dir();
+    let cred_root = paths
+        .runtime_dir
+        .join("credentials")
+        .join("restart-reconcile");
+
+    // Group by action so each action's tracker is resolved once, not once per key.
+    let mut by_action: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        by_action
+            .entry(row.action_name)
+            .or_default()
+            .push(row.job_key);
+    }
+
+    for (action_name, keys) in by_action {
+        let Some(path) = action::resolve_action_path(&action_name, &actions_dir) else {
+            warn!(action = %action_name, keys = ?keys, "restart reconcile: action no longer exists on disk; leftover inflight keys left for the next restart to retry");
+            continue;
+        };
+        let loaded = match action::load_from_path(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(action = %action_name, keys = ?keys, error = %e, "restart reconcile: action failed to parse; leftover inflight keys left for the next restart to retry");
+                continue;
+            }
+        };
+        let cfg = match &loaded.action.native {
+            Some(NativeConfig::Youtrack(cfg)) => cfg,
+            _ => {
+                warn!(action = %action_name, keys = ?keys, "restart reconcile: action is not kind: youtrack; leftover inflight keys left for the next restart to retry");
+                continue;
+            }
+        };
+        let src = &cfg.youtrack;
+
+        let creds = match secrets::resolve_youtrack_credentials(
+            pool,
+            src,
+            &cfg.forgejo,
+            &cfg.github,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                error!(action = %action_name, keys = ?keys, error = %e, "restart reconcile: resolving credentials failed; leftover inflight keys left unreconciled");
+                continue;
+            }
+        };
+        // Held alive for the whole action group so its temp credential files
+        // outlive every key's tracker call below; dropped (and scrubbed) at the
+        // end of this iteration.
+        let mut _guard: Option<JobCredentials> = None;
+        let backend: CliBackend = if creds.is_empty() {
+            CliBackend::new(runner.clone())
+        } else {
+            let dir = cred_root.join(format!(
+                "{}-{}",
+                sanitize_key(&action_name),
+                secrets::unique_suffix()
+            ));
+            match JobCredentials::materialize(&dir, &creds, None) {
+                Ok(g) => {
+                    let b = credentialed_backend(runner, &g);
+                    _guard = Some(g);
+                    b
+                }
+                Err(e) => {
+                    error!(action = %action_name, keys = ?keys, error = %e, "restart reconcile: materializing credentials failed; leftover inflight keys left unreconciled");
+                    continue;
+                }
+            }
+        };
+
+        for key in keys {
+            match backend.get_field(&key, &src.custom_field) {
+                Ok(v) if v.trim() == src.states.working => {
+                    if let Err(e) = backend.set_field(&key, &src.custom_field, &src.states.queued) {
+                        error!(action = %action_name, key = %key, error = %e, "restart reconcile: set_field to Queued failed; key stays on Working until the next restart");
+                        continue;
+                    }
+                    if let Err(e) = backend.comment(&key, RESTART_REQUEUE_COMMENT) {
+                        warn!(action = %action_name, key = %key, error = %e, "restart reconcile: re-queue comment failed (field was already set to Queued)");
+                    }
+                    info!(action = %action_name, key = %key, "restart reconcile: re-queued an issue stranded on Working by a dead process");
+                }
+                Ok(v) => {
+                    info!(action = %action_name, key = %key, current = %v, "restart reconcile: already advanced off Working; leaving untouched");
+                }
+                Err(e) => {
+                    error!(action = %action_name, key = %key, error = %e, "restart reconcile: reading AI Agent failed; key left unreconciled");
+                }
+            }
+        }
+    }
 }
 
 /// Make a job key safe as a single path component for the per-job credential
@@ -8923,5 +9059,205 @@ mod tests {
             1,
             "the second, colliding record surfaces as an operator-visible notice"
         );
+    }
+
+    // ---- CLAUDE-440: startup reconcile of stranded `run_inflight_jobs` rows ----
+
+    /// A minimal, valid `kind: youtrack` action file on disk (default
+    /// `custom_field` "AI Agent", default `states`), named by `name`.
+    fn write_youtrack_action(paths: &Paths, name: &str) {
+        std::fs::create_dir_all(paths.actions_dir()).unwrap();
+        std::fs::write(
+            paths.actions_dir().join(format!("{name}.yml")),
+            format!("name: {name}\nkind: youtrack\nnative: {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    fn test_paths(root: &Path) -> Paths {
+        Paths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            runtime_dir: root.join("runtime"),
+        }
+    }
+
+    /// A key seeded in `run_inflight_jobs` for a `kind: youtrack` action,
+    /// still reading `Working`, is re-queued (AI Agent -> Queued) and gets
+    /// exactly one comment; a subsequent `reap_orphaned_runs` then clears the
+    /// table as before.
+    #[tokio::test]
+    async fn reconcile_restart_inflight_requeues_a_working_key() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+
+        let run_id = state::run_begin(&pool, "yt-action", "scheduler")
+            .await
+            .unwrap();
+        state::run_inflight_add(&pool, run_id, "MK-16", "MK")
+            .await
+            .unwrap();
+
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-16", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-16", "AI Agent", "Queued"],
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "comment", "MK-16", RESTART_REQUEUE_COMMENT],
+                    "",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_restart_inflight(&pool, &paths, &dyn_runner).await;
+
+        {
+            let calls = runner.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c == "yt issue set-field MK-16 AI Agent Queued"),
+                "{calls:?}"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.starts_with("yt issue comment MK-16"))
+                    .count(),
+                1,
+                "exactly one re-queue comment; {calls:?}"
+            );
+        }
+
+        let reaped = state::reap_orphaned_runs(&pool).await.unwrap();
+        assert_eq!(reaped, 1);
+        assert!(state::run_inflight_keys(&pool, run_id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A key whose field already moved off `Working` (a human or another
+    /// process advanced it) is left untouched: no `set-field`, no comment.
+    #[tokio::test]
+    async fn reconcile_restart_inflight_leaves_an_advanced_key_untouched() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+
+        let run_id = state::run_begin(&pool, "yt-action", "scheduler")
+            .await
+            .unwrap();
+        state::run_inflight_add(&pool, run_id, "MK-17", "MK")
+            .await
+            .unwrap();
+
+        let runner = Arc::new(StubRunner::new().ok(
+            "yt",
+            &["issue", "get-field", "MK-17", "AI Agent"],
+            "Code Review\n",
+        ));
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_restart_inflight(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.contains("set-field")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("comment")), "{calls:?}");
+    }
+
+    /// A tracker failure reading one key's `AI Agent` is logged (not
+    /// asserted here, since tracing output is not captured) and must not stop a
+    /// SECOND key, in the same action group, from being reconciled.
+    #[tokio::test]
+    async fn reconcile_restart_inflight_one_key_failure_does_not_block_another() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_youtrack_action(&paths, "yt-action");
+
+        let run_id = state::run_begin(&pool, "yt-action", "scheduler")
+            .await
+            .unwrap();
+        state::run_inflight_add(&pool, run_id, "MK-18", "MK")
+            .await
+            .unwrap();
+        state::run_inflight_add(&pool, run_id, "MK-19", "MK")
+            .await
+            .unwrap();
+
+        // MK-18's get-field is left unstubbed, so the backend's call fails; MK-19
+        // still gets its full stubbed exchange.
+        let runner = Arc::new(
+            StubRunner::new()
+                .ok(
+                    "yt",
+                    &["issue", "get-field", "MK-19", "AI Agent"],
+                    "Working\n",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "set-field", "MK-19", "AI Agent", "Queued"],
+                    "",
+                )
+                .ok(
+                    "yt",
+                    &["issue", "comment", "MK-19", RESTART_REQUEUE_COMMENT],
+                    "",
+                ),
+        );
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+
+        reconcile_restart_inflight(&pool, &paths, &dyn_runner).await;
+
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "yt issue set-field MK-19 AI Agent Queued"),
+            "the second key must still be reconciled despite the first key's tracker failure; {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("MK-18") && !c.contains("get-field")),
+            "the failing key issues no further calls beyond its failed get-field; {calls:?}"
+        );
+    }
+
+    /// A row whose action no longer exists on disk is skipped (left for the
+    /// next restart) rather than panicking or aborting the whole reconcile.
+    #[tokio::test]
+    async fn reconcile_restart_inflight_skips_a_vanished_action() {
+        let pool = mem_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        // No action file written for "gone-action".
+
+        let run_id = state::run_begin(&pool, "gone-action", "scheduler")
+            .await
+            .unwrap();
+        state::run_inflight_add(&pool, run_id, "MK-20", "MK")
+            .await
+            .unwrap();
+
+        let runner = Arc::new(StubRunner::new());
+        let dyn_runner: Arc<dyn CommandRunner> = runner.clone();
+        reconcile_restart_inflight(&pool, &paths, &dyn_runner).await;
+
+        assert!(runner.calls.lock().unwrap().is_empty());
     }
 }

@@ -129,6 +129,26 @@ impl Daemon {
             self.log_apply.take(),
         ));
 
+        // CLAUDE-440: a dead process may have left `run_inflight_jobs` rows for
+        // issues it moved to `AI Agent = Working` and never finished; gather
+        // only ever sees `states.queued`, so those issues are invisible to every
+        // future poll until something re-queues them. `reap_orphaned_runs` below
+        // deletes that table unconditionally, so the reconcile MUST run first:
+        // it is the only chance to read which keys were stranded and ask each
+        // one's own tracker whether it is still Working before the record of it
+        // is gone. Resolving the shared `CommandRunner` is best-effort: a host
+        // with no `yt`/`fj` logs the failure and skips reconcile rather than
+        // blocking startup.
+        match crate::provider::resolve_runner(crate::provider::DEFAULT_PRIORITY) {
+            Ok(runner) => {
+                crate::native::youtrack::reconcile_restart_inflight(&pool, &self.paths, &runner)
+                    .await;
+            }
+            Err(e) => {
+                warn!(error = %e, "restart reconcile: no command runner available; any issue stranded on Working by a dead process is skipped this startup");
+            }
+        }
+
         // A freshly started daemon holds the single-instance lock, so any run
         // with no end state is orphaned from a process that died without
         // finalizing. Reap it before scheduling begins, as `UNEXPECTED` rather
