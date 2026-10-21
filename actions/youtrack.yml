@@ -28,6 +28,14 @@
 #                   .claude-run-no-code-change; no PR is opened and State is left alone (CLAUDE-214, label configurable
 #                   as native.youtrack.states.no_code)
 #
+# Working can also revert to Queued (CLAUDE-439), with a comment naming the reason and no attempt counted: a transient
+# claude result (an authentication failure, or a rate-limit / usage-limit signal) after the pre step already wrote
+# Working; or a global pause / the Claude login needing renewal tripping the run after the pre step but before claude
+# started. Either way the re-read before the revert checks the field is still Working first, so a concurrent manual
+# edit or a second runner instance is never stomped back to Queued; a run already stopped before the pre step writes
+# nothing at all, not even the live AI Agent re-read's own side effects. An operator cancel in that same window is
+# unaffected and still finalizes as Failed.
+#
 # The agent does ONLY local engineering work on code (read issue, branch, change, commit locally, run the repo's
 # checks): no git push and no PR. Since CLAUDE-214 it may also make bounded tracker writes, in two cases (CLAUDE-297
 # split these): a gap, deferred item, or descoped piece of the triggering issue is filed in
