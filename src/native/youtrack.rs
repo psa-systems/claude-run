@@ -1082,6 +1082,30 @@ async fn process_job(
         }
     };
 
+    // ---- pre-mutation checkpoint: stop before Working ----
+    // Checked once more, right before the first mutation of this issue
+    // (`preserve_aside` is local-only, but `run_pre` right after it writes AI
+    // Agent=Working and clones): an operator cancel, a global pause, or the
+    // readiness gate's login-required state must never move this issue to
+    // Working. Nothing has been written yet, so leaving it `Queued` costs
+    // nothing: no field write, no clone, no attempt. `Filtered` is reused
+    // rather than a new `ProcessedJob` variant: nothing downstream of
+    // `process_job` inspects it beyond a generic "not processed" count, so it
+    // cannot mis-report this outcome.
+    if cancel.is_cancelled() {
+        info!(action = %action.name, key = %key, "run cancelled before Working; left Queued, no attempt consumed");
+        return Ok(ProcessedJob::Filtered { key: key.clone() });
+    }
+    if pause.stop().await {
+        let reason = if pause.login_tripped() {
+            "the Claude login needing renewal"
+        } else {
+            "a global pause"
+        };
+        info!(action = %action.name, key = %key, reason, "run stopped before Working; left Queued, no attempt consumed");
+        return Ok(ProcessedJob::Filtered { key: key.clone() });
+    }
+
     // A preserved workdir from a failed finalize (unpushed commits)
     // must not be clobbered by this attempt's clone; move it aside first.
     preserve_aside(&workdir_path);
@@ -1115,11 +1139,25 @@ async fn process_job(
             )
         }
         Ok(()) if paused_before_claude => {
-            warn!(action = %action.name, key = %key, "globally paused before claude started (finalize still runs)");
+            // Not an operator cancel: either a global pause or the readiness
+            // gate's login-required state tripped after `run_pre` wrote
+            // Working but before claude started. The issue did nothing wrong,
+            // so below (after this match) it is reverted to Queued instead of
+            // running through `finalize`'s generic failure path.
+            let reason = if pause.login_tripped() {
+                "the Claude login needing renewal"
+            } else {
+                "a global pause"
+            };
+            warn!(action = %action.name, key = %key, reason, "run stopped before claude started; re-queueing instead of finalizing");
             (
                 ClaudeResult::synthesized(
-                    "run stopped by global pause",
-                    "globally paused before claude started",
+                    format!("run stopped by {reason}"),
+                    format!(
+                        "This run was stopped by {reason} after the issue was marked Working but \
+                         before claude started. No attempt was counted, and the issue has been \
+                         returned to Queued; it will be picked up again once the stop clears."
+                    ),
                 ),
                 false,
             )
@@ -1179,6 +1217,9 @@ async fn process_job(
     };
 
     // Transient claude error: no finalize, no attempt counted, no daily count.
+    // The issue is still on Working from `run_pre`, so it is returned to
+    // Queued below; otherwise the transient summary's "picked up again"
+    // promise is false and the issue is stranded forever.
     if claude_result.transient {
         info!(action = %action.name, key = %key, error = %claude_result.error, "transient claude error, not counting attempt");
         // The preserve decision runs `git ls-remote` against the
@@ -1186,7 +1227,35 @@ async fn process_job(
         // async worker thread.
         let token_url = clone_url_for(forge, job);
         crate::blocking::in_place(|| {
-            cleanup_or_preserve(&workdir_path, &action.name, key, Some(&token_url))
+            cleanup_or_preserve(&workdir_path, &action.name, key, Some(&token_url));
+            requeue_off_working(
+                backend,
+                src,
+                &action.name,
+                key,
+                &requeue_comment(&claude_result),
+            );
+        });
+        return Ok(ProcessedJob::Transient { key: key.clone() });
+    }
+
+    // A pause or login trip landed between `run_pre` and `invoke` (not an
+    // operator cancel, which keeps its existing `Failed` finalize below): the
+    // agent never ran, through no fault of this issue, so it is reverted to
+    // Queued here instead of falling through to `finalize`'s generic failure
+    // arm, which would mark it Failed.
+    if paused_before_claude {
+        info!(action = %action.name, key = %key, "run stopped before claude started; re-queueing, not finalizing as failed");
+        let token_url = clone_url_for(forge, job);
+        crate::blocking::in_place(|| {
+            cleanup_or_preserve(&workdir_path, &action.name, key, Some(&token_url));
+            requeue_off_working(
+                backend,
+                src,
+                &action.name,
+                key,
+                &requeue_comment(&claude_result),
+            );
         });
         return Ok(ProcessedJob::Transient { key: key.clone() });
     }
@@ -2562,6 +2631,56 @@ fn comment_then_field(
         warn!(key = %key, error = %e, "issue comment failed (continuing to AI Agent write)");
     }
     backend.set_field(key, &src.custom_field, target)
+}
+
+/// Return an issue to Queued after an outcome where the agent did not run to
+/// a result through no fault of the issue (a transient claude result, or a
+/// pause/login trip landing between `run_pre` and `invoke`). Re-reads the AI
+/// Agent field first: a human or the agent may already have advanced it off
+/// Working while this job was in flight (a concurrent manual edit, or a
+/// second runner instance), in which case it is left untouched rather than
+/// stomped back to Queued. A failed re-read, or a failed write, is never
+/// treated as "already advanced": both are logged at `error` naming the key
+/// and the underlying cause, since that is the only way a stranded issue is
+/// findable (this path returns before any `ProcessedJob::Done` outcome is
+/// built, so neither is otherwise visible outside the log).
+fn requeue_off_working(
+    backend: &dyn IssueTracker,
+    src: &YoutrackSource,
+    action: &str,
+    key: &str,
+    body: &str,
+) {
+    let current = match backend.get_field(key, &src.custom_field) {
+        Ok(v) => v,
+        Err(e) => {
+            error!(action = %action, key = %key, error = %e, "AI Agent re-read failed after a stopped run; the issue may be stranded off Queued");
+            return;
+        }
+    };
+    if current.trim() != src.states.working {
+        info!(action = %action, key = %key, current = %current.trim(), "AI Agent already advanced off Working; leaving untouched");
+        return;
+    }
+    if let Err(e) = comment_then_field(backend, src, key, body, &src.states.queued) {
+        error!(action = %action, key = %key, error = %e, "re-queueing after a stopped run failed; the issue is stranded on Working");
+    }
+}
+
+/// The comment posted when [`requeue_off_working`] moves the issue back to
+/// Queued: names the cause (`r.error`) and reuses the synthesized/transient
+/// result's own `summary`, which already explains the specific trigger
+/// (login-required / relay / read-failure / rate-limit, or a pause/login
+/// trip) and that no attempt was counted.
+fn requeue_comment(r: &ClaudeResult) -> String {
+    [
+        format!("This run did not finish, through no fault of this issue ({}):", r.error),
+        String::new(),
+        r.summary.clone(),
+        String::new(),
+        "AI Agent has been returned to Queued; no attempt was counted, so the next poll picks this issue up again.".to_string(),
+    ]
+    .join("\n")
 }
 
 /// Bare host of a forge server URL: `https://dev.a8n.run` -> `dev.a8n.run`,
