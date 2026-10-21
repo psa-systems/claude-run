@@ -1037,6 +1037,43 @@ impl Drop for RunGuard {
     }
 }
 
+/// One row left in `run_inflight_jobs` by a dead process, joined to its run's
+/// action name (the table itself carries no action, only `run_id`). Read by
+/// [`crate::native::youtrack::reconcile_restart_inflight`] at `serve` startup
+/// BEFORE [`reap_orphaned_runs`] deletes the table, since that delete is the
+/// only place these rows are otherwise lost.
+#[derive(Debug, Clone)]
+pub struct InflightJobRow {
+    pub action_name: String,
+    pub job_key: String,
+}
+
+/// Every row currently in `run_inflight_jobs`, each joined to its run's
+/// `action_name`. Called only at startup, before any new run begins, so every
+/// row here belongs to a process that died mid-job: `run_inflight_remove`
+/// clears a job's own row the instant it finishes, so a live run leaves none
+/// behind for its finished jobs, and the single-instance lock guarantees no
+/// other process is adding rows concurrently.
+pub async fn run_inflight_rows_all(pool: &DbPool) -> Result<Vec<InflightJobRow>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(&crate::db::q(
+        pool,
+        r#"
+        SELECT r.action_name, rij.job_key
+        FROM run_inflight_jobs rij
+        JOIN runs r ON r.id = rij.run_id
+        "#,
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(action_name, job_key)| InflightJobRow {
+            action_name,
+            job_key,
+        })
+        .collect())
+}
+
 /// Reconcile runs left open at daemon SHUTDOWN, after the cancel
 /// grace elapsed. Those runs were stopped by this process, so they close as
 /// `exit::CANCELLED`, the same sentinel the live-cancel path uses.
@@ -1053,6 +1090,13 @@ pub async fn cancel_orphaned_runs(pool: &DbPool) -> Result<u64> {
 /// Neither is a cancel, so they close as `exit::UNEXPECTED` and stay
 /// distinguishable from an operator's `claude-run stop`. Returns the number
 /// reaped; the caller logs a non-zero count at `warn`.
+///
+/// The caller MUST run
+/// [`crate::native::youtrack::reconcile_restart_inflight`] against
+/// [`run_inflight_rows_all`] before calling this: this function's own
+/// `DELETE FROM run_inflight_jobs` is unconditional and carries no tracker
+/// call, so it is the last chance to read which issue keys a dead process had
+/// moved to `Working` and never finished (CLAUDE-440).
 pub async fn reap_orphaned_runs(pool: &DbPool) -> Result<u64> {
     close_open_runs(pool, crate::exit::UNEXPECTED).await
 }
