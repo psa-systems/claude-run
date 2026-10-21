@@ -3229,7 +3229,39 @@ mod tests {
     use crate::provider::cli::testutil::StubRunner;
     use crate::provider::{CliBackend, IssueLink, LinkDirection};
     use serde_json::Value;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    /// Run `f` with a capturing `tracing` subscriber installed, and return
+    /// everything it logged. Lets a test assert a failure path logged at
+    /// `error` without a real log file to read back.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(self.0.clone())
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(sub);
+        f();
+        drop(guard);
+        let out = buf.lock().unwrap().clone();
+        String::from_utf8(out).unwrap()
+    }
 
     /// The pre step clones the URL the FORGE resolves from its key
     /// store, not the unauthenticated one the YouTrack VCS integration reports.
@@ -3277,22 +3309,10 @@ mod tests {
         assert!(!rendered.contains("oauth2:"), "{rendered}");
     }
 
-    /// A job whose invocation hits the
-    /// authentication failure spends no attempt against
-    /// `max_attempts_per_key` and runs no finalize, through the native
-    /// YouTrack `process_job` pipeline (not merely the generic scripted one in
-    /// `job.rs`). The pre steps (field/state writes, clone) run for real
-    /// against a stub `yt` and a local git repo, so the transient outcome is
-    /// reached exactly as production does, then claude's stub reports the
-    /// structured auth failure.
-    #[tokio::test]
-    async fn process_job_hitting_auth_failure_is_transient_and_skips_finalize() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        // A real local repo to clone, so `run_pre`'s git clone succeeds with no
-        // network. `clone_url_for` falls back to the job's own (unauthenticated)
-        // URL because `CliBackend::new` reads no key store under test.
-        let origin = tmp.path().join("origin");
+    /// Clone a tiny one-commit repo at `tmp/origin`, for a `run_pre` test
+    /// that clones for real with no network.
+    fn make_origin_repo(tmp: &Path) -> PathBuf {
+        let origin = tmp.join("origin");
         std::fs::create_dir_all(&origin).unwrap();
         for args in [
             vec!["init", "-q"],
@@ -3319,6 +3339,24 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        origin
+    }
+
+    /// A job whose invocation hits the
+    /// authentication failure spends no attempt against
+    /// `max_attempts_per_key` and runs no finalize, through the native
+    /// YouTrack `process_job` pipeline (not merely the generic scripted one in
+    /// `job.rs`). The pre steps (field writes, clone) run for real against a
+    /// `FakeTracker` and a local git repo, so the transient outcome is reached
+    /// exactly as production does, then claude's stub reports the structured
+    /// auth failure. `FakeTracker`'s field is a real mutable cell, so the
+    /// revert-to-Queued re-read sees `run_pre`'s own Working write, and the
+    /// test proves the issue is actually reverted (not merely that finalize
+    /// never ran): the field ends on Queued with exactly one comment posted.
+    #[tokio::test]
+    async fn process_job_hitting_auth_failure_is_transient_and_skips_finalize() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = make_origin_repo(tmp.path());
 
         let stub = tmp.path().join("claude-stub.sh");
         crate::testutil::write_stub(
@@ -3330,17 +3368,8 @@ mod tests {
         );
         let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
 
-        let runner = Arc::new(
-            StubRunner::new()
-                .ok("yt", &["issue", "get-field", "MK-16", "AI Agent"], "Queued")
-                .ok(
-                    "yt",
-                    &["issue", "set-field", "MK-16", "AI Agent", "Working"],
-                    "",
-                )
-                .ok("yt", &["issue", "set-state", "MK-16", "In Progress"], ""),
-        );
-        let backend = CliBackend::new(runner.clone());
+        let tracker = FakeTracker::new("Queued");
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
 
         let mut j = job();
         j.clone_url = format!("file://{}", origin.display());
@@ -3374,8 +3403,8 @@ mod tests {
             &paths,
             &pool,
             &claude,
-            &backend,
-            &backend,
+            &tracker,
+            &forge,
             &s,
             &limits,
             &cancel,
@@ -3398,9 +3427,269 @@ mod tests {
             0,
             "no attempt is spent on a transient auth failure"
         );
-        // No `set-field` past `Working` and no comment were registered on the
-        // stub, so a call to either would have failed with "no canned
-        // response"; reaching this point proves finalize never ran.
+        assert_eq!(
+            tracker.field(),
+            "Queued",
+            "a transient auth failure must revert the issue off Working"
+        );
+        assert_eq!(
+            tracker.comments.lock().unwrap().len(),
+            1,
+            "exactly one comment names the revert"
+        );
+    }
+
+    /// A non-auth transient claude result (`classify_transient`'s rate-limit /
+    /// usage-limit path) reverts the issue to Queued exactly like an
+    /// authentication failure does.
+    #[tokio::test]
+    async fn process_job_hitting_a_rate_limit_is_transient_and_reverts_to_queued() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = make_origin_repo(tmp.path());
+
+        let stub = tmp.path().join("claude-stub.sh");
+        crate::testutil::write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"result\",\"is_error\":true,\"error\":\"usage limit exceeded\"}'\n\
+             exit 1\n",
+        );
+        let claude = ClaudeInvoker::new(Some(stub.to_str().unwrap()));
+
+        let tracker = FakeTracker::new("Queued");
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+
+        let mut j = job();
+        j.clone_url = format!("file://{}", origin.display());
+        let mut s = src();
+        s.dependencies.enabled = false;
+
+        let pool = mem_pool().await;
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+        };
+        let cancel = CancellationToken::new();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            &pool,
+            &claude,
+            &tracker,
+            &forge,
+            &s,
+            &limits,
+            &cancel,
+            &crate::pause::RunPause::never(),
+            &spend,
+            &j,
+            PrStrategy::Branch,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, ProcessedJob::Transient { .. }),
+            "a rate-limit result must finalize as transient, got {outcome:?}"
+        );
+        assert_eq!(
+            state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
+            0,
+            "no attempt is spent on a transient rate-limit result"
+        );
+        assert_eq!(tracker.field(), "Queued");
+        assert_eq!(tracker.comments.lock().unwrap().len(), 1);
+    }
+
+    /// A run already stopped (here: by the Claude login needing renewal) when
+    /// it picks up a queued issue writes nothing: the live AI Agent re-read is
+    /// the only call `FakeTracker` sees, so no clone, no Working write, no
+    /// comment, and no attempt is spent.
+    #[tokio::test]
+    async fn process_job_stopped_before_working_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = ClaudeInvoker::new(Some("/nonexistent/claude-stub-should-never-run.sh"));
+
+        let tracker = FakeTracker::new("Queued");
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+
+        let mut j = job();
+        j.clone_url = "/nonexistent/claude-run-439.git".into();
+        let mut s = src();
+        s.dependencies.enabled = false;
+
+        let pool = mem_pool().await;
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+        };
+        let cancel = CancellationToken::new();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+
+        let readiness = crate::readiness::ReadinessGate::new(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            None,
+        );
+        readiness.trip_login_required("OAuth session expired", "test");
+        let gate = crate::pause::PauseGate::new(pool.clone()).with_readiness(readiness);
+        let pause = gate.for_action_run("yt");
+
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            &pool,
+            &claude,
+            &tracker,
+            &forge,
+            &s,
+            &limits,
+            &cancel,
+            &pause,
+            &spend,
+            &j,
+            PrStrategy::Branch,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, ProcessedJob::Filtered { .. }),
+            "a run already stopped must leave the issue untouched, got {outcome:?}"
+        );
+        assert_eq!(tracker.field(), "Queued");
+        assert!(
+            tracker.set_calls.lock().unwrap().is_empty(),
+            "no field write: {:?}",
+            tracker.set_calls.lock().unwrap()
+        );
+        assert!(tracker.comments.lock().unwrap().is_empty());
+        assert_eq!(state::attempts_get(&pool, "yt", "MK-16").await.unwrap(), 0);
+    }
+
+    /// The Claude login needing renewal mid-run trips the readiness gate
+    /// AFTER `run_pre` has already written AI Agent=Working and cloned, but
+    /// BEFORE claude is invoked: the issue is reverted to Queued with a
+    /// comment, not finalized as Failed. The trip is raced against `run_pre`'s
+    /// real `git clone` subprocess on a multi-thread runtime (`in_place` only
+    /// yields the worker to other tasks there, never on the `#[tokio::test]`
+    /// default), with a short sleep chosen to land reliably after the
+    /// pre-mutation checkpoint's own (near-instant, in-memory) check and
+    /// before the clone completes; a sufficiently loaded test host could in
+    /// principle still flip the race, which would fail this test rather than
+    /// silently pass it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_job_login_trip_between_pre_and_claude_requeues_not_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = make_origin_repo(tmp.path());
+        let claude = ClaudeInvoker::new(Some("/nonexistent/claude-stub-should-never-run.sh"));
+
+        let tracker = FakeTracker::new("Queued");
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+
+        let mut j = job();
+        j.clone_url = format!("file://{}", origin.display());
+        let mut s = src();
+        s.dependencies.enabled = false;
+
+        let pool = mem_pool().await;
+        let paths = Paths {
+            config_dir: tmp.path().to_path_buf(),
+            data_dir: tmp.path().to_path_buf(),
+            state_dir: tmp.path().to_path_buf(),
+            runtime_dir: tmp.path().to_path_buf(),
+        };
+        let loaded =
+            crate::action::validate_str("name: yt\nkind: youtrack\nnative: {}\n", "<test>")
+                .unwrap();
+        let limits = EffectiveLimits {
+            max_attempts_per_key: 3,
+            max_runs_per_day: 20,
+            claude_timeout: Duration::from_secs(30),
+            daily_budget_usd: 5.0,
+            run_budget_usd: 5.0,
+            budget_warn_fraction: 0.8,
+            max_issues_per_run: 25,
+        };
+        let cancel = CancellationToken::new();
+        let spend = crate::usage::RunSpend::new("t", limits.run_budget(), None);
+
+        let readiness = crate::readiness::ReadinessGate::new(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            None,
+        );
+        let gate = crate::pause::PauseGate::new(pool.clone()).with_readiness(readiness.clone());
+        let pause = gate.for_action_run("yt");
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            readiness.trip_login_required("OAuth session expired", "test");
+        });
+
+        let outcome = process_job(
+            &loaded,
+            &paths,
+            &pool,
+            &claude,
+            &tracker,
+            &forge,
+            &s,
+            &limits,
+            &cancel,
+            &pause,
+            &spend,
+            &j,
+            PrStrategy::Branch,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, ProcessedJob::Transient { .. }),
+            "a login trip mid-run must requeue rather than fail, got {outcome:?}"
+        );
+        assert_eq!(tracker.field(), "Queued");
+        assert_eq!(tracker.comments.lock().unwrap().len(), 1);
+        assert_eq!(
+            state::attempts_get(&pool, "yt", "MK-16").await.unwrap(),
+            0,
+            "no attempt is spent on a mid-run login trip"
+        );
     }
 
     /// A queued issue whose key is at the
@@ -3619,6 +3908,186 @@ mod tests {
             killed: false,
             exit_code: Some(124),
         }
+    }
+
+    /// An [`IssueTracker`] whose AI Agent field is a real mutable cell rather
+    /// than a fixed canned response, so a test can prove a re-read after a
+    /// write sees that write's effect (`StubRunner`'s per-`(binary, args)`
+    /// canned response cannot: the same `get-field` call always returns the
+    /// same text, so it cannot model Queued -> Working -> Queued across one
+    /// `process_job` run). Every other required `IssueTracker` method is a
+    /// trivial stub; nothing in these tests exercises them.
+    #[derive(Default)]
+    struct FakeTracker {
+        field: Mutex<String>,
+        get_calls: Mutex<u32>,
+        comments: Mutex<Vec<String>>,
+        set_calls: Mutex<Vec<(String, String)>>,
+        /// 1-indexed call number on which `get_field` errors instead of
+        /// reading `field`; `None` means every call succeeds.
+        fail_get_on_call: Option<u32>,
+        /// `set_field` errors instead of writing when the target value
+        /// equals this; `None` means every write succeeds.
+        fail_set_to: Option<String>,
+    }
+
+    impl FakeTracker {
+        fn new(initial: &str) -> Self {
+            Self {
+                field: Mutex::new(initial.to_string()),
+                ..Self::default()
+            }
+        }
+
+        fn field(&self) -> String {
+            self.field.lock().unwrap().clone()
+        }
+    }
+
+    impl IssueTracker for FakeTracker {
+        fn list_queued(&self, _query: &str) -> Result<Vec<Value>> {
+            Ok(Vec::new())
+        }
+
+        fn get_field(&self, _key: &str, _field: &str) -> Result<String> {
+            let mut n = self.get_calls.lock().unwrap();
+            *n += 1;
+            if self.fail_get_on_call == Some(*n) {
+                return Err(Error::Other(anyhow::anyhow!("get-field failed")));
+            }
+            Ok(self.field())
+        }
+
+        fn set_field(&self, _key: &str, field: &str, value: &str) -> Result<()> {
+            self.set_calls
+                .lock()
+                .unwrap()
+                .push((field.to_string(), value.to_string()));
+            if self.fail_set_to.as_deref() == Some(value) {
+                return Err(Error::Other(anyhow::anyhow!("set-field failed")));
+            }
+            *self.field.lock().unwrap() = value.to_string();
+            Ok(())
+        }
+
+        fn set_state(&self, _key: &str, _state: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_assignee(&self, _key: &str, _login: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn comment(&self, _key: &str, body: &str) -> Result<()> {
+            self.comments.lock().unwrap().push(body.to_string());
+            Ok(())
+        }
+
+        fn issue_links(&self, _key: &str) -> Result<Vec<IssueLink>> {
+            Ok(Vec::new())
+        }
+
+        fn inspect_issue(&self, _key: &str) -> Result<provider::IssueInspect> {
+            Ok(provider::IssueInspect::default())
+        }
+
+        fn resolve_vcs(&self, _project_key: &str) -> Result<provider::VcsRepo> {
+            Err(Error::Other(anyhow::anyhow!(
+                "resolve_vcs not supported by FakeTracker"
+            )))
+        }
+
+        fn vcs_repo_map(&self) -> Result<Vec<provider::VcsMapEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn create_issue(
+            &self,
+            _project: &str,
+            _summary: &str,
+            _description: &str,
+            _assignee: Option<&str>,
+        ) -> Result<String> {
+            Err(Error::Other(anyhow::anyhow!(
+                "create_issue not supported by FakeTracker"
+            )))
+        }
+
+        fn attach_file(&self, _key: &str, _file: &Path) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Still on Working (as a transient claude result or a mid-run pause/login
+    /// trip leaves it): one comment, then the field moves to Queued.
+    #[test]
+    fn requeue_off_working_reverts_when_still_working() {
+        let tracker = FakeTracker::new("Working");
+        requeue_off_working(
+            &tracker,
+            &src(),
+            "act",
+            "MK-16",
+            "stopped, no fault of the issue",
+        );
+        assert_eq!(tracker.field(), "Queued");
+        assert_eq!(tracker.comments.lock().unwrap().len(), 1);
+        assert_eq!(
+            tracker.set_calls.lock().unwrap().as_slice(),
+            [("AI Agent".to_string(), "Queued".to_string())]
+        );
+    }
+
+    /// Already moved off Working by the time of the re-read (a concurrent
+    /// manual edit, or a second runner instance): left untouched, no comment,
+    /// no write.
+    #[test]
+    fn requeue_off_working_leaves_untouched_when_already_advanced() {
+        let tracker = FakeTracker::new("Code Review");
+        requeue_off_working(
+            &tracker,
+            &src(),
+            "act",
+            "MK-16",
+            "stopped, no fault of the issue",
+        );
+        assert_eq!(tracker.field(), "Code Review");
+        assert!(tracker.comments.lock().unwrap().is_empty());
+        assert!(tracker.set_calls.lock().unwrap().is_empty());
+    }
+
+    /// A failed re-read is logged at `error` naming the key, and is never
+    /// treated as "already advanced": no comment or write is attempted, since
+    /// the real current value is unknown.
+    #[test]
+    fn requeue_off_working_logs_error_on_failed_reread() {
+        let tracker = FakeTracker {
+            fail_get_on_call: Some(1),
+            ..FakeTracker::new("Working")
+        };
+        let logs = capture_logs(|| {
+            requeue_off_working(&tracker, &src(), "act", "MK-16", "body");
+        });
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains("MK-16"), "{logs}");
+        assert!(tracker.comments.lock().unwrap().is_empty());
+        assert!(tracker.set_calls.lock().unwrap().is_empty());
+    }
+
+    /// A failed Queued write is logged at `error` naming the key; the field
+    /// stays on Working rather than being reported as reverted.
+    #[test]
+    fn requeue_off_working_logs_error_on_failed_write() {
+        let tracker = FakeTracker {
+            fail_set_to: Some("Queued".to_string()),
+            ..FakeTracker::new("Working")
+        };
+        let logs = capture_logs(|| {
+            requeue_off_working(&tracker, &src(), "act", "MK-16", "body");
+        });
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains("MK-16"), "{logs}");
+        assert_eq!(tracker.field(), "Working");
     }
 
     /// A failure with a populated `raw` event leads with the friendly
