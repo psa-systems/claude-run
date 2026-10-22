@@ -1,6 +1,6 @@
 //! Read-only troubleshooting MCP server (`claude-run mcp stdio`, CLAUDE-437).
 //!
-//! Runs inside the container as `docker compose exec --no-TTY --user claudebot
+//! Runs inside the container as `docker compose exec --no-TTY --user appuser
 //! <service> claude-run mcp stdio`. The tool set is limited to status, runs,
 //! attempts, stream logs and CI failures; no tool writes anything. See
 //! `docs/conventions/mcp.md`.
