@@ -82,6 +82,9 @@ const SKIP_ATTEMPT_MARKER: &str = ".claude-run-skip-attempt";
 /// hatch for a code task the agent could not finish: that stays
 /// [`NEEDS_REVIEW_MARKER`].
 const NO_CODE_MARKER: &str = ".claude-run-no-code-change";
+/// How often the checkpoint-push watcher (CLAUDE-448) ticks while `claude` is
+/// still running.
+const CHECKPOINT_PUSH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A typed YouTrack job: an eligible issue plus the repo resolved from its
 /// project's enabled VCS integration.
@@ -1228,7 +1231,15 @@ async fn process_job(
     // A DB lookup (async) plus, when a record is found, a live confirmation
     // against the forge (sync, so wrapped). Any failure here just means a fresh
     // pickup; it never fails the job.
-    let resume = match resolve_pr_resume(pool, forge, job, pr_strategy).await {
+    // `mut`: a checkpoint push that opens its own draft PR mid-run (CLAUDE-448)
+    // synthesizes a `PrResume` here, right after `claude.invoke` returns, so
+    // the resumed-run success promotion below (`refresh_pr_text` +
+    // `mark_pr_ready`, `salvaged` cleared per CLAUDE-429) applies to it too,
+    // and the post-finalize bookkeeping routes to the update/clear branch
+    // instead of colliding on `agent_pull_requests`'s `UNIQUE(host, repo,
+    // pr_number)`. Every other read of `resume` below happens before
+    // `claude.invoke`, so this late mutation cannot affect them.
+    let mut resume = match resolve_pr_resume(pool, forge, job, pr_strategy).await {
         Ok(r) => r,
         Err(e) => {
             warn!(action = %action.name, key = %key, error = %e, "PR-resume lookup failed; starting from the default branch");
@@ -1277,6 +1288,10 @@ async fn process_job(
     // The gate is read once here (not in a match guard, which cannot
     // `await`) and reused below so a paused job's attempt is not counted.
     let paused_before_claude = pre_result.is_ok() && !cancel.is_cancelled() && pause.stop().await;
+    // Set only in the claude-ran arm below, from the checkpoint-push
+    // watcher's own outcome; every other arm never checkpoints, so this
+    // stays `None` for them, which `finalize` treats as "nothing rejected".
+    let mut checkpoint_rejected: Option<String> = None;
     let (claude_result, claude_ran) = match pre_result {
         Err(reason) => {
             warn!(action = %action.name, key = %key, %reason, "pre step failed (finalize still runs)");
@@ -1328,16 +1343,52 @@ async fn process_job(
             let stream_log =
                 ClaudeInvoker::stream_log_path(&paths.logs_dir(), &action.name, key, attempts + 1);
             info!(action = %action.name, key = %key, stream_log = %stream_log.display(), "invoking claude");
-            let r = claude.invoke(
-                &prompt,
-                &action.claude,
-                limits.claude_timeout,
-                &workdir_path,
-                &stream_log,
-                cancel,
-                // Cap the child at the run's remaining ceiling.
-                Some(spend.remaining_usd()),
-            )?;
+            // ---- checkpoint-push watcher (CLAUDE-448) ----
+            // Ticks `forge.checkpoint_push` on its own OS thread for as long
+            // as `claude.invoke` (below) runs; `stop_tx` is dropped the
+            // instant `invoke` returns, which wakes the watcher immediately
+            // rather than after a further whole interval. `std::thread::scope`
+            // (not `tokio::spawn`) because `forge`/`job`/`workdir_path` are
+            // borrowed from this stack frame, not `'static`.
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+            let pool_handle = tokio::runtime::Handle::current();
+            let already_resuming = resume.is_some();
+            let (invoke_result, checkpoint_outcome) = std::thread::scope(|scope| {
+                let watcher = scope.spawn(|| {
+                    run_checkpoint_watcher(
+                        forge,
+                        job,
+                        &workdir_path,
+                        pool,
+                        &pool_handle,
+                        &action.name,
+                        already_resuming,
+                        CHECKPOINT_PUSH_INTERVAL,
+                        stop_rx,
+                    )
+                });
+                let invoke_result = claude.invoke(
+                    &prompt,
+                    &action.claude,
+                    limits.claude_timeout,
+                    &workdir_path,
+                    &stream_log,
+                    cancel,
+                    // Cap the child at the run's remaining ceiling.
+                    Some(spend.remaining_usd()),
+                );
+                drop(stop_tx);
+                let outcome = watcher.join().unwrap_or(CheckpointOutcome {
+                    opened: None,
+                    rejected: None,
+                });
+                (invoke_result, outcome)
+            });
+            let r = invoke_result?;
+            checkpoint_rejected = checkpoint_outcome.rejected;
+            if resume.is_none() {
+                resume = checkpoint_outcome.opened;
+            }
             // Bill the run before any branch discards `r`.
             spend.record(&r);
             // Persist this invocation's plan usage before any
@@ -1461,7 +1512,7 @@ async fn process_job(
                 attempt: attempts + 1,
                 started: started_wall,
             },
-            None,
+            checkpoint_rejected.as_deref(),
         )
     });
     // ---- record a newly opened PR against its issue ----
@@ -1799,6 +1850,117 @@ async fn clear_salvaged_for_resume(
         if let Err(e) = backend.comment(&job.key, &message) {
             warn!(key = %job.key, error = %e, "salvaged-clear-failure comment also failed (continuing)");
         }
+    }
+}
+
+/// What the periodic checkpoint-push watcher (CLAUDE-448) produced over the
+/// course of one `claude.invoke` call: a freshly opened-and-recorded draft PR
+/// (when the run was not already resuming one of its own), and/or the reason
+/// a checkpoint push was rejected, if any. Neither field ever fails the job:
+/// `rejected` is only ever named in the outcome comment (`finalize`'s
+/// `checkpoint_push_rejected` parameter), and `opened` is only ever used to
+/// promote the run through the same resumed-run success path
+/// (`refresh_pr_text` and `mark_pr_ready`, `salvaged` cleared per CLAUDE-429)
+/// an actual CLAUDE-275 resume already takes.
+struct CheckpointOutcome {
+    opened: Option<PrResume>,
+    rejected: Option<String>,
+}
+
+/// Tick `forge.checkpoint_push` on `interval` while `claude` is still running,
+/// stopping promptly once `stop_rx`'s sender is dropped (the normal path,
+/// right after `claude.invoke` returns) rather than sleeping out a further
+/// whole `interval`. Runs on its own OS thread, spawned via
+/// `std::thread::scope` at the call site rather than `tokio::spawn`, because
+/// `forge` / `job` / `workdir` are borrowed from `process_job`'s stack, not
+/// `'static`; `pool_handle` is the caller's captured `tokio::runtime::Handle`,
+/// which lets this non-tokio thread make the one DB write a freshly opened PR
+/// needs (the reverse of CLAUDE-228's `blocking::in_place`, which only covers
+/// async-to-sync).
+///
+/// Skips the DB write, and never populates `opened`, when `already_resuming`
+/// is set: the run already has its own `PrResume` from an actual CLAUDE-275
+/// resume, so a checkpoint-adopted PR here is that SAME row, and a second
+/// insert would collide on `agent_pull_requests`'s `UNIQUE(host, repo,
+/// pr_number)`.
+///
+/// `opened` is set at most once, on the first push whose DB write also
+/// succeeds (every later tick just adopts the same PR, per `checkpoint_push`'s
+/// own idempotency). A DB-write failure leaves `opened` `None` so
+/// `process_job`'s existing post-`claude.invoke` `record_new_pr` fallback (the
+/// `resume.is_none()` branch) retries the insert once the run finishes.
+///
+/// On the first rejected push (an `Err` from `checkpoint_push` itself, e.g. a
+/// rejected non-fast-forward), logs at `error`, records the reason, and stops
+/// ticking for the rest of the run; keeps waiting on `stop_rx` so the thread
+/// still exits promptly when `claude` finishes.
+#[allow(clippy::too_many_arguments)]
+fn run_checkpoint_watcher(
+    forge: &dyn Forge,
+    job: &YoutrackJob,
+    workdir: &Path,
+    pool: &DbPool,
+    pool_handle: &tokio::runtime::Handle,
+    action_name: &str,
+    already_resuming: bool,
+    interval: Duration,
+    stop_rx: std::sync::mpsc::Receiver<()>,
+) -> CheckpointOutcome {
+    use std::sync::mpsc::RecvTimeoutError;
+    let host = host_only(&job.repo_host);
+    let body = checkpoint_pr_body(&job.key);
+    let mut opened: Option<PrResume> = None;
+    loop {
+        match stop_rx.recv_timeout(interval) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        match forge.checkpoint_push(workdir, &host, Some(body.as_str())) {
+            Ok(Some(pr)) => {
+                if opened.is_none() && !already_resuming {
+                    if let (Some(pr_number), Some(head_branch)) =
+                        (pr.number, pr.head_branch.clone())
+                    {
+                        let now = state::now_iso();
+                        match pool_handle.block_on(crate::ci_failure::store::record_agent_pr(
+                            pool,
+                            action_name,
+                            &job.key,
+                            &host,
+                            &job.repo_path,
+                            pr_number as i64,
+                            &head_branch,
+                            "open",
+                            true,
+                            &now,
+                        )) {
+                            Ok(id) => {
+                                let url = pr_url(job, &pr);
+                                opened = Some(PrResume {
+                                    id,
+                                    branch: head_branch,
+                                    pr_url: url,
+                                });
+                            }
+                            Err(e) => {
+                                error!(key = %job.key, pr_number, error = %e, "CLAUDE-448: recording the checkpoint-opened PR failed; will retry once the run finishes");
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                error!(key = %job.key, error = %e, "CLAUDE-448: checkpoint push rejected; stopping checkpointing for the rest of this run");
+                let rejected = Some(e.to_string());
+                let _ = stop_rx.recv();
+                return CheckpointOutcome { opened, rejected };
+            }
+        }
+    }
+    CheckpointOutcome {
+        opened,
+        rejected: None,
     }
 }
 
@@ -3257,6 +3419,25 @@ fn draft_pr_body(key: &str) -> String {
     .join("\n")
 }
 
+/// Runner-written PR body for a draft PR opened mid-run by the checkpoint-push
+/// watcher (CLAUDE-448): the tip commit at checkpoint time is agent work in
+/// progress, not a finished change, so (mirroring `draft_pr_body`'s CLAUDE-398
+/// shape) the draft body is written here instead of derived from `git log`. A
+/// successful run that finishes replaces this description via the same
+/// resumed-refresh path `finalize` already uses for a timeout salvage. No
+/// `Closes` line: the issue is not done simply because a checkpoint landed.
+fn checkpoint_pr_body(key: &str) -> String {
+    [
+        "## Summary".to_string(),
+        String::new(),
+        format!("This draft PR was opened by the runner from an in-progress run of {key}."),
+        "The branch holds work committed so far; the agent is still working and the PR will be marked ready when the run finishes.".to_string(),
+        String::new(),
+        format!("#{key}"),
+    ]
+    .join("\n")
+}
+
 /// PR comment explaining why a timeout-salvaged draft PR (CLAUDE-379) exists:
 /// the timeout limit, the agent's cost and summary at kill time, whether the
 /// branch tip is the runner's own WIP commit or the agent's, and a note that
@@ -4196,6 +4377,268 @@ mod tests {
 
     fn src() -> YoutrackSource {
         YoutrackSource::default()
+    }
+
+    /// A [`Forge`] whose `checkpoint_push` returns a fixed, canned sequence
+    /// of results (one per call, the last one repeating once exhausted), so a
+    /// `run_checkpoint_watcher` test can drive it through several ticks
+    /// without the full `CliBackend` + `StubRunner` git plumbing (already
+    /// covered at that layer by the `provider::cli` checkpoint_push tests).
+    /// Every other `Forge` method is unused by the watcher and left at its
+    /// default / an unreachable stub.
+    struct FakeCheckpointForge {
+        results: Mutex<Vec<Result<Option<PullRequest>>>>,
+        calls: Mutex<u32>,
+    }
+
+    impl FakeCheckpointForge {
+        fn new(results: Vec<Result<Option<PullRequest>>>) -> Self {
+            Self {
+                results: Mutex::new(results),
+                calls: Mutex::new(0),
+            }
+        }
+
+        fn call_count(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl Forge for FakeCheckpointForge {
+        fn create_pr(
+            &self,
+            _workdir: &Path,
+            _host: &str,
+            _strategy: crate::action::PrStrategy,
+        ) -> Result<PullRequest> {
+            unreachable!("run_checkpoint_watcher never calls create_pr")
+        }
+
+        fn checkpoint_push(
+            &self,
+            _workdir: &Path,
+            _host: &str,
+            _body: Option<&str>,
+        ) -> Result<Option<PullRequest>> {
+            let mut calls = self.calls.lock().unwrap();
+            let results = self.results.lock().unwrap();
+            let idx = (*calls as usize).min(results.len() - 1);
+            *calls += 1;
+            match &results[idx] {
+                Ok(pr) => Ok(pr.clone()),
+                Err(_) => Err(Error::Other(anyhow::anyhow!("checkpoint push rejected"))),
+            }
+        }
+
+        fn clone_url(&self, _host: &str, _repo: &str) -> Result<String> {
+            unreachable!("run_checkpoint_watcher never calls clone_url")
+        }
+
+        fn repo_access(&self, _host: &str, _repo: &str) -> Result<()> {
+            unreachable!("run_checkpoint_watcher never calls repo_access")
+        }
+
+        fn list_open_prs(
+            &self,
+            _host: &str,
+            _repo: &str,
+        ) -> Result<Vec<provider::ForgePullRequest>> {
+            unreachable!("run_checkpoint_watcher never calls list_open_prs")
+        }
+
+        fn pr_ci_state(&self, _host: &str, _repo: &str, _pr_number: u64) -> Result<String> {
+            unreachable!("run_checkpoint_watcher never calls pr_ci_state")
+        }
+
+        fn pr_comment(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _pr_number: u64,
+            _body_file: &Path,
+        ) -> Result<()> {
+            unreachable!("run_checkpoint_watcher never calls pr_comment")
+        }
+
+        fn issue_comment(
+            &self,
+            _host: &str,
+            _repo: &str,
+            _issue_number: u64,
+            _body_file: &Path,
+        ) -> Result<()> {
+            unreachable!("run_checkpoint_watcher never calls issue_comment")
+        }
+    }
+
+    fn checkpoint_pr(number: u64, branch: &str) -> PullRequest {
+        PullRequest {
+            number: Some(number),
+            url: format!("https://dev.a8n.run/contoso/claude-run/pulls/{number}"),
+            head_branch: Some(branch.to_string()),
+            push_comment_failure: None,
+        }
+    }
+
+    /// A tiny interval so the watcher ticks several times inside the test's
+    /// short, bounded wait; exact tick counts are never asserted on, only
+    /// "at least one tick happened" / "ticking stopped after the first
+    /// rejection", so this stays robust to scheduling jitter.
+    fn watcher_test_interval() -> Duration {
+        Duration::from_millis(5)
+    }
+
+    /// The first tick that successfully pushes and opens a draft PR records
+    /// it in `agent_pull_requests` and reports it as `opened`; a second tick
+    /// adopting the same PR (`checkpoint_push`'s own idempotency) must not
+    /// attempt a second insert.
+    // `multi_thread`: the watcher's own OS thread calls `pool_handle.block_on`
+    // while this test's task is synchronously blocked on `watcher.join()`; a
+    // `current_thread` runtime has no other thread left to drive the DB
+    // query, which deadlocks instead of completing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_checkpoint_watcher_records_the_first_opened_pr_once() {
+        let pool = mem_pool().await;
+        let forge = FakeCheckpointForge::new(vec![
+            Ok(Some(checkpoint_pr(77, "fix/MK-16"))),
+            Ok(Some(checkpoint_pr(77, "fix/MK-16"))),
+        ]);
+        let wd = tempfile::tempdir().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let pool_handle = tokio::runtime::Handle::current();
+        let outcome = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                run_checkpoint_watcher(
+                    &forge,
+                    &job(),
+                    wd.path(),
+                    &pool,
+                    &pool_handle,
+                    "act",
+                    false,
+                    watcher_test_interval(),
+                    stop_rx,
+                )
+            });
+            std::thread::sleep(Duration::from_millis(40));
+            drop(stop_tx);
+            watcher.join().unwrap()
+        });
+        assert!(
+            forge.call_count() >= 2,
+            "watcher must have ticked at least twice: {}",
+            forge.call_count()
+        );
+        let opened = outcome
+            .opened
+            .expect("the first successful push must be recorded");
+        assert_eq!(opened.branch, "fix/MK-16");
+        assert_eq!(
+            opened.pr_url,
+            "https://dev.a8n.run/contoso/claude-run/pulls/77"
+        );
+        assert!(outcome.rejected.is_none());
+        let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT COUNT(*) FROM agent_pull_requests").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows, 1,
+            "a later tick adopting the same PR must not insert a second row"
+        );
+    }
+
+    /// A run that is already resuming its own recorded PR must never let the
+    /// watcher record a second row for it: `already_resuming` suppresses the
+    /// DB write (and `opened`) entirely, even though the forge itself still
+    /// happily pushes and adopts the PR every tick.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_checkpoint_watcher_skips_the_db_write_when_already_resuming() {
+        let pool = mem_pool().await;
+        let forge = FakeCheckpointForge::new(vec![Ok(Some(checkpoint_pr(7, "fix/MK-16")))]);
+        let wd = tempfile::tempdir().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let pool_handle = tokio::runtime::Handle::current();
+        let outcome = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                run_checkpoint_watcher(
+                    &forge,
+                    &job(),
+                    wd.path(),
+                    &pool,
+                    &pool_handle,
+                    "act",
+                    true,
+                    watcher_test_interval(),
+                    stop_rx,
+                )
+            });
+            std::thread::sleep(Duration::from_millis(30));
+            drop(stop_tx);
+            watcher.join().unwrap()
+        });
+        assert!(outcome.opened.is_none());
+        assert!(outcome.rejected.is_none());
+        let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            crate::db::q(&pool, "SELECT COUNT(*) FROM agent_pull_requests").into_owned(),
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows, 0,
+            "an already-resuming run must never gain a second recorded row"
+        );
+    }
+
+    /// The first rejected push stops the watcher from ticking `checkpoint_push`
+    /// again for the rest of the run, but it keeps listening for the stop
+    /// signal so the thread still exits promptly once `claude.invoke` returns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_checkpoint_watcher_stops_ticking_after_a_rejected_push() {
+        let pool = mem_pool().await;
+        let forge = FakeCheckpointForge::new(vec![Err(Error::Other(anyhow::anyhow!(
+            "remote rejected non-fast-forward update"
+        )))]);
+        let wd = tempfile::tempdir().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let pool_handle = tokio::runtime::Handle::current();
+        let outcome = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                run_checkpoint_watcher(
+                    &forge,
+                    &job(),
+                    wd.path(),
+                    &pool,
+                    &pool_handle,
+                    "act",
+                    false,
+                    watcher_test_interval(),
+                    stop_rx,
+                )
+            });
+            // Long enough for several more intervals to have elapsed had the
+            // watcher kept ticking after the rejection.
+            std::thread::sleep(Duration::from_millis(40));
+            drop(stop_tx);
+            watcher.join().unwrap()
+        });
+        assert!(outcome.opened.is_none());
+        assert!(
+            outcome
+                .rejected
+                .as_deref()
+                .is_some_and(|r| r.contains("checkpoint push rejected")),
+            "{:?}",
+            outcome.rejected
+        );
+        assert_eq!(
+            forge.call_count(),
+            1,
+            "a rejected push must stop further ticks for the rest of the run"
+        );
     }
 
     fn test_comment_run() -> crate::run_footer::CommentRun {
