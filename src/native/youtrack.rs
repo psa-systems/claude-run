@@ -4878,6 +4878,27 @@ mod tests {
         );
     }
 
+    /// CLAUDE-450 criterion 2: the default prompt (not just a custom
+    /// template) substitutes `{{deadline_utc}}` with the invocation time plus
+    /// the timeout, to the second, via an injected clock rather than a live
+    /// one.
+    #[test]
+    fn build_prompt_default_renders_deadline_utc_from_the_injected_clock() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let p = build_prompt(
+            &src(),
+            &job(),
+            std::path::Path::new("/tmp/wd"),
+            hour(),
+            now,
+            None,
+        );
+        assert!(
+            p.contains("The run is killed at 2023-11-14T23:13:20Z, 60 minutes after it started"),
+            "{p}"
+        );
+    }
+
     /// CLAUDE-450: a run never ends voluntarily while an acceptance criterion
     /// lacks evidence. For an issue judged too large there are exactly two
     /// paths: the "Task too large" blocker before any code change, or working
