@@ -728,6 +728,7 @@ impl CliBackend {
             // The caller (branch-backed create, or AGit) fills in
             // `head_branch` when it has one; AGit has none.
             head_branch: None,
+            push_comment_failure: None,
         })
     }
 
@@ -1132,6 +1133,7 @@ impl CliBackend {
                 number: Some(p.number),
                 url: p.html_url,
                 head_branch: Some(branch.to_string()),
+                push_comment_failure: None,
             }))
     }
 

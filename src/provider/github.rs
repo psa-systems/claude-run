@@ -538,7 +538,41 @@ impl GithubForge {
         // The subject guard (CLAUDE-398) runs before any push.
         crate::provider::validate_pr_subject(&title, &branch)?;
 
+        // The push comment (CLAUDE-447) names the triggering issue; this
+        // layer has no job key passed in directly, so it is read back out of
+        // the bare `#<KEY>-N` reference every runner commit body carries
+        // (CLAUDE-398). Falls back to the branch name on a commit that
+        // somehow carries none (never expected in practice).
+        let issue_key = crate::provider::bare_issue_key(&body).unwrap_or_else(|| branch.clone());
+
+        // The remote tip before the push (CLAUDE-447), `None` for a branch
+        // GitHub has never seen; read-only, so a transient failure here just
+        // degrades the push comment's range to "none" rather than blocking
+        // the push itself.
+        let old_sha = self
+            .git(workdir, &["ls-remote", "--heads", "origin", &branch])
+            .ok()
+            .and_then(|out| out.split_whitespace().next().map(str::to_string))
+            .filter(|s| !s.is_empty());
+
         self.push(workdir, host, &repo, &branch)?;
+
+        let event = if draft {
+            crate::push_comment::PushEvent::TimeoutSalvagePush
+        } else if old_sha.is_some() {
+            crate::push_comment::PushEvent::ResumedRunPush
+        } else {
+            crate::push_comment::PushEvent::InitialPush
+        };
+        let new_sha = self.git(workdir, &["rev-parse", "HEAD"]).ok();
+        let bound = old_sha.clone().unwrap_or_else(|| format!("origin/{base}"));
+        let subjects = new_sha.as_deref().and_then(|new_sha| {
+            self.git(
+                workdir,
+                &["log", "--format=%s", &format!("{bound}..{new_sha}")],
+            )
+            .ok()
+        });
 
         // Walk [Mcp, Gh]: prefer the remote MCP, fall back to `gh`.
         let mut tried: Vec<String> = Vec::new();
@@ -559,6 +593,17 @@ impl GithubForge {
                                     // GitHub PRs are always branch-backed;
                                     // this is the branch just pushed above.
                                     pr.head_branch = Some(branch.clone());
+                                    self.post_push_comment(
+                                        host,
+                                        &repo,
+                                        &issue_key,
+                                        &mut pr,
+                                        event,
+                                        draft,
+                                        old_sha.as_deref(),
+                                        new_sha.as_deref(),
+                                        &subjects,
+                                    );
                                     pr
                                 })
                                 .map_err(|e| pr_create_error(&repo, host, &branch, e));
@@ -572,6 +617,17 @@ impl GithubForge {
                             .open_via_gh(workdir, &branch, &base, &title, &body, draft)
                             .map(|mut pr| {
                                 pr.head_branch = Some(branch.clone());
+                                self.post_push_comment(
+                                    host,
+                                    &repo,
+                                    &issue_key,
+                                    &mut pr,
+                                    event,
+                                    draft,
+                                    old_sha.as_deref(),
+                                    new_sha.as_deref(),
+                                    &subjects,
+                                );
                                 pr
                             })
                             .map_err(|e| pr_create_error(&repo, host, &branch, e))
@@ -583,6 +639,48 @@ impl GithubForge {
             }
         }
         Err(Error::NoBackend(tried.join("; ")))
+    }
+
+    /// Post the CLAUDE-447 push comment for `create_pr_impl`'s push, folding
+    /// a failure into `pr.push_comment_failure` for the caller's own outcome
+    /// comment rather than failing the PR create that already succeeded.
+    #[allow(clippy::too_many_arguments)]
+    fn post_push_comment(
+        &self,
+        host: &str,
+        repo: &str,
+        issue_key: &str,
+        pr: &mut PullRequest,
+        event: crate::push_comment::PushEvent,
+        draft: bool,
+        old_sha: Option<&str>,
+        new_sha: Option<&str>,
+        subjects: &Option<String>,
+    ) {
+        let Some(pr_number) = pr.number else {
+            return;
+        };
+        let subjects = match subjects {
+            Some(s) if s.is_empty() => crate::push_comment::CommitSubjects::Listed(Vec::new()),
+            Some(s) => {
+                crate::push_comment::CommitSubjects::Listed(s.lines().map(str::to_string).collect())
+            }
+            None => crate::push_comment::CommitSubjects::Unavailable,
+        };
+        let public_url = crate::run_footer::resolved_public_url();
+        let ctx = crate::push_comment::PushCommentContext {
+            event,
+            issue_key,
+            draft,
+            old_sha,
+            new_sha,
+            subjects,
+            public_url: public_url.as_deref(),
+            run_id: None,
+            started: None,
+        };
+        pr.push_comment_failure =
+            crate::push_comment::post(self, host, repo, pr_number, &std::env::temp_dir(), &ctx);
     }
 }
 
@@ -1239,6 +1337,7 @@ fn parse_pr_from_mcp(result: &Value) -> Result<PullRequest> {
                 // Filled in by the caller, which knows the branch it
                 // pushed; the MCP result carries no head-branch field of its own.
                 head_branch: None,
+                push_comment_failure: None,
             });
         }
     }
@@ -1287,6 +1386,7 @@ fn parse_pr_from_gh(stdout: &str) -> PullRequest {
         url,
         // Filled in by the caller, which knows the branch it pushed.
         head_branch: None,
+        push_comment_failure: None,
     }
 }
 

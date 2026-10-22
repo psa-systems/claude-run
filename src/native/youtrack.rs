@@ -5127,6 +5127,7 @@ mod tests {
             number: Some(7),
             url: "raw line".into(),
             head_branch: Some("fix/x".into()),
+            push_comment_failure: None,
         };
         assert_eq!(
             pr_url(&j, &with_num),
@@ -5136,6 +5137,7 @@ mod tests {
             number: None,
             url: "fallback line".into(),
             head_branch: None,
+            push_comment_failure: None,
         };
         assert_eq!(pr_url(&j, &no_num), "fallback line");
         // A real HTTP URL (the GitHub backend's html_url) is used
@@ -5144,6 +5146,7 @@ mod tests {
             number: Some(11),
             url: "https://github.com/octo/widget/pull/11".into(),
             head_branch: Some("fix/x".into()),
+            push_comment_failure: None,
         };
         assert_eq!(pr_url(&j, &gh), "https://github.com/octo/widget/pull/11");
     }
