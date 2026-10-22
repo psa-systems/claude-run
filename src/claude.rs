@@ -275,6 +275,21 @@ impl ClaudeInvoker {
             .join(format!("{key}-attempt-{attempt}.jsonl"))
     }
 
+    /// Stream log for the post-success review session (CLAUDE-449): its own
+    /// file, never the main attempt's, so a review failure's trace does not
+    /// overwrite the agent session's own log.
+    pub fn review_stream_log_path(
+        logs_dir: &Path,
+        action: &str,
+        key: &str,
+        attempt: u32,
+    ) -> PathBuf {
+        logs_dir
+            .join(action)
+            .join("streams")
+            .join(format!("{key}-attempt-{attempt}-review.jsonl"))
+    }
+
     /// Spawn claude, relay its stdout to `stream_log` stamping each JSON event
     /// line with an arrival-time `ts` (stderr is a direct, unstamped redirect to
     /// the same file), wait, then scan the stream for the terminal `result`
@@ -1500,99 +1515,12 @@ mod tests {
     /// A `claude` that outlives the wall-clock budget is SIGKILLed by
     /// the `timeout(1)` wrapper (exit 124). The result carries `timed_out = true`
     /// alongside `ok = false`, distinguishing a timeout from a hard failure.
-    /// Ensure a coreutils-faithful `timeout` is first on PATH for the test
-    /// process. Production resolves `timeout` via PATH and relies on its
-    /// exit-124-on-timeout contract (a documented coreutils host dependency).
-    /// The pre-commit dev image (`rust-builder-musl:*-alpine`) ships only
-    /// busybox `timeout`, which exits 143 (SIGTERM) instead of 124 on timeout,
-    /// so a test that asserts the 124 contract is non-deterministic across hosts.
-    /// We install a tiny POSIX-sh shim that reproduces coreutils' behaviour
-    /// (TERM after N seconds, exit 124 if it had to kill) and prepend it to PATH
-    /// once, so the exit-code contract is exercised deterministically regardless
-    /// of which `timeout` the host happens to ship. For non-timeout runs the shim
-    /// forwards the child's own exit status, so other `invoke` tests are
-    /// unaffected: the watchdog `sleep` is killed on every exit path instead of
-    /// surviving as an orphan for the rest of its duration.
-    fn ensure_coreutils_timeout_on_path() {
-        use std::sync::OnceLock;
-
-        static SHIM_DIR: OnceLock<PathBuf> = OnceLock::new();
-        let dir = SHIM_DIR.get_or_init(|| {
-            let dir = std::env::temp_dir().join("claude-run-test-timeout-shim");
-            std::fs::create_dir_all(&dir).unwrap();
-            let shim = dir.join("timeout");
-            // Parse a leading `<N>s` (or bare `<N>`) duration like coreutils, run
-            // the command in the background, and SIGTERM it after the budget. A
-            // marker file records that the watchdog fired: exit 124 when it did
-            // (the run was killed for exceeding the budget), otherwise forward the
-            // child's own exit status. This reproduces coreutils' contract that
-            // the only `invoke` test asserting on it (`invoke_timeout_sets_timed_out`)
-            // depends on.
-            // The watcher's own `sleep "$secs"` must be killable
-            // directly. Killing only the watcher subshell (the old shape) does
-            // NOT kill a child that subshell already forked: `sleep` survives
-            // as an orphan, reparented to init, and keeps running for the rest
-            // of its duration. An orphaned `sleep` inherits this script's
-            // stdout/stderr fds (the pipe `ClaudeInvoker::invoke` reads to
-            // EOF), so on every run that finishes before `secs` elapses, the
-            // caller's relay thread blocks reading that pipe until the orphan
-            // itself exits, i.e. for the full `secs`. The trap lets the normal
-            // exit path (`kill "$watcher"`, below) reach the grandchild `sleep`
-            // and terminate it immediately instead of leaving it to run out
-            // its clock.
-            let body = r#"#!/bin/sh
-secs=$1; shift
-secs=${secs%s}
-fired="$(mktemp)"
-rm -f "$fired"
-"$@" &
-child=$!
-(
-    trap 'kill -TERM "$spid" 2>/dev/null; exit 0' TERM
-    sleep "$secs" &
-    spid=$!
-    wait "$spid"
-    : > "$fired"
-    kill -TERM "$child" 2>/dev/null
-    sleep 1
-    kill -KILL "$child" 2>/dev/null
-) &
-watcher=$!
-wait "$child"
-code=$?
-kill "$watcher" 2>/dev/null
-wait "$watcher" 2>/dev/null
-if [ -e "$fired" ]; then
-    rm -f "$fired"
-    exit 124
-fi
-rm -f "$fired"
-exit "$code"
-"#;
-            write_stub(&shim, body);
-            dir
-        });
-        let current = std::env::var_os("PATH").unwrap_or_default();
-        let prefix = dir.as_os_str().to_owned();
-        // Idempotent: only prepend if our shim dir is not already leading.
-        let already = std::env::split_paths(&current).next().map(|p| p == *dir);
-        if already != Some(true) {
-            let mut paths = vec![dir.clone()];
-            paths.extend(std::env::split_paths(&current));
-            let joined = std::env::join_paths(paths).unwrap();
-            // Safe under edition 2021; the init is effectively single-shot and
-            // only ever prepends the same shim dir.
-            std::env::set_var("PATH", &joined);
-            let _ = prefix;
-        }
-    }
-
     #[test]
     fn invoke_timeout_sets_timed_out() {
         // Pin a coreutils-faithful `timeout` (exit 124 on timeout) so the assertion
-        // holds even on hosts whose `timeout` is busybox (exits 143). See the
-        // helper for the full rationale.
-        ensure_coreutils_timeout_on_path();
+        // holds even on hosts whose `timeout` is busybox (exits 143). See
+        // `testutil::ensure_coreutils_timeout_on_path` for the full rationale.
+        crate::testutil::ensure_coreutils_timeout_on_path();
 
         let dir = tempfile::tempdir().unwrap();
         // Stub "claude": sleep well past the 1s budget so the wrapper kills it.
@@ -1621,7 +1549,7 @@ exit "$code"
 
     #[test]
     fn invoke_sets_bash_timeout_env_to_the_invocation_timeout() {
-        ensure_coreutils_timeout_on_path();
+        crate::testutil::ensure_coreutils_timeout_on_path();
 
         let dir = tempfile::tempdir().unwrap();
         let env_dump = dir.path().join("env.txt");
@@ -1667,7 +1595,7 @@ exit "$code"
     /// unfixed shim and passes once the watchdog is killed on every exit path.
     #[test]
     fn invoke_returns_promptly_when_the_child_exits_well_under_the_budget() {
-        ensure_coreutils_timeout_on_path();
+        crate::testutil::ensure_coreutils_timeout_on_path();
 
         let dir = tempfile::tempdir().unwrap();
         let stub = dir.path().join("claude-stub.sh");

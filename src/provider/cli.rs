@@ -897,6 +897,7 @@ impl CliBackend {
                     &repo,
                     branch,
                     draft,
+                    body.is_some(),
                     crate::push_comment::PushEvent::InitialPush,
                     None,
                     &local_sha,
@@ -929,6 +930,7 @@ impl CliBackend {
                         &repo,
                         branch,
                         draft,
+                        body.is_some(),
                         crate::push_comment::PushEvent::ResumedRunPush,
                         Some(&remote_sha),
                         &local_sha,
@@ -952,6 +954,7 @@ impl CliBackend {
                         &repo,
                         branch,
                         draft,
+                        body.is_some(),
                         crate::push_comment::PushEvent::MergedRemoteBranchBeforePush,
                         Some(&remote_sha),
                         &merged_sha,
@@ -968,12 +971,16 @@ impl CliBackend {
     /// PR has no number (an adopted lookup can race the actual create and
     /// return an unopened placeholder; nothing here ever happens on that
     /// path since every caller already has a number by the time it calls
-    /// this). `draft` overrides `event` to `TimeoutSalvagePush` regardless of
-    /// which git leg triggered the push, since the timeout-salvage caller's
-    /// intent is what the comment should name, not the git mechanics that
-    /// got the branch there. The failure, if any, is recorded on `pr` rather
-    /// than propagated: a failed comment must never fail, retry, or roll
-    /// back the push it reports on (CLAUDE-366).
+    /// this). `salvage` overrides `event` to `TimeoutSalvagePush` regardless
+    /// of which git leg triggered the push, since the timeout-salvage
+    /// caller's intent is what the comment should name, not the git
+    /// mechanics that got the branch there. This used to be keyed off
+    /// `draft`, but CLAUDE-449 made every successful run's first PR a draft
+    /// (pending its post-success review), not just a timeout salvage, so the
+    /// caller now passes the salvage signal explicitly instead. The failure,
+    /// if any, is recorded on `pr` rather than propagated: a failed comment
+    /// must never fail, retry, or roll back the push it reports on
+    /// (CLAUDE-366).
     #[allow(clippy::too_many_arguments)]
     fn post_branch_push_comment(
         &self,
@@ -982,6 +989,7 @@ impl CliBackend {
         repo: &str,
         branch: &str,
         draft: bool,
+        salvage: bool,
         event: crate::push_comment::PushEvent,
         old_sha: Option<&str>,
         new_sha: &str,
@@ -990,7 +998,7 @@ impl CliBackend {
         let Some(pr_number) = pr.number else {
             return;
         };
-        let event = if draft {
+        let event = if salvage {
             crate::push_comment::PushEvent::TimeoutSalvagePush
         } else {
             event
@@ -1521,6 +1529,7 @@ impl CliBackend {
                 host,
                 &repo,
                 "HEAD",
+                false,
                 false,
                 crate::push_comment::PushEvent::InitialPush,
                 None,

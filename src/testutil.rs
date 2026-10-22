@@ -46,6 +46,89 @@ pub fn clear_ambient_git_env(cmd: &mut Command) {
     }
 }
 
+/// Pin a coreutils-faithful `timeout` (exit 124 on timeout) first on PATH for
+/// the test process.
+///
+/// Production resolves `timeout` via PATH and relies on its exit-124-on-timeout
+/// contract (a documented coreutils host dependency). The pre-commit dev image
+/// (`rust-builder-musl:*-alpine`) ships only busybox `timeout`, which exits 143
+/// (SIGTERM) instead of 124 on timeout, so a test that asserts the 124 contract
+/// is non-deterministic across hosts. This installs a tiny POSIX-sh shim that
+/// reproduces coreutils' behaviour (TERM after N seconds, exit 124 if it had to
+/// kill) and prepends it to PATH once, so the exit-code contract is exercised
+/// deterministically regardless of which `timeout` the host happens to ship.
+/// For non-timeout runs the shim forwards the child's own exit status, so
+/// other tests invoking a `timeout`-wrapped subprocess are unaffected.
+pub fn ensure_coreutils_timeout_on_path() {
+    use std::sync::OnceLock;
+
+    static SHIM_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let dir = SHIM_DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join("claude-run-test-timeout-shim");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("timeout");
+        // Parse a leading `<N>s` (or bare `<N>`) duration like coreutils, run
+        // the command in the background, and SIGTERM it after the budget. A
+        // marker file records that the watchdog fired: exit 124 when it did
+        // (the run was killed for exceeding the budget), otherwise forward the
+        // child's own exit status.
+        // The watcher's own `sleep "$secs"` must be killable
+        // directly. Killing only the watcher subshell (the old shape) does
+        // NOT kill a child that subshell already forked: `sleep` survives
+        // as an orphan, reparented to init, and keeps running for the rest
+        // of its duration. An orphaned `sleep` inherits this script's
+        // stdout/stderr fds (the pipe `ClaudeInvoker::invoke` reads to
+        // EOF), so on every run that finishes before `secs` elapses, the
+        // caller's relay thread blocks reading that pipe until the orphan
+        // itself exits, i.e. for the full `secs`. The trap lets the normal
+        // exit path (`kill "$watcher"`, below) reach the grandchild `sleep`
+        // and terminate it immediately instead of leaving it to run out
+        // its clock.
+        let body = r#"#!/bin/sh
+secs=$1; shift
+secs=${secs%s}
+fired="$(mktemp)"
+rm -f "$fired"
+"$@" &
+child=$!
+(
+    trap 'kill -TERM "$spid" 2>/dev/null; exit 0' TERM
+    sleep "$secs" &
+    spid=$!
+    wait "$spid"
+    : > "$fired"
+    kill -TERM "$child" 2>/dev/null
+    sleep 1
+    kill -KILL "$child" 2>/dev/null
+) &
+watcher=$!
+wait "$child"
+code=$?
+kill "$watcher" 2>/dev/null
+wait "$watcher" 2>/dev/null
+if [ -e "$fired" ]; then
+    rm -f "$fired"
+    exit 124
+fi
+rm -f "$fired"
+exit "$code"
+"#;
+        write_stub(&shim, body);
+        dir
+    });
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    // Idempotent: only prepend if our shim dir is not already leading.
+    let already = std::env::split_paths(&current).next().map(|p| p == *dir);
+    if already != Some(true) {
+        let mut paths = vec![dir.clone()];
+        paths.extend(std::env::split_paths(&current));
+        let joined = std::env::join_paths(paths).unwrap();
+        // Safe under edition 2021; the init is effectively single-shot and
+        // only ever prepends the same shim dir.
+        std::env::set_var("PATH", &joined);
+    }
+}
+
 /// Write an executable test stub WITHOUT this process ever holding a writable
 /// descriptor on it.
 ///
