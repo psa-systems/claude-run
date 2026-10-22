@@ -234,6 +234,7 @@ placeholder (or an unterminated `{{`) is left literal and logged at warn:
 | `{{clone_url}}`          | Full clone URL of the resolved repo.                                          |
 | `{{workdir}}`            | Absolute path of the per-job working directory (the repo is cloned here).     |
 | `{{timeout_minutes}}`    | The action's effective `claude_timeout_seconds` divided by 60, rounded down (CLAUDE-377). |
+| `{{deadline_utc}}`       | The invocation time plus the action's effective `claude_timeout_seconds`, as an RFC 3339 UTC timestamp to the second (CLAUDE-450). |
 | `{{needs_review_marker}}`| The `.claude-run-needs-review` marker filename.                               |
 | `{{skip_attempt_marker}}`| The `.claude-run-skip-attempt` marker filename.                               |
 | `{{no_code_marker}}`     | The `.claude-run-no-code-change` marker filename (CLAUDE-214).                |
