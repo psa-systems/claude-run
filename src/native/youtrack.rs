@@ -1461,6 +1461,7 @@ async fn process_job(
                 attempt: attempts + 1,
                 started: started_wall,
             },
+            None,
         )
     });
     // ---- record a newly opened PR against its issue ----
@@ -2453,8 +2454,23 @@ fn finalize(
     claude_timeout: Duration,
     resumed: bool,
     run: crate::run_footer::CommentRun,
+    // CLAUDE-448: the reason the periodic checkpoint-push watcher stopped
+    // checkpointing partway through this run (a rejected push), if any. Never
+    // fails the job; named in whichever outcome comment this call produces so
+    // it is never silent.
+    checkpoint_push_rejected: Option<&str>,
 ) -> Result<Finalized> {
     let public_url = crate::run_footer::resolved_public_url();
+    // CLAUDE-448: appended to whichever outcome body this call produces, right
+    // before the run footer, so a rejected checkpoint push is never silent.
+    let note_checkpoint_rejection = |body: String| -> String {
+        match checkpoint_push_rejected {
+            Some(reason) => {
+                format!("{body}\n\nAutomatic checkpoint pushes stopped partway through this run: {reason}")
+            }
+            None => body,
+        }
+    };
     let needs_review = workdir.join(NEEDS_REVIEW_MARKER);
     let skip_marker = workdir.join(SKIP_ATTEMPT_MARKER);
     let no_code = workdir.join(NO_CODE_MARKER);
@@ -2467,6 +2483,7 @@ fn finalize(
         }
         let reason = std::fs::read_to_string(&needs_review)?.trim().to_string();
         let reason = append_compaction_note(&reason, stream_log, &job.key);
+        let reason = note_checkpoint_rejection(reason);
         let reason = crate::run_footer::append_job(&reason, public_url.as_deref(), run, &job.key);
         if let Err(e) = backend.comment(&job.key, &reason) {
             warn!(key = %job.key, error = %e, "issue comment failed (continuing to tag / AI Agent write)");
@@ -2488,6 +2505,7 @@ fn finalize(
         // the behavior below: the ahead check fails and AI Agent goes
         // to Failed.
         let summary = std::fs::read_to_string(&no_code)?.trim().to_string();
+        let summary = note_checkpoint_rejection(summary);
         let summary = crate::run_footer::append_job(&summary, public_url.as_deref(), run, &job.key);
         let label = src.states.no_code_label().to_string();
         comment_then_field(backend, src, &job.key, &summary, &label)?;
@@ -2536,6 +2554,7 @@ fn finalize(
                     None => body,
                 };
                 let body = append_compaction_note(&body, stream_log, &job.key);
+                let body = note_checkpoint_rejection(body);
                 let body =
                     crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
                 comment_then_field(backend, src, &job.key, &body, &src.states.code_review)?;
@@ -2567,6 +2586,7 @@ fn finalize(
                     _ => "push",
                 };
                 let body = pr_failure_comment(claude_result, &e, &location);
+                let body = note_checkpoint_rejection(body);
                 let body =
                     crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
                 comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
@@ -2595,6 +2615,7 @@ fn finalize(
             claude_timeout,
         );
         let body = timeout_comment(claude_result, claude_timeout, &salvage);
+        let body = note_checkpoint_rejection(body);
         let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
         if let Err(e) = backend.comment(&job.key, &body) {
             warn!(key = %job.key, error = %e, "timeout comment failed (continuing)");
@@ -2614,6 +2635,7 @@ fn finalize(
     } else {
         // Failure: crash, empty prompt, or pre failure.
         let body = failure_comment(claude_result);
+        let body = note_checkpoint_rejection(body);
         let body = crate::run_footer::append_job(&body, public_url.as_deref(), run, &job.key);
         comment_then_field(backend, src, &job.key, &body, &src.states.failed)?;
         Ok(Finalized::Failed {
@@ -5727,6 +5749,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -5741,6 +5764,42 @@ mod tests {
         );
         // No PR on the park path.
         assert!(!calls.iter().any(|c| c.starts_with("fj ")), "{calls:?}");
+    }
+
+    /// CLAUDE-448: a rejected checkpoint push must never fail the job, but it
+    /// must be named in whichever outcome comment the run produces; proven
+    /// here on the Needs-Review path and relied on to hold for every other
+    /// `finalize` branch via the shared `note_checkpoint_rejection` closure.
+    #[test]
+    fn finalize_names_a_rejected_checkpoint_push_in_the_outcome_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path();
+        std::fs::write(wd.join(NEEDS_REVIEW_MARKER), "need a decision on X").unwrap();
+        let backend = FakeTracker::new("Working");
+        let forge = CliBackend::new(Arc::new(StubRunner::new()));
+        let res = finalize(
+            &backend,
+            &forge,
+            &src(),
+            &job(),
+            wd,
+            &ClaudeResult::synthesized("e", "s"),
+            PrStrategy::Branch,
+            None,
+            Duration::from_secs(1800),
+            false,
+            test_comment_run(),
+            Some("remote rejected non-fast-forward update"),
+        )
+        .unwrap();
+        assert_eq!(res, Finalized::NeedsReview);
+        let comments = backend.comments.lock().unwrap();
+        assert!(
+            comments
+                .iter()
+                .any(|c| c.contains("remote rejected non-fast-forward update")),
+            "{comments:?}"
+        );
     }
 
     /// The agent-signalled blocker park (CLAUDE-373) attaches the
@@ -5782,6 +5841,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -5829,6 +5889,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -5878,6 +5939,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -5918,6 +5980,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -5984,6 +6047,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NoCodeChange);
@@ -6023,6 +6087,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(res, Finalized::NeedsReview);
@@ -6132,6 +6197,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -6283,6 +6349,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -6341,6 +6408,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -6856,6 +6924,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert!(
@@ -6937,6 +7006,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert!(matches!(res, Finalized::Failed { .. }), "{res:?}");
@@ -7042,6 +7112,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -7109,6 +7180,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert!(matches!(res, Finalized::CodeReview { .. }));
@@ -7152,6 +7224,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert!(
@@ -7196,6 +7269,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert!(
@@ -7352,6 +7426,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -7406,6 +7481,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -7586,6 +7662,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -7746,6 +7823,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -7839,6 +7917,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -7986,6 +8065,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         // The PR still counts, even though the comment on it failed.
@@ -8196,6 +8276,7 @@ mod tests {
             Duration::from_secs(1800),
             true,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -8338,6 +8419,7 @@ mod tests {
             Duration::from_secs(1800),
             true,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -8488,6 +8570,7 @@ mod tests {
             Duration::from_secs(1800),
             true,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -8592,6 +8675,7 @@ mod tests {
             Duration::from_secs(1800),
             false,
             test_comment_run(),
+            None,
         )
         .unwrap();
         assert_eq!(
